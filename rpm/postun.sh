@@ -11,6 +11,7 @@ if [ "$(readlink /boot/vmlinuz)" = vmlinuz-%ver_str -o \
     # the symlinks point to it. This makes sure that the boot
     # manager will always have a kernel to boot in its default
     # configuration.
+    shopt -s nullglob
     for image in $(cd /boot ; ls -dt vmlinu[xz]-* image-*); do
 	initrd=initrd-${image#*-}
 	if [ -f /boot/$image -a -f /boot/$initrd ]; then
@@ -19,4 +20,5 @@ if [ "$(readlink /boot/vmlinuz)" = vmlinuz-%ver_str -o \
 	    break
 	fi
     done
+    shopt -u nullglob
 fi
