@@ -15,7 +15,6 @@ image=$image_link-%ver_str
 # isn't a symlink pointing to the real kernel yet.
 if [ -L /boot/$image_link -o ! -e /boot/$image_link ]; then
 	relink $image /boot/$image_link
-	relink initrd-%ver_str /boot/initrd
 fi
 
 #if [ -e /etc/sysconfig/kernel ]; then
@@ -27,8 +26,16 @@ fi
 touch /lib/modules/%ver_str/modules.dep
 
 if [ -f /etc/fstab ]; then
-    cd /boot && \
+    cd /boot
     /sbin/mkinitrd -k $image -i initrd-%ver_str
+
+    if [ -L /boot/initrd -o ! -e /boot/initrd ]; then
+	if [ -e initrd-%ver_str ]; then
+	    relink initrd-%ver_str /boot/initrd
+	elif [ -L /boot/initrd ]; then
+	    rm -f /boot/initrd
+	fi
+    fi
 else
     echo "please run mkinitrd as soon as your system is complete"
 fi
