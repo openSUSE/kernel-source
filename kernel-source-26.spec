@@ -188,7 +188,7 @@ for config in arch/$ARCH/defconfig.* ; do
     differences="$(
 	diff -U0 <(sort $config) <(sort .config) \
 	| grep '^[-+][^-+]'
-    )"
+    )" || true
     if [ -n "$differences" ]; then
 	echo "Configuration differences:"
 	echo "$differences"
