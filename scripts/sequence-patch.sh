@@ -293,7 +293,7 @@ while [ $# -gt 0 ]; do
 	break
     else
 	echo "${CLEAN:+# }$PATCH" >> $PATCH_DIR/series
-	[ -z "$CLEAN" ]
+	[ -z "$CLEAN" ] \
 	    && echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
 	rm -f $LAST_LOG
     fi
