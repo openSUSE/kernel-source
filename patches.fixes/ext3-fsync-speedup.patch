@@ -1,0 +1,226 @@
+
+
+ext3's fsync/fdatasync implementation is currently syncing the inode via a
+full journal commit even if it was unaltered.
+
+Fix that up by exporting the core VFS's inode sync function to modules and
+calling it if the inode is dirty.  We need to do it this way so that the
+inode is moved to the appropriate superblock list and so that the i_state
+dirty flags are appropriately updated.
+
+This speeds up ext3 fsync() for file overwrites by a factor of four (disk
+non-writeback) to forty (disk in writeback mode).
+
+
+
+---
+
+ 25-akpm/fs/ext3/fsync.c     |   38 ++++++++++++++++++++++++++++----------
+ 25-akpm/fs/fs-writeback.c   |   42 ++++++++++++++++++++++++++++++++++--------
+ 25-akpm/include/linux/fs.h  |    1 +
+ 25-akpm/mm/page-writeback.c |    2 ++
+ 4 files changed, 65 insertions(+), 18 deletions(-)
+
+diff -puN fs/ext3/fsync.c~ext3-fsync-speedup fs/ext3/fsync.c
+--- 25/fs/ext3/fsync.c~ext3-fsync-speedup	2004-04-03 02:59:55.785872200 -0800
++++ 25-akpm/fs/ext3/fsync.c	2004-04-03 02:59:55.792871136 -0800
+@@ -24,6 +24,8 @@
+ 
+ #include <linux/time.h>
+ #include <linux/fs.h>
++#include <linux/sched.h>
++#include <linux/writeback.h>
+ #include <linux/jbd.h>
+ #include <linux/ext3_fs.h>
+ #include <linux/ext3_jbd.h>
+@@ -38,29 +40,28 @@
+  *
+  * What we do is just kick off a commit and wait on it.  This will snapshot the
+  * inode to disk.
+- *
+- * Note that there is a serious optimisation we can make here: if the current
+- * inode is not part of j_running_transaction or j_committing_transaction
+- * then we have nothing to do.  That would require implementation of t_ilist,
+- * which isn't too hard.
+  */
+ 
+ int ext3_sync_file(struct file * file, struct dentry *dentry, int datasync)
+ {
+ 	struct inode *inode = dentry->d_inode;
++	int ret = 0;
+ 
+ 	J_ASSERT(ext3_journal_current_handle() == 0);
+ 
++	smp_mb();		/* prepare for lockless i_state read */
++	if (!(inode->i_state & I_DIRTY))
++		goto out;
++
+ 	/*
+ 	 * data=writeback:
+ 	 *  The caller's filemap_fdatawrite()/wait will sync the data.
+-	 *  ext3_force_commit() will sync the metadata
++	 *  sync_inode() will sync the metadata
+ 	 *
+ 	 * data=ordered:
+ 	 *  The caller's filemap_fdatawrite() will write the data and
+-	 *  ext3_force_commit() will wait on the buffers.  Then the caller's
+-	 *  filemap_fdatawait() will wait on the pages (but all IO is complete)
+-	 *  Not pretty, but it works.
++	 *  sync_inode() will write the inode if it is dirty.  Then the caller's
++	 *  filemap_fdatawait() will wait on the pages.
+ 	 *
+ 	 * data=journal:
+ 	 *  filemap_fdatawrite won't do anything (the buffers are clean).
+@@ -70,5 +71,22 @@ int ext3_sync_file(struct file * file, s
+ 	 *  (they were dirtied by commit).  But that's OK - the blocks are
+ 	 *  safe in-journal, which is all fsync() needs to ensure.
+ 	 */
+-	return ext3_force_commit(inode->i_sb);
++	if (ext3_should_journal_data(inode)) {
++		ret = ext3_force_commit(inode->i_sb);
++		goto out;
++	}
++
++	/*
++	 * The VFS has written the file data.  If the inode is unaltered
++	 * then we need not start a commit.
++	 */
++	if (inode->i_state & (I_DIRTY_SYNC|I_DIRTY_DATASYNC)) {
++		struct writeback_control wbc = {
++			.sync_mode = WB_SYNC_ALL,
++			.nr_to_write = 0, /* sys_fsync did this */
++		};
++		ret = sync_inode(inode, &wbc);
++	}
++out:
++	return ret;
+ }
+diff -puN fs/fs-writeback.c~ext3-fsync-speedup fs/fs-writeback.c
+--- 25/fs/fs-writeback.c~ext3-fsync-speedup	2004-04-03 02:59:55.786872048 -0800
++++ 25-akpm/fs/fs-writeback.c	2004-04-03 02:59:55.794870832 -0800
+@@ -137,13 +137,14 @@ static void write_inode(struct inode *in
+  *
+  * Called under inode_lock.
+  */
+-static void
++static int
+ __sync_single_inode(struct inode *inode, struct writeback_control *wbc)
+ {
+ 	unsigned dirty;
+ 	struct address_space *mapping = inode->i_mapping;
+ 	struct super_block *sb = inode->i_sb;
+ 	int wait = wbc->sync_mode == WB_SYNC_ALL;
++	int ret;
+ 
+ 	BUG_ON(inode->i_state & I_LOCK);
+ 
+@@ -164,14 +165,17 @@ __sync_single_inode(struct inode *inode,
+ 	spin_unlock(&mapping->page_lock);
+ 	spin_unlock(&inode_lock);
+ 
+-	do_writepages(mapping, wbc);
++	ret = do_writepages(mapping, wbc);
+ 
+ 	/* Don't write the inode if only I_DIRTY_PAGES was set */
+ 	if (dirty & (I_DIRTY_SYNC | I_DIRTY_DATASYNC))
+ 		write_inode(inode, wait);
+ 
+-	if (wait)
+-		filemap_fdatawait(mapping);
++	if (wait) {
++		int err = filemap_fdatawait(mapping);
++		if (ret == 0)
++			ret = err;
++	}
+ 
+ 	spin_lock(&inode_lock);
+ 	inode->i_state &= ~I_LOCK;
+@@ -195,18 +199,19 @@ __sync_single_inode(struct inode *inode,
+ 		}
+ 	}
+ 	wake_up_inode(inode);
++	return ret;
+ }
+ 
+ /*
+  * Write out an inode's dirty pages.  Called under inode_lock.
+  */
+-static void
++static int
+ __writeback_single_inode(struct inode *inode,
+ 			struct writeback_control *wbc)
+ {
+ 	if ((wbc->sync_mode != WB_SYNC_ALL) && (inode->i_state & I_LOCK)) {
+ 		list_move(&inode->i_list, &inode->i_sb->s_dirty);
+-		return;
++		return 0;
+ 	}
+ 
+ 	/*
+@@ -219,7 +224,7 @@ __writeback_single_inode(struct inode *i
+ 		iput(inode);
+ 		spin_lock(&inode_lock);
+ 	}
+-	__sync_single_inode(inode, wbc);
++	return __sync_single_inode(inode, wbc);
+ }
+ 
+ /*
+@@ -499,10 +504,31 @@ void write_inode_now(struct inode *inode
+ 	if (sync)
+ 		wait_on_inode(inode);
+ }
+-
+ EXPORT_SYMBOL(write_inode_now);
+ 
+ /**
++ * sync_inode - write an inode and its pages to disk.
++ * @inode: the inode to sync
++ * @wbc: controls the writeback mode
++ *
++ * sync_inode() will write an inode and its pages to disk.  It will also
++ * correctly update the inode on its superblock's dirty inode lists and will
++ * update inode->i_state.
++ *
++ * The caller must have a ref on the inode.
++ */
++int sync_inode(struct inode *inode, struct writeback_control *wbc)
++{
++	int ret;
++
++	spin_lock(&inode_lock);
++	ret = __writeback_single_inode(inode, wbc);
++	spin_unlock(&inode_lock);
++	return ret;
++}
++EXPORT_SYMBOL(sync_inode);
++
++/**
+  * generic_osync_inode - flush all dirty data for a given inode to disk
+  * @inode: inode to write
+  * @what:  what to write and wait upon
+diff -puN include/linux/fs.h~ext3-fsync-speedup include/linux/fs.h
+--- 25/include/linux/fs.h~ext3-fsync-speedup	2004-04-03 02:59:55.788871744 -0800
++++ 25-akpm/include/linux/fs.h	2004-04-03 02:59:55.795870680 -0800
+@@ -925,6 +925,7 @@ static inline void file_accessed(struct 
+ 	touch_atime(file->f_vfsmnt, file->f_dentry);
+ }
+ 
++int sync_inode(struct inode *inode, struct writeback_control *wbc);
+ 
+ /**
+  * &export_operations - for nfsd to communicate with file systems
+diff -puN mm/page-writeback.c~ext3-fsync-speedup mm/page-writeback.c
+--- 25/mm/page-writeback.c~ext3-fsync-speedup	2004-04-03 02:59:55.789871592 -0800
++++ 25-akpm/mm/page-writeback.c	2004-04-03 02:59:55.796870528 -0800
+@@ -441,6 +441,8 @@ void __init page_writeback_init(void)
+ 
+ int do_writepages(struct address_space *mapping, struct writeback_control *wbc)
+ {
++	if (wbc->nr_to_write <= 0)
++		return 0;
+ 	if (mapping->a_ops->writepages)
+ 		return mapping->a_ops->writepages(mapping, wbc);
+ 	return generic_writepages(mapping, wbc);
+
+_
