@@ -33,19 +33,12 @@ function _region_msg_ () {
     fi
 }
 
-case "$TERM" in
-linux | xterm | screen)
-    use_region=1
-    _region_init_
-    trap "_region_fini_" EXIT
-    ;;
-esac
-
 #########################################################
 # main
 
 arch="--list"
 YES=
+menuconfig=no
 until [ "$#" = "0" ] ; do
     case "$1" in
     y|-y|--yes)
@@ -56,11 +49,25 @@ until [ "$#" = "0" ] ; do
 	arch='$(scripts/arch-symbols '"$2"')'
 	shift 2
 	;;
+    m|-m|--menuconfig)
+	menuconfig=yes
+	shift
+	;;
     *)
 	shift
 	;;
     esac
 done
+if [ "$menuconfig" = "no" ] ; then
+	case "$TERM" in
+	linux | xterm | screen)
+	    use_region=1
+	    _region_init_
+	    trap "_region_fini_" EXIT
+	    ;;
+	esac
+fi
+
 for config in $(cd patches && \
 	        eval scripts/guards $arch < config.conf); do
     arch=${config%/*}
@@ -75,9 +82,16 @@ for config in $(cd patches && \
     esac
     config="patches/config/$config"
 
-    _region_msg_ "working on $config"
     cp -v $config .config
+    case "$menuconfig" in
+    	yes)
+	KCONFIG_NOTIMESTAMP=1 make $MAKE_ARGS menuconfig
+	;;
+	*)
+    _region_msg_ "working on $config"
     eval $YES KCONFIG_NOTIMESTAMP=1 make $MAKE_ARGS oldconfig
+	;;
+   esac
     if ! diff -U0 $config .config; then
 	cp -v .config $config
 	cp -v .config arch/$arch/defconfig.$flavor
