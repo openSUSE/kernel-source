@@ -19,9 +19,11 @@ Autoreqprov:  off
 Summary:      The Linux kernel (the core of the Linux operating system)
 Group:        Development/Sources
 Requires:     make c_compiler
-Version:      2.5.73
+# rpm doesn't like '-' in Version ...
+Version:      2.6.0test1
+%define kversion 2.6.0-test1
 Release:      0
-Source0:      linux-%version.tar.bz2
+Source0:      linux-%{kversion}.tar.bz2
 Source10:     series.conf
 Source11:     arch-symbols
 Source12:     guards
@@ -31,7 +33,7 @@ Source100:    patches.arch.tar.bz2
 Source101:    patches.fixes.tar.bz2
 Source102:    patches.drivers.tar.bz2
 Source103:    patches.rpmify.tar.bz2
-%define ver_str %version-%release
+%define ver_str %{kversion}-%release
 BuildRoot:    %_tmppath/linux-%ver_str-build
 Prefix:       /usr/src
 
@@ -87,7 +89,7 @@ echo "Architecture symbol(s): $SYMBOLS"
 
 # the kernel source tree is unpacked last so that RPM_BUILD_DIR
 # points to the right path, /usr/src/packages/BUILD/linux-%version
-%setup -q -n linux-%version
+%setup -q -n linux-%{kversion}
 
 # Apply the patches needed for this architecture.
 

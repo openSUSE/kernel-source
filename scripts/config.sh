@@ -4,9 +4,9 @@ if test -d /home/ftp/pub/kernel; then
 	MIRROR=${MIRROR:-/home/ftp/pub/kernel}
 else
 	# SuSE DHS
-	MIRROR=${MIRROR:-/mounts/mirror/kernel/v2.5}
+	MIRROR=${MIRROR:-/mounts/mirror/kernel/v2.6}
 fi
 
-VERSION=2.5.73
+VERSION=2.6.0-test1
 BUILD_DIR=kernel-source-26
 
