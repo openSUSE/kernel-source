@@ -66,7 +66,7 @@ for flavor in $flavors ; do
     esac
     use_icecream=1
     case $flavor in
-	pseries64|pmac64|iseries64)
+	ppc64|iseries64)
 	    use_icecream=1 ;;
     esac
 
