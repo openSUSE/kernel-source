@@ -37,6 +37,15 @@ while [ $# -gt 0 ]; do
 	--quilt)
 	    CLEAN=
 	    ;;
+	-d)
+		shift
+		SCRATCH_AREA=$1 
+		shift
+		;;
+	--dir=*)
+		SCRATCH_AREA=${1#--dir=}
+		shift
+		;;
 	-|[^-]*)
 	    [ -n "$LIMIT" ] && break
 	    LIMIT=$1
@@ -48,9 +57,13 @@ while [ $# -gt 0 ]; do
     shift
 done
 if [ $# -gt 0 ]; then
-    echo "SYNOPSIS: $0 [-qv] [--arch=...] [--symbol=...] [last-patch-name]"
+    echo "SYNOPSIS: $0 [-qv] [--arch=...] [--symbol=...] [--dir=...] [last-patch-name]"
     exit 1
 fi
+case "$1" in
+	/*) ;; 
+	*)  SCRATCH_AREA=`pwd`/$SCRATCH_AREA ;;
+esac
 
 # Some patches require patch 2.5.4. Abort with older versions.
 PATCH_VERSION=$(patch -v | sed -e '/^patch/!d' -e 's/patch //')
