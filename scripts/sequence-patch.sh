@@ -235,9 +235,12 @@ restore_files() {
 }
 
 echo -e "# Symbols: $SYMBOLS\n#" > $PATCH_DIR/series
+mkdir $PATCH_DIR/.pc
+echo 2 > $PATCH_DIR/.pc/.version
 
 # Patch kernel
 set -- $PATCHES
+set -- $1
 while [ $# -gt 0 ]; do
     PATCH="$1"
     if [ "$PATCH" = "$LIMIT" ]; then
@@ -302,7 +305,6 @@ ln -s $PWD $PATCH_DIR/patches
 # they can be fixed up with quilt (or similar).
 if [ -n "$*" ]; then
     ( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
-    echo 2 > $PATCH_DIR/.pc/.version
 fi
 
 [ $# -gt 0 ] && exit $status
