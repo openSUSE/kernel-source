@@ -9,6 +9,14 @@ else
     exit 0
 fi
 
+# If we have old symlinks, rename them to *.previous
+if [ -L /boot/$image -a -L /boot/initrd -a \
+     "$(readlink /boot/$image)" != $image-%ver_str -a \
+     "$(readlink /boot/initrd)" != initrd-%ver_str ]; then
+    mv /boot/$image /boot/$image.previous
+    mv /boot/initrd /boot/initrd.previous
+fi
+
 # update /boot/vmlinuz symlink
 relink $image-%ver_str /boot/$image
 
