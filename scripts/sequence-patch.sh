@@ -2,9 +2,9 @@
 
 source $(dirname $0)/config.sh
 
-PATCH_DIR=$SCRATCH_AREA/linux-$VERSION
-PATCH_LOG=$SCRATCH_AREA/patch-$VERSION.log
-LAST_LOG=$SCRATCH_AREA/last-$VERSION.log
+#SCRATCH_AREA=...
+#PATCH_ARCH=...
+
 QUIET=1
 
 while [ $# -gt 0 ]; do
@@ -46,15 +46,25 @@ if [ -z "$SCRATCH_AREA" ]; then
     echo "creating a temporary scratch area does not work yet"
     exit 1
 fi
-#if [[ "$SCRATCH_AREA" != /* ]]; then
-#    SCRATCH_AREA="$PWD/$SCRATCH_AREA"
-#fi
 if [ ! -d "$SCRATCH_AREA" ]; then
     if ! mkdir -p $SCRATCH_AREA; then
 	echo "creating scratch dir $SCRATCH_AREA failed"
 	exit 1
     fi
 fi
+
+[ "${SCRATCH_AREA:0:1}" != "/" ] \
+    && SCRATCH_AREA="$PWD/$SCRATCH_AREA"
+
+PATCH_DIR=$SCRATCH_AREA/linux-$VERSION
+PATCH_LOG=$SCRATCH_AREA/patch-$VERSION.log
+LAST_LOG=$SCRATCH_AREA/last-$VERSION.log
+
+# Check if we can clean up backup files at the end
+# (slightly faster, but requires more disk space).
+free_blocks="$(df -P "$SCRATCH_AREA" \
+    | awk 'NR==2 && match($4, /^[0-9]*$/) { print $4 }' 2> /dev/null)"
+[ "0$free_blocks" -gt 262144 ] && enough_free_space=1
 
 echo "Creating tree in $PATCH_DIR"
 
@@ -140,7 +150,7 @@ PATCHES=$(scripts/guards $SYMBOLS < series.conf)
 if [ -n "$LIMIT" ]; then
     for PATCH in $PATCHES; do
 	case $PATCH in 
-	    (*/$LIMIT)
+	    $LIMIT|*/$LIMIT)
 		LIMIT=$PATCH
 		unset PATCH
 		break
@@ -166,8 +176,38 @@ if [ -d $PATCH_DIR.orig ]; then
 else
     echo "Extracting $LINUX_ORIG_TARBALL"
     tar xf$COMPRESS_MODE $LINUX_ORIG_TARBALL --directory $SCRATCH_AREA
+    if [ ! -e $PATCH_DIR -a -e ${PATCH_DIR%-$VERSION} ]; then
+	# Old kernels unpack into linux/ instead of linux-$VERSION/.
+	mv ${PATCH_DIR%-$VERSION} $PATCH_DIR
+    fi
     cp -rld $PATCH_DIR $PATCH_DIR.orig
 fi
+
+# Helper function to restore files backed up by patch. This is
+# faster than doing a --dry-run first.
+restore_files() {
+    local backup_dir=$1 log=$2 file
+    local -a remove restore
+ 
+    pushd $backup_dir > /dev/null
+    #for file in $(find . -type f) ; do
+    for file in $( sed -e '/^patching file /!d' \
+	    	       -e 's/^patching file //' "$log" ); do
+	if [ -e "$file" ]; then
+	    if [ -s "$file" ]; then
+		restore[${#restore[@]}]="$file"
+	    else
+		remove[${#remove[@]}]="$file"
+	    fi
+	fi
+    done
+    [ ${#restore[@]} -ne 0 ] \
+	&& cp -f --parents "${restore[@]}" ..
+    cd ..
+    [ ${#remove[@]} -ne 0 ] \
+    	&& rm -f "${remove[@]}"
+    popd > /dev/null
+}
 
 # Patch kernel
 for PATCH in $PATCHES; do
@@ -177,7 +217,7 @@ for PATCH in $PATCHES; do
     fi
     if [ -n "$STEP_BY_STEP" ]; then
 	while true; do
-	    echo -n "Continue (y/n/a)?"
+	    echo -n "Continue ([y]es/[n]o/yes to [a]ll)?"
 	    read YESNO
 	    case $YESNO in
 		([yYjJsS])
@@ -201,20 +241,30 @@ for PATCH in $PATCHES; do
     echo "[ $PATCH ]"
     echo "[ $PATCH ]" >> $PATCH_LOG
     echo $PATCH >> $SCRATCH_AREA/series
-    patch -d $PATCH_DIR --no-backup-if-mismatch -p1 \
-    	< $PATCH > $LAST_LOG 2>&1
+    #patch -d $PATCH_DIR --no-backup-if-mismatch -p1 \
+    #	< $PATCH > $LAST_LOG 2>&1
+    patch -d $PATCH_DIR --backup --prefix=.sequence_patch/ -p1 \
+	    < $PATCH > $LAST_LOG 2>&1
     STATUS=$?
+    [ $STATUS -ne 0 ] \
+	&& restore_files $PATCH_DIR/.sequence_patch $LAST_LOG
+    [ -n "$enough_free_space" ] \
+	|| rm -rf $PATCH_DIR/.sequence_patch
     cat $LAST_LOG >> $PATCH_LOG
     [ -z "$QUIET" ] && cat $LAST_LOG
     if [ $STATUS -ne 0 ]; then
 	[ -n "$QUIET" ] && cat $LAST_LOG
-	echo "*** Patch $PATCH failed ***" >&2
-	exit 1
+	echo "*** Patch $PATCH failed (rolled back) ***" >&2
+	failed=1
+	break
     else
 	rm -f $LAST_LOG
     fi
 done
 
+[ -n "$enough_free_space" ] \
+    && rm -rf $PATCH_DIR/.sequence_patch
+[ -n "$failed" ] && exit 1
 
 # config_subst makes sure that CONFIG_CFGNAME and CONFIG_RELEASE are
 # set correctly.
@@ -243,6 +293,9 @@ config_subst()
     '
 }
 
+# Old kernels don't have a config.conf.
+[ -e config.conf ] || exit
+
 # Copy the config files that apply for this kernel.
 echo "[ Copying config files ]" >> $PATCH_LOG
 echo "[ Copying config files ]"
@@ -255,8 +308,9 @@ for config in $CONFIGS; do
 	name=$(basename $config)
 	path=arch/$(dirname $config)/defconfig.$name
 	mkdir -p $(dirname $PATCH_DIR/$path)
- 	config_subst $name 0 \
- 		< config/$config \
+
+	config_subst $name 0 \
+		< config/$config \
 		> $TMPFILE
 
 	if [ "${config/*\//}" = "default" ]; then
