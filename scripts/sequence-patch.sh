@@ -1,4 +1,7 @@
 #!/bin/sh
+#
+# Takes clean tarball and patches it with all patches according to series.conf.
+#
 
 source $(dirname $0)/config.sh
 
