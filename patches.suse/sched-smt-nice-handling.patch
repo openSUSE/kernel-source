@@ -1,0 +1,283 @@
+
+From: Con Kolivas <kernel@kolivas.org>
+
+This patch provides full per-package priority support for SMT processors
+(aka pentium4 hyperthreading) when combined with CONFIG_SCHED_SMT.
+
+It maintains cpu percentage distribution within each physical cpu package
+by limiting the time a lower priority task can run on a sibling cpu
+concurrently with a higher priority task.
+
+It introduces a new flag into the scheduler domain
+unsigned int per_cpu_gain;	/* CPU % gained by adding domain cpus */
+
+This is empirically set to 15% for pentium4 at the moment and can be
+modified to support different values dynamically as newer processors come
+out with improved SMT performance.  It should not matter how many siblings
+there are.
+
+How it works is it compares tasks running on sibling cpus and when a lower
+static priority task is running it will delay it till
+high_priority_timeslice * (100 - per_cpu_gain) / 100 <= low_prio_timeslice
+
+eg.  a nice 19 task timeslice is 10ms and nice 0 timeslice is 102ms On
+vanilla the nice 0 task runs on one logical cpu while the nice 19 task runs
+unabated on the other logical cpu.  With smtnice the nice 0 runs on one
+logical cpu for 102ms and the nice 19 sleeps till the nice 0 task has 12ms
+remaining and then will schedule.
+
+Real time tasks and kernel threads are not altered by this code, and kernel
+threads do not delay lower priority user tasks.
+
+with lots of thanks to Zwane Mwaikambo and Nick Piggin for help with the
+coding of this version.
+
+If this is merged, it is probably best to delay pushing this upstream in
+mainline till sched_domains gets tested for at least one major release.
+
+
+Index: linux-2.6.5/arch/i386/kernel/smpboot.c
+===================================================================
+--- linux-2.6.5.orig/arch/i386/kernel/smpboot.c	2004-04-16 15:06:42.000000000 +0200
++++ linux-2.6.5/arch/i386/kernel/smpboot.c	2004-04-16 15:06:42.000000000 +0200
+@@ -1159,8 +1159,12 @@
+ 		int j;
+ 		first_cpu = last_cpu = NULL;
+ 
+-		if (i != first_cpu(cpu_domain->span))
++		if (i != first_cpu(cpu_domain->span)) {
++			cpu_sched_domain(i)->flags |= SD_FLAG_SHARE_CPUPOWER;
++			cpu_sched_domain(first_cpu(cpu_domain->span))->flags |=
++				SD_FLAG_SHARE_CPUPOWER;
+ 			continue;
++		}
+ 
+ 		for_each_cpu_mask(j, cpu_domain->span) {
+ 			struct sched_group *cpu = &sched_group_cpus[j];
+@@ -1279,8 +1283,12 @@
+ 		int j;
+ 		first_cpu = last_cpu = NULL;
+ 
+-		if (i != first_cpu(cpu_domain->span))
++		if (i != first_cpu(cpu_domain->span)) {
++			cpu_sched_domain(i)->flags |= SD_FLAG_SHARE_CPUPOWER;
++			cpu_sched_domain(first_cpu(cpu_domain->span))->flags |=
++				SD_FLAG_SHARE_CPUPOWER;
+ 			continue;
++		}
+ 
+ 		for_each_cpu_mask(j, cpu_domain->span) {
+ 			struct sched_group *cpu = &sched_group_cpus[j];
+Index: linux-2.6.5/kernel/sched.c
+===================================================================
+--- linux-2.6.5.orig/kernel/sched.c	2004-04-16 15:06:42.000000000 +0200
++++ linux-2.6.5/kernel/sched.c	2004-04-16 15:06:42.000000000 +0200
+@@ -1764,6 +1764,25 @@
+ }
+ #endif
+ 
++#ifdef CONFIG_SCHED_SMT
++static inline int wake_priority_sleeper(runqueue_t *rq)
++{	/*
++	 * If an SMT sibling task has been put to sleep for priority
++	 * reasons reschedule the idle task to see if it can now run.
++	 */
++	if (rq->nr_running) {
++		resched_task(rq->idle);
++		return 1;
++	}
++	return 0;
++}
++#else
++static inline int wake_priority_sleeper(runqueue_t *rq)
++{
++	return 0;
++}
++#endif
++
+ DEFINE_PER_CPU(struct kernel_stat, kstat);
+ 
+ EXPORT_PER_CPU_SYMBOL(kstat);
+@@ -1817,6 +1836,8 @@
+ 			cpustat->iowait += sys_ticks;
+ 		else
+ 			cpustat->idle += sys_ticks;
++		if (wake_priority_sleeper(rq))
++			goto out;
+ 		rebalance_tick(cpu, rq, IDLE);
+ 		return;
+ 	}
+@@ -1904,6 +1925,91 @@
+ 	rebalance_tick(cpu, rq, NOT_IDLE);
+ }
+ 
++#ifdef CONFIG_SCHED_SMT
++static inline void wake_sleeping_dependent(int cpu, runqueue_t *rq)
++{
++	int i;
++	struct sched_domain *sd = cpu_sched_domain(cpu);
++	cpumask_t sibling_map;
++
++	if (!(sd->flags & SD_FLAG_SHARE_CPUPOWER)) {
++		/* Not SMT */
++		return;
++	}
++
++	cpus_and(sibling_map, sd->span, cpu_online_map);
++	cpu_clear(cpu, sibling_map);
++	for_each_cpu_mask(i, sibling_map) {
++		runqueue_t *smt_rq;
++
++		smt_rq = cpu_rq(i);
++
++		/*
++		 * If an SMT sibling task is sleeping due to priority
++		 * reasons wake it up now.
++		 */
++		if (smt_rq->curr == smt_rq->idle && smt_rq->nr_running)
++			resched_task(smt_rq->idle);
++	}
++}
++
++static inline int dependent_sleeper(int cpu, runqueue_t *rq, task_t *p)
++{
++	int ret = 0, i;
++	struct sched_domain *sd = cpu_sched_domain(cpu);
++	cpumask_t sibling_map;
++
++	if (!(sd->flags & SD_FLAG_SHARE_CPUPOWER)) {
++		/* Not SMT */
++		return 0;
++	}
++
++	cpus_and(sibling_map, sd->span, cpu_online_map);
++	cpu_clear(cpu, sibling_map);
++	for_each_cpu_mask(i, sibling_map) {
++		runqueue_t *smt_rq;
++		task_t *smt_curr;
++
++		smt_rq = cpu_rq(i);
++		smt_curr = smt_rq->curr;
++
++		/*
++		 * If a user task with lower static priority than the
++		 * running task on the SMT sibling is trying to schedule,
++		 * delay it till there is proportionately less timeslice
++		 * left of the sibling task to prevent a lower priority
++		 * task from using an unfair proportion of the
++		 * physical cpu's resources. -ck
++		 */
++		if (((smt_curr->time_slice * (100 - sd->per_cpu_gain) / 100) >
++			task_timeslice(p) || rt_task(smt_curr)) &&
++			p->mm && smt_curr->mm && !rt_task(p))
++				ret |= 1;
++
++		/*
++		 * Reschedule a lower priority task on the SMT sibling,
++		 * or wake it up if it has been put to sleep for priority
++		 * reasons.
++		 */
++		if ((((p->time_slice * (100 - sd->per_cpu_gain) / 100) >
++			task_timeslice(smt_curr) || rt_task(p)) &&
++			smt_curr->mm && p->mm && !rt_task(smt_curr)) ||
++			(smt_curr == smt_rq->idle && smt_rq->nr_running))
++				resched_task(smt_curr);
++	}
++	return ret;
++}
++#else
++static inline void wake_sleeping_dependent(int cpu, runqueue_t *rq)
++{
++}
++
++static inline int dependent_sleeper(int cpu, runqueue_t *rq, task_t *p)
++{
++	return 0;
++}
++#endif
++
+ void scheduling_functions_start_here(void) { }
+ 
+ /*
+@@ -1918,7 +2024,7 @@
+ 	struct list_head *queue;
+ 	unsigned long long now;
+ 	unsigned long run_time;
+-	int idx;
++	int cpu, idx;
+ 
+ 	/*
+ 	 * Test if we are atomic.  Since do_exit() needs to call into
+@@ -1968,13 +2074,15 @@
+ 			deactivate_task(prev, rq);
+ 	}
+ 
++	cpu = smp_processor_id();
+ 	if (unlikely(!rq->nr_running)) {
+ #ifdef CONFIG_SMP
+-		idle_balance(smp_processor_id(), rq);
++		idle_balance(cpu, rq);
+ #endif
+ 		if (!rq->nr_running) {
+ 			next = rq->idle;
+ 			rq->expired_timestamp = 0;
++			wake_sleeping_dependent(cpu, rq);
+ 			goto switch_tasks;
+ 		}
+ 	}
+@@ -1995,6 +2103,11 @@
+ 	queue = array->queue + idx;
+ 	next = list_entry(queue->next, task_t, run_list);
+ 
++	if (dependent_sleeper(cpu, rq, next)) {
++		next = rq->idle;
++		goto switch_tasks;
++	}
++
+ 	if (!rt_task(next) && next->activated > 0) {
+ 		unsigned long long delta = now - next->timestamp;
+ 
+Index: linux-2.6.5/include/linux/sched.h
+===================================================================
+--- linux-2.6.5.orig/include/linux/sched.h	2004-04-16 15:06:42.000000000 +0200
++++ linux-2.6.5/include/linux/sched.h	2004-04-16 15:06:42.000000000 +0200
+@@ -539,6 +539,7 @@
+ #define SD_FLAG_EXEC		2	/* Balance on exec */
+ #define SD_FLAG_WAKE		4	/* Balance on task wakeup */
+ #define SD_FLAG_FASTMIGRATE	8	/* Sync wakes put task on waking CPU */
++#define SD_FLAG_SHARE_CPUPOWER	16	/* Domain members share cpu power */
+ 
+ struct sched_group {
+ 	struct sched_group *next;	/* Must be a circular list */
+@@ -564,6 +565,7 @@
+ 	unsigned int imbalance_pct;	/* No balance until over watermark */
+ 	unsigned long long cache_hot_time; /* Task considered cache hot (ns) */
+ 	unsigned int cache_nice_tries;	/* Leave cache hot tasks for # tries */
++	unsigned int per_cpu_gain;	/* CPU % gained by adding domain cpus */
+ 	int flags;			/* See SD_FLAG_* */
+ 
+ 	/* Runtime fields. */
+@@ -583,6 +585,7 @@
+ 	.imbalance_pct		= 110,			\
+ 	.cache_hot_time		= 0,			\
+ 	.cache_nice_tries	= 0,			\
++	.per_cpu_gain		= 15,			\
+ 	.flags			= SD_FLAG_FASTMIGRATE | SD_FLAG_NEWIDLE | SD_FLAG_WAKE,\
+ 	.last_balance		= jiffies,		\
+ 	.balance_interval	= 1,			\
+@@ -600,6 +603,7 @@
+ 	.imbalance_pct		= 125,			\
+ 	.cache_hot_time		= (5*1000000/2),	\
+ 	.cache_nice_tries	= 1,			\
++	.per_cpu_gain		= 100,			\
+ 	.flags			= SD_FLAG_FASTMIGRATE | SD_FLAG_NEWIDLE,\
+ 	.last_balance		= jiffies,		\
+ 	.balance_interval	= 1,			\
+@@ -618,6 +622,7 @@
+ 	.imbalance_pct		= 125,			\
+ 	.cache_hot_time		= (10*1000000),		\
+ 	.cache_nice_tries	= 1,			\
++	.per_cpu_gain		= 100,			\
+ 	.flags			= SD_FLAG_EXEC,		\
+ 	.last_balance		= jiffies,		\
+ 	.balance_interval	= 1,			\
