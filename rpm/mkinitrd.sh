@@ -7,19 +7,34 @@ if test "$YAST_IS_RUNNING" != instsys ; then
 	    echo "/sbin/mkinitrd failed" >&2
 	    exit 1
 	fi
-
-	# update /boot/initrd symlink
-	if [ -L /boot/initrd -a \
-	     "$(readlink /boot/initrd)" != initrd-%ver_str ]; then
-	    mv /boot/initrd /boot/initrd.previous
-	fi
-	if [ -e /boot/initrd-%ver_str ]; then
-	    relink initrd-%ver_str /boot/initrd
-	else
-	    rm -f /boot/initrd
-	fi
     else
 	echo "please run mkinitrd as soon as your system is complete"
+    fi
+
+    if [ -f /boot/vmlinuz-%ver_str ]; then
+	image=vmlinuz
+    elif [ -f /boot/image-%ver_str ]; then
+	image=image
+    elif [ -f /boot/vmlinux-%ver_str ]; then
+	image=vmlinux
+    fi
+
+    # update /boot/vmlinuz symlink
+    if [ -L /boot/$image -a \
+	 "$(readlink /boot/$image)" != $image-%ver_str ]; then
+	mv /boot/$image /boot/$image.previous
+    fi
+    relink $image-%ver_str /boot/$image
+
+    # update /boot/initrd symlink
+    if [ -L /boot/initrd -a \
+	 "$(readlink /boot/initrd)" != initrd-%ver_str ]; then
+	mv /boot/initrd /boot/initrd.previous
+    fi
+    if [ -e /boot/initrd-%ver_str ]; then
+	relink initrd-%ver_str /boot/initrd
+    else
+	rm -f /boot/initrd
     fi
 
     if [ -x /sbin/new-kernel-pkg ]; then
