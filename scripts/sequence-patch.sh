@@ -112,6 +112,9 @@ if [ ! -d $PATCH_DIR.orig ]; then
 	elif [ -r $MIRROR/linux-$VERSION.tar.bz2 ]; then
 	    LINUX_ORIG_TARBALL=$MIRROR/linux-$VERSION.tar.bz2
             COMPRESS_MODE=j
+	elif [ -r $MIRROR/testing/linux-$VERSION.tar.bz2 ]; then
+	    LINUX_ORIG_TARBALL=$MIRROR/testing/linux-$VERSION.tar.bz2
+            COMPRESS_MODE=j
 	else
 	    LINUX_ORIG_TARBALL=linux-$VERSION.tar.gz
 	fi

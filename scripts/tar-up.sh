@@ -203,6 +203,8 @@ if [ -r $SRC_FILE ]; then
   LINUX_ORIG_TARBALL=$SRC_FILE
 elif [ -r $MIRROR/$SRC_FILE ]; then
   LINUX_ORIG_TARBALL=$MIRROR/$SRC_FILE
+elif [ -r $MIRROR/testing/$SRC_FILE ]; then
+  LINUX_ORIG_TARBALL=$MIRROR/testing/$SRC_FILE
 else
   echo "Cannot find $SRC_FILE."
   exit 1
