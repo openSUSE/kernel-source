@@ -9,17 +9,6 @@ else
     exit 0
 fi
 
-# If we have old symlinks, rename them to *.previous
-if [ -L /boot/$image -a -L /boot/initrd -a \
-     "$(readlink /boot/$image)" != $image-%ver_str -a \
-     "$(readlink /boot/initrd)" != initrd-%ver_str ]; then
-    mv /boot/$image /boot/$image.previous
-    mv /boot/initrd /boot/initrd.previous
-fi
-
-# update /boot/vmlinuz symlink
-relink $image-%ver_str /boot/$image
-
 if test "$YAST_IS_RUNNING" != instsys ; then
     if [ -f /etc/fstab ]; then
 	echo Setting up /lib/modules/%ver_str
@@ -31,6 +20,11 @@ if test "$YAST_IS_RUNNING" != instsys ; then
 	fi
 
 	if [ -e /boot/initrd-%ver_str ]; then
+	    # update /boot/initrd symlink
+	    if [ -L /boot/initrd -a \
+		 "$(readlink /boot/initrd)" != initrd-%ver_str ]; then
+		mv /boot/initrd /boot/initrd.previous
+	    fi
 	    relink initrd-%ver_str /boot/initrd
 	else
 	    rm -f /boot/initrd
@@ -47,3 +41,10 @@ if test "$YAST_IS_RUNNING" != instsys ; then
 	/sbin/new-kernel-pkg %ver_str
     fi
 fi
+
+# update /boot/vmlinuz symlink
+if [ -L /boot/$image -a \
+     "$(readlink /boot/$image)" != $image-%ver_str ]; then
+    mv /boot/$image /boot/$image.previous
+fi
+relink $image-%ver_str /boot/$image
