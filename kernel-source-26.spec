@@ -161,7 +161,7 @@ yes "" | make $MAKE_ARGS oldconfig
 make -s $MAKE_ARGS include/linux/version.h
 
 # Collect the filelist. (Not needed at the moment.)
-#find . -mindepth 1 > linux.files
+#find . -mindepth 1 -not -path ./linux.files > linux.files
 
 
 %install
