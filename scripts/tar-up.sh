@@ -17,7 +17,9 @@ rm -rf $BUILD_DIR
 mkdir -p $BUILD_DIR
 
 echo "Computing timestamp..."
-scripts/cvs-wd-timestamp > $BUILD_DIR/build-source-timestamp
+if ! scripts/cvs-wd-timestamp > $BUILD_DIR/build-source-timestamp; then
+    exit 1
+fi
 
 # List all used configurations
 config_files="$(
