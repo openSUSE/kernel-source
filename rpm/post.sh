@@ -1,7 +1,7 @@
 echo Setting up /lib/modules/@KERNELRELEASE@
 /sbin/depmod -a -F /boot/System.map-@KERNELRELEASE@ @KERNELRELEASE@
 
-for x in vmlinuz image vmlinux linux; do
+for x in vmlinuz image vmlinux linux bzImage; do
     if [ -f /boot/$x-@KERNELRELEASE@ ]; then
 	image=$x
 	break
@@ -44,7 +44,11 @@ if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
     fi
 
     case @KERNELRELEASE@ in
-	(*xen*|*um*)
+	(*xen*)
+	    ln -sf $image-@KERNELRELEASE /boot/$image-xen
+	    ln -sf initrd-@KERNELRELEASE /boot/initrd-xen
+	    ;;
+	(*um*)
 	    # nothing to be done
     	    ;;
   	(*)	
