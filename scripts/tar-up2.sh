@@ -88,6 +88,7 @@ for config in ${configs[@]} $um_config; do
     | sed -e "s:@NAME@:kernel-$cfgname-26:g" \
     	  -e "s:@ARCH@:$PATCH_ARCH:g" \
 	  -e "s:@CFGNAME@:$cfgname:g" \
+	  -e "s:@VERSION@:$VERSION:g" \
     | m4 > $BUILD_DIR/kernel-$cfgname-26.spec
     cat kernel-source-26.changes kernel-binary-26.changes \
 	> $BUILD_DIR/kernel-$cfgname-26.changes
@@ -101,6 +102,7 @@ if [ ${#configs[@]} -ne 0 ]; then
     | sed -e "s:@NAME@:kernel-source-26:g" \
 	  -e "s:@ARCH@:$PATCH_ARCH:g" \
 	  -e "s:@CFGNAMES@:$cfgnames:g" \
+	  -e "s:@VERSION@:$VERSION:g" \
     | m4 > $BUILD_DIR/kernel-source-26.spec
 fi
 
@@ -112,6 +114,7 @@ cat rpm/kernel-source-26.spec.in \
 | sed -e "s:@NAME@:kernel-bare-26:g" \
       -e "s:@ARCH@:$PATCH_ARCH:g" \
       -e "s:@CFGNAMES@::g" \
+      -e "s:@VERSION@:$VERSION:g" \
 | m4 > $BUILD_DIR/kernel-bare-26.spec
 
 for d in config patches.*; do
