@@ -1,0 +1,586 @@
+dm-multipath: mv-path-code-to-ps.patch
+Some path-selectors will want to choose paths that have a couple of failed
+IOs vs always failing paths with X number of failures. Also some path-
+selectors will want to select a path by detecting congestion or some other
+determination than X bios have been sent.
+
+From: Mike Christie <mikenc@us.ibm.com>
+
+--- diff/drivers/md/dm-mpath.c	2004-07-01 21:35:20.000000000 +0100
++++ source/drivers/md/dm-mpath.c	2004-07-01 21:35:32.000000000 +0100
+@@ -19,33 +19,12 @@
+ #include <linux/workqueue.h>
+ #include <asm/atomic.h>
+ 
+-/* FIXME: get rid of this */
+-#define MPATH_FAIL_COUNT	1
+-
+-/*
+- * We don't want to call the path selector for every single io
+- * that comes through, so instead we only consider changing paths
+- * every MPATH_MIN_IO ios.  This number should be selected to be
+- * big enough that we can reduce the overhead of the path
+- * selector, but also small enough that we don't take the policy
+- * decision away from the path selector.
+- *
+- * So people should _not_ be tuning this number to try and get
+- * the most performance from some particular type of hardware.
+- * All the smarts should be going into the path selector.
+- */
+-#define MPATH_MIN_IO		1000
+-
+ /* Path properties */
+ struct path {
+ 	struct list_head list;
+ 
+ 	struct dm_dev *dev;
+ 	struct priority_group *pg;
+-
+-	spinlock_t failed_lock;
+-	int has_failed;
+-	unsigned fail_count;
+ };
+ 
+ struct priority_group {
+@@ -65,12 +44,9 @@
+ 
+ 	unsigned nr_priority_groups;
+ 	struct list_head priority_groups;
++	struct priority_group *current_pg;
+ 
+ 	spinlock_t lock;
+-	unsigned nr_valid_paths;
+-
+-	struct path *current_path;
+-	unsigned current_count;
+ 
+ 	struct work_struct dispatch_failed;
+ 	struct bio_list failed_ios;
+@@ -78,19 +54,20 @@
+ 	struct work_struct trigger_event;
+ 
+ 	/*
+-	 * We must use a mempool of mpath_io structs so that we
++	 * We must use a mempool of mp_io structs so that we
+ 	 * can resubmit bios on error.
+ 	 */
+-	mempool_t *details_pool;
++	mempool_t *mpio_pool;
+ };
+ 
+ struct mpath_io {
+ 	struct path *path;
++	union map_info info;
+ 	struct dm_bio_details details;
+ };
+ 
+ #define MIN_IOS 256
+-static kmem_cache_t *_details_cache;
++static kmem_cache_t *_mpio_cache;
+ 
+ static void dispatch_failed_ios(void *data);
+ static void trigger_event(void *data);
+@@ -99,12 +76,8 @@
+ {
+ 	struct path *path = kmalloc(sizeof(*path), GFP_KERNEL);
+ 
+-	if (path) {
++	if (path)
+ 		memset(path, 0, sizeof(*path));
+-		path->failed_lock = SPIN_LOCK_UNLOCKED;
+-		path->fail_count = MPATH_FAIL_COUNT;
+-	}
+-
+ 	return path;
+ }
+ 
+@@ -172,9 +145,9 @@
+ 		m->lock = SPIN_LOCK_UNLOCKED;
+ 		INIT_WORK(&m->dispatch_failed, dispatch_failed_ios, m);
+ 		INIT_WORK(&m->trigger_event, trigger_event, m);
+-		m->details_pool = mempool_create(MIN_IOS, mempool_alloc_slab,
+-						 mempool_free_slab, _details_cache);
+-		if (!m->details_pool) {
++		m->mpio_pool = mempool_create(MIN_IOS, mempool_alloc_slab,
++					      mempool_free_slab, _mpio_cache);
++		if (!m->mpio_pool) {
+ 			kfree(m);
+ 			return NULL;
+ 		}
+@@ -192,58 +165,51 @@
+ 		free_priority_group(pg, m->ti);
+ 	}
+ 
+-	mempool_destroy(m->details_pool);
++	mempool_destroy(m->mpio_pool);
+ 	kfree(m);
+ }
+ 
+ /*-----------------------------------------------------------------
+  * The multipath daemon is responsible for resubmitting failed ios.
+  *---------------------------------------------------------------*/
+-static int __choose_path(struct multipath *m)
++static struct path *select_path(struct multipath *m, struct bio *bio,
++				union map_info *info)
+ {
+ 	struct priority_group *pg;
+ 	struct path *path = NULL;
+-
+-	if (m->nr_valid_paths) {
+-		/* loop through the priority groups until we find a valid path. */
+-		list_for_each_entry (pg, &m->priority_groups, list) {
+-			path = pg->ps->type->select_path(pg->ps);
+-			if (path)
+-				break;
+-		}
+-	}
+-
+-	m->current_path = path;
+-	m->current_count = MPATH_MIN_IO;
+-
+-	return 0;
+-}
+-
+-static struct path *get_current_path(struct multipath *m)
+-{
+-	struct path *path;
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&m->lock, flags);
+ 
+-	/* Do we need to select a new path? */
+-	if (!m->current_path || --m->current_count == 0)
+-		__choose_path(m);
++	pg = m->current_pg;
++	if (pg && (path = pg->ps->type->select_path(pg->ps, bio, info)))
++		goto done;
+ 
+-	path = m->current_path;
++	/*
++	 * loop through the priority groups until we
++	 * find a valid path.
++	 */
++	list_for_each_entry (pg, &m->priority_groups, list) {
++		path = pg->ps->type->select_path(pg->ps, bio, info);
++		if (path) {
++			m->current_pg = pg;
++			break;
++		}
++	}
+ 
++ done:
+ 	spin_unlock_irqrestore(&m->lock, flags);
+ 
+ 	return path;
+ }
+ 
+-static int map_io(struct multipath *m, struct bio *bio, struct path **chosen)
++static int map_io(struct multipath *m, struct bio *bio, struct mpath_io *mpio)
+ {
+-	*chosen = get_current_path(m);
+-	if (!*chosen)
++	mpio->path = select_path(m, bio, &mpio->info);
++	if (unlikely(!mpio->path))
+ 		return -EIO;
+ 
+-	bio->bi_bdev = (*chosen)->dev->bdev;
++	bio->bi_bdev = mpio->path->dev->bdev;
+ 	return 0;
+ }
+ 
+@@ -471,10 +437,10 @@
+ 		if (!pg)
+ 			goto bad;
+ 
+-		m->nr_valid_paths += pg->nr_paths;
+ 		list_add_tail(&pg->list, &m->priority_groups);
+ 	}
+-
++	m->current_pg = list_entry(m->priority_groups.next,
++				   struct priority_group, list);
+ 	ti->private = m;
+ 	m->ti = ti;
+ 
+@@ -492,72 +458,36 @@
+ }
+ 
+ static int multipath_map(struct dm_target *ti, struct bio *bio,
+-			 union map_info *map_context)
++			 union map_info *info)
+ {
+ 	int r;
+ 	struct mpath_io *io;
+ 	struct multipath *m = (struct multipath *) ti->private;
+ 
+-	io = mempool_alloc(m->details_pool, GFP_NOIO);
++	io = mempool_alloc(m->mpio_pool, GFP_NOIO);
+ 	dm_bio_record(&io->details, bio);
+ 
+ 	bio->bi_rw |= (1 << BIO_RW_FAILFAST);
+-	r = map_io(m, bio, &io->path);
+-	if (r) {
+-		mempool_free(io, m->details_pool);
++	r = map_io(m, bio, io);
++	if (unlikely(r)) {
++		mempool_free(io, m->mpio_pool);
+ 		return r;
+ 	}
+ 
+-	map_context->ptr = io;
++	info->ptr = io;
+ 	return 1;
+ }
+ 
+-static void fail_path(struct path *path)
+-{
+-	unsigned long flags;
+-	struct multipath *m;
+-
+-	spin_lock_irqsave(&path->failed_lock, flags);
+-
+-	/* FIXME: path->fail_count is brain dead */
+-	if (!path->has_failed && !--path->fail_count) {
+-		m = path->pg->m;
+-
+-		path->has_failed = 1;
+-		path->pg->ps->type->fail_path(path->pg->ps, path);
+-		schedule_work(&m->trigger_event);
+-
+-		spin_lock(&m->lock);
+-		m->nr_valid_paths--;
+-
+-		if (path == m->current_path)
+-			m->current_path = NULL;
+-
+-		spin_unlock(&m->lock);
+-	}
+-
+-	spin_unlock_irqrestore(&path->failed_lock, flags);
+-}
+-
+ static int do_end_io(struct multipath *m, struct bio *bio,
+ 		     int error, struct mpath_io *io)
+ {
+-	int r;
++	struct path_selector *ps = io->path->pg->ps;
+ 
++	error = ps->type->end_io(ps, bio, error, &io->info);
+ 	if (error) {
+-		spin_lock(&m->lock);
+-		if (!m->nr_valid_paths) {
+-			spin_unlock(&m->lock);
+-			return -EIO;
+-		}
+-		spin_unlock(&m->lock);
+-
+-		fail_path(io->path);
+-
+ 		/* remap */
+ 		dm_bio_restore(&io->details, bio);
+-		r = map_io(m, bio, &io->path);
+-		if (r)
++		if (map_io(m, bio, io))
+ 			/* no paths left */
+ 			return -EIO;
+ 
+@@ -574,15 +504,15 @@
+ }
+ 
+ static int multipath_end_io(struct dm_target *ti, struct bio *bio,
+-			    int error, union map_info *map_context)
++			    int error, union map_info *info)
+ {
+ 	struct multipath *m = (struct multipath *) ti->private;
+-	struct mpath_io *io = (struct mpath_io *) map_context->ptr;
++	struct mpath_io *io = (struct mpath_io *) info->ptr;
+ 	int r;
+ 
+ 	r  = do_end_io(m, bio, error, io);
+ 	if (r <= 0)
+-		mempool_free(io, m->details_pool);
++		mempool_free(io, m->mpio_pool);
+ 
+ 	return r;
+ }
+@@ -598,7 +528,6 @@
+ 			    char *result, unsigned int maxlen)
+ {
+ 	int sz = 0;
+-	unsigned long flags;
+ 	struct multipath *m = (struct multipath *) ti->private;
+ 	struct priority_group *pg;
+ 	struct path *p;
+@@ -616,12 +545,9 @@
+ 
+ 			list_for_each_entry(p, &pg->paths, list) {
+ 				format_dev_t(buffer, p->dev->bdev->bd_dev);
+-				spin_lock_irqsave(&p->failed_lock, flags);
+-				EMIT("%s %s %u ", buffer,
+-				     p->has_failed ? "F" : "A", p->fail_count);
+-				pg->ps->type->status(pg->ps, p, type,
++				EMIT("%s ", buffer);
++				sz += pg->ps->type->status(pg->ps, p, type,
+ 						     result + sz, maxlen - sz);
+-				spin_unlock_irqrestore(&p->failed_lock, flags);
+ 			}
+ 		}
+ 		break;
+@@ -636,7 +562,7 @@
+ 			list_for_each_entry(p, &pg->paths, list) {
+ 				format_dev_t(buffer, p->dev->bdev->bd_dev);
+ 				EMIT("%s ", buffer);
+-				pg->ps->type->status(pg->ps, p, type,
++				sz += pg->ps->type->status(pg->ps, p, type,
+ 						     result + sz, maxlen - sz);
+ 
+ 			}
+@@ -661,27 +587,27 @@
+ 	.status = multipath_status,
+ };
+ 
+-int __init dm_multipath_init(void)
++static int __init dm_multipath_init(void)
+ {
+ 	int r;
+ 
+ 	/* allocate a slab for the dm_ios */
+-	_details_cache = kmem_cache_create("dm_mpath", sizeof(struct mpath_io),
+-					   0, 0, NULL, NULL);
+-	if (!_details_cache)
++	_mpio_cache = kmem_cache_create("dm_mpath", sizeof(struct mpath_io),
++					0, 0, NULL, NULL);
++	if (!_mpio_cache)
+ 		return -ENOMEM;
+ 
+ 	r = dm_register_target(&multipath_target);
+ 	if (r < 0) {
+ 		DMERR("%s: register failed %d", multipath_target.name, r);
+-		kmem_cache_destroy(_details_cache);
++		kmem_cache_destroy(_mpio_cache);
+ 		return -EINVAL;
+ 	}
+ 
+ 	r = dm_register_path_selectors();
+ 	if (r && r != -EEXIST) {
+ 		dm_unregister_target(&multipath_target);
+-		kmem_cache_destroy(_details_cache);
++		kmem_cache_destroy(_mpio_cache);
+ 		return r;
+ 	}
+ 
+@@ -689,7 +615,7 @@
+ 	return r;
+ }
+ 
+-void __exit dm_multipath_exit(void)
++static void __exit dm_multipath_exit(void)
+ {
+ 	int r;
+ 
+@@ -698,7 +624,7 @@
+ 	if (r < 0)
+ 		DMERR("%s: target unregister failed %d",
+ 		      multipath_target.name, r);
+-	kmem_cache_destroy(_details_cache);
++	kmem_cache_destroy(_mpio_cache);
+ }
+ 
+ module_init(dm_multipath_init);
+--- diff/drivers/md/dm-path-selector.c	2004-07-01 21:35:25.000000000 +0100
++++ source/drivers/md/dm-path-selector.c	2004-07-01 21:35:32.000000000 +0100
+@@ -141,9 +141,14 @@
+ /*-----------------------------------------------------------------
+  * Path handling code, paths are held in lists
+  *---------------------------------------------------------------*/
++
++/* FIXME: get rid of this */
++#define RR_FAIL_COUNT	1
++
+ struct path_info {
+ 	struct list_head list;
+ 	struct path *path;
++	unsigned fail_count;
+ };
+ 
+ static struct path_info *path_lookup(struct list_head *head, struct path *p)
+@@ -160,9 +165,15 @@
+ /*-----------------------------------------------------------------
+  * Round robin selector
+  *---------------------------------------------------------------*/
++
++#define RR_MIN_IO		1000
++
+ struct selector {
+ 	spinlock_t lock;
+ 
++	struct path_info *current_path;
++	unsigned current_count;
++
+ 	struct list_head valid_paths;
+ 	struct list_head invalid_paths;
+ };
+@@ -172,6 +183,7 @@
+ 	struct selector *s = kmalloc(sizeof(*s), GFP_KERNEL);
+ 
+ 	if (s) {
++		memset(s, 0, sizeof(*s));
+ 		INIT_LIST_HEAD(&s->valid_paths);
+ 		INIT_LIST_HEAD(&s->invalid_paths);
+ 		s->lock = SPIN_LOCK_UNLOCKED;
+@@ -232,6 +244,7 @@
+ 		return -ENOMEM;
+ 	}
+ 
++	pi->fail_count = 0;
+ 	pi->path = path;
+ 
+ 	spin_lock(&s->lock);
+@@ -241,44 +254,58 @@
+ 	return 0;
+ }
+ 
+-static void rr_fail_path(struct path_selector *ps, struct path *p)
++static int rr_end_io(struct path_selector *ps, struct bio *bio, int error,
++		     union map_info *info)
+ {
+ 	unsigned long flags;
+ 	struct selector *s = (struct selector *) ps->context;
+-	struct path_info *pi;
++	struct path_info *pi = (struct path_info *)info->ptr;
+ 
+-	/*
+-	 * This function will be called infrequently so we don't
+-	 * mind the expense of these searches.
+-	 */
+-	spin_lock_irqsave(&s->lock, flags);
+-	pi = path_lookup(&s->valid_paths, p);
+-	if (!pi)
+-		pi = path_lookup(&s->invalid_paths, p);
++	if (likely(!error))
++		return 0;
+ 
+-	if (!pi)
+-		DMWARN("asked to change the state of an unknown path");
++	spin_lock_irqsave(&s->lock, flags);
+ 
+-	else
++	if (++pi->fail_count == RR_FAIL_COUNT) {
+ 		list_move(&pi->list, &s->invalid_paths);
+ 
++		if (pi == s->current_path)
++			s->current_path = NULL;
++	}
++
+ 	spin_unlock_irqrestore(&s->lock, flags);
++
++	return -EIO;
+ }
+ 
+ /* Path selector */
+-static struct path *rr_select_path(struct path_selector *ps)
++static struct path *rr_select_path(struct path_selector *ps, struct bio *bio,
++				   union map_info *info)
+ {
+ 	unsigned long flags;
+ 	struct selector *s = (struct selector *) ps->context;
+ 	struct path_info *pi = NULL;
+ 
+ 	spin_lock_irqsave(&s->lock, flags);
++
++	/* Do we need to select a new path? */
++	if (s->current_path && s->current_count-- > 0) {
++		pi = s->current_path;
++		goto done;
++	}
++
+ 	if (!list_empty(&s->valid_paths)) {
+ 		pi = list_entry(s->valid_paths.next, struct path_info, list);
+ 		list_move_tail(&pi->list, &s->valid_paths);
++
++		s->current_path = pi;
++		s->current_count = RR_MIN_IO;
+ 	}
++
++ done:
+ 	spin_unlock_irqrestore(&s->lock, flags);
+ 
++	info->ptr = pi;
+ 	return pi ? pi->path : NULL;
+ }
+ 
+@@ -286,7 +313,34 @@
+ static int rr_status(struct path_selector *ps, struct path *path,
+ 		     status_type_t type, char *result, unsigned int maxlen)
+ {
+-	return 0;
++	unsigned long flags;
++	struct path_info *pi;
++	int failed = 0;
++	struct selector *s = (struct selector *) ps->context;
++	int sz = 0;
++
++	if (type == STATUSTYPE_TABLE)
++		return 0;
++
++	spin_lock_irqsave(&s->lock, flags);
++
++	/*
++	 * Is status called often for testing or something?
++	 * If so maybe a ps's info should be allocated w/ path
++	 * so a simple container_of can be used.
++	 */
++	pi = path_lookup(&s->valid_paths, path);
++	if (!pi) {
++		failed = 1;
++		pi = path_lookup(&s->invalid_paths, path);
++	}
++
++	sz = scnprintf(result, maxlen, "%s %u ", failed ? "F" : "A",
++		       pi->fail_count);
++
++	spin_unlock_irqrestore(&s->lock, flags);
++
++	return sz;
+ }
+ 
+ static struct path_selector_type rr_ps = {
+@@ -297,7 +351,7 @@
+ 	.ctr = rr_ctr,
+ 	.dtr = rr_dtr,
+ 	.add_path = rr_add_path,
+-	.fail_path = rr_fail_path,
++	.end_io = rr_end_io,
+ 	.select_path = rr_select_path,
+ 	.status = rr_status,
+ };
+--- diff/drivers/md/dm-path-selector.h	2004-07-01 21:35:25.000000000 +0100
++++ source/drivers/md/dm-path-selector.h	2004-07-01 21:35:32.000000000 +0100
+@@ -49,13 +49,11 @@
+  * reused or reallocated because an endio call (which needs to free it)
+  * might happen after a couple of select calls.
+  */
+-typedef	struct path *(*ps_select_path_fn) (struct path_selector *ps);
+-
+-/*
+- * Notify the selector that a path has failed.
+- */
+-typedef	void (*ps_fail_path_fn) (struct path_selector *ps,
+-				 struct path *p);
++typedef	struct path *(*ps_select_path_fn) (struct path_selector *ps,
++					   struct bio *bio,
++					   union map_info *info);
++typedef int (*ps_end_io) (struct path_selector *ps, struct bio *bio,
++			  int error, union map_info *info);
+ 
+ /*
+  * Table content based on parameters added in ps_add_path_fn
+@@ -77,8 +75,8 @@
+ 	ps_dtr_fn dtr;
+ 
+ 	ps_add_path_fn add_path;
+-	ps_fail_path_fn fail_path;
+ 	ps_select_path_fn select_path;
++	ps_end_io end_io;
+ 	ps_status_fn status;
+ };
+ 
