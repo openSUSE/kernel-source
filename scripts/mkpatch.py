@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright (C) 2004 Andrea Arcangeli <andrea@suse.de> SUSE
-# $Id$
+# $Id: mkpatch.py,v 1.7 2004/11/24 04:17:16 andrea Exp $
 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -49,7 +49,7 @@ TAGS = (
 	'From',
 	'Subject',
 	'Patch-mainline',
-	'SUSE-Bugzilla',
+	'Suse-bugzilla',
 	)
 
 DIFF_CMD = 'diff -urNp --exclude CVS --exclude BitKeeper --exclude {arch} --exclude .arch-ids --exclude .svn'
