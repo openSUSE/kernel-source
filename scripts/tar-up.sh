@@ -16,13 +16,12 @@ source $(dirname $0)/config.sh
 export LANG=POSIX
 SRC_FILE=linux-$VERSION.tar.bz2
 
-if [ -e scripts/check-conf ]; then
-    scripts/check-conf || {
-	echo "Inconsistencies found."
-	echo "Please clean up series.conf and/or the patches directories!"
-	echo "Press <ENTER> to continue"
-	read
-    }
+if ! scripts/check-conf || \
+   ! scripts/check-cvs-add; then
+    echo "Inconsistencies found."
+    echo "Please clean up series.conf and/or the patches directories!"
+    echo "Press <ENTER> to continue"
+    read
 fi
 
 rm -rf $BUILD_DIR
