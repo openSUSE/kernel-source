@@ -353,3 +353,17 @@ for config in $CONFIGS; do
     cp -f $TMPFILE $PATCH_DIR/$path
 done
 rm -f $TMPFILE
+
+status=
+KERNELRELEASE=$(make -s -C $PATCH_DIR kernelrelease 2> /dev/null)
+if [ "${KERNELRELEASE#$VERSION}" = "$KERNELRELEASE" ]; then
+    echo >&2
+    echo "Please update VERSION in scripts/config.sh" >&2
+    status=1
+fi
+if [ "${KERNELRELEASE%$EXTRAVERSION}" = "$KERNELRELEASE" ]; then
+    echo >&2
+    echo "Please update EXTRAVERSION in scripts/config.sh" >&2
+    status=1
+fi
+exit $status
