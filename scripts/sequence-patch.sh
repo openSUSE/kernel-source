@@ -38,12 +38,12 @@ while [ $# -gt 0 ]; do
 	    CLEAN=
 	    ;;
 	-d)
-		shift
-		SCRATCH_AREA=$1 
-		;;
+	    shift
+	    SCRATCH_AREA=$1 
+	    ;;
 	--dir=*)
-		SCRATCH_AREA=${1#--dir=}
-		;;
+	    SCRATCH_AREA=${1#--dir=}
+	    ;;
 	-|[^-]*)
 	    [ -n "$LIMIT" ] && break
 	    LIMIT=$1
@@ -59,8 +59,11 @@ if [ $# -gt 0 ]; then
     exit 1
 fi
 case $SCRATCH_AREA in
-	/*) ;; 
-	*)  SCRATCH_AREA=$(pwd)/$SCRATCH_AREA ;;
+    /*)
+	;; 
+    *)
+	SCRATCH_AREA=$(pwd)/$SCRATCH_AREA
+	;;
 esac
 
 # Some patches require patch 2.5.4. Abort with older versions.
@@ -340,24 +343,24 @@ TMPFILE=$(mktemp /tmp/$(basename $0).XXXXXX)
 chmod a+r $TMPFILE
 CONFIGS=$(scripts/guards --list < config.conf)
 for config in $CONFIGS; do
-	if ! [ -e config/$config ]; then
-		echo "Configuration file config/$config not found"
-	fi
-	name=$(basename $config)
-	path=arch/$(dirname $config)/defconfig.$name
-	mkdir -p $(dirname $PATCH_DIR/$path)
+    if ! [ -e config/$config ]; then
+	echo "Configuration file config/$config not found"
+    fi
+    name=$(basename $config)
+    path=arch/$(dirname $config)/defconfig.$name
+    mkdir -p $(dirname $PATCH_DIR/$path)
 
-	chmod +x rpm/config-subst
-	cat config/$config \
-	| rpm/config-subst CONFIG_CFGNAME \"$name\" \
-	| rpm/config-subst CONFIG_RELEASE \"0\" \
-	| rpm/config-subst CONFIG_SUSE_KERNEL y \
-	> $TMPFILE
+    chmod +x rpm/config-subst
+    cat config/$config \
+    | rpm/config-subst CONFIG_CFGNAME \"$name\" \
+    | rpm/config-subst CONFIG_RELEASE \"0\" \
+    | rpm/config-subst CONFIG_SUSE_KERNEL y \
+    > $TMPFILE
 
-	echo $path >> $PATCH_LOG
-	[ -z "$QUIET" ] && echo $path
-	# Make sure we don't override a hard-linked file.
-	rm -f $PATCH_DIR/$path
-	cp -f $TMPFILE $PATCH_DIR/$path
+    echo $path >> $PATCH_LOG
+    [ -z "$QUIET" ] && echo $path
+    # Make sure we don't override a hard-linked file.
+    rm -f $PATCH_DIR/$path
+    cp -f $TMPFILE $PATCH_DIR/$path
 done
 rm -f $TMPFILE
