@@ -90,7 +90,7 @@ for config in ${configs[@]} $um_config; do
 	  -e "s:@CFGNAME@:$cfgname:g" \
 	  -e "s:@VERSION@:$VERSION:g" \
     | m4 > $BUILD_DIR/kernel-$cfgname-26.spec
-    cat kernel-source-26.changes kernel-binary-26.changes \
+    cat kernel-source-26.changes rpm/kernel-binary-26.changes \
 	> $BUILD_DIR/kernel-$cfgname-26.changes
 done
 
@@ -116,6 +116,7 @@ cat rpm/kernel-source-26.spec.in \
       -e "s:@CFGNAMES@::g" \
       -e "s:@VERSION@:$VERSION:g" \
 | m4 > $BUILD_DIR/kernel-bare-26.spec
+cp kernel-source-26.changes $BUILD_DIR/kernel-bare-26.changes
 
 for d in config patches.*; do
     # Skip non-directories. Also work around CVS problem: Directories can't
