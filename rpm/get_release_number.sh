@@ -1,3 +1,3 @@
 #! /bin/sh
 
-echo "pkg:kernel-source"
+echo "pkg:kernel-syms"
