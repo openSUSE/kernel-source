@@ -8,4 +8,4 @@ else
 fi
 
 VERSION=2.6.1
-BUILD_DIR=kernel-source-26
+BUILD_DIR=kernel-source

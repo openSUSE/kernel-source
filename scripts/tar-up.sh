@@ -43,7 +43,7 @@ if [ -r $LINUX_ORIG_TARBALL ]; then
 fi
 
 #echo "Copying various files..."
-cp -pv	kernel-source-26.changes \
+cp -pv	kernel-source.changes \
 	series.conf config.conf scripts/merge-headers \
 	scripts/check-for-config-changes \
 	rpm/config-subst rpm/running-kernel.init.in \
@@ -62,7 +62,7 @@ config_files="$(
 cfgnames="$(echo "$config_files" | sed -e 's:.*/::' | sort -u)"
 
 for cfgname in $cfgnames ; do
-    echo "kernel-$cfgname-26.spec"
+    echo "kernel-$cfgname.spec"
 
     set -- $(
 	echo "$config_files" \
@@ -72,34 +72,33 @@ for cfgname in $cfgnames ; do
 	| sort -u)
     archs="$*"
     
-    sed -e "s:@NAME@:kernel-$cfgname-26:g" \
+    sed -e "s:@NAME@:kernel-$cfgname:g" \
 	-e "s:@CFGNAME@:$cfgname:g" \
 	-e "s:@VERSION@:$VERSION:g" \
 	-e "s:@ARCHS@:$archs:g" \
-      < rpm/kernel-binary-26.spec.in \
-    > $BUILD_DIR/kernel-$cfgname-26.spec
-    cat kernel-source-26.changes rpm/kernel-binary-26.changes \
-      > $BUILD_DIR/kernel-$cfgname-26.changes
+      < rpm/kernel-binary.spec.in \
+    > $BUILD_DIR/kernel-$cfgname.spec
+    cp kernel-source.changes $BUILD_DIR/kernel-$cfgname.changes
 done
 
 # The pre-configured kernel source package
-echo "kernel-source-26.spec"
-sed -e "s:@NAME@:kernel-source-26:g" \
+echo "kernel-source.spec"
+sed -e "s:@NAME@:kernel-source:g" \
     -e "s:@VERSION@:$VERSION:g" \
     -e "s:@PRECONF@:1:g" \
-  < rpm/kernel-source-26.spec.in \
-> $BUILD_DIR/kernel-source-26.spec
+  < rpm/kernel-source.spec.in \
+> $BUILD_DIR/kernel-source.spec
 
 # The unconfigured kernel source package: Source for User Mode Linux, and
 # for any km_* packages that absolutely think they need kernel sources
 # installed.
-echo "kernel-bare-26.spec"
-sed -e "s:@NAME@:kernel-bare-26:g" \
+echo "kernel-bare.spec"
+sed -e "s:@NAME@:kernel-bare:g" \
     -e "s:@VERSION@:$VERSION:g" \
     -e "s:@PRECONF@:0:g" \
-  < rpm/kernel-source-26.spec.in \
-> $BUILD_DIR/kernel-bare-26.spec
-cp kernel-source-26.changes $BUILD_DIR/kernel-bare-26.changes
+  < rpm/kernel-source.spec.in \
+> $BUILD_DIR/kernel-bare.spec
+cp kernel-source.changes $BUILD_DIR/kernel-bare.changes
 
 if [ ! -r $LINUX_ORIG_TARBALL ]; then
   echo "Please add $SRC_FILE to $BUILD_DIR"
