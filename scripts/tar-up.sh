@@ -50,6 +50,12 @@ flavors="$(echo "$config_files" | sed -e 's,.*/,,' | sort -u)"
 for flavor in $flavors ; do
     echo "kernel-$flavor.spec"
 
+    extra_needs=
+    case $flavor in
+	um)
+	    extra_needs=x-devel-packages ;;
+    esac
+
     # Find all architectures for this spec file
     set -- $(
 	echo "$config_files" \
@@ -103,6 +109,7 @@ for flavor in $flavors ; do
 	-e "s,@VERSION@,$VERSION,g" \
 	-e "s,@ARCHS@,$archs,g" \
 	-e "s,@PROVIDES_OBSOLETES@,${prov_obs//$'\n'/\\n},g" \
+	-e "s,@EXTRA_NEEDS@,$extra_needs,g" \
       < rpm/kernel-binary.spec.in \
     > $BUILD_DIR/kernel-$flavor.spec
     cp kernel-source.changes $BUILD_DIR/kernel-$flavor.changes
