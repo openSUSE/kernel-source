@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright (C) 2004 Andrea Arcangeli <andrea@suse.de> SUSE
-# $Id: mkpatch.py,v 1.7 2004/11/24 04:17:16 andrea Exp $
+# $Id: mkpatch.py,v 1.9 2004/11/25 02:43:07 andrea Exp $
 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -302,7 +302,7 @@ def mkpatch(*args):
 		raise 'EINVAL'
 	elif nr_args == 0:
 		olddir = None
-		newdir = os.getcwd()
+		newdir = '.'
 		patchfile = None
 	elif nr_args == 1:
 		olddir = None
