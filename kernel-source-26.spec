@@ -302,7 +302,9 @@ touch $RPM_BUILD_ROOT/var/adm/running-kernel.h \
       $RPM_BUILD_ROOT/var/adm/running-kernel.make
 
 %post
+%if 0
 #%{fillup_and_insserv -f running-kernel}  ## doesn't work: ???
+%endif
 /sbin/insserv running-kernel
 
 if [ -e /.buildenv ]; then
@@ -313,7 +315,7 @@ if [ -e /.buildenv ]; then
 	case $ARCH in
 	(i?86)
 	    ARCH=i386 ;;
-	s390x)
+	(s390x)
 	    ARCH=s390 ;;
 	esac
 
