@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright (C) 2004 Andrea Arcangeli <andrea@suse.de> SUSE
-# $Id: mkpatch.py,v 1.16 2004/12/04 00:00:54 andrea Exp $
+# $Id: mkpatch.py,v 1.17 2004/12/04 04:22:09 andrea Exp $
 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -115,7 +115,10 @@ class tag_class(object):
 class patch_class(object):
 	def __init__(self, patchfile, signoff_mode):
 		self.patchfile = patchfile
-		self.message = Message(file(patchfile))
+		try:
+			self.message = Message(file(patchfile))
+		except IOError:
+			self.message = None
 		self.signoff_mode = signoff_mode
 		self.prepare()
 		self.read()
@@ -163,10 +166,11 @@ class patch_class(object):
 				self.signoff_order.append(this_signoff)
 			return
 
-		for tag in self.tags:
-			ret = tag.parse(line, self.message)
-			if ret:
-				return ret
+		if self.message:
+			for tag in self.tags:
+				ret = tag.parse(line, self.message)
+				if ret:
+					return ret
 
 	def read(self):
 		self.metadata = ''
