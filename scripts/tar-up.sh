@@ -51,16 +51,24 @@ sed -e "s:@NAME@:kernel-source:g" \
   < rpm/kernel-source.spec.in \
 > $BUILD_DIR/kernel-source.spec
 
-# The unconfigured kernel source package: Source for User Mode Linux, and
-# for any km_* packages that absolutely think they need kernel sources
-# installed.
-echo "kernel-bare.spec"
-sed -e "s:@NAME@:kernel-bare:g" \
+## The unconfigured kernel source package: Source for User Mode Linux, and
+## for any km_* packages that absolutely think they need kernel sources
+## installed.
+#echo "kernel-bare.spec"
+#sed -e "s:@NAME@:kernel-bare:g" \
+#    -e "s:@VERSION@:$VERSION:g" \
+#    -e "s:@PRECONF@:0:g" \
+#  < rpm/kernel-source.spec.in \
+#> $BUILD_DIR/kernel-bare.spec
+#cp kernel-source.changes $BUILD_DIR/kernel-bare.changes
+
+echo "kernel-syms.spec"
+sed -e "s:@NAME@:kernel-syms:g" \
     -e "s:@VERSION@:$VERSION:g" \
-    -e "s:@PRECONF@:0:g" \
-  < rpm/kernel-source.spec.in \
-> $BUILD_DIR/kernel-bare.spec
-cp kernel-source.changes $BUILD_DIR/kernel-bare.changes
+    -e "s:@PRECONF@:1:g" \
+  < rpm/kernel-syms.spec.in \
+> $BUILD_DIR/kernel-syms.spec
+cp kernel-source.changes $BUILD_DIR/kernel-syms.changes
 
 echo "Copying various files..."
 install -m 644					\
