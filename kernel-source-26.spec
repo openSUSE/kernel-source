@@ -154,8 +154,6 @@ export RPM_TARGET=%_target_cpu
 case $RPM_TARGET in
 i?86)
     RPM_TARGET=i386 ;;
-s390*)
-    MAKE_ARGS="CROSS_COMPILE=$RPM_TARGET-linux-" ;;
 esac
 
 if [ "$RPM_TARGET" != "$HOSTTYPE" ]; then
@@ -176,8 +174,6 @@ export RPM_TARGET=%_target_cpu
 case $RPM_TARGET in
 i?86)
     RPM_TARGET=i386 ;;
-s390*)
-    MAKE_ARGS="CROSS_COMPILE=$RPM_TARGET-linux-" ;;
 esac
 
 if [ "$RPM_TARGET" != "$HOSTTYPE" ]; then
