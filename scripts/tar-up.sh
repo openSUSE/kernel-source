@@ -17,7 +17,7 @@ rm -rf $BUILD_DIR
 mkdir -p $BUILD_DIR
 
 echo "Computing timestamp..."
-scripts/cvs-wd-timestamp > $BUILD_DIR/timestamp
+scripts/cvs-wd-timestamp > $BUILD_DIR/build-source-timestamp
 
 # List all used configurations
 config_files="$(
@@ -92,7 +92,7 @@ done
 echo "kernel-source.spec"
 sed -e "s,@NAME@,kernel-source,g" \
     -e "s,@VERSION@,$VERSION,g" \
-    -e "s,@PRECONF@,1,g" \
+    -e "s,@PRECONF@,0,g" \
   < rpm/kernel-source.spec.in \
 > $BUILD_DIR/kernel-source.spec
 
