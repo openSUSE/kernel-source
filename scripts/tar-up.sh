@@ -16,6 +16,9 @@ fi
 rm -rf $BUILD_DIR
 mkdir -p $BUILD_DIR
 
+echo "Computing timestamp..."
+scripts/cvs-wd-timestamp > $BUILD_DIR/timestamp
+
 # List all used configurations
 config_files="$(
     for arch in $(scripts/arch-symbols --list) ; do
