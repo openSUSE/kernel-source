@@ -92,7 +92,7 @@ done
 echo "kernel-source.spec"
 sed -e "s,@NAME@,kernel-source,g" \
     -e "s,@VERSION@,$VERSION,g" \
-    -e "s,@PRECONF@,0,g" \
+    -e "s,@PRECONF@,1,g" \
   < rpm/kernel-source.spec.in \
 > $BUILD_DIR/kernel-source.spec
 
@@ -101,17 +101,6 @@ sed -e "s,@NAME@,kernel-dummy,g" \
     -e "s,@VERSION@,$VERSION,g" \
   < rpm/kernel-dummy.spec.in \
 > $BUILD_DIR/kernel-dummy.spec
-
-## The unconfigured kernel source package: Source for User Mode Linux, and
-## for any km_* packages that absolutely think they need kernel sources
-## installed.
-#echo "kernel-bare.spec"
-#sed -e "s,@NAME@,kernel-bare,g" \
-#    -e "s,@VERSION@,$VERSION,g" \
-#    -e "s,@PRECONF@,0,g" \
-#  < rpm/kernel-source.spec.in \
-#> $BUILD_DIR/kernel-bare.spec
-#cp kernel-source.changes $BUILD_DIR/kernel-bare.changes
 
 echo "kernel-syms.spec"
 sed -e "s,@NAME@,kernel-syms,g" \

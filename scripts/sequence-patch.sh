@@ -17,9 +17,6 @@ while [ $# -gt 0 ]; do
     	-v)
 	    unset QUIET
 	    ;;
-	#--quilt)
-	#    QUILT=1  # temporary hack ...
-	#    ;;
 	--arch=*)
 	    export PATCH_ARCH="${1#--arch=}"
 	    ;;
@@ -34,7 +31,7 @@ while [ $# -gt 0 ]; do
 	    EXTRA_SYMBOLS="$EXTRA_SYMBOLS $2"
 	    shift
 	    ;;
-	[^-]*)
+	-|[^-]*)
 	    [ -n "$LIMIT" ] && break
 	    LIMIT=$1
 	    ;;
@@ -169,6 +166,9 @@ PATCHES=$(scripts/guards $SYMBOLS < series.conf)
 # Check if patch $LIMIT exists
 if [ -n "$LIMIT" ]; then
     for PATCH in $PATCHES; do
+	if [ "$LIMIT" = - ]; then
+	    LIMIT=$PATCH
+	fi
 	case $PATCH in 
 	    $LIMIT|*/$LIMIT)
 		LIMIT=$PATCH
