@@ -37,9 +37,10 @@ if test "$YAST_IS_RUNNING" != instsys ; then
     fi
 fi
 
-# $1 is 1 in postinstall if this package is installed
-# for the first time and is >1 on update.
-if [ "$1" -gt 1 -a -x /sbin/new-kernel-pkg ]; then
+if [ "$YAST_IS_RUNNING" != instsys -a -x /sbin/new-kernel-pkg ]; then
     # Notify boot loader that a new kernel image has been installed.
+    # (during initial installation the boot loader configuration does not
+    #  yet exist when the kernel is installed, but yast kicks the boot
+    #  loader itself later.)
     /sbin/new-kernel-pkg %ver_str
 fi
