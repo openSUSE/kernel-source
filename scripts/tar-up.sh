@@ -18,7 +18,7 @@ mkdir -p $BUILD_DIR
 
 cp -pv README* kernel-source*.spec kernel-source*.changes \
 	series.conf config.conf scripts/config_subst.sh \
-	scripts/merge-headers scripts/running-kernel.init \
+	scripts/merge-headers scripts/running-kernel.init.in \
 	scripts/guards scripts/arch-symbols $BUILD_DIR
 
 [ -e skip-build ]    && cp -pv skip-build    $BUILD_DIR 
