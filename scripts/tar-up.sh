@@ -126,6 +126,12 @@ for flavor in $flavors ; do
 	-e "s,@EXTRA_NEEDS@,$extra_needs,g" \
       < rpm/kernel-binary.spec.in \
     > $BUILD_DIR/kernel-$flavor.spec
+    case $flavor in
+	(xen*)
+		# We don't compete with a normal kernel
+		sed -i 's/^Provides: *kernel/Provides: xenkernel/' $BUILD_DIR/kernel-$flavor.spec
+ 	;;
+    esac
     cp kernel-source.changes $BUILD_DIR/kernel-$flavor.changes
 done
 

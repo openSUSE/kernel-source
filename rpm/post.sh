@@ -16,13 +16,26 @@ fi
 # a problem with the /boot/initrd symlink.
 
 # Update the /boot/vmlinuz and /boot/initrd symlinks
-for x in /boot/$image /boot/initrd; do
-    if [ -e $x -a "$(readlink $x)" != ${x##*/}-%ver_str ]; then
-	mv -f $x $x.previous
-    fi
-    rm -f $x
-    ln -s ${x##*/}-%ver_str $x
-done
+case %ver_str in
+    (*xen*)
+	# Remove bootsplash picture 
+	mv /boot/initrd-%ver_str /boot/initrd-%ver_str.gz
+	#echo "gunzipping /boot/initrd-%ver_str.gz"
+	gunzip -f /boot/initrd-%ver_str.gz
+	gzip -9f /boot/initrd-%ver_str
+	;;
+    (*um*)
+	# nothing to be done
+    	;;
+    (*)	
+	for x in /boot/$image /boot/initrd; do
+	    if [ -e $x -a "$(readlink $x)" != ${x##*/}-%ver_str ]; then
+		mv -f $x $x.previous
+	    fi
+	    rm -f $x
+	    ln -s ${x##*/}-%ver_str $x
+	done
+esac
 
 if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
     if [ -f /etc/fstab ]; then
@@ -35,6 +48,7 @@ if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
 	echo "please run mkinitrd as soon as your system is complete"
     fi
 
+    # TODO: Do we need to skip this as well for xen / UML ?
     if [ -x /sbin/new-kernel-pkg ]; then
 	# Notify boot loader that a new kernel image has been installed.
 	# (during initial installation the boot loader configuration does not
