@@ -19,7 +19,7 @@ Autoreqprov:  off
 Summary:      The Linux kernel (the core of the Linux operating system)
 Group:        Development/Sources
 Requires:     make c_compiler
-Version:      2.5.70
+Version:      2.5.72
 Release:      0
 Source0:      linux-%version.tar.bz2
 Source10:     series.conf
