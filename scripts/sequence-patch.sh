@@ -1,15 +1,14 @@
-#!/bin/bash
-# bash extension(s) used: "[[ string1 < string2 ]]"
+#!/bin/sh
 
-source `dirname $0`/config.sh
+source $(dirname $0)/config.sh
 
-PATCH_DIR="$SCRATCH_AREA/linux-$VERSION"
-PATCH_LOG="$SCRATCH_AREA/patch.log"
-LAST_LOG="$SCRATCH_AREA/last.log"
+PATCH_DIR=$SCRATCH_AREA/linux-$VERSION
+PATCH_LOG=$SCRATCH_AREA/patch-$VERSION.log
+LAST_LOG=$SCRATCH_AREA/last-$VERSION.log
 QUIET=1
 
 while [ $# -gt 0 ]; do
-    case "$1" in
+    case $1 in
     	(-q)
 	    QUIET=1
 	    ;;
@@ -18,7 +17,7 @@ while [ $# -gt 0 ]; do
 	    ;;
 	([^-]*)
 	    [ -n "$LIMIT" ] && break
-	    LIMIT="$1"
+	    LIMIT=$1
 	    ;;
 	(*)
 	    break
@@ -32,8 +31,8 @@ if [ $# -gt 0 ]; then
 fi
 
 # Some patches require patch 2.5.4. Abort with older versions.
-PATCH_VERSION="$(patch -v | sed -e '/^patch/!d' -e 's/patch //')"
-case "$PATCH_VERSION" in
+PATCH_VERSION=$(patch -v | sed -e '/^patch/!d' -e 's/patch //')
+case $PATCH_VERSION in
     ([01].*|2.[1-4].*|2.5.[1-3])  # (check if < 2.5.4)
 	echo "patch version $PATCH_VERSION found; " \
 	     "a version >= 2.5.4 required." >&2
@@ -121,7 +120,7 @@ if [ -z "$SYMBOLS" ]; then
 	    exit 1
 	fi
     fi
-    SYMBOLS="$($ARCH_SYMBOLS)"
+    SYMBOLS=$($ARCH_SYMBOLS)
     if [ -z "$SYMBOLS" ]; then
 	echo "Unsupported architecture \`$ARCH'" >&2
 	exit 1
@@ -140,9 +139,9 @@ PATCHES=$(scripts/guards $SYMBOLS < series.conf)
 # Check if patch $LIMIT exists
 if [ -n "$LIMIT" ]; then
     for PATCH in $PATCHES; do
-	case "$PATCH" in 
+	case $PATCH in 
 	    (*/$LIMIT)
-		LIMIT="$PATCH"
+		LIMIT=$PATCH
 		unset PATCH
 		break
 		;;
@@ -172,7 +171,7 @@ fi
 
 # Patch kernel
 for PATCH in $PATCHES; do
-    if [ "$PATCH" == "$LIMIT" ]; then
+    if [ "$PATCH" = "$LIMIT" ]; then
 	STEP_BY_STEP=1
 	echo "*** Stopping before $PATCH ***"
     fi
@@ -180,7 +179,7 @@ for PATCH in $PATCHES; do
 	while true; do
 	    echo -n "Continue (y/n/a)?"
 	    read YESNO
-	    case "$YESNO" in
+	    case $YESNO in
 		([yYjJsS])
 		    break
 		    ;;
