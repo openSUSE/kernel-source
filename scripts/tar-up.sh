@@ -145,7 +145,7 @@ install -m 755					\
 	scripts/guards				\
 	scripts/arch-symbols			\
 	rpm/install-configs			\
-	rpm/generate-build-kernel-modules	\
+	rpm/generate-Makefile.suse		\
 	$BUILD_DIR
 
 if [ -e extra-symbols ]; then
