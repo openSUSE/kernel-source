@@ -21,7 +21,7 @@ Summary:      The Linux kernel (the core of the Linux operating system)
 Group:        Development/Sources
 Requires:     make c_compiler
 PreReq:       %insserv_prereq
-Version:      2.6.0
+Version:      2.6.1
 Release:      0
 %define kversion %(echo %version | sed s/_/-/g)
 Source0:      http://www.kernel.org/pub/linux/kernel/v2.6/linux-%{kversion}.tar.bz2
