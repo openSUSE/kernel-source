@@ -1,45 +1,32 @@
 if [ -f /boot/vmlinuz-%ver_str ]; then
-    image_link=vmlinuz
+    image=vmlinuz
 elif [ -f /boot/image-%ver_str ]; then
-    image_link=image
+    image=image
 elif [ -f /boot/vmlinux-%ver_str ]; then
-    image_link=vmlinux
+    image=vmlinux
 else
     # nothing to do (UML kernels for example).
     exit 0
 fi
-image=$image_link-%ver_str
 
-# update /boot/vmlinuz symlink -- do that only if /boot/vmlinuz
-# isn't a real file to avoid removing old kernels where /boot/vmlinuz
-# isn't a symlink pointing to the real kernel yet.
-if [ -L /boot/$image_link -o ! -e /boot/$image_link ]; then
-	relink $image /boot/$image_link
-fi
-
-#if [ -e /etc/sysconfig/kernel ]; then
-#    update_rcfile_setting /etc/sysconfig/kernel INITRD_MODULES 2>&1
-#elif [ -e /etc/rc.config ]; then
-#    update_rcfile_setting /etc/rc.config INITRD_MODULES 2>&1
-#fi
+# update /boot/vmlinuz symlink
+relink $image-%ver_str /boot/$image
 
 touch /lib/modules/%ver_str/modules.dep
 
 if test "$YAST_IS_RUNNING" != instsys ; then
-	if [ -f /etc/fstab ]; then
-	    cd /boot
-	    /sbin/mkinitrd -k $image -i initrd-%ver_str
+    if [ -f /etc/fstab ]; then
+	cd /boot
+	/sbin/mkinitrd -k $image-%ver_str -i initrd-%ver_str
 
-	    if [ -L /boot/initrd -o ! -e /boot/initrd ]; then
-		if [ -e /boot/initrd-%ver_str ]; then
-		    relink initrd-%ver_str /boot/initrd
-		elif [ -L /boot/initrd ]; then
-		    rm -f /boot/initrd
-		fi
-	    fi
+	if [ -e /boot/initrd-%ver_str ]; then
+	    relink initrd-%ver_str /boot/initrd
 	else
-	    echo "please run mkinitrd as soon as your system is complete"
+	    rm -f /boot/initrd
 	fi
+    else
+	echo "please run mkinitrd as soon as your system is complete"
+    fi
 fi
 
 # $1 is 1 in postinstall if this package is installed
