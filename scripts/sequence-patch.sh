@@ -211,8 +211,6 @@ restore_files() {
     local backup_dir=$1 patch_dir=$2 file wd=$PWD
     local -a remove restore
  
-    set -x
-
     if [ -d $backup_dir ]; then
 	pushd $backup_dir > /dev/null
 	for file in $(find . -type f) ; do
@@ -231,8 +229,6 @@ restore_files() {
 	    && rm -f "${remove[@]}"
 	popd > /dev/null
     fi
-
-    set +x
 }
 
 echo -e "# Symbols: $SYMBOLS\n#" > $PATCH_DIR/series
