@@ -40,11 +40,9 @@ while [ $# -gt 0 ]; do
 	-d)
 		shift
 		SCRATCH_AREA=$1 
-		shift
 		;;
 	--dir=*)
 		SCRATCH_AREA=${1#--dir=}
-		shift
 		;;
 	-|[^-]*)
 	    [ -n "$LIMIT" ] && break
