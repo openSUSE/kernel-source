@@ -20,10 +20,10 @@ fi
 # update /boot/vmlinuz symlink
 relink $image-%ver_str /boot/$image
 
-touch /lib/modules/%ver_str/modules.dep
-
 if test "$YAST_IS_RUNNING" != instsys ; then
     if [ -f /etc/fstab ]; then
+	echo Setting up /lib/modules/%ver_str
+	/sbin/update-modules.dep -v %ver_str
 	cd /boot
 	/sbin/mkinitrd -k $image-%ver_str -i initrd-%ver_str
 
