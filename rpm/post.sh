@@ -1,4 +1,4 @@
-if [ ! -f "/boot/vmlinuz-%ver_str" ]; then
+if [ ! \( -f "/boot/vmlinuz-%ver_str" -o -f "/boot/vmlinux-%ver_str" \) ]; then
 	# nothing to do (UML kernels for example).
 	exit 0
 fi
