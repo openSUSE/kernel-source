@@ -1,12 +1,12 @@
-if ! [ -f /boot/vmlinuz-%ver_str -o -f /boot/vmlinux-%ver_str ]; then
-	# nothing to do (UML kernels for example).
-	exit 0
-fi
-
 if [ -f /boot/vmlinuz-%ver_str ]; then
     image_link=vmlinuz
-else
+elif [ -f /boot/image-%ver_str ]; then
+    image_link=image
+elif [ -f /boot/vmlinux-%ver_str ]; then
     image_link=vmlinux
+else
+    # nothing to do (UML kernels for example).
+    exit 0
 fi
 image=$image_link-%ver_str
 
