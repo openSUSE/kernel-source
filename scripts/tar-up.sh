@@ -42,15 +42,6 @@ for flavor in $flavors ; do
 	o=( $(scripts/guards $(scripts/arch-symbols $arch) $flavor o \
 		< rpm/old-packages.conf) )
 
-	[ $arch = i386 ] && arch="%ix86" && nl=$'\n'
-	if [ ${#p[@]} -o ${#p[@]} ]; then
-	    [ -n "$head" ] && head="${head}%else$nl"
-	    head="${head}%ifarch $arch$nl"
-	    [ -n "$p" ] && head="${head}Provides:     ${p[@]}$nl"
-	    [ -n "$o" ] && head="${head}Obsoletes:    ${o[@]}$nl"
-	    tail="%endif$nl$tail"
-	fi
-
 	# Do we have an override config file or an additional patch?
 	if [ -e $arch-$flavor.conf ]; then
 	    echo "Override config: $arch-$flavor.conf"
@@ -59,6 +50,15 @@ for flavor in $flavors ; do
 	if [ -e $arch-$flavor.diff ]; then
 	    echo "Extra patch: $arch-$flavor.diff"
 	    cp $arch-$flavor.diff $BUILD_DIR/
+	fi
+
+	[ $arch = i386 ] && arch="%ix86" && nl=$'\n'
+	if [ ${#p[@]} -o ${#p[@]} ]; then
+	    [ -n "$head" ] && head="${head}%else$nl"
+	    head="${head}%ifarch $arch$nl"
+	    [ -n "$p" ] && head="${head}Provides:     ${p[@]}$nl"
+	    [ -n "$o" ] && head="${head}Obsoletes:    ${o[@]}$nl"
+	    tail="%endif$nl$tail"
 	fi
     done
     prov_obs="$head${tail%$'\n'}"
