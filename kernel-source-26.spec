@@ -143,6 +143,7 @@ for config in $(%_sourcedir/guards $SYMBOLS < %_sourcedir/config.conf); do
 	< %_builddir/config/$config \
 	> $path
 done
+chmod +x arch/ia64/scripts/toolchain-flags
 
 
 %build
