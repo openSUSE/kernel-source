@@ -19,5 +19,5 @@ if [ -e /.buildenv ]; then
     echo %ver_str-$flavor > /.kernelversion
 fi
 
-/etc/rc.d/running-kernel start
+/etc/init.d/running-kernel start
 fi
