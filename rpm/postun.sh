@@ -2,7 +2,6 @@ rm -f /boot/initrd-%ver_str  # created in %post -- clean up.
 
 if [ "$(readlink /boot/vmlinuz)" = vmlinuz-%ver_str -o \
      "$(readlink /boot/vmlinux)" = vmlinux-%ver_str -o \
-     "$(readlink /boot/initrd)"  = initrd-%ver_str -o \
      "$(readlink /boot/image)"   = image-%ver_str ]; then
     # This may be the last kernel RPM on the system, or it may
     # be an update. In both of those cases the symlinks will
@@ -16,8 +15,8 @@ if [ "$(readlink /boot/vmlinuz)" = vmlinuz-%ver_str -o \
     for image in $(cd /boot ; ls -dt vmlinu[xz]-* image-*); do
 	initrd=initrd-${image#*-}
 	if [ -f /boot/$image -a -f /boot/$initrd ]; then
-	    relink $image /boot/image
-	    relink $initrd /boot/initrd
+	    relink $image /boot/${image%%-*}
+	    relink $initrd /boot/${initrd%%-*}
 	    break
 	fi
     done
