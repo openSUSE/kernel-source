@@ -30,7 +30,7 @@ if [ -f /etc/fstab ]; then
     /sbin/mkinitrd -k $image -i initrd-%ver_str
 
     if [ -L /boot/initrd -o ! -e /boot/initrd ]; then
-	if [ -e initrd-%ver_str ]; then
+	if [ -e /boot/initrd-%ver_str ]; then
 	    relink initrd-%ver_str /boot/initrd
 	elif [ -L /boot/initrd ]; then
 	    rm -f /boot/initrd
