@@ -240,7 +240,6 @@ echo 2 > $PATCH_DIR/.pc/.version
 
 # Patch kernel
 set -- $PATCHES
-set -- $1
 while [ $# -gt 0 ]; do
     PATCH="$1"
     if [ "$PATCH" = "$LIMIT" ]; then
