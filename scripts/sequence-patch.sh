@@ -57,6 +57,8 @@ if [ ! -d "$SCRATCH_AREA" ]; then
     fi
 fi
 
+echo "Creating tree in $PATCH_DIR"
+
 if [ ! -d $PATCH_DIR.orig ]; then
     # Check if linux-$VERSION.tar.gz is accessible.
     if [ -z "$LINUX_ORIG_TARBALL" ]; then
@@ -160,7 +162,7 @@ echo -e "# Symbols: $SYMBOLS\n#" > $SCRATCH_AREA/series
 
 # Create fresh $SCRATCH_AREA/linux-$VERSION.
 if [ -d $PATCH_DIR.orig ]; then
-    echo "Linking $PATCH_DIR.orig to $PATCH_DIR"
+    echo "Linking from $PATCH_DIR.orig"
     cp -rld $PATCH_DIR.orig $PATCH_DIR
 else
     echo "Extracting $LINUX_ORIG_TARBALL"
