@@ -8,6 +8,7 @@
 # Please submit bugfixes or comments via http://www.suse.de/feedback/
 #
 
+# norootforbuild
 # neededforbuild  modutils
 # usedforbuild    aaa_base acl attr bash bind-utils bison bzip2 coreutils cpio cpp cvs cyrus-sasl db devs diffutils e2fsprogs file filesystem fillup findutils flex gawk gdbm-devel glibc glibc-devel glibc-locale gpm grep groff gzip info insserv kbd less libacl libattr libgcc libstdc++ libxcrypt m4 make man mktemp modutils ncurses ncurses-devel net-tools netcfg openldap2-client openssl pam pam-devel pam-modules patch permissions popt ps rcs readline sed sendmail shadow strace syslogd sysvinit tar texinfo timezone unzip util-linux vim zlib zlib-devel autoconf automake binutils cracklib gcc gdbm gettext libtool perl rpm
 
@@ -23,7 +24,7 @@ PreReq:       %insserv_prereq
 Version:      2.6.0_test11
 Release:      0
 %define kversion %(echo %version | sed s/_/-/g)
-Source0:      linux-%{kversion}.tar.bz2
+Source0:      http://www.kernel.org/pub/linux/kernel/v2.6/linux-%{kversion}.tar.bz2
 Source10:     series.conf
 Source11:     arch-symbols
 Source12:     guards
@@ -41,6 +42,10 @@ Source105:    patches.suse.tar.bz2
 %define ver_str %{kversion}-%release
 BuildRoot:    %{_tmppath}/%{name}-%{version}-build
 Prefix:       /usr/src
+# do not waste space on the CDs and on the mirrors
+%ifarch ppc
+NoSource:     0
+%endif
 
 %description
 Linux Kernel sources with many fixes and improvements.
