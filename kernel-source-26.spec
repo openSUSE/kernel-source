@@ -33,6 +33,7 @@ Source102:    patches.drivers.tar.bz2
 Source103:    patches.rpmify.tar.bz2
 %define ver_str %version-%release
 BuildRoot:    %_tmppath/linux-%ver_str-build
+Prefix:       /usr/src/
 
 %description
 Linux Kernel sources with many Improvements and Fixes.
