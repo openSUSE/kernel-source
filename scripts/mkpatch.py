@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright (C) 2004 Andrea Arcangeli <andrea@suse.de> SUSE
-# $Id: mkpatch.py,v 1.11 2004/11/29 06:25:04 andrea Exp $
+# $Id: mkpatch.py,v 1.12 2004/12/01 01:35:11 andrea Exp $
 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -341,6 +341,7 @@ def mkpatch(*args):
 			print >>sys.stderr, 'none found.'
 
 		diff = ''
+		already_diffed = {}
 		for backup_f in files:
 			new_f = None
 			backup_f = backup_f[:-1]
@@ -350,10 +351,13 @@ def mkpatch(*args):
 				new_f = backup_f[:-4]
 			elif backup_f[-1:] == '~':
 				new_f = backup_f[:-1]
-			if not os.path.isfile(new_f):
-				continue
 
 			if new_f:
+				if not os.path.isfile(new_f):
+					continue
+				if new_f in already_diffed:
+					continue
+				already_diffed[new_f] = 0
 				print >>sys.stderr, 'Diffing %s...' % new_f,
 				this_diff = os.popen(DIFF_CMD + ' %s %s' % (backup_f, new_f) + ' 2>/dev/null').read()
 				diff += this_diff
