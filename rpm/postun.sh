@@ -39,5 +39,3 @@ case "$(readlink /boot/initrd.previous)" in
 initrd-%ver_str|$(readlink /boot/initrd))
     rm -f /boot/initrd.previous ;;
 esac
-# created in %post
-rm -f /boot/initrd-%ver_str
