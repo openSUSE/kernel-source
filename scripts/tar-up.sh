@@ -5,8 +5,8 @@ source `dirname $0`/config.sh
 
 SRC_FILE=linux-$VERSION.tar.bz2
 
-if [ -e scripts/check-patches ]; then
-    scripts/check-patches || {
+if [ -e scripts/check-config ]; then
+    scripts/check-config || {
 	echo "Inconsistencies found."
 	echo "Please clean up series.conf and/or the patches directories!"
 	read
