@@ -129,7 +129,7 @@ install -m 644					\
 	rpm/kernel-dummy.spec			\
 	$BUILD_DIR
 
-install m 644					\
+install -m 644					\
 	kernel-source.changes 			\
 	$BUILD_DIR/kernel-dummy.changes
 
