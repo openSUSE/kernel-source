@@ -185,11 +185,16 @@ for config in arch/$ARCH/defconfig.* ; do
 	| make %{?jobs:-j%jobs} oldconfig $MAKE_ARGS > /dev/null
 
     # Check for changes (and abort if there are any).
-    if ! diff -q <(sort $config) <(sort .config) > /dev/null ; then
-	echo "Configuration differences:"
+    differences="$(
 	diff -U0 <(sort $config) <(sort .config) \
 	| grep '^[-+][^-+]'
-	exit 1
+    )"
+    if [ -n "$differences" ]; then
+	echo "Configuration differences:"
+	echo "$differences"
+	if echo "$differences" | grep -q '^+' ; then
+	    exit 1
+	fi
     fi
 
     make include/linux/version.h $MAKE_ARGS
