@@ -139,6 +139,7 @@ install -m 644					\
 	kernel-source.changes			\
 	series.conf				\
 	config.conf				\
+	supported.conf				\
 	rpm/running-kernel.init.in		\
 	rpm/functions.sh			\
 	rpm/trigger-script.sh.in		\
@@ -156,6 +157,7 @@ install -m 755					\
 	rpm/config-subst 			\
 	rpm/get_release_number.sh		\
 	rpm/check-for-config-changes		\
+	rpm/check-supported-list		\
 	scripts/guards				\
 	scripts/arch-symbols			\
 	rpm/install-configs			\
