@@ -1,16 +1,31 @@
 #!/bin/bash
 set -x
 
+ARCH="*"
+until [ "$#" = "0" ] ; do
 case "$1" in
 	y|-y|--yes)
 	YES="yes '' | "
+	shift
+	;;
+	a|-a|--arch)
+	shift
+	if [ -d arch/$1 -a "$1" != "" ] ; then
+	ARCH=$1
+	shift
+	echo running make oldconfig only for arch $ARCH
+	else
+	echo "$1 is not a valid directory in arch/"
+	exit
+	fi
 	;;
 	*)
 	YES=""
+	shift
 	;;
 esac
-
-for i in arch/*/defconfig.*
+done
+for i in arch/$ARCH/defconfig.*
 do
 #
 A=${i#*/}
