@@ -8,5 +8,6 @@ else
 fi
 
 VERSION=2.6.11
+EXTRAVERSION=.1
 BUILD_DIR=kernel-source
 IGNORE_ARCHS=
