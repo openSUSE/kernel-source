@@ -1,7 +1,88 @@
-diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
---- linux-2.6.5/fs/aio.c	2004-04-04 05:37:06.000000000 +0200
-+++ linux-2.6.5.aio-retry/fs/aio.c	2004-04-04 23:29:13.000000000 +0200
-@@ -38,6 +38,9 @@
+
+From: Suparna Bhattacharya <suparna@in.ibm.com>
+
+Core retry infrastructure for AIO. 
+
+Allows an AIO request to be executed as a series of non-blocking
+iterations, where each iteration retries the remaining part of the
+request from where the last iteration left off, by reissuing the
+corresponding AIO fop routine with modified arguments representing
+the remaining I/O. The retries are "kicked" via the AIO waitqueue 
+callback aio_wake_function() which replaces the default wait 
+queue entry used for blocking waits.
+
+The high level retry infrastructure is responsible for running the 
+iterations in the mm context (address space) of the caller, and 
+ensures that only one retry instance is active at a given time, 
+thus relieving the fops themselves from having to deal with potential 
+races of that sort.
+
+Follow on fixes:
+
+DESC
+Fix aio process hang on EINVAL
+EDESC
+From: Daniel McNeil <daniel@osdl.org>
+
+Here is a patch to fix EINVAL handling in io_submit_one() that was causing
+a process hang when attempting AIO to a device not able to handle aio.  I
+hit this doing a AIO read from /dev/zero.  The process would hang on exit
+in wait_for_all_aios().  The fix is to check for EINVAL coming back from
+aio_setup_iocb() in addition to the EFAULT and EBADF already there.  This
+causes the io_submit to fail with EINVAL.  That check looks error prone. 
+Are there other error return values where it should jump to the
+aio_put_req()?  Should the check be:
+
+	if (ret != 0 && ret != -EIOCBQUEUED)
+		goto out_put_req;
+
+
+DESC
+AIO: flush workqueues before destroying ioctx'es
+EDESC
+From: Suparna Bhattacharya <suparna@in.ibm.com>
+
+Flush out the workqueue before destroying the ioctx which may be sitting on
+it.
+DESC
+AIO: hold the context lock across unuse_mm
+EDESC
+
+Hold the context lock across unuse_mm
+DESC
+task task_lock in use_mm()
+EDESC
+From: Suparna Bhattacharya <suparna@in.ibm.com>
+
+Another patch based on a suggestion from Ben.  use_mm wasn't acquiring the
+task_lock - its possible this might be causing a race with procps.
+
+DESC
+Allow fops to override the retry method with their own
+EDESC
+From: Suparna Bhattacharya <suparna@in.ibm.com>
+
+David Brownell <david-b@pacbell.net> has a patch to implement AIO
+support for gadgetfs which specified its own ->retry() method to
+perform the copy_to_user from the AIO workqueue after I/O completion.
+To enable that to work correctly, with our retry code, we should
+drop the lines that nullify and reinstate the ->ki_retry() field 
+in aio_run_iocb. 
+
+
+ fs/aio.c                  |  576 ++++++++++++++++++++++++++++++++++++++-------- include/linux/aio.h       |   25 +
+ include/linux/errno.h     |    1 
+ include/linux/init_task.h |    1 
+ include/linux/sched.h     |    8 
+ include/linux/wait.h      |    9 
+ kernel/fork.c             |   15 +
+ 7 files changed, 543 insertions(+), 92 deletions(-)
+
+Index: linux.t/fs/aio.c
+===================================================================
+--- linux.t.orig/fs/aio.c	2004-08-13 09:27:11.077985464 -0400
++++ linux.t/fs/aio.c	2004-08-13 10:04:27.026069688 -0400
+@@ -39,6 +39,9 @@
  #define dprintk(x...)	do { ; } while (0)
  #endif
  
@@ -11,7 +92,7 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
  /*------ sysctl variables----*/
  atomic_t aio_nr = ATOMIC_INIT(0);	/* current system wide number of aio requests */
  unsigned aio_max_nr = 0x10000;	/* system wide maximum number of aio requests */
-@@ -281,6 +284,7 @@ static void aio_cancel_all(struct kioctx
+@@ -277,6 +280,7 @@ static void aio_cancel_all(struct kioctx
  		struct kiocb *iocb = list_kiocb(pos);
  		list_del_init(&iocb->ki_list);
  		cancel = iocb->ki_cancel;
@@ -19,7 +100,7 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
  		if (cancel) {
  			iocb->ki_users++;
  			spin_unlock_irq(&ctx->ctx_lock);
-@@ -341,6 +345,11 @@ void fastcall exit_aio(struct mm_struct 
+@@ -337,6 +341,11 @@ void fastcall exit_aio(struct mm_struct 
  		aio_cancel_all(ctx);
  
  		wait_for_all_aios(ctx);
@@ -31,42 +112,44 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
  
  		if (1 != atomic_read(&ctx->users))
  			printk(KERN_DEBUG
-@@ -400,6 +409,7 @@ static struct kiocb fastcall *__aio_get_
- 	req->ki_cancel = NULL;
- 	req->ki_retry = NULL;
- 	req->ki_user_obj = NULL;
+@@ -398,6 +407,7 @@ static struct kiocb fastcall *__aio_get_
+ 	req->ki_obj.user = NULL;
+ 	req->ki_dtor = NULL;
+ 	req->private = NULL;
 +	INIT_LIST_HEAD(&req->ki_run_list);
  
  	/* Check if the completion queue has enough free space to
  	 * accept an event from this io.
-@@ -541,65 +551,301 @@ struct kioctx *lookup_ioctx(unsigned lon
+@@ -543,85 +553,313 @@ struct kioctx *lookup_ioctx(unsigned lon
  	return ioctx;
  }
  
 +/*
 + * use_mm
-+ * 	Makes the calling kernel thread take on the specified
-+ * 	mm context.
-+ * 	Called by the retry thread execute retries within the
-+ * 	iocb issuer's mm context, so that copy_from/to_user
-+ * 	operations work seamlessly for aio.
-+ * 	(Note: this routine is intended to be called only
-+ * 	from a kernel thread context)
++ *	Makes the calling kernel thread take on the specified
++ *	mm context.
++ *	Called by the retry thread execute retries within the
++ *	iocb issuer's mm context, so that copy_from/to_user
++ *	operations work seamlessly for aio.
++ *	(Note: this routine is intended to be called only
++ *	from a kernel thread context)
 + */
  static void use_mm(struct mm_struct *mm)
  {
--	struct mm_struct *active_mm = current->active_mm;
-+	struct mm_struct *active_mm;
+ 	struct mm_struct *active_mm;
 +	struct task_struct *tsk = current;
-+
+ 
 +	task_lock(tsk);
 +	active_mm = tsk->active_mm;
  	atomic_inc(&mm->mm_count);
+-	task_lock(current);
+-	active_mm = current->active_mm;
 -	current->mm = mm;
 -	if (mm != active_mm) {
 -		current->active_mm = mm;
 -		activate_mm(active_mm, mm);
 -	}
+-	task_unlock(current);
 +	tsk->mm = mm;
 +	tsk->active_mm = mm;
 +	activate_mm(active_mm, mm);
@@ -78,18 +161,20 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 -static void unuse_mm(struct mm_struct *mm)
 +/*
 + * unuse_mm
-+ * 	Reverses the effect of use_mm, i.e. releases the
-+ * 	specified mm context which was earlier taken on
-+ * 	by the calling kernel thread
-+ * 	(Note: this routine is intended to be called only
-+ * 	from a kernel thread context)
++ *	Reverses the effect of use_mm, i.e. releases the
++ *	specified mm context which was earlier taken on
++ *	by the calling kernel thread
++ *	(Note: this routine is intended to be called only
++ *	from a kernel thread context)
 + *
 + * Comments: Called with ctx->ctx_lock held. This nests
 + * task_lock instead ctx_lock.
 + */
 +void unuse_mm(struct mm_struct *mm)
  {
+-	task_lock(current);
 -	current->mm = NULL;
+-	task_unlock(current);
 +	struct task_struct *tsk = current;
 +
 +	task_lock(tsk);
@@ -118,7 +203,7 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 +static inline int __queue_kicked_iocb(struct kiocb *iocb)
  {
 -	struct kioctx *ctx = data;
-+	struct kioctx	*ctx = iocb->ki_ctx;
++	struct kioctx *ctx = iocb->ki_ctx;
  
 -	use_mm(ctx->mm);
 +	if (list_empty(&iocb->ki_run_list)) {
@@ -129,18 +214,14 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 +	}
 +	return 0;
 +}
- 
--	spin_lock_irq(&ctx->ctx_lock);
--	while (!list_empty(&ctx->run_list)) {
--		struct kiocb *iocb;
--		long ret;
++
 +/* aio_run_iocb
-+ * 	 This is the core aio execution routine. It is
-+ * 	 invoked both for initial i/o submission and
-+ * 	 subsequent retries via the aio_kick_handler.
-+ *       Expects to be invoked with iocb->ki_ctx->lock
-+ *       already held. The lock is released and reaquired
-+ *       as needed during processing.
++ *	This is the core aio execution routine. It is
++ *	invoked both for initial i/o submission and
++ *	subsequent retries via the aio_kick_handler.
++ *	Expects to be invoked with iocb->ki_ctx->lock
++ *	already held. The lock is released and reaquired
++ *	as needed during processing.
 + *
 + * Calls the iocb retry method (already setup for the
 + * iocb on initial submission) for operation specific
@@ -161,12 +242,7 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 +	struct kioctx	*ctx = iocb->ki_ctx;
 +	ssize_t (*retry)(struct kiocb *);
 +	ssize_t ret;
- 
--		iocb = list_entry(ctx->run_list.next, struct kiocb,
--				  ki_run_list);
--		list_del(&iocb->ki_run_list);
--		iocb->ki_users ++;
--		spin_unlock_irq(&ctx->ctx_lock);
++ 
 +	if (iocb->ki_retried++ > 1024*1024) {
 +		printk("Maximal retry count.  Bytes done %Zd\n",
 +			iocb->ki_nbytes - iocb->ki_left);
@@ -179,14 +255,12 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 +			iocb->ki_nbytes - iocb->ki_left, iocb->ki_nbytes,
 +			iocb->ki_kicked, iocb->ki_queued, aio_run, aio_wakeups);
 +	}
-+
+ 
 +	if (!(retry = iocb->ki_retry)) {
 +		printk("aio_run_iocb: iocb->ki_retry = NULL\n");
 +		return 0;
 +	}
- 
--		kiocbClearKicked(iocb);
--		ret = iocb->ki_retry(iocb);
++ 
 +	/*
 +	 * We don't want the next retry iteration for this
 +	 * operation to start until this one has returned and
@@ -241,12 +315,11 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 +	current->io_wait = NULL;
 +
 +	if (-EIOCBRETRY != ret) {
- 		if (-EIOCBQUEUED != ret) {
++ 		if (-EIOCBQUEUED != ret) {
 +			BUG_ON(!list_empty(&iocb->ki_wait.task_list));
- 			aio_complete(iocb, ret, 0);
--			iocb = NULL;
++			aio_complete(iocb, ret, 0);
 +			/* must not access the iocb after this */
- 		}
++		}
 +	} else {
 +		/*
 +		 * Issue an additional retry to avoid waiting forever if
@@ -256,11 +329,11 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 +			kiocbSetKicked(iocb);
 +	}
 +out:
-+	spin_lock_irq(&ctx->ctx_lock);
- 
--		spin_lock_irq(&ctx->ctx_lock);
--		if (NULL != iocb)
--			__aio_put_req(ctx, iocb);
+ 	spin_lock_irq(&ctx->ctx_lock);
+-	while (!list_empty(&ctx->run_list)) {
+-		struct kiocb *iocb;
+-		long ret;
++ 
 +	if (-EIOCBRETRY == ret) {
 +		/*
 +		 * OK, now that we are done with this iteration
@@ -292,17 +365,26 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 +	struct kiocb *iocb;
 +	ssize_t ret;
 +	int count = 0;
-+
+ 
 +	while (!list_empty(&ctx->run_list)) {
-+		iocb = list_entry(ctx->run_list.next, struct kiocb,
+ 		iocb = list_entry(ctx->run_list.next, struct kiocb,
+-				  ki_run_list);
 +			ki_run_list);
-+		list_del(&iocb->ki_run_list);
+ 		list_del(&iocb->ki_run_list);
+-		iocb->ki_users ++;
+-		spin_unlock_irq(&ctx->ctx_lock);
 +		ret = aio_run_iocb(iocb);
 +		count++;
- 	}
++ 	}
 +	aio_run++;
 +}
-+
+ 
+-		kiocbClearKicked(iocb);
+-		ret = iocb->ki_retry(iocb);
+-		if (-EIOCBQUEUED != ret) {
+-			aio_complete(iocb, ret, 0);
+-			iocb = NULL;
+-		}
 +/*
 + * aio_run_iocbs:
 + * 	Process all pending retries queued on the ioctx
@@ -314,9 +396,9 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 +{
 +	spin_lock_irq(&ctx->ctx_lock);
 +	__aio_run_iocbs(ctx);
- 	spin_unlock_irq(&ctx->ctx_lock);
++ 	spin_unlock_irq(&ctx->ctx_lock);
 +}
- 
++ 
 +/*
 + * aio_kick_handler:
 + * 	Work queue handler triggered to process pending
@@ -327,24 +409,28 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 +static void aio_kick_handler(void *data)
 +{
 +	struct kioctx *ctx = data;
-+
+ 
+-		spin_lock_irq(&ctx->ctx_lock);
+-		if (NULL != iocb)
+-			__aio_put_req(ctx, iocb);
+-	}
 +	use_mm(ctx->mm);
 +	spin_lock_irq(&ctx->ctx_lock);
 +	__aio_run_iocbs(ctx);
- 	unuse_mm(ctx->mm);
-+	spin_unlock_irq(&ctx->ctx_lock);
- }
++ 	unuse_mm(ctx->mm);
+ 	spin_unlock_irq(&ctx->ctx_lock);
++}
++ 
  
--void fastcall kick_iocb(struct kiocb *iocb)
-+
+-	unuse_mm(ctx->mm);
 +/*
 + * Called by kick_iocb to queue the kiocb for retry
 + * and if required activate the aio work queue to process
 + * it
 + */
 +void queue_kicked_iocb(struct kiocb *iocb)
- {
- 	struct kioctx	*ctx = iocb->ki_ctx;
++{
++ 	struct kioctx	*ctx = iocb->ki_ctx;
 +	unsigned long flags;
 +	int run = 0;
 +
@@ -357,21 +443,25 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 +		queue_work(aio_wq, &ctx->wq);
 +		aio_wakeups++;
 +	}
-+}
+ }
  
 +/*
 + * kick_iocb:
-+ * 	Called typically from a wait queue callback context
-+ * 	(aio_wake_function) to trigger a retry of the iocb.
-+ * 	The retry is usually executed by aio workqueue
-+ * 	threads (See aio_kick_handler).
++ *      Called typically from a wait queue callback context
++ *      (aio_wake_function) to trigger a retry of the iocb.
++ *      The retry is usually executed by aio workqueue
++ *      threads (See aio_kick_handler).
 + */
-+void fastcall kick_iocb(struct kiocb *iocb)
-+{
+ void fastcall kick_iocb(struct kiocb *iocb)
+ {
+-	struct kioctx	*ctx = iocb->ki_ctx;
+-
  	/* sync iocbs are easy: they can only ever be executing from a 
  	 * single context. */
  	if (is_sync_kiocb(iocb)) {
-@@ -608,12 +854,10 @@ void fastcall kick_iocb(struct kiocb *io
+ 		kiocbSetKicked(iocb);
+-		wake_up_process(iocb->ki_obj.tsk);
++	        wake_up_process(iocb->ki_obj.tsk);
  		return;
  	}
  
@@ -382,12 +472,12 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 -		spin_lock_irqsave(&ctx->ctx_lock, flags);
 -		list_add_tail(&iocb->ki_run_list, &ctx->run_list);
 -		spin_unlock_irqrestore(&ctx->ctx_lock, flags);
--		schedule_work(&ctx->wq);
+-		queue_work(aio_wq, &ctx->wq);
 +		queue_kicked_iocb(iocb);
  	}
  }
- 
-@@ -666,6 +910,9 @@ int fastcall aio_complete(struct kiocb *
+ EXPORT_SYMBOL(kick_iocb);
+@@ -675,6 +913,9 @@ int fastcall aio_complete(struct kiocb *
  	 */
  	spin_lock_irqsave(&ctx->ctx_lock, flags);
  
@@ -397,7 +487,7 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
  	ring = kmap_atomic(info->ring_pages[0], KM_IRQ1);
  
  	tail = info->tail;
-@@ -694,6 +941,11 @@ int fastcall aio_complete(struct kiocb *
+@@ -703,6 +944,11 @@ int fastcall aio_complete(struct kiocb *
  
  	pr_debug("added to ring %p at [%lu]\n", iocb, tail);
  
@@ -409,7 +499,7 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
  	/* everything turned out well, dispose of the aiocb. */
  	ret = __aio_put_req(ctx, iocb);
  
-@@ -808,6 +1060,7 @@ static int read_events(struct kioctx *ct
+@@ -809,6 +1055,7 @@ static int read_events(struct kioctx *ct
  	int			i = 0;
  	struct io_event		ent;
  	struct timeout		to;
@@ -417,7 +507,7 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
  
  	/* needed to zero any padding within an entry (there shouldn't be 
  	 * any, but C is fun!
-@@ -857,7 +1110,6 @@ static int read_events(struct kioctx *ct
+@@ -858,7 +1105,6 @@ static int read_events(struct kioctx *ct
  		add_wait_queue_exclusive(&ctx->wait, &wait);
  		do {
  			set_task_state(tsk, TASK_INTERRUPTIBLE);
@@ -425,7 +515,7 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
  			ret = aio_read_evt(ctx, &ent);
  			if (ret)
  				break;
-@@ -867,6 +1119,7 @@ static int read_events(struct kioctx *ct
+@@ -868,6 +1114,7 @@ static int read_events(struct kioctx *ct
  			if (to.timed_out)	/* Only check after read evt */
  				break;
  			schedule();
@@ -433,7 +523,7 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
  			if (signal_pending(tsk)) {
  				ret = -EINTR;
  				break;
-@@ -894,6 +1147,9 @@ static int read_events(struct kioctx *ct
+@@ -895,6 +1142,9 @@ static int read_events(struct kioctx *ct
  	if (timeout)
  		clear_timeout(&to);
  out:
@@ -443,7 +533,7 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
  	return i ? i : ret;
  }
  
-@@ -923,6 +1179,11 @@ static void io_destroy(struct kioctx *io
+@@ -924,6 +1174,11 @@ static void io_destroy(struct kioctx *io
  
  	aio_cancel_all(ioctx);
  	wait_for_all_aios(ioctx);
@@ -455,7 +545,16 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
  	put_ioctx(ioctx);	/* once for the lookup */
  }
  
-@@ -985,13 +1246,179 @@ asmlinkage long sys_io_destroy(aio_conte
+@@ -962,7 +1217,7 @@ asmlinkage long sys_io_setup(unsigned nr
+ 		ret = put_user(ioctx->user_id, ctxp);
+ 		if (!ret)
+ 			return 0;
+-	 	get_ioctx(ioctx);
++		get_ioctx(ioctx);
+ 		io_destroy(ioctx);
+ 	}
+ 
+@@ -987,13 +1242,185 @@ asmlinkage long sys_io_destroy(aio_conte
  	return -EINVAL;
  }
  
@@ -562,6 +661,9 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 +		if (unlikely(!access_ok(VERIFY_WRITE, kiocb->ki_buf,
 +			kiocb->ki_left)))
 +			break;
++		ret = security_file_permission(file, MAY_READ);
++		if (ret)
++			break;
 +		ret = -EINVAL;
 +		if (file->f_op->aio_read)
 +			kiocb->ki_retry = aio_pread;
@@ -573,6 +675,9 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 +		ret = -EFAULT;
 +		if (unlikely(!access_ok(VERIFY_READ, kiocb->ki_buf,
 +			kiocb->ki_left)))
++			break;
++		ret = security_file_permission(file, MAY_WRITE);
++		if (ret)
 +			break;
 +		ret = -EINVAL;
 +		if (file->f_op->aio_write)
@@ -617,7 +722,7 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 + * because this callback isn't used for wait queues which
 + * are nested inside ioctx lock (i.e. ctx->wait)
 + */
-+int aio_wake_function(wait_queue_t *wait, unsigned mode, int sync)
++int aio_wake_function(wait_queue_t *wait, unsigned mode, int sync, void *key)
 +{
 +	struct kiocb *iocb = container_of(wait, struct kiocb, ki_wait);
 +
@@ -636,12 +741,12 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
  
  	/* enforce forwards compatibility on users */
  	if (unlikely(iocb->aio_reserved1 || iocb->aio_reserved2 ||
-@@ -1032,52 +1459,31 @@ int fastcall io_submit_one(struct kioctx
+@@ -1034,58 +1461,31 @@ int fastcall io_submit_one(struct kioctx
  	req->ki_user_data = iocb->aio_data;
  	req->ki_pos = iocb->aio_offset;
  
 -	buf = (char __user *)(unsigned long)iocb->aio_buf;
-+	req->ki_buf = (char __user *)(unsigned long)iocb->aio_buf;
++	req->ki_buf = (char *)(unsigned long)iocb->aio_buf;
 +	req->ki_left = req->ki_nbytes = iocb->aio_nbytes;
 +	req->ki_opcode = iocb->aio_lio_opcode;
 +	init_waitqueue_func_entry(&req->ki_wait, aio_wake_function);
@@ -662,6 +767,9 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 -		ret = -EFAULT;
 -		if (unlikely(!access_ok(VERIFY_WRITE, buf, iocb->aio_nbytes)))
 -			goto out_put_req;
+-		ret = security_file_permission (file, MAY_READ);
+-		if (ret)
+-			goto out_put_req;
 -		ret = -EINVAL;
 -		if (file->f_op->aio_read)
 -			ret = file->f_op->aio_read(req, buf,
@@ -673,6 +781,9 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 -			goto out_put_req;
 -		ret = -EFAULT;
 -		if (unlikely(!access_ok(VERIFY_READ, buf, iocb->aio_nbytes)))
+-			goto out_put_req;
+-		ret = security_file_permission (file, MAY_WRITE);
+-		if (ret)
 -			goto out_put_req;
 -		ret = -EINVAL;
 -		if (file->f_op->aio_write)
@@ -695,10 +806,6 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 -	}
 +	ret = aio_setup_iocb(req);
  
--	aio_put_req(req);	/* drop extra ref to req */
--	if (likely(-EIOCBQUEUED == ret))
--		return 0;
--	aio_complete(req, ret, 0);	/* will drop i/o ref to req */
 +	if (ret)
 +		goto out_put_req;
 +
@@ -708,49 +815,52 @@ diff -uNrp linux-2.6.5/fs/aio.c linux-2.6.5.aio-retry/fs/aio.c
 +
 +	if (-EIOCBRETRY == ret)
 +		queue_work(aio_wq, &ctx->wq);
-+  	aio_put_req(req);	/* drop extra ref to req */
+ 	aio_put_req(req);	/* drop extra ref to req */
+-	if (likely(-EIOCBQUEUED == ret))
+-		return 0;
+-	aio_complete(req, ret, 0);	/* will drop i/o ref to req */
  	return 0;
  
  out_put_req:
-diff -uNrp linux-2.6.5/include/linux/aio.h linux-2.6.5.aio-retry/include/linux/aio.h
---- linux-2.6.5/include/linux/aio.h	2004-04-04 05:36:15.000000000 +0200
-+++ linux-2.6.5.aio-retry/include/linux/aio.h	2004-04-04 23:31:41.000000000 +0200
-@@ -54,7 +54,7 @@ struct kiocb {
+Index: linux.t/include/linux/aio.h
+===================================================================
+--- linux.t.orig/include/linux/aio.h	2004-08-13 09:27:19.754666408 -0400
++++ linux.t/include/linux/aio.h	2004-08-13 09:46:17.815654840 -0400
+@@ -52,7 +52,7 @@ struct kiocb {
  	struct file		*ki_filp;
  	struct kioctx		*ki_ctx;	/* may be NULL for sync ops */
  	int			(*ki_cancel)(struct kiocb *, struct io_event *);
 -	long			(*ki_retry)(struct kiocb *);
 +	ssize_t			(*ki_retry)(struct kiocb *);
+ 	void			(*ki_dtor)(struct kiocb *);
  
  	struct list_head	ki_list;	/* the aio core uses this
- 						 * for cancellation */
-@@ -63,6 +63,16 @@ struct kiocb {
+@@ -65,6 +65,15 @@ struct kiocb {
  	__u64			ki_user_data;	/* user's data for completion */
  	loff_t			ki_pos;
- 
+ 	void			*private;
 +	/* State that we remember to be able to restart/retry  */
 +	unsigned short		ki_opcode;
 +	size_t			ki_nbytes; 	/* copy of iocb->aio_nbytes */
-+	char __user 		*ki_buf;	/* remaining iocb->aio_buf */
++	char 			*ki_buf;	/* remaining iocb->aio_buf */
 +	size_t			ki_left; 	/* remaining bytes */
 +	wait_queue_t		ki_wait;
 +	long			ki_retried; 	/* just for testing */
 +	long			ki_kicked; 	/* just for testing */
 +	long			ki_queued; 	/* just for testing */
-+
- 	char			private[KIOCB_PRIVATE_SIZE];
  };
  
-@@ -77,6 +87,8 @@ struct kiocb {
- 		(x)->ki_ctx = &tsk->active_mm->default_kioctx;	\
+ #define is_sync_kiocb(iocb)	((iocb)->ki_key == KIOCB_SYNC_KEY)
+@@ -79,6 +88,8 @@ struct kiocb {
  		(x)->ki_cancel = NULL;			\
- 		(x)->ki_user_obj = tsk;			\
-+		(x)->ki_user_data = 0;			\
-+		init_wait((&(x)->ki_wait));		\
+ 		(x)->ki_dtor = NULL;			\
+ 		(x)->ki_obj.tsk = tsk;			\
++		(x)->ki_user_data = 0;                  \
++		init_wait((&(x)->ki_wait));             \
  	} while (0)
  
  #define AIO_RING_MAGIC			0xa10a10a1
-@@ -159,6 +171,17 @@ int FASTCALL(io_submit_one(struct kioctx
+@@ -161,6 +172,17 @@ int FASTCALL(io_submit_one(struct kioctx
  #define get_ioctx(kioctx)	do { if (unlikely(atomic_read(&(kioctx)->users) <= 0)) BUG(); atomic_inc(&(kioctx)->users); } while (0)
  #define put_ioctx(kioctx)	do { if (unlikely(atomic_dec_and_test(&(kioctx)->users))) __put_ioctx(kioctx); else if (unlikely(atomic_read(&(kioctx)->users) < 0)) BUG(); } while (0)
  
@@ -768,9 +878,10 @@ diff -uNrp linux-2.6.5/include/linux/aio.h linux-2.6.5.aio-retry/include/linux/a
  #include <linux/aio_abi.h>
  
  static inline struct kiocb *list_kiocb(struct list_head *h)
-diff -uNrp linux-2.6.5/include/linux/errno.h linux-2.6.5.aio-retry/include/linux/errno.h
---- linux-2.6.5/include/linux/errno.h	2004-04-04 05:37:44.000000000 +0200
-+++ linux-2.6.5.aio-retry/include/linux/errno.h	2004-04-04 23:18:27.000000000 +0200
+Index: linux.t/include/linux/errno.h
+===================================================================
+--- linux.t.orig/include/linux/errno.h	2004-01-09 01:59:56.000000000 -0500
++++ linux.t/include/linux/errno.h	2004-08-13 09:41:09.617508080 -0400
 @@ -22,6 +22,7 @@
  #define EBADTYPE	527	/* Type not supported by server */
  #define EJUKEBOX	528	/* Request initiated, but will not complete before timeout */
@@ -779,24 +890,27 @@ diff -uNrp linux-2.6.5/include/linux/errno.h linux-2.6.5.aio-retry/include/linux
  
  #endif
  
-diff -uNrp linux-2.6.5/include/linux/init_task.h linux-2.6.5.aio-retry/include/linux/init_task.h
---- linux-2.6.5/include/linux/init_task.h	2004-04-04 05:36:18.000000000 +0200
-+++ linux-2.6.5.aio-retry/include/linux/init_task.h	2004-04-04 23:18:27.000000000 +0200
-@@ -112,6 +112,7 @@ extern struct group_info init_groups;
- 	.proc_lock	= SPIN_LOCK_UNLOCKED,				\
+Index: linux.t/include/linux/init_task.h
+===================================================================
+--- linux.t.orig/include/linux/init_task.h	2004-08-13 09:27:48.874239560 -0400
++++ linux.t/include/linux/init_task.h	2004-08-13 09:46:32.005497656 -0400
+@@ -113,6 +113,7 @@ extern struct group_info init_groups;
  	.switch_lock	= SPIN_LOCK_UNLOCKED,				\
  	.journal_info	= NULL,						\
+  	.map_base	= __TASK_UNMAPPED_BASE,				\
 +	.io_wait	= NULL,						\
  }
  
  
-diff -uNrp linux-2.6.5/include/linux/sched.h linux-2.6.5.aio-retry/include/linux/sched.h
---- linux-2.6.5/include/linux/sched.h	2004-04-04 05:36:18.000000000 +0200
-+++ linux-2.6.5.aio-retry/include/linux/sched.h	2004-04-04 23:18:27.000000000 +0200
-@@ -493,6 +493,13 @@ struct task_struct {
+Index: linux.t/include/linux/sched.h
+===================================================================
+--- linux.t.orig/include/linux/sched.h	2004-08-13 09:27:55.961162184 -0400
++++ linux.t/include/linux/sched.h	2004-08-13 09:41:09.620507624 -0400
+@@ -523,7 +523,13 @@ struct task_struct {
  
  	unsigned long ptrace_message;
  	siginfo_t *last_siginfo; /* For ptrace use.  */
+-
 +/*
 + * current io wait handle: wait queue entry to use for io waits
 + * If this thread is processing aio, this points at the waitqueue
@@ -804,12 +918,13 @@ diff -uNrp linux-2.6.5/include/linux/sched.h linux-2.6.5.aio-retry/include/linux
 + * to a stack based synchronous wait) if its doing sync IO.
 + */
 +	wait_queue_t *io_wait;
- };
- 
- static inline pid_t process_group(struct task_struct *tsk)
-diff -uNrp linux-2.6.5/include/linux/wait.h linux-2.6.5.aio-retry/include/linux/wait.h
---- linux-2.6.5/include/linux/wait.h	2004-04-04 05:37:07.000000000 +0200
-+++ linux-2.6.5.aio-retry/include/linux/wait.h	2004-04-04 23:18:27.000000000 +0200
+ #ifdef CONFIG_NUMA
+   	struct mempolicy *mempolicy;
+   	short il_next;		/* could be shared with used_math */
+Index: linux.t/include/linux/wait.h
+===================================================================
+--- linux.t.orig/include/linux/wait.h	2004-08-13 09:27:20.743516080 -0400
++++ linux.t/include/linux/wait.h	2004-08-13 09:41:09.621507472 -0400
 @@ -80,6 +80,15 @@ static inline int waitqueue_active(wait_
  	return !list_empty(&q->task_list);
  }
@@ -826,10 +941,11 @@ diff -uNrp linux-2.6.5/include/linux/wait.h linux-2.6.5.aio-retry/include/linux/
  extern void FASTCALL(add_wait_queue(wait_queue_head_t *q, wait_queue_t * wait));
  extern void FASTCALL(add_wait_queue_exclusive(wait_queue_head_t *q, wait_queue_t * wait));
  extern void FASTCALL(remove_wait_queue(wait_queue_head_t *q, wait_queue_t * wait));
-diff -uNrp linux-2.6.5/kernel/fork.c linux-2.6.5.aio-retry/kernel/fork.c
---- linux-2.6.5/kernel/fork.c	2004-04-04 23:16:42.000000000 +0200
-+++ linux-2.6.5.aio-retry/kernel/fork.c	2004-04-04 23:18:27.000000000 +0200
-@@ -147,7 +147,12 @@ void fastcall prepare_to_wait(wait_queue
+Index: linux.t/kernel/fork.c
+===================================================================
+--- linux.t.orig/kernel/fork.c	2004-08-13 09:27:21.186448744 -0400
++++ linux.t/kernel/fork.c	2004-08-13 09:41:09.623507168 -0400
+@@ -151,7 +151,12 @@ void fastcall prepare_to_wait(wait_queue
  	spin_lock_irqsave(&q->lock, flags);
  	if (list_empty(&wait->task_list))
  		__add_wait_queue(q, wait);
@@ -843,7 +959,7 @@ diff -uNrp linux-2.6.5/kernel/fork.c linux-2.6.5.aio-retry/kernel/fork.c
  	spin_unlock_irqrestore(&q->lock, flags);
  }
  
-@@ -162,7 +167,12 @@ prepare_to_wait_exclusive(wait_queue_hea
+@@ -166,7 +171,12 @@ prepare_to_wait_exclusive(wait_queue_hea
  	spin_lock_irqsave(&q->lock, flags);
  	if (list_empty(&wait->task_list))
  		__add_wait_queue_tail(q, wait);
@@ -857,11 +973,11 @@ diff -uNrp linux-2.6.5/kernel/fork.c linux-2.6.5.aio-retry/kernel/fork.c
  	spin_unlock_irqrestore(&q->lock, flags);
  }
  
-@@ -945,6 +955,7 @@ struct task_struct *copy_process(unsigne
+@@ -964,6 +974,7 @@ struct task_struct *copy_process(unsigne
  	p->start_time = get_jiffies_64();
  	p->security = NULL;
  	p->io_context = NULL;
 +	p->io_wait = NULL;
- 
- 	retval = -ENOMEM;
- 	if ((retval = security_task_alloc(p)))
+ 	p->audit_context = NULL;
+ #ifdef CONFIG_NUMA
+  	p->mempolicy = mpol_copy(p->mempolicy);
