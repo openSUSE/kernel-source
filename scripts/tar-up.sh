@@ -217,7 +217,10 @@ for archive in $all_archives ; do
     esac
 
     files="$( echo "$all_files" \
-	| sed -ne "\:^${archive//./\\.}/:p" )"
+	| sed -ne "\:^${archive//./\\.}/:p" \
+	| while read patch; do
+	    [ -e "$patch" ] && echo "$patch"
+	done)"
     tar -cf - $files \
     | bzip2 -9 > $BUILD_DIR/$archive.tar.bz2
 done
