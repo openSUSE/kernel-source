@@ -56,6 +56,11 @@ for flavor in $flavors ; do
 	um)
 	    extra_needs=x-devel-packages ;;
     esac
+    use_icecream=1
+    case $flavor in
+	pseries64|pmac64|iseries64)
+	    use_icecream=0 ;;
+    esac
 
     # Find all architectures for this spec file
     set -- $(
@@ -106,6 +111,7 @@ for flavor in $flavors ; do
 
     # Generate spec file
     sed -e "s,@NAME@,kernel-$flavor,g" \
+	-e "s,@ICECREAM@,$use_icecream,g" \
 	-e "s,@CFGNAME@,$flavor,g" \
 	-e "s,@VERSION@,$_VERSION,g" \
 	-e "s,@ARCHS@,$archs,g" \
