@@ -246,6 +246,7 @@ config_subst()
 # Copy the config files that apply for this kernel.
 echo "[ Copying config files ]" >> $PATCH_LOG
 echo "[ Copying config files ]"
+TMPFILE=$(mktemp /tmp/$(basename $0).XXXXXX)
 CONFIGS=$(scripts/guards $SYMBOLS < config.conf)
 for config in $CONFIGS; do
 	if ! [ -e config/$config ]; then
@@ -254,19 +255,29 @@ for config in $CONFIGS; do
 	name=$(basename $config)
 	path=arch/$(dirname $config)/defconfig.$name
 	mkdir -p $(dirname $PATCH_DIR/$path)
-	if [ "${config/*\//}" = "default" ]; then
-		echo ${path%.default} >> $PATCH_LOG
-		[ -z "$QUIET" ] && echo ${path%.default}
+ 	config_subst $name 0 \
+ 		< config/$config \
+		> $TMPFILE
 
-		config_subst $name 0 \
-			< config/$config \
-			> $PATCH_DIR/${path%.default}
+	if [ "${config/*\//}" = "default" ]; then
+		# We may have patches that modify one of the
+		# arch/$ARCH/defconfig files. If we apply only up to a
+		# certain position, don't overwrite those defconfig
+		# files, or else those modifications may accidentally
+		# end up in one of the patches.
+
+		if [ -z "$LIMIT" ]; then
+			echo ${path%.default} >> $PATCH_LOG
+			[ -z "$QUIET" ] && echo ${path%.default}
+			cp -f $TMPFILE $PATCH_DIR/${path%.default}
+		else
+			echo "Skipping ${path%.default}" \
+			     "(some patches were not applied)"
+		fi
 	fi
+
 	echo $path >> $PATCH_LOG
 	[ -z "$QUIET" ] && echo $path
-
-	config_subst $name 0 \
-		< config/$config \
-		> $PATCH_DIR/$path
+	cp -f $TMPFILE $PATCH_DIR/$path
 done
-
+rm -f $TMPFILE
