@@ -9,8 +9,9 @@ config_subst=${0%/*}/../rpm/config-subst
 use_region=0
 
 function _region_init_ () {
-    echo -e '\x1b[H\033[J'		# clear screen
-    echo -e '\x1b[4;0r'		# setup scroll region
+    echo -ne '\x1b[H\033[J'	# clear screen
+    echo -ne '\x1b[4;0r'	# setup scroll region
+    echo -ne '\x1b[4;0H'	# move cursor
 }
 
 function _region_fini_ () {
@@ -23,7 +24,7 @@ function _region_msg_ () {
     local msg="$*"
     if test "$use_region" != "0"; then
 	echo -ne '\x1b7'	# save cursor
-	echo -ne '\x1b[0;0H'	# move cursoe
+	echo -ne '\x1b[0;0H'	# move cursor
 	echo -e "##\x1b[K"	# message
 	echo -e "## $msg\x1b[K"	# message
 	echo -e "##\x1b[K"	# message
@@ -89,14 +90,14 @@ for config in $(cd patches && \
     | $config_subst CONFIG_SUSE_KERNEL y \
     > .config
     case "$menuconfig" in
-    	yes)
+    yes)
 	KCONFIG_NOTIMESTAMP=1 make $MAKE_ARGS menuconfig
 	;;
-	*)
-    _region_msg_ "working on $config"
-    eval $YES KCONFIG_NOTIMESTAMP=1 make $MAKE_ARGS oldconfig
+    *)
+	_region_msg_ "working on $config"
+	eval $YES KCONFIG_NOTIMESTAMP=1 make $MAKE_ARGS oldconfig
 	;;
-   esac
+    esac
     if ! diff -U0 $config .config; then
 	cp -v .config $config
 	cp -v .config arch/$arch/defconfig.$flavor
