@@ -243,7 +243,7 @@ echo 2 > $PATCH_DIR/.pc/.version
 set -- $PATCHES
 while [ $# -gt 0 ]; do
     PATCH="$1"
-    if [ "$PATCH" = "$LIMIT" ]; then
+    if [ "$PATCH" = "$LIMIT" -a -n "$CLEAN" ]; then
 	STEP_BY_STEP=1
 	echo "Stopping before $PATCH"
     fi
@@ -294,6 +294,10 @@ while [ $# -gt 0 ]; do
 	[ -z "$CLEAN" ] \
 	    && echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
 	rm -f $LAST_LOG
+    fi
+
+    if [ "$PATCH" = "$LIMIT" -a -z "$CLEAN" ]; then
+	break
     fi
     shift
 done
