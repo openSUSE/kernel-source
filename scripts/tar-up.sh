@@ -119,19 +119,13 @@ for flavor in $flavors ; do
     # Generate spec file
     sed -e "s,@NAME@,kernel-$flavor,g" \
 	-e "s,@ICECREAM@,$use_icecream,g" \
-	-e "s,@CFGNAME@,$flavor,g" \
+	-e "s,@FLAVOR@,$flavor,g" \
 	-e "s,@VERSION@,$_VERSION,g" \
 	-e "s,@ARCHS@,$archs,g" \
 	-e "s,@PROVIDES_OBSOLETES@,${prov_obs//$'\n'/\\n},g" \
 	-e "s,@EXTRA_NEEDS@,$extra_needs,g" \
       < rpm/kernel-binary.spec.in \
     > $BUILD_DIR/kernel-$flavor.spec
-    case $flavor in
-	(xen*)
-		# We don't compete with a normal kernel
-		sed -i 's/^Provides: *kernel/Provides: xenkernel/' $BUILD_DIR/kernel-$flavor.spec
- 	;;
-    esac
     cp kernel-source.changes $BUILD_DIR/kernel-$flavor.changes
 done
 

@@ -9,7 +9,7 @@ else
     exit 0
 fi
 
-if [ "$(readlink /boot/$image)" = $image-%ver_str ]; then
+if [ "$(readlink /boot/$image)" = $image-@KERNELRELEASE@ ]; then
     # This may be the last kernel RPM on the system, or it may
     # be an update. In both of those cases the symlinks will
     # eventually be correct. Only if this kernel
@@ -37,10 +37,10 @@ fi
 
 # Created in the other kernel's %post
 case "$(readlink /boot/$image.previous)" in
-$image-%ver_str|$(readlink /boot/$image))
+$image-@KERNELRELEASE@|$(readlink /boot/$image))
     rm -f /boot/$image.previous ;;
 esac
 case "$(readlink /boot/initrd.previous)" in
-initrd-%ver_str|$(readlink /boot/initrd))
+initrd-@KERNELRELEASE@|$(readlink /boot/initrd))
     rm -f /boot/initrd.previous ;;
 esac

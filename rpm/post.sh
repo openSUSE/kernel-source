@@ -1,8 +1,8 @@
-echo Setting up /lib/modules/%ver_str
-/sbin/depmod -a -F /boot/System.map-%ver_str %ver_str
+echo Setting up /lib/modules/@KERNELRELEASE@
+/sbin/depmod -a -F /boot/System.map-@KERNELRELEASE@ @KERNELRELEASE@
 
 for x in vmlinuz image vmlinux linux; do
-    if [ -f /boot/$x-%ver_str ]; then
+    if [ -f /boot/$x-@KERNELRELEASE@ ]; then
 	image=$x
 	break
     fi
@@ -16,24 +16,24 @@ fi
 # a problem with the /boot/initrd symlink.
 
 # Update the /boot/vmlinuz and /boot/initrd symlinks
-case %ver_str in
+case @KERNELRELEASE@ in
     (*xen*|*um*)
     	#nothing to be done
 	;;
     (*)	
 	for x in /boot/$image /boot/initrd; do
-	    if [ -e $x -a "$(readlink $x)" != ${x##*/}-%ver_str ]; then
+	    if [ -e $x -a "$(readlink $x)" != ${x##*/}-@KERNELRELEASE@ ]; then
 		mv -f $x $x.previous
 	    fi
 	    rm -f $x
-	    ln -s ${x##*/}-%ver_str $x
+	    ln -s ${x##*/}-@KERNELRELEASE@ $x
 	done
 esac
 
 if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
     if [ -f /etc/fstab ]; then
-	if ! /sbin/mkinitrd -k /boot/$image-%ver_str \
-			    -i /boot/initrd-%ver_str; then
+	if ! /sbin/mkinitrd -k /boot/$image-@KERNELRELEASE@ \
+			    -i /boot/initrd-@KERNELRELEASE@; then
 	    echo "/sbin/mkinitrd failed" >&2
 	    exit 1
 	fi
@@ -41,13 +41,13 @@ if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
 	echo "please run mkinitrd as soon as your system is complete"
     fi
 
-    case %ver_str in
+    case @KERNELRELEASE@ in
 	(*xen*)
 	    # Remove bootsplash picture 
-	    mv /boot/initrd-%ver_str /boot/initrd-%ver_str.gz
-	    #echo "gunzipping /boot/initrd-%ver_str.gz"
-	    gunzip -f /boot/initrd-%ver_str.gz
-	    gzip -9f /boot/initrd-%ver_str
+	    mv /boot/initrd-@KERNELRELEASE@ /boot/initrd-@KERNELRELEASE@.gz
+	    #echo "gunzipping /boot/initrd-@KERNELRELEASE@.gz"
+	    gunzip -f /boot/initrd-@KERNELRELEASE@.gz
+	    gzip -9f /boot/initrd-@KERNELRELEASE@
 	    ;;
 	(*um*)
 	    # nothing to be done
@@ -59,7 +59,7 @@ if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
 	    # (during initial installation the boot loader configuration does not
 	    #  yet exist when the kernel is installed, but yast kicks the boot
 	    #  loader itself later.)
-	    /sbin/new-kernel-pkg %ver_str
+	    /sbin/new-kernel-pkg @KERNELRELEASE@
 	    fi
 	    ;;
     esac

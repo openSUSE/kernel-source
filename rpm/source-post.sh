@@ -1,5 +1,5 @@
-relink linux-%ver_str /usr/src/linux
-relink linux-%ver_str-obj /usr/src/linux-obj
+relink linux-@KERNELRELEASE@ /usr/src/linux
+relink linux-@KERNELRELEASE@-obj /usr/src/linux-obj
 if [ 0%preconf -ne 0 ]; then
 /sbin/insserv running-kernel
 
@@ -11,13 +11,13 @@ if [ -e /.buildenv ]; then
     		 -e s/arm.*/arm/  -e s/sa110/arm/ \
 		 -e s/s390x/s390/ -e s/parisc64/parisc/)
     flavor="$(
-	cd /usr/src/linux-%ver_str/arch/$arch
+	cd /usr/src/linux-@KERNELRELEASE@/arch/$arch
 	set -- defconfig.*
 	[ -e defconfig.default ] && set -- defconfig.default
 	echo ${1/defconfig.}
     )"
 
-    echo %ver_str-$flavor > /.kernelversion
+    echo @KERNELRELEASE@-$flavor > /.kernelversion
 fi
 
 /etc/init.d/running-kernel start
