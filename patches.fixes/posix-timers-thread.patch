@@ -1,0 +1,407 @@
+
+From: Roland McGrath <roland@redhat.com>
+
+The posix-timers implementation associates timers with the creating thread
+and destroys timers when their creator thread dies.  POSIX clearly
+specifies that these timers are per-process, and a timer should not be torn
+down when the thread that created it exits.  I hope there won't be any
+controversy on what the correct semantics are here, since POSIX is clear
+and the Linux feature is called "posix-timers".
+
+The attached program built with NPTL -lrt -lpthread demonstrates the bug. 
+The program is correct by POSIX, but fails on Linux.  Note that a until
+just the other day, NPTL had a trivial bug that always disabled its use of
+kernel timer syscalls (check strace for lack of timer_create/SYS_259).  So
+unless you have built your own NPTL libs very recently, you probably won't
+see the kernel calls actually used by this program.
+
+Also attached is my patch to fix this.  It (you guessed it) moves the
+posix_timers field from task_struct to signal_struct.  Access is now
+governed by the siglock instead of the task lock.  exit_itimers is called
+from __exit_signal, i.e.  only on the death of the last thread in the
+group, rather than from do_exit for every thread.  Timers' it_process
+fields store the group leader's pointer, which won't die.  For the case of
+SIGEV_THREAD_ID, I hold a ref on the task_struct for it_process to stay
+robust in case the target thread dies; the ref is released and the dangling
+pointer cleared when the timer fires and the target thread is dead.  (This
+should only come up in a buggy user program, so noone cares exactly how the
+kernel handles that case.  But I think what I did is robust and sensical.)
+
+/* Test for bogus per-thread deletion of timers.  */
+
+#include <stdio.h>
+#include <error.h>
+#include <time.h>
+#include <signal.h>
+#include <stdint.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#include <pthread.h>
+
+/* Creating timers in another thread should work too.  */
+static void *do_timer_create(void *arg)
+{
+	struct sigevent *const sigev = arg;
+	timer_t *const timerId = sigev->sigev_value.sival_ptr;
+	if (timer_create(CLOCK_REALTIME, sigev, timerId) < 0) {
+		perror("timer_create");
+		return NULL;
+	}
+	return timerId;
+}
+
+int main(void)
+{
+	int i, res;
+	timer_t timerId;
+	struct itimerspec itval;
+	struct sigevent sigev;
+
+	itval.it_interval.tv_sec = 2;
+	itval.it_interval.tv_nsec = 0;
+	itval.it_value.tv_sec = 2;
+	itval.it_value.tv_nsec = 0;
+
+	sigev.sigev_notify = SIGEV_SIGNAL;
+	sigev.sigev_signo = SIGALRM;
+	sigev.sigev_value.sival_ptr = (void *)&timerId;
+
+	for (i = 0; i < 100; i++) {
+		printf("cnt = %d\n", i);
+
+		pthread_t thr;
+		res = pthread_create(&thr, NULL, &do_timer_create, &sigev);
+		if (res) {
+			error(0, res, "pthread_create");
+			continue;
+		}
+		void *val;
+		res = pthread_join(thr, &val);
+		if (res) {
+			error(0, res, "pthread_join");
+			continue;
+		}
+		if (val == NULL)
+			continue;
+
+		res = timer_settime(timerId, 0, &itval, NULL);
+		if (res < 0)
+			perror("timer_settime");
+
+		res = timer_delete(timerId);
+		if (res < 0)
+			perror("timer_delete");
+	}
+
+	return 0;
+}
+
+
+
+---
+
+ 25-akpm/fs/exec.c                 |    1 
+ 25-akpm/include/linux/init_task.h |    2 
+ 25-akpm/include/linux/sched.h     |    6 +-
+ 25-akpm/kernel/exit.c             |    1 
+ 25-akpm/kernel/fork.c             |    2 
+ 25-akpm/kernel/posix-timers.c     |   97 +++++++++++++++++++++++++++-----------
+ 25-akpm/kernel/signal.c           |    2 
+ 7 files changed, 78 insertions(+), 33 deletions(-)
+
+diff -puN fs/exec.c~posix-timers-thread fs/exec.c
+--- 25/fs/exec.c~posix-timers-thread	2004-04-08 13:44:00.460289448 -0700
++++ 25-akpm/fs/exec.c	2004-04-08 13:44:00.473287472 -0700
+@@ -856,7 +856,6 @@ int flush_old_exec(struct linux_binprm *
+ 			
+ 	flush_signal_handlers(current, 0);
+ 	flush_old_files(current->files);
+-	exit_itimers(current);
+ 
+ 	return 0;
+ 
+diff -puN include/linux/init_task.h~posix-timers-thread include/linux/init_task.h
+--- 25/include/linux/init_task.h~posix-timers-thread	2004-04-08 13:44:00.461289296 -0700
++++ 25-akpm/include/linux/init_task.h	2004-04-08 13:44:00.473287472 -0700
+@@ -49,6 +49,7 @@
+ 	.shared_pending	= { 				\
+ 		.list = LIST_HEAD_INIT(sig.shared_pending.list),	\
+ 		.signal =  {{0}}}, \
++	.posix_timers	 = LIST_HEAD_INIT(sig.posix_timers),		\
+ }
+ 
+ #define INIT_SIGHAND(sighand) {	\
+@@ -107,7 +108,6 @@ extern struct group_info init_groups;
+ 		.list = LIST_HEAD_INIT(tsk.pending.list),		\
+ 		.signal = {{0}}},					\
+ 	.blocked	= {{0}},					\
+-	.posix_timers	 = LIST_HEAD_INIT(tsk.posix_timers),		\
+ 	.alloc_lock	= SPIN_LOCK_UNLOCKED,				\
+ 	.proc_lock	= SPIN_LOCK_UNLOCKED,				\
+ 	.switch_lock	= SPIN_LOCK_UNLOCKED,				\
+diff -puN include/linux/sched.h~posix-timers-thread include/linux/sched.h
+--- 25/include/linux/sched.h~posix-timers-thread	2004-04-08 13:44:00.462289144 -0700
++++ 25-akpm/include/linux/sched.h	2004-04-08 13:44:00.475287168 -0700
+@@ -270,6 +270,9 @@ struct signal_struct {
+ 	/* thread group stop support, overloads group_exit_code too */
+ 	int			group_stop_count;
+ 
++	/* POSIX.1b Interval Timers */
++	struct list_head posix_timers;
++
+ 	/* job control IDs */
+ 	pid_t pgrp;
+ 	pid_t tty_old_pgrp;
+@@ -433,7 +436,6 @@ struct task_struct {
+ 	unsigned long it_real_value, it_prof_value, it_virt_value;
+ 	unsigned long it_real_incr, it_prof_incr, it_virt_incr;
+ 	struct timer_list real_timer;
+-	struct list_head posix_timers; /* POSIX.1b Interval Timers */
+ 	unsigned long utime, stime, cutime, cstime;
+ 	unsigned long nvcsw, nivcsw, cnvcsw, cnivcsw; /* context switch counts */
+ 	u64 start_time;
+@@ -728,7 +730,7 @@ extern void exit_signal(struct task_stru
+ extern void __exit_signal(struct task_struct *);
+ extern void exit_sighand(struct task_struct *);
+ extern void __exit_sighand(struct task_struct *);
+-extern void exit_itimers(struct task_struct *);
++extern void exit_itimers(struct signal_struct *);
+ 
+ extern NORET_TYPE void do_group_exit(int);
+ 
+diff -puN kernel/exit.c~posix-timers-thread kernel/exit.c
+--- 25/kernel/exit.c~posix-timers-thread	2004-04-08 13:44:00.464288840 -0700
++++ 25-akpm/kernel/exit.c	2004-04-08 13:44:00.475287168 -0700
+@@ -776,7 +776,6 @@ asmlinkage NORET_TYPE void do_exit(long 
+ 	__exit_files(tsk);
+ 	__exit_fs(tsk);
+ 	exit_namespace(tsk);
+-	exit_itimers(tsk);
+ 	exit_thread();
+ 
+ 	if (tsk->signal->leader)
+diff -puN kernel/fork.c~posix-timers-thread kernel/fork.c
+--- 25/kernel/fork.c~posix-timers-thread	2004-04-08 13:44:00.466288536 -0700
++++ 25-akpm/kernel/fork.c	2004-04-08 13:44:00.476287016 -0700
+@@ -815,6 +815,7 @@ static inline int copy_signal(unsigned l
+ 	sig->group_stop_count = 0;
+ 	sig->curr_target = NULL;
+ 	init_sigpending(&sig->shared_pending);
++	INIT_LIST_HEAD(&sig->posix_timers);
+ 
+ 	sig->tty = current->signal->tty;
+ 	sig->pgrp = process_group(current);
+@@ -932,7 +933,6 @@ struct task_struct *copy_process(unsigne
+ 
+ 	INIT_LIST_HEAD(&p->children);
+ 	INIT_LIST_HEAD(&p->sibling);
+-	INIT_LIST_HEAD(&p->posix_timers);
+ 	init_waitqueue_head(&p->wait_chldexit);
+ 	p->vfork_done = NULL;
+ 	spin_lock_init(&p->alloc_lock);
+diff -puN kernel/posix-timers.c~posix-timers-thread kernel/posix-timers.c
+--- 25/kernel/posix-timers.c~posix-timers-thread	2004-04-08 13:44:00.467288384 -0700
++++ 25-akpm/kernel/posix-timers.c	2004-04-08 13:44:00.478286712 -0700
+@@ -317,12 +317,21 @@ static void timer_notify_task(struct k_i
+ 	if (timr->it_incr)
+ 		timr->sigq->info.si_sys_private = ++timr->it_requeue_pending;
+ 
+-	if (timr->it_sigev_notify & SIGEV_THREAD_ID )
++	if (timr->it_sigev_notify & SIGEV_THREAD_ID) {
++		if (unlikely(timr->it_process->flags & PF_EXITING)) {
++			timr->it_sigev_notify = SIGEV_SIGNAL;
++			put_task_struct(timr->it_process);
++			timr->it_process = timr->it_process->group_leader;
++			goto group;
++		}
+ 		ret = send_sigqueue(timr->it_sigev_signo, timr->sigq,
+ 			timr->it_process);
+-	else
++	}
++	else {
++	group:
+ 		ret = send_group_sigqueue(timr->it_sigev_signo, timr->sigq,
+ 			timr->it_process);
++	}
+ 	if (ret) {
+ 		/*
+ 		 * signal was not sent because of sig_ignor
+@@ -352,7 +361,7 @@ static void posix_timer_fn(unsigned long
+ 
+ static inline struct task_struct * good_sigevent(sigevent_t * event)
+ {
+-	struct task_struct *rtn = current;
++	struct task_struct *rtn = current->group_leader;
+ 
+ 	if ((event->sigev_notify & SIGEV_THREAD_ID ) &&
+ 		(!(rtn = find_task_by_pid(event->sigev_notify_thread_id)) ||
+@@ -395,11 +404,15 @@ static struct k_itimer * alloc_posix_tim
+ static void release_posix_timer(struct k_itimer *tmr)
+ {
+ 	if (tmr->it_id != -1) {
+-		spin_lock_irq(&idr_lock);
++		unsigned long flags;
++		spin_lock_irqsave(&idr_lock, flags);
+ 		idr_remove(&posix_timers_id, tmr->it_id);
+-		spin_unlock_irq(&idr_lock);
++		spin_unlock_irqrestore(&idr_lock, flags);
+ 	}
+ 	sigqueue_free(tmr->sigq);
++	if (unlikely(tmr->it_process) &&
++	    tmr->it_sigev_notify == (SIGEV_SIGNAL|SIGEV_THREAD_ID))
++		put_task_struct(tmr->it_process);
+ 	kmem_cache_free(posix_timers_cache, tmr);
+ }
+ 
+@@ -414,6 +427,7 @@ sys_timer_create(clockid_t which_clock,
+ 	struct k_itimer *new_timer = NULL;
+ 	timer_t new_timer_id;
+ 	struct task_struct *process = 0;
++	unsigned long flags;
+ 	sigevent_t event;
+ 
+ 	if ((unsigned) which_clock >= MAX_CLOCKS ||
+@@ -458,7 +472,7 @@ sys_timer_create(clockid_t which_clock,
+ 			 * We may be setting up this process for another
+ 			 * thread.  It may be exiting.  To catch this
+ 			 * case the we check the PF_EXITING flag.  If
+-			 * the flag is not set, the task_lock will catch
++			 * the flag is not set, the siglock will catch
+ 			 * him before it is too late (in exit_itimers).
+ 			 *
+ 			 * The exec case is a bit more invloved but easy
+@@ -469,13 +483,14 @@ sys_timer_create(clockid_t which_clock,
+ 			 * for us to die which means we can finish this
+ 			 * linkage with our last gasp. I.e. no code :)
+ 			 */
+-			task_lock(process);
++			spin_lock_irqsave(&process->sighand->siglock, flags);
+ 			if (!(process->flags & PF_EXITING)) {
+ 				list_add(&new_timer->list,
+-					 &process->posix_timers);
+-				task_unlock(process);
++					 &process->signal->posix_timers);
++				spin_unlock_irqrestore(&process->sighand->siglock, flags);
++				get_task_struct(process);
+ 			} else {
+-				task_unlock(process);
++				spin_unlock_irqrestore(&process->sighand->siglock, flags);
+ 				process = 0;
+ 			}
+ 		}
+@@ -491,10 +506,10 @@ sys_timer_create(clockid_t which_clock,
+ 		new_timer->it_sigev_notify = SIGEV_SIGNAL;
+ 		new_timer->it_sigev_signo = SIGALRM;
+ 		new_timer->it_sigev_value.sival_int = new_timer->it_id;
+-		process = current;
+-		task_lock(process);
+-		list_add(&new_timer->list, &process->posix_timers);
+-		task_unlock(process);
++		process = current->group_leader;
++		spin_lock_irqsave(&process->sighand->siglock, flags);
++		list_add(&new_timer->list, &process->signal->posix_timers);
++		spin_unlock_irqrestore(&process->sighand->siglock, flags);
+ 	}
+ 
+ 	new_timer->it_clock = which_clock;
+@@ -925,14 +940,18 @@ retry_delete:
+ #else
+ 	p_timer_del(&posix_clocks[timer->it_clock], timer);
+ #endif
+-	task_lock(timer->it_process);
++	spin_lock(&current->sighand->siglock);
+ 	list_del(&timer->list);
+-	task_unlock(timer->it_process);
++	spin_unlock(&current->sighand->siglock);
+ 	/*
+ 	 * This keeps any tasks waiting on the spin lock from thinking
+ 	 * they got something (see the lock code above).
+ 	 */
++	if (timer->it_process) {
++		if (timer->it_sigev_notify == (SIGEV_SIGNAL|SIGEV_THREAD_ID))
++			put_task_struct(timer->it_process);
+ 	timer->it_process = NULL;
++	}
+ 	unlock_timer(timer, flags);
+ 	release_posix_timer(timer);
+ 	return 0;
+@@ -942,24 +961,50 @@ retry_delete:
+  */
+ static inline void itimer_delete(struct k_itimer *timer)
+ {
+-	if (sys_timer_delete(timer->it_id))
+-		BUG();
++	unsigned long flags;
++
++#ifdef CONFIG_SMP
++	int error;
++retry_delete:
++#endif
++	spin_lock_irqsave(&timer->it_lock, flags);
++
++#ifdef CONFIG_SMP
++	error = p_timer_del(&posix_clocks[timer->it_clock], timer);
++
++	if (error == TIMER_RETRY) {
++		unlock_timer(timer, flags);
++		goto retry_delete;
++	}
++#else
++	p_timer_del(&posix_clocks[timer->it_clock], timer);
++#endif
++	list_del(&timer->list);
++	/*
++	 * This keeps any tasks waiting on the spin lock from thinking
++	 * they got something (see the lock code above).
++	 */
++	if (timer->it_process) {
++		if (timer->it_sigev_notify == (SIGEV_SIGNAL|SIGEV_THREAD_ID))
++			put_task_struct(timer->it_process);
++		timer->it_process = NULL;
++	}
++	unlock_timer(timer, flags);
++	release_posix_timer(timer);
+ }
++
+ /*
+- * This is exported to exit and exec
++ * This is called by __exit_signal, only when there are no more
++ * references to the shared signal_struct.
+  */
+-void exit_itimers(struct task_struct *tsk)
++void exit_itimers(struct signal_struct *sig)
+ {
+ 	struct k_itimer *tmr;
+ 
+-	task_lock(tsk);
+-	while (!list_empty(&tsk->posix_timers)) {
+-		tmr = list_entry(tsk->posix_timers.next, struct k_itimer, list);
+-		task_unlock(tsk);
++	while (!list_empty(&sig->posix_timers)) {
++		tmr = list_entry(sig->posix_timers.next, struct k_itimer, list);
+ 		itimer_delete(tmr);
+-		task_lock(tsk);
+ 	}
+-	task_unlock(tsk);
+ }
+ 
+ /*
+diff -puN kernel/signal.c~posix-timers-thread kernel/signal.c
+--- 25/kernel/signal.c~posix-timers-thread	2004-04-08 13:44:00.469288080 -0700
++++ 25-akpm/kernel/signal.c	2004-04-08 13:44:00.480286408 -0700
+@@ -352,6 +352,7 @@ void __exit_signal(struct task_struct *t
+ 		if (tsk == sig->curr_target)
+ 			sig->curr_target = next_thread(tsk);
+ 		tsk->signal = NULL;
++		exit_itimers(sig);
+ 		spin_unlock(&sighand->siglock);
+ 		flush_sigqueue(&sig->shared_pending);
+ 		kmem_cache_free(signal_cachep, sig);
+@@ -2555,4 +2556,3 @@ void __init signals_init(void)
+ 	if (!sigqueue_cachep)
+ 		panic("signals_init(): cannot create sigqueue SLAB cache");
+ }
+-
+
+_
