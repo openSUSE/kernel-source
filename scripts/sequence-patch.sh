@@ -260,7 +260,8 @@ while [ $# -gt 0 ]; do
 
     if [ ! -r "$PATCH" ]; then
 	echo "Patch $PATCH not found."
-	exit 1
+	status=1
+	break
     fi
     echo "[ $PATCH ]"
     echo "[ $PATCH ]" >> $PATCH_LOG
