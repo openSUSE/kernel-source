@@ -1,0 +1,1694 @@
+Index: linux.t/net/core/Makefile
+===================================================================
+--- linux.t.orig/net/core/Makefile	2004-01-09 02:00:03.000000000 -0500
++++ linux.t/net/core/Makefile	2004-02-25 13:56:40.792372297 -0500
+@@ -13,3 +13,4 @@
+ obj-$(CONFIG_NET_DIVERT) += dv.o
+ obj-$(CONFIG_NET_PKTGEN) += pktgen.o
+ obj-$(CONFIG_NET_RADIO) += wireless.o
++obj-$(CONFIG_NETPOLL) += netpoll.o
+Index: linux.t/net/core/dev.c
+===================================================================
+--- linux.t.orig/net/core/dev.c	2004-02-25 13:48:44.999527246 -0500
++++ linux.t/net/core/dev.c	2004-02-25 13:56:40.795371952 -0500
+@@ -105,6 +105,7 @@
+ #include <linux/kmod.h>
+ #include <linux/module.h>
+ #include <linux/kallsyms.h>
++#include <linux/netpoll.h>
+ #ifdef CONFIG_NET_RADIO
+ #include <linux/wireless.h>		/* Note : will define WIRELESS_EXT */
+ #include <net/iw_handler.h>
+@@ -1572,6 +1573,13 @@
+ 	struct softnet_data *queue;
+ 	unsigned long flags;
+ 
++#ifdef CONFIG_NETPOLL_RX
++	if (skb->dev->netpoll_rx && netpoll_rx(skb)) {
++		kfree_skb(skb);
++		return NET_RX_DROP;
++	}
++#endif
++
+ 	if (!skb->stamp.tv_sec)
+ 		do_gettimeofday(&skb->stamp);
+ 
+@@ -1727,6 +1735,13 @@
+ 	int ret = NET_RX_DROP;
+ 	unsigned short type = skb->protocol;
+ 
++#ifdef CONFIG_NETPOLL_RX
++	if (skb->dev->netpoll_rx && skb->dev->poll && netpoll_rx(skb)) {
++		kfree_skb(skb);
++		return NET_RX_DROP;
++	}
++#endif
++
+ 	if (!skb->stamp.tv_sec)
+ 		do_gettimeofday(&skb->stamp);
+ 
+Index: linux.t/net/core/netpoll.c
+===================================================================
+--- linux.t.orig/net/core/netpoll.c	2003-09-23 13:59:22.000000000 -0400
++++ linux.t/net/core/netpoll.c	2004-02-25 13:56:40.797371722 -0500
+@@ -0,0 +1,651 @@
++/*
++ * Common framework for low-level network console, dump, and debugger code
++ *
++ * Sep 8 2003  Matt Mackall <mpm@selenic.com>
++ */
++
++#include <linux/smp_lock.h>
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/string.h>
++#include <linux/inetdevice.h>
++#include <linux/inet.h>
++#include <linux/interrupt.h>
++#include <linux/netpoll.h>
++#include <linux/sched.h>
++#include <net/tcp.h>
++#include <net/udp.h>
++
++/*
++ * We maintain a small pool of fully-sized skbs, to make sure the
++ * message gets out even in extreme OOM situations.
++ */
++
++#define MAX_SKBS 32
++#define MAX_UDP_CHUNK 1460
++
++static spinlock_t skb_list_lock = SPIN_LOCK_UNLOCKED;
++static int nr_skbs;
++static struct sk_buff *skbs;
++
++static spinlock_t rx_list_lock = SPIN_LOCK_UNLOCKED;
++static LIST_HEAD(rx_list);
++
++static int trapped;
++
++#define MAX_SKB_SIZE \
++		(MAX_UDP_CHUNK + sizeof(struct udphdr) + \
++				sizeof(struct iphdr) + sizeof(struct ethhdr))
++
++static void zap_completion_queue(void);
++
++static int checksum_udp(struct sk_buff *skb, struct udphdr *uh,
++			     unsigned short ulen, u32 saddr, u32 daddr)
++{
++	if (uh->check == 0)
++		return 0;
++
++	if (skb->ip_summed == CHECKSUM_HW)
++		return csum_tcpudp_magic(
++			saddr, daddr, ulen, IPPROTO_UDP, skb->csum);
++
++	skb->csum = csum_tcpudp_nofold(saddr, daddr, ulen, IPPROTO_UDP, 0);
++
++	return csum_fold(skb_checksum(skb, 0, skb->len, skb->csum));
++}
++
++void netpoll_poll(struct netpoll *np)
++{
++	int budget = 1;
++
++	if(!np->dev || !netif_running(np->dev) || !np->dev->poll_controller)
++		return;
++
++	/* Process pending work on NIC */
++	np->dev->poll_controller(np->dev);
++
++	/* If scheduling is stopped, tickle NAPI bits */
++	if(trapped && np->dev->poll &&
++	   test_bit(__LINK_STATE_RX_SCHED, &np->dev->state))
++		np->dev->poll(np->dev, &budget);
++	zap_completion_queue();
++}
++
++static void refill_skbs(void)
++{
++	struct sk_buff *skb;
++	unsigned long flags;
++
++	spin_lock_irqsave(&skb_list_lock, flags);
++	while (nr_skbs < MAX_SKBS) {
++		skb = alloc_skb(MAX_SKB_SIZE, GFP_ATOMIC);
++		if (!skb)
++			break;
++
++		skb->next = skbs;
++		skbs = skb;
++		nr_skbs++;
++	}
++	spin_unlock_irqrestore(&skb_list_lock, flags);
++}
++
++static void zap_completion_queue(void)
++{
++	unsigned long flags;
++	struct softnet_data *sd = &get_cpu_var(softnet_data);
++
++	if (sd->completion_queue) {
++		struct sk_buff *clist;
++
++		local_irq_save(flags);
++		clist = sd->completion_queue;
++		sd->completion_queue = NULL;
++		local_irq_restore(flags);
++
++		while (clist != NULL) {
++			struct sk_buff *skb = clist;
++			clist = clist->next;
++			__kfree_skb(skb);
++		}
++	}
++
++	put_cpu_var(softnet_data);
++}
++
++static struct sk_buff * find_skb(struct netpoll *np, int len, int reserve)
++{
++	int once = 1, count = 0;
++	unsigned long flags;
++	struct sk_buff *skb = NULL;
++
++	zap_completion_queue();
++repeat:
++	if (nr_skbs < MAX_SKBS)
++		refill_skbs();
++
++	skb = alloc_skb(len, GFP_ATOMIC);
++
++	if (!skb) {
++		spin_lock_irqsave(&skb_list_lock, flags);
++		skb = skbs;
++		if (skb)
++			skbs = skb->next;
++		skb->next = NULL;
++		nr_skbs--;
++		spin_unlock_irqrestore(&skb_list_lock, flags);
++	}
++
++	if(!skb) {
++		count++;
++		if (once && (count == 1000000)) {
++			printk("out of netpoll skbs!\n");
++			once = 0;
++		}
++		netpoll_poll(np);
++		goto repeat;
++	}
++
++	atomic_set(&skb->users, 1);
++	skb_reserve(skb, reserve);
++	return skb;
++}
++
++void netpoll_send_skb(struct netpoll *np, struct sk_buff *skb)
++{
++	int status;
++
++repeat:
++	if(!np || !np->dev || !netif_running(np->dev)) {
++		__kfree_skb(skb);
++		return;
++	}
++
++	spin_lock(&np->dev->xmit_lock);
++	np->dev->xmit_lock_owner = smp_processor_id();
++
++	if (netif_queue_stopped(np->dev)) {
++		np->dev->xmit_lock_owner = -1;
++		spin_unlock(&np->dev->xmit_lock);
++
++		netpoll_poll(np);
++		goto repeat;
++	}
++
++	status = np->dev->hard_start_xmit(skb, np->dev);
++	np->dev->xmit_lock_owner = -1;
++	spin_unlock(&np->dev->xmit_lock);
++
++	/* transmit busy */
++	if(status)
++		goto repeat;
++}
++
++void netpoll_send_udp(struct netpoll *np, const char *msg, int len)
++{
++	int total_len, eth_len, ip_len, udp_len;
++	struct sk_buff *skb;
++	struct udphdr *udph;
++	struct iphdr *iph;
++	struct ethhdr *eth;
++
++	udp_len = len + sizeof(*udph);
++	ip_len = eth_len = udp_len + sizeof(*iph);
++	total_len = eth_len + ETH_HLEN;
++
++	skb = find_skb(np, total_len, total_len - len);
++	if (!skb)
++		return;
++
++	memcpy(skb->data, msg, len);
++	skb->len += len;
++
++	udph = (struct udphdr *) skb_push(skb, sizeof(*udph));
++	udph->source = htons(np->local_port);
++	udph->dest = htons(np->remote_port);
++	udph->len = htons(udp_len);
++	udph->check = 0;
++
++	iph = (struct iphdr *)skb_push(skb, sizeof(*iph));
++
++	iph->version  = 4;
++	iph->ihl      = 5;
++	iph->tos      = 0;
++	iph->tot_len  = htons(ip_len);
++	iph->id       = 0;
++	iph->frag_off = 0;
++	iph->ttl      = 64;
++	iph->protocol = IPPROTO_UDP;
++	iph->check    = 0;
++	iph->saddr    = htonl(np->local_ip);
++	iph->daddr    = htonl(np->remote_ip);
++	iph->check    = ip_fast_csum((unsigned char *)iph, iph->ihl);
++
++	eth = (struct ethhdr *) skb_push(skb, ETH_HLEN);
++
++	eth->h_proto = htons(ETH_P_IP);
++	memcpy(eth->h_source, np->local_mac, 6);
++	memcpy(eth->h_dest, np->remote_mac, 6);
++
++	netpoll_send_skb(np, skb);
++}
++
++static void arp_reply(struct sk_buff *skb)
++{
++	struct in_device *in_dev = (struct in_device *) skb->dev->ip_ptr;
++	struct arphdr *arp;
++	unsigned char *arp_ptr, *sha, *tha;
++	int size, type = ARPOP_REPLY, ptype = ETH_P_ARP;
++	u32 sip, tip;
++	struct sk_buff *send_skb;
++	unsigned long flags;
++	struct list_head *p;
++	struct netpoll *np = 0;
++
++	spin_lock_irqsave(&rx_list_lock, flags);
++	list_for_each(p, &rx_list) {
++		np = list_entry(p, struct netpoll, rx_list);
++		if ( np->dev == skb->dev )
++			break;
++		np = 0;
++	}
++	spin_unlock_irqrestore(&rx_list_lock, flags);
++
++	if (!np) return;
++
++	/* No arp on this interface */
++	if (!in_dev || skb->dev->flags & IFF_NOARP)
++		return;
++
++	if (!pskb_may_pull(skb, (sizeof(struct arphdr) +
++				 (2 * skb->dev->addr_len) +
++				 (2 * sizeof(u32)))))
++		return;
++
++	skb->h.raw = skb->nh.raw = skb->data;
++	arp = skb->nh.arph;
++
++	if ((arp->ar_hrd != htons(ARPHRD_ETHER) &&
++	     arp->ar_hrd != htons(ARPHRD_IEEE802)) ||
++	    arp->ar_pro != htons(ETH_P_IP) ||
++	    arp->ar_op != htons(ARPOP_REQUEST))
++		return;
++
++	arp_ptr= (unsigned char *)(arp+1);
++	sha = arp_ptr;
++	arp_ptr += skb->dev->addr_len;
++	memcpy(&sip, arp_ptr, 4);
++	arp_ptr += 4;
++	tha = arp_ptr;
++	arp_ptr += skb->dev->addr_len;
++	memcpy(&tip, arp_ptr, 4);
++
++	/* Should we ignore arp? */
++	if (tip != in_dev->ifa_list->ifa_address ||
++	    LOOPBACK(tip) || MULTICAST(tip))
++		return;
++
++
++	size = sizeof(struct arphdr) + 2 * (skb->dev->addr_len + 4);
++	send_skb = find_skb(np, size + LL_RESERVED_SPACE(np->dev),
++			    LL_RESERVED_SPACE(np->dev));
++
++	if (!send_skb)
++		return;
++
++	send_skb->nh.raw = send_skb->data;
++	arp = (struct arphdr *) skb_put(send_skb, size);
++	send_skb->dev = skb->dev;
++	send_skb->protocol = htons(ETH_P_ARP);
++
++	/* Fill the device header for the ARP frame */
++
++	if (np->dev->hard_header &&
++	    np->dev->hard_header(send_skb, skb->dev, ptype,
++				       np->remote_mac, np->local_mac,
++				       send_skb->len) < 0) {
++		kfree_skb(send_skb);
++		return;
++	}
++
++	/*
++	 * Fill out the arp protocol part.
++	 *
++	 * we only support ethernet device type,
++	 * which (according to RFC 1390) should always equal 1 (Ethernet).
++	 */
++
++	arp->ar_hrd = htons(np->dev->type);
++	arp->ar_pro = htons(ETH_P_IP);
++	arp->ar_hln = np->dev->addr_len;
++	arp->ar_pln = 4;
++	arp->ar_op = htons(type);
++
++	arp_ptr=(unsigned char *)(arp + 1);
++	memcpy(arp_ptr, np->dev->dev_addr, np->dev->addr_len);
++	arp_ptr += np->dev->addr_len;
++	memcpy(arp_ptr, &tip, 4);
++	arp_ptr += 4;
++	memcpy(arp_ptr, np->local_mac, np->dev->addr_len);
++	arp_ptr += np->dev->addr_len;
++	memcpy(arp_ptr, &sip, 4);
++
++	netpoll_send_skb(np, send_skb);
++}
++
++int netpoll_rx(struct sk_buff *skb)
++{
++	int proto, len, ulen;
++	struct iphdr *iph;
++	struct udphdr *uh;
++	struct netpoll *np;
++	struct list_head *p;
++	unsigned long flags;
++
++	if (skb->dev->type != ARPHRD_ETHER)
++		goto out;
++
++	/* check if netpoll clients need ARP */
++	if (skb->protocol == __constant_htons(ETH_P_ARP) && trapped) {
++		arp_reply(skb);
++		return 1;
++	}
++
++	proto = ntohs(skb->mac.ethernet->h_proto);
++	if (proto != ETH_P_IP)
++		goto out;
++	if (skb->pkt_type == PACKET_OTHERHOST)
++		goto out;
++	if (skb_shared(skb))
++		goto out;
++
++	iph = (struct iphdr *)skb->data;
++	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
++		goto out;
++	if (iph->ihl < 5 || iph->version != 4)
++		goto out;
++	if (!pskb_may_pull(skb, iph->ihl*4))
++		goto out;
++	if (ip_fast_csum((u8 *)iph, iph->ihl) != 0)
++		goto out;
++
++	len = ntohs(iph->tot_len);
++	if (skb->len < len || len < iph->ihl*4)
++		goto out;
++
++	if (iph->protocol != IPPROTO_UDP)
++		goto out;
++
++	len -= iph->ihl*4;
++	uh = (struct udphdr *)(((char *)iph) + iph->ihl*4);
++	ulen = ntohs(uh->len);
++
++	if (ulen != len)
++		goto out;
++	if (checksum_udp(skb, uh, ulen, iph->saddr, iph->daddr) < 0)
++		goto out;
++
++	spin_lock_irqsave(&rx_list_lock, flags);
++	list_for_each(p, &rx_list) {
++		np = list_entry(p, struct netpoll, rx_list);
++		if (np->dev && np->dev != skb->dev)
++			continue;
++		if (np->local_ip && np->local_ip != ntohl(iph->daddr))
++			continue;
++		if (np->remote_ip && np->remote_ip != ntohl(iph->saddr))
++			continue;
++		if (np->local_port && np->local_port != ntohs(uh->dest))
++			continue;
++
++		spin_unlock_irqrestore(&rx_list_lock, flags);
++
++		if (np->rx_hook)
++			np->rx_hook(np, ntohs(uh->source),
++				    (char *)(uh+1),
++				    ulen - sizeof(struct udphdr));
++
++		return 1;
++	}
++	spin_unlock_irqrestore(&rx_list_lock, flags);
++
++out:
++	return trapped;
++}
++
++int netpoll_parse_options(struct netpoll *np, char *opt)
++{
++	char *cur=opt, *delim;
++
++	if(*cur != '@') {
++		if ((delim = strchr(cur, '@')) == NULL)
++			goto parse_failed;
++		*delim=0;
++		np->local_port=simple_strtol(cur, 0, 10);
++		cur=delim;
++	}
++	cur++;
++	printk(KERN_INFO "%s: local port %d\n", np->name, np->local_port);
++
++	if(*cur != '/') {
++		if ((delim = strchr(cur, '/')) == NULL)
++			goto parse_failed;
++		*delim=0;
++		np->local_ip=ntohl(in_aton(cur));
++		cur=delim;
++
++		printk(KERN_INFO "%s: local IP %d.%d.%d.%d\n",
++		       np->name, HIPQUAD(np->local_ip));
++	}
++	cur++;
++
++	if ( *cur != ',') {
++		/* parse out dev name */
++		if ((delim = strchr(cur, ',')) == NULL)
++			goto parse_failed;
++		*delim=0;
++		strlcpy(np->dev_name, cur, sizeof(np->dev_name));
++		cur=delim;
++	}
++	cur++;
++
++	printk(KERN_INFO "%s: interface %s\n", np->name, np->dev_name);
++
++	if ( *cur != '@' ) {
++		/* dst port */
++		if ((delim = strchr(cur, '@')) == NULL)
++			goto parse_failed;
++		*delim=0;
++		np->remote_port=simple_strtol(cur, 0, 10);
++		cur=delim;
++	}
++	cur++;
++	printk(KERN_INFO "%s: remote port %d\n", np->name, np->remote_port);
++
++	/* dst ip */
++	if ((delim = strchr(cur, '/')) == NULL)
++		goto parse_failed;
++	*delim=0;
++	np->remote_ip=ntohl(in_aton(cur));
++	cur=delim+1;
++
++	printk(KERN_INFO "%s: remote IP %d.%d.%d.%d\n",
++		       np->name, HIPQUAD(np->remote_ip));
++
++	if( *cur != 0 )
++	{
++		/* MAC address */
++		if ((delim = strchr(cur, ':')) == NULL)
++			goto parse_failed;
++		*delim=0;
++		np->remote_mac[0]=simple_strtol(cur, 0, 16);
++		cur=delim+1;
++		if ((delim = strchr(cur, ':')) == NULL)
++			goto parse_failed;
++		*delim=0;
++		np->remote_mac[1]=simple_strtol(cur, 0, 16);
++		cur=delim+1;
++		if ((delim = strchr(cur, ':')) == NULL)
++			goto parse_failed;
++		*delim=0;
++		np->remote_mac[2]=simple_strtol(cur, 0, 16);
++		cur=delim+1;
++		if ((delim = strchr(cur, ':')) == NULL)
++			goto parse_failed;
++		*delim=0;
++		np->remote_mac[3]=simple_strtol(cur, 0, 16);
++		cur=delim+1;
++		if ((delim = strchr(cur, ':')) == NULL)
++			goto parse_failed;
++		*delim=0;
++		np->remote_mac[4]=simple_strtol(cur, 0, 16);
++		cur=delim+1;
++		np->remote_mac[5]=simple_strtol(cur, 0, 16);
++	}
++
++	printk(KERN_INFO "%s: remote ethernet address "
++	       "%02x:%02x:%02x:%02x:%02x:%02x\n",
++	       np->name,
++	       np->remote_mac[0],
++	       np->remote_mac[1],
++	       np->remote_mac[2],
++	       np->remote_mac[3],
++	       np->remote_mac[4],
++	       np->remote_mac[5]);
++
++	return 0;
++
++ parse_failed:
++	printk(KERN_INFO "%s: couldn't parse config at %s!\n",
++	       np->name, cur);
++	return -1;
++}
++
++int netpoll_setup(struct netpoll *np)
++{
++	struct net_device *ndev = NULL;
++	struct in_device *in_dev;
++
++	if (np->dev_name)
++		ndev = dev_get_by_name(np->dev_name);
++	if (!ndev) {
++		printk(KERN_ERR "%s: %s doesn't exist, aborting.\n",
++		       np->name, np->dev_name);
++		return -1;
++	}
++	if (!ndev->poll_controller) {
++		printk(KERN_ERR "%s: %s doesn't support polling, aborting.\n",
++		       np->name, np->dev_name);
++		goto release;
++	}
++
++	if (!(ndev->flags & IFF_UP)) {
++		unsigned short oflags;
++		unsigned long atmost, atleast;
++
++		printk(KERN_INFO "%s: device %s not up yet, forcing it\n",
++		       np->name, np->dev_name);
++
++		oflags = ndev->flags;
++
++		rtnl_shlock();
++		if (dev_change_flags(ndev, oflags | IFF_UP) < 0) {
++			printk(KERN_ERR "%s: failed to open %s\n",
++			       np->name, np->dev_name);
++			rtnl_shunlock();
++			goto release;
++		}
++		rtnl_shunlock();
++
++		atleast = jiffies + HZ/10;
++ 		atmost = jiffies + 10*HZ;
++		while (!netif_carrier_ok(ndev)) {
++			if (time_after(jiffies, atmost)) {
++				printk(KERN_NOTICE
++				       "%s: timeout waiting for carrier\n",
++				       np->name);
++				break;
++			}
++			cond_resched();
++		}
++
++		if (time_before(jiffies, atleast)) {
++			printk(KERN_NOTICE "%s: carrier detect appears flaky,"
++			       " waiting 10 seconds\n",
++			       np->name);
++			while (time_before(jiffies, atmost))
++				cond_resched();
++		}
++	}
++
++	if (!memcmp(np->local_mac, "\0\0\0\0\0\0", 6) && ndev->dev_addr)
++		memcpy(np->local_mac, ndev->dev_addr, 6);
++
++	if (!np->local_ip) {
++		in_dev = in_dev_get(ndev);
++
++		if (!in_dev) {
++			printk(KERN_ERR "%s: no IP address for %s, aborting\n",
++			       np->name, np->dev_name);
++			goto release;
++		}
++
++		np->local_ip = ntohl(in_dev->ifa_list->ifa_local);
++		in_dev_put(in_dev);
++		printk(KERN_INFO "%s: local IP %d.%d.%d.%d\n",
++		       np->name, HIPQUAD(np->local_ip));
++	}
++
++	np->dev = ndev;
++
++	if(np->rx_hook) {
++		unsigned long flags;
++
++#ifdef CONFIG_NETPOLL_RX
++		np->dev->netpoll_rx = 1;
++#endif
++
++		spin_lock_irqsave(&rx_list_lock, flags);
++		list_add(&np->rx_list, &rx_list);
++		spin_unlock_irqrestore(&rx_list_lock, flags);
++	}
++
++	return 0;
++ release:
++	dev_put(ndev);
++	return -1;
++}
++
++void netpoll_cleanup(struct netpoll *np)
++{
++	if(np->rx_hook) {
++		unsigned long flags;
++
++		spin_lock_irqsave(&rx_list_lock, flags);
++		list_del(&np->rx_list);
++#ifdef CONFIG_NETPOLL_RX
++		np->dev->netpoll_rx = 0;
++#endif
++		spin_unlock_irqrestore(&rx_list_lock, flags);
++	}
++
++	dev_put(np->dev);
++	np->dev = 0;
++}
++
++int netpoll_trap()
++{
++	return trapped;
++}
++
++void netpoll_set_trap(int trap)
++{
++	trapped = trap;
++}
++
++EXPORT_SYMBOL(netpoll_set_trap);
++EXPORT_SYMBOL(netpoll_trap);
++EXPORT_SYMBOL(netpoll_parse_options);
++EXPORT_SYMBOL(netpoll_setup);
++EXPORT_SYMBOL(netpoll_cleanup);
++EXPORT_SYMBOL(netpoll_send_skb);
++EXPORT_SYMBOL(netpoll_send_udp);
++EXPORT_SYMBOL(netpoll_poll);
+Index: linux.t/net/Kconfig
+===================================================================
+--- linux.t.orig/net/Kconfig	2004-02-25 13:48:43.752657087 -0500
++++ linux.t/net/Kconfig	2004-02-25 13:56:40.791372412 -0500
+@@ -658,4 +658,20 @@
+ 
+ source "net/bluetooth/Kconfig"
+ 
++config NETPOLL
++	def_bool NETCONSOLE
++
++config NETPOLL_RX
++	bool "Netpoll support for trapping incoming packets"
++	default n
++	depends on NETPOLL
++
++config NETPOLL_TRAP
++	bool "Netpoll traffic trapping"
++	default n
++	depends on NETPOLL
++
++config NET_POLL_CONTROLLER
++	def_bool NETPOLL
++
+ endmenu
+Index: linux.t/drivers/net/hp.c
+===================================================================
+--- linux.t.orig/drivers/net/hp.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/hp.c	2004-02-25 13:56:40.752376898 -0500
+@@ -207,6 +207,9 @@
+ 	dev->base_addr = ioaddr + NIC_OFFSET;
+ 	dev->open = &hp_open;
+ 	dev->stop = &hp_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 
+ 	ei_status.name = name;
+ 	ei_status.word16 = wordmode;
+Index: linux.t/drivers/net/ne.c
+===================================================================
+--- linux.t.orig/drivers/net/ne.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/ne.c	2004-02-25 13:56:40.756376437 -0500
+@@ -496,6 +496,9 @@
+ 	ei_status.priv = 0;
+ 	dev->open = &ne_open;
+ 	dev->stop = &ne_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 	NS8390_init(dev, 0);
+ 	return 0;
+ 
+Index: linux.t/drivers/net/wd.c
+===================================================================
+--- linux.t.orig/drivers/net/wd.c	2004-02-18 22:22:30.000000000 -0500
++++ linux.t/drivers/net/wd.c	2004-02-25 13:56:40.786372987 -0500
+@@ -333,6 +333,9 @@
+ 	ei_status.get_8390_hdr = &wd_get_8390_hdr;
+ 	dev->open = &wd_open;
+ 	dev->stop = &wd_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 	NS8390_init(dev, 0);
+ 
+ #if 1
+Index: linux.t/drivers/net/Makefile
+===================================================================
+--- linux.t.orig/drivers/net/Makefile	2004-02-25 13:48:47.089309547 -0500
++++ linux.t/drivers/net/Makefile	2004-02-25 13:56:40.741378163 -0500
+@@ -189,3 +189,4 @@
+ obj-$(CONFIG_HAMRADIO) += hamradio/
+ obj-$(CONFIG_IRDA) += irda/
+ 
++obj-$(CONFIG_NETCONSOLE) += netconsole.o
+Index: linux.t/drivers/net/ne2.c
+===================================================================
+--- linux.t.orig/drivers/net/ne2.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/ne2.c	2004-02-25 13:56:40.757376322 -0500
+@@ -509,6 +509,9 @@
+ 	
+ 	dev->open = &ne_open;
+ 	dev->stop = &ne_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 	NS8390_init(dev, 0);
+ 	return 0;
+ out:
+Index: linux.t/drivers/net/tg3.c
+===================================================================
+--- linux.t.orig/drivers/net/tg3.c	2004-02-25 13:48:43.302703934 -0500
++++ linux.t/drivers/net/tg3.c	2004-02-25 13:56:40.776374137 -0500
+@@ -2511,6 +2511,13 @@
+ static int tg3_init_hw(struct tg3 *);
+ static int tg3_halt(struct tg3 *);
+ 
++#ifdef CONFIG_NET_POLL_CONTROLLER
++static void tg3_poll_controller(struct net_device *dev)
++{
++	tg3_interrupt(dev->irq, dev, NULL);
++}
++#endif
++
+ static void tg3_reset_task(void *_data)
+ {
+ 	struct tg3 *tp = _data;
+@@ -7705,6 +7712,9 @@
+ 	dev->watchdog_timeo = TG3_TX_TIMEOUT;
+ 	dev->change_mtu = tg3_change_mtu;
+ 	dev->irq = pdev->irq;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = tg3_poll_controller;
++#endif
+ 
+ 	err = tg3_get_invariants(tp);
+ 	if (err) {
+Index: linux.t/drivers/net/tulip/tulip_core.c
+===================================================================
+--- linux.t.orig/drivers/net/tulip/tulip_core.c	2004-02-18 22:22:30.000000000 -0500
++++ linux.t/drivers/net/tulip/tulip_core.c	2004-02-25 13:56:40.783373332 -0500
+@@ -253,7 +253,7 @@
+ static struct net_device_stats *tulip_get_stats(struct net_device *dev);
+ static int private_ioctl(struct net_device *dev, struct ifreq *rq, int cmd);
+ static void set_rx_mode(struct net_device *dev);
+-
++static void poll_tulip(struct net_device *dev);
+ 
+ 
+ static void tulip_set_power_state (struct tulip_private *tp,
+@@ -1618,6 +1618,9 @@
+ 	dev->get_stats = tulip_get_stats;
+ 	dev->do_ioctl = private_ioctl;
+ 	dev->set_multicast_list = set_rx_mode;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = &poll_tulip;
++#endif
+ 
+ 	if (register_netdev(dev))
+ 		goto err_out_free_ring;
+@@ -1774,6 +1777,22 @@
+ 	/* pci_power_off (pdev, -1); */
+ }
+ 
++#ifdef CONFIG_NET_POLL_CONTROLLER
++/*
++ * Polling 'interrupt' - used by things like netconsole to send skbs
++ * without having to re-enable interrupts. It's not called while
++ * the interrupt routine is executing.
++ */
++
++static void poll_tulip (struct net_device *dev)
++{
++	/* disable_irq here is not very nice, but with the lockless
++	   interrupt handler we have no other choice. */
++	disable_irq(dev->irq);
++	tulip_interrupt (dev->irq, dev, NULL);
++	enable_irq(dev->irq);
++}
++#endif
+ 
+ static struct pci_driver tulip_driver = {
+ 	.name		= DRV_NAME,
+Index: linux.t/drivers/net/smc-ultra32.c
+===================================================================
+--- linux.t.orig/drivers/net/smc-ultra32.c	2004-02-18 22:22:30.000000000 -0500
++++ linux.t/drivers/net/smc-ultra32.c	2004-02-25 13:56:40.768375057 -0500
+@@ -268,6 +268,9 @@
+ 	ei_status.reset_8390 = &ultra32_reset_8390;
+ 	dev->open = &ultra32_open;
+ 	dev->stop = &ultra32_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 	NS8390_init(dev, 0);
+ 
+ 	return 0;
+Index: linux.t/drivers/net/mac8390.c
+===================================================================
+--- linux.t.orig/drivers/net/mac8390.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/mac8390.c	2004-02-25 13:56:40.755376552 -0500
+@@ -442,6 +442,9 @@
+ 	/* Now fill in our stuff */
+ 	dev->open = &mac8390_open;
+ 	dev->stop = &mac8390_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 
+ 	/* GAR, ei_status is actually a macro even though it looks global */
+ 	ei_status.name = cardname[type];
+Index: linux.t/drivers/net/zorro8390.c
+===================================================================
+--- linux.t.orig/drivers/net/zorro8390.c	2004-02-18 22:22:30.000000000 -0500
++++ linux.t/drivers/net/zorro8390.c	2004-02-25 13:56:40.787372872 -0500
+@@ -222,6 +222,9 @@
+     ei_status.reg_offset = zorro8390_offsets;
+     dev->open = &zorro8390_open;
+     dev->stop = &zorro8390_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++    dev->poll_controller = ei_poll;
++#endif
+ #ifdef MODULE
+     ei_status.priv = (unsigned long)root_zorro8390_dev;
+     root_zorro8390_dev = dev;
+Index: linux.t/drivers/net/eepro100.c
+===================================================================
+--- linux.t.orig/drivers/net/eepro100.c	2004-01-09 01:59:45.000000000 -0500
++++ linux.t/drivers/net/eepro100.c	2004-02-25 13:56:40.749377243 -0500
+@@ -542,6 +542,7 @@
+ static void speedo_refill_rx_buffers(struct net_device *dev, int force);
+ static int speedo_rx(struct net_device *dev);
+ static void speedo_tx_buffer_gc(struct net_device *dev);
++static void poll_speedo (struct net_device *dev);
+ static irqreturn_t speedo_interrupt(int irq, void *dev_instance, struct pt_regs *regs);
+ static int speedo_close(struct net_device *dev);
+ static struct net_device_stats *speedo_get_stats(struct net_device *dev);
+@@ -885,6 +886,9 @@
+ 	dev->get_stats = &speedo_get_stats;
+ 	dev->set_multicast_list = &set_rx_mode;
+ 	dev->do_ioctl = &speedo_ioctl;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = &poll_speedo;
++#endif
+ 
+ 	if (register_netdevice(dev))
+ 		goto err_free_unlock;
+@@ -1675,6 +1679,23 @@
+ 	return IRQ_RETVAL(handled);
+ }
+ 
++#ifdef CONFIG_NET_POLL_CONTROLLER
++/*
++ * Polling 'interrupt' - used by things like netconsole to send skbs
++ * without having to re-enable interrupts. It's not called while
++ * the interrupt routine is executing.
++ */
++
++static void poll_speedo (struct net_device *dev)
++{
++	/* disable_irq is not very nice, but with the funny lockless design
++	   we have no other choice. */
++	disable_irq(dev->irq);
++	speedo_interrupt (dev->irq, dev, NULL);
++	enable_irq(dev->irq);
++}
++#endif
++
+ static inline struct RxFD *speedo_rx_alloc(struct net_device *dev, int entry)
+ {
+ 	struct speedo_private *sp = (struct speedo_private *)dev->priv;
+Index: linux.t/drivers/net/ne2k-pci.c
+===================================================================
+--- linux.t.orig/drivers/net/ne2k-pci.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/ne2k-pci.c	2004-02-25 13:56:40.758376207 -0500
+@@ -359,6 +359,9 @@
+ 	dev->open = &ne2k_pci_open;
+ 	dev->stop = &ne2k_pci_close;
+ 	dev->ethtool_ops = &ne2k_pci_ethtool_ops;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 	NS8390_init(dev, 0);
+ 
+ 	i = register_netdev(dev);
+Index: linux.t/drivers/net/amd8111e.c
+===================================================================
+--- linux.t.orig/drivers/net/amd8111e.c	2004-01-09 01:59:44.000000000 -0500
++++ linux.t/drivers/net/amd8111e.c	2004-02-25 13:56:40.744377818 -0500
+@@ -1153,6 +1153,17 @@
+ 	return IRQ_RETVAL(handled);
+ }
+ 
++#ifdef CONFIG_NET_POLL_CONTROLLER
++static void amd8111e_poll(struct net_device *dev)
++{ 
++	unsigned long flags;
++	local_save_flags(flags); 
++	local_irq_disable();
++	amd8111e_interrupt(0, dev, NULL);
++	local_irq_restore(flags); 
++} 
++#endif
++
+ /*
+ This function closes the network interface and updates the statistics so that most recent statistics will be available after the interface is down.
+ */
+@@ -1884,6 +1895,9 @@
+ 	dev->irq =pdev->irq;
+ 	dev->tx_timeout = amd8111e_tx_timeout; 
+ 	dev->watchdog_timeo = AMD8111E_TX_TIMEOUT; 
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = amd8111e_poll; 
++#endif
+ 
+ #if AMD8111E_VLAN_TAG_USED
+ 	dev->features |= NETIF_F_HW_VLAN_TX | NETIF_F_HW_VLAN_RX;
+Index: linux.t/drivers/net/ne2k_cbus.c
+===================================================================
+--- linux.t.orig/drivers/net/ne2k_cbus.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/ne2k_cbus.c	2004-02-25 13:56:40.759376092 -0500
+@@ -534,6 +534,9 @@
+ 	ei_status.priv = 0;
+ 	dev->open = &ne_open;
+ 	dev->stop = &ne_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 	NS8390_init(dev, 0);
+ 	return 0;
+ 
+Index: linux.t/drivers/net/Kconfig
+===================================================================
+--- linux.t.orig/drivers/net/Kconfig	2004-02-25 13:48:47.088309651 -0500
++++ linux.t/drivers/net/Kconfig	2004-02-25 13:56:40.740378278 -0500
+@@ -2494,6 +2494,13 @@
+ 	  To compile this driver as a module, choose M here: the module
+ 	  will be called shaper.  If unsure, say N.
+ 
++config NETCONSOLE
++	tristate "Network console logging support (EXPERIMENTAL)"
++	depends on NETDEVICES && EXPERIMENTAL
++	---help---
++	If you want to log kernel messages over the network, enable this.
++	See Documentation/networking/netconsole.txt for details.
++
+ source "drivers/net/wan/Kconfig"
+ 
+ source "drivers/net/pcmcia/Kconfig"
+Index: linux.t/drivers/net/es3210.c
+===================================================================
+--- linux.t.orig/drivers/net/es3210.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/es3210.c	2004-02-25 13:56:40.750377128 -0500
+@@ -298,6 +298,9 @@
+ 
+ 	dev->open = &es_open;
+ 	dev->stop = &es_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 	NS8390_init(dev, 0);
+ 	return 0;
+ out1:
+Index: linux.t/drivers/net/hp-plus.c
+===================================================================
+--- linux.t.orig/drivers/net/hp-plus.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/hp-plus.c	2004-02-25 13:56:40.751377013 -0500
+@@ -236,6 +236,9 @@
+ 
+ 	dev->open = &hpp_open;
+ 	dev->stop = &hpp_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 
+ 	ei_status.name = name;
+ 	ei_status.word16 = 0;		/* Agggghhhhh! Debug time: 2 days! */
+Index: linux.t/drivers/net/apne.c
+===================================================================
+--- linux.t.orig/drivers/net/apne.c	2004-02-25 13:48:43.133721528 -0500
++++ linux.t/drivers/net/apne.c	2004-02-25 13:56:40.745377703 -0500
+@@ -333,6 +333,9 @@
+     ei_status.get_8390_hdr = &apne_get_8390_hdr;
+     dev->open = &apne_open;
+     dev->stop = &apne_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++    dev->poll_controller = ei_poll;
++#endif
+     NS8390_init(dev, 0);
+ 
+     pcmcia_ack_int(pcmcia_get_intreq());		/* ack PCMCIA int req */
+Index: linux.t/drivers/net/stnic.c
+===================================================================
+--- linux.t.orig/drivers/net/stnic.c	2004-02-18 22:22:30.000000000 -0500
++++ linux.t/drivers/net/stnic.c	2004-02-25 13:56:40.768375057 -0500
+@@ -124,6 +124,9 @@
+   dev->irq = IRQ_STNIC;
+   dev->open = &stnic_open;
+   dev->stop = &stnic_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++  dev->poll_controller = ei_poll;
++#endif
+ 
+   /* Snarf the interrupt now.  There's no point in waiting since we cannot
+      share and the board will usually be enabled. */
+Index: linux.t/drivers/net/e2100.c
+===================================================================
+--- linux.t.orig/drivers/net/e2100.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/e2100.c	2004-02-25 13:56:40.746377588 -0500
+@@ -269,6 +269,9 @@
+ 	ei_status.get_8390_hdr = &e21_get_8390_hdr;
+ 	dev->open = &e21_open;
+ 	dev->stop = &e21_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 	NS8390_init(dev, 0);
+ 
+ 	return 0;
+Index: linux.t/drivers/net/lne390.c
+===================================================================
+--- linux.t.orig/drivers/net/lne390.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/lne390.c	2004-02-25 13:56:40.754376667 -0500
+@@ -299,6 +299,9 @@
+ 
+ 	dev->open = &lne390_open;
+ 	dev->stop = &lne390_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 	NS8390_init(dev, 0);
+ 	return 0;
+ cleanup:
+Index: linux.t/drivers/net/pcnet32.c
+===================================================================
+--- linux.t.orig/drivers/net/pcnet32.c	2004-02-25 13:48:43.217712783 -0500
++++ linux.t/drivers/net/pcnet32.c	2004-02-25 13:56:40.765375402 -0500
+@@ -456,6 +456,14 @@
+     .reset	= pcnet32_dwio_reset
+ };
+ 
++#ifdef CONFIG_NET_POLL_CONTROLLER
++static void pcnet32_poll_controller(struct net_device *dev)
++{ 
++	disable_irq(dev->irq);
++	pcnet32_interrupt(0, dev, NULL);
++	enable_irq(dev->irq);
++} 
++#endif
+ 
+ 
+ /* only probes for non-PCI devices, the rest are handled by 
+@@ -807,6 +815,9 @@
+     dev->do_ioctl = &pcnet32_ioctl;
+     dev->tx_timeout = pcnet32_tx_timeout;
+     dev->watchdog_timeo = (5*HZ);
++#ifdef CONFIG_NET_POLL_CONTROLLER
++    dev->poll_controller = pcnet32_poll_controller;
++#endif    
+ 
+     /* Fill in the generic fields of the device structure. */
+     if (register_netdev(dev))
+Index: linux.t/drivers/net/via-rhine.c
+===================================================================
+--- linux.t.orig/drivers/net/via-rhine.c	2004-01-09 02:00:04.000000000 -0500
++++ linux.t/drivers/net/via-rhine.c	2004-02-25 13:56:40.785373102 -0500
+@@ -615,6 +615,15 @@
+ 			break;
+ }
+ 
++#ifdef CONFIG_NET_POLL_CONTROLLER
++static void via_rhine_poll(struct net_device *dev)
++{
++	disable_irq(dev->irq);
++	via_rhine_interrupt(dev->irq, (void *)dev, NULL);
++	enable_irq(dev->irq);
++}
++#endif
++
+ static int __devinit via_rhine_init_one (struct pci_dev *pdev,
+ 					 const struct pci_device_id *ent)
+ {
+@@ -784,6 +793,9 @@
+ 	dev->ethtool_ops = &netdev_ethtool_ops;
+ 	dev->tx_timeout = via_rhine_tx_timeout;
+ 	dev->watchdog_timeo = TX_TIMEOUT;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = via_rhine_poll;
++#endif
+ 	if (np->drv_flags & ReqTxAlign)
+ 		dev->features |= NETIF_F_SG|NETIF_F_HW_CSUM;
+ 
+Index: linux.t/drivers/net/oaknet.c
+===================================================================
+--- linux.t.orig/drivers/net/oaknet.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/oaknet.c	2004-02-25 13:56:40.762375747 -0500
+@@ -192,6 +192,9 @@
+ 
+ 	dev->open = oaknet_open;
+ 	dev->stop = oaknet_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 
+ 	NS8390_init(dev, FALSE);
+ 	ret = register_netdev(dev);
+Index: linux.t/drivers/net/netconsole.c
+===================================================================
+--- linux.t.orig/drivers/net/netconsole.c	2003-09-23 13:59:22.000000000 -0400
++++ linux.t/drivers/net/netconsole.c	2004-02-25 13:56:40.761375862 -0500
+@@ -0,0 +1,126 @@
++/*
++ *  linux/drivers/net/netconsole.c
++ *
++ *  Copyright (C) 2001  Ingo Molnar <mingo@redhat.com>
++ *
++ *  This file contains the implementation of an IRQ-safe, crash-safe
++ *  kernel console implementation that outputs kernel messages to the
++ *  network.
++ *
++ * Modification history:
++ *
++ * 2001-09-17    started by Ingo Molnar.
++ * 2003-08-11    2.6 port by Matt Mackall
++ *               simplified options
++ *               generic card hooks
++ *               works non-modular
++ * 2003-09-07    rewritten with netpoll api
++ */
++
++/****************************************************************
++ *      This program is free software; you can redistribute it and/or modify
++ *      it under the terms of the GNU General Public License as published by
++ *      the Free Software Foundation; either version 2, or (at your option)
++ *      any later version.
++ *
++ *      This program is distributed in the hope that it will be useful,
++ *      but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *      MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *      GNU General Public License for more details.
++ *
++ *      You should have received a copy of the GNU General Public License
++ *      along with this program; if not, write to the Free Software
++ *      Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ *
++ ****************************************************************/
++
++#include <linux/mm.h>
++#include <linux/tty.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/console.h>
++#include <linux/tty_driver.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/string.h>
++#include <linux/sysrq.h>
++#include <linux/smp.h>
++#include <linux/netpoll.h>
++
++MODULE_AUTHOR("Maintainer: Matt Mackall <mpm@selenic.com>");
++MODULE_DESCRIPTION("Console driver for network interfaces");
++MODULE_LICENSE("GPL");
++
++static char config[256];
++module_param_string(netconsole, config, 256, 0);
++MODULE_PARM_DESC(netconsole, " netconsole=[src-port]@[src-ip]/[dev],[tgt-port]@<tgt-ip>/[tgt-macaddr]\n");
++
++static struct netpoll np = {
++	.name = "netconsole",
++	.dev_name = "eth0",
++	.local_port = 6665,
++	.remote_port = 6666,
++	.remote_mac = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
++};
++static int configured = 0;
++
++#define MAX_PRINT_CHUNK 1000
++
++static void write_msg(struct console *con, const char *msg, unsigned int len)
++{
++	int frag, left;
++	unsigned long flags;
++
++	if (!np.dev)
++		return;
++
++	local_irq_save(flags);
++
++	for(left = len; left; ) {
++		frag = min(left, MAX_PRINT_CHUNK);
++		netpoll_send_udp(&np, msg, frag);
++		msg += frag;
++		left -= frag;
++	}
++
++	local_irq_restore(flags);
++}
++
++static struct console netconsole = {
++	.flags = CON_ENABLED | CON_PRINTBUFFER,
++	.write = write_msg
++};
++
++static void option_setup(char *opt)
++{
++	configured = !netpoll_parse_options(&np, opt);
++}
++
++__setup("netconsole=", option_setup);
++
++static int init_netconsole(void)
++{
++	if(strlen(config))
++		option_setup(config);
++
++	if(!configured) {
++		printk("netconsole: not configured, aborting\n");
++		return -EINVAL;
++	}
++
++	if(netpoll_setup(&np))
++		return -EINVAL;
++
++	register_console(&netconsole);
++	printk(KERN_INFO "netconsole: network logging started\n");
++	return 0;
++}
++
++static void cleanup_netconsole(void)
++{
++	unregister_console(&netconsole);
++	netpoll_cleanup(&np);
++}
++
++module_init(init_netconsole);
++module_exit(cleanup_netconsole);
+Index: linux.t/drivers/net/tlan.c
+===================================================================
+--- linux.t.orig/drivers/net/tlan.c	2004-01-09 01:59:09.000000000 -0500
++++ linux.t/drivers/net/tlan.c	2004-02-25 13:56:40.780373677 -0500
+@@ -814,6 +814,14 @@
+ 
+ } /* TLan_EisaProbe */
+ 
++#ifdef CONFIG_NET_POLL_CONTROLLER
++static void TLan_Poll(struct net_device *dev)
++{
++	disable_irq(dev->irq);
++	TLan_HandleInterrupt(dev->irq, dev, NULL);
++	enable_irq(dev->irq);
++}
++#endif
+ 
+ 	
+ 
+@@ -893,6 +901,9 @@
+ 	dev->get_stats = &TLan_GetStats;
+ 	dev->set_multicast_list = &TLan_SetMulticastList;
+ 	dev->do_ioctl = &TLan_ioctl;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = &TLan_Poll;
++#endif
+ 	dev->tx_timeout = &TLan_tx_timeout;
+ 	dev->watchdog_timeo = TX_TIMEOUT;
+ 
+Index: linux.t/drivers/net/ac3200.c
+===================================================================
+--- linux.t.orig/drivers/net/ac3200.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/ac3200.c	2004-02-25 13:56:40.742378048 -0500
+@@ -276,6 +276,9 @@
+ 
+ 	dev->open = &ac_open;
+ 	dev->stop = &ac_close_card;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 	NS8390_init(dev, 0);
+ 	return 0;
+ out1:
+Index: linux.t/drivers/net/ne3210.c
+===================================================================
+--- linux.t.orig/drivers/net/ne3210.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/ne3210.c	2004-02-25 13:56:40.760375977 -0500
+@@ -205,6 +205,9 @@
+ 
+ 	dev->open = &ne3210_open;
+ 	dev->stop = &ne3210_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 	dev->if_port = ifmap_val[port_index];
+ 
+ 	if ((retval = register_netdev (dev)))
+Index: linux.t/drivers/net/8390.c
+===================================================================
+--- linux.t.orig/drivers/net/8390.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/8390.c	2004-02-25 13:56:40.736378738 -0500
+@@ -516,6 +516,15 @@
+ 	return IRQ_HANDLED;
+ }
+ 
++#ifdef CONFIG_NET_POLL_CONTROLLER
++void ei_poll(struct net_device *dev)
++{
++	disable_irq(dev->irq);
++	ei_interrupt(dev->irq, dev, NULL);
++	enable_irq(dev->irq);
++}
++#endif
++
+ /**
+  * ei_tx_err - handle transmitter error
+  * @dev: network device which threw the exception
+@@ -1124,6 +1133,9 @@
+ EXPORT_SYMBOL(ei_open);
+ EXPORT_SYMBOL(ei_close);
+ EXPORT_SYMBOL(ei_interrupt);
++#ifdef CONFIG_NET_POLL_CONTROLLER
++EXPORT_SYMBOL(ei_poll);
++#endif
+ EXPORT_SYMBOL(ei_tx_timeout);
+ EXPORT_SYMBOL(NS8390_init);
+ EXPORT_SYMBOL(__alloc_ei_netdev);
+Index: linux.t/drivers/net/8390.h
+===================================================================
+--- linux.t.orig/drivers/net/8390.h	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/8390.h	2004-02-25 13:57:53.792000184 -0500
+@@ -39,6 +39,10 @@
+ #define ei_debug 1
+ #endif
+ 
++#ifdef CONFIG_NET_POLL_CONTROLLER
++extern void ei_poll(struct net_device *dev);
++#endif
++
+ extern void NS8390_init(struct net_device *dev, int startp);
+ extern int ei_open(struct net_device *dev);
+ extern int ei_close(struct net_device *dev);
+Index: linux.t/drivers/net/3c503.c
+===================================================================
+--- linux.t.orig/drivers/net/3c503.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/3c503.c	2004-02-25 13:56:40.729379543 -0500
+@@ -337,6 +337,9 @@
+     dev->open = &el2_open;
+     dev->stop = &el2_close;
+     dev->ethtool_ops = &netdev_ethtool_ops;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++    dev->poll_controller = ei_poll;
++#endif
+ 
+     if (dev->mem_start)
+ 	printk("%s: %s - %dkB RAM, 8kB shared mem window at %#6lx-%#6lx.\n",
+Index: linux.t/drivers/net/3c59x.c
+===================================================================
+--- linux.t.orig/drivers/net/3c59x.c	2004-02-25 13:48:43.123722569 -0500
++++ linux.t/drivers/net/3c59x.c	2004-02-25 13:57:20.344830271 -0500
+@@ -927,6 +927,18 @@
+ 
+ static int vortex_cards_found;
+ 
++#ifdef CONFIG_NET_POLL_CONTROLLER
++static void poll_vortex(struct net_device *dev)
++{
++	struct vortex_private *vp = (struct vortex_private *)dev->priv;
++	unsigned long flags;
++	local_save_flags(flags);
++	local_irq_disable();
++	(vp->full_bus_master_rx ? boomerang_interrupt:vortex_interrupt)(dev->irq,dev,NULL);
++	local_irq_restore(flags);
++} 
++#endif
++
+ #ifdef CONFIG_PM
+ 
+ static int vortex_suspend (struct pci_dev *pdev, u32 state)
+@@ -1463,6 +1475,9 @@
+ 	dev->set_multicast_list = set_rx_mode;
+ 	dev->tx_timeout = vortex_tx_timeout;
+ 	dev->watchdog_timeo = (watchdog * HZ) / 1000;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = poll_vortex; 
++#endif
+ 	if (pdev && vp->enable_wol) {
+ 		vp->pm_state_valid = 1;
+  		pci_save_state(VORTEX_PCI(vp), vp->power_state);
+Index: linux.t/drivers/net/smc-mca.c
+===================================================================
+--- linux.t.orig/drivers/net/smc-mca.c	2004-02-18 22:22:30.000000000 -0500
++++ linux.t/drivers/net/smc-mca.c	2004-02-25 13:56:40.766375287 -0500
+@@ -324,6 +324,9 @@
+ 
+ 	dev->open = &ultramca_open;
+ 	dev->stop = &ultramca_close_card;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 
+ 	NS8390_init(dev, 0);
+ 
+Index: linux.t/drivers/net/hydra.c
+===================================================================
+--- linux.t.orig/drivers/net/hydra.c	2004-02-18 22:22:29.000000000 -0500
++++ linux.t/drivers/net/hydra.c	2004-02-25 13:56:40.753376783 -0500
+@@ -138,6 +138,9 @@
+     ei_status.reg_offset = hydra_offsets;
+     dev->open = &hydra_open;
+     dev->stop = &hydra_close;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++    dev->poll_controller = ei_poll;
++#endif
+ #ifdef MODULE
+     ei_status.priv = (unsigned long)root_hydra_dev;
+     root_hydra_dev = dev;
+Index: linux.t/drivers/net/smc-ultra.c
+===================================================================
+--- linux.t.orig/drivers/net/smc-ultra.c	2004-02-18 22:22:30.000000000 -0500
++++ linux.t/drivers/net/smc-ultra.c	2004-02-25 13:56:40.767375172 -0500
+@@ -121,6 +121,14 @@
+ #define ULTRA_IO_EXTENT 32
+ #define EN0_ERWCNT		0x08	/* Early receive warning count. */
+ 
++#ifdef CONFIG_NET_POLL_CONTROLLER
++static void ultra_poll(struct net_device *dev)
++{
++	disable_irq(dev->irq);
++	ei_interrupt(dev->irq, dev, NULL);
++	enable_irq(dev->irq);
++}
++#endif
+ /*	Probe for the Ultra.  This looks like a 8013 with the station
+ 	address PROM at I/O ports <base>+8 to <base>+13, with a checksum
+ 	following.
+@@ -134,6 +142,9 @@
+ 
+ 	SET_MODULE_OWNER(dev);
+ 
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = &ultra_poll;
++#endif
+ 	if (base_addr > 0x1ff)		/* Check a single specified location. */
+ 		return ultra_probe1(dev, base_addr);
+ 	else if (base_addr != 0)	/* Don't probe at all. */
+@@ -301,6 +312,9 @@
+ 	ei_status.reset_8390 = &ultra_reset_8390;
+ 	dev->open = &ultra_open;
+ 	dev->stop = &ultra_close_card;
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	dev->poll_controller = ei_poll;
++#endif
+ 	NS8390_init(dev, 0);
+ 
+ 	return 0;
+Index: linux.t/Documentation/networking/netconsole.txt
+===================================================================
+--- linux.t.orig/Documentation/networking/netconsole.txt	2003-09-23 13:59:22.000000000 -0400
++++ linux.t/Documentation/networking/netconsole.txt	2004-02-25 13:56:40.728379658 -0500
+@@ -0,0 +1,57 @@
++
++started by Ingo Molnar <mingo@redhat.com>, 2001.09.17
++2.6 port and netpoll api by Matt Mackall <mpm@selenic.com>, Sep 9 2003
++
++Please send bug reports to Matt Mackall <mpm@selenic.com>
++
++This module logs kernel printk messages over UDP allowing debugging of
++problem where disk logging fails and serial consoles are impractical.
++
++It can be used either built-in or as a module. As a built-in,
++netconsole initializes immediately after NIC cards and will bring up
++the specified interface as soon as possible. While this doesn't allow
++capture of early kernel panics, it does capture most of the boot
++process.
++
++It takes a string configuration parameter "netconsole" in the
++following format:
++
++ netconsole=[src-port]@[src-ip]/[<dev>],[tgt-port]@<tgt-ip>/[tgt-macaddr]
++
++   where
++        src-port      source for UDP packets (defaults to 6665)
++        src-ip        source IP to use (interface address)
++        dev           network interface (eth0)
++        tgt-port      port for logging agent (6666)
++        tgt-ip        IP address for logging agent
++        tgt-macaddr   ethernet MAC address for logging agent (broadcast)
++
++Examples:
++
++ linux netconsole=4444@10.0.0.1/eth1,9353@10.0.0.2/12:34:56:78:9a:bc
++
++  or
++
++ insmod netconsole netconsole=@/,@10.0.0.2/
++
++Built-in netconsole starts immediately after the TCP stack is
++initialized and attempts to bring up the supplied dev at the supplied
++address.
++
++The remote host can run either 'netcat -u -l -p <port>' or syslogd.
++
++WARNING: the default target ethernet setting uses the broadcast
++ethernet address to send packets, which can cause increased load on
++other systems on the same ethernet segment.
++
++NOTE: the network device (eth1 in the above case) can run any kind
++of other network traffic, netconsole is not intrusive. Netconsole
++might cause slight delays in other traffic if the volume of kernel
++messages is high, but should have no other impact.
++
++Netconsole was designed to be as instantaneous as possible, to
++enable the logging of even the most critical kernel bugs. It works
++from IRQ contexts as well, and does not enable interrupts while
++sending packets. Due to these unique needs, configuration can not
++be more automatic, and some fundamental limitations will remain:
++only IP networks, UDP packets and ethernet devices are supported.
+Index: linux.t/include/linux/netdevice.h
+===================================================================
+--- linux.t.orig/include/linux/netdevice.h	2004-02-25 13:49:01.661788838 -0500
++++ linux.t/include/linux/netdevice.h	2004-02-25 14:00:12.421028451 -0500
+@@ -457,7 +457,13 @@
+ 	int			(*neigh_setup)(struct net_device *dev, struct neigh_parms *);
+ 	int			(*accept_fastpath)(struct net_device *, struct dst_entry*);
+ 	int                     (*generate_eui64)(u8 *eui, struct net_device *dev);
+-
++	
++#ifdef CONFIG_NETPOLL_RX
++	int			netpoll_rx;
++#endif
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	void                    (*poll_controller)(struct net_device *dev);
++#endif
+ 	/* bridge stuff */
+ 	struct net_bridge_port	*br_port;
+ 
+@@ -550,6 +556,9 @@
+ extern struct net_device	*dev_get_by_index(int ifindex);
+ extern struct net_device	*__dev_get_by_index(int ifindex);
+ extern int		dev_restart(struct net_device *dev);
++#ifdef CONFIG_NETPOLL_TRAP
++extern int		netpoll_trap(void);
++#endif
+ 
+ typedef int gifconf_func_t(struct net_device * dev, char * bufptr, int len);
+ extern int		register_gifconf(unsigned int family, gifconf_func_t * gifconf);
+@@ -608,12 +617,20 @@
+ 
+ static inline void netif_wake_queue(struct net_device *dev)
+ {
++#ifdef CONFIG_NETPOLL_TRAP
++	if (netpoll_trap())
++		return;
++#endif
+ 	if (test_and_clear_bit(__LINK_STATE_XOFF, &dev->state))
+ 		__netif_schedule(dev);
+ }
+ 
+ static inline void netif_stop_queue(struct net_device *dev)
+ {
++#ifdef CONFIG_NETPOLL_TRAP
++	if (netpoll_trap())
++		return;
++#endif
+ 	set_bit(__LINK_STATE_XOFF, &dev->state);
+ }
+ 
+Index: linux.t/include/linux/netpoll.h
+===================================================================
+--- linux.t.orig/include/linux/netpoll.h	2003-09-23 13:59:22.000000000 -0400
++++ linux.t/include/linux/netpoll.h	2004-02-25 13:56:40.790372527 -0500
+@@ -0,0 +1,38 @@
++/*
++ * Common code for low-level network console, dump, and debugger code
++ *
++ * Derived from netconsole, kgdb-over-ethernet, and netdump patches
++ */
++
++#ifndef _LINUX_NETPOLL_H
++#define _LINUX_NETPOLL_H
++
++#include <linux/netdevice.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/list.h>
++
++struct netpoll;
++
++struct netpoll {
++	struct net_device *dev;
++	char dev_name[16], *name;
++	void (*rx_hook)(struct netpoll *, int, char *, int);
++	u32 local_ip, remote_ip;
++	u16 local_port, remote_port;
++	unsigned char local_mac[6], remote_mac[6];
++	struct list_head rx_list;
++};
++
++void netpoll_poll(struct netpoll *np);
++void netpoll_send_skb(struct netpoll *np, struct sk_buff *skb);
++void netpoll_send_udp(struct netpoll *np, const char *msg, int len);
++int netpoll_parse_options(struct netpoll *np, char *opt);
++int netpoll_setup(struct netpoll *np);
++int netpoll_trap(void);
++void netpoll_set_trap(int trap);
++void netpoll_cleanup(struct netpoll *np);
++int netpoll_rx(struct sk_buff *skb);
++
++
++#endif
