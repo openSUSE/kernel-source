@@ -77,7 +77,7 @@ for config in $(cd patches && \
 
     _region_msg_ "working on $config"
     cp -v $config .config
-    eval $YES make $MAKE_ARGS oldconfig
+    eval $YES NOTIMESTAMP=1 make $MAKE_ARGS oldconfig
     if ! diff -U0 $config .config; then
 	cp -v .config $config
 	cp -v .config arch/$arch/defconfig.$flavor
