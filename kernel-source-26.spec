@@ -1,5 +1,5 @@
 #
-# spec file for package kernel-source (Version 2.4.20.SuSE)
+# spec file for package kernel-source-26
 #
 # Copyright (c) 2002 SuSE Linux AG, Nuernberg, Germany.
 # This file and all modifications and additions to the pristine
@@ -30,7 +30,7 @@ Source21:     config.conf
 Source100:    patches.arch.tar.bz2
 Source101:    patches.fixes.tar.bz2
 Source102:    patches.drivers.tar.bz2
-Source103:    patches.suse.tar.bz2
+Source103:    patches.rpmify.tar.bz2
 %define ver_str %version-%release
 BuildRoot:    %_tmppath/linux-%ver_str-build
 
@@ -82,7 +82,7 @@ echo "Architecture symbol(s): $SYMBOLS"
 %setup -q -T -n patches.arch	-b 100
 %setup -q -T -n patches.fixes	-b 101
 %setup -q -T -n patches.drivers	-b 102
-%setup -q -T -n patches.suse	-b 103
+%setup -q -T -n patches.rpmify	-b 103
 
 # the kernel source tree is unpacked last so that RPM_BUILD_DIR
 # points to the right path, /usr/src/packages/BUILD/linux-%version
