@@ -28,7 +28,7 @@ for d in config patches.*; do
 
   echo "Compressing $d..."
   tar -cf - --exclude=CVS --exclude="*~" --exclude=".#*" $d \
-    | bzip2 -1 > kernel-source-26/$d.tar.bz2
+    | bzip2 -1 > $BUILD_DIR/$d.tar.bz2
 done
 if [ -r $SRC_FILE ]; then
   LINUX_ORIG_TARBALL=$SRC_FILE
@@ -39,7 +39,7 @@ else
   exit 1
 fi
 if [ -r $LINUX_ORIG_TARBALL ]; then
-  cp -av $LINUX_ORIG_TARBALL kernel-source-26
+  cp -av $LINUX_ORIG_TARBALL $BUILD_DIR
 fi
 
 #echo "Copying various files..."
@@ -72,11 +72,11 @@ for cfgname in $cfgnames ; do
 	| sort -u)
     archs="$*"
     
-    cat rpm/kernel-binary-26.spec.in \
-    | sed -e "s:@NAME@:kernel-$cfgname-26:g" \
-	  -e "s:@CFGNAME@:$cfgname:g" \
-	  -e "s:@VERSION@:$VERSION:g" \
-	  -e "s:@ARCHS@:$archs:g" \
+    sed -e "s:@NAME@:kernel-$cfgname-26:g" \
+	-e "s:@CFGNAME@:$cfgname:g" \
+	-e "s:@VERSION@:$VERSION:g" \
+	-e "s:@ARCHS@:$archs:g" \
+      < rpm/kernel-binary-26.spec.in \
     | m4 > $BUILD_DIR/kernel-$cfgname-26.spec
     cat kernel-source-26.changes rpm/kernel-binary-26.changes \
       > $BUILD_DIR/kernel-$cfgname-26.changes
@@ -84,23 +84,23 @@ for cfgname in $cfgnames ; do
 
 # The pre-configured kernel source package
 echo "kernel-source-26.spec"
-cat rpm/kernel-source-26.spec.in \
-| sed -e "s:@NAME@:kernel-source-26:g" \
-      -e "s:@VERSION@:$VERSION:g" \
-      -e "s:@PRECONF@:1:g" \
+sed -e "s:@NAME@:kernel-source-26:g" \
+    -e "s:@VERSION@:$VERSION:g" \
+    -e "s:@PRECONF@:1:g" \
+  < rpm/kernel-source-26.spec.in \
 | m4 > $BUILD_DIR/kernel-source-26.spec
 
 # The unconfigured kernel source package: Source for User Mode Linux, and
 # for any km_* packages that absolutely think they need kernel sources
 # installed.
 echo "kernel-bare-26.spec"
-cat rpm/kernel-source-26.spec.in \
-| sed -e "s:@NAME@:kernel-bare-26:g" \
-      -e "s:@VERSION@:$VERSION:g" \
-      -e "s:@PRECONF@:0:g" \
+sed -e "s:@NAME@:kernel-bare-26:g" \
+    -e "s:@VERSION@:$VERSION:g" \
+    -e "s:@PRECONF@:0:g" \
+  < rpm/kernel-source-26.spec.in \
 | m4 > $BUILD_DIR/kernel-bare-26.spec
 cp kernel-source-26.changes $BUILD_DIR/kernel-bare-26.changes
 
 if [ ! -r $LINUX_ORIG_TARBALL ]; then
-  echo "Please add $SRC_FILE to kernel-source-26/*"
+  echo "Please add $SRC_FILE to $BUILD_DIR"
 fi
