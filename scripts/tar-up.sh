@@ -170,6 +170,7 @@ install -m 644					\
 install -m 755					\
 	rpm/config-subst 			\
 	rpm/get_release_number.sh		\
+	rpm/prepare-build.sh			\
 	rpm/check-for-config-changes		\
 	rpm/check-supported-list		\
 	rpm/check-build.sh			\
