@@ -66,7 +66,7 @@ for flavor in $flavors ; do
     use_icecream=1
     case $flavor in
 	pseries64|pmac64|iseries64)
-	    use_icecream=0 ;;
+	    use_icecream=1 ;;
     esac
 
     # Find all architectures for this spec file
