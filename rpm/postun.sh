@@ -24,6 +24,11 @@ if [ "$(readlink /boot/$image)" = $image-%ver_str ]; then
 	if [ -f /boot/$image -a -f /boot/$initrd ]; then
 	    relink $image /boot/${image%%%%-*}
 	    relink $initrd /boot/${initrd%%%%-*}
+
+	    # Notify the boot loader that a new kernel image is active.
+	    if [ -x /sbin/new-kernel-pkg ]; then
+		/sbin/new-kernel-pkg $(/sbin/get_kernel_version /boot/$image)
+	    fi
 	    break
 	fi
     done
