@@ -1,0 +1,1472 @@
+
+From: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+Add Linux - z/VM monitor stream.
+
+
+---
+
+ 25-akpm/arch/s390/Kconfig                     |   60 ++
+ 25-akpm/arch/s390/Makefile                    |    3 
+ 25-akpm/arch/s390/appldata/Makefile           |    8 
+ 25-akpm/arch/s390/appldata/appldata.h         |   59 ++
+ 25-akpm/arch/s390/appldata/appldata_base.c    |  677 ++++++++++++++++++++++++++
+ 25-akpm/arch/s390/appldata/appldata_mem.c     |  183 +++++++
+ 25-akpm/arch/s390/appldata/appldata_net_sum.c |  187 +++++++
+ 25-akpm/arch/s390/appldata/appldata_os.c      |  231 ++++++++
+ 8 files changed, 1407 insertions(+), 1 deletion(-)
+
+diff -puN /dev/null arch/s390/appldata/appldata_base.c
+--- /dev/null	Thu Apr 11 07:25:15 2002
++++ 25-akpm/arch/s390/appldata/appldata_base.c	Fri Feb 20 16:03:40 2004
+@@ -0,0 +1,677 @@
++/*
++ * arch/s390/appldata/appldata_base.c
++ *
++ * Base infrastructure for Linux-z/VM Monitor Stream, Stage 1.
++ * Exports appldata_register_ops() and appldata_unregister_ops() for the
++ * data gathering modules.
++ *
++ * Copyright (C) 2003 IBM Corporation, IBM Deutschland Entwicklung GmbH.
++ *
++ * Author: Gerald Schaefer <geraldsc@de.ibm.com>
++ */
++
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/errno.h>
++#include <asm/uaccess.h>
++#include <asm/io.h>
++#include <linux/interrupt.h>
++#include <linux/proc_fs.h>
++#include <linux/page-flags.h>
++#include <linux/swap.h>
++#include <linux/pagemap.h>
++#include <linux/sysctl.h>
++#include <asm/timer.h>
++//#include <linux/kernel_stat.h>
++
++#include "appldata.h"
++
++
++#define MY_PRINT_NAME	"appldata"		/* for debug messages, etc. */
++#define APPLDATA_CPU_INTERVAL	10000		/* default (CPU) time for
++						   sampling interval in
++						   milliseconds */
++
++#define TOD_MICRO	0x01000			/* nr. of TOD clock units
++						   for 1 microsecond */
++#ifndef CONFIG_ARCH_S390X
++
++#define APPLDATA_START_INTERVAL_REC 0x00   	/* Function codes for */
++#define APPLDATA_STOP_REC	    0x01	/* DIAG 0xDC	  */
++#define APPLDATA_GEN_EVENT_RECORD   0x02
++#define APPLDATA_START_CONFIG_REC   0x03
++
++#else
++
++#define APPLDATA_START_INTERVAL_REC 0x80
++#define APPLDATA_STOP_REC   	    0x81
++#define APPLDATA_GEN_EVENT_RECORD   0x82
++#define APPLDATA_START_CONFIG_REC   0x83
++
++#endif /* CONFIG_ARCH_S390X */
++
++
++/*
++ * Parameter list for DIAGNOSE X'DC'
++ */
++#ifndef CONFIG_ARCH_S390X
++struct appldata_parameter_list {
++	u16 diag;		/* The DIAGNOSE code X'00DC'          */
++	u8  function;		/* The function code for the DIAGNOSE */
++	u8  parlist_length;	/* Length of the parameter list       */
++	u32 product_id_addr;	/* Address of the 16-byte product ID  */
++	u16 reserved;
++	u16 buffer_length;	/* Length of the application data buffer  */
++	u32 buffer_addr;	/* Address of the application data buffer */
++};
++#else
++struct appldata_parameter_list {
++	u16 diag;
++	u8  function;
++	u8  parlist_length;
++	u32 unused01;
++	u16 reserved;
++	u16 buffer_length;
++	u32 unused02;
++	u64 product_id_addr;
++	u64 buffer_addr;
++};
++#endif /* CONFIG_ARCH_S390X */
++
++/*
++ * /proc entries (sysctl)
++ */
++static const char appldata_proc_name[APPLDATA_PROC_NAME_LENGTH] = "appldata";
++static int appldata_timer_handler(ctl_table *ctl, int write, struct file *filp,
++		   		  void *buffer, size_t *lenp);
++static int appldata_interval_handler(ctl_table *ctl, int write,
++					 struct file *filp, void *buffer,
++					 size_t *lenp);
++
++static struct ctl_table_header *appldata_sysctl_header;
++static struct ctl_table appldata_table[] = {
++	{
++		.ctl_name	= CTL_APPLDATA_TIMER,
++		.procname	= "timer",
++		.mode		= S_IRUGO | S_IWUSR,
++		.proc_handler	= &appldata_timer_handler,
++	},
++	{
++		.ctl_name	= CTL_APPLDATA_INTERVAL,
++		.procname	= "interval",
++		.mode		= S_IRUGO | S_IWUSR,
++		.proc_handler	= &appldata_interval_handler,
++	},
++	{ .ctl_name = 0 }
++};
++
++static struct ctl_table appldata_dir_table[] = {
++	{
++		.ctl_name	= CTL_APPLDATA,
++		.procname	= appldata_proc_name,
++		.maxlen		= 0,
++		.mode		= S_IRUGO | S_IXUGO,
++		.child		= appldata_table,
++	},
++	{ .ctl_name = 0 }
++};
++
++/*
++ * Timer
++ */
++DEFINE_PER_CPU(struct vtimer_list, appldata_timer);
++static atomic_t appldata_expire_count = ATOMIC_INIT(0);
++static struct appldata_mod_vtimer_args {
++	struct vtimer_list *timer;
++	u64    expires;
++} appldata_mod_vtimer_args;
++
++static spinlock_t appldata_timer_lock = SPIN_LOCK_UNLOCKED;
++static int appldata_interval = APPLDATA_CPU_INTERVAL;
++static int appldata_timer_active;
++
++/*
++ * Tasklet
++ */
++static struct tasklet_struct appldata_tasklet_struct;
++
++/*
++ * Ops list
++ */
++static spinlock_t appldata_ops_lock = SPIN_LOCK_UNLOCKED;
++static LIST_HEAD(appldata_ops_list);
++
++
++/************************* timer, tasklet, DIAG ******************************/
++/*
++ * appldata_timer_function()
++ *
++ * schedule tasklet and reschedule timer
++ */
++static void appldata_timer_function(unsigned long data, struct pt_regs *regs)
++{
++	P_DEBUG("   -= Timer =-\n");
++	P_DEBUG("CPU: %i, expire: %i\n", smp_processor_id(),
++		atomic_read(&appldata_expire_count));
++	if (atomic_dec_and_test(&appldata_expire_count)) {
++		atomic_set(&appldata_expire_count, num_online_cpus());
++		tasklet_schedule((struct tasklet_struct *) data);
++	}
++}
++
++/*
++ * appldata_tasklet_function()
++ *
++ * call data gathering function for each (active) module
++ */
++static void appldata_tasklet_function(unsigned long data)
++{
++	struct list_head *lh;
++	struct appldata_ops *ops;
++	int i;
++
++	P_DEBUG("  -= Tasklet =-\n");
++	i = 0;
++	spin_lock(&appldata_ops_lock);
++	list_for_each(lh, &appldata_ops_list) {
++		ops = list_entry(lh, struct appldata_ops, list);
++		P_DEBUG("list_for_each loop: %i) active = %u, name = %s\n",
++			++i, ops->active, ops->name);
++		if (ops->active == 1) {
++			ops->callback(ops->data);
++		}
++	}
++	spin_unlock(&appldata_ops_lock);
++}
++
++/*
++ * appldata_mod_vtimer_wrap()
++ *
++ * wrapper function for mod_virt_timer(), because smp_call_function_on()
++ * accepts only one parameter.
++ */
++static void appldata_mod_vtimer_wrap(struct appldata_mod_vtimer_args *args) {
++	mod_virt_timer(args->timer, args->expires);
++}
++
++/*
++ * appldata_diag()
++ *
++ * prepare parameter list, issue DIAG 0xDC
++ */
++static int appldata_diag(char record_nr, u16 function, unsigned long buffer,
++			u16 length)
++{
++	unsigned long ry;
++	struct appldata_product_id {
++		char prod_nr[7];			/* product nr. */
++		char prod_fn[2];			/* product function */
++		char record_nr;				/* record nr. */
++		char version_nr[2];			/* version */
++		char release_nr[2];			/* release */
++		char mod_lvl[2];			/* modification lvl. */
++	} appldata_product_id = {
++	/* all strings are EBCDIC, record_nr is byte */
++		.prod_nr    = {0xD3, 0xC9, 0xD5, 0xE4,
++				0xE7, 0xD2, 0xD9},	/* "LINUXKR" */
++		.prod_fn    = {0xD5, 0xD3},		/* "NL" */
++		.record_nr  = record_nr,
++		.version_nr = {0xF2, 0xF6},		/* "26" */
++		.release_nr = {0xF0, 0xF1},		/* "01" */
++		.mod_lvl    = {0xF0, 0xF0},		/* "00" */
++	};
++	struct appldata_parameter_list appldata_parameter_list = {
++				.diag = 0xDC,
++				.function = function,
++				.parlist_length =
++					sizeof(appldata_parameter_list),
++				.buffer_length = length,
++				.product_id_addr =
++					(unsigned long) &appldata_product_id,
++				.buffer_addr = virt_to_phys((void *) buffer)
++	};
++
++        if (!MACHINE_IS_VM)
++                return -ENOSYS;
++	ry = -1;
++	asm volatile(
++			"diag %1,%0,0xDC\n\t"
++			: "=d" (ry) : "d" (&(appldata_parameter_list)) : "cc");
++	return (int) ry;
++}
++/********************** timer, tasklet, DIAG <END> ***************************/
++
++
++/****************************** /proc stuff **********************************/
++/*
++ * appldata_timer_handler()
++ *
++ * Start/Stop timer, show status of timer (0 = not active, 1 = active)
++ */
++static int
++appldata_timer_handler(ctl_table *ctl, int write, struct file *filp,
++			   void *buffer, size_t *lenp)
++{
++	int len, i;
++	char buf[2];
++	u64 per_cpu_interval;
++
++	if (!*lenp || filp->f_pos) {
++		*lenp = 0;
++		return 0;
++	}
++	if (!write) {
++		len = sprintf(buf, appldata_timer_active ? "1\n" : "0\n");
++		if (len > *lenp)
++			len = *lenp;
++		if (copy_to_user(buffer, buf, len))
++			return -EFAULT;
++		goto out;
++	}
++	per_cpu_interval = (u64) (appldata_interval*1000 /
++				 num_online_cpus()) * TOD_MICRO;
++	len = *lenp;
++	if (copy_from_user(buf, buffer, len > sizeof(buf) ? sizeof(buf) : len))
++		return -EFAULT;
++	spin_lock(&appldata_timer_lock);
++	per_cpu_interval = (u64) (appldata_interval*1000 /
++				 num_online_cpus()) * TOD_MICRO;
++	if ((buf[0] == '1') && (!appldata_timer_active)) {
++		for (i = 0; i < num_online_cpus(); i++) {
++			per_cpu(appldata_timer, i).expires = per_cpu_interval;
++			smp_call_function_on(add_virt_timer_periodic,
++						&per_cpu(appldata_timer, i),
++						0, 1, i);
++		}
++		appldata_timer_active = 1;
++		P_INFO("Monitoring timer started.\n");
++	} else if ((buf[0] == '0') && (appldata_timer_active)) {
++		for (i = 0; i < num_online_cpus(); i++) {
++			del_virt_timer(&per_cpu(appldata_timer, i));
++		}
++		appldata_timer_active = 0;
++		P_INFO("Monitoring timer stopped.\n");
++	}
++	spin_unlock(&appldata_timer_lock);
++out:
++	*lenp = len;
++	filp->f_pos += len;
++	return 0;
++}
++
++/*
++ * appldata_interval_handler()
++ *
++ * Set (CPU) timer interval for collection of data (in milliseconds), show
++ * current timer interval.
++ */
++static int
++appldata_interval_handler(ctl_table *ctl, int write, struct file *filp,
++			   void *buffer, size_t *lenp)
++{
++	int len, i, interval;
++	char buf[16];
++	u64 per_cpu_interval;
++
++	if (!*lenp || filp->f_pos) {
++		*lenp = 0;
++		return 0;
++	}
++	if (!write) {
++		len = sprintf(buf, "%i\n", appldata_interval);
++		if (len > *lenp)
++			len = *lenp;
++		if (copy_to_user(buffer, buf, len))
++			return -EFAULT;
++		goto out;
++	}
++	len = *lenp;
++	if (copy_from_user(buf, buffer, len > sizeof(buf) ? sizeof(buf) : len)) {
++		return -EFAULT;
++	}
++	sscanf(buf, "%i", &interval);
++	if (interval <= 0) {
++		P_ERROR("Timer CPU interval has to be > 0!\n");
++		return -EINVAL;
++	}
++	per_cpu_interval = (u64) (interval*1000 / num_online_cpus()) * TOD_MICRO;
++
++	spin_lock(&appldata_timer_lock);
++	appldata_interval = interval;
++	if (appldata_timer_active) {
++		for (i = 0; i < num_online_cpus(); i++) {
++			appldata_mod_vtimer_args.timer =
++					&per_cpu(appldata_timer, i);
++			appldata_mod_vtimer_args.expires =
++					per_cpu_interval;
++			smp_call_function_on(
++				(void *) appldata_mod_vtimer_wrap,
++				&appldata_mod_vtimer_args,
++				0, 1, i);
++		}
++	}
++	spin_unlock(&appldata_timer_lock);
++
++	P_INFO("Monitoring CPU interval set to %u milliseconds.\n",
++		 interval);
++out:
++	*lenp = len;
++	filp->f_pos += len;
++	return 0;
++}
++
++/*
++ * appldata_generic_handler()
++ *
++ * Generic start/stop monitoring and DIAG, show status of
++ * monitoring (0 = not in process, 1 = in process)
++ */
++static int
++appldata_generic_handler(ctl_table *ctl, int write, struct file *filp,
++			   void *buffer, size_t *lenp)
++{
++	struct appldata_ops *ops;
++	int rc, len;
++	char buf[2];
++
++	ops = ctl->data;
++	if (!*lenp || filp->f_pos) {
++		*lenp = 0;
++		return 0;
++	}
++	if (!write) {
++		len = sprintf(buf, ops->active ? "1\n" : "0\n");
++		if (len > *lenp)
++			len = *lenp;
++		if (copy_to_user(buffer, buf, len))
++			return -EFAULT;
++		goto out;
++	}
++	len = *lenp;
++	if (copy_from_user(buf, buffer, len > sizeof(buf) ? sizeof(buf) : len))
++		return -EFAULT;
++
++	spin_lock_bh(&appldata_ops_lock);
++	if ((buf[0] == '1') && (ops->active == 0)) {
++		ops->active = 1;
++		ops->callback(ops->data);	// init record
++		rc = appldata_diag(ops->record_nr,
++					APPLDATA_START_INTERVAL_REC,
++					(unsigned long) ops->data, ops->size);
++		if (rc != 0) {
++			P_ERROR("START DIAG 0xDC for %s failed, "
++				"return code: %d\n", ops->name, rc);
++			ops->active = 0;
++		} else {
++			P_INFO("Monitoring %s data enabled, "
++				"DIAG 0xDC started.\n", ops->name);
++		}
++	} else if ((buf[0] == '0') && (ops->active == 1)) {
++		ops->active = 0;
++		rc = appldata_diag(ops->record_nr, APPLDATA_STOP_REC,
++				(unsigned long) ops->data, ops->size);
++		if (rc != 0) {
++			P_ERROR("STOP DIAG 0xDC for %s failed, "
++				"return code: %d\n", ops->name, rc);
++		} else {
++			P_INFO("Monitoring %s data disabled, "
++				"DIAG 0xDC stopped.\n", ops->name);
++		}
++	}
++	spin_unlock_bh(&appldata_ops_lock);
++out:
++	*lenp = len;
++	filp->f_pos += len;
++	return 0;
++}
++
++/*************************** /proc stuff <END> *******************************/
++
++
++/************************* module-ops management *****************************/
++/*
++ * appldata_register_ops()
++ *
++ * update ops list, register /proc/sys entries
++ */
++int appldata_register_ops(struct appldata_ops *ops)
++{
++	struct list_head *lh;
++	struct appldata_ops *tmp_ops;
++	int rc, i;
++
++	rc = 0;
++	i = 0;
++
++	if ((ops->size > APPLDATA_MAX_REC_SIZE) ||
++		(ops->size < 0)){
++		P_ERROR("Invalid size of %s record = %i, maximum = %i!\n",
++			ops->name, ops->size, APPLDATA_MAX_REC_SIZE);
++		rc = -ENOMEM;
++		goto out;
++	}
++	if ((ops->ctl_nr == CTL_APPLDATA) ||
++	    (ops->ctl_nr == CTL_APPLDATA_TIMER) ||
++	    (ops->ctl_nr == CTL_APPLDATA_INTERVAL)) {
++		P_ERROR("ctl_nr %i already in use!\n", ops->ctl_nr);
++		rc = -EBUSY;
++		goto out;
++	}
++	ops->ctl_table = kmalloc(4*sizeof(struct ctl_table), GFP_KERNEL);
++	if (ops->ctl_table == NULL) {
++		P_ERROR("Not enough memory for %s ctl_table!\n", ops->name);
++		rc = -ENOMEM;
++		goto out;
++	}
++	memset(ops->ctl_table, 0, 4*sizeof(struct ctl_table));
++
++	spin_lock_bh(&appldata_ops_lock);
++	list_for_each(lh, &appldata_ops_list) {
++		tmp_ops = list_entry(lh, struct appldata_ops, list);
++		P_DEBUG("register_ops loop: %i) name = %s, ctl = %i\n",
++			++i, tmp_ops->name, tmp_ops->ctl_nr);
++		P_DEBUG("Comparing %s (ctl %i) with %s (ctl %i)\n",
++			tmp_ops->name, tmp_ops->ctl_nr, ops->name,
++			ops->ctl_nr);
++		if (strncmp(tmp_ops->name, ops->name,
++				APPLDATA_PROC_NAME_LENGTH) == 0) {
++			spin_unlock_bh(&appldata_ops_lock);
++			P_ERROR("Name \"%s\" already registered!\n", ops->name);
++			kfree(ops->ctl_table);
++			rc = -EBUSY;
++			goto out;
++		}
++		if (tmp_ops->ctl_nr == ops->ctl_nr) {
++			spin_unlock_bh(&appldata_ops_lock);
++			P_ERROR("ctl_nr %i already registered!\n", ops->ctl_nr);
++			kfree(ops->ctl_table);
++			rc = -EBUSY;
++			goto out;
++		}
++	}
++	list_add(&ops->list, &appldata_ops_list);
++	spin_unlock_bh(&appldata_ops_lock);
++
++	ops->ctl_table[0].ctl_name = CTL_APPLDATA;
++	ops->ctl_table[0].procname = appldata_proc_name;
++	ops->ctl_table[0].maxlen   = 0;
++	ops->ctl_table[0].mode     = S_IRUGO | S_IXUGO;
++	ops->ctl_table[0].child    = &ops->ctl_table[2];
++
++	ops->ctl_table[1].ctl_name = 0;
++
++	ops->ctl_table[2].ctl_name = ops->ctl_nr;
++	ops->ctl_table[2].procname = ops->name;
++	ops->ctl_table[2].mode     = S_IRUGO | S_IWUSR;
++	ops->ctl_table[2].proc_handler = appldata_generic_handler;
++	ops->ctl_table[2].data = ops;
++
++	ops->ctl_table[3].ctl_name = 0;
++
++	ops->sysctl_header = register_sysctl_table(ops->ctl_table,1);
++	ops->ctl_table[2].de->owner = ops->owner;
++	P_INFO("%s-ops registered!\n", ops->name);
++out:
++	return rc;
++}
++
++/*
++ * appldata_unregister_ops()
++ *
++ * update ops list, unregister /proc entries, stop DIAG if necessary
++ */
++void appldata_unregister_ops(struct appldata_ops *ops)
++{
++	int rc;
++
++	unregister_sysctl_table(ops->sysctl_header);
++	kfree(ops->ctl_table);
++	if (ops->active == 1) {
++		ops->active = 0;
++		rc = appldata_diag(ops->record_nr, APPLDATA_STOP_REC,
++				(unsigned long) ops->data, ops->size);
++		if (rc != 0) {
++			P_ERROR("STOP DIAG 0xDC for %s failed, "
++				"return code: %d\n", ops->name, rc);
++		} else {
++			P_INFO("Monitoring %s data disabled, "
++				"DIAG 0xDC stopped.\n", ops->name);
++		}
++
++	}
++	spin_lock_bh(&appldata_ops_lock);
++	list_del(&ops->list);
++	spin_unlock_bh(&appldata_ops_lock);
++	P_INFO("%s-ops unregistered!\n", ops->name);
++}
++/********************** module-ops management <END> **************************/
++
++
++/******************************* init / exit *********************************/
++/*
++ * appldata_init()
++ *
++ * init timer and tasklet, register /proc entries
++ */
++static int __init appldata_init(void)
++{
++	int i;
++
++	P_DEBUG("sizeof(parameter_list) = %lu\n",
++		sizeof(struct appldata_parameter_list));
++
++	for (i = 0; i < num_online_cpus(); i++) {
++		init_virt_timer(&per_cpu(appldata_timer, i));
++		per_cpu(appldata_timer, i).function = appldata_timer_function;
++		per_cpu(appldata_timer, i).data = (unsigned long)
++						&appldata_tasklet_struct;
++	}
++	atomic_set(&appldata_expire_count, num_online_cpus());
++
++	appldata_sysctl_header = register_sysctl_table(appldata_dir_table, 1);
++#ifdef MODULE
++	appldata_dir_table[0].de->owner = THIS_MODULE;
++	appldata_table[0].de->owner = THIS_MODULE;
++	appldata_table[1].de->owner = THIS_MODULE;
++#endif
++
++	tasklet_init(&appldata_tasklet_struct, appldata_tasklet_function, 0);
++	P_DEBUG("Base interface initialized.\n");
++	return 0;
++}
++
++/*
++ * appldata_exit()
++ *
++ * stop timer and tasklet, unregister /proc entries
++ */
++static void __exit appldata_exit(void)
++{
++	struct list_head *lh;
++	struct appldata_ops *ops;
++	int rc, i;
++
++	P_DEBUG("Unloading module ...\n");
++	/*
++	 * ops list should be empty, but just in case something went wrong...
++	 */
++	spin_lock_bh(&appldata_ops_lock);
++	list_for_each(lh, &appldata_ops_list) {
++		ops = list_entry(lh, struct appldata_ops, list);
++		rc = appldata_diag(ops->record_nr, APPLDATA_STOP_REC,
++				(unsigned long) ops->data, ops->size);
++		if (rc != 0) {
++			P_ERROR("STOP DIAG 0xDC for %s failed, "
++				"return code: %d\n", ops->name, rc);
++		}
++	}
++	spin_unlock_bh(&appldata_ops_lock);
++
++	for (i = 0; i < num_online_cpus(); i++) {
++		del_virt_timer(&per_cpu(appldata_timer, i));
++	}
++	appldata_timer_active = 0;
++
++	unregister_sysctl_table(appldata_sysctl_header);
++
++	tasklet_kill(&appldata_tasklet_struct);
++	P_DEBUG("... module unloaded!\n");
++}
++/**************************** init / exit <END> ******************************/
++
++
++module_init(appldata_init);
++module_exit(appldata_exit);
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Gerald Schaefer");
++MODULE_DESCRIPTION("Linux-VM Monitor Stream, base infrastructure");
++
++EXPORT_SYMBOL_GPL(appldata_register_ops);
++EXPORT_SYMBOL_GPL(appldata_unregister_ops);
++
++#ifdef MODULE
++/*
++ * Kernel symbols needed by appldata_mem and appldata_os modules.
++ * However, if this file is compiled as a module (for testing only), these
++ * symbols are not exported. In this case, we define them locally and export
++ * those.
++ */
++void si_swapinfo(struct sysinfo *val)
++{
++	val->freeswap = -1ul;
++	val->totalswap = -1ul;
++}
++
++unsigned long avenrun[3] = {-1 - FIXED_1/200, -1 - FIXED_1/200,
++				-1 - FIXED_1/200};
++int nr_threads = -1;
++
++void get_full_page_state(struct page_state *ps)
++{
++	memset(ps, -1, sizeof(struct page_state));
++}
++
++unsigned long nr_running(void)
++{
++	return -1;
++}
++
++unsigned long nr_iowait(void)
++{
++	return -1;
++}
++
++/*unsigned long nr_context_switches(void)
++{
++	return -1;
++}*/
++#endif /* MODULE */
++EXPORT_SYMBOL_GPL(si_swapinfo);
++EXPORT_SYMBOL_GPL(nr_threads);
++EXPORT_SYMBOL_GPL(avenrun);
++EXPORT_SYMBOL_GPL(get_full_page_state);
++EXPORT_SYMBOL_GPL(nr_running);
++EXPORT_SYMBOL_GPL(nr_iowait);
++//EXPORT_SYMBOL_GPL(nr_context_switches);
+diff -puN /dev/null arch/s390/appldata/appldata.h
+--- /dev/null	Thu Apr 11 07:25:15 2002
++++ 25-akpm/arch/s390/appldata/appldata.h	Fri Feb 20 16:03:40 2004
+@@ -0,0 +1,59 @@
++/*
++ * arch/s390/appldata/appldata.h
++ *
++ * Definitions and interface for Linux - z/VM Monitor Stream.
++ *
++ * Copyright (C) 2003 IBM Corporation, IBM Deutschland Entwicklung GmbH.
++ *
++ * Author: Gerald Schaefer <geraldsc@de.ibm.com>
++ */
++
++//#define APPLDATA_DEBUG			/* Debug messages on/off */
++
++#define APPLDATA_MAX_REC_SIZE	  4024	/* Maximum size of the */
++					/* data buffer */
++#define APPLDATA_MAX_PROCS 100
++
++#define APPLDATA_PROC_NAME_LENGTH 16	/* Max. length of /proc name */
++
++#define APPLDATA_RECORD_MEM_ID		0x01	/* IDs to identify the */
++#define APPLDATA_RECORD_OS_ID		0x02	/* individual records, */
++#define APPLDATA_RECORD_NET_SUM_ID	0x03	/* must be < 256 !     */
++#define APPLDATA_RECORD_PROC_ID		0x04
++
++#define CTL_APPLDATA 		2120	/* sysctl IDs, must be unique */
++#define CTL_APPLDATA_TIMER 	2121
++#define CTL_APPLDATA_INTERVAL 	2122
++#define CTL_APPLDATA_MEM	2123
++#define CTL_APPLDATA_OS		2124
++#define CTL_APPLDATA_NET_SUM	2125
++#define CTL_APPLDATA_PROC	2126
++
++#define P_INFO(x...)	printk(KERN_INFO MY_PRINT_NAME " info: " x)
++#define P_ERROR(x...)	printk(KERN_ERR MY_PRINT_NAME " error: " x)
++#define P_WARNING(x...)	printk(KERN_WARNING MY_PRINT_NAME " status: " x)
++
++#ifdef APPLDATA_DEBUG
++#define P_DEBUG(x...)   printk(KERN_DEBUG MY_PRINT_NAME " debug: " x)
++#else
++#define P_DEBUG(x...)   do {} while (0)
++#endif
++
++struct appldata_ops {
++	struct list_head list;
++	struct ctl_table_header *sysctl_header;
++	struct ctl_table *ctl_table;
++	int    active;				/* monitoring status */
++
++	/* fill in from here */
++	unsigned int ctl_nr;			/* sysctl ID */
++	char name[APPLDATA_PROC_NAME_LENGTH];	/* name of /proc fs node */
++	unsigned char record_nr;		/* Record Nr. for Product ID */
++	void (*callback)(void *data);		/* callback function */
++	void *data;				/* record data */
++	unsigned int size;			/* size of record */
++	struct module *owner;			/* THIS_MODULE */
++};
++
++extern int appldata_register_ops(struct appldata_ops *ops);
++extern void appldata_unregister_ops(struct appldata_ops *ops);
+diff -puN /dev/null arch/s390/appldata/appldata_mem.c
+--- /dev/null	Thu Apr 11 07:25:15 2002
++++ 25-akpm/arch/s390/appldata/appldata_mem.c	Fri Feb 20 16:03:40 2004
+@@ -0,0 +1,183 @@
++/*
++ * arch/s390/appldata/appldata_mem.c
++ *
++ * Data gathering module for Linux-VM Monitor Stream, Stage 1.
++ * Collects data related to memory management.
++ *
++ * Copyright (C) 2003 IBM Corporation, IBM Deutschland Entwicklung GmbH.
++ *
++ * Author: Gerald Schaefer <geraldsc@de.ibm.com>
++ */
++
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/errno.h>
++#include <linux/kernel_stat.h>
++#include <asm/io.h>
++#include <linux/pagemap.h>
++#include <linux/swap.h>
++
++#include "appldata.h"
++
++
++#define MY_PRINT_NAME "appldata_mem"		/* for debug messages, etc. */
++#define P2K(x) ((x) << (PAGE_SHIFT - 10))	/* Converts #Pages to KB */
++
++/*
++ * Memory data
++ */
++struct appldata_mem_data {
++	u64 timestamp;
++	u32 sync_count_1;       /* after VM collected the record data, */
++	u32 sync_count_2;	/* sync_count_1 and sync_count_2 should be the
++				   same. If not, the record has been updated on
++				   the Linux side while VM was collecting the
++				   (possibly corrupt) data */
++
++	u64 pgpgin;		/* data read from disk  */
++	u64 pgpgout;		/* data written to disk */
++	u64 pswpin;		/* pages swapped in  */
++	u64 pswpout;		/* pages swapped out */
++
++	u64 sharedram;		/* sharedram is currently set to 0 */
++
++	u64 totalram;		/* total main memory size */
++	u64 freeram;		/* free main memory size  */
++	u64 totalhigh;		/* total high memory size */
++	u64 freehigh;		/* free high memory size  */
++
++	u64 bufferram;		/* memory reserved for buffers, free cache */
++	u64 cached;		/* size of (used) cache, w/o buffers */
++	u64 totalswap;		/* total swap space size */
++	u64 freeswap;		/* free swap space */
++
++// New in 2.6 -->
++	u64 pgalloc;		/* page allocations */
++	u64 pgfault;		/* page faults (major+minor) */
++	u64 pgmajfault;		/* page faults (major only) */
++// <-- New in 2.6
++
++} appldata_mem_data;
++
++
++static inline void appldata_debug_print(struct appldata_mem_data *mem_data)
++{
++	P_DEBUG("--- MEM - RECORD ---\n");
++	P_DEBUG("pgpgin     = %8lu KB\n", mem_data->pgpgin);
++	P_DEBUG("pgpgout    = %8lu KB\n", mem_data->pgpgout);
++	P_DEBUG("pswpin     = %8lu Pages\n", mem_data->pswpin);
++	P_DEBUG("pswpout    = %8lu Pages\n", mem_data->pswpout);
++	P_DEBUG("pgalloc    = %8lu \n", mem_data->pgalloc);
++	P_DEBUG("pgfault    = %8lu \n", mem_data->pgfault);
++	P_DEBUG("pgmajfault = %8lu \n", mem_data->pgmajfault);
++	P_DEBUG("sharedram  = %8lu KB\n", mem_data->sharedram);
++	P_DEBUG("totalram   = %8lu KB\n", mem_data->totalram);
++	P_DEBUG("freeram    = %8lu KB\n", mem_data->freeram);
++	P_DEBUG("totalhigh  = %8lu KB\n", mem_data->totalhigh);
++	P_DEBUG("freehigh   = %8lu KB\n", mem_data->freehigh);
++	P_DEBUG("bufferram  = %8lu KB\n", mem_data->bufferram);
++	P_DEBUG("cached     = %8lu KB\n", mem_data->cached);
++	P_DEBUG("totalswap  = %8lu KB\n", mem_data->totalswap);
++	P_DEBUG("freeswap   = %8lu KB\n", mem_data->freeswap);
++	P_DEBUG("sync_count_1 = %u\n", mem_data->sync_count_1);
++	P_DEBUG("sync_count_2 = %u\n", mem_data->sync_count_2);
++	P_DEBUG("timestamp    = %lX\n", mem_data->timestamp);
++}
++
++/*
++ * appldata_get_mem_data()
++ *
++ * gather memory data
++ */
++static void appldata_get_mem_data(void *data)
++{
++	struct sysinfo val;
++	struct page_state ps;
++	struct appldata_mem_data *mem_data;
++
++	mem_data = data;
++	mem_data->sync_count_1++;
++
++	get_full_page_state(&ps);
++	mem_data->pgpgin     = ps.pgpgin >> 1;
++	mem_data->pgpgout    = ps.pgpgout >> 1;
++	mem_data->pswpin     = ps.pswpin;
++	mem_data->pswpout    = ps.pswpout;
++	mem_data->pgalloc    = ps.pgalloc;
++	mem_data->pgfault    = ps.pgfault;
++	mem_data->pgmajfault = ps.pgmajfault;
++
++P_DEBUG("pgalloc = %lu, pgfree = %lu\n", ps.pgalloc, ps.pgfree);
++
++	si_meminfo(&val);
++	mem_data->sharedram = val.sharedram;
++	mem_data->totalram  = P2K(val.totalram);
++	mem_data->freeram   = P2K(val.freeram);
++	mem_data->totalhigh = P2K(val.totalhigh);
++	mem_data->freehigh  = P2K(val.freehigh);
++	mem_data->bufferram = P2K(val.bufferram);
++	mem_data->cached    = P2K(atomic_read(&nr_pagecache) - val.bufferram);
++
++	si_swapinfo(&val);
++	mem_data->totalswap = P2K(val.totalswap);
++	mem_data->freeswap  = P2K(val.freeswap);
++
++	mem_data->timestamp = get_clock();
++	mem_data->sync_count_2++;
++#ifdef APPLDATA_DEBUG
++	appldata_debug_print(mem_data);
++#endif
++}
++
++
++static struct appldata_ops ops = {
++	.ctl_nr    = CTL_APPLDATA_MEM,
++	.name      = "mem",
++	.record_nr = APPLDATA_RECORD_MEM_ID,
++	.size	   = sizeof(struct appldata_mem_data),
++	.callback  = &appldata_get_mem_data,
++	.data      = &appldata_mem_data,
++	.owner     = THIS_MODULE,
++};
++
++
++/*
++ * appldata_mem_init()
++ *
++ * init_data, register ops
++ */
++static int __init appldata_mem_init(void)
++{
++	int rc;
++
++	P_DEBUG("sizeof(mem) = %lu\n", sizeof(struct appldata_mem_data));
++
++	rc = appldata_register_ops(&ops);
++	if (rc != 0) {
++		P_ERROR("Error registering ops, rc = %i\n", rc);
++	} else {
++		P_DEBUG("%s-ops registered!\n", ops.name);
++	}
++	return rc;
++}
++
++/*
++ * appldata_mem_exit()
++ *
++ * unregister ops
++ */
++static void __exit appldata_mem_exit(void)
++{
++	appldata_unregister_ops(&ops);
++	P_DEBUG("%s-ops unregistered!\n", ops.name);
++}
++
++
++module_init(appldata_mem_init);
++module_exit(appldata_mem_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Gerald Schaefer");
++MODULE_DESCRIPTION("Linux-VM Monitor Stream, MEMORY statistics");
+diff -puN /dev/null arch/s390/appldata/appldata_net_sum.c
+--- /dev/null	Thu Apr 11 07:25:15 2002
++++ 25-akpm/arch/s390/appldata/appldata_net_sum.c	Fri Feb 20 16:03:40 2004
+@@ -0,0 +1,187 @@
++/*
++ * arch/s390/appldata/appldata_net_sum.c
++ *
++ * Data gathering module for Linux-VM Monitor Stream, Stage 1.
++ * Collects accumulated network statistics (Packets received/transmitted,
++ * dropped, errors, ...).
++ *
++ * Copyright (C) 2003 IBM Corporation, IBM Deutschland Entwicklung GmbH.
++ *
++ * Author: Gerald Schaefer <geraldsc@de.ibm.com>
++ */
++
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/errno.h>
++#include <linux/kernel_stat.h>
++#include <linux/netdevice.h>
++
++#include "appldata.h"
++
++
++#define MY_PRINT_NAME	"appldata_net_sum"	/* for debug messages, etc. */
++
++
++/*
++ * Network data
++ */
++struct appldata_net_sum_data {
++	u64 timestamp;
++	u32 sync_count_1;	/* after VM collected the record data, */
++	u32 sync_count_2;	/* sync_count_1 and sync_count_2 should be the
++				   same. If not, the record has been updated on
++				   the Linux side while VM was collecting the
++				   (possibly corrupt) data */
++
++	u32 nr_interfaces;	/* nr. of network interfaces being monitored */
++
++	u32 padding;		/* next value is 64-bit aligned, so these */
++				/* 4 byte would be padded out by compiler */
++
++	u64 rx_packets;		/* total packets received        */
++	u64 tx_packets;		/* total packets transmitted     */
++	u64 rx_bytes;		/* total bytes received          */
++	u64 tx_bytes;		/* total bytes transmitted       */
++	u64 rx_errors;		/* bad packets received          */
++	u64 tx_errors;		/* packet transmit problems      */
++	u64 rx_dropped;		/* no space in linux buffers     */
++	u64 tx_dropped;		/* no space available in linux   */
++	u64 collisions;		/* collisions while transmitting */
++} appldata_net_sum_data;
++
++
++static inline void appldata_print_debug(struct appldata_net_sum_data *net_data)
++{
++	P_DEBUG("--- NET - RECORD ---\n");
++
++	P_DEBUG("nr_interfaces = %u\n", net_data->nr_interfaces);
++	P_DEBUG("rx_packets    = %8lu\n", net_data->rx_packets);
++	P_DEBUG("tx_packets    = %8lu\n", net_data->tx_packets);
++	P_DEBUG("rx_bytes      = %8lu\n", net_data->rx_bytes);
++	P_DEBUG("tx_bytes      = %8lu\n", net_data->tx_bytes);
++	P_DEBUG("rx_errors     = %8lu\n", net_data->rx_errors);
++	P_DEBUG("tx_errors     = %8lu\n", net_data->tx_errors);
++	P_DEBUG("rx_dropped    = %8lu\n", net_data->rx_dropped);
++	P_DEBUG("tx_dropped    = %8lu\n", net_data->tx_dropped);
++	P_DEBUG("collisions    = %8lu\n", net_data->collisions);
++
++	P_DEBUG("sync_count_1 = %u\n", net_data->sync_count_1);
++	P_DEBUG("sync_count_2 = %u\n", net_data->sync_count_2);
++	P_DEBUG("timestamp    = %lX\n", net_data->timestamp);
++}
++
++/*
++ * appldata_get_net_sum_data()
++ *
++ * gather accumulated network statistics
++ */
++static void appldata_get_net_sum_data(void *data)
++{
++	int i;
++	struct appldata_net_sum_data *net_data;
++	struct net_device *dev;
++	struct net_device_stats *stats;
++	unsigned long rx_packets, tx_packets, rx_bytes, tx_bytes, rx_errors,
++			tx_errors, rx_dropped, tx_dropped, collisions;
++
++	net_data = data;
++	net_data->sync_count_1++;
++
++	i = 0;
++	rx_packets = 0;
++	tx_packets = 0;
++	rx_bytes   = 0;
++	tx_bytes   = 0;
++	rx_errors  = 0;
++	tx_errors  = 0;
++	rx_dropped = 0;
++	tx_dropped = 0;
++	collisions = 0;
++	read_lock(&dev_base_lock);
++	for (dev = dev_base; dev != NULL; dev = dev->next) {
++		if (dev->get_stats == NULL) {
++			continue;
++		}
++		stats = dev->get_stats(dev);
++		rx_packets += stats->rx_packets;
++		tx_packets += stats->tx_packets;
++		rx_bytes   += stats->rx_bytes;
++		tx_bytes   += stats->tx_bytes;
++		rx_errors  += stats->rx_errors;
++		tx_errors  += stats->tx_errors;
++		rx_dropped += stats->rx_dropped;
++		tx_dropped += stats->tx_dropped;
++		collisions += stats->collisions;
++		i++;
++	}
++	read_unlock(&dev_base_lock);
++	net_data->nr_interfaces = i;
++	net_data->rx_packets = rx_packets;
++	net_data->tx_packets = tx_packets;
++	net_data->rx_bytes   = rx_bytes;
++	net_data->tx_bytes   = tx_bytes;
++	net_data->rx_errors  = rx_errors;
++	net_data->tx_errors  = tx_errors;
++	net_data->rx_dropped = rx_dropped;
++	net_data->tx_dropped = tx_dropped;
++	net_data->collisions = collisions;
++
++	net_data->timestamp = get_clock();
++	net_data->sync_count_2++;
++#ifdef APPLDATA_DEBUG
++	appldata_print_debug(net_data);
++#endif
++}
++
++
++static struct appldata_ops ops = {
++	.ctl_nr    = CTL_APPLDATA_NET_SUM,
++	.name	   = "net_sum",
++	.record_nr = APPLDATA_RECORD_NET_SUM_ID,
++	.size	   = sizeof(struct appldata_net_sum_data),
++	.callback  = &appldata_get_net_sum_data,
++	.data      = &appldata_net_sum_data,
++	.owner     = THIS_MODULE,
++};
++
++
++/*
++ * appldata_net_init()
++ *
++ * init data, register ops
++ */
++static int __init appldata_net_init(void)
++{
++	int rc;
++
++	P_DEBUG("sizeof(net) = %lu\n", sizeof(struct appldata_net_sum_data));
++
++	rc = appldata_register_ops(&ops);
++	if (rc != 0) {
++		P_ERROR("Error registering ops, rc = %i\n", rc);
++	} else {
++		P_DEBUG("%s-ops registered!\n", ops.name);
++	}
++	return rc;
++}
++
++/*
++ * appldata_net_exit()
++ *
++ * unregister ops
++ */
++static void __exit appldata_net_exit(void)
++{
++	appldata_unregister_ops(&ops);
++	P_DEBUG("%s-ops unregistered!\n", ops.name);
++}
++
++
++module_init(appldata_net_init);
++module_exit(appldata_net_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Gerald Schaefer");
++MODULE_DESCRIPTION("Linux-VM Monitor Stream, accumulated network statistics");
+diff -puN /dev/null arch/s390/appldata/appldata_os.c
+--- /dev/null	Thu Apr 11 07:25:15 2002
++++ 25-akpm/arch/s390/appldata/appldata_os.c	Fri Feb 20 16:03:40 2004
+@@ -0,0 +1,231 @@
++/*
++ * arch/s390/appldata/appldata_os.c
++ *
++ * Data gathering module for Linux-VM Monitor Stream, Stage 1.
++ * Collects misc. OS related data (CPU utilization, running processes).
++ *
++ * Copyright (C) 2003 IBM Corporation, IBM Deutschland Entwicklung GmbH.
++ *
++ * Author: Gerald Schaefer <geraldsc@de.ibm.com>
++ */
++
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/errno.h>
++#include <linux/kernel_stat.h>
++#include <linux/netdevice.h>
++#include <linux/sched.h>
++#include <asm/smp.h>
++
++#include "appldata.h"
++
++
++#define MY_PRINT_NAME	"appldata_os"		/* for debug messages, etc. */
++#define LOAD_INT(x) ((x) >> FSHIFT)
++#define LOAD_FRAC(x) LOAD_INT(((x) & (FIXED_1-1)) * 100)
++
++/*
++ * OS data
++ */
++struct appldata_os_per_cpu {
++	u32 per_cpu_user;	/* timer ticks spent in user mode   */
++	u32 per_cpu_nice;	/* ... spent with modified priority */
++	u32 per_cpu_system;	/* ... spent in kernel mode         */
++	u32 per_cpu_idle;	/* ... spent in idle mode           */
++
++// New in 2.6 -->
++	u32 per_cpu_irq;	/* ... spent in interrupts          */
++	u32 per_cpu_softirq;	/* ... spent in softirqs            */
++	u32 per_cpu_iowait;	/* ... spent while waiting for I/O  */
++// <-- New in 2.6
++};
++
++struct appldata_os_data {
++	u64 timestamp;
++	u32 sync_count_1;	/* after VM collected the record data, */
++	u32 sync_count_2;	/* sync_count_1 and sync_count_2 should be the
++				   same. If not, the record has been updated on
++				   the Linux side while VM was collecting the
++				   (possibly corrupt) data */
++
++	u32 nr_cpus;		/* number of (virtual) CPUs        */
++	u32 per_cpu_size;	/* size of the per-cpu data struct */
++	u32 cpu_offset;		/* offset of the first per-cpu data struct */
++
++	u32 nr_running;		/* number of runnable threads      */
++	u32 nr_threads;		/* number of threads               */
++	u32 avenrun[3];		/* average nr. of running processes during */
++				/* the last 1, 5 and 15 minutes */
++
++// New in 2.6 -->
++	u32 nr_iowait;		/* number of blocked threads
++				   (waiting for I/O)               */
++// <-- New in 2.6
++
++	/* per cpu data */
++	struct appldata_os_per_cpu os_cpu[0];
++};
++
++static struct appldata_os_data *appldata_os_data;
++
++
++static inline void appldata_print_debug(struct appldata_os_data *os_data)
++{
++	int a0, a1, a2, i;
++
++	P_DEBUG("--- OS - RECORD ---\n");
++	P_DEBUG("nr_threads   = %u\n", os_data->nr_threads);
++	P_DEBUG("nr_running   = %u\n", os_data->nr_running);
++	P_DEBUG("nr_iowait    = %u\n", os_data->nr_iowait);
++	P_DEBUG("avenrun(int) = %8x / %8x / %8x\n", os_data->avenrun[0],
++		os_data->avenrun[1], os_data->avenrun[2]);
++	a0 = os_data->avenrun[0];
++	a1 = os_data->avenrun[1];
++	a2 = os_data->avenrun[2];
++	P_DEBUG("avenrun(float) = %d.%02d / %d.%02d / %d.%02d\n",
++		LOAD_INT(a0), LOAD_FRAC(a0), LOAD_INT(a1), LOAD_FRAC(a1),
++		LOAD_INT(a2), LOAD_FRAC(a2));
++
++	P_DEBUG("nr_cpus = %u\n", os_data->nr_cpus);
++	for (i = 0; i < NR_CPUS; i++) {
++		if (!cpu_online(i)) continue;
++		P_DEBUG("cpu%u : user = %u, nice = %u, system = %u, "
++			"idle = %u, irq = %u, softirq = %u, iowait = %u\n",
++				i,
++				os_data->os_cpu[i].per_cpu_user,
++				os_data->os_cpu[i].per_cpu_nice,
++				os_data->os_cpu[i].per_cpu_system,
++				os_data->os_cpu[i].per_cpu_idle,
++				os_data->os_cpu[i].per_cpu_irq,
++				os_data->os_cpu[i].per_cpu_softirq,
++				os_data->os_cpu[i].per_cpu_iowait);
++	}
++
++	P_DEBUG("sync_count_1 = %u\n", os_data->sync_count_1);
++	P_DEBUG("sync_count_2 = %u\n", os_data->sync_count_2);
++	P_DEBUG("timestamp    = %lX\n", os_data->timestamp);
++}
++
++/*
++ * appldata_get_os_data()
++ *
++ * gather OS data
++ */
++static void appldata_get_os_data(void *data)
++{
++	int i;
++	struct appldata_os_data *os_data;
++
++	os_data = data;
++	os_data->sync_count_1++;
++
++	os_data->nr_cpus = num_online_cpus();
++
++	os_data->nr_threads = nr_threads;
++	os_data->nr_running = nr_running();
++	os_data->nr_iowait  = nr_iowait();
++	os_data->avenrun[0] = avenrun[0] + (FIXED_1/200);
++	os_data->avenrun[1] = avenrun[1] + (FIXED_1/200);
++	os_data->avenrun[2] = avenrun[2] + (FIXED_1/200);
++
++	for (i = 0; i < num_online_cpus(); i++) {
++		os_data->os_cpu[i].per_cpu_user =
++					kstat_cpu(i).cpustat.user;
++		os_data->os_cpu[i].per_cpu_nice =
++					kstat_cpu(i).cpustat.nice;
++		os_data->os_cpu[i].per_cpu_system =
++					kstat_cpu(i).cpustat.system;
++		os_data->os_cpu[i].per_cpu_idle =
++					kstat_cpu(i).cpustat.idle;
++		os_data->os_cpu[i].per_cpu_irq =
++					kstat_cpu(i).cpustat.irq;
++		os_data->os_cpu[i].per_cpu_softirq =
++					kstat_cpu(i).cpustat.softirq;
++		os_data->os_cpu[i].per_cpu_iowait =
++					kstat_cpu(i).cpustat.iowait;
++	}
++
++	os_data->timestamp = get_clock();
++	os_data->sync_count_2++;
++#ifdef APPLDATA_DEBUG
++	appldata_print_debug(os_data);
++#endif
++}
++
++
++static struct appldata_ops ops = {
++	.ctl_nr    = CTL_APPLDATA_OS,
++	.name	   = "os",
++	.record_nr = APPLDATA_RECORD_OS_ID,
++	.callback  = &appldata_get_os_data,
++	.owner     = THIS_MODULE,
++};
++
++
++/*
++ * appldata_os_init()
++ *
++ * init data, register ops
++ */
++static int __init appldata_os_init(void)
++{
++	int rc, size;
++
++	size = sizeof(struct appldata_os_data) +
++		(NR_CPUS * sizeof(struct appldata_os_per_cpu));
++	if (size > APPLDATA_MAX_REC_SIZE) {
++		P_ERROR("Size of record = %i, bigger than maximum (%i)!\n",
++			size, APPLDATA_MAX_REC_SIZE);
++		rc = -ENOMEM;
++		goto out;
++	}
++	P_DEBUG("sizeof(os) = %i, sizeof(os_cpu) = %lu\n", size,
++		sizeof(struct appldata_os_per_cpu));
++
++	appldata_os_data = kmalloc(size, GFP_DMA);
++	if (appldata_os_data == NULL) {
++		P_ERROR("No memory for %s!\n", ops.name);
++		rc = -ENOMEM;
++		goto out;
++	}
++	memset(appldata_os_data, 0, size);
++
++	appldata_os_data->per_cpu_size = sizeof(struct appldata_os_per_cpu);
++	appldata_os_data->cpu_offset   = offsetof(struct appldata_os_data,
++							os_cpu);
++	P_DEBUG("cpu offset = %u\n", appldata_os_data->cpu_offset);
++
++	ops.data = appldata_os_data;
++	ops.size = size;
++	rc = appldata_register_ops(&ops);
++	if (rc != 0) {
++		P_ERROR("Error registering ops, rc = %i\n", rc);
++		kfree(appldata_os_data);
++	} else {
++		P_DEBUG("%s-ops registered!\n", ops.name);
++	}
++out:
++	return rc;
++}
++
++/*
++ * appldata_os_exit()
++ *
++ * unregister ops
++ */
++static void __exit appldata_os_exit(void)
++{
++	appldata_unregister_ops(&ops);
++	kfree(appldata_os_data);
++	P_DEBUG("%s-ops unregistered!\n", ops.name);
++}
++
++
++module_init(appldata_os_init);
++module_exit(appldata_os_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Gerald Schaefer");
++MODULE_DESCRIPTION("Linux-VM Monitor Stream, OS statistics");
+diff -puN /dev/null arch/s390/appldata/Makefile
+--- /dev/null	Thu Apr 11 07:25:15 2002
++++ 25-akpm/arch/s390/appldata/Makefile	Fri Feb 20 16:03:40 2004
+@@ -0,0 +1,8 @@
++#
++# Makefile for the Linux - z/VM Monitor Stream.
++#
++
++obj-$(CONFIG_APPLDATA_BASE) += appldata_base.o
++obj-$(CONFIG_APPLDATA_MEM) += appldata_mem.o
++obj-$(CONFIG_APPLDATA_OS) += appldata_os.o
++obj-$(CONFIG_APPLDATA_NET_SUM) += appldata_net_sum.o
+diff -puN arch/s390/Kconfig~s390-10-zvm-monitor-stream arch/s390/Kconfig
+--- 25/arch/s390/Kconfig~s390-10-zvm-monitor-stream	Fri Feb 20 16:03:40 2004
++++ 25-akpm/arch/s390/Kconfig	Fri Feb 20 16:03:40 2004
+@@ -261,6 +261,66 @@ config VIRT_TIMER
+ 	  This provides a kernel interface for virtual CPU timers.
+ 	  Default is disabled.
+ 
++config APPLDATA_BASE
++	bool "Linux - VM Monitor Stream, base infrastructure"
++	depends on PROC_FS && VIRT_TIMER=y
++	help
++	  This provides a kernel interface for creating and updating z/VM APPLDATA
++	  monitor records. The monitor records are updated at certain time
++	  intervals, once the timer is started.
++	  Writing 1 or 0 to /proc/appldata/timer starts(1) or stops(0) the timer,
++	  i.e. enables or disables monitoring on the Linux side.
++	  A custom interval value (in seconds) can be written to
++	  /proc/appldata/interval.
++
++	  Defaults are 60 seconds interval and timer off.
++	  The /proc entries can also be read from, showing the current settings.
++
++config APPLDATA_MEM
++	tristate "Monitor memory management statistics"
++	depends on APPLDATA_BASE
++	help
++	  This provides memory management related data to the Linux - VM Monitor
++	  Stream, like paging/swapping rate, memory utilisation, etc.
++	  Writing 1 or 0 to /proc/appldata/memory creates(1) or removes(0) a z/VM
++	  APPLDATA monitor record, i.e. enables or disables monitoring this record
++	  on the z/VM side.
++
++	  Default is disabled.
++	  The /proc entry can also be read from, showing the current settings.
++
++	  This can also be compiled as a module, which will be called
++	  appldata_mem.o.
++
++config APPLDATA_OS
++	tristate "Monitor OS statistics"
++	depends on APPLDATA_BASE
++	help
++	  This provides OS related data to the Linux - VM Monitor Stream, like
++	  CPU utilisation, etc.
++	  Writing 1 or 0 to /proc/appldata/os creates(1) or removes(0) a z/VM
++	  APPLDATA monitor record, i.e. enables or disables monitoring this record
++	  on the z/VM side.
++
++	  Default is disabled.
++	  This can also be compiled as a module, which will be called
++	  appldata_os.o.
++
++config APPLDATA_NET_SUM
++	tristate "Monitor overall network statistics"
++	depends on APPLDATA_BASE
++	help
++	  This provides network related data to the Linux - VM Monitor Stream,
++	  currently there is only a total sum of network I/O statistics, no
++	  per-interface data.
++	  Writing 1 or 0 to /proc/appldata/net_sum creates(1) or removes(0) a z/VM
++	  APPLDATA monitor record, i.e. enables or disables monitoring this record
++	  on the z/VM side.
++
++	  Default is disabled.
++	  This can also be compiled as a module, which will be called
++	  appldata_net_sum.o.
++
+ endmenu
+ 
+ config PCMCIA
+diff -puN arch/s390/Makefile~s390-10-zvm-monitor-stream arch/s390/Makefile
+--- 25/arch/s390/Makefile~s390-10-zvm-monitor-stream	Fri Feb 20 16:03:40 2004
++++ 25-akpm/arch/s390/Makefile	Fri Feb 20 16:03:40 2004
+@@ -44,7 +44,8 @@ head-$(CONFIG_ARCH_S390_31)	+= arch/$(AR
+ head-$(CONFIG_ARCH_S390X)	+= arch/$(ARCH)/kernel/head64.o
+ head-y				+= arch/$(ARCH)/kernel/init_task.o
+ 
+-core-y		+= arch/$(ARCH)/mm/ arch/$(ARCH)/kernel/
++core-y		+= arch/$(ARCH)/mm/ arch/$(ARCH)/kernel/ \
++		   arch/$(ARCH)/appldata/
+ libs-y		+= arch/$(ARCH)/lib/
+ drivers-y	+= drivers/s390/
+ drivers-$(CONFIG_MATHEMU) += arch/$(ARCH)/math-emu/
+
+_
