@@ -163,6 +163,8 @@ export ARCH=%_target_cpu
 case $ARCH in
 i?86)
     ARCH=i386 ;;
+s390x)
+    ARCH=s390 ;;
 esac
 
 if [ "$ARCH" != "$HOSTTYPE" ]; then
@@ -276,6 +278,8 @@ export ARCH=%_target_cpu
 case $ARCH in
 i?86)
     ARCH=i386 ;;
+s390x)
+    ARCH=s390 ;;
 esac
 
 shopt -s nullglob
@@ -309,6 +313,8 @@ if [ -e /.buildenv ]; then
 	case $ARCH in
 	(i?86)
 	    ARCH=i386 ;;
+	s390x)
+	    ARCH=s390 ;;
 	esac
 
 	cd /usr/src/linux-%ver_str/arch/$ARCH
