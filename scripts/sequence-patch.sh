@@ -58,9 +58,9 @@ if [ $# -gt 0 ]; then
     echo "SYNOPSIS: $0 [-qv] [--arch=...] [--symbol=...] [--dir=...] [last-patch-name]"
     exit 1
 fi
-case "$1" in
+case $SCRATCH_AREA in
 	/*) ;; 
-	*)  SCRATCH_AREA=`pwd`/$SCRATCH_AREA ;;
+	*)  SCRATCH_AREA=$(pwd)/$SCRATCH_AREA ;;
 esac
 
 # Some patches require patch 2.5.4. Abort with older versions.
