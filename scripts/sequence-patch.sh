@@ -7,7 +7,10 @@ source $(dirname $0)/config.sh
 
 QUIET=1
 EXTRA_SYMBOLS=
-CLEAN=
+CLEAN=1
+
+# Allow to pass in default arguments via SEQUENCE_PATCH_ARGS.
+set -- $SEQUENCE_PATCH_ARGS "$@"
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -31,8 +34,8 @@ while [ $# -gt 0 ]; do
 	    EXTRA_SYMBOLS="$EXTRA_SYMBOLS $2"
 	    shift
 	    ;;
-	--clean)
-	    CLEAN=1
+	--quilt)
+	    CLEAN=
 	    ;;
 	-|[^-]*)
 	    [ -n "$LIMIT" ] && break
