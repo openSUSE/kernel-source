@@ -192,7 +192,6 @@ rm -rf $PATCH_DIR/
 if [ -d $PATCH_DIR.orig ]; then
     echo "Linking from $PATCH_DIR.orig"
     cp -rld $PATCH_DIR.orig $PATCH_DIR
-    find $PATCH_DIR -type d | xargs chmod +w
 else
     echo "Extracting $LINUX_ORIG_TARBALL"
     tar xf$COMPRESS_MODE $LINUX_ORIG_TARBALL --directory $SCRATCH_AREA
@@ -201,7 +200,7 @@ else
 	mv ${PATCH_DIR%-$VERSION} $PATCH_DIR
     fi
     cp -rld $PATCH_DIR $PATCH_DIR.orig
-#    chmod -R a-w $PATCH_DIR.orig
+    find $PATCH_DIR.orig -type f | xargs chmod a-w
 fi
 
 # Helper function to restore files backed up by patch. This is
