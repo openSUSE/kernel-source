@@ -45,7 +45,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 if [ $# -gt 0 ]; then
-    echo "SYNOPSIS: $0 [-v] [last-patch-name]"
+    echo "SYNOPSIS: $0 [-qv] [--arch=...] [--symbol=...] [last-patch-name]"
     exit 1
 fi
 

@@ -30,6 +30,6 @@ echo $A ${A}_$C
 cp -v $i .config
 $YES make ARCH=$ARCH oldconfig
 cp -v .config ${A}_$C
-test -f patches/config/$A/$B && cp -v .config patches/config/$A/$B
+[ -f patches/config/$A/$B ] && cp -v .config patches/config/$A/$B
 diff -u $i .config
 done

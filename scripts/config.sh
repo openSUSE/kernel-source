@@ -1,5 +1,5 @@
 
-if test -d /home/ftp/pub/kernel; then
+if [ -d /home/ftp/pub/kernel ]; then
 	# kraxel @home
 	MIRROR=${MIRROR:-/home/ftp/pub/kernel}
 else
@@ -9,4 +9,3 @@ fi
 
 VERSION=2.6.1
 BUILD_DIR=kernel-source-26
-
