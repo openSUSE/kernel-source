@@ -1,5 +1,5 @@
 relink linux-%ver_str $RPM_BUILD_ROOT/usr/src/linux
-%if %preconf
+if [ 0%preconf -ne 0 ]; then
 /sbin/insserv running-kernel
 
 if [ -e /.buildenv ]; then
@@ -20,4 +20,4 @@ if [ -e /.buildenv ]; then
 fi
 
 /etc/rc.d/running-kernel
-%endif
+fi
