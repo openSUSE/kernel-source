@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright (C) 2004 Andrea Arcangeli <andrea@suse.de> SUSE
-# $Id: mkpatch.py,v 1.9 2004/11/25 02:43:07 andrea Exp $
+# $Id: mkpatch.py,v 1.11 2004/11/29 06:25:04 andrea Exp $
 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -333,7 +333,7 @@ def mkpatch(*args):
 	if not olddir and newdir:
 		# use backup files
 		print >>sys.stderr, 'Searching backup files in %s ...' % newdir,
-		find = os.popen('find %s -type f -name \*~ 2>/dev/null' % newdir, 'r')
+		find = os.popen('find %s -type f \( -name \*~ -or -name \*.orig \) 2>/dev/null' % newdir, 'r')
 		files = find.readlines()
 		if files:
 			print >>sys.stderr, 'done.'
@@ -344,7 +344,9 @@ def mkpatch(*args):
 		for backup_f in files:
 			new_f = None
 			backup_f = backup_f[:-1]
-			if backup_f[-4:] == '.~1~':
+			if backup_f[-5:] == '.orig':
+				new_f = backup_f[:-5]
+			elif backup_f[-4:] == '.~1~':
 				new_f = backup_f[:-4]
 			elif backup_f[-1:] == '~':
 				new_f = backup_f[:-1]
@@ -353,8 +355,12 @@ def mkpatch(*args):
 
 			if new_f:
 				print >>sys.stderr, 'Diffing %s...' % new_f,
-				diff += os.popen(DIFF_CMD + ' %s %s' % (backup_f, new_f) + ' 2>/dev/null').read()
-				print >>sys.stderr, 'done.'
+				this_diff = os.popen(DIFF_CMD + ' %s %s' % (backup_f, new_f) + ' 2>/dev/null').read()
+				diff += this_diff
+				if this_diff:
+					print >>sys.stderr, 'unchanged.'
+				else:
+					print >>sys.stderr, 'unchanged.'
 	elif olddir and newdir:
 		# use two directories
 		print >>sys.stderr, 'Creating diff between %s and %s ...' % (olddir, newdir),
