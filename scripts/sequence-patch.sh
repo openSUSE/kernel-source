@@ -192,7 +192,7 @@ rm -rf $PATCH_DIR/
 if [ -d $PATCH_DIR.orig ]; then
     echo "Linking from $PATCH_DIR.orig"
     cp -rld $PATCH_DIR.orig $PATCH_DIR
-    find $PATCH_DIR -type d | xargs chmod a+w
+    find $PATCH_DIR -type d | xargs chmod +w
 else
     echo "Extracting $LINUX_ORIG_TARBALL"
     tar xf$COMPRESS_MODE $LINUX_ORIG_TARBALL --directory $SCRATCH_AREA
