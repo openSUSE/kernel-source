@@ -18,9 +18,11 @@ fi
 # Update the /boot/vmlinuz and /boot/initrd symlinks
 case @KERNELRELEASE@ in
     (*xen*|*um*)
+	NOBOOTSPLASH="-s off"
     	#nothing to be done
 	;;
     (*)	
+	unset NOBOOTSPLASH
 	for x in /boot/$image /boot/initrd; do
 	    if [ -e $x -a "$(readlink $x)" != ${x##*/}-@KERNELRELEASE@ ]; then
 		mv -f $x $x.previous
@@ -33,7 +35,7 @@ esac
 if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
     if [ -f /etc/fstab ]; then
 	if ! /sbin/mkinitrd -k /boot/$image-@KERNELRELEASE@ \
-			    -i /boot/initrd-@KERNELRELEASE@; then
+			    -i /boot/initrd-@KERNELRELEASE@ $NOBOOTSPLASH; then
 	    echo "/sbin/mkinitrd failed" >&2
 	    exit 1
 	fi
@@ -42,14 +44,7 @@ if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
     fi
 
     case @KERNELRELEASE@ in
-	(*xen*)
-	    # Remove bootsplash picture 
-	    mv /boot/initrd-@KERNELRELEASE@ /boot/initrd-@KERNELRELEASE@.gz
-	    #echo "gunzipping /boot/initrd-@KERNELRELEASE@.gz"
-	    gunzip -f /boot/initrd-@KERNELRELEASE@.gz
-	    gzip -9f /boot/initrd-@KERNELRELEASE@
-	    ;;
-	(*um*)
+	(*xen*|*um*)
 	    # nothing to be done
     	    ;;
   	(*)	
