@@ -185,3 +185,6 @@ fi
 if [ ! -r $LINUX_ORIG_TARBALL ]; then
   echo "Please add $SRC_FILE to $BUILD_DIR"
 fi
+
+echo "IF you want to submit the kernel to autobuild now,"
+echo "how about a mbuild on all archs before doing so?"
