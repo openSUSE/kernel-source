@@ -1,0 +1,399 @@
+#! /bin/sh
+
+set -e  # exit on errors
+#set -x  # trace
+
+export CVS_RSH=ssh
+hostname=$(hostname).$(hostname -d)
+build=/work/src/bin/build
+build_root_base=/abuild/buildsystem.kernel
+tools=/work/src/bin/tools
+pidfile=/var/run/${0##*/}.pid
+cachesize=1024
+keepdays=7
+renice=+9
+report_lines=1000
+mailto=root
+
+update_and_prepare() {
+    local archs=$1 rnums=$2 unchanged=0
+    cvs_update 2>&1 || unchanged=1
+    if [ -z "$unchanged" -o -n "$force_build" ]; then
+	tar_up
+    fi
+    get_release_number "$archs" "$rnums" \
+    | su $user -c "cat > $directory/kernel-source/get_release_number.sh"
+    return $unchanged
+}
+
+cvs_update() {(
+    echo "[update working directory]"
+    cd $directory
+    messages=$(su $user -c "cvs update")
+    echo -n "$messages" 2>&1 | grep -v -e '^cvs server:' -e '^?'
+)}
+
+tar_up() {(
+    echo "[packing up sources]"
+    cd $directory
+    su $user -c scripts/tar-up.sh
+)}
+
+now() {
+    date '+%s'
+}
+
+elapsed_since() {
+    local ts=$[$(now) - $1]
+    printf '%d:%02d' $[$ts/60] $[$ts%60]
+}
+
+# the name of the build root to use
+build_root() {
+    local arch=$1
+    echo -n "$build_root_base."
+    case $(uname -m):$arch in
+	x86_64:i?86)	echo i386 ;;
+	ppc64:ppc*)	echo ppc ;;
+	*)		echo $arch ;;
+    esac
+}
+
+# The architecture emulation wrapper to use (if any).
+emulator() {
+    local arch=$1
+    case $(uname -m):$arch in
+	x86_64:i?86)	echo linux32 ;;
+	ppc64:ppc*)	echo powerpc32 ;;
+    esac
+}
+
+in_build_root() {
+    local arch=$1
+    shift
+    $(emulator $arch) chroot $BUILD_ROOT "$@"
+}
+
+ccache_stats() {
+    local arch=$1
+    export CCACHE_DIR=.ccache
+    if [ -d $BUILD_ROOT ]; then
+	in_build_root $arch ccache -s
+	in_build_root $arch ccache -z > /dev/null
+    fi
+}
+
+# Compute the next free release number (m.n) for a particular architecture
+last_release_number() {
+    local arch=$1
+    local abuild_next=$($tools/get_next_release $arch kernel-source $VERSION)
+
+    case $arch in
+    i?86)	arch=i586 ;;
+    ppc*)	arch=ppc ;;
+    esac
+
+    set -- $(find $homedir/built -name kernel-*-$VERSION-*.$arch.rpm \
+    | sed -e 's/.*-//' -e "s/\.$arch\.rpm//" -e 's/\./ /' \
+    | while read maj min; do
+	echo $(printf '%4d' $maj) $(printf '%4d' $min)
+    done \
+    | sort -r | head -n 1)
+
+    if (( $abuild_next > ${1:-0} )); then
+	echo $abuild_next.0
+    else
+	echo $1.$[${2:--1}+1]
+    fi
+}
+
+last_release_numbers() {
+    local archs=$1 arch
+
+    for arch in $archs ; do
+	last_release_number $arch
+    done
+}
+
+# Create a suitable get_release_number.sh script
+get_release_number() {
+    local archs rnums n
+    archs=( $1 )
+    rnums=( $2 )
+
+    echo 'case $(uname -m) in'
+    for (( n=0 ; $n<${#archs[@]} ; n++ )); do
+	arch=${archs[$n]}
+	case $arch in
+	i?86)	arch='i?86' ;;
+	esac
+	echo -e "$arch)\techo ${rnums[$n]} ;;"
+    done
+    echo -e '*)\techo $2.0 ;;'
+    echo 'esac'
+}
+
+build_rpm() {
+    local package=$1 arch=$2
+    shift 2
+    echo "[building $package ($arch)]" >&2
+    local err=0
+    (   cd $directory/kernel-source
+	$(emulator $arch) $build --ccache $jobs "$@" $package.spec
+    ) || err=1
+    shopt -s nullglob
+    rpms=$(echo $BUILD_ROOT/usr/src/packages/RPMS/*/$package-*.rpm \
+		$BUILD_ROOT/usr/src/packages/SRPMS/$package-*.rpm)
+    shopt -u nullglob
+    su $user -c "mkdir -p $homedir/built/$arch"
+    if [ -n "$rpms" ]; then
+	su $user -c "cp -v $rpms $homedir/built/$arch/"
+	if [ $err = 1 ]; then
+	    err=2
+	fi
+    else
+	echo "[no rpm created]"
+    fi
+    return $err
+}
+
+# Get certain flavors in front of others
+schwartz_sort() {
+    for word in "$@"; do
+	case $word in
+	default)    echo "0 $word" ;;
+	smp)	    echo "1 $word" ;;
+	*)	    echo "2 $word" ;;
+	esac
+    done \
+    | sort \
+    | sed -e 's/^[^ ]\+ //'
+}
+
+# Remove packages older than a certain age [days].
+remove_old_builds() {
+    local days=$1
+    local said
+
+    old=$(mktemp /tmp/timestamp.XXXXXX)
+    touch -d "$days days ago" $old
+
+    for file in $(find $homedir/built -type f); do
+	[ $file -ot $old ] || continue
+	
+	if [ -z "$said" ]; then
+	    echo "[removing builds older than $days days]"
+	    said=1
+	fi
+	echo $file
+	su $user -c "rm -rf $file"
+    done
+
+    rm -f $old
+}
+
+# Limit the space used in dir to size [Mib].
+limit_size() {
+    local size=$1
+    local said
+
+    while [ "$(du -s $homedir | awk '{print int($1/1024)}')" -gt $size ]; do
+	if [ -z "$said" ]; then
+	    echo "[shrinking rpm cache]"
+	    said=1
+	fi
+	rpm="$(shopt -s nullglob ; \
+	       ls -d $homedir/built/*/*.rpm | sort | head -n 1)"
+	if [ -n "$rpm" ]; then
+	    echo "$rpm"
+	    su $user -c "rm -f $rpm"
+	    su $user -c "rmdir $(dirname $rpm) 2> /dev/null" || :
+	else
+	    echo "no files to recycle"
+	    break
+	fi
+    done
+}
+
+# Run a copy of myself in /tmp, so that the original script can be
+# changed more easily.
+if [ ${0:0:5} != /tmp/ ]; then
+    tmpname=$(mktemp /tmp/${0##*/}.XXXXXX)
+    cp -p $0 $tmpname
+    exec $tmpname "$@"
+    echo "exec failed" >&2
+    exit 1  # never reached, usually...
+fi
+
+usage() {
+    basename=${0##*/}
+    basename=${basename/.*}
+    echo "SYNOPSIS: $basename [--force] [--dir ...] [--jobs n] [--flavor ...] [--user ...] [--mailto ...] arch ..."
+    exit 1
+}
+
+options=`getopt -o fh --long dir:,jobs:,flavor:,user:,mailto:,force -- "$@"`
+
+if [ $? -ne 0 ]
+then
+	usage
+fi
+
+eval set -- "$options"
+
+while :; do
+    case $1 in
+    --dir)      homedir=$2
+    		shift 2 ;;
+    --jobs)	jobs="--jobs $2"
+		shift 2 ;;
+    --flavor)   opt_flavors="$opt_flavors $2"
+		shift 2 ;;
+    --user)	user=$2
+		shift 2 ;;
+    --mailto)	mailto=$2
+		shift 2 ;;
+    --force)	force_build=1
+		shift ;;
+    --)		shift
+		break ;;
+    *)		usage ;;
+    esac
+done
+
+if [ $# == 0 ]; then
+    usage
+fi
+
+opt_archs="$*"
+directory=$homedir/kernel-source-26
+
+# Pull in the kernel configuration
+source $directory/scripts/config.sh
+
+# Check for running processes
+pid=$(cat $pidfile 2> /dev/null || :)
+if [ -n "$pid" ]; then
+    if [ -d /proc/$pid ]; then
+	# Another instance seems to be running.
+	exit 0
+    else
+	rm -f $pidfile
+    fi
+fi
+
+# Create pid file (race free)
+set -o noclobber
+echo $$ > $pidfile \
+|| exit 0  # race with another instance
+set +o noclobber
+
+if [ -e $homedir/force-build ]; then
+    force_build=1
+    rm -f $homedir/force-build
+fi
+
+if ! [ -d $directory ]; then
+    echo "Directory $directory does not exist" >&2
+    exit 1
+fi
+
+# open /dev/null as standard input
+exec < /dev/null
+
+archs=( $opt_archs )
+rnums=( $(last_release_numbers "${archs[*]}") )
+if setup="$(update_and_prepare "${archs[*]}" "${rnums[*]}")" \
+   || [ -n "$force_build" ]; then
+    cd $homedir
+    [ -n "$renice" ] \
+    && renice $renice $$ > /dev/null
+
+    batch_start_timestamp=$(now)
+    summary=$(mktemp /tmp/${0##*/}.XXXXXX)
+    cat >> $summary <<-EOF
+	building on: $hostname:$homedir
+	start time: $(date '+%Y%m%d-%H%M')
+
+	EOF
+
+    for (( n=0 ; $n<${#archs[@]} ; n++ )); do
+	arch=${archs[$n]}
+	rnum=${rnums[$n]}
+	export BUILD_ROOT="$(build_root $arch)"
+	ccache_stats $arch > /dev/null  # reset statistics
+
+	if [ -z "$opt_flavors" ]; then
+	    flavors=$(schwartz_sort $(
+		shopt -s nullglob
+		for config in $directory/config/$arch/*; do
+		    [ -f $config ] || continue
+		    flavor=${config##*/}
+		    #[ $flavor = um ] && continue
+		    echo $flavor
+		done))
+	    flavors="$flavors source"
+	else
+	    flavors=$opt_flavors
+	fi
+
+	no_init=
+	for flavor in $flavors; do
+	    if ! [ -e $directory/kernel-source/kernel-$flavor.spec ]; then
+		echo "[kernel-$flavor.spec does not exist]"
+	    fi
+
+	    start_timestamp=$(now)
+
+	    status="succeeded"
+	    output="$(build_rpm kernel-$flavor $arch $no_init --no-checks 2>&1)" \
+	    || case $? in
+		2)	status="warnings" ;; 
+		*)	status="failed" ;;
+	    esac
+
+	    su $user -c "mkdir -p $homedir/built/$arch"
+	    logfile=$homedir/built/$arch/kernel-$flavor-$VERSION-$rnum.log.gz
+	    (   echo "$setup"
+	        echo "$output"
+		echo "[statistics]"
+		echo "time: $(elapsed_since $start_timestamp)"
+		ccache_stats $arch
+	    ) | gzip -9 > $logfile
+	    chown $user $logfile
+	    
+	    cat >> $summary <<-EOF
+		$arch $flavor $status (time: $(elapsed_since $start_timestamp))
+		EOF
+
+	    if [ $status != succeeded ]; then
+		(   echo "$hostname"
+		    echo "\$ zcat $logfile | tail -n $report_lines"
+		    zcat $logfile | tail -n $report_lines
+		) | mail -s "[cvs build] $arch $flavor $status" $mailto
+	    fi
+
+	    [ -n "$opt_flavor" ] && break
+
+	    # Only need to initialize once for all flavors
+	    no_init=--no-init
+	done
+    done
+
+    cat >> $summary <<-EOF
+
+	total time: $(elapsed_since $batch_start_timestamp)
+
+	EOF
+
+    (   remove_old_builds $keepdays
+	echo
+	limit_size $cachesize
+    ) >> $summary
+
+    mail -s "[cvs build] ($opt_archs) summary" $mailto < $summary
+    rm -f $summary
+fi
+
+rm -f $pidfile
+[ ${0:0:5} == /tmp/ -a $0 != ${0/.} ] && rm -f $0
