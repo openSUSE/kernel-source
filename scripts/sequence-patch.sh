@@ -200,6 +200,7 @@ else
 	mv ${PATCH_DIR%-$VERSION} $PATCH_DIR
     fi
     cp -rld $PATCH_DIR $PATCH_DIR.orig
+    chmod -R a-w $PATCH_DIR
 fi
 
 # Helper function to restore files backed up by patch. This is
@@ -321,7 +322,7 @@ for config in $CONFIGS; do
 	chmod +x rpm/config-subst
 	cat config/$config \
 	| rpm/config-subst CONFIG_CFGNAME \"$name\" \
-	| rpm/config-subst CONFIG_RELEASE 0 \
+	| rpm/config-subst CONFIG_RELEASE \"0\" \
 	| rpm/config-subst CONFIG_SUSE_KERNEL y \
 	> $TMPFILE
 
