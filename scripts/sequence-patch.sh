@@ -6,20 +6,38 @@ source $(dirname $0)/config.sh
 #PATCH_ARCH=...
 
 QUIET=1
+EXTRA_SYMBOLS=
 
 while [ $# -gt 0 ]; do
     case $1 in
-    	(-q)
+    	-q)
 	    QUIET=1
 	    ;;
-    	(-v)
+    	-v)
 	    unset QUIET
 	    ;;
-	([^-]*)
+	--quilt)
+	    QUILT=1  # temporary hack ...
+	    ;;
+	--arch=*)
+	    export PATCH_ARCH="${1#--arch=}"
+	    ;;
+	--arch)
+	    export PATCH_ARCH="$2"
+	    shift
+	    ;;
+	--symbol=*)
+	    EXTRA_SYMBOLS="$EXTRA_SYMBOLS ${1#--symbol=}"
+	    ;;
+	--symbol)
+	    EXTRA_SYMBOLS="$EXTRA_SYMBOLS $2"
+	    shift
+	    ;;
+	[^-]*)
 	    [ -n "$LIMIT" ] && break
 	    LIMIT=$1
 	    ;;
-	(*)
+	*)
 	    break
 	    ;;
     esac
@@ -42,8 +60,7 @@ esac
 
 # Check SCRATCH_AREA.
 if [ -z "$SCRATCH_AREA" ]; then
-    echo "Please export SCRATCH_AREA=/tmp/kscratch (example)"
-    echo "creating a temporary scratch area does not work yet"
+    echo "SCRATCH_AREA not defined (set to /var/tmp/scratch or similar)"
     exit 1
 fi
 if [ ! -d "$SCRATCH_AREA" ]; then
@@ -106,8 +123,8 @@ if [ ! -r series.conf ]; then
     echo "Configuration file \`series.conf' not found"
     exit 1
 fi
-if [ -e scripts/check-conf ]; then
-    scripts/check-conf || {
+if [ -e scripts/check-patches ]; then
+    scripts/check-patches || {
 	echo "Inconsistencies found."
 	echo "Please clean up series.conf and/or the patches directories!"
 	read
@@ -139,9 +156,11 @@ fi
 
 echo "Architecture symbol(s): $SYMBOLS"
 if [ -s extra-symbols ]; then
-	EXTRA_SYMBOLS=$(cat extra-symbols)
-	echo "Extra symbols: $EXTRA_SYMBOLS"
-	SYMBOLS="$SYMBOLS $EXTRA_SYMBOLS"
+	EXTRA_SYMBOLS="$EXTRA_SYMBOLS $(cat extra-symbols)"
+fi
+if [ -n "$EXTRA_SYMBOLS" ]; then
+    echo "Extra symbols: $EXTRA_SYMBOLS"
+    SYMBOLS="$SYMBOLS $EXTRA_SYMBOLS"
 fi
 
 PATCHES=$(scripts/guards $SYMBOLS < series.conf)
@@ -210,10 +229,12 @@ restore_files() {
 }
 
 # Patch kernel
-for PATCH in $PATCHES; do
+set -- $PATCHES
+while [ $# -gt 0 ]; do
+    PATCH="$1"
     if [ "$PATCH" = "$LIMIT" ]; then
 	STEP_BY_STEP=1
-	echo "*** Stopping before $PATCH ***"
+	echo "Stopping before $PATCH"
     fi
     if [ -n "$STEP_BY_STEP" ]; then
 	while true; do
@@ -235,14 +256,12 @@ for PATCH in $PATCHES; do
     fi
 
     if [ ! -r "$PATCH" ]; then
-	echo "*** Patch $PATCH not found ***"
+	echo "Patch $PATCH not found."
 	exit 1
     fi
     echo "[ $PATCH ]"
     echo "[ $PATCH ]" >> $PATCH_LOG
     echo $PATCH >> $SCRATCH_AREA/series
-    #patch -d $PATCH_DIR --no-backup-if-mismatch -p1 \
-    #	< $PATCH > $LAST_LOG 2>&1
     patch -d $PATCH_DIR --backup --prefix=.sequence_patch/ -p1 \
 	    < $PATCH > $LAST_LOG 2>&1
     STATUS=$?
@@ -254,43 +273,52 @@ for PATCH in $PATCHES; do
     [ -z "$QUIET" ] && cat $LAST_LOG
     if [ $STATUS -ne 0 ]; then
 	[ -n "$QUIET" ] && cat $LAST_LOG
-	echo "*** Patch $PATCH failed (rolled back) ***" >&2
-	failed=1
+	echo "Patch $PATCH failed (rolled back)."
+	echo "Logfile: $PATCH_LOG"
+	status=1
 	break
     else
 	rm -f $LAST_LOG
     fi
+    shift
 done
 
 [ -n "$enough_free_space" ] \
     && rm -rf $PATCH_DIR/.sequence_patch
-[ -n "$failed" ] && exit 1
 
-# config_subst makes sure that CONFIG_CFGNAME and CONFIG_RELEASE are
-# set correctly.
+if [ -n "$QUILT" ]; then
+    ln -s $PWD $PATCH_DIR/patches
+    ( IFS=$'\n' ; echo "$*" ) > $PATCH_DIR/series
+fi
 
-config_subst()
-{
-    local name=$1 release=$2
+[ $# -gt 0 ] && exit $status
+
+# Substitute CONFIG_ variables
+config_subst() {
     awk '
-	function print_name(force)
+	function subst(force)
 	{
-	    if (!done_name || force)
-		printf "CONFIG_CFGNAME=\"%s\"\n", "'"$name"'"
-	    done_name=1
-	}
-	function print_release(force)
-	{
-	    if (!done_release || force)
-		printf "CONFIG_RELEASE=%d\n", '"$release"'
-	    done_release=1
+	    if (!done || force) {
+		if (has_value)
+		    print symbol "=" value
+		else
+		    print "# " symbol " is not set"
+	    }
+	    done=1
 	}
 
-	/\<CONFIG_CFGNAME\>/	{ print_name(1) ; next }
-	/\<CONFIG_RELEASE\>/	{ print_release(1) ; next }
-				{ print }
-	END			{ print_name(0) ; print_release(0) }
-    '
+	BEGIN           { symbol = ARGV[1]
+			 if (ARGC == 3) {
+			     has_value=1
+			     value = ARGV[2]
+			 }
+			 split("", ARGV)
+		        }
+	match($0, "\\<" symbol "\\>") \
+		        { subst(1) ; next }
+		        { print }
+	END             { subst(0) }
+    ' "$@"
 }
 
 # Old kernels don't have a config.conf.
@@ -303,15 +331,17 @@ TMPFILE=$(mktemp /tmp/$(basename $0).XXXXXX)
 CONFIGS=$(scripts/guards $SYMBOLS < config.conf)
 for config in $CONFIGS; do
 	if ! [ -e config/$config ]; then
-		echo "*** Configuration file config/$config not found ***"
+		echo "Configuration file config/$config not found"
 	fi
 	name=$(basename $config)
 	path=arch/$(dirname $config)/defconfig.$name
 	mkdir -p $(dirname $PATCH_DIR/$path)
 
-	config_subst $name 0 \
-		< config/$config \
-		> $TMPFILE
+	cat config/$config \
+	| config_subst CONFIG_CFGNAME \"$name\" \
+	| config_subst CONFIG_RELEASE 0 \
+	| config_subst CONFIG_SUSE_KERNEL \
+	> $TMPFILE
 
 	if [ "${config/*\//}" = "default" ]; then
 		# We may have patches that modify one of the
