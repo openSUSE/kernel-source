@@ -32,6 +32,7 @@ Source21:     config.conf
 Source100:    patches.arch.tar.bz2
 Source101:    patches.fixes.tar.bz2
 Source102:    patches.drivers.tar.bz2
+Source103:    patches.suse.tar.bz2
 BuildRoot:    %{_tmppath}/%{name}-%{version}-build
 
 %description
@@ -101,6 +102,7 @@ echo "Architecture symbol(s): $SYMBOLS"
 %setup -T -n patches.arch	-b 100
 %setup -T -n patches.fixes	-b 101
 %setup -T -n patches.drivers	-b 102
+%setup -T -n patches.suse	-b 103
 
 # the kernel source tree is unpacked last so that RPM_BUILD_DIR
 # points to the right path, /usr/src/packages/BUILD/%lxsubdir
@@ -179,9 +181,6 @@ cp -a . $RPM_BUILD_ROOT/usr/src/linux-%{version}
     if grep -q CONFIG_MODVERSIONS=y .config; then
         echo "$RPM_BUILD_ROOT/usr/src/linux-%{version}/include/linux/modules/*.ver"
     fi
-%ifarch x86_64
-    echo $RPM_BUILD_ROOT/usr/src/linux-%{version}/include/asm/offset.h
-%endif
 } |
 sed -e "s:$RPM_BUILD_ROOT::" > $RPM_BUILD_DIR/%lxsubdir/linux.files
 ###################################################################
