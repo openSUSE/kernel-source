@@ -289,7 +289,9 @@ done
 
 if [ -n "$QUILT" ]; then
     ln -s $PWD $PATCH_DIR/patches
-    ( IFS=$'\n' ; echo "$*" ) > $PATCH_DIR/series
+    if [ -n "$*" ]; then
+    	( IFS=$'\n' ; echo "$*" ) > $PATCH_DIR/series
+    fi
 fi
 
 [ $# -gt 0 ] && exit $status
