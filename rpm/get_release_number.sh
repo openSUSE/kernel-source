@@ -1,3 +1,3 @@
 #! /bin/sh
 
-echo "pkg:kernel-syms"
+echo "pkg:kernel-dummy"

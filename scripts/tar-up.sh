@@ -126,6 +126,7 @@ install -m 644					\
 	rpm/source-post.sh			\
 	rpm/post.sh				\
 	rpm/postun.sh				\
+	rpm/kernel-dummy.spec			\
 	$BUILD_DIR
 
 install -m 755					\
