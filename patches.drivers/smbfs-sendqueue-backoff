@@ -1,0 +1,179 @@
+This patch makes sure we gracefully back off if the TCP send buffer
+is full, or if TCP was unable to allocate an skb. Otherwise, smbiod
+would spin endlessly, and never release the CPU.
+
+Index: linux-2.6.5/fs/smbfs/proc.c
+===================================================================
+--- linux-2.6.5.orig/fs/smbfs/proc.c	2004-03-12 12:17:25.000000000 +0100
++++ linux-2.6.5/fs/smbfs/proc.c	2004-06-08 14:40:43.000000000 +0200
+@@ -901,6 +901,7 @@
+ 
+ 	/* chain into the data_ready callback */
+ 	server->data_ready = xchg(&sk->sk_data_ready, smb_data_ready);
++	server->write_space = xchg(&sk->sk_write_space, smb_write_space);
+ 
+ 	/* check if we have an old smbmount that uses seconds for the 
+ 	   serverzone */
+Index: linux-2.6.5/fs/smbfs/proto.h
+===================================================================
+--- linux-2.6.5.orig/fs/smbfs/proto.h	2004-02-04 04:43:57.000000000 +0100
++++ linux-2.6.5/fs/smbfs/proto.h	2004-06-08 14:39:40.000000000 +0200
+@@ -48,6 +48,7 @@
+ extern int smb_fill_cache(struct file *filp, void *dirent, filldir_t filldir, struct smb_cache_control *ctrl, struct qstr *qname, struct smb_fattr *entry);
+ /* sock.c */
+ extern void smb_data_ready(struct sock *sk, int len);
++extern void smb_write_space(struct sock *sk);
+ extern int smb_valid_socket(struct inode *inode);
+ extern void smb_close_socket(struct smb_sb_info *server);
+ extern int smb_recv_available(struct smb_sb_info *server);
+Index: linux-2.6.5/fs/smbfs/request.c
+===================================================================
+--- linux-2.6.5.orig/fs/smbfs/request.c	2004-03-12 12:17:25.000000000 +0100
++++ linux-2.6.5/fs/smbfs/request.c	2004-06-08 14:34:15.000000000 +0200
+@@ -316,7 +316,7 @@
+ 	if (server->state == CONN_VALID) {
+ 		if (list_empty(&server->xmitq))
+ 			result = smb_request_send_req(req);
+-		if (result < 0) {
++		if (result < 0 && result != -EAGAIN) {
+ 			/* Connection lost? */
+ 			server->conn_error = result;
+ 			server->state = CONN_INVALID;
+@@ -394,7 +394,6 @@
+ 	if (result < 0 && result != -EAGAIN)
+ 		goto out;
+ 
+-	result = 0;
+ 	if (!(req->rq_flags & SMB_REQ_TRANSMITTED))
+ 		goto out;
+ 
+@@ -431,7 +430,7 @@
+ 		return 0;
+ 
+ 	result = smb_request_send_req(req);
+-	if (result < 0) {
++	if (result < 0 && result != -EAGAIN) {
+ 		server->conn_error = result;
+ 		list_del_init(&req->rq_queue);
+ 		list_add(&req->rq_queue, &server->xmitq);
+Index: linux-2.6.5/fs/smbfs/smbiod.c
+===================================================================
+--- linux-2.6.5.orig/fs/smbfs/smbiod.c	2004-03-12 12:17:25.000000000 +0100
++++ linux-2.6.5/fs/smbfs/smbiod.c	2004-06-08 14:56:32.000000000 +0200
+@@ -45,7 +45,9 @@
+ static LIST_HEAD(smb_servers);
+ static spinlock_t servers_lock = SPIN_LOCK_UNLOCKED;
+ 
+-#define SMBIOD_DATA_READY	(1<<0)
++#define SMBIOD_DATA_READY	0
++#define SMBIOD_BACKOFF		1
++
+ static long smbiod_flags;
+ 
+ static int smbiod(void *);
+@@ -240,7 +242,7 @@
+ /*
+  * Do some IO for one server.
+  */
+-static void smbiod_doio(struct smb_sb_info *server)
++static int smbiod_doio(struct smb_sb_info *server)
+ {
+ 	int result;
+ 	int maxwork = 7;
+@@ -268,6 +270,18 @@
+ 
+ 	do {
+ 		result = smb_request_send_server(server);
++		if (result == -EAGAIN) {
++			/* TCP was unable to allocate memory.
++			 * Set the backoff flag, but *not* DATA_READY.
++			 * If there are no new requests in the queue,
++			 * this will cause smbiod to back off and
++			 * not retry until
++			 *  a)	we receive a write_space callback from TCP
++			 *  b)  we slept for one second.
++			 */
++			set_bit(SMBIOD_BACKOFF, &smbiod_flags);
++			goto out;
++		}
+ 		if (result < 0) {
+ 			server->state = CONN_INVALID;
+ 			smbiod_retry(server);
+@@ -300,9 +314,28 @@
+ 		struct smb_sb_info *server;
+ 		struct list_head *pos, *n;
+ 
+-		/* FIXME: Use poll? */
+-		wait_event_interruptible(smbiod_wait,
+-			 test_bit(SMBIOD_DATA_READY, &smbiod_flags));
++		/* smbiod should use a more sophisticated approach
++		 * to polling the socket... this is an ugly hack.
++		 */
++		if (test_bit(SMBIOD_BACKOFF, &smbiod_flags)) {
++			/* We tried to transmit some requests, but received
++			 * EAGAIN. Either the TCP send queue is full, or
++			 * we're low on memory. Go to sleep.
++			 * If this was due to a full receive queue, the
++			 * write_space callback handler will wake us.
++			 *
++			 * If it was low memory, we'll just sleep a little
++			 * to let the VM do its job.
++			 */
++			wait_event_interruptible_timeout(smbiod_wait,
++				 test_bit(SMBIOD_DATA_READY, &smbiod_flags),
++				 HZ);
++			clear_bit(SMBIOD_BACKOFF, &smbiod_flags);
++		} else {
++			wait_event_interruptible(smbiod_wait,
++				 test_bit(SMBIOD_DATA_READY, &smbiod_flags));
++		}
++
+ 		if (signal_pending(current)) {
+ 			spin_lock(&servers_lock);
+ 			smbiod_state = SMBIOD_DEAD;
+Index: linux-2.6.5/fs/smbfs/sock.c
+===================================================================
+--- linux-2.6.5.orig/fs/smbfs/sock.c	2004-04-05 11:09:50.000000000 +0200
++++ linux-2.6.5/fs/smbfs/sock.c	2004-06-08 14:44:10.000000000 +0200
+@@ -84,6 +84,25 @@
+ 	smbiod_wake_up();
+ }
+ 
++/*
++ * Called when there's room in the TCP send queue.
++ * Just wake up smbiod so it can retry sending.
++ */
++void
++smb_write_space(struct sock *sk)
++{
++	struct smb_sb_info *server = server_from_socket(sk->sk_socket);
++	void (*write_space)(struct sock *) = server->write_space;
++
++	/* Invoke the original sk_write_space callback.
++	 * I don't think we actually need to do this, but I'll
++	 * do that for symmetry with smb_data_ready above.
++	 */
++	write_space(sk);
++	VERBOSE("(%p)\n", sk);
++	smbiod_wake_up();
++}
++
+ int
+ smb_valid_socket(struct inode * inode)
+ {
+Index: linux-2.6.5/include/linux/smb_fs_sb.h
+===================================================================
+--- linux-2.6.5.orig/include/linux/smb_fs_sb.h	2004-02-04 04:44:44.000000000 +0100
++++ linux-2.6.5/include/linux/smb_fs_sb.h	2004-06-08 14:42:02.000000000 +0200
+@@ -68,8 +68,10 @@
+ 	u32                smb_len;
+ 	u32                smb_read;
+ 
+-        /* We use our own data_ready callback, but need the original one */
++        /* We use our own data_ready and write_space callbacks,
++	 * but need the original ones */
+         void *data_ready;
++	void *write_space;
+ 
+ 	/* nls pointers for codepage conversions */
+ 	struct nls_table *remote_nls;
