@@ -1,6 +1,7 @@
 rm -f /boot/initrd-%ver_str  # created in %post -- clean up.
 
 if [ "$(readlink /boot/vmlinuz)" = vmlinuz-%ver_str -o \
+     "$(readlink /boot/vmlinux)" = vmlinux-%ver_str -o \
      "$(readlink /boot/initrd)"  = initrd-%ver_str -o \
      "$(readlink /boot/image)"   = image-%ver_str ]; then
     # This may be the last kernel RPM on the system, or it may
