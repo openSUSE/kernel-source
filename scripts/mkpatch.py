@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright (C) 2004 Andrea Arcangeli <andrea@suse.de> SUSE
-# $Id: mkpatch.py,v 1.12 2004/12/01 01:35:11 andrea Exp $
+# $Id: mkpatch.py,v 1.13 2004/12/01 01:40:49 andrea Exp $
 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -362,7 +362,7 @@ def mkpatch(*args):
 				this_diff = os.popen(DIFF_CMD + ' %s %s' % (backup_f, new_f) + ' 2>/dev/null').read()
 				diff += this_diff
 				if this_diff:
-					print >>sys.stderr, 'unchanged.'
+					print >>sys.stderr, 'done.'
 				else:
 					print >>sys.stderr, 'unchanged.'
 	elif olddir and newdir:
