@@ -44,6 +44,9 @@ for i in arch/$ARCH/defconfig.*; do
   cp -v $i .config
   eval $YES make ARCH=$ARCH oldconfig
   cp -v .config ${A}_$C
-  [ -f patches/config/$A/$B ] && cp -v .config patches/config/$A/$B
+  if [ -f patches/config/$A/$B ] \
+     && ! diff -q .config patches/config/$A/$B ; then
+	  cp -v .config patches/config/$A/$B
+  fi
   diff -U0 $i .config
 done
