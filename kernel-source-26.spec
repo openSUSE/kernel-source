@@ -172,7 +172,7 @@ ln -sf linux-%ver_str $RPM_BUILD_ROOT/usr/src/linux
 cp -dpR --parents . $RPM_BUILD_ROOT/usr/src/linux-%ver_str
 # Do a test build to catch the most stupid mistakes early.
 if [ ! -e %_sourcedir/skip-build ]; then
-make %{?jobs:-j%jobs} $MAKE_ARGS vmlinux
+make %{?jobs:-j%jobs} $MAKE_ARGS vmlinux -k
 fi
 
 %files
