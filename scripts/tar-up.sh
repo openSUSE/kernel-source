@@ -96,6 +96,12 @@ sed -e "s,@NAME@,kernel-source,g" \
   < rpm/kernel-source.spec.in \
 > $BUILD_DIR/kernel-source.spec
 
+echo "kernel-dummy.spec"
+sed -e "s,@NAME@,kernel-dummy,g" \
+    -e "s,@VERSION@,$VERSION,g" \
+  < rpm/kernel-dummy.spec.in \
+> $BUILD_DIR/kernel-dummy.spec
+
 ## The unconfigured kernel source package: Source for User Mode Linux, and
 ## for any km_* packages that absolutely think they need kernel sources
 ## installed.
@@ -126,7 +132,6 @@ install -m 644					\
 	rpm/source-post.sh			\
 	rpm/post.sh				\
 	rpm/postun.sh				\
-	rpm/kernel-dummy.spec			\
 	$BUILD_DIR
 
 install -m 644					\
