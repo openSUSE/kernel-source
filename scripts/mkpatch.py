@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright (C) 2004 Andrea Arcangeli <andrea@suse.de> SUSE
-# $Id: mkpatch.py,v 1.4 2004/11/23 07:14:38 andrea Exp $
+# $Id: mkpatch.py,v 1.6 2004/11/23 07:27:26 andrea Exp $
 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -199,6 +199,10 @@ class patch_class(object):
 		if signoff:
 			signoff += '\n'
 		payload = self.payload
+		try:
+			os.unlink(self.patchfile) # handle links
+		except OSError:
+			pass
 		file(self.patchfile, 'w').write(tags + metadata + signoff + payload)
 
 	def get_payload(self):
