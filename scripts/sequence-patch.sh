@@ -296,10 +296,10 @@ while [ $# -gt 0 ]; do
 	rm -f $LAST_LOG
     fi
 
+    shift
     if [ "$PATCH" = "$LIMIT" -a -z "$CLEAN" ]; then
 	break
     fi
-    shift
 done
 
 [ -n "$CLEAN" -a -n "$enough_free_space" ] \
