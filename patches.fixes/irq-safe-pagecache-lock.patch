@@ -1,0 +1,719 @@
+
+
+
+Intro to these patches:
+
+- Major surgery against the pagecache, radix-tree and writeback code.  This
+  work is to address the O_DIRECT-vs-buffered data exposure horrors which
+  we've been struggling with for months.
+
+  As a side-effect, 32 bytes are saved from struct inode and eight bytes
+  are removed from struct page.
+
+  This change will break any arch code which is using page->list and will
+  also break any arch code which is using page->lru of memory which was
+  obtained from slab.
+
+  The basic problem which we (mainly Daniel McNeil) have been struggling
+  with is in getting a really reliable fsync() across the page lists while
+  other processes are performing writeback against the same file.  It's like
+  juggling four bars of wet soap with your eyes shut while someone is
+  whacking you with a baseball bat.  Daniel pretty much has the problem
+  plugged but I suspect that's just because we don't have testcases to
+  trigger the remaining problems.  The complexity and additional locking
+  which those patches add is worrisome.
+
+  So the approach taken here is to remove the page lists altogether and
+  replace the list-based writeback and wait operations with in-order
+  radix-tree walks.
+
+  The radix-tree code has been enhanced to support "tagging" of pages, for
+  later searches for pages which have a particular tag set.  This means that
+  we can ask the radix tree code "find me the next 16 dirty pages starting at
+  pagecache index N" and it will do that in O(log64(N)) time.
+
+  This affects I/O scheduling potentially quite significantly.  It is no
+  longer the case that the kernel will submit pages for I/O in the order in
+  which the application dirtied them.  We instead submit them in file-offset
+  order all the time.
+
+  This is likely to be advantageous when applications are seeking all over
+  a large file randomly writing small amounts of data.  I haven't performed
+  much benchmarking, but tiobench random write throughput seems to be
+  increased by 30%.  Other tests appear to be unaltered.  dbench may have got
+  10-20% quicker, but it's variable.
+
+  There is one large file which everyone seeks all over randomly writing
+  small amounts of data: the blockdev mapping which caches filesystem
+  metadata.  The kernel's IO submission patterns for this are now ideal.
+
+
+  Because writeback and wait-for-writeback use a tree walk instead of a
+  list walk they are no longer livelockable.  This probably means that we no
+  longer need to hold i_sem across O_SYNC writes and perhaps fsync() and
+  fdatasync().  This may be beneficial for databases: multiple processes
+  writing and syncing different parts of the same file at the same time can
+  now all submit and wait upon writes to just their own little bit of the
+  file, so we can get a lot more data into the queues.
+
+  It is trivial to implement a part-file-fdatasync() as well, so
+  applications can say "sync the file from byte N to byte M", and multiple
+  applications can do this concurrently.  This is easy for ext2 filesystems,
+  but probably needs lots of work for data-journalled filesystems and XFS and
+  it probably doesn't offer much benefit over an i_semless O_SYNC write.
+
+
+This patch:
+
+- Later, we'll need to access the radix trees from inside disk I/O
+  completion handlers.  So make mapping->page_lock irq-safe.  And rename it
+  to tree_lock to reliably break any missed conversions.
+
+
+Index: linux.t/fs/buffer.c
+===================================================================
+--- linux.t.orig/fs/buffer.c	2004-03-16 11:06:14.127538960 -0500
++++ linux.t/fs/buffer.c	2004-03-16 11:07:34.745928119 -0500
+@@ -401,7 +401,7 @@ out:
+  * Hack idea: for the blockdev mapping, i_bufferlist_lock contention
+  * may be quite high.  This code could TryLock the page, and if that
+  * succeeds, there is no need to take private_lock. (But if
+- * private_lock is contended then so is mapping->page_lock).
++ * private_lock is contended then so is mapping->tree_lock).
+  */
+ static struct buffer_head *
+ __find_get_block_slow(struct block_device *bdev, sector_t block, int unused)
+@@ -874,14 +874,14 @@ int __set_page_dirty_buffers(struct page
+ 	spin_unlock(&mapping->private_lock);
+ 
+ 	if (!TestSetPageDirty(page)) {
+-		spin_lock(&mapping->page_lock);
++		spin_lock_irq(&mapping->tree_lock);
+ 		if (page->mapping) {	/* Race with truncate? */
+ 			if (!mapping->backing_dev_info->memory_backed)
+ 				inc_page_state(nr_dirty);
+ 			list_del(&page->list);
+ 			list_add(&page->list, &mapping->dirty_pages);
+ 		}
+-		spin_unlock(&mapping->page_lock);
++		spin_unlock_irq(&mapping->tree_lock);
+ 		__mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
+ 	}
+ 	
+@@ -1261,7 +1261,7 @@ __getblk_slow(struct block_device *bdev,
+  * inode to its superblock's dirty inode list.
+  *
+  * mark_buffer_dirty() is atomic.  It takes bh->b_page->mapping->private_lock,
+- * mapping->page_lock and the global inode_lock.
++ * mapping->tree_lock and the global inode_lock.
+  */
+ void fastcall mark_buffer_dirty(struct buffer_head *bh)
+ {
+Index: linux.t/fs/cifs/file.c
+===================================================================
+--- linux.t.orig/fs/cifs/file.c	2004-02-18 22:22:31.000000000 -0500
++++ linux.t/fs/cifs/file.c	2004-03-16 11:07:34.790922187 -0500
+@@ -898,11 +898,9 @@ static void cifs_copy_cache_pages(struct
+ 		if(list_empty(pages))
+ 			break;
+ 
+-		spin_lock(&mapping->page_lock);
+ 		page = list_entry(pages->prev, struct page, list);
+ 
+ 		list_del(&page->list);
+-		spin_unlock(&mapping->page_lock);
+ 
+ 		if (add_to_page_cache(page, mapping, page->index, GFP_KERNEL)) {
+ 			page_cache_release(page);
+@@ -962,14 +960,10 @@ cifs_readpages(struct file *file, struct
+ 	pagevec_init(&lru_pvec, 0);
+ 
+ 	for(i = 0;i<num_pages;) {
+-		spin_lock(&mapping->page_lock);
+-		if(list_empty(page_list)) {
+-			spin_unlock(&mapping->page_lock);
++		if(list_empty(page_list))
+ 			break;
+-		}
+ 		page = list_entry(page_list->prev, struct page, list);
+ 		offset = (loff_t)page->index << PAGE_CACHE_SHIFT;
+-	        spin_unlock(&mapping->page_lock);
+ 
+ 		/* for reads over a certain size could initiate async read ahead */
+ 
+@@ -989,12 +983,10 @@ cifs_readpages(struct file *file, struct
+ 			cFYI(1,("Read error in readpages: %d",rc));
+ 			/* clean up remaing pages off list */
+             
+-			spin_lock(&mapping->page_lock);
+ 			while (!list_empty(page_list) && (i < num_pages)) {
+ 				page = list_entry(page_list->prev, struct page, list);
+ 				list_del(&page->list);
+ 			}
+-			spin_unlock(&mapping->page_lock);
+ 			break;
+ 		} else if (bytes_read > 0) {
+ 			pSMBr = (struct smb_com_read_rsp *)smb_read_data;
+Index: linux.t/fs/fs-writeback.c
+===================================================================
+--- linux.t.orig/fs/fs-writeback.c	2004-03-16 11:07:27.120933270 -0500
++++ linux.t/fs/fs-writeback.c	2004-03-16 11:07:34.792921923 -0500
+@@ -152,10 +152,10 @@ __sync_single_inode(struct inode *inode,
+ 	 * read speculatively by this cpu before &= ~I_DIRTY  -- mikulas
+ 	 */
+ 
+-	spin_lock(&mapping->page_lock);
++	spin_lock_irq(&mapping->tree_lock);
+ 	if (wait || !wbc->for_kupdate || list_empty(&mapping->io_pages))
+ 		list_splice_init(&mapping->dirty_pages, &mapping->io_pages);
+-	spin_unlock(&mapping->page_lock);
++	spin_unlock_irq(&mapping->tree_lock);
+ 	spin_unlock(&inode_lock);
+ 
+ 	do_writepages(mapping, wbc);
+Index: linux.t/fs/inode.c
+===================================================================
+--- linux.t.orig/fs/inode.c	2004-03-16 10:58:55.000000000 -0500
++++ linux.t/fs/inode.c	2004-03-16 11:07:34.826917441 -0500
+@@ -184,7 +184,7 @@ void inode_init_once(struct inode *inode
+ 	INIT_LIST_HEAD(&inode->i_devices);
+ 	sema_init(&inode->i_sem, 1);
+ 	INIT_RADIX_TREE(&inode->i_data.page_tree, GFP_ATOMIC);
+-	spin_lock_init(&inode->i_data.page_lock);
++	spin_lock_init(&inode->i_data.tree_lock);
+ 	init_MUTEX(&inode->i_data.i_shared_sem);
+ 	atomic_set(&inode->i_data.truncate_count, 0);
+ 	INIT_LIST_HEAD(&inode->i_data.private_list);
+Index: linux.t/fs/mpage.c
+===================================================================
+--- linux.t.orig/fs/mpage.c	2004-03-16 11:07:27.123932874 -0500
++++ linux.t/fs/mpage.c	2004-03-16 11:07:34.828917178 -0500
+@@ -635,7 +635,7 @@ mpage_writepages(struct address_space *m
+ 	if (get_block == NULL)
+ 		writepage = mapping->a_ops->writepage;
+ 
+-	spin_lock(&mapping->page_lock);
++	spin_lock_irq(&mapping->tree_lock);
+ 	while (!list_empty(&mapping->io_pages) && !done) {
+ 		struct page *page = list_entry(mapping->io_pages.prev,
+ 					struct page, list);
+@@ -655,10 +655,10 @@ mpage_writepages(struct address_space *m
+ 		list_add(&page->list, &mapping->locked_pages);
+ 
+ 		page_cache_get(page);
+-		spin_unlock(&mapping->page_lock);
++		spin_unlock_irq(&mapping->tree_lock);
+ 
+ 		/*
+-		 * At this point we hold neither mapping->page_lock nor
++		 * At this point we hold neither mapping->tree_lock nor
+ 		 * lock on the page itself: the page may be truncated or
+ 		 * invalidated (changing page->mapping to NULL), or even
+ 		 * swizzled back from swapper_space to tmpfs file mapping.
+@@ -696,12 +696,12 @@ mpage_writepages(struct address_space *m
+ 		}
+ 		page_cache_release(page);
+ 		cond_resched();
+-		spin_lock(&mapping->page_lock);
++		spin_lock_irq(&mapping->tree_lock);
+ 	}
+ 	/*
+ 	 * Leave any remaining dirty pages on ->io_pages
+ 	 */
+-	spin_unlock(&mapping->page_lock);
++	spin_unlock_irq(&mapping->tree_lock);
+ 	if (bio)
+ 		mpage_bio_submit(WRITE, bio);
+ 	return ret;
+Index: linux.t/include/linux/fs.h
+===================================================================
+--- linux.t.orig/include/linux/fs.h	2004-03-16 11:06:14.145536595 -0500
++++ linux.t/include/linux/fs.h	2004-03-16 11:07:34.851914146 -0500
+@@ -324,7 +324,7 @@ struct backing_dev_info;
+ struct address_space {
+ 	struct inode		*host;		/* owner: inode, block_device */
+ 	struct radix_tree_root	page_tree;	/* radix tree of all pages */
+-	spinlock_t		page_lock;	/* and spinlock protecting it */
++	spinlock_t		tree_lock;	/* and spinlock protecting it */
+ 	struct list_head	clean_pages;	/* list of clean pages */
+ 	struct list_head	dirty_pages;	/* list of dirty pages */
+ 	struct list_head	locked_pages;	/* list of locked pages */
+Index: linux.t/ipc/shm.c
+===================================================================
+--- linux.t.orig/ipc/shm.c	2004-03-12 16:27:39.000000000 -0500
++++ linux.t/ipc/shm.c	2004-03-16 11:07:34.887909400 -0500
+@@ -380,9 +380,7 @@ static void shm_get_stat(unsigned long *
+ 
+ 		if (is_file_hugepages(shp->shm_file)) {
+ 			struct address_space *mapping = inode->i_mapping;
+-			spin_lock(&mapping->page_lock);
+ 			*rss += (HPAGE_SIZE/PAGE_SIZE)*mapping->nrpages;
+-			spin_unlock(&mapping->page_lock);
+ 		} else {
+ 			struct shmem_inode_info *info = SHMEM_I(inode);
+ 			spin_lock(&info->lock);
+Index: linux.t/mm/filemap.c
+===================================================================
+--- linux.t.orig/mm/filemap.c	2004-03-16 11:07:14.741564463 -0500
++++ linux.t/mm/filemap.c	2004-03-16 11:07:34.890909005 -0500
+@@ -59,7 +59,7 @@
+  *    ->private_lock		(__free_pte->__set_page_dirty_buffers)
+  *      ->swap_list_lock
+  *        ->swap_device_lock	(exclusive_swap_page, others)
+- *          ->mapping->page_lock
++ *          ->mapping->tree_lock
+  *
+  *  ->i_sem
+  *    ->i_shared_sem		(truncate->invalidate_mmap_range)
+@@ -78,12 +78,12 @@
+  *
+  *  ->inode_lock
+  *    ->sb_lock			(fs/fs-writeback.c)
+- *    ->mapping->page_lock	(__sync_single_inode)
++ *    ->mapping->tree_lock	(__sync_single_inode)
+  *
+  *  ->page_table_lock
+  *    ->swap_device_lock	(try_to_unmap_one)
+  *    ->private_lock		(try_to_unmap_one)
+- *    ->page_lock		(try_to_unmap_one)
++ *    ->tree_lock		(try_to_unmap_one)
+  *    ->zone.lru_lock		(follow_page->mark_page_accessed)
+  *
+  *  ->task->proc_lock
+@@ -93,7 +93,7 @@
+ /*
+  * Remove a page from the page cache and free it. Caller has to make
+  * sure the page is locked and that nobody else uses it - or that usage
+- * is safe.  The caller must hold a write_lock on the mapping's page_lock.
++ * is safe.  The caller must hold a write_lock on the mapping's tree_lock.
+  */
+ void __remove_from_page_cache(struct page *page)
+ {
+@@ -114,9 +114,9 @@ void remove_from_page_cache(struct page 
+ 	if (unlikely(!PageLocked(page)))
+ 		PAGE_BUG(page);
+ 
+-	spin_lock(&mapping->page_lock);
++	spin_lock_irq(&mapping->tree_lock);
+ 	__remove_from_page_cache(page);
+-	spin_unlock(&mapping->page_lock);
++	spin_unlock_irq(&mapping->tree_lock);
+ }
+ 
+ static inline int sync_page(struct page *page)
+@@ -150,9 +150,9 @@ static int __filemap_fdatawrite(struct a
+ 	if (mapping->backing_dev_info->memory_backed)
+ 		return 0;
+ 
+-	spin_lock(&mapping->page_lock);
++	spin_lock_irq(&mapping->tree_lock);
+ 	list_splice_init(&mapping->dirty_pages, &mapping->io_pages);
+-	spin_unlock(&mapping->page_lock);
++	spin_unlock_irq(&mapping->tree_lock);
+ 	ret = do_writepages(mapping, &wbc);
+ 	return ret;
+ }
+@@ -187,7 +187,7 @@ int filemap_fdatawait(struct address_spa
+ 
+ restart:
+ 	progress = 0;
+-	spin_lock(&mapping->page_lock);
++	spin_lock_irq(&mapping->tree_lock);
+         while (!list_empty(&mapping->locked_pages)) {
+ 		struct page *page;
+ 
+@@ -201,7 +201,7 @@ restart:
+ 		if (!PageWriteback(page)) {
+ 			if (++progress > 32) {
+ 				if (need_resched()) {
+-					spin_unlock(&mapping->page_lock);
++					spin_unlock_irq(&mapping->tree_lock);
+ 					__cond_resched();
+ 					goto restart;
+ 				}
+@@ -211,16 +211,16 @@ restart:
+ 
+ 		progress = 0;
+ 		page_cache_get(page);
+-		spin_unlock(&mapping->page_lock);
++		spin_unlock_irq(&mapping->tree_lock);
+ 
+ 		wait_on_page_writeback(page);
+ 		if (PageError(page))
+ 			ret = -EIO;
+ 
+ 		page_cache_release(page);
+-		spin_lock(&mapping->page_lock);
++		spin_lock_irq(&mapping->tree_lock);
+ 	}
+-	spin_unlock(&mapping->page_lock);
++	spin_unlock_irq(&mapping->tree_lock);
+ 
+ 	/* Check for outstanding write errors */
+ 	if (test_and_clear_bit(AS_ENOSPC, &mapping->flags))
+@@ -257,7 +257,7 @@ int add_to_page_cache(struct page *page,
+ 
+ 	if (error == 0) {
+ 		page_cache_get(page);
+-		spin_lock(&mapping->page_lock);
++		spin_lock_irq(&mapping->tree_lock);
+ 		error = radix_tree_insert(&mapping->page_tree, offset, page);
+ 		if (!error) {
+ 			SetPageLocked(page);
+@@ -265,7 +265,7 @@ int add_to_page_cache(struct page *page,
+ 		} else {
+ 			page_cache_release(page);
+ 		}
+-		spin_unlock(&mapping->page_lock);
++		spin_unlock_irq(&mapping->tree_lock);
+ 		radix_tree_preload_end();
+ 	}
+ 	return error;
+@@ -401,11 +401,11 @@ struct page * find_get_page(struct addre
+ 	 * We scan the hash list read-only. Addition to and removal from
+ 	 * the hash-list needs a held write-lock.
+ 	 */
+-	spin_lock(&mapping->page_lock);
++	spin_lock_irq(&mapping->tree_lock);
+ 	page = radix_tree_lookup(&mapping->page_tree, offset);
+ 	if (page)
+ 		page_cache_get(page);
+-	spin_unlock(&mapping->page_lock);
++	spin_unlock_irq(&mapping->tree_lock);
+ 	return page;
+ }
+ 
+@@ -418,11 +418,11 @@ struct page *find_trylock_page(struct ad
+ {
+ 	struct page *page;
+ 
+-	spin_lock(&mapping->page_lock);
++	spin_lock_irq(&mapping->tree_lock);
+ 	page = radix_tree_lookup(&mapping->page_tree, offset);
+ 	if (page && TestSetPageLocked(page))
+ 		page = NULL;
+-	spin_unlock(&mapping->page_lock);
++	spin_unlock_irq(&mapping->tree_lock);
+ 	return page;
+ }
+ 
+@@ -444,15 +444,15 @@ struct page *find_lock_page(struct addre
+ {
+ 	struct page *page;
+ 
+-	spin_lock(&mapping->page_lock);
++	spin_lock_irq(&mapping->tree_lock);
+ repeat:
+ 	page = radix_tree_lookup(&mapping->page_tree, offset);
+ 	if (page) {
+ 		page_cache_get(page);
+ 		if (TestSetPageLocked(page)) {
+-			spin_unlock(&mapping->page_lock);
++			spin_unlock_irq(&mapping->tree_lock);
+ 			lock_page(page);
+-			spin_lock(&mapping->page_lock);
++			spin_lock_irq(&mapping->tree_lock);
+ 
+ 			/* Has the page been truncated while we slept? */
+ 			if (page->mapping != mapping || page->index != offset) {
+@@ -462,7 +462,7 @@ repeat:
+ 			}
+ 		}
+ 	}
+-	spin_unlock(&mapping->page_lock);
++	spin_unlock_irq(&mapping->tree_lock);
+ 	return page;
+ }
+ 
+@@ -536,12 +536,12 @@ unsigned int find_get_pages(struct addre
+ 	unsigned int i;
+ 	unsigned int ret;
+ 
+-	spin_lock(&mapping->page_lock);
++	spin_lock_irq(&mapping->tree_lock);
+ 	ret = radix_tree_gang_lookup(&mapping->page_tree,
+ 				(void **)pages, start, nr_pages);
+ 	for (i = 0; i < ret; i++)
+ 		page_cache_get(pages[i]);
+-	spin_unlock(&mapping->page_lock);
++	spin_unlock_irq(&mapping->tree_lock);
+ 	return ret;
+ }
+ 
+Index: linux.t/mm/page-writeback.c
+===================================================================
+--- linux.t.orig/mm/page-writeback.c	2004-03-16 10:59:29.000000000 -0500
++++ linux.t/mm/page-writeback.c	2004-03-16 11:07:34.906906895 -0500
+@@ -511,12 +511,12 @@ int write_one_page(struct page *page, in
+ 	if (wait)
+ 		wait_on_page_writeback(page);
+ 
+-	spin_lock(&mapping->page_lock);
++	spin_lock_irq(&mapping->tree_lock);
+ 	list_del(&page->list);
+ 	if (test_clear_page_dirty(page)) {
+ 		list_add(&page->list, &mapping->locked_pages);
+ 		page_cache_get(page);
+-		spin_unlock(&mapping->page_lock);
++		spin_unlock_irq(&mapping->tree_lock);
+ 		ret = mapping->a_ops->writepage(page, &wbc);
+ 		if (ret == 0 && wait) {
+ 			wait_on_page_writeback(page);
+@@ -526,7 +526,7 @@ int write_one_page(struct page *page, in
+ 		page_cache_release(page);
+ 	} else {
+ 		list_add(&page->list, &mapping->clean_pages);
+-		spin_unlock(&mapping->page_lock);
++		spin_unlock_irq(&mapping->tree_lock);
+ 		unlock_page(page);
+ 	}
+ 	return ret;
+@@ -554,7 +554,7 @@ int __set_page_dirty_nobuffers(struct pa
+ 		struct address_space *mapping = page->mapping;
+ 
+ 		if (mapping) {
+-			spin_lock(&mapping->page_lock);
++			spin_lock_irq(&mapping->tree_lock);
+ 			if (page->mapping) {	/* Race with truncate? */
+ 				BUG_ON(page->mapping != mapping);
+ 				if (!mapping->backing_dev_info->memory_backed)
+@@ -562,7 +562,7 @@ int __set_page_dirty_nobuffers(struct pa
+ 				list_del(&page->list);
+ 				list_add(&page->list, &mapping->dirty_pages);
+ 			}
+-			spin_unlock(&mapping->page_lock);
++			spin_unlock_irq(&mapping->tree_lock);
+ 			if (!PageSwapCache(page))
+ 				__mark_inode_dirty(mapping->host,
+ 							I_DIRTY_PAGES);
+Index: linux.t/mm/readahead.c
+===================================================================
+--- linux.t.orig/mm/readahead.c	2004-03-16 11:06:14.158534887 -0500
++++ linux.t/mm/readahead.c	2004-03-16 11:07:34.917905445 -0500
+@@ -236,7 +236,7 @@ __do_page_cache_readahead(struct address
+ 	/*
+ 	 * Preallocate as many pages as we will need.
+ 	 */
+-	spin_lock(&mapping->page_lock);
++	spin_lock_irq(&mapping->tree_lock);
+ 	for (page_idx = 0; page_idx < nr_to_read; page_idx++) {
+ 		unsigned long page_offset = offset + page_idx;
+ 		
+@@ -247,16 +247,16 @@ __do_page_cache_readahead(struct address
+ 		if (page)
+ 			continue;
+ 
+-		spin_unlock(&mapping->page_lock);
++		spin_unlock_irq(&mapping->tree_lock);
+ 		page = page_cache_alloc_cold(mapping);
+-		spin_lock(&mapping->page_lock);
++		spin_lock_irq(&mapping->tree_lock);
+ 		if (!page)
+ 			break;
+ 		page->index = page_offset;
+ 		list_add(&page->list, &page_pool);
+ 		ret++;
+ 	}
+-	spin_unlock(&mapping->page_lock);
++	spin_unlock_irq(&mapping->tree_lock);
+ 
+ 	/*
+ 	 * Now start the IO.  We ignore I/O errors - if the page is not
+Index: linux.t/mm/swap_state.c
+===================================================================
+--- linux.t.orig/mm/swap_state.c	2004-03-16 11:06:14.207528450 -0500
++++ linux.t/mm/swap_state.c	2004-03-16 11:07:34.923904654 -0500
+@@ -26,7 +26,7 @@ extern struct address_space_operations s
+ 
+ struct address_space swapper_space = {
+ 	.page_tree	= RADIX_TREE_INIT(GFP_ATOMIC),
+-	.page_lock	= SPIN_LOCK_UNLOCKED,
++	.tree_lock	= SPIN_LOCK_UNLOCKED,
+ 	.clean_pages	= LIST_HEAD_INIT(swapper_space.clean_pages),
+ 	.dirty_pages	= LIST_HEAD_INIT(swapper_space.dirty_pages),
+ 	.io_pages	= LIST_HEAD_INIT(swapper_space.io_pages),
+@@ -183,9 +183,9 @@ void delete_from_swap_cache(struct page 
+   
+ 	entry.val = page->index;
+ 
+-	spin_lock(&swapper_space.page_lock);
++	spin_lock_irq(&swapper_space.tree_lock);
+ 	__delete_from_swap_cache(page);
+-	spin_unlock(&swapper_space.page_lock);
++	spin_unlock_irq(&swapper_space.tree_lock);
+ 
+ 	swap_free(entry);
+ 	page_cache_release(page);
+@@ -196,8 +196,8 @@ int move_to_swap_cache(struct page *page
+ 	struct address_space *mapping = page->mapping;
+ 	int err;
+ 
+-	spin_lock(&swapper_space.page_lock);
+-	spin_lock(&mapping->page_lock);
++	spin_lock_irq(&swapper_space.tree_lock);
++	spin_lock(&mapping->tree_lock);
+ 
+ 	err = radix_tree_insert(&swapper_space.page_tree, entry.val, page);
+ 	if (!err) {
+@@ -205,8 +205,8 @@ int move_to_swap_cache(struct page *page
+ 		___add_to_page_cache(page, &swapper_space, entry.val);
+ 	}
+ 
+-	spin_unlock(&mapping->page_lock);
+-	spin_unlock(&swapper_space.page_lock);
++	spin_unlock(&mapping->tree_lock);
++	spin_unlock_irq(&swapper_space.tree_lock);
+ 
+ 	if (!err) {
+ 		if (!swap_duplicate(entry))
+@@ -232,8 +232,8 @@ int move_from_swap_cache(struct page *pa
+ 
+ 	entry.val = page->index;
+ 
+-	spin_lock(&swapper_space.page_lock);
+-	spin_lock(&mapping->page_lock);
++	spin_lock_irq(&swapper_space.tree_lock);
++	spin_lock(&mapping->tree_lock);
+ 
+ 	err = radix_tree_insert(&mapping->page_tree, index, page);
+ 	if (!err) {
+@@ -241,8 +241,8 @@ int move_from_swap_cache(struct page *pa
+ 		___add_to_page_cache(page, mapping, index);
+ 	}
+ 
+-	spin_unlock(&mapping->page_lock);
+-	spin_unlock(&swapper_space.page_lock);
++	spin_unlock(&mapping->tree_lock);
++	spin_unlock_irq(&swapper_space.tree_lock);
+ 
+ 	if (!err) {
+ 		swap_free(entry);
+Index: linux.t/mm/swapfile.c
+===================================================================
+--- linux.t.orig/mm/swapfile.c	2004-03-16 11:07:14.802556429 -0500
++++ linux.t/mm/swapfile.c	2004-03-16 11:07:34.925904391 -0500
+@@ -310,10 +310,10 @@ static int exclusive_swap_page(struct pa
+ 		/* Is the only swap cache user the cache itself? */
+ 		if (p->swap_map[swp_offset(entry)] == 1) {
+ 			/* Recheck the page count with the pagecache lock held.. */
+-			spin_lock(&swapper_space.page_lock);
++			spin_lock_irq(&swapper_space.tree_lock);
+ 			if (page_count(page) - !!PagePrivate(page) == 2)
+ 				retval = 1;
+-			spin_unlock(&swapper_space.page_lock);
++			spin_unlock_irq(&swapper_space.tree_lock);
+ 		}
+ 		swap_info_put(p);
+ 	}
+@@ -381,13 +381,13 @@ int remove_exclusive_swap_page(struct pa
+ 	retval = 0;
+ 	if (p->swap_map[swp_offset(entry)] == 1) {
+ 		/* Recheck the page count with the pagecache lock held.. */
+-		spin_lock(&swapper_space.page_lock);
++		spin_lock_irq(&swapper_space.tree_lock);
+ 		if ((page_count(page) == 2) && !PageWriteback(page)) {
+ 			__delete_from_swap_cache(page);
+ 			SetPageDirty(page);
+ 			retval = 1;
+ 		}
+-		spin_unlock(&swapper_space.page_lock);
++		spin_unlock_irq(&swapper_space.tree_lock);
+ 	}
+ 	swap_info_put(p);
+ 
+Index: linux.t/mm/truncate.c
+===================================================================
+--- linux.t.orig/mm/truncate.c	2004-03-16 10:59:00.000000000 -0500
++++ linux.t/mm/truncate.c	2004-03-16 11:07:34.939902545 -0500
+@@ -62,7 +62,7 @@ truncate_complete_page(struct address_sp
+  * This is for invalidate_inode_pages().  That function can be called at
+  * any time, and is not supposed to throw away dirty pages.  But pages can
+  * be marked dirty at any time too.  So we re-check the dirtiness inside
+- * ->page_lock.  That provides exclusion against the __set_page_dirty
++ * ->tree_lock.  That provides exclusion against the __set_page_dirty
+  * functions.
+  */
+ static int
+@@ -74,13 +74,13 @@ invalidate_complete_page(struct address_
+ 	if (PagePrivate(page) && !try_to_release_page(page, 0))
+ 		return 0;
+ 
+-	spin_lock(&mapping->page_lock);
++	spin_lock_irq(&mapping->tree_lock);
+ 	if (PageDirty(page)) {
+-		spin_unlock(&mapping->page_lock);
++		spin_unlock_irq(&mapping->tree_lock);
+ 		return 0;
+ 	}
+ 	__remove_from_page_cache(page);
+-	spin_unlock(&mapping->page_lock);
++	spin_unlock_irq(&mapping->tree_lock);
+ 	ClearPageUptodate(page);
+ 	page_cache_release(page);	/* pagecache ref */
+ 	return 1;
+Index: linux.t/mm/vmscan.c
+===================================================================
+--- linux.t.orig/mm/vmscan.c	2004-03-16 10:59:00.000000000 -0500
++++ linux.t/mm/vmscan.c	2004-03-16 11:07:34.942902150 -0500
+@@ -352,7 +352,6 @@ shrink_list(struct list_head *page_list,
+ 				goto keep_locked;
+ 			if (!may_write_to_queue(mapping->backing_dev_info))
+ 				goto keep_locked;
+-			spin_lock(&mapping->page_lock);
+ 			if (test_clear_page_dirty(page)) {
+ 				int res;
+ 				struct writeback_control wbc = {
+@@ -362,9 +361,6 @@ shrink_list(struct list_head *page_list,
+ 					.for_reclaim = 1,
+ 				};
+ 
+-				list_move(&page->list, &mapping->locked_pages);
+-				spin_unlock(&mapping->page_lock);
+-
+ 				SetPageReclaim(page);
+ 				res = mapping->a_ops->writepage(page, &wbc);
+ 				if (res < 0)
+@@ -379,7 +375,6 @@ shrink_list(struct list_head *page_list,
+ 				}
+ 				goto keep;
+ 			}
+-			spin_unlock(&mapping->page_lock);
+ 		}
+ 
+ 		/*
+@@ -413,7 +408,7 @@ shrink_list(struct list_head *page_list,
+ 		if (!mapping)
+ 			goto keep_locked;	/* truncate got there first */
+ 
+-		spin_lock(&mapping->page_lock);
++		spin_lock_irq(&mapping->tree_lock);
+ 
+ 		/*
+ 		 * The non-racy check for busy page.  It is critical to check
+@@ -421,7 +416,7 @@ shrink_list(struct list_head *page_list,
+ 		 * not in use by anybody. 	(pagecache + us == 2)
+ 		 */
+ 		if (page_count(page) != 2 || PageDirty(page)) {
+-			spin_unlock(&mapping->page_lock);
++			spin_unlock_irq(&mapping->tree_lock);
+ 			goto keep_locked;
+ 		}
+ 
+@@ -429,7 +424,7 @@ shrink_list(struct list_head *page_list,
+ 		if (PageSwapCache(page)) {
+ 			swp_entry_t swap = { .val = page->index };
+ 			__delete_from_swap_cache(page);
+-			spin_unlock(&mapping->page_lock);
++			spin_unlock_irq(&mapping->tree_lock);
+ 			swap_free(swap);
+ 			__put_page(page);	/* The pagecache ref */
+ 			goto free_it;
+@@ -437,7 +432,7 @@ shrink_list(struct list_head *page_list,
+ #endif /* CONFIG_SWAP */
+ 
+ 		__remove_from_page_cache(page);
+-		spin_unlock(&mapping->page_lock);
++		spin_unlock_irq(&mapping->tree_lock);
+ 		__put_page(page);
+ 
+ free_it:
