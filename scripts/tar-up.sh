@@ -204,6 +204,9 @@ if [ -e extra-symbols ]; then
 		$BUILD_DIR
 fi
 
+# Force mbuild to choose build hosts with enough memory available:
+echo $((600*1024)) > $BUILD_DIR/minmem
+
 echo "hello.tar.bz2"
 (   cd doc
     tar -cf - --exclude=CVS --exclude='.*.cmd' \
