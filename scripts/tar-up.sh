@@ -145,15 +145,9 @@ install -m 755					\
 	rpm/check-for-config-changes		\
 	scripts/guards				\
 	scripts/arch-symbols			\
+	rpm/install-configs			\
+	rpm/generate-build-kernel-modules	\
 	$BUILD_DIR
-
-#cp -pv	kernel-source.changes \
-#	series.conf config.conf rpm/merge-headers \
-#	rpm/check-for-config-changes \
-#	rpm/config-subst rpm/running-kernel.init.in \
-#	rpm/functions.sh rpm/post.sh rpm/postun.sh \
-#	rpm/trigger-script.sh.in rpm/get_release_number.sh \
-#	scripts/guards scripts/arch-symbols $BUILD_DIR
 
 if [ -e extra-symbols ]; then
 	install -m 755					\
