@@ -9,6 +9,6 @@ test -z "$this_release" && exit 1
 for i in /usr/src/packages/SOURCES/*.spec
 do
 	test -f $i || continue
-	sed "/^Release:/s@^.*@Release: $this_release@" < $i > $i.$$
+	sed -e '/^BuildRequires:/s@\(kernel-dummy\|km_[^ ]\+\)@@g' -e "/^Release:/s@^.*@Release: $this_release@" < $i > $i.$$
 	mv -v $i.$$ $i
 done
