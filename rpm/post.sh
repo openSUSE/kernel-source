@@ -3,11 +3,20 @@ if [ ! \( -f "/boot/vmlinuz-%ver_str" -o -f "/boot/vmlinux-%ver_str" \) ]; then
 	exit 0
 fi
 
+if [ -f "/boot/vmlinux-%ver_str" ] ; then
+boot_file_initrd="vmlinux-%ver_str"
+boot_file="/boot/vmlinux-%ver_str"
+boot_link="/boot/vmlinux"
+else
+boot_file_initrd="vmlinuz-%ver_str"
+boot_file="/boot/vmlinuz-%ver_str"
+boot_link="/boot/vmlinuz"
+fi
 # update /boot/vmlinuz symlink -- do that only if /boot/vmlinuz
 # isn't a real file to avoid removing old kernels where /boot/vmlinuz
 # isn't a symlink pointing to the real kernel yet.
-if [ -L /boot/vmlinuz -o ! -e /boot/vmlinuz ]; then
-	relink vmlinuz-%ver_str /boot/vmlinuz
+if [ -L "$boot_link" -o ! -e "$boot_link" ]; then
+	relink "$boot_file" "$boot_link"
 	relink initrd-%ver_str /boot/initrd
 fi
 
@@ -21,7 +30,7 @@ touch /lib/modules/%ver_str/modules.dep
 
 if [ -f /etc/fstab ]; then
     cd /boot && \
-    /sbin/mkinitrd -k "vmlinuz-%ver_str" -i "initrd-%ver_str"
+    /sbin/mkinitrd -k "$boot_file_initrd" -i "initrd-%ver_str"
 else
     echo "please run mkinitrd as soon as your system is complete"
 fi
