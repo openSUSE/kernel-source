@@ -42,6 +42,8 @@ for i in arch/$ARCH/defconfig.*; do
   esac
   echo $A ${A}_$C
   cp -v $i .config
+  echo working on $i, press RETURN
+  read
   eval $YES make ARCH=$ARCH oldconfig
   cp -v .config ${A}_$C
   if [ -f patches/config/$A/$B ] \
