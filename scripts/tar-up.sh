@@ -8,6 +8,7 @@ if [ -e scripts/check-conf ]; then
     scripts/check-conf || {
 	echo "Inconsistencies found."
 	echo "Please clean up series.conf and/or the patches directories!"
+	echo "Press <ENTER> to continue"
 	read
     }
 fi
