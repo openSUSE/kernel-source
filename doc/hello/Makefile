@@ -5,7 +5,7 @@ KERNEL_BUILD  := /lib/modules/`uname -r`/build
 
 # Directory below /lib/modules/`uname -r`/kernel into which to install
 # the module(s):
-#MOD_SUBDIR = misc
+#MOD_DIR = misc
 
 obj-m		:= hello.o
 hello-y		+= main.o
