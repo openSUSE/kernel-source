@@ -53,6 +53,13 @@ if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
 	    # nothing to be done
     	    ;;
   	(*)	
+	    if [ -x /sbin/update-bootloader ]; then
+		opt_initrd=
+		[ -e /boot/initrd-@KERNELRELEASE@ ] \
+		    && opt_initrd="--initrd /boot/initrd-@KERNELRELEASE@"
+		/sbin/update-bootloader --image /boot/$image-@KERNELRELEASE@ \
+		    $opt_initrd --add
+	    fi
 	    # TODO: Do we need to skip this as well for xen / UML ?
 	    if [ -x /sbin/new-kernel-pkg ]; then
 	    # Notify boot loader that a new kernel image has been installed.

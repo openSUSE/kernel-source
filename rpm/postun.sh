@@ -9,6 +9,10 @@ else
     exit 0
 fi
 
+if [ -x /sbin/update-bootloader ]; then
+    /sbin/update-bootloader --image /boot/$image-@KERNELRELEASE@ --remove
+fi
+
 if [ "$(readlink /boot/$image)" = $image-@KERNELRELEASE@ ]; then
     # This may be the last kernel RPM on the system, or it may
     # be an update. In both of those cases the symlinks will
