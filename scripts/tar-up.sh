@@ -213,6 +213,7 @@ for archive in $all_archives ; do
     tar -cf - $files \
     | bzip2 -9 > $BUILD_DIR/$archive.tar.bz2
 done
+bzip2 -9 < /dev/null > $BUILD_DIR/patches.addon.tar.bz2
 
 if [ -r $SRC_FILE ]; then
   LINUX_ORIG_TARBALL=$SRC_FILE
