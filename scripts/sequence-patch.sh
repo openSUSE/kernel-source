@@ -201,7 +201,7 @@ else
 	mv ${PATCH_DIR%-$VERSION} $PATCH_DIR
     fi
     cp -rld $PATCH_DIR $PATCH_DIR.orig
-    chmod -R a-w $PATCH_DIR.orig
+#    chmod -R a-w $PATCH_DIR.orig
 fi
 
 # Helper function to restore files backed up by patch. This is
