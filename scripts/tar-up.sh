@@ -172,6 +172,7 @@ install -m 755					\
 	rpm/get_release_number.sh		\
 	rpm/check-for-config-changes		\
 	rpm/check-supported-list		\
+	rpm/check-build.sh			\
 	scripts/guards				\
 	scripts/arch-symbols			\
 	rpm/install-configs			\
