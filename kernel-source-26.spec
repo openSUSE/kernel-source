@@ -160,21 +160,8 @@ yes "" | make $MAKE_ARGS oldconfig
 
 make -s $MAKE_ARGS include/linux/version.h
 
-# Collect the filelist.
-
-{
-    echo /usr/src/linux
-    find . \
-	-path ./Documentation \
-	    -prune -printf "%%%%doc %%p\n" \
-	-o -type d \
-	    -printf "%%%%dir %%p\n" \
-	-o \
-	    -print
-} \
-| sed -e '/^\(%%dir \.\|\.\/linux\.files\)$/d' \
-      -e 's:\./:/usr/src/linux-%ver_str/:' \
-| sort -u > linux.files
+# Collect the filelist. (Not needed at the moment.)
+#find . -mindepth 1 > linux.files
 
 
 %install
@@ -196,7 +183,8 @@ fi
 rm -rf $RPM_BUILD_ROOT
 mkdir -p $RPM_BUILD_ROOT/usr/src/linux-%ver_str
 ln -sf linux-%ver_str $RPM_BUILD_ROOT/usr/src/linux
-cp -Rdp . $RPM_BUILD_ROOT/usr/src/linux-%ver_str
+#cpio -p $RPM_BUILD_ROOT/usr/src/linux-%ver_str < linux.files
+cp -dpR --parents . $RPM_BUILD_ROOT/usr/src/linux-%ver_str
 
 # Do a test build to catch the most stupid mistakes early.
 
@@ -205,4 +193,6 @@ make $MAKE_ARGS vmlinux
 fi
 
 
-%files -f linux.files
+%files
+/usr/src/linux
+/usr/src/linux-%ver_str
