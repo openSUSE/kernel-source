@@ -159,6 +159,7 @@ install -m 644					\
 	rpm/trigger-script.sh.in		\
 	rpm/source-post.sh			\
 	rpm/post.sh				\
+	rpm/mkinitrd.sh				\
 	rpm/postun.sh				\
 	rpm/Makefile.suse			\
 	doc/README.SUSE				\
