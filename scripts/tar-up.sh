@@ -129,6 +129,10 @@ install -m 644					\
 	rpm/kernel-dummy.spec			\
 	$BUILD_DIR
 
+install m 644					\
+	kernel-source.changes 			\
+	$BUILD_DIR/kernel-dummy.changes
+
 install -m 755					\
 	rpm/config-subst 			\
 	rpm/get_release_number.sh		\
