@@ -11,7 +11,9 @@ readlink() {
 }
 relink() {
     if [ -h "$2" ]; then
-	echo "Changing symlink $2 from $(readlink "$2") to $1"
+	local old=$(readlink "$2")
+	[ "$old" = "$1" ] && return 0
+	echo "Changing symlink $2 from $old to $1"
     elif [ -e "$2" ]; then
 	echo "Replacing file $2 with symlink to $1"
     fi
