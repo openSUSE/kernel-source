@@ -20,8 +20,8 @@ Summary:      The Linux kernel (the core of the Linux operating system)
 Group:        Development/Sources
 Requires:     make c_compiler
 # rpm doesn't like '-' in Version ...
-Version:      2.6.0test2
-%define kversion 2.6.0-test2
+Version:      2.6.0test3
+%define kversion 2.6.0-test3
 Release:      0
 Source0:      linux-%{kversion}.tar.bz2
 Source10:     series.conf
