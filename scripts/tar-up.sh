@@ -19,35 +19,66 @@ mkdir -p $BUILD_DIR
 config_files="$(
     for arch in $(scripts/arch-symbols --list) ; do
 	scripts/guards $(scripts/arch-symbols $arch) < config.conf \
-	| sed -e "s:^:$arch :"
+	| sed -e "s,^,$arch ,"
     done)"
-cfgnames="$(echo "$config_files" | sed -e 's:.*/::' | sort -u)"
+flavors="$(echo "$config_files" | sed -e 's,.*/,,' | sort -u)"
 
-for cfgname in $cfgnames ; do
-    echo "kernel-$cfgname.spec"
+for flavor in $flavors ; do
+    echo "kernel-$flavor.spec"
 
+    # Find all architectures for this spec file
     set -- $(
 	echo "$config_files" \
-	| sed -e "/\/$cfgname/!d" \
-	      -e "s: .*::g" \
-	      -e "s:i386:%ix86:g" \
+	| sed -e "/\/$flavor/!d" \
+	      -e "s, .*,,g" \
 	| sort -u)
     archs="$*"
     
-    sed -e "s:@NAME@:kernel-$cfgname:g" \
-	-e "s:@CFGNAME@:$cfgname:g" \
-	-e "s:@VERSION@:$VERSION:g" \
-	-e "s:@ARCHS@:$archs:g" \
+    # Compute @PROVIDES_OBSOLETES@ expansion
+    head="" ; tail=""
+    for arch in $archs ; do
+	p=( $(scripts/guards $(scripts/arch-symbols $arch) $flavor p \
+		< rpm/old-packages.conf) )
+	o=( $(scripts/guards $(scripts/arch-symbols $arch) $flavor o \
+		< rpm/old-packages.conf) )
+
+	[ $arch = i386 ] && arch="%ix86" && nl=$'\n'
+	if [ ${#p[@]} -o ${#p[@]} ]; then
+	    [ -n "$head" ] && head="${head}%else$nl"
+	    head="${head}%ifarch $arch$nl"
+	    [ -n "$p" ] && head="${head}Provides:     ${p[@]}$nl"
+	    [ -n "$o" ] && head="${head}Obsoletes:    ${o[@]}$nl"
+	    tail="%endif$nl$tail"
+	fi
+    done
+    prov_obs="$head${tail%$'\n'}"
+
+    # If we build this spec file for only one architecture,  the
+    # enclosing if is not needed
+    if [ $(set -- $archs ; echo $#) -eq 1 ]; then
+	prov_obs="$(echo "$prov_obs" | grep -v '%ifarch\|%endif')"
+    fi
+
+    # In ExclusiveArch in the spec file, we must specify %ix86 instead
+    # of i386.
+    archs="$(echo $archs | sed -e 's,i386,%ix86,g')"
+
+    # Generate spec file
+    sed -e "s,@NAME@,kernel-$flavor,g" \
+	-e "s,@CFGNAME@,$flavor,g" \
+	-e "s,@VERSION@,$VERSION,g" \
+	-e "s,@ARCHS@,$archs,g" \
+	-e "s,@PROVIDES_OBSOLETES@,${prov_obs//$'\n'/\\n},g" \
       < rpm/kernel-binary.spec.in \
-    > $BUILD_DIR/kernel-$cfgname.spec
-    cp kernel-source.changes $BUILD_DIR/kernel-$cfgname.changes
+    > $BUILD_DIR/kernel-$flavor.spec
+    cp kernel-source.changes $BUILD_DIR/kernel-$flavor.changes
 done
 
 # The pre-configured kernel source package
 echo "kernel-source.spec"
-sed -e "s:@NAME@:kernel-source:g" \
-    -e "s:@VERSION@:$VERSION:g" \
-    -e "s:@PRECONF@:1:g" \
+sed -e "s,@NAME@,kernel-source,g" \
+    -e "s,@VERSION@,$VERSION,g" \
+    -e "s,@PRECONF@,1,g" \
   < rpm/kernel-source.spec.in \
 > $BUILD_DIR/kernel-source.spec
 
@@ -55,17 +86,17 @@ sed -e "s:@NAME@:kernel-source:g" \
 ## for any km_* packages that absolutely think they need kernel sources
 ## installed.
 #echo "kernel-bare.spec"
-#sed -e "s:@NAME@:kernel-bare:g" \
-#    -e "s:@VERSION@:$VERSION:g" \
-#    -e "s:@PRECONF@:0:g" \
+#sed -e "s,@NAME@,kernel-bare,g" \
+#    -e "s,@VERSION@,$VERSION,g" \
+#    -e "s,@PRECONF@,0,g" \
 #  < rpm/kernel-source.spec.in \
 #> $BUILD_DIR/kernel-bare.spec
 #cp kernel-source.changes $BUILD_DIR/kernel-bare.changes
 
 echo "kernel-syms.spec"
-sed -e "s:@NAME@:kernel-syms:g" \
-    -e "s:@VERSION@:$VERSION:g" \
-    -e "s:@PRECONF@:1:g" \
+sed -e "s,@NAME@,kernel-syms,g" \
+    -e "s,@VERSION@,$VERSION,g" \
+    -e "s,@PRECONF@,1,g" \
   < rpm/kernel-syms.spec.in \
 > $BUILD_DIR/kernel-syms.spec
 cp kernel-source.changes $BUILD_DIR/kernel-syms.changes
@@ -80,7 +111,6 @@ install -m 644					\
 	rpm/trigger-script.sh.in		\
 	rpm/post.sh				\
 	rpm/postun.sh				\
-	rpm/old-packages.conf			\
 	$BUILD_DIR
 
 install -m 755					\
