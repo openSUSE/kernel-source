@@ -41,8 +41,6 @@ linux | xterm | screen)
     ;;
 esac
 
-cvs_wd=$(readlink patches)
-
 #########################################################
 # main
 
@@ -63,7 +61,7 @@ until [ "$#" = "0" ] ; do
 	;;
     esac
 done
-for config in $(cd $cvs_wd && \
+for config in $(cd patches && \
 	        eval scripts/guards $arch < config.conf); do
     arch=${config%/*}
     flavor=${config#*/}
