@@ -88,11 +88,21 @@ for flavor in $flavors ; do
     cp kernel-source.changes $BUILD_DIR/kernel-$flavor.changes
 done
 
+binary_spec_files=$(
+    n=50
+    for flavor in syms $flavors ; do
+	printf "%-14s%s\n" "Source$n:" "kernel-$flavor.spec"
+	n=$[$n+1]
+    done
+)
+binary_spec_files=${binary_spec_files//$'\n'/\\n}
+
 # The pre-configured kernel source package
 echo "kernel-source.spec"
 sed -e "s,@NAME@,kernel-source,g" \
     -e "s,@VERSION@,$VERSION,g" \
     -e "s,@PRECONF@,1,g" \
+    -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
   < rpm/kernel-source.spec.in \
 > $BUILD_DIR/kernel-source.spec
 
