@@ -156,20 +156,28 @@ if [ -e extra-symbols ]; then
 		$BUILD_DIR
 fi
 
-for d in config patches.*; do
-  # Skip non-directories. Also work around CVS problem: Directories can't
-  # be deleted, but are checked out with only a CVS sub-directory in them.
-  DIR_ENTRIES=( $d/* )
-  DIR_ENTRIES=${#DIR_ENTRIES[@]}
-  if [ ! -d $d -o $DIR_ENTRIES -eq 0 -o \
-       \( -d $d/CVS -a $DIR_ENTRIES -eq 1 \) ] ; then
-    echo "Skipping $d..."
-    continue
-  fi
+# Generate list of all config files and patches used
+all_files="$( {
+	$(dirname $0)/guards --list < series.conf
+	$(dirname $0)/guards --prefix=config --list < config.conf
+    } | sort -u )"
+# The first directory level determines the archive name
+all_archives="$(
+    echo "$all_files" \
+    | sed -e 's,/.*,,' \
+    | uniq )"
+for archive in $all_archives ; do
+    echo "$archive.tar.bz2"
+    case " $IGNORE_ARCHS " in
+    *" ${archive#patches.} "*)
+	echo "Ignoring $d..."
+	continue ;;
+    esac
 
-  echo "Compressing $d..."
-  tar -cf - --exclude=CVS --exclude="*~" --exclude=".#*" $d \
-    | bzip2 -1 > $BUILD_DIR/$d.tar.bz2
+    files="$( echo "$all_files" \
+	| sed -ne "\:^${archive//./\\.}/:p" )"
+    tar -cf - $files \
+    | bzip2 -9 > $BUILD_DIR/$archive.tar.bz2
 done
 
 if [ -r $SRC_FILE ]; then

@@ -9,3 +9,4 @@ fi
 
 VERSION=2.6.5
 BUILD_DIR=kernel-source
+IGNORE_ARCHS=
