@@ -7,6 +7,6 @@ else
 	MIRROR=${MIRROR:-/mounts/mirror/kernel/v2.6}
 fi
 
-VERSION=2.6.0-test8
+VERSION=2.6.0-test9
 BUILD_DIR=kernel-source-26
 

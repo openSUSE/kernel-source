@@ -20,7 +20,7 @@ Autoreqprov:  off
 Summary:      The Linux kernel (the core of the Linux operating system)
 Group:        Development/Sources
 Requires:     make c_compiler
-Version:      2.6.0_test8
+Version:      2.6.0_test9
 Release:      0
 %define kversion %(echo %version | sed s/_/-/g)
 Source0:      linux-%{kversion}.tar.bz2
