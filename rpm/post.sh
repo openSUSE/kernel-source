@@ -45,8 +45,8 @@ if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
 
     case @KERNELRELEASE@ in
 	(*xen*)
-	    ln -sf $image-@KERNELRELEASE /boot/$image-xen
-	    ln -sf initrd-@KERNELRELEASE /boot/initrd-xen
+	    ln -sf $image-@KERNELRELEASE@ /boot/$image-xen
+	    ln -sf initrd-@KERNELRELEASE@ /boot/initrd-xen
 	    ;;
 	(*um*)
 	    # nothing to be done
