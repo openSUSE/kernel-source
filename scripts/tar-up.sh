@@ -80,7 +80,7 @@ for cfgname in $cfgnames ; do
     | m4 > $BUILD_DIR/kernel-$cfgname-26.spec
     cat kernel-source-26.changes rpm/kernel-binary-26.changes \
       > $BUILD_DIR/kernel-$cfgname-26.changes
-  done
+done
 
 # The pre-configured kernel source package
 echo "kernel-source-26.spec"
