@@ -2,69 +2,68 @@
 
 source $(dirname $0)/config.sh
 
-#SCRATCH_AREA=...
-#PATCH_ARCH=...
+usage() {
+    echo "SYNOPSIS: $0 [-qv] [--arch=...] [--symbol=...] [--dir=...] [last-patch-name]"
+    exit 1
+}
+
+# Allow to pass in default arguments via SEQUENCE_PATCH_ARGS.
+set -- $SEQUENCE_PATCH_ARGS "$@"
+
+options=`getopt -o qvd: --long quilt,arch:,symbol:,dir: -- "$@"`
+
+if [ $? -ne 0 ]
+then
+    usage
+fi
+
+eval set -- "$options"
 
 QUIET=1
 EXTRA_SYMBOLS=
 CLEAN=1
 
-# Allow to pass in default arguments via SEQUENCE_PATCH_ARGS.
-set -- $SEQUENCE_PATCH_ARGS "$@"
-
-while [ $# -gt 0 ]; do
-    case $1 in
+while true; do
+    case "$1" in
     	-q)
 	    QUIET=1
 	    ;;
     	-v)
-	    unset QUIET
+	    QUIET=
 	    ;;
-	--arch=*)
-	    export PATCH_ARCH="${1#--arch=}"
+	--quilt)
+	    CLEAN=
 	    ;;
 	--arch)
-	    export PATCH_ARCH="$2"
+	    export PATCH_ARCH=$2
 	    shift
-	    ;;
-	--symbol=*)
-	    EXTRA_SYMBOLS="$EXTRA_SYMBOLS ${1#--symbol=}"
 	    ;;
 	--symbol)
 	    EXTRA_SYMBOLS="$EXTRA_SYMBOLS $2"
 	    shift
 	    ;;
-	--quilt)
-	    CLEAN=
-	    ;;
-	-d)
+	-d|--dir)
+	    SCRATCH_AREA=$2
 	    shift
-	    SCRATCH_AREA=$1 
 	    ;;
-	--dir=*)
-	    SCRATCH_AREA=${1#--dir=}
-	    ;;
-	-|[^-]*)
-	    [ -n "$LIMIT" ] && break
-	    LIMIT=$1
-	    ;;
+	--)
+	    shift
+	    break ;;
 	*)
-	    break
-	    ;;
+	    usage ;;
     esac
     shift
 done
-if [ $# -gt 0 ]; then
-    echo "SYNOPSIS: $0 [-qv] [--arch=...] [--symbol=...] [--dir=...] [last-patch-name]"
-    exit 1
+
+unset LIMIT
+if [ $# -ge 1 ]; then
+    LIMIT=$1
+    shift
 fi
-case $SCRATCH_AREA in
-    /*)
-	;; 
-    *)
-	SCRATCH_AREA=$(pwd)/$SCRATCH_AREA
-	;;
-esac
+
+if [ $# -ne 0 ]; then
+    usage
+fi
 
 # Some patches require patch 2.5.4. Abort with older versions.
 PATCH_VERSION=$(patch -v | sed -e '/^patch/!d' -e 's/patch //')
@@ -107,34 +106,16 @@ echo "Creating tree in $PATCH_DIR"
 
 if [ ! -d $PATCH_DIR.orig ]; then
     # Check if linux-$VERSION.tar.gz is accessible.
-    if [ -z "$LINUX_ORIG_TARBALL" ]; then
-	if [ -r $SCRATCH_AREA/linux-$VERSION.tar.gz ]; then
-	    LINUX_ORIG_TARBALL=$SCRATCH_AREA/linux-$VERSION.tar.gz
-            COMPRESS_MODE=z
-	elif [ -r $SCRATCH_AREA/linux-$VERSION.tar.bz2 ]; then
-	    LINUX_ORIG_TARBALL=$SCRATCH_AREA/linux-$VERSION.tar.bz2
-            COMPRESS_MODE=j
-	elif [ -r linux-$VERSION.tar.gz ]; then
-	    LINUX_ORIG_TARBALL=linux-$VERSION.tar.gz
-            COMPRESS_MODE=z
-        elif [ -r linux-$VERSION.tar.bz2 ]; then
-	    LINUX_ORIG_TARBALL=linux-$VERSION.tar.bz2
-            COMPRESS_MODE=j
-	elif [ -r $MIRROR/linux-$VERSION.tar.gz ]; then
-	    LINUX_ORIG_TARBALL=$MIRROR/linux-$VERSION.tar.gz
-            COMPRESS_MODE=z
-	elif [ -r $MIRROR/linux-$VERSION.tar.bz2 ]; then
-	    LINUX_ORIG_TARBALL=$MIRROR/linux-$VERSION.tar.bz2
-            COMPRESS_MODE=j
-	elif [ -r $MIRROR/testing/linux-$VERSION.tar.bz2 ]; then
-	    LINUX_ORIG_TARBALL=$MIRROR/testing/linux-$VERSION.tar.bz2
-            COMPRESS_MODE=j
-	else
-	    LINUX_ORIG_TARBALL=linux-$VERSION.tar.gz
+    for file in {$SCRATCH_AREA/,,$MIRROR/,$MIRROR/testing/}linux-$VERSION.tar.{gz,bz2}; do
+	if [ -r $file ]; then
+	    LINUX_ORIG_TARBALL=$file
+	    [ ${file:(-3)} = .gz  ] && COMPRESS_MODE=z
+	    [ ${file:(-4)} = .bz2 ] && COMPRESS_MODE=j
+	    break
 	fi
-    fi
-    if [ ! -r "$LINUX_ORIG_TARBALL" ]; then
-	echo "Kernel source archive \`$LINUX_ORIG_TARBALL' not found," >&2
+    done
+    if [ -z "$LINUX_ORIG_TARBALL" ]; then
+	echo "Kernel source archive \`linux-$VERSION.tar.gz' not found," >&2
 	echo "alternatively you can put an unpatched kernel tree to" >&2
 	echo "$PATCH_DIR.orig." >&2
 	exit 1

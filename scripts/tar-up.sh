@@ -32,6 +32,13 @@ if ! scripts/cvs-wd-timestamp > $BUILD_DIR/build-source-timestamp; then
     exit 1
 fi
 
+# If we are on a CVS branch, included the branch name as well:
+if [ -e CVS/Tag ]; then
+    read tag < CVS/Tag
+    [ "${tag:0:1}" = T ] \
+    && echo "CVS Branch: ${tag:1}" >> $BUILD_DIR/build-source-timestamp
+fi
+
 # List all used configurations
 config_files="$(
     for arch in $(scripts/arch-symbols --list) ; do
