@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright (C) 2004 Andrea Arcangeli <andrea@suse.de> SUSE
-# $Id: mkpatch.py,v 1.13 2004/12/01 01:40:49 andrea Exp $
+# $Id: mkpatch.py,v 1.14 2004/12/01 03:28:19 andrea Exp $
 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -44,6 +44,7 @@
 # behaviour will be forced.
 
 import sys, os, re, readline, getopt
+from rfc822 import Message
 
 TAGS = (
 	'From',
@@ -91,18 +92,30 @@ class tag_class(object):
 		self.regexp = re.compile(name + r': (.*)', re.I)
 		self.value = ''
 
-	def parse(self, line):
-		m = self.regexp.match(line)
-		if m:
-			self.value = m.group(1)
-			return 1
+	def parse(self, line, message):
+		header = message.isheader(line)
+		if header and header.lower() == self.name.lower():
+			header = message.getheader(header)
+			if header:
+				self.value = header
+				return len(self.value.split('\n'))
 
 	def ask_value(self):
-		self.value = raw_input('%s: ' % self.name)
+		self.value = ''
+		first = 1
+		while 1:
+			this_value = raw_input('%s: ' % self.name)
+			if not this_value:
+				break
+			if not first:
+				self.value += '\n '
+			first = 0
+			self.value += this_value
 
 class patch_class(object):
 	def __init__(self, patchfile, signoff_mode):
 		self.patchfile = patchfile
+		self.message = Message(file(patchfile))
 		self.signoff_mode = signoff_mode
 		self.prepare()
 		self.read()
@@ -150,8 +163,9 @@ class patch_class(object):
 			return
 
 		for tag in self.tags:
-			if tag.parse(line):
-				return 1
+			ret = tag.parse(line, self.message)
+			if ret:
+				return ret
 
 	def read(self):
 		self.metadata = ''
@@ -174,7 +188,7 @@ class patch_class(object):
 			re_ackedby = self.re_ackedby
 
 			emptylines = ''
-			first = 1
+			headers = 1
 			state = 'is_metadata'
 			while 1:
 				line = patch.readline()
@@ -192,10 +206,14 @@ class patch_class(object):
 					if re_empty.search(line):
 						emptylines += '\n'
 					else:
-						if not self.parse_metadata(line):
-							if first:
+						nr_lines = self.parse_metadata(line)
+						if type(nr_lines) == int:
+							for i in xrange(1, nr_lines):
+								patch.readline()
+						if not headers or not nr_lines:
+							if headers:
 								emptylines = ''
-								first = 0
+								headers = 0
 							self.metadata += emptylines + line
 							emptylines = ''
 				elif state == 'is_signoff':
