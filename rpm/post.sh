@@ -19,12 +19,12 @@ if test "$YAST_IS_RUNNING" != instsys ; then
 	    exit 1
 	fi
 
+	# update /boot/initrd symlink
+	if [ -L /boot/initrd -a \
+	     "$(readlink /boot/initrd)" != initrd-%ver_str ]; then
+	    mv /boot/initrd /boot/initrd.previous
+	fi
 	if [ -e /boot/initrd-%ver_str ]; then
-	    # update /boot/initrd symlink
-	    if [ -L /boot/initrd -a \
-		 "$(readlink /boot/initrd)" != initrd-%ver_str ]; then
-		mv /boot/initrd /boot/initrd.previous
-	    fi
 	    relink initrd-%ver_str /boot/initrd
 	else
 	    rm -f /boot/initrd
