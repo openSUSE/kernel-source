@@ -1,4 +1,5 @@
 relink linux-%ver_str $RPM_BUILD_ROOT/usr/src/linux
+relink linux-%ver_str-obj $RPM_BUILD_ROOT/usr/src/linux-obj
 if [ 0%preconf -ne 0 ]; then
 /sbin/insserv running-kernel
 

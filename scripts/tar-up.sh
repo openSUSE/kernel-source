@@ -142,12 +142,10 @@ install -m 644					\
 install -m 755					\
 	rpm/config-subst 			\
 	rpm/get_release_number.sh		\
-	rpm/merge-headers			\
 	rpm/check-for-config-changes		\
 	scripts/guards				\
 	scripts/arch-symbols			\
 	rpm/install-configs			\
-	rpm/generate-Makefile.suse		\
 	$BUILD_DIR
 
 if [ -e extra-symbols ]; then
