@@ -19,9 +19,8 @@ Autoreqprov:  off
 Summary:      The Linux kernel (the core of the Linux operating system)
 Group:        Development/Sources
 Requires:     make c_compiler
-# rpm doesn't like '-' in Version ...
-Version:      2.6.0test4
-%define kversion 2.6.0-test4
+Version:      2.6.0_test4
+%define kversion %(echo %version | sed s/_/-/g)
 Release:      0
 Source0:      linux-%{kversion}.tar.bz2
 Source10:     series.conf
