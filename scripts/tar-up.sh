@@ -1,5 +1,17 @@
 #!/bin/sh
 
+rpm_release_timestamp=
+until [ "$#" = "0" ] ; do
+  case "$1" in
+    -ts|--timestamp)
+      rpm_release_timestamp=yes
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
 source $(dirname $0)/config.sh
 export LANG=POSIX
 SRC_FILE=linux-$VERSION.tar.bz2
@@ -192,6 +204,14 @@ fi
 
 if [ ! -r $LINUX_ORIG_TARBALL ]; then
   echo "Please add $SRC_FILE to $BUILD_DIR"
+fi
+
+if [ "$rpm_release_timestamp" = "yes" ] ; then
+cat > $BUILD_DIR/get_release_number.sh <<EOF
+#!/bin/sh
+env -i - TZ=GMT date +%Y%m%d
+EOF
+chmod -v a+rx $BUILD_DIR/get_release_number.sh
 fi
 
 echo "If you want to submit the kernel to Autobuild now,"
