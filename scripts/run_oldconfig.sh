@@ -99,7 +99,7 @@ for config in $(cd patches && \
 	;;
     esac
     if ! diff -U0 $config .config; then
-	cp -v .config $config
+	sed '/^# Linux kernel version:/d' < .config > $config
 	cp -v .config arch/$arch/defconfig.$flavor
     fi
 done
