@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright (C) 2004 Andrea Arcangeli <andrea@suse.de> SUSE
-# $Id: mkpatch.py,v 1.6 2004/11/23 07:27:26 andrea Exp $
+# $Id$
 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -27,19 +27,63 @@
 #	./mkpatch.py dir1 dir2
 #	./mkpatch.py dir2 destination-patchfile
 #	./mkpatch.py dir1 dir2 destination-patchfile
+#	./mkpatch.py destination-patchfile # this will only parse patchfile
 
-import sys, os, re, readline
+# There are three options: -n, -s, -a (alias respectively to
+# --no-signoff, --signoff and --acked). If you're only rediffing
+# the patch you can use '-n' to avoid altering the signoff list.
+# If you're instead only reviewing the patch you can use '-a'
+# to add an Acked-by, instead of a Signed-off-by. You can use
+# bash alias with bash 'alias mkpatch.py=mkpatch.py -a' if you
+# only review patches, or you can use -n instead if you only
+# regenerate patches without even reviewing them. You can always
+# force a signoff by using -a or -s. The last option mode overrides
+# any previous signoff mode. The default is '-s' (aka '--signoff').
+
+# If you miss the ~/.signedoffby file, '-n' (aka '--no-signoff')
+# behaviour will be forced.
+
+import sys, os, re, readline, getopt
 
 TAGS = (
 	'From',
 	'Subject',
 	'Patch-mainline',
-	'SUSE-Bugzilla-#',
-	'SUSE-CVS-branches',
+	'SUSE-Bugzilla',
 	)
 
 DIFF_CMD = 'diff -urNp --exclude CVS --exclude BitKeeper --exclude {arch} --exclude .arch-ids --exclude .svn'
 SIGNOFF_FILE = '~/.signedoffby'
+
+class signoff_mode_class(object):
+	signedoffby = 'Signed-off-by: '
+	ackedby = 'Acked-by: '
+
+	def __init__(self):
+		self.mode = 0
+		self.my_signoff = None
+	def signoff(self):
+		self.mode = 0
+	def no_signoff(self):
+		self.mode = 1
+	def acked(self):
+		self.mode = 2
+	def is_acked(self):
+		return self.mode == 2
+	def is_signingoff(self):
+		return self.mode == 0
+	def is_enabled(self):
+		return self.is_signingoff() or self.is_acked()
+	def change_prefix(self, prefix, signoff):
+		if self.my_signoff is None:
+			return prefix
+		if self.is_signingoff():
+			if signoff == self.my_signoff:
+				return self.signedoffby
+		elif self.is_acked():
+			if signoff == self.my_signoff:
+				return self.ackedby
+		return prefix
 
 class tag_class(object):
 	def __init__(self, name):
@@ -57,22 +101,19 @@ class tag_class(object):
 		self.value = raw_input('%s: ' % self.name)
 
 class patch_class(object):
-	def __init__(self, patchfile):
+	def __init__(self, patchfile, signoff_mode):
 		self.patchfile = patchfile
+		self.signoff_mode = signoff_mode
 		self.prepare()
 		self.read()
 
 	def prepare(self):
-		self.signedoffby = 'Signed-off-by: '
-		self.ackedby = 'Acked-by: '
-
 		readline.add_history(os.path.basename(self.patchfile))
-		readline.add_history('HEAD, SLES9_SP1_BRANCH, SL92_BRANCH, SLES9_GA_BRANCH')
 		readline.add_history('yes'); readline.add_history('no')
 
-		self.my_signoff = None
-		self.re_signoff = re.compile(self.signedoffby + r'(.*)', re.I)
-		self.re_ackedby = re.compile(self.ackedby + r'(.*)', re.I)
+		my_signoff = None
+		self.re_signoff = re.compile(self.signoff_mode.signedoffby + r'(.*)', re.I)
+		self.re_ackedby = re.compile(self.signoff_mode.ackedby + r'(.*)', re.I)
 		try:
 			signoff = file(os.path.expanduser(SIGNOFF_FILE)).readline()
 		except IOError:
@@ -80,12 +121,20 @@ class patch_class(object):
 		else:
 			m = self.re_signoff.search(signoff)
 			if m:
-				self.my_signoff = m.group(1)
-				readline.add_history(self.my_signoff)
+				my_signoff = m.group(1)
+				readline.add_history(my_signoff)
+
+		if not my_signoff:
+			self.signoff_mode.no_signoff()
+		else:
+			self.signoff_mode.my_signoff = my_signoff
 
 		self.tags = []
 		for tag in TAGS:
 			self.tags.append(tag_class(tag))
+
+		self.signedoffby = self.signoff_mode.signedoffby
+		self.ackedby = self.signoff_mode.ackedby
 
 	def parse_metadata(self, line):
 		# grab bk metadata and convert into valid header
@@ -181,11 +230,13 @@ class patch_class(object):
 		ret = ''
 		for signoff in self.signoff_order:
 			prefix = self.signoff[signoff]
-			if signoff == self.my_signoff:
-				prefix = self.signedoffby
+			prefix = self.signoff_mode.change_prefix(prefix, signoff)
 			ret += prefix + signoff + '\n'
-		if self.my_signoff not in self.signoff:
-			ret += self.signedoffby + self.my_signoff + '\n'
+		my_signoff = self.signoff_mode.my_signoff
+		if self.signoff_mode.is_enabled() and \
+		       my_signoff and my_signoff not in self.signoff:
+			prefix = self.signoff_mode.change_prefix(None, my_signoff)
+			ret += prefix + my_signoff + '\n'
 		return ret
 
 	def write(self):
@@ -209,7 +260,8 @@ class patch_class(object):
 		return self.__payload
 
 	def set_payload(self, value):
-		self.__payload = cleanup_patch(value)
+		if value is not None:
+			self.__payload = cleanup_patch(value)
 
 	payload = property(get_payload, set_payload)
 
@@ -221,47 +273,65 @@ def cleanup_patch(patch):
 			ret += line + '\n'
 	return ret
 
-def replace_diff(diff, patchfile):
-	patch = patch_class(patchfile)
+def replace_diff(diff, patchfile, signoff_mode):
+	patch = patch_class(patchfile, signoff_mode)
 	patch.payload = diff
 	patch.ask_empty_tags()
 	patch.write()
 
-def mkpatch(*arg):
-	nr_arg = len(arg)
-	def cleanup_path(arg):
-		return map(os.path.normpath, map(os.path.expanduser, arg))
-	if nr_arg > 3:
+def mkpatch(*args):
+	# parse opts
+	try:
+		opts, args = getopt.getopt(args, 'nas', ( 'no-signoff', 'acked', 'signoff', ))
+	except getopt.GetoptError:
 		raise 'EINVAL'
-	elif nr_arg == 0:
+	signoff_mode = signoff_mode_class()
+	for opt, arg in opts:
+		if opt in ('-n', '--no-signoff', ):
+			signoff_mode.no_signoff()
+		elif opt in ('-a', '--acked', ):
+			signoff_mode.acked()
+		elif opt in ('-s', '--signoff', ):
+			signoff_mode.signoff()
+
+	# parse args
+	nr_args = len(args)
+	def cleanup_path(args):
+		return map(os.path.normpath, map(os.path.expanduser, args))
+	if nr_args > 3:
+		raise 'EINVAL'
+	elif nr_args == 0:
 		olddir = None
 		newdir = os.getcwd()
 		patchfile = None
-	elif nr_arg == 1:
+	elif nr_args == 1:
 		olddir = None
-		newdir, = cleanup_path(arg)
+		newdir, = cleanup_path(args)
 		patchfile = None
-	elif nr_arg == 2:
+	elif nr_args == 2:
 		olddir = None
-		newdir, patchfile = cleanup_path(arg)
-	elif nr_arg == 3:
-		olddir, newdir, patchfile = cleanup_path(arg)
+		newdir, patchfile = cleanup_path(args)
+	elif nr_args == 3:
+		olddir, newdir, patchfile = cleanup_path(args)
 
+	#print olddir, newdir, patchfile
 	if olddir and not os.path.isdir(olddir):
 		print >>sys.stderr, 'olddir must be a directory'
 		raise 'EINVAL'
-	if not os.path.isdir(newdir):
-		print >>sys.stderr, 'newdir must be a directory'
-		raise 'EINVAL'
-	if patchfile and os.path.isdir(patchfile):
+	elif not os.path.isdir(newdir):
+		if not os.path.isfile(newdir):
+			print >>sys.stderr, 'newdir must be a directory or a file'
+			raise 'EINVAL'
+		olddir, newdir, patchfile = (None, None, newdir, )
+	elif patchfile and os.path.isdir(patchfile):
 		olddir = newdir
 		newdir = patchfile
 		patchfile = None
+	#print olddir, newdir, patchfile
 
-	diff = ''
-	if not olddir:
+	diff = None
+	if not olddir and newdir:
 		# use backup files
-
 		print >>sys.stderr, 'Searching backup files in %s ...' % newdir,
 		find = os.popen('find %s -type f -name \*~ 2>/dev/null' % newdir, 'r')
 		files = find.readlines()
@@ -270,6 +340,7 @@ def mkpatch(*arg):
 		else:
 			print >>sys.stderr, 'none found.'
 
+		diff = ''
 		for backup_f in files:
 			new_f = None
 			backup_f = backup_f[:-1]
@@ -284,13 +355,14 @@ def mkpatch(*arg):
 				print >>sys.stderr, 'Diffing %s...' % new_f,
 				diff += os.popen(DIFF_CMD + ' %s %s' % (backup_f, new_f) + ' 2>/dev/null').read()
 				print >>sys.stderr, 'done.'
-	else:
+	elif olddir and newdir:
+		# use two directories
 		print >>sys.stderr, 'Creating diff between %s and %s ...' % (olddir, newdir),
-		diff += os.popen(DIFF_CMD + ' %s %s' % (olddir, newdir) + ' 2>/dev/null', 'r').read()
+		diff = os.popen(DIFF_CMD + ' %s %s' % (olddir, newdir) + ' 2>/dev/null', 'r').read()
 		print >>sys.stderr, 'done.'
 
 	if patchfile:
-		replace_diff(diff, patchfile)
+		replace_diff(diff, patchfile, signoff_mode)
 		os.execvp('vi', ('vi', '-c', 'set tw=72', patchfile, ))
 	else:
 		if diff:
@@ -300,4 +372,5 @@ if __name__ == '__main__':
 	try:
 		mkpatch(*sys.argv[1:])
 	except 'EINVAL':
-		print >>sys.stderr, 'Usage:', sys.argv[0], '[olddir] <newdir> [patch]'
+		print >>sys.stderr, 'Usage:', sys.argv[0], \
+		      '[-a|--acked] [-n|--no-signoff] [-s|--signoff] [olddir] [newdir] [patch]'
