@@ -72,6 +72,7 @@ install -m 644					\
 	rpm/trigger-script.sh.in		\
 	rpm/post.sh				\
 	rpm/postun.sh				\
+	rpm/old-packages.conf			\
 	$BUILD_DIR
 
 install -m 755					\
