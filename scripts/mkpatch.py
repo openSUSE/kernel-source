@@ -23,7 +23,7 @@
 
 # Usage is intuitive like this:
 #	./mkpatch.py # without parameter search the backup in current dir
-#	./mkpatch.py dir2 # this search the backups in dir
+#	./mkpatch.py dir2 # this search the backups in dir2
 #	./mkpatch.py dir1 dir2
 #	./mkpatch.py dir2 destination-patchfile
 #	./mkpatch.py dir1 dir2 destination-patchfile
