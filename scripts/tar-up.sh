@@ -51,10 +51,14 @@ for flavor in $flavors ; do
 	    tail="%endif$nl$tail"
 	fi
 
-	# Do we have an override config file for testing?
+	# Do we have an override config file or an additional patch?
 	if [ -e $arch-$flavor.conf ]; then
 	    echo "Override config: $arch-$flavor.conf"
 	    cp $arch-$flavor.conf $BUILD_DIR/
+	fi
+	if [ -e $arch-$flavor.diff ]; then
+	    echo "Extra patch: $arch-$flavor.diff"
+	    cp $arch-$flavor.diff $BUILD_DIR/
 	fi
     done
     prov_obs="$head${tail%$'\n'}"
