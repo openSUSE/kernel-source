@@ -264,7 +264,7 @@ while [ $# -gt 0 ]; do
     echo "[ $PATCH ]"
     echo "[ $PATCH ]" >> $PATCH_LOG
     backup_dir=.sequence_patch/$PATCH
-    patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 \
+    patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E \
 	    --no-backup-if-mismatch < $PATCH > $LAST_LOG 2>&1
     STATUS=$?
     [ $STATUS -ne 0 ] \
@@ -325,25 +325,10 @@ for config in $CONFIGS; do
 	| rpm/config-subst CONFIG_SUSE_KERNEL y \
 	> $TMPFILE
 
-	if [ "${config/*\//}" = "default" ]; then
-		# We may have patches that modify one of the
-		# arch/$ARCH/defconfig files. If we apply only up to a
-		# certain position, don't overwrite those defconfig
-		# files, or else those modifications may accidentally
-		# end up in one of the patches.
-
-		if [ -z "$LIMIT" ]; then
-			echo ${path%.default} >> $PATCH_LOG
-			[ -z "$QUIET" ] && echo ${path%.default}
-			cp -f $TMPFILE $PATCH_DIR/${path%.default}
-		else
-			echo "Skipping ${path%.default}" \
-			     "(some patches were not applied)"
-		fi
-	fi
-
 	echo $path >> $PATCH_LOG
 	[ -z "$QUIET" ] && echo $path
+	# Make sure we don't override a hard-linked file.
+	rm -f $PATCH_DIR/$path
 	cp -f $TMPFILE $PATCH_DIR/$path
 done
 rm -f $TMPFILE
