@@ -8,7 +8,7 @@ if [ -e scripts/check-conf ]; then
     scripts/check-conf || {
 	echo "Inconsistencies found."
 	echo "Please clean up series.conf and/or the patches directories!"
-	exit
+	read
     }
 fi
 
@@ -46,7 +46,7 @@ fi
 cp -pv	kernel-source-26.changes \
 	series.conf config.conf scripts/merge-headers \
 	scripts/check-for-config-changes \
-	rpm/config_subst.sh rpm/running-kernel.init.in \
+	rpm/config-subst rpm/running-kernel.init.in \
 	rpm/functions.sh rpm/post.sh rpm/postun.sh \
 	rpm/trigger-script.sh.in \
 	scripts/guards scripts/arch-symbols $BUILD_DIR
@@ -77,7 +77,7 @@ for cfgname in $cfgnames ; do
 	-e "s:@VERSION@:$VERSION:g" \
 	-e "s:@ARCHS@:$archs:g" \
       < rpm/kernel-binary-26.spec.in \
-    | m4 > $BUILD_DIR/kernel-$cfgname-26.spec
+    > $BUILD_DIR/kernel-$cfgname-26.spec
     cat kernel-source-26.changes rpm/kernel-binary-26.changes \
       > $BUILD_DIR/kernel-$cfgname-26.changes
 done
@@ -88,7 +88,7 @@ sed -e "s:@NAME@:kernel-source-26:g" \
     -e "s:@VERSION@:$VERSION:g" \
     -e "s:@PRECONF@:1:g" \
   < rpm/kernel-source-26.spec.in \
-| m4 > $BUILD_DIR/kernel-source-26.spec
+> $BUILD_DIR/kernel-source-26.spec
 
 # The unconfigured kernel source package: Source for User Mode Linux, and
 # for any km_* packages that absolutely think they need kernel sources
@@ -98,7 +98,7 @@ sed -e "s:@NAME@:kernel-bare-26:g" \
     -e "s:@VERSION@:$VERSION:g" \
     -e "s:@PRECONF@:0:g" \
   < rpm/kernel-source-26.spec.in \
-| m4 > $BUILD_DIR/kernel-bare-26.spec
+> $BUILD_DIR/kernel-bare-26.spec
 cp kernel-source-26.changes $BUILD_DIR/kernel-bare-26.changes
 
 if [ ! -r $LINUX_ORIG_TARBALL ]; then
