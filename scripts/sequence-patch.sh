@@ -275,7 +275,7 @@ while [ $# -gt 0 ]; do
 	    --no-backup-if-mismatch < $PATCH > $LAST_LOG 2>&1
     STATUS=$?
     [ $STATUS -ne 0 ] \
-	&& restore_files $PATCH_DIR/$backup_dir $PATCH_DIR
+	&& restore_files $backup_dir $PATCH_DIR
     [ -n "$CLEAN" -a -z "$enough_free_space" ] \
 	&& rm -rf $PATCH_DIR/.pc/
     cat $LAST_LOG >> $PATCH_LOG
