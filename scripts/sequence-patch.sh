@@ -95,8 +95,8 @@ if [ ! -r series.conf ]; then
     echo "Configuration file \`series.conf' not found"
     exit 1
 fi
-if [ -e scripts/check-patches ]; then
-    scripts/check-patches || {
+if [ -e scripts/check-conf ]; then
+    scripts/check-conf || {
 	echo "Inconsistencies found."
 	echo "Please clean up series.conf and/or the patches directories!"
 	read
