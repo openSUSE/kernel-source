@@ -145,6 +145,7 @@ install -m 644					\
 	rpm/source-post.sh			\
 	rpm/post.sh				\
 	rpm/postun.sh				\
+	doc/README.SUSE				\
 	$BUILD_DIR
 
 install -m 644					\
@@ -165,6 +166,12 @@ if [ -e extra-symbols ]; then
 		extra-symbols				\
 		$BUILD_DIR
 fi
+
+echo "hello.tar.bz2"
+(   cd doc
+    tar -cf - --exclude=CVS --exclude='.*.cmd' \
+    	      --exclude='*.ko' --exclude='*.o' hello
+) | bzip2 > $BUILD_DIR/hello.tar.bz2
 
 # Generate list of all config files and patches used
 all_files="$( {
