@@ -36,8 +36,15 @@ fi
 # If we are on a CVS branch, included the branch name as well:
 if [ -e CVS/Tag ]; then
     read tag < CVS/Tag
-    [ "${tag:0:1}" = T ] \
-    && echo "CVS Branch: ${tag:1}" >> $BUILD_DIR/build-source-timestamp
+    case "$tag" in
+    T*)	tag="CVS Branch: ${tag:1}" ;;
+    N*)	tag="CVS Tag: ${tag:1}" ;;
+    D*)	tag="CVS Date: ${tag:1}" ;;
+    *)	tag=
+    esac
+    if [ -n "$tag" ]; then
+	echo $tag >> $BUILD_DIR/build-source-timestamp
+    fi
 fi
 
 # List all used configurations
