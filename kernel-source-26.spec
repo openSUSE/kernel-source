@@ -28,6 +28,7 @@ Source11:     arch-symbols
 Source12:     guards
 Source20:     config.tar.bz2
 Source21:     config.conf
+Source30:     config_subst.sh
 Source100:    patches.arch.tar.bz2
 Source101:    patches.fixes.tar.bz2
 Source102:    patches.drivers.tar.bz2
@@ -95,46 +96,35 @@ for patch in $(%_sourcedir/guards $SYMBOLS < %_sourcedir/series.conf); do
 	exit 1
     fi
 done
-# config_subst makes sure that CONFIG_CFGNAME and CONFIG_RELEASE are
-# set correctly.
-config_subst()
-{
-    local name=$1 release=$2
-    awk '
-	function print_name(force)
-	{
-	    if (!done_name || force)
-		printf "CONFIG_CFGNAME=\"%s\"\n", "'"$name"'"
-	    done_name=1
-	}
-	function print_release(force)
-	{
-	    if (!done_release || force)
-		printf "CONFIG_RELEASE=%d\n", '"$release"'
-	    done_release=1
-	}
-	/\<CONFIG_CFGNAME\>/	{ print_name(1) ; next }
-	/\<CONFIG_RELEASE\>/	{ print_release(1) ; next }
-				{ print }
-	END			{ print_name(0) ; print_release(0) }
-    '
-    #echo "CONFIG_MODVERSIONS=y"
-}
+
+source %{SOURCE30}  # config_subst.sh
+
 # Install all config files that make sense for that particular
 # kernel.
-for config in $(%_sourcedir/guards $SYMBOLS < %_sourcedir/config.conf); do
+configs="$(%_sourcedir/guards $SYMBOLS < %_sourcedir/config.conf)"
+for config in $configs; do
     name=$(basename $config)
     path=arch/$(dirname $config)/defconfig.$name
     mkdir -p $(dirname $path)
-    if [ "${config/*\//}" = "default" ]; then
-        config_subst $name %release \
-	    < %_builddir/config/$config \
-	    > ${path%.default}
-    fi
-    config_subst $name %release \
-	< %_builddir/config/$config \
+    cat %_builddir/config/$config \
+	| config_subst CONFIG_CFGNAME '"'$name'"' \
+	| config_subst CONFIG_RELEASE %release \
 	> $path
 done
+
+# For all architectures included, if there is a defconfig.default,
+# make that the defconfig as well. If there is no defconfig.default,
+# also remove the defconfig, as it is obviously not a tested, and
+# woldn't work, anyway.
+for config in $configs; do
+    arch=$(dirname $config)
+    if [ -e arch/$arch/defconfig.default ]; then
+	cat arch/$arch/defconfig.default > arch/$arch/defconfig
+    else
+	rm -f arch/$arch/defconfig
+    fi
+done
+
 chmod +x arch/ia64/scripts/toolchain-flags
 
 %build
@@ -155,24 +145,12 @@ make -s $MAKE_ARGS include/linux/version.h
 
 %install
 ###################################################################
-export RPM_TARGET=%_target_cpu
-case $RPM_TARGET in
-i?86)
-    RPM_TARGET=i386 ;;
-esac
-if [ "$RPM_TARGET" != "$HOSTTYPE" ]; then
-    MAKE_ARGS="$MAKE_ARGS ARCH=$RPM_TARGET"
-fi
 # Set up $RPM_BUILD_ROOT
 rm -rf $RPM_BUILD_ROOT
 mkdir -p $RPM_BUILD_ROOT/usr/src/linux-%ver_str
 ln -sf linux-%ver_str $RPM_BUILD_ROOT/usr/src/linux
 #cpio -p $RPM_BUILD_ROOT/usr/src/linux-%ver_str < linux.files
 cp -dpR --parents . $RPM_BUILD_ROOT/usr/src/linux-%ver_str
-# Do a test build to catch the most stupid mistakes early.
-if [ ! -e %_sourcedir/skip-build ]; then
-make %{?jobs:-j%jobs} $MAKE_ARGS vmlinux -k
-fi
 
 %files
 %defattr(-, root, root)
