@@ -7,7 +7,7 @@ source $(dirname $0)/config.sh
 
 QUIET=1
 EXTRA_SYMBOLS=
-QUILT=1
+CLEAN=
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -30,6 +30,9 @@ while [ $# -gt 0 ]; do
 	--symbol)
 	    EXTRA_SYMBOLS="$EXTRA_SYMBOLS $2"
 	    shift
+	    ;;
+	--clean)
+	    CLEAN=1
 	    ;;
 	-|[^-]*)
 	    [ -n "$LIMIT" ] && break
@@ -267,14 +270,14 @@ while [ $# -gt 0 ]; do
     fi
     echo "[ $PATCH ]"
     echo "[ $PATCH ]" >> $PATCH_LOG
-    backup_dir=.sequence_patch/$PATCH
+    backup_dir=$PATCH_DIR/.pc/$PATCH
     patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E \
 	    --no-backup-if-mismatch < $PATCH > $LAST_LOG 2>&1
     STATUS=$?
     [ $STATUS -ne 0 ] \
 	&& restore_files $PATCH_DIR/$backup_dir $PATCH_DIR
-    [ -n "$enough_free_space" ] \
-	|| rm -rf $PATCH_DIR/.sequence_patch/
+    [ -n "$CLEAN" -a -z "$enough_free_space" ] \
+	&& rm -rf $PATCH_DIR/.pc/
     cat $LAST_LOG >> $PATCH_LOG
     [ -z "$QUIET" ] && cat $LAST_LOG
     if [ $STATUS -ne 0 ]; then
@@ -284,23 +287,21 @@ while [ $# -gt 0 ]; do
 	status=1
 	break
     else
-	[ -n "$QUILT" ] &&
-	    echo "# $PATCH" >> $PATCH_DIR/series
+	echo "${CLEAN:+# }$PATCH" >> $PATCH_DIR/series
+	echo "${CLEAN:+# }$PATCH" >> $PATCH_DIR/.pc/applied-patches
 	rm -f $LAST_LOG
     fi
     shift
 done
 
-[ -n "$enough_free_space" ] \
-    && rm -rf $PATCH_DIR/.sequence_patch/
+[ -n "$CLEAN" -a -n "$enough_free_space" ] \
+    && rm -rf $PATCH_DIR/.pc/
 
-if [ -n "$QUILT" ]; then
-    ln -s $PWD $PATCH_DIR/patches
-    # If there are any remaining patches, add them to the series so
-    # they can be fixed up with quilt (or similar).
-    if [ -n "$*" ]; then
-    	( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
-    fi
+ln -s $PWD $PATCH_DIR/patches
+# If there are any remaining patches, add them to the series so
+# they can be fixed up with quilt (or similar).
+if [ -n "$*" ]; then
+    ( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
 fi
 
 [ $# -gt 0 ] && exit $status
