@@ -293,7 +293,8 @@ while [ $# -gt 0 ]; do
 	break
     else
 	echo "${CLEAN:+# }$PATCH" >> $PATCH_DIR/series
-	echo "${CLEAN:+# }$PATCH" >> $PATCH_DIR/.pc/applied-patches
+	[ -z "$CLEAN" ]
+	    && echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
 	rm -f $LAST_LOG
     fi
     shift
@@ -301,6 +302,10 @@ done
 
 [ -n "$CLEAN" -a -n "$enough_free_space" ] \
     && rm -rf $PATCH_DIR/.pc/
+
+if [ -n "$CLEAN" ]; then
+    rm $PATCH_DIR/series
+fi
 
 ln -s $PWD $PATCH_DIR/patches
 # If there are any remaining patches, add them to the series so
