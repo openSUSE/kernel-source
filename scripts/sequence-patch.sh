@@ -205,27 +205,27 @@ fi
 # Helper function to restore files backed up by patch. This is
 # faster than doing a --dry-run first.
 restore_files() {
-    local backup_dir=$1 log=$2 file
+    local backup_dir=$1 file
     local -a remove restore
  
-    pushd $backup_dir > /dev/null
-    #for file in $(find . -type f) ; do
-    for file in $( sed -e '/^patching file /!d' \
-	    	       -e 's/^patching file //' "$log" ); do
-	if [ -e "$file" ]; then
+    if [ -d $backup_dir ]; then
+	pushd $backup_dir > /dev/null
+	for file in $(find . -type f) ; do
 	    if [ -s "$file" ]; then
 		restore[${#restore[@]}]="$file"
 	    else
 		remove[${#remove[@]}]="$file"
 	    fi
-	fi
-    done
-    [ ${#restore[@]} -ne 0 ] \
-	&& cp -f --parents "${restore[@]}" ..
-    cd ..
-    [ ${#remove[@]} -ne 0 ] \
-    	&& rm -f "${remove[@]}"
-    popd > /dev/null
+	done
+	#echo "Restore: ${restore[@]}"
+	[ ${#restore[@]} -ne 0 ] \
+	    && cp -f --parents "${restore[@]}" ..
+	cd ..
+	#echo "Remove: ${remove[@]}"
+	[ ${#remove[@]} -ne 0 ] \
+	    && rm -f "${remove[@]}"
+	popd > /dev/null
+    fi
 }
 
 echo -e "# Symbols: $SYMBOLS\n#" > $PATCH_DIR/series
@@ -263,13 +263,14 @@ while [ $# -gt 0 ]; do
     fi
     echo "[ $PATCH ]"
     echo "[ $PATCH ]" >> $PATCH_LOG
-    patch -d $PATCH_DIR --backup --prefix=.sequence_patch/ -p1 \
-	    < $PATCH > $LAST_LOG 2>&1
+    backup_dir=.sequence_patch/$PATCH
+    patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 \
+	    --no-backup-if-mismatch < $PATCH > $LAST_LOG 2>&1
     STATUS=$?
     [ $STATUS -ne 0 ] \
-	&& restore_files $PATCH_DIR/.sequence_patch $LAST_LOG
+	&& restore_files $PATCH_DIR/$backup_dir
     [ -n "$enough_free_space" ] \
-	|| rm -rf $PATCH_DIR/.sequence_patch
+	|| rm -rf $PATCH_DIR/.sequence_patch/
     cat $LAST_LOG >> $PATCH_LOG
     [ -z "$QUIET" ] && cat $LAST_LOG
     if [ $STATUS -ne 0 ]; then
@@ -287,7 +288,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$enough_free_space" ] \
-    && rm -rf $PATCH_DIR/.sequence_patch
+    && rm -rf $PATCH_DIR/.sequence_patch/
 
 if [ -n "$QUILT" ]; then
     ln -s $PWD $PATCH_DIR/patches
