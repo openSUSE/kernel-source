@@ -215,7 +215,34 @@ for PATCH in $PATCHES; do
 done
 
 
-# Finally, copy the config files that apply fot this kernel.
+# config_subst makes sure that CONFIG_CFGNAME and CONFIG_RELEASE are
+# set correctly.
+
+config_subst()
+{
+    local name=$1 release=$2
+    awk '
+	function print_name(force)
+	{
+	    if (!done_name || force)
+		printf "CONFIG_CFGNAME=\"%s\"\n", "'"$name"'"
+	    done_name=1
+	}
+	function print_release(force)
+	{
+	    if (!done_release || force)
+		printf "CONFIG_RELEASE=%d\n", '"$release"'
+	    done_release=1
+	}
+
+	/\<CONFIG_CFGNAME\>/	{ print_name(1) ; next }
+	/\<CONFIG_RELEASE\>/	{ print_release(1) ; next }
+				{ print }
+	END			{ print_name(0) ; print_release(0) }
+    '
+}
+
+# Copy the config files that apply for this kernel.
 echo "[ Copying config files ]" >> $PATCH_LOG
 echo "[ Copying config files ]"
 CONFIGS=$(scripts/guards $SYMBOLS < config.conf)
@@ -223,23 +250,22 @@ for config in $CONFIGS; do
 	if ! [ -e config/$config ]; then
 		echo "*** Configuration file config/$config not found ***"
 	fi
-	path=arch/$(dirname $config)/defconfig.$(basename $config)
+	name=$(basename $config)
+	path=arch/$(dirname $config)/defconfig.$name
 	mkdir -p $(dirname $PATCH_DIR/$path)
 	if [ "${config/*\//}" = "default" ]; then
-		echo $path >> $PATCH_LOG
 		echo ${path%.default} >> $PATCH_LOG
-		if [ -z "$QUIET" ]; then
-			echo $path
-			echo ${path%.default}
-		fi
+		[ -z "$QUIET" ] && echo ${path%.default}
 
-		cp config/$config $PATCH_DIR/$path
-		cp config/$config $PATCH_DIR/${path%.default}
-	else
-		echo $path >> $PATCH_LOG
-		[ -z "$QUIET" ] && echo $path
-
-		cp config/$config $PATCH_DIR/$path
+		config_subst $name 0 \
+			< config/$config \
+			> $PATCH_DIR/${path%.default}
 	fi
+	echo $path >> $PATCH_LOG
+	[ -z "$QUIET" ] && echo $path
+
+	config_subst $name 0 \
+		< config/$config \
+		> $PATCH_DIR/$path
 done
 
