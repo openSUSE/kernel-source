@@ -2,6 +2,14 @@ echo Setting up /lib/modules/%ver_str
 /sbin/depmod -a -F /boot/System.map-%ver_str %ver_str
 
 if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
+    if [ -f /boot/vmlinuz-%ver_str ]; then
+	image=vmlinuz
+    elif [ -f /boot/image-%ver_str ]; then
+	image=image
+    elif [ -f /boot/vmlinux-%ver_str ]; then
+	image=vmlinux
+    fi
+
     if [ -f /etc/fstab ]; then
 	cd /boot
 	if ! /sbin/mkinitrd -k $image-%ver_str -i initrd-%ver_str; then
@@ -10,14 +18,6 @@ if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
 	fi
     else
 	echo "please run mkinitrd as soon as your system is complete"
-    fi
-
-    if [ -f /boot/vmlinuz-%ver_str ]; then
-	image=vmlinuz
-    elif [ -f /boot/image-%ver_str ]; then
-	image=image
-    elif [ -f /boot/vmlinux-%ver_str ]; then
-	image=vmlinux
     fi
 
     # update /boot/vmlinuz symlink
