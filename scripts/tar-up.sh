@@ -15,44 +15,6 @@ fi
 rm -rf $BUILD_DIR
 mkdir -p $BUILD_DIR
 
-for d in config patches.*; do
-  # Skip non-directories. Also work around CVS problem: Directories can't
-  # be deleted, but are checked out with only a CVS sub-directory in them.
-  DIR_ENTRIES=( $d/* )
-  DIR_ENTRIES=${#DIR_ENTRIES[@]}
-  if [ ! -d $d -o $DIR_ENTRIES -eq 0 -o \
-       \( -d $d/CVS -a $DIR_ENTRIES -eq 1 \) ] ; then
-    echo "Skipping $d..."
-    continue
-  fi
-
-  echo "Compressing $d..."
-  tar -cf - --exclude=CVS --exclude="*~" --exclude=".#*" $d \
-    | bzip2 -1 > $BUILD_DIR/$d.tar.bz2
-done
-if [ -r $SRC_FILE ]; then
-  LINUX_ORIG_TARBALL=$SRC_FILE
-elif [ -r $MIRROR/$SRC_FILE ]; then
-  LINUX_ORIG_TARBALL=$MIRROR/$SRC_FILE
-else
-  echo "Cannot find $SRC_FILE."
-  exit 1
-fi
-if [ -r $LINUX_ORIG_TARBALL ]; then
-  cp -av $LINUX_ORIG_TARBALL $BUILD_DIR
-fi
-
-#echo "Copying various files..."
-cp -pv	kernel-source.changes \
-	series.conf config.conf scripts/merge-headers \
-	scripts/check-for-config-changes \
-	rpm/config-subst rpm/running-kernel.init.in \
-	rpm/functions.sh rpm/post.sh rpm/postun.sh \
-	rpm/trigger-script.sh.in \
-	scripts/guards scripts/arch-symbols $BUILD_DIR
-
-[ -e extra-symbols ] && cp -pv extra-symbols $BUILD_DIR
-
 # List all used configurations
 config_files="$(
     for arch in $(scripts/arch-symbols --list) ; do
@@ -99,6 +61,69 @@ sed -e "s:@NAME@:kernel-bare:g" \
   < rpm/kernel-source.spec.in \
 > $BUILD_DIR/kernel-bare.spec
 cp kernel-source.changes $BUILD_DIR/kernel-bare.changes
+
+echo "Copying various files..."
+install -m 644					\
+	kernel-source.changes			\
+	series.conf				\
+	config.conf				\
+	rpm/running-kernel.init.in		\
+	rpm/functions.sh			\
+	rpm/trigger-script.sh.in		\
+	rpm/post.sh				\
+	rpm/postun.sh				\
+	$BUILD_DIR
+
+install -m 755					\
+	rpm/config-subst 			\
+	rpm/get_release_number.sh		\
+	rpm/merge-headers			\
+	rpm/check-for-config-changes		\
+	scripts/guards				\
+	scripts/arch-symbols			\
+	$BUILD_DIR
+
+#cp -pv	kernel-source.changes \
+#	series.conf config.conf rpm/merge-headers \
+#	rpm/check-for-config-changes \
+#	rpm/config-subst rpm/running-kernel.init.in \
+#	rpm/functions.sh rpm/post.sh rpm/postun.sh \
+#	rpm/trigger-script.sh.in rpm/get_release_number.sh \
+#	scripts/guards scripts/arch-symbols $BUILD_DIR
+
+if [ -e extra-symbols ]; then
+	install -m 755					\
+		extra-symbols				\
+		$BUILD_DIR
+fi
+
+for d in config patches.*; do
+  # Skip non-directories. Also work around CVS problem: Directories can't
+  # be deleted, but are checked out with only a CVS sub-directory in them.
+  DIR_ENTRIES=( $d/* )
+  DIR_ENTRIES=${#DIR_ENTRIES[@]}
+  if [ ! -d $d -o $DIR_ENTRIES -eq 0 -o \
+       \( -d $d/CVS -a $DIR_ENTRIES -eq 1 \) ] ; then
+    echo "Skipping $d..."
+    continue
+  fi
+
+  echo "Compressing $d..."
+  tar -cf - --exclude=CVS --exclude="*~" --exclude=".#*" $d \
+    | bzip2 -1 > $BUILD_DIR/$d.tar.bz2
+done
+
+if [ -r $SRC_FILE ]; then
+  LINUX_ORIG_TARBALL=$SRC_FILE
+elif [ -r $MIRROR/$SRC_FILE ]; then
+  LINUX_ORIG_TARBALL=$MIRROR/$SRC_FILE
+else
+  echo "Cannot find $SRC_FILE."
+  exit 1
+fi
+if [ -r $LINUX_ORIG_TARBALL ]; then
+  cp -av $LINUX_ORIG_TARBALL $BUILD_DIR
+fi
 
 if [ ! -r $LINUX_ORIG_TARBALL ]; then
   echo "Please add $SRC_FILE to $BUILD_DIR"
