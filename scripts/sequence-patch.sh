@@ -316,7 +316,7 @@ if [ -n "$*" ]; then
     ( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
 fi
 
-echo 0 > $PATCH_DIR/rpm-release
+rm -f $PATCH_DIR/rpm-release
 
 [ $# -gt 0 ] && exit $status
 
