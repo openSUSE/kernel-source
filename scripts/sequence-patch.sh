@@ -187,7 +187,6 @@ fi
 echo "Cleaning up from previous run"
 rm -f "$PATCH_LOG" "$LAST_LOG"
 rm -rf $PATCH_DIR/
-echo -e "# Symbols: $SYMBOLS\n#" > $SCRATCH_AREA/series
 
 # Create fresh $SCRATCH_AREA/linux-$VERSION.
 if [ -d $PATCH_DIR.orig ]; then
@@ -229,6 +228,8 @@ restore_files() {
     popd > /dev/null
 }
 
+echo -e "# Symbols: $SYMBOLS\n#" > $PATCH_DIR/series
+
 # Patch kernel
 set -- $PATCHES
 while [ $# -gt 0 ]; do
@@ -262,7 +263,6 @@ while [ $# -gt 0 ]; do
     fi
     echo "[ $PATCH ]"
     echo "[ $PATCH ]" >> $PATCH_LOG
-    echo $PATCH >> $SCRATCH_AREA/series
     patch -d $PATCH_DIR --backup --prefix=.sequence_patch/ -p1 \
 	    < $PATCH > $LAST_LOG 2>&1
     STATUS=$?
@@ -279,6 +279,8 @@ while [ $# -gt 0 ]; do
 	status=1
 	break
     else
+	[ -n "$QUILT" ] &&
+	    echo "# $PATCH" >> $PATCH_DIR/series
 	rm -f $LAST_LOG
     fi
     shift
@@ -289,8 +291,10 @@ done
 
 if [ -n "$QUILT" ]; then
     ln -s $PWD $PATCH_DIR/patches
+    # If there are any remaining patches, add them to the series so
+    # they can be fixed up with quilt (or similar).
     if [ -n "$*" ]; then
-    	( IFS=$'\n' ; echo "$*" ) > $PATCH_DIR/series
+    	( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
     fi
 fi
 
