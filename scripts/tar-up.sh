@@ -50,6 +50,12 @@ for flavor in $flavors ; do
 	    [ -n "$o" ] && head="${head}Obsoletes:    ${o[@]}$nl"
 	    tail="%endif$nl$tail"
 	fi
+
+	# Do we have an override config file for testing?
+	if [ -e $arch-$flavor.conf ]; then
+	    echo "Override config: $arch-$flavor.conf"
+	    cp $arch-$flavor.conf $BUILD_DIR/
+	fi
     done
     prov_obs="$head${tail%$'\n'}"
 
