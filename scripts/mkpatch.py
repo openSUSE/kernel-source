@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright (C) 2004 Andrea Arcangeli <andrea@suse.de> SUSE
-# $Id: mkpatch.py,v 1.15 2004/12/02 01:11:52 andrea Exp $
+# $Id: mkpatch.py,v 1.16 2004/12/04 00:00:54 andrea Exp $
 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -125,8 +125,8 @@ class patch_class(object):
 		readline.add_history('yes'); readline.add_history('no')
 
 		my_signoff = None
-		self.re_signoff = re.compile(self.signoff_mode.signedoffby + r'(.*)', re.I)
-		self.re_ackedby = re.compile(self.signoff_mode.ackedby + r'(.*)', re.I)
+		self.re_signoff = re.compile(self.signoff_mode.signedoffby + r'(.*@.*)', re.I)
+		self.re_ackedby = re.compile(self.signoff_mode.ackedby + r'(.*@.*)', re.I)
 		try:
 			signoff = file(os.path.expanduser(SIGNOFF_FILE)).readline()
 		except IOError:
@@ -160,6 +160,7 @@ class patch_class(object):
 			this_signoff = m.group(1)
 			if this_signoff not in self.signoff:
 				self.signoff[this_signoff] = prefix
+				self.signoff_order.append(this_signoff)
 			return
 
 		for tag in self.tags:
