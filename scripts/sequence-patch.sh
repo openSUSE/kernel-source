@@ -302,7 +302,7 @@ ln -s $PWD $PATCH_DIR/patches
 # they can be fixed up with quilt (or similar).
 if [ -n "$*" ]; then
     ( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
-    echo 2 > $PATCH_DIR/.version
+    echo 2 > $PATCH_DIR/.pc/.version
 fi
 
 [ $# -gt 0 ] && exit $status
