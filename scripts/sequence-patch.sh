@@ -331,6 +331,7 @@ config_subst() {
 echo "[ Copying config files ]" >> $PATCH_LOG
 echo "[ Copying config files ]"
 TMPFILE=$(mktemp /tmp/$(basename $0).XXXXXX)
+chmod a+r $TMPFILE
 CONFIGS=$(scripts/guards $SYMBOLS < config.conf)
 for config in $CONFIGS; do
 	if ! [ -e config/$config ]; then
