@@ -146,6 +146,7 @@ install -m 644					\
 	rpm/source-post.sh			\
 	rpm/post.sh				\
 	rpm/postun.sh				\
+	rpm/Makefile.suse			\
 	doc/README.SUSE				\
 	$BUILD_DIR
 
