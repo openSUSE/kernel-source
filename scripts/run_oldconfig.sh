@@ -1,6 +1,8 @@
 #!/bin/bash
 #set -x
 
+config_subst=${0%/*}/../rpm/config-subst
+
 #########################################################
 # dirty scroll region tricks ...
 
@@ -82,7 +84,10 @@ for config in $(cd patches && \
     esac
     config="patches/config/$config"
 
-    cp -v $config .config
+    cat $config \
+    | $config_subst CONFIG_LOCALVERSION \"-${config##*/}\" \
+    | $config_subst CONFIG_SUSE_KERNEL y \
+    > .config
     case "$menuconfig" in
     	yes)
 	KCONFIG_NOTIMESTAMP=1 make $MAKE_ARGS menuconfig

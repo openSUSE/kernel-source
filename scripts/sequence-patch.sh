@@ -316,6 +316,8 @@ if [ -n "$*" ]; then
     ( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
 fi
 
+echo 0 > $PATCH_DIR/rpm-release
+
 [ $# -gt 0 ] && exit $status
 
 # Old kernels don't have a config.conf.
@@ -337,8 +339,7 @@ for config in $CONFIGS; do
 
     chmod +x rpm/config-subst
     cat config/$config \
-    | rpm/config-subst CONFIG_CFGNAME \"$name\" \
-    | rpm/config-subst CONFIG_RELEASE \"0\" \
+    | rpm/config-subst CONFIG_LOCALVERSION \"-$name\" \
     | rpm/config-subst CONFIG_SUSE_KERNEL y \
     > $TMPFILE
 
