@@ -208,9 +208,11 @@ fi
 # Helper function to restore files backed up by patch. This is
 # faster than doing a --dry-run first.
 restore_files() {
-    local backup_dir=$1 file
+    local backup_dir=$1 patch_dir=$2 file wd=$PWD
     local -a remove restore
  
+    set -x
+
     if [ -d $backup_dir ]; then
 	pushd $backup_dir > /dev/null
 	for file in $(find . -type f) ; do
@@ -222,13 +224,15 @@ restore_files() {
 	done
 	#echo "Restore: ${restore[@]}"
 	[ ${#restore[@]} -ne 0 ] \
-	    && cp -f --parents "${restore[@]}" ..
-	cd ..
+	    && cp -f --parents "${restore[@]}" $patch_dir
+	cd $patch_dir
 	#echo "Remove: ${remove[@]}"
 	[ ${#remove[@]} -ne 0 ] \
 	    && rm -f "${remove[@]}"
 	popd > /dev/null
     fi
+
+    set +x
 }
 
 echo -e "# Symbols: $SYMBOLS\n#" > $PATCH_DIR/series
@@ -272,7 +276,7 @@ while [ $# -gt 0 ]; do
 	    --no-backup-if-mismatch < $PATCH > $LAST_LOG 2>&1
     STATUS=$?
     [ $STATUS -ne 0 ] \
-	&& restore_files $PATCH_DIR/$backup_dir
+	&& restore_files $PATCH_DIR/$backup_dir $PATCH_DIR
     [ -n "$enough_free_space" ] \
 	|| rm -rf $PATCH_DIR/.sequence_patch/
     cat $LAST_LOG >> $PATCH_LOG
