@@ -9,9 +9,12 @@ KERNEL_BUILD  := /lib/modules/`uname -r`/build
 # the module(s):
 #MOD_SUBDIR = misc
 
-obj-m	:= hello.o
-hello-y	+= main.o
+obj-m		:= hello.o
+hello-y		+= main.o
+
+# Do not print "Entering directory ..."
+MAKEFLAGS += --no-print-directory
 
 # Targets for running make directly in the external module directory:
 modules modules_install clean:
-	$(MAKE) -C $(KERNEL_SOURCE) $@ O=$(KERNEL_BUILD) M=$(CURDIR)
+	@$(MAKE) -C $(KERNEL_SOURCE) $@ O=$(KERNEL_BUILD) M=$(CURDIR)
