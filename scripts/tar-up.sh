@@ -122,7 +122,16 @@ for flavor in $flavors ; do
 	-e "s,@EXTRA_NEEDS@,$extra_needs,g" \
       < rpm/kernel-binary.spec.in \
     > $BUILD_DIR/kernel-$flavor.spec
-    cp kernel-source.changes $BUILD_DIR/kernel-$flavor.changes
+done
+
+install_changes() {
+    local changes=$1
+    cat kernel-source.changes kernel-source.changes.old > $changes
+    chmod 644 $changes
+}
+
+for flavor in $flavors ; do
+    install_changes $BUILD_DIR/kernel-$flavor.changes
 done
 
 binary_spec_files=$(
@@ -158,11 +167,10 @@ sed -e "s,@NAME@,kernel-syms,g" \
     -e "s,@PRECONF@,1,g" \
   < rpm/kernel-syms.spec.in \
 > $BUILD_DIR/kernel-syms.spec
-cp kernel-source.changes $BUILD_DIR/kernel-syms.changes
+install_changes $BUILD_DIR/kernel-syms.changes
 
 echo "Copying various files..."
 install -m 644					\
-	kernel-source.changes			\
 	series.conf				\
 	config.conf				\
 	supported.conf				\
@@ -175,10 +183,8 @@ install -m 644					\
 	rpm/Makefile.suse			\
 	doc/README.SUSE				\
 	$BUILD_DIR
-
-install -m 644					\
-	kernel-source.changes 			\
-	$BUILD_DIR/kernel-dummy.changes
+install_changes $BUILD_DIR/kernel-source.changes
+install_changes $BUILD_DIR/kernel-dummy.changes
 
 install -m 755					\
 	rpm/config-subst 			\
