@@ -331,9 +331,9 @@ while [ $# -gt 0 ]; do
     esac
     patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E \
 	    --no-backup-if-mismatch > $LAST_LOG 2>&1
+    STATUS=$?
     exec 0<&5  # restore stdin
     
-    STATUS=$?
     [ $STATUS -ne 0 ] \
 	&& restore_files $backup_dir $PATCH_DIR
     [ -n "$CLEAN" -a -z "$enough_free_space" ] \
