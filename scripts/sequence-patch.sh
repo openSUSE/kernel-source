@@ -1,19 +1,16 @@
-#!/bin/sh
-#
-# Takes clean tarball and patches it with all patches according to series.conf.
-#
+#! /bin/bash
 
 source $(dirname $0)/config.sh
 
 usage() {
-    echo "SYNOPSIS: $0 [-qv] [--arch=...] [--symbol=...] [--dir=...] [last-patch-name]"
+    echo "SYNOPSIS: $0 [-qv] [--arch=...] [--symbol=...] [--dir=...] [--combine|--fast] [last-patch-name]"
     exit 1
 }
 
 # Allow to pass in default arguments via SEQUENCE_PATCH_ARGS.
 set -- $SEQUENCE_PATCH_ARGS "$@"
 
-options=`getopt -o qvd: --long quilt,arch:,symbol:,dir: -- "$@"`
+options=`getopt -o qvd: --long quilt,arch:,symbol:,dir:,combine,fast -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -25,6 +22,8 @@ eval set -- "$options"
 QUIET=1
 EXTRA_SYMBOLS=
 CLEAN=1
+COMBINE=
+FAST=
 
 while true; do
     case "$1" in
@@ -36,6 +35,12 @@ while true; do
 	    ;;
 	--quilt)
 	    CLEAN=
+	    ;;
+	--combine)
+	    COMBINE=1
+	    ;;
+       	--fast)
+	    FAST=1
 	    ;;
 	--arch)
 	    export PATCH_ARCH=$2
@@ -170,7 +175,33 @@ if [ -n "$EXTRA_SYMBOLS" ]; then
     SYMBOLS="$SYMBOLS $EXTRA_SYMBOLS"
 fi
 
-PATCHES=$(scripts/guards $SYMBOLS < series.conf)
+if [ -n "$FAST" ]; then
+    if [ -f combined.patch.gz -a -f combined.series ]; then
+	# Check if the combined patch and series file are current
+	[ combined.series -ot combined.patch.gz ] || FAST=
+	while read patch; do
+	    [ $patch -ot combined.patch.gz ] || FAST=
+	done < combined.series
+	if [ -z "$FAST" ]; then
+	    echo "Combined patch (--combine) out of date; ignoring"
+	fi
+    else
+	echo "Ignoring --fast option (create cache first with --combine)"
+	FAST=
+    fi
+fi
+
+if [ -n "$FAST" ]; then
+    echo "Using combined patch cache"
+
+    # Get the list of patches we haven't applied yet
+    UNAPPLIED=$(scripts/guards $SYMBOLS < series.conf |
+	    comm -23 - combined.series)
+    PATCHES="combined.patch.gz $UNAPPLIED"
+else
+    # Default case - get the list of all patches from series.conf
+    PATCHES=$(scripts/guards $SYMBOLS < series.conf)
+fi
 
 # Check if patch $LIMIT exists
 if [ -n "$LIMIT" ]; then
@@ -193,9 +224,18 @@ if [ -n "$LIMIT" ]; then
 fi
 
 # Clean up from previous run
-echo "Cleaning up from previous run"
 rm -f "$PATCH_LOG" "$LAST_LOG"
-rm -rf $PATCH_DIR/
+if [ -e $PATCH_DIR ]; then
+    tmpdir=$(mktemp -d ${PATCH_DIR%/*}/${0##*/}.XXXXXX)
+    if [ -n "$tmpdir" ]; then
+	echo "Cleaning up from previous run (background)"
+	mv $PATCH_DIR $tmpdir
+	rm -rf $tmpdir &
+    else
+	echo "Cleaning up from previous run"
+	rm -rf $PATCH_DIR
+    fi
+fi
 
 # Create fresh $SCRATCH_AREA/linux-$VERSION.
 if [ -d $PATCH_DIR.orig ]; then
@@ -239,6 +279,11 @@ restore_files() {
 }
 
 echo -e "# Symbols: $SYMBOLS\n#" > $PATCH_DIR/series
+SERIES_PFX=
+if [ -n "$CLEAN" -a -z "$COMBINE" ]; then
+    SERIES_PFX="# "
+fi
+
 mkdir $PATCH_DIR/.pc
 echo 2 > $PATCH_DIR/.pc/.version
 
@@ -277,8 +322,17 @@ while [ $# -gt 0 ]; do
     echo "[ $PATCH ]"
     echo "[ $PATCH ]" >> $PATCH_LOG
     backup_dir=$PATCH_DIR/.pc/$PATCH
+
+    exec 5<&1  # duplicate stdin
+    case $PATCH in
+    *.gz)	exec < <(gzip -cd $PATCH) ;;
+    *.bz2)	exec < <(bzip2 -cd $PATCH) ;;
+    *)		exec < $PATCH ;;
+    esac
     patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E \
-	    --no-backup-if-mismatch < $PATCH > $LAST_LOG 2>&1
+	    --no-backup-if-mismatch > $LAST_LOG 2>&1
+    exec 0<&5  # restore stdin
+    
     STATUS=$?
     [ $STATUS -ne 0 ] \
 	&& restore_files $backup_dir $PATCH_DIR
@@ -293,7 +347,7 @@ while [ $# -gt 0 ]; do
 	status=1
 	break
     else
-	echo "${CLEAN:+# }$PATCH" >> $PATCH_DIR/series
+	echo "$SERIES_PFX$PATCH" >> $PATCH_DIR/series
 	[ -z "$CLEAN" ] \
 	    && echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
 	rm -f $LAST_LOG
@@ -304,6 +358,17 @@ while [ $# -gt 0 ]; do
 	break
     fi
 done
+
+if [ -n "$COMBINE" ]; then
+    echo "[ Building combined patch ]"
+    mv $PATCH_DIR/series combined.series
+    sed -i '/^#.*/d' combined.series
+    (
+	    cd $SCRATCH_AREA
+	    diff -x .pc -U0 -rNa linux-$VERSION.orig linux-$VERSION
+    ) | gzip -c9 > combined.patch.gz
+    exit 0
+fi
 
 [ -n "$CLEAN" -a -n "$enough_free_space" ] \
     && rm -rf $PATCH_DIR/.pc/
@@ -318,8 +383,6 @@ ln -s $PWD $PATCH_DIR/patches
 if [ -n "$*" ]; then
     ( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
 fi
-
-rm -f $PATCH_DIR/rpm-release
 
 [ $# -gt 0 ] && exit $status
 
@@ -342,7 +405,8 @@ for config in $CONFIGS; do
 
     chmod +x rpm/config-subst
     cat config/$config \
-    | rpm/config-subst CONFIG_LOCALVERSION \"-$name\" \
+    | rpm/config-subst CONFIG_CFGNAME \"$name\" \
+    | rpm/config-subst CONFIG_RELEASE \"0\" \
     | rpm/config-subst CONFIG_SUSE_KERNEL y \
     > $TMPFILE
 
@@ -353,17 +417,3 @@ for config in $CONFIGS; do
     cp -f $TMPFILE $PATCH_DIR/$path
 done
 rm -f $TMPFILE
-
-status=
-KERNELRELEASE=$(make -s -C $PATCH_DIR kernelrelease 2> /dev/null)
-if [ "${KERNELRELEASE#$VERSION}" = "$KERNELRELEASE" ]; then
-    echo >&2
-    echo "Please update VERSION in scripts/config.sh" >&2
-    status=1
-fi
-if [ "${KERNELRELEASE%$EXTRAVERSION}" = "$KERNELRELEASE" ]; then
-    echo >&2
-    echo "Please update EXTRAVERSION in scripts/config.sh" >&2
-    status=1
-fi
-exit $status
