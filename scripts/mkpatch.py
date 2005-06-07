@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright (C) 2004 Andrea Arcangeli <andrea@suse.de> SUSE
-# $Id: mkpatch.py,v 1.17 2004/12/04 04:22:09 andrea Exp $
+# $Id: mkpatch.py,v 1.20 2005/06/07 17:22:58 andrea Exp $
 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -53,7 +53,7 @@ TAGS = (
 	'References',
 	)
 
-DIFF_CMD = 'diff -urNp --exclude CVS --exclude BitKeeper --exclude {arch} --exclude .arch-ids --exclude .svn'
+DIFF_CMD = 'diff -urNp --exclude CVS --exclude BitKeeper --exclude {arch} --exclude .arch-ids --exclude .svn --exclude .git --exclude .hg'
 SIGNOFF_FILE = '~/.signedoffby'
 
 class signoff_mode_class(object):
@@ -294,7 +294,13 @@ def cleanup_patch(patch):
 	for line in re.split('\n', patch):
 		if line and not diffline.match(line):
 			ret += line + '\n'
-	return ret
+	stdin, stdout = os.popen2('diffstat')
+	print >>stdin, ret,
+	stdin.close()
+	diffstat = stdout.read()
+	if not diffstat:
+		raise 'no diffstat'
+	return diffstat + '\n' + ret
 
 def replace_diff(diff, patchfile, signoff_mode):
 	patch = patch_class(patchfile, signoff_mode)
@@ -368,6 +374,7 @@ def mkpatch(*args):
 		for backup_f in files:
 			new_f = None
 			backup_f = backup_f[:-1]
+			backup_f = os.path.normpath(backup_f)
 			if backup_f[-5:] == '.orig':
 				new_f = backup_f[:-5]
 			elif backup_f[-4:] == '.~1~':
@@ -383,7 +390,8 @@ def mkpatch(*args):
 				already_diffed[new_f] = 0
 				print >>sys.stderr, 'Diffing %s...' % new_f,
 				this_diff = os.popen(DIFF_CMD + ' %s %s' % (backup_f, new_f) + ' 2>/dev/null').read()
-				diff += this_diff
+				if this_diff:
+					diff += 'Index: ' + new_f + '\n' + this_diff
 				if this_diff:
 					print >>sys.stderr, 'done.'
 				else:
