@@ -3,12 +3,11 @@ Subject: Only remove offsets.h for make mrproper
 
 offsets.h does not need to be removed by make clean.
 
-Index: linux-2.6.10/arch/m68k/Makefile
+Index: linux-2.6.12/arch/m68k/Makefile
 ===================================================================
---- linux-2.6.10.orig/arch/m68k/Makefile
-+++ linux-2.6.10/arch/m68k/Makefile
-@@ -113,9 +113,9 @@ else
- 	bzip2 -1c vmlinux >vmlinux.bz2
+--- linux-2.6.12.orig/arch/m68k/Makefile
++++ linux-2.6.12/arch/m68k/Makefile
+@@ -114,7 +114,7 @@ else
  endif
  
  prepare: include/asm-$(ARCH)/offsets.h
@@ -17,13 +16,11 @@ Index: linux-2.6.10/arch/m68k/Makefile
  
  arch/$(ARCH)/kernel/asm-offsets.s: include/asm include/linux/version.h \
  				   include/config/MARKER
- 
-Index: linux-2.6.10/arch/parisc/Makefile
+Index: linux-2.6.12/arch/parisc/Makefile
 ===================================================================
---- linux-2.6.10.orig/arch/parisc/Makefile
-+++ linux-2.6.10/arch/parisc/Makefile
-@@ -100,10 +100,10 @@ arch/parisc/kernel/asm-offsets.s: includ
- 
+--- linux-2.6.12.orig/arch/parisc/Makefile
++++ linux-2.6.12/arch/parisc/Makefile
+@@ -108,8 +108,8 @@ arch/parisc/kernel/asm-offsets.s: includ
  include/asm-parisc/offsets.h: arch/parisc/kernel/asm-offsets.s
  	$(call filechk,gen-asm-offsets)
  
@@ -34,39 +31,35 @@ Index: linux-2.6.10/arch/parisc/Makefile
  
  define archhelp
  	@echo  '* vmlinux	- Uncompressed kernel image (./vmlinux)'
- 	@echo  '  palo		- Bootable image (./lifimage)'
-Index: linux-2.6.10/arch/ppc/Makefile
+Index: linux-2.6.12/arch/ppc/Makefile
 ===================================================================
---- linux-2.6.10.orig/arch/ppc/Makefile
-+++ linux-2.6.10/arch/ppc/Makefile
-@@ -132,8 +132,8 @@ ifneq ($(AS_ALTIVEC),0)
- 	@false
- endif
- 	@true
+--- linux-2.6.12.orig/arch/ppc/Makefile
++++ linux-2.6.12/arch/ppc/Makefile
+@@ -134,7 +134,6 @@ checkbin:
+ 		false ; \
+ 	fi
  
 -CLEAN_FILES +=	include/asm-$(ARCH)/offsets.h \
 -		arch/$(ARCH)/kernel/asm-offsets.s \
-+CLEAN_FILES += arch/$(ARCH)/kernel/asm-offsets.s \
++CLEAN_FILES +=	arch/$(ARCH)/kernel/asm-offsets.s \
  		$(TOUT)
+-
 +MRPROPER_FILES += include/asm-$(ARCH)/offsets.h
- 
-Index: linux-2.6.10/arch/ppc64/Makefile
+Index: linux-2.6.12/arch/ppc64/Makefile
 ===================================================================
---- linux-2.6.10.orig/arch/ppc64/Makefile
-+++ linux-2.6.10/arch/ppc64/Makefile
-@@ -91,5 +91,5 @@ define archhelp
-   echo  '		   sourced from arch/$(ARCH)/boot/ramdisk.image.gz'
+--- linux-2.6.12.orig/arch/ppc64/Makefile
++++ linux-2.6.12/arch/ppc64/Makefile
+@@ -128,4 +128,4 @@ define archhelp
    echo  '		   (arch/$(ARCH)/boot/zImage.initrd)'
  endef
  
 -CLEAN_FILES += include/asm-ppc64/offsets.h
 +MRPROPER_FILES += include/asm-ppc64/offsets.h
-Index: linux-2.6.10/arch/s390/Makefile
+Index: linux-2.6.12/arch/s390/Makefile
 ===================================================================
---- linux-2.6.10.orig/arch/s390/Makefile
-+++ linux-2.6.10/arch/s390/Makefile
-@@ -107,9 +107,9 @@ arch/$(ARCH)/kernel/asm-offsets.s: inclu
- 
+--- linux-2.6.12.orig/arch/s390/Makefile
++++ linux-2.6.12/arch/s390/Makefile
+@@ -108,7 +108,7 @@ arch/$(ARCH)/kernel/asm-offsets.s: inclu
  include/asm-$(ARCH)/offsets.h: arch/$(ARCH)/kernel/asm-offsets.s
  	$(call filechk,gen-asm-offsets)
  
@@ -75,4 +68,3 @@ Index: linux-2.6.10/arch/s390/Makefile
  
  # Don't use tabs in echo arguments
  define archhelp
-   echo  '* image           - Kernel image for IPL ($(boot)/image)'
