@@ -8,6 +8,6 @@ else
 fi
 
 VERSION=2.6.12
-EXTRAVERSION=git9
+EXTRAVERSION=-git9
 BUILD_DIR=kernel-source
 IGNORE_ARCHS=
