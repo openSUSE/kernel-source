@@ -63,20 +63,30 @@ def match_right(str1, str2):
 		return False
 
 # Conversion of kernel vs rpm versions
-def rpmver_to_kver(rver):
-	"Extracts kernel version from rpmname"
+def parse_rver(rver):
+	"Extracts kernel flavour and version no from rpmname"
 	rver = rver.strip()
 	kver = rmv_re_left(rver, re.compile(r'.*/kernel-'))
 	kver = rmv_re_right(kver, re.compile(r'\.[^\.]*.rpm$'))
 	kvnum = rmv_re_left(kver, re.compile(r'[^-]*-'))
 	kvflav = kver[:-len(kvnum)-1]
+	return (kvflav, kvnum)
+
+def parse_kver(kver):
+	"Extracts kernel flavour and version no from kernel version"
+	kver = kver.strip()
+	rvnum = rmv_re_right(kver, re.compile(r'-[^0-9][^-]*$'))
+	rvflav = kver[len(rvnum)+1:]
+	return (rvflav, rvnum)
+	
+def rpmver_to_kver(rver):
+	"Convert rpmname to kernelver"
+	(kvflav, kvnum) = parse_rver(rver)
 	return kvnum + '-' + kvflav
 
 def kver_to_rpmver(kver):
 	"Shuffles kernel version to make it an rpm name component"
-	kver = kver.strip()
-	rvnum = rmv_re_right(kver, re.compile(r'-[^0-9][^-]*$'))
-	rvflav = kver[len(rvnum)+1:]
+	(rvflav, rvnum) = parse_kver(kver)
 	return rvflav + '-' + rvnum
 
 # Remove unneeded filename components
@@ -121,6 +131,8 @@ def collect_syms_from_obj26file(fname, defd, undefd, path = ''):
 		if match:
 			sym = match.group(2)
 			ver = match.group(1)
+			#ver = '00000000' + rmv_left(ver, '0x')
+			ver = ver[-8:]
 			if defd.has_key(sym):
 				if defd[sym].has_key(ver):
 					if not shortnm in defd[sym][ver].split(','):
@@ -216,6 +228,7 @@ def collect_syms_from_symverfile(fname, defd, undefd):
 				or match_left(lo, 'extra') \
 				or match_left(lo, 'update') \
 				or match_left(lo, 'override') \
+				or match_left(lo, 'ncs') \
 				or match_left(lo, 'nss'):
 					loc += '%s,' % lo
 				else:
@@ -243,8 +256,8 @@ def collect_installed_kernel26(version, defd, undefd, path = '', quick = 0):
 	import glob
 	global modules
 	modules = 0
-	vernum = rmv_re_right(version, re.compile(r'-[^0-9].*'))
-	symverfile = path + '/boot/symvers-%s*' % vernum
+	(verflav, vernum) = parse_kver(version)
+	symverfile = path + '/boot/symvers-%s*-%s*' % (vernum, verflav)
 	symverfiles = glob.glob(symverfile)
 	if len(symverfiles) != 1:
 		print >>sys.stderr, "ERROR: Expected one match for %s" % symverfile
