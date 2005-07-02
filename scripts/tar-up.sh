@@ -15,7 +15,7 @@ done
 source $(dirname $0)/config.sh
 export LANG=POSIX
 SRC_FILE=linux-$SRCVERSION.tar.bz2
-RPMVERSION=${VERSION//-/_}${EXTRAVERSION//-/_}
+RPMVERSION=${PATCHVERSION//-/_}
 
 if ! scripts/check-conf || \
    ! scripts/check-cvs-add; then
@@ -114,9 +114,8 @@ for flavor in $flavors ; do
     # Generate spec file
     sed -e "s,@NAME@,kernel-$flavor,g" \
 	-e "s,@FLAVOR@,$flavor,g" \
-	-e "s,@VERSION@,$VERSION,g" \
 	-e "s,@SRCVERSION@,$SRCVERSION,g" \
-	-e "s,@EXTRAVERSION@,$EXTRAVERSION,g" \
+	-e "s,@PATCHVERSION@,$PATCHVERSION,g" \
 	-e "s,@RPMVERSION@,$RPMVERSION,g" \
 	-e "s,@ARCHS@,$archs,g" \
 	-e "s,@PROVIDES_OBSOLETES@,${prov_obs//$'\n'/\\n},g" \
@@ -147,9 +146,8 @@ binary_spec_files=${binary_spec_files//$'\n'/\\n}
 # The pre-configured kernel source package
 echo "kernel-source.spec"
 sed -e "s,@NAME@,kernel-source,g" \
-    -e "s,@VERSION@,$VERSION,g" \
     -e "s,@SRCVERSION@,$SRCVERSION,g" \
-    -e "s,@EXTRAVERSION@,$EXTRAVERSION,g" \
+    -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
     -e "s,@PRECONF@,1,g" \
     -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
@@ -158,18 +156,16 @@ sed -e "s,@NAME@,kernel-source,g" \
 
 echo "kernel-dummy.spec"
 sed -e "s,@NAME@,kernel-dummy,g" \
-    -e "s,@VERSION@,$VERSION,g" \
     -e "s,@SRCVERSION@,$SRCVERSION,g" \
-    -e "s,@EXTRAVERSION@,$EXTRAVERSION,g" \
+    -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
   < rpm/kernel-dummy.spec.in \
 > $BUILD_DIR/kernel-dummy.spec
 
 echo "kernel-syms.spec"
 sed -e "s,@NAME@,kernel-syms,g" \
-    -e "s,@VERSION@,$VERSION,g" \
     -e "s,@SRCVERSION@,$SRCVERSION,g" \
-    -e "s,@EXTRAVERSION@,$EXTRAVERSION,g" \
+    -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
     -e "s,@PRECONF@,1,g" \
   < rpm/kernel-syms.spec.in \
