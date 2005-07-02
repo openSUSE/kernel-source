@@ -14,7 +14,7 @@ until [ "$#" = "0" ] ; do
 done
 source $(dirname $0)/config.sh
 export LANG=POSIX
-SRC_FILE=linux-$VERSION.tar.bz2
+SRC_FILE=linux-$SRCVERSION.tar.bz2
 RPMVERSION=${VERSION//-/_}${EXTRAVERSION//-/_}
 
 if ! scripts/check-conf || \
@@ -115,6 +115,7 @@ for flavor in $flavors ; do
     sed -e "s,@NAME@,kernel-$flavor,g" \
 	-e "s,@FLAVOR@,$flavor,g" \
 	-e "s,@VERSION@,$VERSION,g" \
+	-e "s,@SRCVERSION@,$SRCVERSION,g" \
 	-e "s,@EXTRAVERSION@,$EXTRAVERSION,g" \
 	-e "s,@RPMVERSION@,$RPMVERSION,g" \
 	-e "s,@ARCHS@,$archs,g" \
@@ -147,6 +148,7 @@ binary_spec_files=${binary_spec_files//$'\n'/\\n}
 echo "kernel-source.spec"
 sed -e "s,@NAME@,kernel-source,g" \
     -e "s,@VERSION@,$VERSION,g" \
+    -e "s,@SRCVERSION@,$SRCVERSION,g" \
     -e "s,@EXTRAVERSION@,$EXTRAVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
     -e "s,@PRECONF@,1,g" \
@@ -157,6 +159,7 @@ sed -e "s,@NAME@,kernel-source,g" \
 echo "kernel-dummy.spec"
 sed -e "s,@NAME@,kernel-dummy,g" \
     -e "s,@VERSION@,$VERSION,g" \
+    -e "s,@SRCVERSION@,$SRCVERSION,g" \
     -e "s,@EXTRAVERSION@,$EXTRAVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
   < rpm/kernel-dummy.spec.in \
@@ -165,6 +168,7 @@ sed -e "s,@NAME@,kernel-dummy,g" \
 echo "kernel-syms.spec"
 sed -e "s,@NAME@,kernel-syms,g" \
     -e "s,@VERSION@,$VERSION,g" \
+    -e "s,@SRCVERSION@,$SRCVERSION,g" \
     -e "s,@EXTRAVERSION@,$EXTRAVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
     -e "s,@PRECONF@,1,g" \

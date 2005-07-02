@@ -100,9 +100,9 @@ fi
 
 TMPDIR=$SCRATCH_AREA
 export TMPDIR
-PATCH_DIR=$SCRATCH_AREA/linux-$VERSION
-PATCH_LOG=$SCRATCH_AREA/patch-$VERSION.log
-LAST_LOG=$SCRATCH_AREA/last-$VERSION.log
+PATCH_DIR=$SCRATCH_AREA/linux-$SRCVERSION
+PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION.log
+LAST_LOG=$SCRATCH_AREA/last-$SRCVERSION.log
 
 # Check if we can clean up backup files at the end
 # (slightly faster, but requires more disk space).
@@ -113,8 +113,8 @@ free_blocks="$(df -P "$SCRATCH_AREA" \
 echo "Creating tree in $PATCH_DIR"
 
 if [ ! -d $PATCH_DIR.orig ]; then
-    # Check if linux-$VERSION.tar.gz is accessible.
-    for file in {$SCRATCH_AREA/,,$MIRROR/,$MIRROR/testing/}linux-$VERSION.tar.{gz,bz2}; do
+    # Check if linux-$SRCVERSION.tar.gz is accessible.
+    for file in {$SCRATCH_AREA/,,$MIRROR/,$MIRROR/testing/}linux-$SRCVERSION.tar.{gz,bz2}; do
 	if [ -r $file ]; then
 	    LINUX_ORIG_TARBALL=$file
 	    [ ${file:(-3)} = .gz  ] && COMPRESS_MODE=z
@@ -123,7 +123,7 @@ if [ ! -d $PATCH_DIR.orig ]; then
 	fi
     done
     if [ -z "$LINUX_ORIG_TARBALL" ]; then
-	echo "Kernel source archive \`linux-$VERSION.tar.gz' not found," >&2
+	echo "Kernel source archive \`linux-$SRCVERSION.tar.gz' not found," >&2
 	echo "alternatively you can put an unpatched kernel tree to" >&2
 	echo "$PATCH_DIR.orig." >&2
 	exit 1
@@ -237,16 +237,16 @@ if [ -e $PATCH_DIR ]; then
     fi
 fi
 
-# Create fresh $SCRATCH_AREA/linux-$VERSION.
+# Create fresh $SCRATCH_AREA/linux-$SRCVERSION.
 if [ -d $PATCH_DIR.orig ]; then
     echo "Linking from $PATCH_DIR.orig"
     cp -rld $PATCH_DIR.orig $PATCH_DIR
 else
     echo "Extracting $LINUX_ORIG_TARBALL"
     tar xf$COMPRESS_MODE $LINUX_ORIG_TARBALL --directory $SCRATCH_AREA
-    if [ ! -e $PATCH_DIR -a -e ${PATCH_DIR%-$VERSION} ]; then
-	# Old kernels unpack into linux/ instead of linux-$VERSION/.
-	mv ${PATCH_DIR%-$VERSION} $PATCH_DIR
+    if [ ! -e $PATCH_DIR -a -e ${PATCH_DIR%-$SRCVERSION} ]; then
+	# Old kernels unpack into linux/ instead of linux-$SRCVERSION/.
+	mv ${PATCH_DIR%-$SRCVERSION} $PATCH_DIR
     fi
     cp -rld $PATCH_DIR $PATCH_DIR.orig
     find $PATCH_DIR.orig -type f | xargs chmod a-w,a+r
@@ -365,7 +365,7 @@ if [ -n "$COMBINE" ]; then
     sed -i '/^#.*/d' combined.series
     (
 	    cd $SCRATCH_AREA
-	    diff -x .pc -U0 -rNa linux-$VERSION.orig linux-$VERSION
+	    diff -x .pc -U0 -rNa linux-$SRCVERSION.orig linux-$SRCVERSION
     ) | gzip -c9 > combined.patch.gz
     exit 0
 fi
