@@ -7,7 +7,7 @@ else
 	MIRROR=${MIRROR:-/mounts/mirror/kernel/v2.6}
 fi
 
-VERSION=2.6.13
-EXTRAVERSION=-rc1
+VERSION=2.6.12
+EXTRAVERSION=-rc1-git3
 BUILD_DIR=kernel-source
 IGNORE_ARCHS=
