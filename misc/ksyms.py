@@ -62,11 +62,18 @@ def match_right(str1, str2):
 	else:
 		return False
 
+# Name replacements for k_* 
+def fix_shortnm(nm):
+	nm = re.sub(r'deflt', 'default', nm)
+	return nm
+
 # Conversion of kernel vs rpm versions
 def parse_rver(rver):
 	"Extracts kernel flavour and version no from rpmname"
 	rver = rver.strip()
-	kver = rmv_re_left(rver, re.compile(r'.*/kernel-'))
+	kver = rmv_re_left(rver, re.compile(r'(.*/|)kernel-'))
+	kver = rmv_re_left(rver, re.compile(r'(.*/|)k_'))
+	kver = fix_shortnm(kver)
 	kver = rmv_re_right(kver, re.compile(r'\.[^\.]*.rpm$'))
 	kvnum = rmv_re_left(kver, re.compile(r'[^-]*-'))
 	kvflav = kver[:-len(kvnum)-1]
@@ -174,7 +181,9 @@ def collect_syms_from_obj26file(fname, defd, undefd, path = ''):
 			ver = ver[-8:]
 			if defd.has_key(sym):
 				if defd[sym].has_key(ver):
-					if not shortnm in defd[sym][ver].split(','):
+					if not defd[sym][ver] and shortnm:
+						defd[sym][ver] = shortnm
+					elif not shortnm in defd[sym][ver].split(','):
 						print >>sys.stderr, "WARNING: Symbol %s in both %s and %s" % (sym, defd[sym][ver], shortnm)
 						defd[sym][ver] += ',%s' % shortnm
 				else:
@@ -204,7 +213,9 @@ def collect_syms_from_obj26file(fname, defd, undefd, path = ''):
 			ver = ver[-8:]
 			if undefd.has_key(nm):
 				if undefd[nm].has_key(ver):
-					if not shortnm in undefd[nm][ver].split(','):
+					if not undefd[sym][ver] and shortnm:
+						undefd[sym][ver] = shortnm
+					elif not shortnm in undefd[nm][ver].split(','):
 						undefd[nm][ver] += ',%s' % shortnm
 				else:
 					print >>sys.stderr, "ERROR: Mismatch for symbol %s" % nm
@@ -271,17 +282,26 @@ def collect_syms_from_obj24file(fname, defd, undefd, path = ''):
 			#ver = ver[-8:]
 			if defd.has_key(sym):
 				if defd[sym].has_key(ver):
-					if not shortnm in defd[sym][ver].split(','):
+					if not defd[sym][ver] and shortnm:
+						defd[sym][ver] = shortnm
+					elif not shortnm in defd[sym][ver].split(','):
 						print >>sys.stderr, "WARNING: Symbol %s in both %s and %s" % (sym, defd[sym][ver], shortnm)
 						defd[sym][ver] += ',%s' % shortnm
 				else:
-					print >>sys.stderr, "ERROR: Mismatch for symbol %s" % sym
-					for key in defd[sym].keys():
-						print >>sys.stderr, " Previous ver %s from %s" \
-							% (key, defd[sym][key])
-					print >>sys.stderr, " Current  ver %s from %s" \
-						% (ver, shortnm)
-					defd[sym][ver] = shortnm
+					# Special case: reading vmlinux, version known
+					# from symvers (where src is not known)
+					if ver == '00000000' \
+					and len(defd[sym]) == 1 \
+					and not defd[sym][defd[sym].keys()[0]]:
+						defd[sym][defd[sym].keys()[0]] = shortnm
+					else:	
+						print >>sys.stderr, "ERROR: Mismatch for symbol %s" % sym
+						for key in defd[sym].keys():
+							print >>sys.stderr, " Previous ver %s from %s" \
+								% (key, defd[sym][key])
+						print >>sys.stderr, " Current  ver %s from %s" \
+							% (ver, shortnm)
+						defd[sym][ver] = shortnm
 			else:
 				defd[sym] = {ver: shortnm}
 			continue
@@ -294,18 +314,29 @@ def collect_syms_from_obj24file(fname, defd, undefd, path = ''):
 				ver = m2.group(2)
 			else:
 				ver = '00000000'
+			if sym == '__this_module':
+				continue
 			if undefd.has_key(sym):
 				if undefd[sym].has_key(ver):
-					if not shortnm in undefd[sym][ver].split(','):
+					if not undefd[sym][ver] and shortnm:
+						undefd[sym][ver] = shortnm
+					elif not shortnm in undefd[sym][ver].split(','):
 						undefd[sym][ver] += ',%s' % shortnm
 				else:
-					print >>sys.stderr, "ERROR: Mismatch for symbol %s" % sym
-					for key in undefd[sym].keys():
+					# Special case: reading vmlinux, version known
+					# from symvers (where src is not known)
+					if ver == '00000000' \
+					and len(undefd[sym]) == 1 \
+					and not undefd[sym][undefd[sym].keys()[0]]:
+						undefd[sym][undefd[sym].keys()[0]] = shortnm
+					else:	
+						print >>sys.stderr, "ERROR: Mismatch for symbol %s" % sym
+						for key in undefd[sym].keys():
+							print >>sys.stderr, " Ver %s needed by %s" \
+							% (key, undefd[sym][key])
 						print >>sys.stderr, " Ver %s needed by %s" \
-						% (key, undefd[sym][key])
-					print >>sys.stderr, " Ver %s needed by %s" \
-						% (ver, shortnm)
-					undefd[sym][ver] = shortnm
+							% (ver, shortnm)
+						undefd[sym][ver] = shortnm
 			else:
 				undefd[sym] = {ver: shortnm}
 	fd.close()
@@ -340,10 +371,16 @@ def collect_syms_from_symverfile(fname, defd, undefd):
 				lst = defd
 			elif match.group(1) == 'Unresolved symbols':
 				lst = undefd
-			continue	
-		(ver, sym, loc) = ln.split()
+			continue
+		sln = ln.split()
+		ver = sln[0] 
 		ver = '00000000' + rmv_left(ver, '0x')
 		ver = ver[-8:]
+		sym = sln[1]
+		if len(sln) > 2:
+			loc = sln[2]
+		else:
+			loc = ''
 		# for modules, we lack the kernel/ part of the
 		# path, readd it, where appropriate
 		# not needed if reading our own output files
@@ -351,7 +388,8 @@ def collect_syms_from_symverfile(fname, defd, undefd):
 			locopy = loc
 			loc = ''
 			for lo in locopy.split(','):
-				if match_left(lo, 'vmlinu') \
+				if not lo \
+				or match_left(lo, 'vmlinu') \
 				or match_left(lo, 'extra') \
 				or match_left(lo, 'misc') \
 				or match_left(lo, 'pcmcia') \
@@ -365,7 +403,7 @@ def collect_syms_from_symverfile(fname, defd, undefd):
 			loc = rmv_right(loc, ',')
 		
 		if lst.has_key(sym):
-			if lst[sym].has_key(ver):
+			if lst[sym].has_key(ver) and loc:
 				lst[sym][ver] += ',%s' % loc
 			else:
 				print >>sys.stderr, "ERROR: Mismatch for symbol %s:" % sym
@@ -416,22 +454,22 @@ def collect_installed_kernel24(version, defd, undefd, path = '', quick = 0):
 	global modules
 	modules = 0
 	(verflav, vernum) = parse_kver(version)
-	# FIXME: There is probably no symvers in 2.4
-	if 0:
-		symverfile = path + '/boot/symvers-%s*-%s*' % (vernum, verflav)
-		symverfiles = glob.glob(symverfile)
-		if len(symverfiles) != 1:
-			print >>sys.stderr, "ERROR: Expected one match for %s" % symverfile
-			print >>sys.stderr, " Found %s" % symverfiles
-			sys.exit(1)
-		collect_syms_from_symverfile(symverfiles[0], defd, undefd)
-	# FIXME: We should scan the kernel now ...
+	symverfile = path + '/boot/symvers-%s*-%s*' % (vernum, verflav)
+	symverfiles = glob.glob(symverfile)
+	if len(symverfiles) != 1:
+		print >>sys.stderr, "ERROR: Expected one match for %s" % symverfile
+		print >>sys.stderr, " Found %s" % symverfiles
+		sys.exit(1)
+	collect_syms_from_symverfile(symverfiles[0], defd, undefd)
+	
+	# Quick does not make sense on 2.4
+	if quick:
+		print >>sys.stderr, "WARNING: Quick mode will not provide much info on 2.4"
+		return modules
+	# In 2.4, symvers does not tell us about the source of a symbol  ...
 	collect_syms_from_obj24file(path + '/boot/vmlinux-%s-%s.gz' % (vernum, verflav),
 			defd, undefd, path)
 
-	# FIXME: Quick does not make sense on 2.4
-	if quick:
-		return modules
 	test_access('%s/lib/modules/%s' % (path, version))
 	fd = os.popen('find %s/lib/modules/%s -name *.o' % (path, version), 'r')
 	for nm in fd.readlines():
@@ -446,6 +484,8 @@ def extract_rpm(rpm, quick):
 	test_access(rpm)
 	tmpdir = get_tmpdir()
 	cwd = os.getcwd()
+	if rpm[0:1] != '/':
+		rpm = cwd + '/' + rpm
 	os.chdir(tmpdir)
 	if quick:
 		reg = re.compile(r'boot/symvers\-')
