@@ -15,6 +15,7 @@ done
 source $(dirname $0)/config.sh
 export LANG=POSIX
 SRC_FILE=linux-$SRCVERSION.tar.bz2
+PATCHVERSION=$($(dirname $0)/compute-PATCHVERSION.sh)
 RPMVERSION=${PATCHVERSION//-/_}
 
 if ! scripts/check-conf || \

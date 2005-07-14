@@ -9,7 +9,5 @@ fi
 
 # The version of the main tarball to use
 SRCVERSION=2.6.12
-# The version of the patched tree
-PATCHVERSION=2.6.13-rc3-git1
 BUILD_DIR=kernel-source
 IGNORE_ARCHS=
