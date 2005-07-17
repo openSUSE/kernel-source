@@ -62,7 +62,7 @@ for flavor in $flavors ; do
     extra_needs=
     case $flavor in
 	um)
-	    extra_needs=x-devel-packages ;;
+	    extra_needs="libpcap x-devel-packages" ;;
     esac
 
     # Find all architectures for this spec file
