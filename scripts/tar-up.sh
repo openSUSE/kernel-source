@@ -1,8 +1,18 @@
 #!/bin/sh
 
 rpm_release_timestamp=
+tolerate_unknown_new_config_options=0
+external_modules=yes
 until [ "$#" = "0" ] ; do
   case "$1" in
+    -nem|--no_external_modules)
+      external_modules=no
+      shift
+      ;;
+    -nf|--tolerate-unknown-new-config-options)
+      tolerate_unknown_new_config_options=1
+      shift
+      ;;
     -ts|--timestamp)
       rpm_release_timestamp=yes
       shift
@@ -14,6 +24,12 @@ until [ "$#" = "0" ] ; do
 done
 source $(dirname $0)/config.sh
 export LANG=POSIX
+rpm_num=100
+rpm_archives=
+rpm_source_number=$rpm_num
+rpm_source=
+rpm_no_source=
+rpm_additional_setup=
 SRC_FILE=linux-$SRCVERSION.tar.bz2
 PATCHVERSION=$($(dirname $0)/compute-PATCHVERSION.sh)
 RPMVERSION=${PATCHVERSION//-/_}
@@ -47,6 +63,56 @@ if [ -e CVS/Tag ]; then
 	echo $tag >> $BUILD_DIR/build-source-timestamp
     fi
 fi
+
+# Generate list of all config files and patches used
+all_files="$( {
+	$(dirname $0)/guards --list < series.conf
+	$(dirname $0)/guards --prefix=config --list < config.conf
+    } | sort -u )"
+# The first directory level determines the archive name
+all_archives="$(
+    echo "$all_files" \
+    | sed -e 's,/.*,,' \
+    | uniq )"
+for archive in $all_archives ; do
+    echo "$archive.tar.bz2"
+    case " $IGNORE_ARCHS " in
+    *" ${archive#patches.} "*)
+	echo "Ignoring $d..."
+	continue ;;
+    esac
+
+    files="$( echo "$all_files" \
+	| sed -ne "\:^${archive//./\\.}/:p" \
+	| while read patch; do
+	    [ -e "$patch" ] && echo "$patch"
+	done)"
+    tar -cf - $files \
+    | bzip2 -9 > $BUILD_DIR/$archive.tar.bz2
+    rpm_archives="$rpm_archives $archive" 
+    rpm_additional_setup="$rpm_additional_setup -a $rpm_source_number"
+    rpm_source_number=$[ $rpm_source_number + 1]
+
+done
+bzip2 -9 < /dev/null > $BUILD_DIR/patches.addon.tar.bz2
+rpm_source=$(
+	rpm_source_number=$rpm_num
+	for i in $rpm_archives
+	do
+		printf "%s\n" "Source$rpm_source_number: $i.tar.bz2"
+		rpm_source_number=$[ $rpm_source_number + 1]
+	done
+)
+rpm_no_source=$(
+	rpm_source_number=$rpm_num
+	for i in $rpm_archives
+	do
+		printf "%s\n" "NoSource: $rpm_source_number"
+		rpm_source_number=$[ $rpm_source_number + 1]
+	done
+)
+rpm_source=${rpm_source//$'\n'/\\n}
+rpm_no_source=${rpm_no_source//$'\n'/\\n}
 
 # List all used configurations
 config_files="$(
@@ -121,8 +187,16 @@ for flavor in $flavors ; do
 	-e "s,@ARCHS@,$archs,g" \
 	-e "s,@PROVIDES_OBSOLETES@,${prov_obs//$'\n'/\\n},g" \
 	-e "s,@EXTRA_NEEDS@,$extra_needs,g" \
+	-e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
+	-e "s,@RPM_ADDITIONAL_SETUP@,$rpm_additional_setup," \
+	-e "s,@RPM_SOURCE_PATCHES@,$rpm_source," \
+	-e "s,@RPM_NO_SOURCE_PATCHES@,$rpm_no_source," \
       < rpm/kernel-binary.spec.in \
     > $BUILD_DIR/kernel-$flavor.spec
+    if test "$external_modules" = "no" ; then
+	sed -e "/^# neededforbuild/s@kernel-module-packages@@g" < $BUILD_DIR/kernel-$flavor.spec > $BUILD_DIR/kernel-$flavor.spec.$$
+	mv -f $BUILD_DIR/kernel-$flavor.spec.$$ $BUILD_DIR/kernel-$flavor.spec
+    fi
 done
 
 install_changes() {
@@ -152,6 +226,10 @@ sed -e "s,@NAME@,kernel-source,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
     -e "s,@PRECONF@,1,g" \
     -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
+    -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
+    -e "s,@RPM_ADDITIONAL_SETUP@,$rpm_additional_setup," \
+    -e "s,@RPM_SOURCE_PATCHES@,$rpm_source," \
+    -e "s,@RPM_NO_SOURCE_PATCHES@,$rpm_no_source," \
   < rpm/kernel-source.spec.in \
 > $BUILD_DIR/kernel-source.spec
 
@@ -216,34 +294,6 @@ echo "hello.tar.bz2"
     tar -cf - --exclude=CVS --exclude='.*.cmd' \
     	      --exclude='*.ko' --exclude='*.o' hello
 ) | bzip2 > $BUILD_DIR/hello.tar.bz2
-
-# Generate list of all config files and patches used
-all_files="$( {
-	$(dirname $0)/guards --list < series.conf
-	$(dirname $0)/guards --prefix=config --list < config.conf
-    } | sort -u )"
-# The first directory level determines the archive name
-all_archives="$(
-    echo "$all_files" \
-    | sed -e 's,/.*,,' \
-    | uniq )"
-for archive in $all_archives ; do
-    echo "$archive.tar.bz2"
-    case " $IGNORE_ARCHS " in
-    *" ${archive#patches.} "*)
-	echo "Ignoring $d..."
-	continue ;;
-    esac
-
-    files="$( echo "$all_files" \
-	| sed -ne "\:^${archive//./\\.}/:p" \
-	| while read patch; do
-	    [ -e "$patch" ] && echo "$patch"
-	done)"
-    tar -cf - $files \
-    | bzip2 -9 > $BUILD_DIR/$archive.tar.bz2
-done
-bzip2 -9 < /dev/null > $BUILD_DIR/patches.addon.tar.bz2
 
 if [ -r $SRC_FILE ]; then
   LINUX_ORIG_TARBALL=$SRC_FILE

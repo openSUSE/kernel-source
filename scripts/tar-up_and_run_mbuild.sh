@@ -6,6 +6,8 @@ sudo -l
 important_specfiles="default smp ppc64 iseries64 s390 s390x 64k-pagesize"
 all_specfiles="`sed -e '/^\+/s@^.*/@@p;d' config.conf | sort -u`"
 timestamp=
+tolerate_unknown_new_config_options=
+external_modules=
 dist=
 specfiles=$important_specfiles
 # action item: learn why $LOGNAME or $USER is not exported...
@@ -17,6 +19,14 @@ until [ "$#" = "0" ] ; do
 	timestamp=-ts
 	shift
 	;;
+    -nf)
+      tolerate_unknown_new_config_options=-nf
+      shift
+      ;;
+    -nem)
+      external_modules=-nem
+      shift
+      ;;
     -l)
 	user="$2"
 	shift 2
@@ -38,7 +48,7 @@ mbuild_options="-l $user $mbuild_options"
 if [ ! -z "$dist" ] ; then
 mbuild_options="$mbuild_options $dist"
 fi
-scripts/tar-up.sh $timestamp
+scripts/tar-up.sh $timestamp $tolerate_unknown_new_config_options $external_modules
 cd kernel-source
 for i in $specfiles
 do
