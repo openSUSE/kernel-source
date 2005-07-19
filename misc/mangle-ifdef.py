@@ -1,136 +1,145 @@
 #!/usr/bin/env python
-# 
+""" 
 # Mangles duplicate functions that are ifdef'd
 # Useful to simplify include/linux/security.h (LSM hooks).
 # 
 # (c) Kurt Garloff <garloff@suse.de>, 2005-06-26, GNU GPL
-#
-# $Id: mangle-ifdef.py,v 1.5 2005/07/03 15:45:19 garloff Exp $
-#
+"""
+__revision__ = '$Id: mangle-ifdef.py,v 1.5 2005/07/03 15:45:19 garloff Exp $'
+
 
 import os, sys, re
 
+indentifdef = 1
+
 def usage():
 	"Help"
-	print >>sys.stderr, "Usage: mangle-ifdef.py INFILE OUTFILE"
-	print >>sys.stderr, " This tool tries to put implementations of the same function"
-	print >>sys.stderr, " with different preprocessor conditional next to each other"
-	print >>sys.stderr, " for consolidation. Used for include/linux/security.h"
+	print >> sys.stderr, "Usage: mangle-ifdef.py INFILE OUTFILE"
+	print >> sys.stderr, " This tool tries to put implementations of the same function"
+	print >> sys.stderr, " with different preprocessor conditional next to each other"
+	print >> sys.stderr, " for consolidation. Used for include/linux/security.h"
 	sys.exit(2)
 
 
+def indent(num):
+	"ifdef indentation"
+	if indentifdef:
+		return ' '*num
+	else:
+		return ''
+
 def writeendifs(outf, number, old):
 	"Write #endifs to output file"
-	for no in range(len(old)-1, len(old)-1-number, -1):
+	for num in range(len(old)-1, len(old)-1-number, -1):
 		outf.write('#%sendif /* %s */\n' 
-			% (' '*no, old[no][0]))
+			% (indent(num), old[num][0]))
 
 def writeelse(outf, which, old):
 	"Write #else to output file"
 	outf.write('#%selse /* %s */\n'
-		% (' '*which, old[which][0]))
+		% (indent(which), old[which][0]))
 
 def writeifdefs(outf, number, new):
 	"Write #if(n)def to output file"
-	for no in range(len(new)-number, len(new)):
-		if new[no][1] == 1:
+	for cno in range(len(new)-number, len(new)):
+		if new[cno][1] == 1:
 			outf.write('#%sifdef %s\n'
-				% (' '*no, new[no][0]))
-		elif new[no][1] == 0:
+				% (indent(cno), new[cno][0]))
+		elif new[cno][1] == 0:
 			outf.write('#%sifndef %s\n'
-				% (' '*no, new[no][0]))
+				% (indent(cno), new[cno][0]))
 		else:
 			outf.write('#%sif %s\n'
-				% (' '*no, new[no][0]))
+				% (indent(cno), new[cno][0]))
 
 lastelse = ''
 def changeifdefs(outf, olddefs, newdefs):
 	"""When the conditions for the line changed, put necessary
 	   conditionals in the output file"""
 	global lastelse
-	ln = min(len(olddefs), len(newdefs))
-	diff = ln
+	mln = min(len(olddefs), len(newdefs))
+	diff = mln
 	#print "Changedefs: %s -> %s" % (olddefs, newdefs)
-	for no in range(0, ln):
-		if newdefs[no] != olddefs[no]:
-			diff = no
+	for num in range(0, mln):
+		if newdefs[num] != olddefs[num]:
+			diff = num
 			break
-	close = len(olddefs) - diff
-	open = len(newdefs) - diff
-	if diff < ln and newdefs[diff][0] == olddefs[diff][0] \
+	toclose = len(olddefs) - diff
+	toopen = len(newdefs) - diff
+	if diff < mln and newdefs[diff][0] == olddefs[diff][0] \
 			and newdefs[diff][0] != lastelse:
-		writeendifs(outf, close-1, olddefs)
+		writeendifs(outf, toclose-1, olddefs)
 		writeelse(outf, diff, olddefs)
 		lastelse = newdefs[diff][0]
-		writeifdefs(outf, open-1, newdefs)
+		writeifdefs(outf, toopen-1,  newdefs)
 	else:
-		writeendifs(outf, close, olddefs)
-		writeifdefs(outf, open, newdefs)
+		writeendifs(outf, toclose, olddefs)
+		writeifdefs(outf, toopen,  newdefs)
 		lastelse = ''
 
 
-def lookahead(outl, no):
+def lookahead(outl, lno):
 	"Reads ahead until next ';' or '}' or '{'"
-	str = ''
-	for (ln, cond) in outl[no:]:
-		str += ln
-		if '}' in ln or ';' in ln or '{' in ln or '*/' in ln:
-			return str
+	rstr = ''
+	for (line, cond) in outl[lno:]:
+		rstr += line
+		if '}' in line or ';' in line or '{' in line or '*/' in line:
+			return rstr
 
-def skipcomm(outl, no):
+def skipcomm(outl, lno):
 	"Skip over defines and empty lines"
-	if outl[no][0][0] == '#':
-		while no < len(outl) and outl[no][0].strip()[-1] == '\\':
-			no += 1
-		return no+1
-	#if '/*' in outl[no][0]:
-	#	while no < len(outl) and '*/' not in outl[no][0]:
-	#		no += 1
-	#	return no
-	while no < len(outl) and not outl[no][0].strip():
-		no += 1
-	return no
+	if outl[lno][0][0] == '#':
+		while lno < len(outl) and outl[lno][0].strip()[-1] == '\\':
+			lno += 1
+		return lno+1
+	#if '/*' in outl[lno][0]:
+	#	while lno < len(outl) and '*/' lnot in outl[lno][0]:
+	#		lno += 1
+	#	return lno
+	while lno < len(outl) and not outl[lno][0].strip():
+		lno += 1
+	return lno
 
-def searchaltfn(outl, no, fname):
-	"Search for (another) definition of function fname"
-	while no < len(outl):
-		no = skipcomm(outl, no)
-		parsestr = lookahead(outl, no)
+def searchaltfn(outl, lno, fname):
+	"Search for (alnother) definition of function fname"
+	while lno < len(outl):
+		lno = skipcomm(outl, lno)
+		parsestr = lookahead(outl, lno)
 		if not parsestr:
-			no += 1
+			lno += 1
 			continue
 		if '{' in parsestr:
-			fn = searchfnname(parsestr)
-			if fn == fname:
-				endln = findendfn(outl, no)
-				return (no, endln)
-		no += 1
+			fnm = searchfnname(parsestr)
+			if fnm == fname:
+				endln = findendfn(outl, lno)
+				return (lno, endln)
+		lno += 1
 	
-	return (0,0)
+	return (0, 0)
 
 def searchfnname(line):
 	"Extract function name from concatenated line"
-	fn = re.compile(r'\b(\w*)[ 	]*\(')
-	m = fn.search(line)
-	if m and not line[0] == '#':
-		return m.group(1)
+	func = re.compile(r'\b(\w*)[ 	]*\(')
+	fmatch = func.search(line)
+	if fmatch and not line[0] == '#':
+		return fmatch.group(1)
 		
 		
-def findendfn(outl, no):
-	"Find end of function starting in line no"
-	eno = no
+def findendfn(outl, lno):
+	"Find end of function starting in line lno"
+	elno = lno
 	ilevel = 0
 	body = 0
-	while eno < len(outl):
-		ilevel += outl[eno][0].count('{')
+	while elno < len(outl):
+		ilevel += outl[elno][0].count('{')
 		if ilevel:
 			body = 1
-		ilevel -= outl[eno][0].count('}')
-		eno += 1
+		ilevel -= outl[elno][0].count('}')
+		elno += 1
 		if body and ilevel <= 0:
-			return eno
+			return elno
 			
-	print >>sys.stderr, "Unbalanced braces"
+	print >> sys.stderr, "Unbalanced braces"
 	sys.exit(4)
 
 def copyrange(outl, st1, en1, st2, en2):
@@ -186,25 +195,25 @@ def copyrange(outl, st1, en1, st2, en2):
 	if 0:	
 		print "Performing consolidation: %s, %s -> %s, st %i en %i" \
 			% (cond1, cond2, commcond, diffst, diffen)
-		for ln in range(st1, en1+ln2):
-			if ln < st1+diffst:
+		for lno in range(st1, en1+ln2):
+			if lno < st1+diffst:
 				print 'C:',
-			elif en1-diffen <= ln < en1:
+			elif en1-diffen <= lno < en1:
 				print 'c:',
-			elif st1 <= ln < en1:
+			elif st1 <= lno < en1:
 				print '1:',
-			elif en1 <= ln < en1+diffst:
+			elif en1 <= lno < en1+diffst:
 				print 'C:',
-			elif en1+ln2-diffen <= ln:
+			elif en1+ln2-diffen <= lno:
 				print 'c:',
 			else:
 				print '2:',
-			print outl[ln][0],
+			print outl[lno][0],
 	# Rewrite common condition
-	for ln in range(st1, st1+diffst):
-		outl[ln][1] = commcond
-	for ln in range(en1-diffen, en1):
-		outl[ln][1] = commcond
+	for lno in range(st1, st1+diffst):
+		outl[lno][1] = commcond
+	for lno in range(en1-diffen, en1):
+		outl[lno][1] = commcond
 	# Save different core 2	
 	lns = outl[en1+diffst:en1+ln2-diffen]
 	# and remove completely
@@ -213,40 +222,41 @@ def copyrange(outl, st1, en1, st2, en2):
 	outl[en1-diffen:en1-diffen] = lns
 	# debug
 	if 0:
-		for ln in range(st1, en1+ln2-diffst-diffen):
-			print "   %s" % outl[ln][0],
+		for lno in range(st1, en1+ln2-diffst-diffen):
+			print "   %s" % outl[lno][0],
 	return en1+ln2-diffst-diffen
 
 
 def sortoutlines(outl):
 	"""Look for duplicate function defs and put them next
 	   to each other."""
-	no = 0
-	while no < len(outl):
-		no = skipcomm(outl, no)
-		parsestr = lookahead(outl, no)
+	lno = 0
+	while lno < len(outl):
+		lno = skipcomm(outl, lno)
+		parsestr = lookahead(outl, lno)
 		if not parsestr:
-			no += 1
+			lno += 1
 			continue
 		if '{' in parsestr:
 			fnname = searchfnname(parsestr)
-			endln = findendfn(outl, no)
+			endln = findendfn(outl, lno)
 			if not fnname:
-				no = endln
+				lno = endln
 				continue
 			(altstartln, altendln) = searchaltfn(outl, endln, fnname)
 			if (altendln):
-				no = copyrange(outl, no, endln, altstartln, altendln)
+				lno = copyrange(outl, lno, endln, 
+						altstartln, altendln)
 			else:
-				no = endln
+				lno = endln
 		else:
-			no += 1
+			lno += 1
 
 def copylist(lst):
 	"Deep copy a list of two-element records"
 	newlst = []
-	for el in lst:
-		newlst.append([el[0], el[1]])
+	for elem in lst:
+		newlst.append([elem[0], elem[1]])
 	return newlst
 
 def process(innm, outnm):
@@ -262,17 +272,17 @@ def process(innm, outnm):
 	elsere = re.compile(r'[ 	]*#[ 	]*else')
 	endifre = re.compile(r'[ 	]*#[ 	]*endif')
 	for line in inlines:
-		m = ifdefre.match(line)
-		if m:
-			ifdefs.append([m.group(1).strip(), 1])
+		match = ifdefre.match(line)
+		if match:
+			ifdefs.append([match.group(1).strip(), 1])
 			continue
-		m = ifndefre.match(line)
-		if m:
-			ifdefs.append([m.group(1).strip(), 0])
+		match = ifndefre.match(line)
+		if match:
+			ifdefs.append([match.group(1).strip(), 0])
 			continue
-		m = ifre.match(line)
-		if m:
-			ifdefs.append([m.group(1).strip(), -1])
+		match = ifre.match(line)
+		if match:
+			ifdefs.append([match.group(1).strip(), -1])
 			continue
 		if elsere.match(line):
 			ifdefs[-1][1] = 1 - ifdefs[-1][1]
@@ -283,39 +293,51 @@ def process(innm, outnm):
 		outlines.append([line, copylist(ifdefs)])
 		
 	if len(ifdefs):
-		print >>stderr, "Unbalanced ifdefs!"
+		print >> sys.stderr, "Unbalanced ifdefs!"
 		sys.exit(3)
 
 	sortoutlines(outlines)
 	outfile = open(outnm, 'w')
-	for no in range(0, len(outlines)):
-		(ln, defs) = outlines[no]
-		if ifdefs != defs and not ln.strip():
+	for lno in range(0, len(outlines)):
+		(line, defs) = outlines[lno]
+		if ifdefs != defs and not line.strip():
 			if len(defs) > len(ifdefs):
 				defs = ifdefs
-			elif no < len(outlines)-1:
-				defs = outlines[no+1][1]
+			elif lno < len(outlines)-1:
+				defs = outlines[lno+1][1]
 		if ifdefs != defs:
 			changeifdefs(outfile, ifdefs, defs)
 			ifdefs = defs
-		outfile.write(ln)
+		outfile.write(line)
 	changeifdefs(outfile, ifdefs, [])
 	outfile.close()	
 
 # MAIN
-if len(sys.argv) != 3:
-	usage()
-	
-if sys.argv[1] == sys.argv[2]:
-	print >>sys.stderr, "Input and output should be different"
-if not os.access(sys.argv[1], os.R_OK):
-	print >>sys.stderr, "Can't read from %s" % sys.argv[1]
-	sys.exit(1)
-#if not os.access(sys.argv[2], os.W_OK):
-#	print >>sys.stderr, "Can't write to  %s" % sys.argv[2]
-#	sys.exit(1)
-	
-process(sys.argv[1], sys.argv[2])
-	
+def main(args):
+	"Parse args and process() them ..."
+	global indentifdef
+	if len(args) == 4 and args[1] == '-n':
+		indentifdef = 0
+		ifile = args[2]
+		ofile = args[3]
+	elif len(args) == 3:
+		ifile = args[1]
+		ofile = args[2]
+	else:
+		usage()
+		
+	if ifile == ofile:
+		print >> sys.stderr, "Input and output should be different"
+	if not os.access(ifile, os.R_OK):
+		print >> sys.stderr, "Can't read from %s" % ifile
+		sys.exit(1)
+#	if not os.access(ofile, os.W_OK):
+#		print >>sys.stderr, "Can't write to  %s" % ofile
+#		sys.exit(1)
 
+	process(ifile, ofile)
+
+
+if __name__ == '__main__':
+	main(sys.argv)
 

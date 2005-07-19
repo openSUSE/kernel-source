@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # ksyms.py
-# 
+""" 
 # Extracts symbols from kernel and kernel modules
 # and creates 3 lists: used, unused, unresolved.
 # Operates on installed kernels or RPMs for the collection.
@@ -10,43 +10,43 @@
 # whether they can be loaded into a kernel (RPM).
 #
 # (c) Kurt Garloff <garloff@suse.de>, 2005-06-22, GNU GPL
-#
-# $Id: ksyms.py,v 1.6 2005/06/23 09:39:50 garloff Exp $
+"""
+__revision__ = '$Id: ksyms.py,v 1.6 2005/06/23 09:39:50 garloff Exp $'
 
 import os, sys, re, getopt, shutil
 
 # Helper functions
-def rmv_left(str, sub):
+def rmv_left(strg, sub):
 	"If str starts with sub, remove it"
-	ln = len(sub)
-	if str[:ln] == sub:
-		return str[ln:]
+	sln = len(sub)
+	if strg[:sln] == sub:
+		return strg[sln:]
 	else:
-		return str
+		return strg
 
-def rmv_right(str, sub):
+def rmv_right(strg, sub):
 	"If str ends with sub, remove it"
-	ln = len(sub)
-	if str[-ln:] == sub:
-		return str[:-ln]
+	sln = len(sub)
+	if strg[-sln:] == sub:
+		return strg[:-sln]
 	else:
-		return str
+		return strg
 
-def rmv_re_left(str, regexp):
+def rmv_re_left(strg, regexp):
 	"If regexp matches the left end of str, remove match"
-	match = regexp.match(str)
+	match = regexp.match(strg)
 	if match:
-		return str[len(match.group(0)):]
+		return strg[len(match.group(0)):]
 	else:
-		return str
+		return strg
 
-def rmv_re_right(str, regexp):
+def rmv_re_right(strg, regexp):
 	"If regexp matches the right end of str, remove match"
-	match = regexp.search(str)
+	match = regexp.search(strg)
 	if match:
-		return str[:-len(match.group(0))]
+		return strg[:-len(match.group(0))]
 	else:
-		return str
+		return strg
 
 def match_left(str1, str2):
 	"Tests whether str1 starts with str2"
@@ -63,20 +63,22 @@ def match_right(str1, str2):
 		return False
 
 # Name replacements for k_* 
-def fix_shortnm(nm):
-	nm = re.sub(r'deflt', 'default', nm)
-	return nm
+def fix_shortnm(name):
+	"The k_ kernel names from SLES8 may need expansion"
+	name = re.sub(r'deflt', 'default', name)
+	return name
 
 # Conversion of kernel vs rpm versions
 def parse_rver(rver):
 	"Extracts kernel flavour and version no from rpmname"
 	rver = rver.strip()
 	kver = rmv_re_left(rver, re.compile(r'(.*/|)kernel-'))
-	kver = rmv_re_left(rver, re.compile(r'(.*/|)k_'))
+	kver = rmv_re_left(kver, re.compile(r'(.*/|)k_'))
 	kver = fix_shortnm(kver)
 	kver = rmv_re_right(kver, re.compile(r'\.[^\.]*.rpm$'))
-	kvnum = rmv_re_left(kver, re.compile(r'[^-]*-'))
+	kvnum  = rmv_re_left(kver, re.compile(r'[^-]*-'))
 	kvflav = kver[:-len(kvnum)-1]
+	kvnum  = re.sub(r'_', '-', kvnum)
 	return (kvflav, kvnum)
 
 def parse_kver(kver):
@@ -97,29 +99,31 @@ def kver_to_rpmver(kver):
 	return rvflav + '-' + rvnum
 
 # Remove unneeded filename components
-def sanitize_name(str):
+def sanitize_name(strg):
 	"Shorten path names for kernel modules and image"
-	str = rmv_left(str, '/boot/')
-	str = rmv_left(str, '/lib/modules/')
-	str = rmv_re_left(str, re.compile(r'[0-9]*\.[^/]*/'))
-	str = rmv_right(str, '.ko')
-	str = rmv_right(str, '.o')
-	return str
+	strg = rmv_left(strg, '/boot/')
+	strg = rmv_left(strg, '/lib/modules/')
+	strg = rmv_re_left(strg, re.compile(r'[0-9]*\.[^/]*/'))
+	strg = rmv_right(strg, '.ko')
+	strg = rmv_right(strg, '.o')
+	return strg
 
 def test_access(fname, mode = os.R_OK):
 	"Tests whether a file can be accessed"
 	if not os.access(fname, mode):
-		m = 'r'
+		amode = 'r'
 		if mode != os.R_OK:
-			m = 'w'
+			amode = 'w'
 		try:
-			fd = open(fname, m)
+			fdes = open(fname, amode)
+			fdes.close()
 		except IOError, err:
-			print >>sys.stderr, "access(\"%s\"): %s" % \
+			print >> sys.stderr, "access(\"%s\"): %s" % \
 				(fname, err.strerror)
 			raise 
 
 def get_tmpdir(exist_ok = 0):
+	"Create temporary directory and return name of it"
 	import random, time
 	if os.environ.has_key('TMPDIR'):
 		tmpdir = os.environ['TMPDIR']
@@ -127,23 +131,23 @@ def get_tmpdir(exist_ok = 0):
 		tmpdir = '/tmp'
 	test_access(tmpdir, os.W_OK)
 	random.seed(time.time() + os.getpid())
-	tmpdir += "/ksyms-%i" % random.randint(100000,999999)
+	tmpdir += "/ksyms-%i" % random.randint(100000, 999999)
 	if not exist_ok and os.access(tmpdir, os.R_OK):
 		try:
-			unlink(tmpdir)
-		except:
+			os.unlink(tmpdir)
+		except OSError:
 			pass
 		try:
 			shutil.rmtree(tmpdir)
 			#rmdir(tmpdir)
-		except:
+		except OSError:
 			pass
 	if not exist_ok and os.access(tmpdir, os.R_OK):
-		print >>sys.stderr, "Can't remove %s, bailing out" % tmpdir
+		print >> sys.stderr, "Can't remove %s, bailing out" % tmpdir
 		sys.exit(4)
 	try:	
 		os.mkdir(tmpdir, 0755)
-	except:
+	except OSError:
 		pass
 	return tmpdir
 
@@ -157,23 +161,23 @@ def collect_syms_from_obj26file(fname, defd, undefd, path = ''):
 	if match_right(fname, ".gz"):
 		tmpdir = get_tmpdir(1)
 		shutil.copyfile(fname, "%s/%s" % (tmpdir, shortnm))
-		fd = os.popen('gunzip %s/%s' % (tmpdir, shortnm))
-		fd.close()
+		fdes = os.popen('gunzip %s/%s' % (tmpdir, shortnm))
+		fdes.close()
 		shortnm = rmv_right(shortnm, ".gz")
-		fd = os.popen('nm %s/%s' % (tmpdir, shortnm))
+		fdes = os.popen('nm %s/%s' % (tmpdir, shortnm))
 		rmname = shortnm
 		shortnm = rmv_re_right(shortnm, re.compile(r'-2\..*'))
 	else:	
-		fd = os.popen('nm %s' % fname, 'r')
+		fdes = os.popen('nm %s' % fname, 'r')
 	# crc=$(echo "$syms" | grep __crc_ | sed "s%^\(00000000\|\)\([0-9a-f]*\) . __crc_\(.*\)$%\3\t\2\t${name}%")
 	crc = re.compile(r'([0-9a-fA-F]*) A __crc_(.*)$')
 	need = re.compile(r' *[uU] (.*)$')
 	#need=$(echo "$syms" | grep '^ *[uU]' | sed "s%^ *[uU] \(.*\)$%\1%")
 
 	miss = []
-	for ln in fd.readlines():
-		ln = ln.strip()
-		match = crc.match(ln)
+	for line in fdes.readlines():
+		line = line.strip()
+		match = crc.match(line)
 		if match:
 			sym = match.group(2)
 			ver = match.group(1)
@@ -184,50 +188,50 @@ def collect_syms_from_obj26file(fname, defd, undefd, path = ''):
 					if not defd[sym][ver] and shortnm:
 						defd[sym][ver] = shortnm
 					elif not shortnm in defd[sym][ver].split(','):
-						print >>sys.stderr, "WARNING: Symbol %s in both %s and %s" % (sym, defd[sym][ver], shortnm)
+						print >> sys.stderr, "WARNING: Symbol %s in both %s and %s" % (sym, defd[sym][ver], shortnm)
 						defd[sym][ver] += ',%s' % shortnm
 				else:
-					print >>sys.stderr, "ERROR: Mismatch for symbol %s" % sym
+					print >> sys.stderr, "ERROR: Mismatch for symbol %s" % sym
 					for key in defd[sym].keys():
-						print >>sys.stderr, " Previous ver %s from %s" \
+						print >> sys.stderr, " Previous ver %s from %s" \
 							% (key, defd[sym][key])
-					print >>sys.stderr, " Current  ver %s from %s" \
+					print >> sys.stderr, " Current  ver %s from %s" \
 						% (ver, shortnm)
 					defd[sym][ver] = shortnm
 			else:
 				defd[sym] = {ver: shortnm}
 			continue
-		match = need.match(ln)
+		match = need.match(line)
 		if match:
 			miss.append(match.group(1))
-	fd.close()
+	fdes.close()
 	# objdump -j __versions -s
 	# Records are 64 byte, an unsigned long crc followed by the name
 	# much easier: modprobe --dump-modversions
 	if miss:
-		fd = os.popen('/sbin/modprobe --dump-modversions %s' % fname, 'r')
-		for ln in fd.readlines():
-			ln = ln.strip()
-			(ver, nm) = ln.split()
+		fdes = os.popen('/sbin/modprobe --dump-modversions %s' % fname, 'r')
+		for line in fdes.readlines():
+			line = line.strip()
+			(ver, snm) = line.split()
 			ver = '00000000' + rmv_left(ver, '0x')
 			ver = ver[-8:]
-			if undefd.has_key(nm):
-				if undefd[nm].has_key(ver):
+			if undefd.has_key(snm):
+				if undefd[snm].has_key(ver):
 					if not undefd[sym][ver] and shortnm:
 						undefd[sym][ver] = shortnm
-					elif not shortnm in undefd[nm][ver].split(','):
-						undefd[nm][ver] += ',%s' % shortnm
+					elif not shortnm in undefd[snm][ver].split(','):
+						undefd[snm][ver] += ',%s' % shortnm
 				else:
-					print >>sys.stderr, "ERROR: Mismatch for symbol %s" % nm
-					for key in undefd[nm].keys():
-						print >>sys.stderr, " Ver %s needed by %s" \
-						% (key, undefd[nm][key])
-					print >>sys.stderr, " Ver %s needed by %s" \
+					print >> sys.stderr, "ERROR: Mismatch for symbol %s" % snm
+					for key in undefd[snm].keys():
+						print >> sys.stderr, " Ver %s needed by %s" \
+						% (key, undefd[snm][key])
+					print >> sys.stderr, " Ver %s needed by %s" \
 						% (ver, shortnm)
-					undefd[nm][ver] = shortnm
+					undefd[snm][ver] = shortnm
 			else:
-				undefd[nm] = {ver: shortnm}
-		fd.close()
+				undefd[snm] = {ver: shortnm}
+		fdes.close()
 	# We could in theory check that we found all symbols from miss,
 	# no more and no less
 	# We could also take care of not overwriting already existing
@@ -235,14 +239,14 @@ def collect_syms_from_obj26file(fname, defd, undefd, path = ''):
 	for sym in miss:
 		if not undefd.has_key(sym):
 			# Should NOT happen on 2.6, where all syms are versioned
-			print >>sys.stderr, 'ERROR: sym %s undefined, but no version found' \
+			print >> sys.stderr, 'ERROR: sym %s undefined, but no version found' \
 					% sym
 			undefd[sym] = {'00000000': shortnm}
 	if tmpdir:
 		try:
 			os.unlink(tmpdir + '/' + rmname)
 			os.rmdir(tmpdir)
-		except:
+		except OSError:
 			pass
 
 def collect_syms_from_obj24file(fname, defd, undefd, path = ''):
@@ -253,29 +257,29 @@ def collect_syms_from_obj24file(fname, defd, undefd, path = ''):
 	if match_right(fname, ".gz"):
 		tmpdir = get_tmpdir(1)
 		shutil.copyfile(fname, "%s/%s" % (tmpdir, shortnm))
-		fd = os.popen('gunzip %s/%s' % (tmpdir, shortnm))
-		fd.close()
+		fdes = os.popen('gunzip %s/%s' % (tmpdir, shortnm))
+		fdes.close()
 		shortnm = rmv_right(shortnm, ".gz")
-		fd = os.popen('nm %s/%s' % (tmpdir, shortnm))
+		fdes = os.popen('nm %s/%s' % (tmpdir, shortnm))
 		rmname = shortnm
 		shortnm = rmv_re_right(shortnm, re.compile(r'-2\..*'))
 	else:	
-		fd = os.popen('nm %s' % fname, 'r')
+		fdes = os.popen('nm %s' % fname, 'r')
 	# crc=$(echo "$syms" | grep __crc_ | sed "s%^\(00000000\|\)\([0-9a-f]*\) . __crc_\(.*\)$%\3\t\2\t${name}%")
 	strtab = re.compile(r'[0-9a-fA-F]* R __kstrtab_(.*)$')
 	versre = re.compile(r'(.*)_R([0-9a-fA-F]*)$')
 	need   = re.compile(r' *[uU] (.*)$')
 	#need=$(echo "$syms" | grep '^ *[uU]' | sed "s%^ *[uU] \(.*\)$%\1%")
 
-	for ln in fd.readlines():
-		ln = ln.strip()
-		match = strtab.match(ln)
+	for line in fdes.readlines():
+		line = line.strip()
+		match = strtab.match(line)
 		if match:
 			sym = match.group(1)
-			m2 = versre.match(sym)
-			if m2:
-				sym = m2.group(1)
-				ver = m2.group(2)
+			mat2 = versre.match(sym)
+			if mat2:
+				sym = mat2.group(1)
+				ver = mat2.group(2)
 			else:
 				ver = '00000000'
 			#ver = '00000000' + rmv_left(ver, '0x')
@@ -285,7 +289,7 @@ def collect_syms_from_obj24file(fname, defd, undefd, path = ''):
 					if not defd[sym][ver] and shortnm:
 						defd[sym][ver] = shortnm
 					elif not shortnm in defd[sym][ver].split(','):
-						print >>sys.stderr, "WARNING: Symbol %s in both %s and %s" % (sym, defd[sym][ver], shortnm)
+						print >> sys.stderr, "WARNING: Symbol %s in both %s and %s" % (sym, defd[sym][ver], shortnm)
 						defd[sym][ver] += ',%s' % shortnm
 				else:
 					# Special case: reading vmlinux, version known
@@ -295,23 +299,23 @@ def collect_syms_from_obj24file(fname, defd, undefd, path = ''):
 					and not defd[sym][defd[sym].keys()[0]]:
 						defd[sym][defd[sym].keys()[0]] = shortnm
 					else:	
-						print >>sys.stderr, "ERROR: Mismatch for symbol %s" % sym
+						print >> sys.stderr, "ERROR: Mismatch for symbol %s" % sym
 						for key in defd[sym].keys():
-							print >>sys.stderr, " Previous ver %s from %s" \
+							print >> sys.stderr, " Previous ver %s from %s" \
 								% (key, defd[sym][key])
-						print >>sys.stderr, " Current  ver %s from %s" \
+						print >> sys.stderr, " Current  ver %s from %s" \
 							% (ver, shortnm)
 						defd[sym][ver] = shortnm
 			else:
 				defd[sym] = {ver: shortnm}
 			continue
-		match = need.match(ln)
+		match = need.match(line)
 		if match:
 			sym = match.group(1)
-			m2 = versre.match(sym)
-			if m2:
-				sym = m2.group(1)
-				ver = m2.group(2)
+			mat2 = versre.match(sym)
+			if mat2:
+				sym = mat2.group(1)
+				ver = mat2.group(2)
 			else:
 				ver = '00000000'
 			if sym == '__this_module':
@@ -330,21 +334,21 @@ def collect_syms_from_obj24file(fname, defd, undefd, path = ''):
 					and not undefd[sym][undefd[sym].keys()[0]]:
 						undefd[sym][undefd[sym].keys()[0]] = shortnm
 					else:	
-						print >>sys.stderr, "ERROR: Mismatch for symbol %s" % sym
+						print >> sys.stderr, "ERROR: Mismatch for symbol %s" % sym
 						for key in undefd[sym].keys():
-							print >>sys.stderr, " Ver %s needed by %s" \
+							print >> sys.stderr, " Ver %s needed by %s" \
 							% (key, undefd[sym][key])
-						print >>sys.stderr, " Ver %s needed by %s" \
+						print >> sys.stderr, " Ver %s needed by %s" \
 							% (ver, shortnm)
 						undefd[sym][ver] = shortnm
 			else:
 				undefd[sym] = {ver: shortnm}
-	fd.close()
+	fdes.close()
 	if tmpdir:
 		try:
 			os.unlink(tmpdir + '/' + rmname)
 			os.rmdir(tmpdir)
-		except:
+		except OSError:
 			pass
 
 
@@ -354,14 +358,14 @@ def collect_syms_from_symverfile(fname, defd, undefd):
 	kver = ''
 	test_access(fname)
 	if match_right(fname, '.gz'):
-		fd = gzip.GzipFile(fname, 'r')
+		fdes = gzip.GzipFile(fname, 'r')
 	else:
-		fd = open(fname, 'r')
+		fdes = open(fname, 'r')
 	tagged = re.compile(r'([^:]*): *(.*)$')
 	lst = defd
-	for ln in fd.readlines():
-		ln = ln.strip()
-		match = tagged.match(ln)
+	for line in fdes.readlines():
+		line = line.strip()
+		match = tagged.match(line)
 		if match:
 			if match.group(1) == 'Kernel':
 				kver = match.group(2)
@@ -372,7 +376,7 @@ def collect_syms_from_symverfile(fname, defd, undefd):
 			elif match.group(1) == 'Unresolved symbols':
 				lst = undefd
 			continue
-		sln = ln.split()
+		sln = line.split()
 		ver = sln[0] 
 		ver = '00000000' + rmv_left(ver, '0x')
 		ver = ver[-8:]
@@ -387,100 +391,98 @@ def collect_syms_from_symverfile(fname, defd, undefd):
 		if not kver:
 			locopy = loc
 			loc = ''
-			for lo in locopy.split(','):
-				if not lo \
-				or match_left(lo, 'vmlinu') \
-				or match_left(lo, 'extra') \
-				or match_left(lo, 'misc') \
-				or match_left(lo, 'pcmcia') \
-				or match_left(lo, 'update') \
-				or match_left(lo, 'override') \
-				or match_left(lo, 'ncs') \
-				or match_left(lo, 'nss'):
-					loc += '%s,' % lo
+			for loe in locopy.split(','):
+				if not loe \
+				or match_left(loe, 'vmlinu') \
+				or match_left(loe, 'extra') \
+				or match_left(loe, 'misc') \
+				or match_left(loe, 'pcmcia') \
+				or match_left(loe, 'update') \
+				or match_left(loe, 'override') \
+				or match_left(loe, 'ncs') \
+				or match_left(loe, 'nss'):
+					loc += '%s,' % loe
 				else:
-					loc += 'kernel/%s,' % lo
+					loc += 'kernel/%s,' % loe
 			loc = rmv_right(loc, ',')
 		
 		if lst.has_key(sym):
 			if lst[sym].has_key(ver) and loc:
 				lst[sym][ver] += ',%s' % loc
 			else:
-				print >>sys.stderr, "ERROR: Mismatch for symbol %s:" % sym
+				print >> sys.stderr, "ERROR: Mismatch for symbol %s:" % sym
 				for key in lst[sym].keys():
-					print >>sys.stderr, " Previous ver %s from %s" \
+					print >> sys.stderr, " Previous ver %s from %s" \
 						% (key, lst[sym][key])
-				print >>sys.stderr, " Current  ver %s from %s" \
-						% (ver, shortnm)
+				print >> sys.stderr, " Current  ver %s from %s" \
+						% (ver, loc)
 				lst[sym][ver] = loc
 		else:
 			lst[sym] = {ver: loc}
-	fd.close()
-	return kver
+	fdes.close()
+	return kver, 0
 
 def collect_installed_kernel26(version, defd, undefd, path = '', quick = 0):
 	"Get symbol versions for a 2.6 kernel"
 	import glob
-	global modules
-	modules = 0
+	nmodules = 0
 	(verflav, vernum) = parse_kver(version)
 	symverfile = path + '/boot/symvers-%s*-%s*' % (vernum, verflav)
 	symverfiles = glob.glob(symverfile)
 	if len(symverfiles) != 1:
-		print >>sys.stderr, "ERROR: Expected one match for %s" % symverfile
-		print >>sys.stderr, " Found %s" % symverfiles
+		print >> sys.stderr, "ERROR: Expected one match for %s" % symverfile
+		print >> sys.stderr, " Found %s" % symverfiles
 		sys.exit(1)
 	collect_syms_from_symverfile(symverfiles[0], defd, undefd)
 
 	if quick:
-		return modules
+		return nmodules
 
 	if 0:
 		collect_syms_from_obj26file(path + '/boot/vmlinux-%s-%s.gz' % (vernum, verflav),
 			defd, undefd, path)
 
 	test_access('%s/lib/modules/%s' % (path, version))
-	fd = os.popen('find %s/lib/modules/%s -name *.ko' % (path, version), 'r')
-	for nm in fd.readlines():
-		nm = nm.strip()
-		collect_syms_from_obj26file(nm, defd, undefd, path)
-		modules += 1
-	fd.close()
-	return modules
+	fdes = os.popen('find %s/lib/modules/%s -name *.ko' % (path, version), 'r')
+	for fnm in fdes.readlines():
+		fnm = fnm.strip()
+		collect_syms_from_obj26file(fnm, defd, undefd, path)
+		nmodules += 1
+	fdes.close()
+	return nmodules
 
 def collect_installed_kernel24(version, defd, undefd, path = '', quick = 0):
 	"Get symbol versions for a 2.4 kernel"
 	import glob
-	global modules
-	modules = 0
+	nmodules = 0
 	(verflav, vernum) = parse_kver(version)
 	symverfile = path + '/boot/symvers-%s*-%s*' % (vernum, verflav)
 	symverfiles = glob.glob(symverfile)
 	if len(symverfiles) != 1:
-		print >>sys.stderr, "ERROR: Expected one match for %s" % symverfile
-		print >>sys.stderr, " Found %s" % symverfiles
+		print >> sys.stderr, "ERROR: Expected one match for %s" % symverfile
+		print >> sys.stderr, " Found %s" % symverfiles
 		sys.exit(1)
 	collect_syms_from_symverfile(symverfiles[0], defd, undefd)
 	
 	# Quick does not make sense on 2.4
 	if quick:
-		print >>sys.stderr, "WARNING: Quick mode will not provide much info on 2.4"
-		return modules
+		print >> sys.stderr, "WARNING: Quick mode will not provide much info on 2.4"
+		return nmodules
 	# In 2.4, symvers does not tell us about the source of a symbol  ...
 	collect_syms_from_obj24file(path + '/boot/vmlinux-%s-%s.gz' % (vernum, verflav),
 			defd, undefd, path)
 
 	test_access('%s/lib/modules/%s' % (path, version))
-	fd = os.popen('find %s/lib/modules/%s -name *.o' % (path, version), 'r')
-	for nm in fd.readlines():
-		nm = nm.strip()
-		collect_syms_from_obj24file(nm, defd, undefd, path)
-		modules += 1
-	fd.close()
-	return modules
+	fdes = os.popen('find %s/lib/modules/%s -name *.o' % (path, version), 'r')
+	for fnm in fdes.readlines():
+		fnm = fnm.strip()
+		collect_syms_from_obj24file(fnm, defd, undefd, path)
+		nmodules += 1
+	fdes.close()
+	return nmodules
 
 def extract_rpm(rpm, quick):
-	import random, time
+	"Unpack the tpm RPM, quick mode will only get symvers"
 	test_access(rpm)
 	tmpdir = get_tmpdir()
 	cwd = os.getcwd()
@@ -489,25 +491,25 @@ def extract_rpm(rpm, quick):
 	os.chdir(tmpdir)
 	if quick:
 		reg = re.compile(r'boot/symvers\-')
-		fd = os.popen('rpm2cpio %s | cpio -t' % rpm, 'r')
-		fn = ''
-		for ln in fd.readlines():
-			match = reg.search(ln)
+		fdes = os.popen('rpm2cpio %s | cpio -t' % rpm, 'r')
+		fnm = ''
+		for line in fdes.readlines():
+			match = reg.search(line)
 			if match:
-				fn = ln.strip()
-		fd.close()
-		if not fn:
-			print >>sys.stderr, "ERROR: boot/symvers-* not found"
+				fnm = line.strip()
+		fdes.close()
+		if not fnm:
+			print >> sys.stderr, "ERROR: boot/symvers-* not found"
 			return tmpdir
 		stat = os.system('rpm2cpio %s | cpio -i -d -u -m %s' \
-				% (rpm, fn))
+				% (rpm, fnm))
 		if stat:
-			print >>sys.stderr, "ERROR: Extracting %s from %s failed (%i)" \
-				% (fn, rpm, stat)
+			print >> sys.stderr, "ERROR: Extracting %s from %s failed (%i)" \
+				% (fnm, rpm, stat)
 	else:	
 		stat = os.system('rpm2cpio %s | cpio -i -d -u -m' % rpm)
 		if stat:
-			print >>sys.stderr, "ERROR: Extracting %s failed (%i)" \
+			print >> sys.stderr, "ERROR: Extracting %s failed (%i)" \
 				% (rpm, stat)
 	return tmpdir
 
@@ -544,29 +546,29 @@ def consolidate_syms(defd, undefd, used, unused, unresolved):
 		else:
 			unresolved[sym] = undefd[sym].copy()
 
-def output(dict, stripkern = 0):
+def output(sdict, stripkern = 0):
 	"Output sorted symbol list"
-	ssyms = dict.keys()
+	ssyms = sdict.keys()
 	ssyms.sort()
 	for sym in ssyms:
-		svers = dict[sym].keys()
+		svers = sdict[sym].keys()
 		svers.sort()
 		for ver in svers:
 			if stripkern:
-				str = ''
-				lst = dict[sym][ver].split(',')
-				for nm in lst:
-					str += rmv_left(nm, 'kernel/') + ','
-				str = rmv_right(str, ',')
+				strg = ''
+				lst = sdict[sym][ver].split(',')
+				for name in lst:
+					strg += rmv_left(name, 'kernel/') + ','
+				strg = rmv_right(strg, ',')
 			else:
-				str = dict[sym][ver]
-			print "0x%s\t%s\t%s" % (ver, sym, str)
+				strg = sdict[sym][ver]
+			print "0x%s\t%s\t%s" % (ver, sym, strg)
 
-def count(dict):
+def count(sdict):
 	"Count symbols _and_ versions"
 	ctr = 0
-	for sym in dict.keys():
-		for ver in dict[sym].keys():
+	for sym in sdict.keys():
+		for ver in sdict[sym].keys():
 			ctr += 1
 	return ctr
 
@@ -611,99 +613,104 @@ def collect_syms(arg, defd, undefd, quick = 0):
 		modules = collect_installed_kernel26(arg, defd, undefd, path, quick)
 	if path:
 		shutil.rmtree(path)
-	return arg
+	return arg, modules
 
 # main
-defd = {}; undefd = {}
-used = {}; unused = {}; unresolved = {}
-
-if len(sys.argv) < 2:
-	usage()
-
-longopts = ('collect=', 'quickcollect=', 'symbols=', 'ignoreothermod', 'testmodule', 'testmodules') 
-try:
-	(optlist, args) = getopt.getopt(sys.argv[1:], 'c:q:s:it', longopts)
-except getopt.GetoptError:	
-	usage()
-
-collfile = ''; symfile = '' 
-quick = 0; ignother = 0; testmod = 0; modules = 0
-
-for (opt, arg) in optlist:
-	if opt in ('-c', '--collect'):
-		collfile = arg
-		quick = 0
-		continue
-	if opt in ('-q', '--quickcollect'):
-		collfile = arg
-		quick = 1
-		continue
-	if opt in ('-s', '--symbols'):
-		symfile = arg
-		continue
-	if opt in ('-i', '--ignoreothermod'):
-		ignother = 1
-		continue
-	if opt in ('-t', '--testmodule', '--testmodules'):
-		testmod = 1
-		continue
-	print >>sys.stderr, 'ERROR:	Internal option processing error %s' % opt
-	sys.exit(2)
-
-if args and not testmod:
-	print >>sys.stderr, 'ERROR: Spurious arguments %s' % args
-	usage()
-
-if collfile and symfile:
-	print >>sys.stderr, 'ERROR: Can\'t read symbols from binaries and list simultaneously'
-	usage()
-
-if testmod and not (symfile or collfile):
-	print >>sys.stderr, 'ERROR: Need to specify a symbol source for --testmodule'
-	usage()
-
-if collfile:
-	kver = collect_syms(collfile, defd, undefd, quick)
-
-if symfile:
-	kver = collect_syms_from_symverfile(symfile, defd, undefd)
-	if not kver:
-		quick = 1
-
-if not testmod:
-	if not (quick):
-		consolidate_syms(defd, undefd, used, unused, unresolved)
+def main(argv):
+	"Main program"
+	defd = {}; undefd = {}
+	used = {}; unused = {}; unresolved = {}
+	quick = 0; ignother = 0; testmod = 0;
+	collfile = ''; symfile = '' 
+	
+	if len(argv) < 2:
+		usage()
+	
+	longopts = ('collect=', 'quickcollect=', 'symbols=', 'ignoreothermod', 'testmodule', 'testmodules') 
+	try:
+		(optlist, args) = getopt.getopt(argv[1:], 'c:q:s:it', longopts)
+	except getopt.GetoptError:	
+		usage()
+	
+	for (opt, arg) in optlist:
+		if opt in ('-c', '--collect'):
+			collfile = arg
+			quick = 0
+			continue
+		if opt in ('-q', '--quickcollect'):
+			collfile = arg
+			quick = 1
+			continue
+		if opt in ('-s', '--symbols'):
+			symfile = arg
+			continue
+		if opt in ('-i', '--ignoreothermod'):
+			ignother = 1
+			continue
+		if opt in ('-t', '--testmodule', '--testmodules'):
+			testmod = 1
+			continue
+		print >> sys.stderr, 'ERROR:	Internal option processing error %s' % opt
+		sys.exit(2)
+	
+	if args and not testmod:
+		print >> sys.stderr, 'ERROR: Spurious arguments %s' % args
+		usage()
+	
+	if collfile and symfile:
+		print >> sys.stderr, 'ERROR: Can\'t read symbols from binaries and list simultaneously'
+		usage()
+	
+	if testmod and not (symfile or collfile):
+		print >> sys.stderr, 'ERROR: Need to specify a symbol source for --testmodule'
+		usage()
+	
+	if collfile:
+		kver, modules = collect_syms(collfile, defd, undefd, quick)
+	
+	if symfile:
+		kver, modules = collect_syms_from_symverfile(symfile, defd, undefd)
+		if not kver:
+			quick = 1
+	
+	if not testmod:
+		if not (quick):
+			consolidate_syms(defd, undefd, used, unused, unresolved)
+			print 'Kernel: %s' % kver
+			print 'Modules scanned: %i' % modules
+			print 'Needed symbols: %i' % count(undefd)
+			print 'Provided symbols: %i' % count(defd)
+			print 'Used symbols: %i' % count(used)
+			output(used)
+			print 'Unused symbols: %i' % count(unused)
+			output(unused)
+			print 'Unresolved symbols: %i' % count(unresolved)
+			output(unresolved)
+			sys.exit(len(unresolved))
+		else:
+			output(defd, 1)
+			sys.exit(0)
+	
+	if ignother:
+		undefd = {}
+	
+	if kver:
 		print 'Kernel: %s' % kver
-		print 'Modules scanned: %i' % modules
-		print 'Needed symbols: %i' % count(undefd)
-		print 'Provided symbols: %i' % count(defd)
+	print 'Test modules:',
+	for mod in args:
+		print ' %s' % mod,
+		collect_syms_from_obj26file(mod, defd, undefd)
+	
+	print
+	consolidate_syms(defd, undefd, used, unused, unresolved)
+	if ignother or quick or symfile:
 		print 'Used symbols: %i' % count(used)
 		output(used)
-		print 'Unused symbols: %i' % count(unused)
-		output(unused)
-		print 'Unresolved symbols: %i' % count(unresolved)
-		output(unresolved)
-		sys.exit(len(unresolved))
-	else:
-		output(defd, 1)
-		sys.exit(0)
+	print 'Unresolved symbols: %i' % count(unresolved)
+	output(unresolved)
+	return len(unresolved)
 
-if ignother:
-	undefd = {}
-
-if kver:
-	print 'Kernel: %s' % kver
-print 'Test modules:',
-for mod in args:
-	print ' %s' % mod,
-	collect_syms_from_obj26file(mod, defd, undefd)
-
-print
-consolidate_syms(defd, undefd, used, unused, unresolved)
-if ignother or quick or symfile:
-	print 'Used symbols: %i' % count(used)
-	output(used)
-print 'Unresolved symbols: %i' % count(unresolved)
-output(unresolved)
-sys.exit(len(unresolved))
+# Entry point
+if __name__ == '__main__':
+	sys.exit(main(sys.argv))
 
