@@ -14,10 +14,11 @@ indentifdef = 1
 
 def usage():
 	"Help"
-	print >> sys.stderr, "Usage: mangle-ifdef.py INFILE OUTFILE"
+	print >> sys.stderr, "Usage: mangle-ifdef.py [-n] INFILE OUTFILE"
 	print >> sys.stderr, " This tool tries to put implementations of the same function"
 	print >> sys.stderr, " with different preprocessor conditional next to each other"
 	print >> sys.stderr, " for consolidation. Used for include/linux/security.h"
+	print >> sys.stderr, " -n switches off the indentation of the ifdefs."
 	sys.exit(2)
 
 

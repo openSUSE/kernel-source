@@ -212,25 +212,25 @@ def collect_syms_from_obj26file(fname, defd, undefd, path = ''):
 		fdes = os.popen('/sbin/modprobe --dump-modversions %s' % fname, 'r')
 		for line in fdes.readlines():
 			line = line.strip()
-			(ver, snm) = line.split()
+			(ver, sym) = line.split()
 			ver = '00000000' + rmv_left(ver, '0x')
 			ver = ver[-8:]
-			if undefd.has_key(snm):
-				if undefd[snm].has_key(ver):
+			if undefd.has_key(sym):
+				if undefd[sym].has_key(ver):
 					if not undefd[sym][ver] and shortnm:
 						undefd[sym][ver] = shortnm
-					elif not shortnm in undefd[snm][ver].split(','):
-						undefd[snm][ver] += ',%s' % shortnm
+					elif not shortnm in undefd[sym][ver].split(','):
+						undefd[sym][ver] += ',%s' % shortnm
 				else:
-					print >> sys.stderr, "ERROR: Mismatch for symbol %s" % snm
-					for key in undefd[snm].keys():
+					print >> sys.stderr, "ERROR: Mismatch for symbol %s" % sym
+					for key in undefd[sym].keys():
 						print >> sys.stderr, " Ver %s needed by %s" \
-						% (key, undefd[snm][key])
+						% (key, undefd[sym][key])
 					print >> sys.stderr, " Ver %s needed by %s" \
 						% (ver, shortnm)
-					undefd[snm][ver] = shortnm
+					undefd[sym][ver] = shortnm
 			else:
-				undefd[snm] = {ver: shortnm}
+				undefd[sym] = {ver: shortnm}
 		fdes.close()
 	# We could in theory check that we found all symbols from miss,
 	# no more and no less
