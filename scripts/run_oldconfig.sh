@@ -42,6 +42,7 @@ function _region_msg_ () {
 arch="--list"
 YES=
 menuconfig=no
+new_config_option=no
 until [ "$#" = "0" ] ; do
     case "$1" in
     y|-y|--yes)
@@ -56,11 +57,23 @@ until [ "$#" = "0" ] ; do
 	menuconfig=yes
 	shift
 	;;
+    -nco|--new-config-option)
+	new_config_option="$2"
+	shift 2
+	;;
     *)
 	shift
 	;;
     esac
 done
+if [ "$new_config_option" != "no" ] ; then
+	echo "appending $new_config_option to all config files listed in config.conf"
+	for config in $(eval scripts/guards $arch < config.conf); do
+		echo "$new_config_option" >> config/$config
+	done
+	exit 0
+fi
+
 if [ "$menuconfig" = "no" ] ; then
 	case "$TERM" in
 	linux | xterm | screen)
