@@ -17,7 +17,9 @@ defkerncvs = "/usr/src/kernel-source-26"
 
 # List of replacement rules
 replrules = [("arch/xen/i386", "arch/i386"),
-	   ("include/asm-xen/asm-i386", "include/asm-i386")]
+	   ("include/asm-xen/asm-i386", "include/asm-i386"),
+	   ("arch/xen/x86_64", "arch/x86_64"),
+	   ("include/asm-xen/asm-x86_64", "include/asm-x86_64")]
 # List of compiled rules (speed reasons)
 #comprules = map(lambda(x): (x[0], x[1], re.compile(x[0])), replrules)
 comprules = [ (x[0], x[1], re.compile(x[0])) for x in replrules ]
@@ -39,9 +41,10 @@ def applCorrFwd(path):
 def createReplList(patch):
 	"Creates a list of files to watch and their corresp xen file names"
 	pfile = open(patch, "r")
-	srch = re.compile(r"^\+\+\+ linux\-2\.6\.[0-9]*[^\/]*\/([^	 \n]*)")
-	# Again illegi^W beautiful function programming
-		# return matched string no 1
+	#srch = re.compile(r"^\+\+\+ linux\-2\.6\.[0-9]*[^\/]*\/([^	 \n]*)")
+	srch = re.compile(r"^\+\+\+ [^	 \/]*\/([^ 	\n]*)")
+	# Again illegi^W beautiful functional programming
+	# return matched string no 1
 	matches = map(lambda(m): m.group(1), \
 		# filter out non-matches
 		filter(lambda(m): m, \
@@ -69,7 +72,7 @@ def writePatch(fname, hdr, body):
 	print "%s -> %s" % (shortname, xenfname)
 	pfile = open(xenfname, "w")
 	pfile.write(hdr)
-	pfile.write("Automatically created from \"%s\" by " +
+	pfile.write("Automatically created from \"%s\" by " \
 			"xen-port-patches.py\n\n" % shortname)
 	pfile.write(body)
 	pfile.close()
@@ -94,10 +97,10 @@ def mayCreatePatch(fname, repls):
 		# If we get here, we're past the patch file header
 		if active:
 			if header:
-				if hmark:
-					patch += re.sub(rule[1], rule[0], line)
-				else:
+				if not hmark:
 					header = 0
+				#else:
+				patch += re.sub(rule[1], rule[0], line)
 			else:
 				if hmark:
 					active = 0
