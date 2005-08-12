@@ -17,6 +17,19 @@ until [ "$#" = "0" ] ; do
       rpm_release_timestamp=yes
       shift
       ;;
+    -h|--help|-v|--version)
+	cat <<EOF
+
+${0##*/} perpares a 'kernel-source' package for submission into autobuild
+
+these options are recognized:
+    -ts                to use the current date as rpm release number
+    -nf                to proceed if a new unknown .config option is found during make oldconfig
+    -nem               to not build any external km_* module packages
+
+EOF
+	exit 1
+	;;
     *)
       shift
       ;;

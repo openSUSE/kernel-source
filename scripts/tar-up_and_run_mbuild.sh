@@ -4,7 +4,7 @@ echo "dont forget to update the defconfig files, or the mbuild may fail"
 sleep 1
 sudo -l
 important_specfiles="default smp ppc64 iseries64 s390 s390x"
-all_specfiles="`sed -e '/^\+/s@^.*/@@p;d' config.conf | sort -u`"
+all_specfiles="`sed -e '/^\+/s@^.*/@@p;d' config.conf | sort -u | xargs echo`"
 timestamp=
 tolerate_unknown_new_config_options=
 external_modules=
@@ -38,6 +38,38 @@ until [ "$#" = "0" ] ; do
     all)
 	specfiles=$all_specfiles
 	shift
+	;;
+    -h|--help|-v|--version)
+	cat <<EOF
+
+${0##*/} builds a kernel.rpm via mbuild for the following list of specfiles:
+$specfiles
+
+these options are recognized:
+    -l <nisusername>   username to send mails after mbuild has finished
+    -d <distsetname>   "distribution set" to build for
+                       to get a complete list of possible options:
+                       '/work/src/bin/mbuild -d'
+    -D <distname>      "distribution name" to build for
+                       to get a complete list of possible options:
+                       '/work/src/bin/mbuild -D'
+    all                to build a kernel.rpm for all configured .config files:
+    $all_specfiles
+
+the following 3 options are needed to build vanilla kernel with a stripped down series.conf:
+    -ts                to use the current date as rpm release number
+    -nf                to proceed if a new unknown .config option is found during make oldconfig
+    -nem               to not build any external km_* module packages
+    
+example usage:
+sudo $0 -l talk -D ppc -D x86_64 -ts
+sudo $0 -l talk -d stable -ts -nf -nem
+
+simple usage:
+sudo $0 -l talk
+
+EOF
+	exit 1
 	;;
     *)
 	shift
