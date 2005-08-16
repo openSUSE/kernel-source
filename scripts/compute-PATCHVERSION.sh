@@ -14,8 +14,13 @@ EXTRAVERSION=
 # convert them to shell code that can be evaluated. Evaluate it.
 eval "$(
     scripts/guards < series.conf \
-    | xargs grep '^+\(VERSION\|PATCHLEVEL\|SUBLEVEL\|EXTRAVERSION\)' \
-    | sed -e 's,.*:+,,' -e 's, *= *\(.*\),="\1",'
+    | xargs awk '
+    /^--- |^+++ / \
+	{ M = match($2, /^[^\/]+\/Makefile( \t|$)/) }
+    M && /^+(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)/ \
+	{ print }
+    ' \
+    | sed -e 's,^+,,' -e 's, *= *\(.*\),="\1",'
 )"
 KERNELRELEASE="$VERSION.$PATCHLEVEL.$SUBLEVEL$EXTRAVERSION"
 
