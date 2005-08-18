@@ -66,7 +66,7 @@ def findPatchFiles(kcvs):
 def writePatch(fname, hdr, body):
 	"Create xen patch corresponding to other patch"
 	xenrepl = re.compile(r"^.*\/([^\/]*)$")
-	xenfname = re.sub(xenrepl, r"xen-\1", fname)
+	xenfname = re.sub(xenrepl, r"xen3-\1", fname)
 	shortrepl = re.compile(r"^.*\/([^\/]*\/[^\/]*)$")
 	shortname = re.sub(shortrepl, r"\1", fname)
 	print "%s -> %s" % (shortname, xenfname)
@@ -118,7 +118,7 @@ def mayCreatePatch(fname, repls):
 	if patch:
 		writePatch(fname, patchheader, patch)
 	if xenfnames:
-		ser = open("xen-series.conf", "w")
+		ser = open("xen3-series.conf", "w")
 		map(lambda(x): ser.write("\t\t%s\n" % x), xenfnames)
 		ser.close()
 	pfile.close()
@@ -139,7 +139,7 @@ def main(args):
 	else:
 		kerncvs = defkerncvs
 	# Create list of replacements
-	repllist = createReplList(kerncvs + "/patches.xen/xen-arch.diff")
+	repllist = createReplList(kerncvs + "/patches.xen/xen3-auto-arch.diff")
 	#print repllist
 	# ... and compile
 	complrepl = map(lambda(x): (x[0], x[1], re.compile(x[1])), repllist)
