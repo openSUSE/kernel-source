@@ -7,6 +7,7 @@ important_specfiles="default smp ppc64 iseries64 s390 s390x"
 all_specfiles="`sed -e '/^\+/s@^.*/@@p;d' config.conf | sort -u | xargs echo`"
 single_specfiles=
 timestamp=
+rpm_release_string=
 tolerate_unknown_new_config_options=
 external_modules=
 dist=
@@ -16,6 +17,10 @@ user="`id -nu`"
 mbuild_options=
 until [ "$#" = "0" ] ; do
     case "$1" in
+    -rs)
+      rpm_release_string="-rs $2"
+      shift 2
+      ;;
     -ts)
 	timestamp=-ts
 	shift
@@ -63,6 +68,7 @@ these options are recognized:
     $all_specfiles
 
 the following 3 options are needed to build vanilla kernel with a stripped down series.conf:
+    -rs <string>       to append specified string to rpm release number
     -ts                to use the current date as rpm release number
     -nf                to proceed if a new unknown .config option is found during make oldconfig
     -nem               to not build any external km_* module packages

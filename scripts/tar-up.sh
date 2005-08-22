@@ -1,6 +1,7 @@
 #!/bin/sh
 
 rpm_release_timestamp=
+rpm_release_string=
 tolerate_unknown_new_config_options=0
 external_modules=yes
 until [ "$#" = "0" ] ; do
@@ -13,6 +14,10 @@ until [ "$#" = "0" ] ; do
       tolerate_unknown_new_config_options=1
       shift
       ;;
+    -rs|--release_string)
+      rpm_release_string="$2"
+      shift 2
+      ;;
     -ts|--timestamp)
       rpm_release_timestamp=yes
       shift
@@ -23,6 +28,7 @@ until [ "$#" = "0" ] ; do
 ${0##*/} perpares a 'kernel-source' package for submission into autobuild
 
 these options are recognized:
+    -rs <string>       to append specified string to rpm release number
     -ts                to use the current date as rpm release number
     -nf                to proceed if a new unknown .config option is found during make oldconfig
     -nem               to not build any external km_* module packages
@@ -46,6 +52,25 @@ rpm_additional_setup=
 SRC_FILE=linux-$SRCVERSION.tar.bz2
 PATCHVERSION=$($(dirname $0)/compute-PATCHVERSION.sh)
 RPMVERSION=${PATCHVERSION//-/_}
+
+case "$rpm_release_string" in
+	*-*)
+		echo "rpm release can not contain a '-', but '$rpm_release_string' contains one"
+		exit 1
+		;;
+	*\ *)
+		echo "rpm release can not contain whitespaces, but '$rpm_release_string' contains one"
+		exit 1
+		;;
+	"")
+		if [ "$rpm_release_timestamp" = "" ] ; then
+			rpm_release_string="pkg:kernel-dummy"
+		fi
+		;;
+	*)
+		rpm_release_string="_$rpm_release_string"
+		;;
+esac
 
 if ! scripts/check-conf || \
    ! scripts/check-cvs-add; then
@@ -329,10 +354,15 @@ fi
 if [ "$rpm_release_timestamp" = "yes" ] ; then
 cat > $BUILD_DIR/get_release_number.sh <<EOF
 #!/bin/sh
-env -i - TZ=GMT date +%Y%m%d
+echo "\`env -i - TZ=GMT date +%Y%m%d\`$rpm_release_string"
 EOF
-chmod -v a+rx $BUILD_DIR/get_release_number.sh
+else
+cat > $BUILD_DIR/get_release_number.sh <<EOF
+#! /bin/sh
+echo "$rpm_release_string"
+EOF
 fi
+chmod -v a+rx $BUILD_DIR/get_release_number.sh
 
 echo "If you want to submit the kernel to Autobuild now,"
 echo "how about running \`mbuild --obey-doesnotbuild' before?"
