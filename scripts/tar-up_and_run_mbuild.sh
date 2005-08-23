@@ -96,7 +96,7 @@ fi
 if [ ! -z "$single_specfiles" ] ; then
 specfiles=`echo $single_specfiles | sort | xargs echo`
 fi
-scripts/tar-up.sh $timestamp $tolerate_unknown_new_config_options $external_modules
+scripts/tar-up.sh $rpm_release_string $timestamp $tolerate_unknown_new_config_options $external_modules
 cd kernel-source
 for i in $specfiles
 do
