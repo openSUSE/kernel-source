@@ -43,12 +43,6 @@ EOF
 done
 source $(dirname $0)/config.sh
 export LANG=POSIX
-rpm_num=100
-rpm_archives=
-rpm_source_number=$rpm_num
-rpm_source=
-rpm_no_source=
-rpm_additional_setup=
 SRC_FILE=linux-$SRCVERSION.tar.bz2
 PATCHVERSION=$($(dirname $0)/compute-PATCHVERSION.sh)
 RPMVERSION=${PATCHVERSION//-/_}
@@ -112,7 +106,7 @@ all_archives="$(
     echo "$all_files" \
     | sed -e 's,/.*,,' \
     | uniq )"
-for archive in $all_archives ; do
+for archive in $all_archives patches.addon; do
     echo "$archive.tar.bz2"
     case " $IGNORE_ARCHS " in
     *" ${archive#patches.} "*)
@@ -125,32 +119,21 @@ for archive in $all_archives ; do
 	| while read patch; do
 	    [ -e "$patch" ] && echo "$patch"
 	done)"
-    tar -cf - $files \
-    | bzip2 -9 > $BUILD_DIR/$archive.tar.bz2
-    rpm_archives="$rpm_archives $archive" 
-    rpm_additional_setup="$rpm_additional_setup -a $rpm_source_number"
-    rpm_source_number=$[ $rpm_source_number + 1]
-
+    if [ -n "$files" ]; then
+	tar -cf - $files \
+	| bzip2 -9 > $BUILD_DIR/$archive.tar.bz2
+    else
+	bzip2 -9 < /dev/null > $BUILD_DIR/$archive.tar.bz2
+    fi
 done
-bzip2 -9 < /dev/null > $BUILD_DIR/patches.addon.tar.bz2
-rpm_source=$(
-	rpm_source_number=$rpm_num
-	for i in $rpm_archives
-	do
-		printf "%s\n" "Source$rpm_source_number: $i.tar.bz2"
-		rpm_source_number=$[ $rpm_source_number + 1]
-	done
-)
-rpm_no_source=$(
-	rpm_source_number=$rpm_num
-	for i in $rpm_archives
-	do
-		printf "%s\n" "NoSource: $rpm_source_number"
-		rpm_source_number=$[ $rpm_source_number + 1]
-	done
-)
-rpm_source=${rpm_source//$'\n'/\\n}
-rpm_no_source=${rpm_no_source//$'\n'/\\n}
+
+for archive in config \
+	       patches.arch patches.drivers patches.fixes patches.rpmify \
+	       patches.suse patches.uml patches.xen patches.addon; do
+    if ! [ -e $BUILD_DIR/$archive.tar.bz2 ]; then
+	bzip2 -9 < /dev/null > $BUILD_DIR/$archive.tar.bz2
+    fi
+done
 
 # List all used configurations
 config_files="$(
@@ -225,10 +208,7 @@ for flavor in $flavors ; do
 	-e "s,@ARCHS@,$archs,g" \
 	-e "s,@PROVIDES_OBSOLETES@,${prov_obs//$'\n'/\\n},g" \
 	-e "s,@EXTRA_NEEDS@,$extra_needs,g" \
-	-e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
-	-e "s,@RPM_ADDITIONAL_SETUP@,$rpm_additional_setup," \
-	-e "s,@RPM_SOURCE_PATCHES@,$rpm_source," \
-	-e "s,@RPM_NO_SOURCE_PATCHES@,$rpm_no_source," \
+	-e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options,g" \
       < rpm/kernel-binary.spec.in \
     > $BUILD_DIR/kernel-$flavor.spec
     if test "$external_modules" = "no" ; then
@@ -265,9 +245,6 @@ sed -e "s,@NAME@,kernel-source,g" \
     -e "s,@PRECONF@,1,g" \
     -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
     -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
-    -e "s,@RPM_ADDITIONAL_SETUP@,$rpm_additional_setup," \
-    -e "s,@RPM_SOURCE_PATCHES@,$rpm_source," \
-    -e "s,@RPM_NO_SOURCE_PATCHES@,$rpm_no_source," \
   < rpm/kernel-source.spec.in \
 > $BUILD_DIR/kernel-source.spec
 
