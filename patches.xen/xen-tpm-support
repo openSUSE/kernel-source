@@ -1,0 +1,3992 @@
+From: Leendert van den Doorn <leendert@watson.us.ibm.com>
+Subject: Support for a virtual TPM in Xen
+
+Extracted from xen mercurial 6610.
+
+Signed-off-by: Kurt Garloff <garloff@suse.de>
+
+Index: linux-2.6.13/arch/xen/Kconfig.drivers
+===================================================================
+--- linux-2.6.13.orig/arch/xen/Kconfig.drivers
++++ linux-2.6.13/arch/xen/Kconfig.drivers
+@@ -47,8 +47,12 @@ source "drivers/usb/Kconfig"
+ source "drivers/mmc/Kconfig"
+ source "drivers/infiniband/Kconfig"
+ endif
+ 
++#if !XEN_PHYSDEV_ACCESS
++source "drivers/char/tpm/Kconfig.domU"
++#endif
++
+ if !XEN_PHYSDEV_ACCESS
+ 
+ menu "Character devices"
+ 
+Index: linux-2.6.13/drivers/char/tpm/Kconfig.domU
+===================================================================
+--- /dev/null
++++ linux-2.6.13/drivers/char/tpm/Kconfig.domU
+@@ -0,0 +1,30 @@
++#
++# TPM device configuration
++#
++
++menu "TPM devices"
++
++config TCG_TPM
++	tristate "TPM Support for XEN"
++	depends on ARCH_XEN && !XEN_PHYSDEV_ACCESS
++	---help---
++	  If you want to make TPM security available in your system,
++	  say Yes and it will be accessible from within a user domain.  For
++	  more information see <http://www.trustedcomputinggroup.org>.
++	  An implementation of the Trusted Software Stack (TSS), the
++	  userspace enablement piece of the specification, can be
++	  obtained at: <http://sourceforge.net/projects/trousers>.  To
++	  compile this driver as a module, choose M here; the module
++	  will be called tpm. If unsure, say N.
++
++config TCG_XEN
++	tristate "XEN TPM Interface"
++	depends on TCG_TPM && ARCH_XEN && XEN_TPMDEV_FRONTEND
++	---help---
++	  If you want to make TPM support available to a Xen
++	  user domain, say Yes and it will
++          be accessible from within Linux. To compile this driver
++          as a module, choose M here; the module will be called
++          tpm_xen.
++
++endmenu
+Index: linux-2.6.13/drivers/char/tpm/Makefile
+===================================================================
+--- linux-2.6.13.orig/drivers/char/tpm/Makefile
++++ linux-2.6.13/drivers/char/tpm/Makefile
+@@ -1,7 +1,18 @@
+ #
+ # Makefile for the kernel tpm device drivers.
+ #
++ifeq ($(CONFIG_XEN),)
+ obj-$(CONFIG_TCG_TPM) += tpm.o
+ obj-$(CONFIG_TCG_NSC) += tpm_nsc.o
+ obj-$(CONFIG_TCG_ATMEL) += tpm_atmel.o
+ obj-$(CONFIG_TCG_INFINEON) += tpm_infineon.o
++else
++ifeq ($(CONFIG_XEN_PHYSDEV_ACCESS),y)
++obj-$(CONFIG_TCG_TPM) += tpm.o
++obj-$(CONFIG_TCG_NSC) += tpm_nsc.o
++obj-$(CONFIG_TCG_ATMEL) += tpm_atmel.o
++obj-$(CONFIG_TCG_INFINEON) += tpm_infineon.o
++endif
++obj-$(CONFIG_TCG_TPM) += tpm_nopci.o
++obj-$(CONFIG_TCG_XEN) += tpm_xen.o
++endif
+Index: linux-2.6.13/drivers/char/tpm/tpm_xen.c
+===================================================================
+--- /dev/null
++++ linux-2.6.13/drivers/char/tpm/tpm_xen.c
+@@ -0,0 +1,513 @@
++/*
++ * Copyright (C) 2004 IBM Corporation
++ *
++ * Authors:
++ * Leendert van Doorn <leendert@watson.ibm.com>
++ * Dave Safford <safford@watson.ibm.com>
++ * Reiner Sailer <sailer@watson.ibm.com>
++ * Kylene Hall <kjhall@us.ibm.com>
++ * Stefan Berger <stefanb@us.ibm.com>
++ *
++ * Maintained by: <tpmdd_devel@lists.sourceforge.net>
++ *
++ * Device driver for TCG/TCPA TPM (trusted platform module) for XEN.
++ * Specifications at www.trustedcomputinggroup.org
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation, version 2 of the
++ * License.
++ *
++ */
++
++#include <asm/uaccess.h>
++#include <linux/list.h>
++#include <linux/tpmfe.h>
++#include <linux/device.h>
++#include <linux/interrupt.h>
++#include "tpm_nopci.h"
++
++/* read status bits */
++enum {
++	STATUS_BUSY = 0x01,
++	STATUS_DATA_AVAIL = 0x02,
++	STATUS_READY = 0x04
++};
++
++#define MIN(x,y)  ((x) < (y)) ? (x) : (y)
++
++struct transmission {
++	struct list_head next;
++	unsigned char *request;
++	unsigned int request_len;
++	unsigned char *rcv_buffer;
++	unsigned int  buffersize;
++	struct tpm_chip     *chip;
++	unsigned int flags;
++};
++
++enum {
++	TRANSMISSION_FLAG_WAS_QUEUED = 0x1
++};
++
++struct data_exchange {
++	struct transmission *current_request;
++	spinlock_t           req_list_lock;
++	wait_queue_head_t    req_wait_queue;
++
++	struct list_head     queued_requests;
++
++	struct transmission *current_response;
++	spinlock_t           resp_list_lock;
++	wait_queue_head_t    resp_wait_queue;     // processes waiting for responses
++
++	struct transmission *req_cancelled;       // if a cancellation was encounterd
++
++	unsigned int         fe_status;
++	unsigned int         flags;
++};
++
++enum {
++	DATAEX_FLAG_QUEUED_ONLY = 0x1
++};
++
++static struct data_exchange dataex;
++
++static unsigned long disconnect_time;
++
++/* local function prototypes */
++static void __exit cleanup_xen(void);
++
++
++/* =============================================================
++ * Some utility functions
++ * =============================================================
++ */
++static inline struct transmission *
++transmission_alloc(void)
++{
++	struct transmission *t = kmalloc(sizeof(*t), GFP_KERNEL);
++	if (t) {
++		memset(t, 0x0, sizeof(*t));
++	}
++	return t;
++}
++
++static inline unsigned char *
++transmission_set_buffer(struct transmission *t,
++                        unsigned char *buffer, unsigned int len)
++{
++	if (NULL != t->request) {
++		kfree(t->request);
++	}
++	t->request = kmalloc(len, GFP_KERNEL);
++	if (t->request) {
++		memcpy(t->request,
++		       buffer,
++		       len);
++		t->request_len = len;
++	}
++	return t->request;
++}
++
++static inline void
++transmission_free(struct transmission *t)
++{
++	if (t->request) {
++		kfree(t->request);
++	}
++	if (t->rcv_buffer) {
++		kfree(t->rcv_buffer);
++	}
++	kfree(t);
++}
++
++/* =============================================================
++ * Interface with the TPM shared memory driver for XEN
++ * =============================================================
++ */
++static int tpm_recv(const u8 *buffer, size_t count, const void *ptr)
++{
++	int ret_size = 0;
++	struct transmission *t, *temp;
++
++	/*
++	 * The list with requests must contain one request
++	 * only and the element there must be the one that
++	 * was passed to me from the front-end.
++	 */
++	if (dataex.current_request != ptr) {
++		printk("WARNING: The request pointer is different than the pointer "
++		       "the shared memory driver returned to me. %p != %p\n",
++		       dataex.current_request, ptr);
++	}
++
++	/*
++	 * If the request has been cancelled, just quit here
++	 */
++	if (dataex.req_cancelled == (struct transmission *)ptr) {
++		if (dataex.current_request == dataex.req_cancelled) {
++			dataex.current_request = NULL;
++		}
++		transmission_free(dataex.req_cancelled);
++		dataex.req_cancelled = NULL;
++		return 0;
++	}
++
++	if (NULL != (temp = dataex.current_request)) {
++		transmission_free(temp);
++		dataex.current_request = NULL;
++	}
++
++	t = transmission_alloc();
++	if (NULL != t) {
++		unsigned long flags;
++		t->rcv_buffer = kmalloc(count, GFP_KERNEL);
++		if (NULL == t->rcv_buffer) {
++			transmission_free(t);
++			return -ENOMEM;
++		}
++		t->buffersize = count;
++		memcpy(t->rcv_buffer, buffer, count);
++		ret_size = count;
++
++		spin_lock_irqsave(&dataex.resp_list_lock ,flags);
++		dataex.current_response = t;
++		spin_unlock_irqrestore(&dataex.resp_list_lock, flags);
++		wake_up_interruptible(&dataex.resp_wait_queue);
++	}
++	return ret_size;
++}
++
++
++static void tpm_fe_status(unsigned int flags)
++{
++	dataex.fe_status = flags;
++	if ((dataex.fe_status & TPMFE_STATUS_CONNECTED) == 0) {
++		disconnect_time = jiffies;
++	}
++}
++
++/* =============================================================
++ * Interface with the generic TPM driver
++ * =============================================================
++ */
++static int tpm_xen_recv(struct tpm_chip *chip, u8 * buf, size_t count)
++{
++	unsigned long flags;
++	int rc = 0;
++
++	spin_lock_irqsave(&dataex.resp_list_lock, flags);
++	/*
++	 * Check if the previous operation only queued the command
++	 * In this case there won't be a response, so I just
++	 * return from here and reset that flag. In any other
++	 * case I should receive a response from the back-end.
++	 */
++	if ((dataex.flags & DATAEX_FLAG_QUEUED_ONLY) != 0) {
++		dataex.flags &= ~DATAEX_FLAG_QUEUED_ONLY;
++		spin_unlock_irqrestore(&dataex.resp_list_lock, flags);
++		/*
++		 * a little hack here. The first few measurements
++		 * are queued since there's no way to talk to the
++		 * TPM yet (due to slowness of the control channel)
++		 * So we just make IMA happy by giving it 30 NULL
++		 * bytes back where the most important part is
++		 * that the result code is '0'.
++		 */
++
++		count = MIN(count, 30);
++		memset(buf, 0x0, count);
++		return count;
++	}
++	/*
++	 * Check whether something is in the responselist and if
++	 * there's nothing in the list wait for something to appear.
++	 */
++
++	if (NULL == dataex.current_response) {
++		spin_unlock_irqrestore(&dataex.resp_list_lock, flags);
++		interruptible_sleep_on_timeout(&dataex.resp_wait_queue,
++		                               1000);
++		spin_lock_irqsave(&dataex.resp_list_lock ,flags);
++	}
++
++	if (NULL != dataex.current_response) {
++		struct transmission *t = dataex.current_response;
++		dataex.current_response = NULL;
++		rc = MIN(count, t->buffersize);
++		memcpy(buf, t->rcv_buffer, rc);
++		transmission_free(t);
++	}
++
++	spin_unlock_irqrestore(&dataex.resp_list_lock, flags);
++	return rc;
++}
++
++static int tpm_xen_send(struct tpm_chip *chip, u8 * buf, size_t count)
++{
++	/*
++	 * We simply pass the packet onto the XEN shared
++	 * memory driver.
++	 */
++	unsigned long flags;
++	int rc;
++	struct transmission *t = transmission_alloc();
++
++	spin_lock_irqsave(&dataex.req_list_lock, flags);
++	/*
++	 * If there's a current request, it must be the
++	 * previous request that has timed out.
++	 */
++	if (dataex.current_request != NULL) {
++		printk("WARNING: Sending although there is a request outstanding.\n"
++		       "         Previous request must have timed out.\n");
++		transmission_free(dataex.current_request);
++		dataex.current_request = NULL;
++	}
++
++	if (t != NULL) {
++		unsigned int error = 0;
++		t->rcv_buffer = NULL;
++		t->buffersize = 0;
++		t->chip = chip;
++
++		/*
++		 * Queue the packet if the driver below is not
++		 * ready, yet, or there is any packet already
++		 * in the queue.
++		 * If the driver below is ready, unqueue all
++		 * packets first before sending our current
++		 * packet.
++		 * For each unqueued packet, except for the
++		 * last (=current) packet, call the function
++		 * tpm_xen_recv to wait for the response to come
++		 * back.
++		 */
++		if ((dataex.fe_status & TPMFE_STATUS_CONNECTED) == 0) {
++			if (time_after(jiffies, disconnect_time + HZ * 10)) {
++				rc = -ENOENT;
++			} else {
++				/*
++				 * copy the request into the buffer
++				 */
++				if (transmission_set_buffer(t, buf, count)
++				    == NULL) {
++					transmission_free(t);
++					rc = -ENOMEM;
++					goto exit;
++				}
++				dataex.flags |= DATAEX_FLAG_QUEUED_ONLY;
++				list_add_tail(&t->next, &dataex.queued_requests);
++				rc = 0;
++			}
++		} else {
++			/*
++			 * Check whether there are any packets in the queue
++			 */
++			while (!list_empty(&dataex.queued_requests)) {
++				/*
++				 * Need to dequeue them.
++				 * Read the result into a dummy buffer.
++				 */
++				unsigned char buffer[1];
++				struct transmission *qt = (struct transmission *) dataex.queued_requests.next;
++				list_del(&qt->next);
++				dataex.current_request = qt;
++				spin_unlock_irqrestore(&dataex.req_list_lock, flags);
++
++				rc = tpm_fe_send(qt->request,
++				                 qt->request_len,
++				                 qt);
++
++				if (rc < 0) {
++					spin_lock_irqsave(&dataex.req_list_lock, flags);
++					if ((qt = dataex.current_request) != NULL) {
++						/*
++						 * requeue it at the beginning
++						 * of the list
++						 */
++						list_add(&qt->next,
++						         &dataex.queued_requests);
++					}
++					dataex.current_request = NULL;
++					error = 1;
++					break;
++				}
++				/*
++				 * After this point qt is not valid anymore!
++				 * It is freed when the front-end is delivering the data
++				 * by calling tpm_recv
++				 */
++
++				/*
++				 * Try to receive the response now into the provided dummy
++				 * buffer (I don't really care about this response since
++				 * there is no receiver anymore for this response)
++				 */
++				rc = tpm_xen_recv(chip, buffer, sizeof(buffer));
++
++				spin_lock_irqsave(&dataex.req_list_lock, flags);
++			}
++
++			if (error == 0) {
++				/*
++				 * Finally, send the current request.
++				 */
++				dataex.current_request = t;
++				/*
++				 * Call the shared memory driver
++				 * Pass to it the buffer with the request, the
++				 * amount of bytes in the request and
++				 * a void * pointer (here: transmission structure)
++				 */
++				rc = tpm_fe_send(buf, count, t);
++				/*
++				 * The generic TPM driver will call
++				 * the function to receive the response.
++				 */
++				if (rc < 0) {
++					dataex.current_request = NULL;
++					goto queue_it;
++				}
++			} else {
++queue_it:
++				if (transmission_set_buffer(t, buf, count) == NULL) {
++					transmission_free(t);
++					rc = -ENOMEM;
++					goto exit;
++				}
++				/*
++				 * An error occurred. Don't event try
++				 * to send the current request. Just
++				 * queue it.
++				 */
++				dataex.flags |= DATAEX_FLAG_QUEUED_ONLY;
++				list_add_tail(&t->next, &dataex.queued_requests);
++				rc = 0;
++			}
++		}
++	} else {
++		rc = -ENOMEM;
++	}
++
++exit:
++	spin_unlock_irqrestore(&dataex.req_list_lock, flags);
++	return rc;
++}
++
++static void tpm_xen_cancel(struct tpm_chip *chip)
++{
++	unsigned long flags;
++	spin_lock_irqsave(&dataex.resp_list_lock,flags);
++
++	dataex.req_cancelled = dataex.current_request;
++
++	spin_unlock_irqrestore(&dataex.resp_list_lock,flags);
++}
++
++static u8 tpm_xen_status(struct tpm_chip *chip)
++{
++	unsigned long flags;
++	u8 rc = 0;
++	spin_lock_irqsave(&dataex.resp_list_lock, flags);
++	/*
++	 * Data are available if:
++	 *  - there's a current response
++	 *  - the last packet was queued only (this is fake, but necessary to
++	 *      get the generic TPM layer to call the receive function.)
++	 */
++	if (NULL != dataex.current_response ||
++	    0 != (dataex.flags & DATAEX_FLAG_QUEUED_ONLY)) {
++		rc = STATUS_DATA_AVAIL;
++	}
++	spin_unlock_irqrestore(&dataex.resp_list_lock, flags);
++	return rc;
++}
++
++static struct file_operations tpm_xen_ops = {
++	.owner = THIS_MODULE,
++	.llseek = no_llseek,
++	.open = tpm_open,
++	.read = tpm_read,
++	.write = tpm_write,
++	.release = tpm_release,
++};
++
++static struct tpm_vendor_specific tpm_xen = {
++	.recv = tpm_xen_recv,
++	.send = tpm_xen_send,
++	.cancel = tpm_xen_cancel,
++	.status = tpm_xen_status,
++	.req_complete_mask = STATUS_BUSY | STATUS_DATA_AVAIL,
++	.req_complete_val  = STATUS_DATA_AVAIL,
++	.req_canceled = STATUS_READY,
++	.base = 0,
++	.attr = TPM_DEVICE_ATTRS,
++	.miscdev.fops = &tpm_xen_ops,
++};
++
++static struct device tpm_device = {
++	.bus_id = "vtpm",
++};
++
++static struct tpmfe_device tpmfe = {
++	.receive = tpm_recv,
++	.status  = tpm_fe_status,
++};
++
++
++static int __init init_xen(void)
++{
++	int rc;
++
++	/*
++	 * Register device with the low lever front-end
++	 * driver
++	 */
++	if ((rc = tpm_fe_register_receiver(&tpmfe)) < 0) {
++		return rc;
++	}
++
++	/*
++	 * Register our device with the system.
++	 */
++	if ((rc = device_register(&tpm_device)) < 0) {
++		tpm_fe_unregister_receiver();
++		return rc;
++	}
++
++	if ((rc = tpm_register_hardware_nopci(&tpm_device, &tpm_xen)) < 0) {
++		device_unregister(&tpm_device);
++		tpm_fe_unregister_receiver();
++		return rc;
++	}
++
++	dataex.current_request = NULL;
++	spin_lock_init(&dataex.req_list_lock);
++	init_waitqueue_head(&dataex.req_wait_queue);
++	INIT_LIST_HEAD(&dataex.queued_requests);
++
++	dataex.current_response = NULL;
++	spin_lock_init(&dataex.resp_list_lock);
++	init_waitqueue_head(&dataex.resp_wait_queue);
++
++	disconnect_time = jiffies;
++
++	return 0;
++}
++
++static void __exit cleanup_xen(void)
++{
++	tpm_remove_hardware(&tpm_device);
++	device_unregister(&tpm_device);
++	tpm_fe_unregister_receiver();
++}
++
++fs_initcall(init_xen);
++module_exit(cleanup_xen);
++
++MODULE_AUTHOR("Stefan Berger (stefanb@us.ibm.com)");
++MODULE_DESCRIPTION("TPM Driver for XEN (shared memory)");
++MODULE_VERSION("1.0");
++MODULE_LICENSE("GPL");
+Index: linux-2.6.13/drivers/xen/Makefile
+===================================================================
+--- linux-2.6.13.orig/drivers/xen/Makefile
++++ linux-2.6.13/drivers/xen/Makefile
+@@ -7,8 +7,10 @@ obj-y	+= privcmd/
+ obj-y	+= xenbus/
+ 
+ obj-$(CONFIG_XEN_BLKDEV_BACKEND)	+= blkback/
+ obj-$(CONFIG_XEN_NETDEV_BACKEND)	+= netback/
++obj-$(CONFIG_XEN_TPMDEV_BACKEND)	+= tpmback/
+ obj-$(CONFIG_XEN_BLKDEV_FRONTEND)	+= blkfront/
+ obj-$(CONFIG_XEN_NETDEV_FRONTEND)	+= netfront/
+ obj-$(CONFIG_XEN_BLKDEV_TAP)    	+= blktap/
++obj-$(CONFIG_XEN_TPMDEV_FRONTEND)	+= tpmfront/
+ 
+Index: linux-2.6.13/drivers/xen/tpmback/Makefile
+===================================================================
+--- /dev/null
++++ linux-2.6.13/drivers/xen/tpmback/Makefile
+@@ -0,0 +1,4 @@
++
++obj-$(CONFIG_XEN_TPMDEV_BACKEND)	+= tpmbk.o
++
++tpmbk-y += tpmback.o interface.o xenbus.o
+Index: linux-2.6.13/drivers/xen/tpmback/common.h
+===================================================================
+--- /dev/null
++++ linux-2.6.13/drivers/xen/tpmback/common.h
+@@ -0,0 +1,89 @@
++/******************************************************************************
++ * drivers/xen/tpmback/common.h
++ */
++
++#ifndef __NETIF__BACKEND__COMMON_H__
++#define __NETIF__BACKEND__COMMON_H__
++
++#include <linux/config.h>
++#include <linux/version.h>
++#include <linux/module.h>
++#include <linux/interrupt.h>
++#include <linux/slab.h>
++#include <asm-xen/ctrl_if.h>
++#include <asm-xen/evtchn.h>
++#include <asm-xen/xen-public/io/tpmif.h>
++#include <asm/io.h>
++#include <asm/pgalloc.h>
++#include <asm-xen/xen-public/io/domain_controller.h>
++
++#if 0
++#define ASSERT(_p) \
++    if ( !(_p) ) { printk("Assertion '%s' failed, line %d, file %s", #_p , \
++    __LINE__, __FILE__); *(int*)0=0; }
++#define DPRINTK(_f, _a...) printk(KERN_ALERT "(file=%s, line=%d) " _f, \
++                           __FILE__ , __LINE__ , ## _a )
++#else
++#define ASSERT(_p) ((void)0)
++#define DPRINTK(_f, _a...) ((void)0)
++#endif
++
++typedef struct tpmif_st {
++        struct list_head tpmif_list;
++	/* Unique identifier for this interface. */
++	domid_t domid;
++	unsigned int handle;
++
++	/* Physical parameters of the comms window. */
++	unsigned long tx_shmem_frame;
++	unsigned int evtchn;
++	unsigned int remote_evtchn;
++
++	/* The shared rings and indexes. */
++	tpmif_tx_interface_t *tx;
++
++	/* Miscellaneous private stuff. */
++	enum { DISCONNECTED, DISCONNECTING, CONNECTED } status;
++	int active;
++
++	struct tpmif_st *hash_next;
++	struct list_head list;	/* scheduling list */
++	atomic_t refcnt;
++
++	long int tpm_instance;
++	unsigned long mmap_vstart;
++
++	struct work_struct work;
++
++	u16 shmem_handle;
++	unsigned long shmem_vaddr;
++	grant_ref_t shmem_ref;
++
++} tpmif_t;
++
++void tpmif_disconnect_complete(tpmif_t * tpmif);
++tpmif_t *tpmif_find(domid_t domid, long int instance);
++void tpmif_interface_init(void);
++void tpmif_schedule_work(tpmif_t * tpmif);
++void tpmif_deschedule_work(tpmif_t * tpmif);
++void tpmif_xenbus_init(void);
++int tpmif_map(tpmif_t *tpmif, unsigned long shared_page, unsigned int evtchn);
++irqreturn_t tpmif_be_int(int irq, void *dev_id, struct pt_regs *regs);
++int tpmif_vtpm_open(tpmif_t *tpmif, domid_t domain, u32 instance);
++int tpmif_vtpm_close(u32 instance);
++
++int vtpm_release_packets(tpmif_t * tpmif, int send_msgs);
++
++#define tpmif_get(_b) (atomic_inc(&(_b)->refcnt))
++#define tpmif_put(_b)                             \
++    do {                                          \
++        if ( atomic_dec_and_test(&(_b)->refcnt) ) \
++            tpmif_disconnect_complete(_b);        \
++    } while (0)
++
++
++extern int num_frontends;
++
++#define MMAP_VADDR(t,_req) ((t)->mmap_vstart + ((_req) * PAGE_SIZE))
++
++#endif /* __TPMIF__BACKEND__COMMON_H__ */
+Index: linux-2.6.13/drivers/xen/tpmback/interface.c
+===================================================================
+--- /dev/null
++++ linux-2.6.13/drivers/xen/tpmback/interface.c
+@@ -0,0 +1,200 @@
++/******************************************************************************
++ * drivers/xen/tpmback/interface.c
++ *
++ * Vritual TPM interface management.
++ *
++ * Copyright (c) 2005, IBM Corporation
++ *
++ * Author: Stefan Berger, stefanb@us.ibm.com
++ *
++ * This code has been derived from drivers/xen/netback/interface.c
++ * Copyright (c) 2004, Keir Fraser
++ */
++
++#include "common.h"
++#include <asm-xen/balloon.h>
++
++#define VMALLOC_VMADDR(x) ((unsigned long)(x))
++
++#define TPMIF_HASHSZ (2 << 5)
++#define TPMIF_HASH(_d,_h) (((int)(_d)^(int)(_h))&(TPMIF_HASHSZ-1))
++
++static kmem_cache_t *tpmif_cachep;
++int num_frontends = 0;
++LIST_HEAD(tpmif_list);
++
++
++tpmif_t *alloc_tpmif(domid_t domid, long int instance)
++{
++    struct page *page;
++    tpmif_t *tpmif;
++
++    tpmif = kmem_cache_alloc(tpmif_cachep, GFP_KERNEL);
++    if (!tpmif)
++        return ERR_PTR(-ENOMEM);
++
++    memset(tpmif, 0, sizeof(*tpmif));
++    tpmif->domid        = domid;
++    tpmif->status       = DISCONNECTED;
++    tpmif->tpm_instance = instance;
++    atomic_set(&tpmif->refcnt, 1);
++
++    page = balloon_alloc_empty_page_range(TPMIF_TX_RING_SIZE);
++    BUG_ON(page == NULL);
++    tpmif->mmap_vstart = (unsigned long)pfn_to_kaddr(page_to_pfn(page));
++
++    list_add(&tpmif->tpmif_list, &tpmif_list);
++    num_frontends++;
++
++    return tpmif;
++}
++
++
++void free_tpmif(tpmif_t *tpmif)
++{
++    num_frontends--;
++    list_del(&tpmif->tpmif_list);
++    kmem_cache_free(tpmif_cachep, tpmif);
++}
++
++
++tpmif_t *tpmif_find(domid_t domid, long int instance)
++{
++    tpmif_t *tpmif;
++
++    list_for_each_entry(tpmif, &tpmif_list, tpmif_list) {
++        if (tpmif->tpm_instance == instance) {
++            if (tpmif->domid == domid) {
++                tpmif_get(tpmif);
++                return tpmif;
++	    } else {
++	        return NULL;
++	    }
++        }
++    }
++
++    return alloc_tpmif(domid, instance);
++}
++
++
++static int map_frontend_page(tpmif_t *tpmif, unsigned long localaddr,
++			     unsigned long shared_page)
++{
++    struct gnttab_map_grant_ref op = {
++        .host_addr = localaddr,
++        .flags     = GNTMAP_host_map,
++        .ref       = shared_page,
++        .dom       = tpmif->domid,
++    };
++
++    BUG_ON( HYPERVISOR_grant_table_op(GNTTABOP_map_grant_ref, &op, 1) );
++
++    if (op.handle < 0) {
++	DPRINTK(" Grant table operation failure !\n");
++	return op.handle;
++    }
++
++    tpmif->shmem_ref    = shared_page;
++    tpmif->shmem_handle = op.handle;
++    tpmif->shmem_vaddr  = localaddr;
++    return 0;
++}
++
++
++static void unmap_frontend_page(tpmif_t *tpmif)
++{
++    struct gnttab_unmap_grant_ref op;
++
++    op.host_addr = tpmif->shmem_vaddr;
++    op.handle = tpmif->shmem_handle;
++    op.dev_bus_addr = 0;
++
++    BUG_ON(HYPERVISOR_grant_table_op(GNTTABOP_unmap_grant_ref, &op, 1));
++}
++
++
++int tpmif_map(tpmif_t *tpmif,
++              unsigned long shared_page, unsigned int evtchn)
++{
++    struct vm_struct *vma;
++    evtchn_op_t op = { .cmd = EVTCHNOP_bind_interdomain };
++    int err;
++
++    BUG_ON(tpmif->remote_evtchn);
++
++    if ( (vma = get_vm_area(PAGE_SIZE, VM_IOREMAP)) == NULL )
++	return -ENOMEM;
++
++    err = map_frontend_page(tpmif,
++                            VMALLOC_VMADDR(vma->addr),
++                            shared_page);
++    if (err) {
++        vfree(vma->addr);
++	return err;
++    }
++
++    op.u.bind_interdomain.dom1 = DOMID_SELF;
++    op.u.bind_interdomain.dom2 = tpmif->domid;
++    op.u.bind_interdomain.port1 = 0;
++    op.u.bind_interdomain.port2 = evtchn;
++    err = HYPERVISOR_event_channel_op(&op);
++    if (err) {
++	unmap_frontend_page(tpmif);
++	vfree(vma->addr);
++	return err;
++    }
++
++    tpmif->evtchn = op.u.bind_interdomain.port1;
++    tpmif->remote_evtchn = evtchn;
++
++    tpmif->tx = (tpmif_tx_interface_t *) vma->addr;
++
++    bind_evtchn_to_irqhandler(tpmif->evtchn,
++                              tpmif_be_int,
++                              0,
++                              "tpmif-backend",
++			      tpmif);
++    tpmif->status        = CONNECTED;
++    tpmif->shmem_ref     = shared_page;
++    tpmif->active        = 1;
++
++    return 0;
++}
++
++
++static void __tpmif_disconnect_complete(void *arg)
++{
++    evtchn_op_t op = { .cmd = EVTCHNOP_close };
++    tpmif_t *tpmif = (tpmif_t *) arg;
++
++    op.u.close.port = tpmif->evtchn;
++    op.u.close.dom  = DOMID_SELF;
++    HYPERVISOR_event_channel_op(&op);
++    op.u.close.port = tpmif->remote_evtchn;
++    op.u.close.dom  = tpmif->domid;
++    HYPERVISOR_event_channel_op(&op);
++
++    if (tpmif->evtchn)
++         unbind_evtchn_from_irqhandler(tpmif->evtchn, tpmif);
++
++    if (tpmif->tx) {
++        unmap_frontend_page(tpmif);
++        vfree(tpmif->tx);
++    }
++
++    free_tpmif(tpmif);
++}
++
++
++void tpmif_disconnect_complete(tpmif_t * tpmif)
++{
++    INIT_WORK(&tpmif->work, __tpmif_disconnect_complete, (void *)tpmif);
++    schedule_work(&tpmif->work);
++}
++
++
++void __init tpmif_interface_init(void)
++{
++    tpmif_cachep = kmem_cache_create("tpmif_cache", sizeof(tpmif_t),
++                                     0, 0, NULL, NULL);
++}
+Index: linux-2.6.13/drivers/xen/tpmback/tpmback.c
+===================================================================
+--- /dev/null
++++ linux-2.6.13/drivers/xen/tpmback/tpmback.c
+@@ -0,0 +1,1078 @@
++/******************************************************************************
++ * drivers/xen/tpmback/tpmback.c
++ *
++ * Copyright (c) 2005, IBM Corporation
++ *
++ * Author: Stefan Berger, stefanb@us.ibm.com
++ * Grant table support: Mahadevan Gomathisankaran
++ *
++ * This code has been derived from drivers/xen/netback/netback.c
++ * Copyright (c) 2002-2004, K A Fraser
++ *
++ */
++
++#include "common.h"
++#include <asm-xen/evtchn.h>
++
++#include <linux/types.h>
++#include <linux/list.h>
++#include <linux/miscdevice.h>
++#include <asm/uaccess.h>
++#include <asm-xen/xenbus.h>
++#include <asm-xen/xen-public/grant_table.h>
++
++
++struct data_exchange {
++	struct list_head pending_pak;
++	struct list_head current_pak;
++	unsigned int copied_so_far;
++	u8 has_opener;
++	rwlock_t pak_lock;  // protects all of the previous fields
++	wait_queue_head_t wait_queue;
++};
++
++struct packet {
++	struct list_head next;
++	unsigned int data_len;
++	u8 *data_buffer;
++	tpmif_t *tpmif;
++	u32 tpm_instance;
++	u8 req_tag;
++	u32 last_read;
++	u8 flags;
++	ctrl_msg_t ctrl_msg;
++	struct timer_list processing_timer;
++};
++
++enum {
++	PACKET_FLAG_DISCARD_RESPONSE = 1,
++	PACKET_FLAG_SEND_CONTROLMESSAGE = 2,
++};
++
++static struct data_exchange dataex;
++
++/* local function prototypes */
++static int vtpm_queue_packet(struct packet *pak);
++static int _packet_write(struct packet *pak,
++                         const char *data, size_t size,
++                         int userbuffer);
++static void processing_timeout(unsigned long ptr);
++static int  packet_read_shmem(struct packet *pak,
++                              tpmif_t *tpmif,
++                              u32 offset,
++                              char *buffer,
++                              int isuserbuffer,
++                              u32 left);
++
++
++#define MAX_PENDING_REQS TPMIF_TX_RING_SIZE
++
++static multicall_entry_t tx_mcl[MAX_PENDING_REQS];
++
++#define MIN(x,y)  (x) < (y) ? (x) : (y)
++
++/***************************************************************
++ Packet-related functions
++***************************************************************/
++
++static struct packet *
++packet_find_instance(struct list_head *head, u32 tpm_instance)
++{
++	struct packet *pak;
++	struct list_head *p;
++	/*
++	 * traverse the list of packets and return the first
++	 * one with the given instance number
++	 */
++	list_for_each(p, head) {
++		pak = list_entry(p, struct packet, next);
++		if (pak->tpm_instance == tpm_instance) {
++			return pak;
++		}
++	}
++	return NULL;
++}
++
++static struct packet *
++packet_find_packet(struct list_head *head, void *packet)
++{
++	struct packet *pak;
++	struct list_head *p;
++	/*
++	 * traverse the list of packets and return the first
++	 * one with the given instance number
++	 */
++	list_for_each(p, head) {
++		pak = list_entry(p, struct packet, next);
++		if (pak == packet) {
++			return pak;
++		}
++	}
++	return NULL;
++}
++
++static struct packet *
++packet_alloc(tpmif_t *tpmif, u32 size, u8 req_tag, u8 flags)
++{
++	struct packet *pak = NULL;
++	pak = kmalloc(sizeof(struct packet),
++                      GFP_KERNEL);
++	if (NULL != pak) {
++		memset(pak, 0x0, sizeof(*pak));
++		if (tpmif) {
++			pak->tpmif = tpmif;
++			pak->tpm_instance = tpmif->tpm_instance;
++		}
++		pak->data_len  = size;
++		pak->req_tag   = req_tag;
++		pak->last_read = 0;
++		pak->flags     = flags;
++
++		/*
++		 * cannot do tpmif_get(tpmif); bad things happen
++		 * on the last tpmif_put()
++		 */
++		init_timer(&pak->processing_timer);
++		pak->processing_timer.function = processing_timeout;
++		pak->processing_timer.data = (unsigned long)pak;
++	}
++	return pak;
++}
++
++static void inline
++packet_reset(struct packet *pak)
++{
++	pak->last_read = 0;
++}
++
++static void inline
++packet_free(struct packet *pak)
++{
++	del_singleshot_timer_sync(&pak->processing_timer);
++	if (pak->data_buffer) {
++		kfree(pak->data_buffer);
++	}
++	/*
++	 * cannot do tpmif_put(pak->tpmif); bad things happen
++	 * on the last tpmif_put()
++	 */
++	kfree(pak);
++}
++
++static int
++packet_set(struct packet *pak,
++           const unsigned char *buffer, u32 size)
++{
++	int rc = 0;
++	unsigned char *buf = kmalloc(size, GFP_KERNEL);
++	if (NULL != buf) {
++		pak->data_buffer = buf;
++		memcpy(buf, buffer, size);
++		pak->data_len = size;
++	} else {
++		rc = -ENOMEM;
++	}
++	return rc;
++}
++
++
++/*
++ * Write data to the shared memory and send it to the FE.
++ */
++static int
++packet_write(struct packet *pak,
++             const char *data, size_t size,
++             int userbuffer)
++{
++	int rc = 0;
++
++	DPRINTK("Supposed to send %d bytes to front-end!\n",
++	        size);
++
++	if (0 != (pak->flags & PACKET_FLAG_SEND_CONTROLMESSAGE)) {
++#ifdef CONFIG_XEN_TPMDEV_CLOSE_IF_VTPM_FAILS
++		u32 res;
++		memcpy(&res, &data[2+4], sizeof(res));
++		if (res != 0) {
++			/*
++			 * Will close down this device and have the
++			 * FE notified about closure.
++			 */
++		}
++#endif
++	}
++
++	if (0 != (pak->flags & PACKET_FLAG_DISCARD_RESPONSE)) {
++		/* Don't send a respone to this packet. Just acknowledge it. */
++		rc = size;
++	} else {
++		rc = _packet_write(pak, data, size, userbuffer);
++	}
++
++	return rc;
++}
++
++
++static int
++_packet_write(struct packet *pak,
++              const char *data, size_t size,
++              int userbuffer)
++{
++	/*
++	 * Write into the shared memory pages directly
++	 * and send it to the front end.
++	 */
++	tpmif_t *tpmif = pak->tpmif;
++	u16 handle;
++	int rc = 0;
++	unsigned int i = 0;
++	unsigned int offset = 0;
++	multicall_entry_t *mcl;
++
++	if (tpmif == NULL)
++		return -EFAULT;
++
++	if (tpmif->status != CONNECTED) {
++		return size;
++	}
++
++	mcl = tx_mcl;
++	while (offset < size && i < TPMIF_TX_RING_SIZE) {
++		unsigned int tocopy;
++		struct gnttab_map_grant_ref map_op;
++		struct gnttab_unmap_grant_ref unmap_op;
++		tpmif_tx_request_t *tx;
++
++		tx = &tpmif->tx->ring[i].req;
++
++		if (0 == tx->addr) {
++			DPRINTK("ERROR: Buffer for outgoing packet NULL?! i=%d\n", i);
++			return 0;
++		}
++
++		map_op.host_addr  = MMAP_VADDR(tpmif, i);
++		map_op.flags      = GNTMAP_host_map;
++		map_op.ref        = tx->ref;
++		map_op.dom        = tpmif->domid;
++
++		if(unlikely(
++		    HYPERVISOR_grant_table_op(
++		        GNTTABOP_map_grant_ref,
++		        &map_op,
++		        1))) {
++			BUG();
++		}
++
++		handle = map_op.handle;
++
++		if (map_op.handle < 0) {
++			DPRINTK(" Grant table operation failure !\n");
++			return 0;
++		}
++		phys_to_machine_mapping[__pa(MMAP_VADDR(tpmif,i)) >>
++					PAGE_SHIFT] =
++			FOREIGN_FRAME(map_op.dev_bus_addr >> PAGE_SHIFT);
++
++		tocopy = size - offset;
++		if (tocopy > PAGE_SIZE) {
++			tocopy = PAGE_SIZE;
++		}
++		if (userbuffer) {
++			if (copy_from_user((void *)(MMAP_VADDR(tpmif,i) |
++			                           (tx->addr & ~PAGE_MASK)),
++			                   (void __user *)&data[offset],
++			                   tocopy)) {
++				tpmif_put(tpmif);
++				return -EFAULT;
++			}
++		} else {
++			memcpy((void *)(MMAP_VADDR(tpmif,i) |
++					(tx->addr & ~PAGE_MASK)),
++			       &data[offset], tocopy);
++		}
++		tx->size = tocopy;
++
++		unmap_op.host_addr    = MMAP_VADDR(tpmif, i);
++		unmap_op.handle       = handle;
++		unmap_op.dev_bus_addr = 0;
++
++		if(unlikely(HYPERVISOR_grant_table_op(GNTTABOP_unmap_grant_ref,
++		                                      &unmap_op,
++		                                      1))) {
++			BUG();
++		}
++
++		offset += tocopy;
++		i++;
++	}
++
++	rc = offset;
++	DPRINTK("Notifying frontend via event channel %d\n",
++	        tpmif->evtchn);
++	notify_via_evtchn(tpmif->evtchn);
++
++	return rc;
++}
++
++/*
++ * Read data from the shared memory and copy it directly into the
++ * provided buffer. Advance the read_last indicator which tells
++ * how many bytes have already been read.
++ */
++static int
++packet_read(struct packet *pak, size_t numbytes,
++            char *buffer, size_t buffersize,
++            int userbuffer)
++{
++	tpmif_t *tpmif = pak->tpmif;
++	/*
++	 * I am supposed to read 'numbytes' of data from the
++	 * buffer.
++	 * The first 4 bytes that are read are the instance number in
++	 * network byte order, after that comes the data from the
++	 * shared memory buffer.
++	 */
++	u32 to_copy;
++	u32 offset = 0;
++	u32 room_left = buffersize;
++	/*
++	 * Ensure that we see the request when we copy it.
++	 */
++	mb();
++
++	if (pak->last_read < 4) {
++		/*
++		 * copy the instance number into the buffer
++		 */
++		u32 instance_no = htonl(pak->tpm_instance);
++		u32 last_read = pak->last_read;
++		to_copy = MIN(4 - last_read, numbytes);
++
++		if (userbuffer) {
++			if (copy_to_user(&buffer[0],
++			                 &(((u8 *)&instance_no)[last_read]),
++			                 to_copy)) {
++				return -EFAULT;
++			}
++		} else {
++			memcpy(&buffer[0],
++			       &(((u8 *)&instance_no)[last_read]),
++			       to_copy);
++		}
++
++		pak->last_read += to_copy;
++		offset += to_copy;
++		room_left -= to_copy;
++	}
++
++	/*
++	 * If the packet has a data buffer appended, read from it...
++	 */
++
++	if (room_left > 0) {
++		if (pak->data_buffer) {
++			u32 to_copy = MIN(pak->data_len - offset, room_left);
++			u32 last_read = pak->last_read - 4;
++			if (userbuffer) {
++				if (copy_to_user(&buffer[offset],
++				                 &pak->data_buffer[last_read],
++				                 to_copy)) {
++					return -EFAULT;
++				}
++			} else {
++				memcpy(&buffer[offset],
++				       &pak->data_buffer[last_read],
++				       to_copy);
++			}
++			pak->last_read += to_copy;
++			offset += to_copy;
++		} else {
++			offset = packet_read_shmem(pak,
++			                           tpmif,
++			                           offset,
++			                           buffer,
++			                           userbuffer,
++			                           room_left);
++		}
++	}
++	return offset;
++}
++
++
++static int
++packet_read_shmem(struct packet *pak,
++                  tpmif_t *tpmif,
++                  u32 offset,
++                  char *buffer,
++                  int isuserbuffer,
++                  u32 room_left) {
++	u32 last_read = pak->last_read - 4;
++	u32 i = (last_read / PAGE_SIZE);
++	u32 pg_offset = last_read & (PAGE_SIZE - 1);
++	u32 to_copy;
++	u16 handle;
++
++	tpmif_tx_request_t *tx;
++	tx = &tpmif->tx->ring[0].req;
++	/*
++	 * Start copying data at the page with index 'index'
++	 * and within that page at offset 'offset'.
++	 * Copy a maximum of 'room_left' bytes.
++	 */
++	to_copy = MIN(PAGE_SIZE - pg_offset, room_left);
++	while (to_copy > 0) {
++		void *src;
++		struct gnttab_map_grant_ref map_op;
++		struct gnttab_unmap_grant_ref unmap_op;
++
++		tx = &tpmif->tx->ring[i].req;
++
++		map_op.host_addr = MMAP_VADDR(tpmif, i);
++		map_op.flags     = GNTMAP_host_map;
++		map_op.ref       = tx->ref;
++		map_op.dom       = tpmif->domid;
++
++		if(unlikely(HYPERVISOR_grant_table_op(GNTTABOP_map_grant_ref,
++		                                      &map_op,
++		                                      1))) {
++			BUG();
++		}
++
++		if (map_op.handle < 0) {
++			DPRINTK(" Grant table operation failure !\n");
++			return -EFAULT;
++		}
++
++		handle = map_op.handle;
++
++		if (to_copy > tx->size) {
++			/*
++			 * This is the case when the user wants to read more
++			 * than what we have. So we just give him what we
++			 * have.
++			 */
++			to_copy = MIN(tx->size, to_copy);
++		}
++
++		DPRINTK("Copying from mapped memory at %08lx\n",
++		        (unsigned long)(MMAP_VADDR(tpmif,i) |
++			(tx->addr & ~PAGE_MASK)));
++
++		src = (void *)(MMAP_VADDR(tpmif,i) | ((tx->addr & ~PAGE_MASK) + pg_offset));
++		if (isuserbuffer) {
++			if (copy_to_user(&buffer[offset],
++			                 src,
++			                 to_copy)) {
++				return -EFAULT;
++			}
++		} else {
++			memcpy(&buffer[offset],
++			       src,
++			       to_copy);
++		}
++
++
++		DPRINTK("Data from TPM-FE of domain %d are %d %d %d %d\n",
++		        tpmif->domid, buffer[offset], buffer[offset+1],buffer[offset+2],buffer[offset+3]);
++
++		unmap_op.host_addr    = MMAP_VADDR(tpmif, i);
++		unmap_op.handle       = handle;
++		unmap_op.dev_bus_addr = 0;
++
++		if(unlikely(HYPERVISOR_grant_table_op(GNTTABOP_unmap_grant_ref,
++		                                      &unmap_op,
++		                                      1))) {
++			BUG();
++		}
++
++		offset += to_copy;
++		pg_offset = 0;
++		last_read += to_copy;
++		room_left -= to_copy;
++
++		to_copy = MIN(PAGE_SIZE, room_left);
++		i++;
++	} /* while (to_copy > 0) */
++	/*
++	 * Adjust the last_read pointer
++	 */
++	pak->last_read = last_read + 4;
++	return offset;
++}
++
++
++/* ============================================================
++ * The file layer for reading data from this device
++ * ============================================================
++ */
++static int
++vtpm_op_open(struct inode *inode, struct file *f)
++{
++	int rc = 0;
++	unsigned long flags;
++
++	write_lock_irqsave(&dataex.pak_lock, flags);
++	if (dataex.has_opener == 0) {
++		dataex.has_opener = 1;
++	} else {
++		rc = -EPERM;
++	}
++	write_unlock_irqrestore(&dataex.pak_lock, flags);
++	return rc;
++}
++
++static ssize_t
++vtpm_op_read(struct file *file,
++	     char __user * data, size_t size, loff_t * offset)
++{
++	int ret_size = -ENODATA;
++	struct packet *pak = NULL;
++	unsigned long flags;
++
++	write_lock_irqsave(&dataex.pak_lock, flags);
++
++	if (list_empty(&dataex.pending_pak)) {
++		write_unlock_irqrestore(&dataex.pak_lock, flags);
++		wait_event_interruptible(dataex.wait_queue,
++		                         !list_empty(&dataex.pending_pak));
++		write_lock_irqsave(&dataex.pak_lock, flags);
++	}
++
++	if (!list_empty(&dataex.pending_pak)) {
++		unsigned int left;
++		pak = list_entry(dataex.pending_pak.next, struct packet, next);
++
++		left = pak->data_len - dataex.copied_so_far;
++
++		DPRINTK("size given by app: %d, available: %d\n", size, left);
++
++		ret_size = MIN(size,left);
++
++		ret_size = packet_read(pak, ret_size, data, size, 1);
++		if (ret_size < 0) {
++			ret_size = -EFAULT;
++		} else {
++			DPRINTK("Copied %d bytes to user buffer\n", ret_size);
++
++			dataex.copied_so_far += ret_size;
++			if (dataex.copied_so_far >= pak->data_len + 4) {
++				DPRINTK("All data from this packet given to app.\n");
++				/* All data given to app */
++
++				del_singleshot_timer_sync(&pak->processing_timer);
++				list_del(&pak->next);
++				list_add_tail(&pak->next, &dataex.current_pak);
++				/*
++				 * The more fontends that are handled at the same time,
++				 * the more time we give the TPM to process the request.
++				 */
++				mod_timer(&pak->processing_timer,
++				          jiffies + (num_frontends * 10 * HZ));
++				dataex.copied_so_far = 0;
++			}
++		}
++	}
++	write_unlock_irqrestore(&dataex.pak_lock, flags);
++
++	DPRINTK("Returning result from read to app: %d\n", ret_size);
++
++	return ret_size;
++}
++
++/*
++ * Write operation - only works after a previous read operation!
++ */
++static ssize_t
++vtpm_op_write(struct file *file, const char __user * data, size_t size,
++	      loff_t * offset)
++{
++	struct packet *pak;
++	int rc = 0;
++	unsigned int off = 4;
++	unsigned long flags;
++	u32 instance_no = 0;
++	u32 len_no = 0;
++
++	/*
++	 * Minimum required packet size is:
++	 * 4 bytes for instance number
++	 * 2 bytes for tag
++	 * 4 bytes for paramSize
++	 * 4 bytes for the ordinal
++	 * sum: 14 bytes
++	 */
++	if ( size < off + 10 ) {
++		return -EFAULT;
++	}
++
++	if (copy_from_user(&instance_no,
++	                   (void __user *)&data[0],
++	                   4)) {
++		return -EFAULT;
++	}
++
++	if (copy_from_user(&len_no,
++	                   (void __user *)&data[off+2],
++	                   4) ||
++	    (off + ntohl(len_no) != size)) {
++		return -EFAULT;
++	}
++
++	write_lock_irqsave(&dataex.pak_lock, flags);
++	pak = packet_find_instance(&dataex.current_pak, ntohl(instance_no));
++
++	if (pak == NULL) {
++		write_unlock_irqrestore(&dataex.pak_lock, flags);
++		printk(KERN_ALERT "No associated packet!\n");
++		return -EFAULT;
++	} else {
++		del_singleshot_timer_sync(&pak->processing_timer);
++		list_del(&pak->next);
++	}
++
++	write_unlock_irqrestore(&dataex.pak_lock, flags);
++
++	/*
++	 * The first 'offset' bytes must be the instance number.
++	 * I will just pull that from the packet.
++	 */
++	size -= off;
++	data = &data[off];
++
++	rc = packet_write(pak, data, size, 1);
++
++	if (rc > 0) {
++		/* I neglected the first 4 bytes */
++		rc += off;
++	}
++	packet_free(pak);
++	return rc;
++}
++
++static int
++vtpm_op_release(struct inode *inode, struct file *file)
++{
++	unsigned long flags;
++	vtpm_release_packets(NULL, 1);
++	write_lock_irqsave(&dataex.pak_lock, flags);
++	dataex.has_opener = 0;
++	write_unlock_irqrestore(&dataex.pak_lock, flags);
++	return 0;
++}
++
++static unsigned int
++vtpm_op_poll(struct file *file, struct poll_table_struct *pst)
++{
++	return 0;
++}
++
++static struct file_operations vtpm_ops = {
++	.owner = THIS_MODULE,
++	.llseek = no_llseek,
++	.open = vtpm_op_open,
++	.read = vtpm_op_read,
++	.write = vtpm_op_write,
++	.release = vtpm_op_release,
++	.poll = vtpm_op_poll,
++};
++
++static struct miscdevice ibmvtpms_miscdevice = {
++	.minor = 225,
++	.name = "vtpm",
++	.fops = &vtpm_ops,
++};
++
++
++/***************************************************************
++ Virtual TPM functions and data stuctures
++***************************************************************/
++
++static u8 create_cmd[] = {
++        1,193,		/* 0: TPM_TAG_RQU_COMMAMD */
++        0,0,0,19,	/* 2: length */
++        0,0,0,0x1,	/* 6: VTPM_ORD_OPEN */
++        0,		/* 10: VTPM type */
++        0,0,0,0,	/* 11: domain id */
++        0,0,0,0		/* 15: instance id */
++};
++
++static u8 destroy_cmd[] = {
++        1,193,		/* 0: TPM_TAG_RQU_COMMAMD */
++        0,0,0,14,	/* 2: length */
++        0,0,0,0x2,	/* 6: VTPM_ORD_CLOSE */
++        0,0,0,0		/* 10: instance id */
++};
++
++int tpmif_vtpm_open(tpmif_t *tpmif, domid_t domid, u32 instance)
++{
++	int rc = 0;
++	struct packet *pak = packet_alloc(tpmif, sizeof(create_cmd), create_cmd[0],
++	    PACKET_FLAG_DISCARD_RESPONSE|
++	    PACKET_FLAG_SEND_CONTROLMESSAGE);
++	if (pak) {
++		u8 buf[sizeof(create_cmd)];
++		u32 domid_no = htonl((u32)domid);
++		u32 instance_no = htonl(instance);
++		memcpy(buf, create_cmd, sizeof(create_cmd));
++
++		memcpy(&buf[11], &domid_no, sizeof(u32));
++		memcpy(&buf[15], &instance_no, sizeof(u32));
++
++		/* copy the buffer into the packet */
++		rc = packet_set(pak, buf, sizeof(buf));
++
++		if (rc == 0) {
++			pak->tpm_instance = 0;
++			rc = vtpm_queue_packet(pak);
++		}
++		if (rc < 0) {
++			/* could not be queued or built */
++			packet_free(pak);
++		}
++	} else {
++		rc = -ENOMEM;
++	}
++	return rc;
++}
++
++int tpmif_vtpm_close(u32 instid)
++{
++	int rc = 0;
++	struct packet *pak;
++
++	pak = packet_alloc(NULL,
++	                   sizeof(create_cmd),
++	                   create_cmd[0],
++	                   PACKET_FLAG_DISCARD_RESPONSE|
++	                   PACKET_FLAG_SEND_CONTROLMESSAGE);
++	if (pak) {
++		u8 buf[sizeof(destroy_cmd)];
++		u32 instid_no = htonl(instid);
++		memcpy(buf, destroy_cmd, sizeof(destroy_cmd));
++		memcpy(&buf[10], &instid_no, sizeof(u32));
++
++		/* copy the buffer into the packet */
++		rc = packet_set(pak, buf, sizeof(buf));
++
++		if (rc == 0) {
++			pak->tpm_instance = 0;
++			rc = vtpm_queue_packet(pak);
++		}
++		if (rc < 0) {
++			/* could not be queued or built */
++			packet_free(pak);
++		}
++	} else {
++		rc = -ENOMEM;
++	}
++	return rc;
++}
++
++
++/***************************************************************
++ Utility functions
++***************************************************************/
++
++static int
++tpm_send_fail_message(struct packet *pak, u8 req_tag)
++{
++	int rc;
++	static const unsigned char tpm_error_message_fail[] = {
++		0x00, 0x00,
++		0x00, 0x00, 0x00, 0x0a,
++		0x00, 0x00, 0x00, 0x09 /* TPM_FAIL */
++	};
++	unsigned char buffer[sizeof(tpm_error_message_fail)];
++
++	memcpy(buffer, tpm_error_message_fail, sizeof(tpm_error_message_fail));
++	/*
++	 * Insert the right response tag depending on the given tag
++	 * All response tags are '+3' to the request tag.
++	 */
++	buffer[1] = req_tag + 3;
++
++	/*
++	 * Write the data to shared memory and notify the front-end
++	 */
++	rc = packet_write(pak, buffer, sizeof(buffer), 0);
++
++	return rc;
++}
++
++
++static void
++_vtpm_release_packets(struct list_head *head, tpmif_t *tpmif,
++                      int send_msgs)
++{
++	struct packet *pak;
++	struct list_head *pos, *tmp;
++
++	list_for_each_safe(pos, tmp, head) {
++		pak = list_entry(pos, struct packet, next);
++		if (tpmif == NULL || pak->tpmif == tpmif) {
++			int can_send = 0;
++			del_singleshot_timer_sync(&pak->processing_timer);
++			list_del(&pak->next);
++
++			if (pak->tpmif && pak->tpmif->status == CONNECTED) {
++				can_send = 1;
++			}
++
++			if (send_msgs && can_send) {
++				tpm_send_fail_message(pak, pak->req_tag);
++			}
++			packet_free(pak);
++		}
++	}
++}
++
++
++int
++vtpm_release_packets(tpmif_t *tpmif, int send_msgs)
++{
++	unsigned long flags;
++
++	write_lock_irqsave(&dataex.pak_lock, flags);
++
++	_vtpm_release_packets(&dataex.pending_pak, tpmif, send_msgs);
++	_vtpm_release_packets(&dataex.current_pak, tpmif, send_msgs);
++
++	write_unlock_irqrestore(&dataex.pak_lock,
++	                        flags);
++	return 0;
++}
++
++
++static int vtpm_queue_packet(struct packet *pak)
++{
++	int rc = 0;
++	if (dataex.has_opener) {
++		unsigned long flags;
++		write_lock_irqsave(&dataex.pak_lock, flags);
++		list_add_tail(&pak->next, &dataex.pending_pak);
++		/* give the TPM some time to pick up the request */
++		mod_timer(&pak->processing_timer, jiffies + (10 * HZ));
++		write_unlock_irqrestore(&dataex.pak_lock,
++		                        flags);
++
++		wake_up_interruptible(&dataex.wait_queue);
++	} else {
++		rc = -EFAULT;
++	}
++	return rc;
++}
++
++
++static int vtpm_receive(tpmif_t *tpmif, u32 size)
++{
++	int rc = 0;
++	unsigned char buffer[10];
++	__be32 *native_size;
++
++	struct packet *pak = packet_alloc(tpmif, size, buffer[4], 0);
++	if (NULL == pak) {
++		return -ENOMEM;
++	}
++	/*
++	 * Read 10 bytes from the received buffer to test its
++	 * content for validity.
++	 */
++	if (sizeof(buffer) != packet_read(pak,
++	                                  sizeof(buffer), buffer,
++	                                  sizeof(buffer), 0)) {
++		goto failexit;
++	}
++	/*
++	 * Reset the packet read pointer so we can read all its
++	 * contents again.
++	 */
++	packet_reset(pak);
++
++	native_size = (__force __be32 *)(&buffer[4+2]);
++	/*
++	 * Verify that the size of the packet is correct
++	 * as indicated and that there's actually someone reading packets.
++	 * The minimum size of the packet is '10' for tag, size indicator
++	 * and ordinal.
++	 */
++	if (size < 10 ||
++	    be32_to_cpu(*native_size) != size ||
++	    0 == dataex.has_opener) {
++	    	rc = -EINVAL;
++	    	goto failexit;
++	} else {
++		if ((rc = vtpm_queue_packet(pak)) < 0) {
++			goto failexit;
++		}
++	}
++	return 0;
++
++failexit:
++	if (pak) {
++		tpm_send_fail_message(pak, buffer[4+1]);
++		packet_free(pak);
++	}
++	return rc;
++}
++
++
++/*
++ * Timeout function that gets invoked when a packet has not been processed
++ * during the timeout period.
++ * The packet must be on a list when this function is invoked. This
++ * also means that once its taken off a list, the timer must be
++ * destroyed as well.
++ */
++static void processing_timeout(unsigned long ptr)
++{
++	struct packet *pak = (struct packet *)ptr;
++	unsigned long flags;
++	write_lock_irqsave(&dataex.pak_lock, flags);
++	/*
++	 * The packet needs to be searched whether it
++	 * is still on the list.
++	 */
++	if (pak == packet_find_packet(&dataex.pending_pak, pak) ||
++	    pak == packet_find_packet(&dataex.current_pak, pak) ) {
++		list_del(&pak->next);
++		tpm_send_fail_message(pak, pak->req_tag);
++		packet_free(pak);
++	}
++
++	write_unlock_irqrestore(&dataex.pak_lock, flags);
++}
++
++
++
++static void tpm_tx_action(unsigned long unused);
++static DECLARE_TASKLET(tpm_tx_tasklet, tpm_tx_action, 0);
++
++#define MAX_PENDING_REQS TPMIF_TX_RING_SIZE
++
++static struct list_head tpm_schedule_list;
++static spinlock_t tpm_schedule_list_lock;
++
++static inline void
++maybe_schedule_tx_action(void)
++{
++	smp_mb();
++	tasklet_schedule(&tpm_tx_tasklet);
++}
++
++static inline int
++__on_tpm_schedule_list(tpmif_t * tpmif)
++{
++	return tpmif->list.next != NULL;
++}
++
++static void
++remove_from_tpm_schedule_list(tpmif_t * tpmif)
++{
++	spin_lock_irq(&tpm_schedule_list_lock);
++	if (likely(__on_tpm_schedule_list(tpmif))) {
++		list_del(&tpmif->list);
++		tpmif->list.next = NULL;
++		tpmif_put(tpmif);
++	}
++	spin_unlock_irq(&tpm_schedule_list_lock);
++}
++
++static void
++add_to_tpm_schedule_list_tail(tpmif_t * tpmif)
++{
++	if (__on_tpm_schedule_list(tpmif))
++		return;
++
++	spin_lock_irq(&tpm_schedule_list_lock);
++	if (!__on_tpm_schedule_list(tpmif) && tpmif->active) {
++		list_add_tail(&tpmif->list, &tpm_schedule_list);
++		tpmif_get(tpmif);
++	}
++	spin_unlock_irq(&tpm_schedule_list_lock);
++}
++
++void
++tpmif_schedule_work(tpmif_t * tpmif)
++{
++	add_to_tpm_schedule_list_tail(tpmif);
++	maybe_schedule_tx_action();
++}
++
++void
++tpmif_deschedule_work(tpmif_t * tpmif)
++{
++	remove_from_tpm_schedule_list(tpmif);
++}
++
++
++static void
++tpm_tx_action(unsigned long unused)
++{
++	struct list_head *ent;
++	tpmif_t *tpmif;
++	tpmif_tx_request_t *tx;
++
++	DPRINTK("%s: Getting data from front-end(s)!\n", __FUNCTION__);
++
++	while (!list_empty(&tpm_schedule_list)) {
++		/* Get a tpmif from the list with work to do. */
++		ent = tpm_schedule_list.next;
++		tpmif = list_entry(ent, tpmif_t, list);
++		tpmif_get(tpmif);
++		remove_from_tpm_schedule_list(tpmif);
++		/*
++		 * Ensure that we see the request when we read from it.
++		 */
++		mb();
++
++		tx = &tpmif->tx->ring[0].req;
++
++		/* pass it up */
++		vtpm_receive(tpmif, tx->size);
++
++		tpmif_put(tpmif);
++	}
++}
++
++irqreturn_t
++tpmif_be_int(int irq, void *dev_id, struct pt_regs *regs)
++{
++	tpmif_t *tpmif = dev_id;
++	add_to_tpm_schedule_list_tail(tpmif);
++	maybe_schedule_tx_action();
++	return IRQ_HANDLED;
++}
++
++static int __init
++tpmback_init(void)
++{
++	int rc;
++	if (!(xen_start_info.flags & SIF_TPM_BE_DOMAIN) &&
++	    !(xen_start_info.flags & SIF_INITDOMAIN)) {
++	    	printk(KERN_ALERT "Neither TPM-BE Domain nor INIT domain!\n");
++		return 0;
++	}
++
++	if ((rc = misc_register(&ibmvtpms_miscdevice)) != 0) {
++		printk(KERN_ALERT "Could not register misc device for TPM BE.\n");
++		return rc;
++	}
++
++	INIT_LIST_HEAD(&dataex.pending_pak);
++	INIT_LIST_HEAD(&dataex.current_pak);
++	dataex.has_opener = 0;
++	rwlock_init(&dataex.pak_lock);
++	init_waitqueue_head(&dataex.wait_queue);
++
++	spin_lock_init(&tpm_schedule_list_lock);
++	INIT_LIST_HEAD(&tpm_schedule_list);
++
++	tpmif_interface_init();
++	tpmif_xenbus_init();
++
++	printk(KERN_ALERT "Successfully initialized TPM backend driver.\n");
++
++	return 0;
++}
++
++__initcall(tpmback_init);
+Index: linux-2.6.13/drivers/xen/tpmback/xenbus.c
+===================================================================
+--- /dev/null
++++ linux-2.6.13/drivers/xen/tpmback/xenbus.c
+@@ -0,0 +1,271 @@
++/*  Xenbus code for tpmif backend
++    Copyright (C) 2005 Rusty Russell <rusty@rustcorp.com.au>
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program; if not, write to the Free Software
++    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++*/
++#include <stdarg.h>
++#include <linux/module.h>
++#include <asm-xen/xenbus.h>
++#include "common.h"
++
++struct backend_info
++{
++	struct xenbus_device *dev;
++
++	/* our communications channel */
++	tpmif_t *tpmif;
++
++	long int frontend_id;
++	long int instance; // instance of TPM
++
++	/* watch front end for changes */
++	struct xenbus_watch backend_watch;
++
++	struct xenbus_watch watch;
++	char * frontpath;
++};
++
++static int tpmback_remove(struct xenbus_device *dev)
++{
++	struct backend_info *be = dev->data;
++
++	if (be->watch.node) {
++		unregister_xenbus_watch(&be->watch);
++	}
++	unregister_xenbus_watch(&be->backend_watch);
++
++	tpmif_vtpm_close(be->instance);
++
++	if (be->tpmif) {
++		tpmif_put(be->tpmif);
++	}
++
++	if (be->frontpath)
++		kfree(be->frontpath);
++	kfree(be);
++	return 0;
++}
++
++
++static void frontend_changed(struct xenbus_watch *watch, const char *node)
++{
++	unsigned long ringref;
++	unsigned int evtchn;
++	unsigned long ready = 1;
++	int err;
++	struct backend_info *be
++		= container_of(watch, struct backend_info, watch);
++
++	/* If other end is gone, delete ourself. */
++	if (node && !xenbus_exists(be->frontpath, "")) {
++		xenbus_rm(be->dev->nodename, "");
++		device_unregister(&be->dev->dev);
++		return;
++	}
++
++	if (be->tpmif == NULL || be->tpmif->status == CONNECTED)
++		return;
++
++	err = xenbus_gather(be->frontpath,
++	                    "ring-ref", "%lu", &ringref,
++			    "event-channel", "%u", &evtchn, NULL);
++	if (err) {
++		xenbus_dev_error(be->dev, err,
++				 "reading %s/grant-id and event-channel",
++				 be->frontpath);
++		return;
++	}
++
++
++	/*
++	 * Tell the front-end that we are ready to go -
++	 * unless something bad happens
++	 */
++	err = xenbus_transaction_start(be->dev->nodename);
++	if (err) {
++		xenbus_dev_error(be->dev, err, "starting transaction");
++		return;
++	}
++
++	err = xenbus_printf(be->dev->nodename,
++	                    "ready", "%lu", ready);
++	if (err) {
++		xenbus_dev_error(be->dev, err, "writing 'ready'");
++		goto abort;
++	}
++
++	err = tpmif_map(be->tpmif, ringref, evtchn);
++	if (err) {
++		xenbus_dev_error(be->dev, err,
++				 "mapping shared-frame %lu port %u",
++				 ringref, evtchn);
++		goto abort;
++	}
++
++	err = tpmif_vtpm_open(be->tpmif,
++	                      be->frontend_id,
++	                      be->instance);
++	if (err) {
++		xenbus_dev_error(be->dev, err,
++		                 "queueing vtpm open packet");
++		/*
++		 * Should close down this device and notify FE
++		 * about closure.
++		 */
++		goto abort;
++	}
++
++	xenbus_transaction_end(0);
++	xenbus_dev_ok(be->dev);
++	return;
++abort:
++	xenbus_transaction_end(1);
++}
++
++
++static void backend_changed(struct xenbus_watch *watch, const char *node)
++{
++	int err;
++	long int instance;
++	struct backend_info *be
++		= container_of(watch, struct backend_info, backend_watch);
++	struct xenbus_device *dev = be->dev;
++
++	err = xenbus_scanf(dev->nodename, "instance", "%li", &instance);
++	if (XENBUS_EXIST_ERR(err))
++		return;
++	if (err < 0) {
++		xenbus_dev_error(dev, err, "reading 'instance' variable");
++		return;
++	}
++
++	if (be->instance != -1 && be->instance != instance) {
++		printk(KERN_WARNING
++		       "cannot change the instance\n");
++		return;
++	}
++	be->instance = instance;
++
++	if (be->tpmif == NULL) {
++		be->tpmif = tpmif_find(be->frontend_id,
++		                       instance);
++		if (IS_ERR(be->tpmif)) {
++			err = PTR_ERR(be->tpmif);
++			be->tpmif = NULL;
++			xenbus_dev_error(dev, err, "creating interface");
++			return;
++		}
++
++		/* Pass in NULL node to skip exist test. */
++		frontend_changed(&be->watch, be->frontpath);
++	}
++}
++
++
++static int tpmback_probe(struct xenbus_device *dev,
++			 const struct xenbus_device_id *id)
++{
++	struct backend_info *be;
++	char *frontend;
++	int err;
++
++	be = kmalloc(sizeof(*be), GFP_KERNEL);
++	if (!be) {
++		xenbus_dev_error(dev, -ENOMEM, "allocating backend structure");
++		err = -ENOMEM;
++	}
++
++	memset(be, 0, sizeof(*be));
++
++	frontend = NULL;
++	err = xenbus_gather(dev->nodename,
++			    "frontend-id", "%li", &be->frontend_id,
++			    "frontend", NULL, &frontend,
++			    NULL);
++	if (XENBUS_EXIST_ERR(err))
++		goto free_be;
++	if (err < 0) {
++		xenbus_dev_error(dev, err,
++				 "reading %s/frontend or frontend-id",
++				 dev->nodename);
++		goto free_be;
++	}
++	if (strlen(frontend) == 0 || !xenbus_exists(frontend, "")) {
++		/* If we can't get a frontend path and a frontend-id,
++		 * then our bus-id is no longer valid and we need to
++		 * destroy the backend device.
++		 */
++		err = -ENOENT;
++		goto free_be;
++	}
++
++	be->dev = dev;
++	be->backend_watch.node     = dev->nodename;
++	be->backend_watch.callback = backend_changed;
++	be->instance = -1;
++	err = register_xenbus_watch(&be->backend_watch);
++	if (err) {
++		be->backend_watch.node = NULL;
++		xenbus_dev_error(dev, err, "adding backend watch on %s",
++				 dev->nodename);
++		goto free_be;
++	}
++
++	be->frontpath = frontend;
++	be->watch.node = be->frontpath;
++	be->watch.callback = frontend_changed;
++	err = register_xenbus_watch(&be->watch);
++	if (err) {
++		be->watch.node = NULL;
++		xenbus_dev_error(dev, err,
++				 "adding frontend watch on %s",
++				 be->frontpath);
++		goto free_be;
++	}
++
++	dev->data = be;
++
++	backend_changed(&be->backend_watch, dev->nodename);
++	return err;
++
++free_be:
++	if (be->backend_watch.node)
++		unregister_xenbus_watch(&be->backend_watch);
++	if (frontend)
++		kfree(frontend);
++	kfree(be);
++	return err;
++}
++
++
++static struct xenbus_device_id tpmback_ids[] = {
++	{ "vtpm" },
++	{ "" }
++};
++
++
++static struct xenbus_driver tpmback = {
++	.name = "vtpm",
++	.owner = THIS_MODULE,
++	.ids = tpmback_ids,
++	.probe = tpmback_probe,
++	.remove = tpmback_remove,
++};
++
++
++void tpmif_xenbus_init(void)
++{
++	xenbus_register_backend(&tpmback);
++}
+Index: linux-2.6.13/drivers/xen/tpmfront/Makefile
+===================================================================
+--- /dev/null
++++ linux-2.6.13/drivers/xen/tpmfront/Makefile
+@@ -0,0 +1,2 @@
++
++obj-$(CONFIG_XEN_TPMDEV_FRONTEND)	+= tpmfront.o
+Index: linux-2.6.13/drivers/xen/tpmfront/tpmfront.c
+===================================================================
+--- /dev/null
++++ linux-2.6.13/drivers/xen/tpmfront/tpmfront.c
+@@ -0,0 +1,739 @@
++/*
++ * Copyright (c) 2005, IBM Corporation
++ *
++ * Author: Stefan Berger, stefanb@us.ibm.com
++ * Grant table support: Mahadevan Gomathisankaran
++ *
++ * This code has been derived from drivers/xen/netfront/netfront.c
++ *
++ * Copyright (c) 2002-2004, K A Fraser
++ *
++ * This file may be distributed separately from the Linux kernel, or
++ * incorporated into other software packages, subject to the following license:
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this source file (the "Software"), to deal in the Software without
++ * restriction, including without limitation the rights to use, copy, modify,
++ * merge, publish, distribute, sublicense, and/or sell copies of the Software,
++ * and to permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ */
++
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/version.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/errno.h>
++#include <linux/interrupt.h>
++#include <linux/init.h>
++#include <linux/tpmfe.h>
++
++#include <asm/semaphore.h>
++#include <asm/io.h>
++#include <asm-xen/evtchn.h>
++#include <asm-xen/ctrl_if.h>
++#include <asm-xen/xen-public/io/tpmif.h>
++#include <asm/uaccess.h>
++#include <asm-xen/xenbus.h>
++#include <asm-xen/xen-public/io/domain_controller.h>
++#include <asm-xen/xen-public/grant_table.h>
++
++#include "tpmfront.h"
++
++#undef DEBUG
++
++#if 1
++#define ASSERT(_p) \
++    if ( !(_p) ) { printk("Assertion '%s' failed, line %d, file %s", #_p , \
++        __LINE__, __FILE__); *(int*)0=0; }
++#else
++#define ASSERT(_p)
++#endif
++
++/* locally visible variables */
++static grant_ref_t gref_head;
++static struct tpm_private my_private;
++
++/* local function prototypes */
++static irqreturn_t tpmif_int(int irq,
++                             void *tpm_priv,
++                             struct pt_regs *ptregs);
++static void tpmif_rx_action(unsigned long unused);
++static void tpmif_connect(u16 evtchn, domid_t domid);
++static DECLARE_TASKLET(tpmif_rx_tasklet, tpmif_rx_action, 0);
++static int tpm_allocate_buffers(struct tpm_private *tp);
++static void tpmif_set_connected_state(struct tpm_private *tp, int newstate);
++static int tpm_xmit(struct tpm_private *tp,
++                    const u8 * buf, size_t count, int userbuffer,
++                    void *remember);
++
++#if DEBUG
++#define DPRINTK(fmt, args...) \
++    printk(KERN_ALERT "xen_tpm_fr (%s:%d) " fmt, __FUNCTION__, __LINE__, ##args)
++#else
++#define DPRINTK(fmt, args...) ((void)0)
++#endif
++#define IPRINTK(fmt, args...) \
++    printk(KERN_INFO "xen_tpm_fr: " fmt, ##args)
++#define WPRINTK(fmt, args...) \
++    printk(KERN_WARNING "xen_tpm_fr: " fmt, ##args)
++
++
++static inline int
++tx_buffer_copy(struct tx_buffer *txb, const u8 * src, int len,
++               int isuserbuffer)
++{
++	int copied = len;
++
++	if (len > txb->size) {
++		copied = txb->size;
++	}
++	if (isuserbuffer) {
++		if (copy_from_user(txb->data,
++		                   src,
++		                   copied)) {
++			return -EFAULT;
++		}
++	} else {
++		memcpy(txb->data, src, copied);
++	}
++	txb->len = len;
++	return copied;
++}
++
++static inline struct tx_buffer *tx_buffer_alloc(void)
++{
++	struct tx_buffer *txb = kmalloc(sizeof (struct tx_buffer),
++					GFP_KERNEL);
++
++	if (txb) {
++		txb->len = 0;
++		txb->size = PAGE_SIZE;
++		txb->data = (unsigned char *)__get_free_page(GFP_KERNEL);
++		if (txb->data == NULL) {
++			kfree(txb);
++			txb = NULL;
++		}
++	}
++	return txb;
++}
++
++
++/**************************************************************
++
++ The interface to let the tpm plugin register its callback
++ function and send data to another partition using this module
++
++**************************************************************/
++
++static DECLARE_MUTEX(upperlayer_lock);
++static DECLARE_MUTEX(suspend_lock);
++static struct tpmfe_device *upperlayer_tpmfe;
++
++/*
++ * Send data via this module by calling this function
++ */
++int tpm_fe_send(const u8 * buf, size_t count, void *ptr)
++{
++	int sent = 0;
++	struct tpm_private *tp = &my_private;
++
++	down(&suspend_lock);
++	sent = tpm_xmit(tp, buf, count, 0, ptr);
++	up(&suspend_lock);
++
++	return sent;
++}
++EXPORT_SYMBOL(tpm_fe_send);
++
++/*
++ * Register a callback for receiving data from this module
++ */
++int tpm_fe_register_receiver(struct tpmfe_device *tpmfe_dev)
++{
++	int rc = 0;
++
++	down(&upperlayer_lock);
++	if (NULL == upperlayer_tpmfe) {
++		upperlayer_tpmfe = tpmfe_dev;
++		tpmfe_dev->max_tx_size = TPMIF_TX_RING_SIZE * PAGE_SIZE;
++	} else {
++		rc = -EBUSY;
++	}
++	up(&upperlayer_lock);
++	return rc;
++}
++EXPORT_SYMBOL(tpm_fe_register_receiver);
++
++/*
++ * Unregister the callback for receiving data from this module
++ */
++void tpm_fe_unregister_receiver(void)
++{
++	down(&upperlayer_lock);
++	upperlayer_tpmfe = NULL;
++	up(&upperlayer_lock);
++}
++EXPORT_SYMBOL(tpm_fe_unregister_receiver);
++
++/*
++ * Call this function to send data to the upper layer's
++ * registered receiver function.
++ */
++static int tpm_fe_send_upperlayer(const u8 * buf, size_t count,
++                                  const void *ptr)
++{
++	int rc;
++
++	down(&upperlayer_lock);
++
++	if (upperlayer_tpmfe && upperlayer_tpmfe->receive) {
++		rc = upperlayer_tpmfe->receive(buf, count, ptr);
++	} else {
++		rc = 0;
++	}
++
++	up(&upperlayer_lock);
++	return rc;
++}
++
++/**************************************************************
++ XENBUS support code
++**************************************************************/
++
++static void watch_for_status(struct xenbus_watch *watch, const char *node)
++{
++	struct tpmfront_info *info;
++	int err;
++	unsigned long ready;
++	struct tpm_private *tp = &my_private;
++
++	info = container_of(watch, struct tpmfront_info, watch);
++	node += strlen(watch->node);
++
++	if (tp->connected)
++		return;
++
++	err = xenbus_gather(watch->node,
++	                    "ready", "%lu", &ready,
++	                    NULL);
++	if (err) {
++		xenbus_dev_error(info->dev, err, "reading 'ready' field");
++		return;
++	}
++
++	tpmif_set_connected_state(tp, 1);
++
++	xenbus_dev_ok(info->dev);
++}
++
++
++static int setup_tpmring(struct xenbus_device *dev,
++                         struct tpmfront_info * info,
++                         domid_t backend_id)
++{
++	tpmif_tx_interface_t *sring;
++	struct tpm_private *tp = &my_private;
++
++	evtchn_op_t op = { .cmd = EVTCHNOP_alloc_unbound };
++	int err;
++
++	sring = (void *)__get_free_page(GFP_KERNEL);
++	if (!sring) {
++		xenbus_dev_error(dev, -ENOMEM, "allocating shared ring");
++		return -ENOMEM;
++	}
++	tp->tx = sring;
++
++	tpm_allocate_buffers(tp);
++
++	info->ring_ref = gnttab_claim_grant_reference(&gref_head);
++	ASSERT(info->ring_ref != -ENOSPC);
++	gnttab_grant_foreign_access_ref(info->ring_ref,
++					backend_id,
++					(virt_to_machine(tp->tx) >> PAGE_SHIFT),
++					0);
++
++	op.u.alloc_unbound.dom = backend_id;
++	err = HYPERVISOR_event_channel_op(&op);
++	if (err) {
++		free_page((unsigned long)sring);
++		tp->tx = 0;
++		xenbus_dev_error(dev, err, "allocating event channel");
++		return err;
++	}
++	tpmif_connect(op.u.alloc_unbound.port, backend_id);
++	return 0;
++}
++
++
++static void destroy_tpmring(struct tpmfront_info *info, struct tpm_private *tp)
++{
++	tpmif_set_connected_state(tp,0);
++
++	if ( tp->tx != NULL ) {
++		free_page((unsigned long)tp->tx);
++		tp->tx = NULL;
++	}
++	unbind_evtchn_from_irqhandler(tp->evtchn, NULL);
++	tp->evtchn = 0;
++}
++
++
++static int talk_to_backend(struct xenbus_device *dev,
++                           struct tpmfront_info *info)
++{
++	char *backend;
++	const char *message;
++	int err;
++	int backend_id;
++
++	backend = NULL;
++	err = xenbus_gather(dev->nodename,
++			    "backend-id", "%i", &backend_id,
++			    "backend", NULL, &backend,
++			    NULL);
++	if (XENBUS_EXIST_ERR(err))
++		goto out;
++	if (backend && strlen(backend) == 0) {
++		err = -ENOENT;
++		goto out;
++	}
++	if (err < 0) {
++		xenbus_dev_error(dev, err, "reading %s/backend or backend-id",
++				 dev->nodename);
++		goto out;
++	}
++
++	info->backend_id      = backend_id;
++	my_private.backend_id = backend_id;
++
++	err = setup_tpmring(dev, info, backend_id);
++	if (err) {
++		xenbus_dev_error(dev, err, "setting up ring");
++		goto out;
++	}
++
++	err = xenbus_transaction_start(dev->nodename);
++	if (err) {
++		xenbus_dev_error(dev, err, "starting transaction");
++		goto destroy_tpmring;
++	}
++
++	err = xenbus_printf(dev->nodename,
++	                    "ring-ref","%u", info->ring_ref);
++	if (err) {
++		message = "writing ring-ref";
++		goto abort_transaction;
++	}
++
++	err = xenbus_printf(dev->nodename,
++			    "event-channel", "%u", my_private.evtchn);
++	if (err) {
++		message = "writing event-channel";
++		goto abort_transaction;
++	}
++
++	info->backend = backend;
++	backend = NULL;
++
++	info->watch.node = info->backend;
++	info->watch.callback = watch_for_status;
++	err = register_xenbus_watch(&info->watch);
++	if (err) {
++		message = "registering watch on backend";
++		goto abort_transaction;
++	}
++
++	err = xenbus_transaction_end(0);
++	if (err) {
++		xenbus_dev_error(dev, err, "completing transaction");
++		goto destroy_tpmring;
++	}
++
++out:
++	if (backend)
++		kfree(backend);
++	return err;
++
++abort_transaction:
++	xenbus_transaction_end(1);
++	/* Have to do this *outside* transaction.  */
++	xenbus_dev_error(dev, err, "%s", message);
++destroy_tpmring:
++	destroy_tpmring(info, &my_private);
++	goto out;
++}
++
++
++static int tpmfront_probe(struct xenbus_device *dev,
++                          const struct xenbus_device_id *id)
++{
++	int err;
++	struct tpmfront_info *info;
++	int handle;
++
++	err = xenbus_scanf(dev->nodename,
++	                   "handle", "%i", &handle);
++	if (XENBUS_EXIST_ERR(err))
++		return err;
++
++	if (err < 0) {
++		xenbus_dev_error(dev,err,"reading virtual-device");
++		return err;
++	}
++
++	info = kmalloc(sizeof(*info), GFP_KERNEL);
++	if (!info) {
++		xenbus_dev_error(dev,err,"allocating info structure");
++		return err;
++	}
++	memset(info, 0x0, sizeof(*info));
++
++	info->dev = dev;
++	info->handle = handle;
++	dev->data = info;
++
++	err = talk_to_backend(dev, info);
++	if (err) {
++		kfree(info);
++		dev->data = NULL;
++		return err;
++	}
++
++	watch_for_status(&info->watch, info->watch.node);
++	return 0;
++}
++
++static int tpmfront_remove(struct xenbus_device *dev)
++{
++	struct tpmfront_info *info = dev->data;
++	if (info->backend)
++		unregister_xenbus_watch(&info->watch);
++
++	destroy_tpmring(info, &my_private);
++
++	kfree(info->backend);
++	kfree(info);
++
++	return 0;
++}
++
++static int tpmfront_suspend(struct xenbus_device *dev)
++{
++	struct tpmfront_info *info = dev->data;
++	struct tpm_private *tp = &my_private;
++
++	/* lock so no app can send */
++	down(&suspend_lock);
++
++	while (atomic_read(&tp->tx_busy)) {
++		printk("---- TPMIF: Outstanding request.\n");
++#if 0
++		/*
++		 * Would like to wait until the outstanding request
++		 * has come back, but this does not work properly, yet.
++		 */
++		interruptible_sleep_on_timeout(&tp->wait_q,
++		                               100);
++#else
++		break;
++#endif
++	}
++
++	unregister_xenbus_watch(&info->watch);
++
++	kfree(info->backend);
++	info->backend = NULL;
++
++	destroy_tpmring(info, tp);
++
++	return 0;
++}
++
++static int tpmif_recover(void)
++{
++	return 0;
++}
++
++static int tpmfront_resume(struct xenbus_device *dev)
++{
++	struct tpmfront_info *info = dev->data;
++	int err;
++
++	err = talk_to_backend(dev, info);
++	if (!err) {
++		tpmif_recover();
++	}
++
++	/* unlock so apps can resume */
++	up(&suspend_lock);
++
++	return err;
++}
++
++static void tpmif_connect(u16 evtchn, domid_t domid)
++{
++	int err = 0;
++	struct tpm_private *tp = &my_private;
++
++	tp->evtchn = evtchn;
++	tp->backend_id  = domid;
++
++	err = bind_evtchn_to_irqhandler(
++		tp->evtchn,
++		tpmif_int, SA_SAMPLE_RANDOM, "tpmif", tp);
++	if ( err != 0 ) {
++		WPRINTK("bind_evtchn_to_irqhandler failed (err=%d)\n", err);
++		return;
++	}
++}
++
++static struct xenbus_device_id tpmfront_ids[] = {
++	{ "vtpm" },
++	{ "" }
++};
++
++static struct xenbus_driver tpmfront = {
++	.name = "vtpm",
++	.owner = THIS_MODULE,
++	.ids = tpmfront_ids,
++	.probe = tpmfront_probe,
++	.remove =  tpmfront_remove,
++	.resume = tpmfront_resume,
++	.suspend = tpmfront_suspend,
++};
++
++static void __init init_tpm_xenbus(void)
++{
++	xenbus_register_device(&tpmfront);
++}
++
++
++static int
++tpm_allocate_buffers(struct tpm_private *tp)
++{
++	unsigned int i;
++
++	i = 0;
++	while (i < TPMIF_TX_RING_SIZE) {
++		tp->tx_buffers[i] = tx_buffer_alloc();
++		i++;
++	}
++
++	return 1;
++}
++
++static void
++tpmif_rx_action(unsigned long unused)
++{
++	struct tpm_private *tp = &my_private;
++
++	int i = 0;
++	unsigned int received;
++	unsigned int offset = 0;
++	u8 *buffer;
++	tpmif_tx_request_t *tx;
++	tx = &tp->tx->ring[i].req;
++
++	received = tx->size;
++
++	buffer = kmalloc(received, GFP_KERNEL);
++	if (NULL == buffer) {
++		goto exit;
++	}
++
++	i = 0;
++	while (i < TPMIF_TX_RING_SIZE &&
++	       offset < received) {
++		struct tx_buffer *txb = tp->tx_buffers[i];
++		tpmif_tx_request_t *tx;
++		unsigned int tocopy;
++
++		tx = &tp->tx->ring[i].req;
++		tocopy = tx->size;
++		if (tocopy > PAGE_SIZE) {
++			tocopy = PAGE_SIZE;
++		}
++
++		memcpy(&buffer[offset], txb->data, tocopy);
++
++		gnttab_release_grant_reference(&gref_head, tx->ref);
++
++		offset += tocopy;
++		i++;
++	}
++
++	tpm_fe_send_upperlayer(buffer, received, tp->tx_remember);
++	kfree(buffer);
++
++exit:
++	atomic_set(&tp->tx_busy, 0);
++	wake_up_interruptible(&tp->wait_q);
++}
++
++
++static irqreturn_t
++tpmif_int(int irq, void *tpm_priv, struct pt_regs *ptregs)
++{
++	struct tpm_private *tp = tpm_priv;
++	unsigned long flags;
++
++	spin_lock_irqsave(&tp->tx_lock, flags);
++	tasklet_schedule(&tpmif_rx_tasklet);
++	spin_unlock_irqrestore(&tp->tx_lock, flags);
++
++	return IRQ_HANDLED;
++}
++
++
++static int
++tpm_xmit(struct tpm_private *tp,
++         const u8 * buf, size_t count, int isuserbuffer,
++         void *remember)
++{
++	tpmif_tx_request_t *tx;
++	TPMIF_RING_IDX i;
++	unsigned int offset = 0;
++
++	spin_lock_irq(&tp->tx_lock);
++
++	if (unlikely(atomic_read(&tp->tx_busy))) {
++		printk("There's an outstanding request/response on the way!\n");
++		spin_unlock_irq(&tp->tx_lock);
++		return -EBUSY;
++	}
++
++	if (tp->connected != 1) {
++		spin_unlock_irq(&tp->tx_lock);
++		return -EIO;
++	}
++
++	i = 0;
++	while (count > 0 && i < TPMIF_TX_RING_SIZE) {
++		struct tx_buffer *txb = tp->tx_buffers[i];
++		int copied;
++
++		if (NULL == txb) {
++			DPRINTK("txb (i=%d) is NULL. buffers initilized?\n", i);
++			DPRINTK("Not transmittin anything!\n");
++			spin_unlock_irq(&tp->tx_lock);
++			return -EFAULT;
++		}
++		copied = tx_buffer_copy(txb, &buf[offset], count,
++		                        isuserbuffer);
++		if (copied < 0) {
++			/* An error occurred */
++			return copied;
++		}
++		count -= copied;
++		offset += copied;
++
++		tx = &tp->tx->ring[i].req;
++
++		tx->id = i;
++		tx->addr = virt_to_machine(txb->data);
++		tx->size = txb->len;
++
++		DPRINTK("First 4 characters sent by TPM-FE are 0x%02x 0x%02x 0x%02x 0x%02x\n",
++		        txb->data[0],txb->data[1],txb->data[2],txb->data[3]);
++
++		/* get the granttable reference for this page */
++		tx->ref = gnttab_claim_grant_reference( &gref_head );
++
++		if(-ENOSPC == tx->ref ) {
++			DPRINTK(" Grant table claim reference failed in func:%s line:%d file:%s\n", __FUNCTION__, __LINE__, __FILE__);
++			return -ENOSPC;
++		}
++		gnttab_grant_foreign_access_ref( tx->ref,
++		                                 tp->backend_id,
++		                                 (tx->addr >> PAGE_SHIFT),
++		                                 0 /*RW*/);
++		i++;
++		wmb();
++	}
++
++	atomic_set(&tp->tx_busy, 1);
++	tp->tx_remember = remember;
++	mb();
++
++	DPRINTK("Notifying backend via event channel %d\n",
++	        tp->evtchn);
++
++	notify_via_evtchn(tp->evtchn);
++
++	spin_unlock_irq(&tp->tx_lock);
++	return offset;
++}
++
++
++static void tpmif_notify_upperlayer(struct tpm_private *tp)
++{
++	/*
++	 * Notify upper layer about the state of the connection
++	 * to the BE.
++	 */
++	down(&upperlayer_lock);
++
++	if (upperlayer_tpmfe != NULL) {
++		switch (tp->connected) {
++			case 1:
++				upperlayer_tpmfe->status(TPMFE_STATUS_CONNECTED);
++			break;
++
++			default:
++				upperlayer_tpmfe->status(0);
++			break;
++		}
++	}
++	up(&upperlayer_lock);
++}
++
++
++static void tpmif_set_connected_state(struct tpm_private *tp, int newstate)
++{
++	if (newstate != tp->connected) {
++		tp->connected = newstate;
++		tpmif_notify_upperlayer(tp);
++	}
++}
++
++
++/* =================================================================
++ * Initialization function.
++ * =================================================================
++ */
++
++static int __init
++tpmif_init(void)
++{
++	IPRINTK("Initialising the vTPM driver.\n");
++	if ( gnttab_alloc_grant_references ( TPMIF_TX_RING_SIZE,
++	                                     &gref_head ) < 0) {
++		return -EFAULT;
++	}
++	/*
++	 * Only don't send the driver status when we are in the
++	 * INIT domain.
++	 */
++	spin_lock_init(&my_private.tx_lock);
++	init_waitqueue_head(&my_private.wait_q);
++
++	init_tpm_xenbus();
++
++	return 0;
++}
++
++__initcall(tpmif_init);
+Index: linux-2.6.13/drivers/xen/tpmfront/tpmfront.h
+===================================================================
+--- /dev/null
++++ linux-2.6.13/drivers/xen/tpmfront/tpmfront.h
+@@ -0,0 +1,38 @@
++#ifndef TPM_FRONT_H
++#define TPM_FRONT_H
++
++
++struct tpm_private {
++	tpmif_tx_interface_t *tx;
++	unsigned int evtchn;
++	int connected;
++
++	spinlock_t tx_lock;
++
++	struct tx_buffer *tx_buffers[TPMIF_TX_RING_SIZE];
++
++	atomic_t tx_busy;
++	void *tx_remember;
++	domid_t backend_id;
++	wait_queue_head_t wait_q;
++};
++
++
++struct tpmfront_info
++{
++	struct xenbus_watch watch;
++	int handle;
++	struct xenbus_device *dev;
++	char *backend;
++	int ring_ref;
++	domid_t backend_id;
++};
++
++
++struct tx_buffer {
++	unsigned int size;	// available space in data
++	unsigned int len;	// used space in data
++	unsigned char *data;    // pointer to a page
++};
++
++#endif
+Index: linux-2.6.13/include/linux/tpmfe.h
+===================================================================
+--- /dev/null
++++ linux-2.6.13/include/linux/tpmfe.h
+@@ -0,0 +1,33 @@
++#ifndef TPM_FE_H
++#define TPM_FE_H
++
++struct tpmfe_device {
++	/*
++	 * Let upper layer receive data from front-end
++	 */
++	int (*receive)(const u8 *buffer, size_t count, const void *ptr);
++	/*
++	 * Indicate the status of the front-end to the upper
++	 * layer.
++	 */
++	void (*status)(unsigned int flags);
++
++	/*
++	 * This field indicates the maximum size the driver can
++	 * transfer in one chunk. It is filled out by the front-end
++	 * driver and should be propagated to the generic tpm driver
++	 * for allocation of buffers.
++	 */
++	unsigned int max_tx_size;
++};
++
++enum {
++	TPMFE_STATUS_DISCONNECTED = 0x0,
++	TPMFE_STATUS_CONNECTED = 0x1
++};
++
++int tpm_fe_send(const u8 * buf, size_t count, void *ptr);
++int tpm_fe_register_receiver(struct tpmfe_device *);
++void tpm_fe_unregister_receiver(void);
++
++#endif
+Index: linux-2.6.13/drivers/char/tpm/tpm_nopci.c
+===================================================================
+--- /dev/null
++++ linux-2.6.13/drivers/char/tpm/tpm_nopci.c
+@@ -0,0 +1,741 @@
++/*
++ * Copyright (C) 2004 IBM Corporation
++ *
++ * Authors:
++ * Leendert van Doorn <leendert@watson.ibm.com>
++ * Dave Safford <safford@watson.ibm.com>
++ * Reiner Sailer <sailer@watson.ibm.com>
++ * Kylene Hall <kjhall@us.ibm.com>
++ *
++ * Maintained by: <tpmdd_devel@lists.sourceforge.net>
++ *
++ * Device driver for TCG/TCPA TPM (trusted platform module).
++ * Specifications at www.trustedcomputinggroup.org
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation, version 2 of the
++ * License.
++ *
++ * Note, the TPM chip is not interrupt driven (only polling)
++ * and can have very long timeouts (minutes!). Hence the unusual
++ * calls to schedule_timeout.
++ *
++ */
++
++#include <linux/sched.h>
++#include <linux/poll.h>
++#include <linux/spinlock.h>
++#include "tpm_nopci.h"
++
++enum {
++	TPM_MINOR = 224,	/* officially assigned */
++	TPM_BUFSIZE = 2048,
++	TPM_NUM_DEVICES = 256,
++	TPM_NUM_MASK_ENTRIES = TPM_NUM_DEVICES / (8 * sizeof(int))
++};
++
++  /* PCI configuration addresses */
++enum {
++	PCI_GEN_PMCON_1 = 0xA0,
++	PCI_GEN1_DEC = 0xE4,
++	PCI_LPC_EN = 0xE6,
++	PCI_GEN2_DEC = 0xEC
++};
++
++enum {
++	TPM_LOCK_REG = 0x0D,
++	TPM_INTERUPT_REG = 0x0A,
++	TPM_BASE_ADDR_LO = 0x08,
++	TPM_BASE_ADDR_HI = 0x09,
++	TPM_UNLOCK_VALUE = 0x55,
++	TPM_LOCK_VALUE = 0xAA,
++	TPM_DISABLE_INTERUPT_VALUE = 0x00
++};
++
++static LIST_HEAD(tpm_chip_list);
++static spinlock_t driver_lock = SPIN_LOCK_UNLOCKED;
++static int dev_mask[32];
++
++static void user_reader_timeout(unsigned long ptr)
++{
++	struct tpm_chip *chip = (struct tpm_chip *) ptr;
++
++	down(&chip->buffer_mutex);
++	atomic_set(&chip->data_pending, 0);
++	memset(chip->data_buffer, 0, TPM_BUFSIZE);
++	up(&chip->buffer_mutex);
++}
++
++void tpm_time_expired(unsigned long ptr)
++{
++	int *exp = (int *) ptr;
++	*exp = 1;
++}
++
++EXPORT_SYMBOL_GPL(tpm_time_expired);
++
++
++/*
++ * This function should be used by other kernel subsystems attempting to use the tpm through the tpm_transmit interface.
++ * A call to this function will return the chip structure corresponding to the TPM you are looking for that can then be sent with your command to tpm_transmit.
++ * Passing 0 as the argument corresponds to /dev/tpm0 and thus the first and probably primary TPM on the system.  Passing 1 corresponds to /dev/tpm1 and the next TPM discovered.  If a TPM with the given chip_num does not exist NULL will be returned.
++ */
++struct tpm_chip* tpm_chip_lookup(int chip_num)
++{
++
++	struct tpm_chip *pos;
++	list_for_each_entry(pos, &tpm_chip_list, list)
++		if (pos->dev_num == chip_num ||
++		    chip_num == TPM_ANY_NUM)
++			return pos;
++
++	return NULL;
++
++}
++
++/*
++ * Internal kernel interface to transmit TPM commands
++ */
++ssize_t tpm_transmit(struct tpm_chip * chip, const char *buf,
++		     size_t bufsiz)
++{
++	ssize_t rc;
++	u32 count;
++	unsigned long stop;
++
++	count = be32_to_cpu(*((__be32 *) (buf + 2)));
++
++	if (count == 0)
++		return -ENODATA;
++	if (count > bufsiz) {
++		dev_err(chip->dev,
++			"invalid count value %x %x \n", count, bufsiz);
++		return -E2BIG;
++	}
++
++	dev_dbg(chip->dev, "TPM Ordinal: %d\n",
++		be32_to_cpu(*((__be32 *) (buf + 6))));
++	dev_dbg(chip->dev, "Chip Status: %x\n",
++		inb(chip->vendor->base + 1));
++
++	down(&chip->tpm_mutex);
++
++	if ((rc = chip->vendor->send(chip, (u8 *) buf, count)) < 0) {
++		dev_err(chip->dev,
++			"tpm_transmit: tpm_send: error %d\n", rc);
++		goto out;
++	}
++
++	stop = jiffies + 2 * 60 * HZ;
++	do {
++		u8 status = chip->vendor->status(chip);
++		if ((status & chip->vendor->req_complete_mask) ==
++		    chip->vendor->req_complete_val) {
++			goto out_recv;
++		}
++
++		if ((status == chip->vendor->req_canceled)) {
++			dev_err(chip->dev, "Operation Canceled\n");
++			rc = -ECANCELED;
++			goto out;
++		}
++
++		msleep(TPM_TIMEOUT);	/* CHECK */
++		rmb();
++	}
++	while (time_before(jiffies, stop));
++
++
++	chip->vendor->cancel(chip);
++	dev_err(chip->dev, "Operation Timed out\n");
++	rc = -ETIME;
++	goto out;
++
++out_recv:
++	rc = chip->vendor->recv(chip, (u8 *) buf, bufsiz);
++	if (rc < 0)
++		dev_err(chip->dev,
++			"tpm_transmit: tpm_recv: error %d\n", rc);
++	atomic_set(&chip->data_position, 0);
++
++out:
++	up(&chip->tpm_mutex);
++	return rc;
++}
++
++EXPORT_SYMBOL_GPL(tpm_transmit);
++
++#define TPM_DIGEST_SIZE 20
++#define CAP_PCR_RESULT_SIZE 18
++static const u8 cap_pcr[] = {
++	0, 193,			/* TPM_TAG_RQU_COMMAND */
++	0, 0, 0, 22,		/* length */
++	0, 0, 0, 101,		/* TPM_ORD_GetCapability */
++	0, 0, 0, 5,
++	0, 0, 0, 4,
++	0, 0, 1, 1
++};
++
++#define READ_PCR_RESULT_SIZE 30
++static const u8 pcrread[] = {
++	0, 193,			/* TPM_TAG_RQU_COMMAND */
++	0, 0, 0, 14,		/* length */
++	0, 0, 0, 21,		/* TPM_ORD_PcrRead */
++	0, 0, 0, 0		/* PCR index */
++};
++
++ssize_t tpm_show_pcrs(struct device *dev, char *buf)
++{
++	u8 data[READ_PCR_RESULT_SIZE];
++	ssize_t len;
++	int i, j, num_pcrs;
++	__be32 index;
++	char *str = buf;
++
++	struct tpm_chip *chip = dev_get_drvdata(dev);
++	if (chip == NULL)
++		return -ENODEV;
++
++	memcpy(data, cap_pcr, sizeof(cap_pcr));
++	if ((len = tpm_transmit(chip, data, sizeof(data)))
++	    < CAP_PCR_RESULT_SIZE)
++		return len;
++
++	num_pcrs = be32_to_cpu(*((__be32 *) (data + 14)));
++
++	for (i = 0; i < num_pcrs; i++) {
++		memcpy(data, pcrread, sizeof(pcrread));
++		index = cpu_to_be32(i);
++		memcpy(data + 10, &index, 4);
++		if ((len = tpm_transmit(chip, data, sizeof(data)))
++		    < READ_PCR_RESULT_SIZE)
++			return len;
++		str += sprintf(str, "PCR-%02d: ", i);
++		for (j = 0; j < TPM_DIGEST_SIZE; j++)
++			str += sprintf(str, "%02X ", *(data + 10 + j));
++		str += sprintf(str, "\n");
++	}
++	return str - buf;
++}
++
++EXPORT_SYMBOL_GPL(tpm_show_pcrs);
++
++/*
++ * Return 0 on success.  On error pass along error code.
++ * chip_id Upper 2 bytes equal ANY, HW_ONLY or SW_ONLY
++ * Lower 2 bytes equal tpm idx # or AN&
++ * res_buf must fit a TPM_PCR (20 bytes) or NULL if you don't care
++ */
++int tpm_pcr_read( u32 chip_id, int pcr_idx, u8* res_buf, int res_buf_size )
++{
++	u8 data[READ_PCR_RESULT_SIZE];
++	int rc;
++	__be32 index;
++	int chip_num = chip_id & TPM_CHIP_NUM_MASK;
++	struct tpm_chip* chip;
++
++	if ( res_buf && res_buf_size < TPM_DIGEST_SIZE )
++		return -ENOSPC;
++	if ( (chip = tpm_chip_lookup( chip_num /*,
++				       chip_id >> TPM_CHIP_TYPE_SHIFT*/ ) ) == NULL ) {
++		printk("chip %d not found.\n",chip_num);
++		return -ENODEV;
++	}
++	memcpy(data, pcrread, sizeof(pcrread));
++	index = cpu_to_be32(pcr_idx);
++	memcpy(data + 10, &index, 4);
++	if ((rc = tpm_transmit(chip, data, sizeof(data))) > 0 )
++		rc = be32_to_cpu(*((u32*)(data+6)));
++
++	if ( rc == 0 && res_buf )
++		memcpy(res_buf, data+10, TPM_DIGEST_SIZE);
++	return rc;
++}
++EXPORT_SYMBOL_GPL(tpm_pcr_read);
++
++#define EXTEND_PCR_SIZE 34
++static const u8 pcrextend[] = {
++	0, 193,		 		 		 /* TPM_TAG_RQU_COMMAND */
++	0, 0, 0, 34,		 		 /* length */
++	0, 0, 0, 20,		 		 /* TPM_ORD_Extend */
++	0, 0, 0, 0		 		 /* PCR index */
++};
++
++/*
++ * Return 0 on success.  On error pass along error code.
++ * chip_id Upper 2 bytes equal ANY, HW_ONLY or SW_ONLY
++ * Lower 2 bytes equal tpm idx # or ANY
++ */
++int tpm_pcr_extend(u32 chip_id, int pcr_idx, const u8* hash)
++{
++	u8 data[EXTEND_PCR_SIZE];
++	int rc;
++	__be32 index;
++	int chip_num = chip_id & TPM_CHIP_NUM_MASK;
++	struct tpm_chip* chip;
++
++	if ( (chip = tpm_chip_lookup( chip_num /*,
++				      chip_id >> TPM_CHIP_TYPE_SHIFT */)) == NULL )
++		return -ENODEV;
++
++	memcpy(data, pcrextend, sizeof(pcrextend));
++	index = cpu_to_be32(pcr_idx);
++	memcpy(data + 10, &index, 4);
++	memcpy( data + 14, hash, TPM_DIGEST_SIZE );
++	if ((rc = tpm_transmit(chip, data, sizeof(data))) > 0 )
++		rc = be32_to_cpu(*((u32*)(data+6)));
++	return rc;
++}
++EXPORT_SYMBOL_GPL(tpm_pcr_extend);
++
++
++
++#define  READ_PUBEK_RESULT_SIZE 314
++static const u8 readpubek[] = {
++	0, 193,			/* TPM_TAG_RQU_COMMAND */
++	0, 0, 0, 30,		/* length */
++	0, 0, 0, 124,		/* TPM_ORD_ReadPubek */
++};
++
++ssize_t tpm_show_pubek(struct device *dev, char *buf)
++{
++	u8 *data;
++	ssize_t len;
++	int i, rc;
++	char *str = buf;
++
++	struct tpm_chip *chip = dev_get_drvdata(dev);
++	if (chip == NULL)
++		return -ENODEV;
++
++	data = kmalloc(READ_PUBEK_RESULT_SIZE, GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	memcpy(data, readpubek, sizeof(readpubek));
++	memset(data + sizeof(readpubek), 0, 20);	/* zero nonce */
++
++	if ((len = tpm_transmit(chip, data, READ_PUBEK_RESULT_SIZE)) <
++	    READ_PUBEK_RESULT_SIZE) {
++		rc = len;
++		goto out;
++	}
++
++	/*
++	   ignore header 10 bytes
++	   algorithm 32 bits (1 == RSA )
++	   encscheme 16 bits
++	   sigscheme 16 bits
++	   parameters (RSA 12->bytes: keybit, #primes, expbit)
++	   keylenbytes 32 bits
++	   256 byte modulus
++	   ignore checksum 20 bytes
++	 */
++
++	str +=
++	    sprintf(str,
++		    "Algorithm: %02X %02X %02X %02X\nEncscheme: %02X %02X\n"
++		    "Sigscheme: %02X %02X\nParameters: %02X %02X %02X %02X"
++		    " %02X %02X %02X %02X %02X %02X %02X %02X\n"
++		    "Modulus length: %d\nModulus: \n",
++		    data[10], data[11], data[12], data[13], data[14],
++		    data[15], data[16], data[17], data[22], data[23],
++		    data[24], data[25], data[26], data[27], data[28],
++		    data[29], data[30], data[31], data[32], data[33],
++		    be32_to_cpu(*((__be32 *) (data + 32))));
++
++	for (i = 0; i < 256; i++) {
++		str += sprintf(str, "%02X ", data[i + 39]);
++		if ((i + 1) % 16 == 0)
++			str += sprintf(str, "\n");
++	}
++	rc = str - buf;
++out:
++	kfree(data);
++	return rc;
++}
++
++EXPORT_SYMBOL_GPL(tpm_show_pubek);
++
++#define CAP_VER_RESULT_SIZE 18
++static const u8 cap_version[] = {
++	0, 193,			/* TPM_TAG_RQU_COMMAND */
++	0, 0, 0, 18,		/* length */
++	0, 0, 0, 101,		/* TPM_ORD_GetCapability */
++	0, 0, 0, 6,
++	0, 0, 0, 0
++};
++
++#define CAP_MANUFACTURER_RESULT_SIZE 18
++static const u8 cap_manufacturer[] = {
++	0, 193,			/* TPM_TAG_RQU_COMMAND */
++	0, 0, 0, 22,		/* length */
++	0, 0, 0, 101,		/* TPM_ORD_GetCapability */
++	0, 0, 0, 5,
++	0, 0, 0, 4,
++	0, 0, 1, 3
++};
++
++ssize_t tpm_show_caps(struct device *dev, char *buf)
++{
++	u8 data[sizeof(cap_manufacturer)];
++	ssize_t len;
++	char *str = buf;
++
++	struct tpm_chip *chip = dev_get_drvdata(dev);
++	if (chip == NULL)
++		return -ENODEV;
++
++	memcpy(data, cap_manufacturer, sizeof(cap_manufacturer));
++
++	if ((len = tpm_transmit(chip, data, sizeof(data))) <
++	    CAP_MANUFACTURER_RESULT_SIZE)
++		return len;
++
++	str += sprintf(str, "Manufacturer: 0x%x\n",
++		       be32_to_cpu(*((__be32 *)(data + 14))));
++
++	memcpy(data, cap_version, sizeof(cap_version));
++
++	if ((len = tpm_transmit(chip, data, sizeof(data))) <
++	    CAP_VER_RESULT_SIZE)
++		return len;
++
++	str +=
++	    sprintf(str, "TCG version: %d.%d\nFirmware version: %d.%d\n",
++		    (int) data[14], (int) data[15], (int) data[16],
++		    (int) data[17]);
++
++	return str - buf;
++}
++
++EXPORT_SYMBOL_GPL(tpm_show_caps);
++
++ssize_t tpm_store_cancel(struct device * dev, const char *buf,
++			 size_t count)
++{
++	struct tpm_chip *chip = dev_get_drvdata(dev);
++	if (chip == NULL)
++		return 0;
++
++	chip->vendor->cancel(chip);
++	return count;
++}
++
++EXPORT_SYMBOL_GPL(tpm_store_cancel);
++
++/*
++ * Device file system interface to the TPM
++ */
++int tpm_open(struct inode *inode, struct file *file)
++{
++	int rc = 0, minor = iminor(inode);
++	struct tpm_chip *chip = NULL, *pos;
++
++	spin_lock(&driver_lock);
++
++	list_for_each_entry(pos, &tpm_chip_list, list) {
++		if (pos->vendor->miscdev.minor == minor) {
++			chip = pos;
++			break;
++		}
++	}
++
++	if (chip == NULL) {
++		rc = -ENODEV;
++		goto err_out;
++	}
++
++	if (chip->num_opens) {
++		dev_dbg(chip->dev, "Another process owns this TPM\n");
++		rc = -EBUSY;
++		goto err_out;
++	}
++
++	chip->num_opens++;
++	get_device(chip->dev);
++
++	spin_unlock(&driver_lock);
++
++	chip->data_buffer = kmalloc(TPM_BUFSIZE * sizeof(u8), GFP_KERNEL);
++	if (chip->data_buffer == NULL) {
++		chip->num_opens--;
++		put_device(chip->dev);
++		return -ENOMEM;
++	}
++
++	atomic_set(&chip->data_pending, 0);
++
++	file->private_data = chip;
++	return 0;
++
++err_out:
++	spin_unlock(&driver_lock);
++	return rc;
++}
++
++EXPORT_SYMBOL_GPL(tpm_open);
++
++int tpm_release(struct inode *inode, struct file *file)
++{
++	struct tpm_chip *chip = file->private_data;
++
++	spin_lock(&driver_lock);
++	file->private_data = NULL;
++	chip->num_opens--;
++	del_singleshot_timer_sync(&chip->user_read_timer);
++	atomic_set(&chip->data_pending, 0);
++	put_device(chip->dev);
++	kfree(chip->data_buffer);
++	spin_unlock(&driver_lock);
++	return 0;
++}
++
++EXPORT_SYMBOL_GPL(tpm_release);
++
++ssize_t tpm_write(struct file * file, const char __user * buf,
++		  size_t size, loff_t * off)
++{
++	struct tpm_chip *chip = file->private_data;
++	int in_size = size, out_size;
++
++	/* cannot perform a write until the read has cleared
++	   either via tpm_read or a user_read_timer timeout */
++	while (atomic_read(&chip->data_pending) != 0)
++		msleep(TPM_TIMEOUT);
++
++	down(&chip->buffer_mutex);
++
++	if (in_size > TPM_BUFSIZE)
++		in_size = TPM_BUFSIZE;
++
++	if (copy_from_user
++	    (chip->data_buffer, (void __user *) buf, in_size)) {
++		up(&chip->buffer_mutex);
++		return -EFAULT;
++	}
++
++	/* atomic tpm command send and result receive */
++	out_size = tpm_transmit(chip, chip->data_buffer, TPM_BUFSIZE);
++
++	atomic_set(&chip->data_pending, out_size);
++	up(&chip->buffer_mutex);
++
++	/* Set a timeout by which the reader must come claim the result */
++	mod_timer(&chip->user_read_timer, jiffies + (60 * HZ));
++
++	return in_size;
++}
++
++EXPORT_SYMBOL_GPL(tpm_write);
++
++ssize_t tpm_read(struct file * file, char __user * buf,
++		 size_t size, loff_t * off)
++{
++	struct tpm_chip *chip = file->private_data;
++	int ret_size;
++
++	del_singleshot_timer_sync(&chip->user_read_timer);
++	ret_size = atomic_read(&chip->data_pending);
++
++	if (ret_size > 0) {	/* relay data */
++		int position = atomic_read(&chip->data_position);
++
++		if (size < ret_size)
++			ret_size = size;
++
++		down(&chip->buffer_mutex);
++
++		if (copy_to_user((void __user *) buf,
++				 &chip->data_buffer[position],
++				 ret_size)) {
++			ret_size = -EFAULT;
++		} else {
++		 	int pending = atomic_read(&chip->data_pending) - ret_size;
++			atomic_set(&chip->data_pending,
++			           pending);
++			atomic_set(&chip->data_position,
++			           position + ret_size);
++		}
++		up(&chip->buffer_mutex);
++	}
++
++	return ret_size;
++}
++
++EXPORT_SYMBOL_GPL(tpm_read);
++
++void tpm_remove_hardware(struct device *dev)
++{
++	struct tpm_chip *chip = dev_get_drvdata(dev);
++	int i;
++
++	if (chip == NULL) {
++		dev_err(dev, "No device data found\n");
++		return;
++	}
++
++	spin_lock(&driver_lock);
++
++	list_del(&chip->list);
++
++	spin_unlock(&driver_lock);
++
++	dev_set_drvdata(dev, NULL);
++	misc_deregister(&chip->vendor->miscdev);
++
++	for (i = 0; i < TPM_NUM_ATTR; i++)
++		device_remove_file(dev, &chip->vendor->attr[i]);
++
++	dev_mask[chip->dev_num / TPM_NUM_MASK_ENTRIES] &=
++	    !(1 << (chip->dev_num % TPM_NUM_MASK_ENTRIES));
++
++	kfree(chip);
++
++	put_device(dev);
++}
++
++EXPORT_SYMBOL_GPL(tpm_remove_hardware);
++
++static const u8 savestate[] = {
++	0, 193,			/* TPM_TAG_RQU_COMMAND */
++	0, 0, 0, 10,		/* blob length (in bytes) */
++	0, 0, 0, 152		/* TPM_ORD_SaveState */
++};
++
++/*
++ * We are about to suspend. Save the TPM state
++ * so that it can be restored.
++ */
++int tpm_pm_suspend(struct pci_dev *pci_dev, u32 pm_state)
++{
++	struct tpm_chip *chip = pci_get_drvdata(pci_dev);
++	if (chip == NULL)
++		return -ENODEV;
++
++	tpm_transmit(chip, savestate, sizeof(savestate));
++	return 0;
++}
++
++EXPORT_SYMBOL_GPL(tpm_pm_suspend);
++
++/*
++ * Resume from a power safe. The BIOS already restored
++ * the TPM state.
++ */
++int tpm_pm_resume(struct pci_dev *pci_dev)
++{
++	struct tpm_chip *chip = pci_get_drvdata(pci_dev);
++
++	if (chip == NULL)
++		return -ENODEV;
++
++	return 0;
++}
++
++EXPORT_SYMBOL_GPL(tpm_pm_resume);
++
++/*
++ * Called from tpm_<specific>.c probe function only for devices
++ * the driver has determined it should claim.  Prior to calling
++ * this function the specific probe function has called pci_enable_device
++ * upon errant exit from this function specific probe function should call
++ * pci_disable_device
++ */
++int tpm_register_hardware_nopci(struct device *dev,
++			        struct tpm_vendor_specific *entry)
++{
++	char devname[7];
++	struct tpm_chip *chip;
++	int i, j;
++
++	/* Driver specific per-device data */
++	chip = kmalloc(sizeof(*chip), GFP_KERNEL);
++	if (chip == NULL)
++		return -ENOMEM;
++
++	memset(chip, 0, sizeof(struct tpm_chip));
++
++	init_MUTEX(&chip->buffer_mutex);
++	init_MUTEX(&chip->tpm_mutex);
++	INIT_LIST_HEAD(&chip->list);
++
++	init_timer(&chip->user_read_timer);
++	chip->user_read_timer.function = user_reader_timeout;
++	chip->user_read_timer.data = (unsigned long) chip;
++
++	chip->vendor = entry;
++
++	chip->dev_num = -1;
++
++	for (i = 0; i < TPM_NUM_MASK_ENTRIES; i++)
++		for (j = 0; j < 8 * sizeof(int); j++)
++			if ((dev_mask[i] & (1 << j)) == 0) {
++				chip->dev_num =
++				    i * TPM_NUM_MASK_ENTRIES + j;
++				dev_mask[i] |= 1 << j;
++				goto dev_num_search_complete;
++			}
++
++dev_num_search_complete:
++	if (chip->dev_num < 0) {
++		dev_err(dev, "No available tpm device numbers\n");
++		kfree(chip);
++		return -ENODEV;
++	} else if (chip->dev_num == 0)
++		chip->vendor->miscdev.minor = TPM_MINOR;
++	else
++		chip->vendor->miscdev.minor = MISC_DYNAMIC_MINOR;
++
++	snprintf(devname, sizeof(devname), "%s%d", "tpm", chip->dev_num);
++	chip->vendor->miscdev.name = devname;
++
++	chip->vendor->miscdev.dev = dev;
++	chip->dev = get_device(dev);
++
++
++	if (misc_register(&chip->vendor->miscdev)) {
++		dev_err(chip->dev,
++			"unable to misc_register %s, minor %d\n",
++			chip->vendor->miscdev.name,
++			chip->vendor->miscdev.minor);
++		put_device(dev);
++		kfree(chip);
++		dev_mask[i] &= !(1 << j);
++		return -ENODEV;
++	}
++
++	spin_lock(&driver_lock);
++
++	dev_set_drvdata(dev, chip);
++
++	list_add(&chip->list, &tpm_chip_list);
++
++	spin_unlock(&driver_lock);
++
++	for (i = 0; i < TPM_NUM_ATTR; i++)
++		device_create_file(dev, &chip->vendor->attr[i]);
++
++	return 0;
++}
++
++EXPORT_SYMBOL_GPL(tpm_register_hardware_nopci);
++
++static int __init init_tpm(void)
++{
++	return 0;
++}
++
++static void __exit cleanup_tpm(void)
++{
++
++}
++
++module_init(init_tpm);
++module_exit(cleanup_tpm);
++
++MODULE_AUTHOR("Leendert van Doorn (leendert@watson.ibm.com)");
++MODULE_DESCRIPTION("TPM Driver");
++MODULE_VERSION("2.0");
++MODULE_LICENSE("GPL");
+Index: linux-2.6.13/drivers/char/tpm/tpm_nopci.h
+===================================================================
+--- /dev/null
++++ linux-2.6.13/drivers/char/tpm/tpm_nopci.h
+@@ -0,0 +1,127 @@
++/*
++ * Copyright (C) 2004 IBM Corporation
++ *
++ * Authors:
++ * Leendert van Doorn <leendert@watson.ibm.com>
++ * Dave Safford <safford@watson.ibm.com>
++ * Reiner Sailer <sailer@watson.ibm.com>
++ * Kylene Hall <kjhall@us.ibm.com>
++ *
++ * Maintained by: <tpmdd_devel@lists.sourceforge.net>
++ *
++ * Device driver for TCG/TCPA TPM (trusted platform module).
++ * Specifications at www.trustedcomputinggroup.org
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation, version 2 of the
++ * License.
++ *
++ */
++#include <linux/module.h>
++#include <linux/version.h>
++#include <linux/pci.h>
++#include <linux/delay.h>
++#include <linux/miscdevice.h>
++
++enum {
++	TPM_TIMEOUT = 5,	/* msecs */
++	TPM_NUM_ATTR = 4
++};
++
++/* TPM addresses */
++enum {
++	TPM_ADDR = 0x4E,
++	TPM_DATA = 0x4F
++};
++
++/*
++ * Chip num is this value or a valid tpm idx in lower two bytes of chip_id
++ */
++enum tpm_chip_num {
++	TPM_ANY_NUM = 0xFFFF,
++};
++
++#define TPM_CHIP_NUM_MASK	0x0000ffff
++
++extern ssize_t tpm_show_pubek(struct device *, char *);
++extern ssize_t tpm_show_pcrs(struct device *, char *);
++extern ssize_t tpm_show_caps(struct device *, char *);
++extern ssize_t tpm_store_cancel(struct device *, const char *, size_t);
++
++#define TPM_DEVICE_ATTRS { \
++	__ATTR(pubek, S_IRUGO, tpm_show_pubek, NULL), \
++	__ATTR(pcrs, S_IRUGO, tpm_show_pcrs, NULL), \
++	__ATTR(caps, S_IRUGO, tpm_show_caps, NULL), \
++	__ATTR(cancel, S_IWUSR | S_IWGRP, NULL, tpm_store_cancel) }
++
++struct tpm_chip;
++
++struct tpm_vendor_specific {
++	u8 req_complete_mask;
++	u8 req_complete_val;
++	u8 req_canceled;
++	u16 base;		/* TPM base address */
++
++	int (*recv) (struct tpm_chip *, u8 *, size_t);
++	int (*send) (struct tpm_chip *, u8 *, size_t);
++	void (*cancel) (struct tpm_chip *);
++	 u8(*status) (struct tpm_chip *);
++	struct miscdevice miscdev;
++	struct device_attribute attr[TPM_NUM_ATTR];
++};
++
++struct tpm_chip {
++	struct device *dev;	/* PCI device stuff */
++
++	int dev_num;		/* /dev/tpm# */
++	int num_opens;		/* only one allowed */
++	int time_expired;
++
++	/* Data passed to and from the tpm via the read/write calls */
++	u8 *data_buffer;
++	atomic_t data_pending;
++	atomic_t data_position;
++	struct semaphore buffer_mutex;
++
++	struct timer_list user_read_timer;	/* user needs to claim result */
++	struct semaphore tpm_mutex;	/* tpm is processing */
++
++	struct tpm_vendor_specific *vendor;
++
++	struct list_head list;
++};
++
++static inline int tpm_read_index(int index)
++{
++	outb(index, TPM_ADDR);
++	return inb(TPM_DATA) & 0xFF;
++}
++
++static inline void tpm_write_index(int index, int value)
++{
++	outb(index, TPM_ADDR);
++	outb(value & 0xFF, TPM_DATA);
++}
++
++extern void tpm_time_expired(unsigned long);
++extern int tpm_lpc_bus_init(struct pci_dev *, u16);
++
++extern int tpm_register_hardware_nopci(struct device *,
++				       struct tpm_vendor_specific *);
++extern void tpm_remove_hardware(struct device *);
++extern int tpm_open(struct inode *, struct file *);
++extern int tpm_release(struct inode *, struct file *);
++extern ssize_t tpm_write(struct file *, const char __user *, size_t,
++			 loff_t *);
++extern ssize_t tpm_read(struct file *, char __user *, size_t, loff_t *);
++extern int tpm_pcr_extend(u32 chip_id, int pcr_idx, const u8* hash);
++extern int tpm_pcr_read( u32 chip_id, int pcr_idx, u8* res_buf, int res_buf_size );
++
++extern int tpm_pm_suspend(struct pci_dev *, u32);
++extern int tpm_pm_resume(struct pci_dev *);
++
++/* internal kernel interface */
++extern ssize_t tpm_transmit(struct tpm_chip *chip, const char *buf,
++			    size_t bufsiz);
++extern struct tpm_chip *tpm_chip_lookup(int chip_num);
