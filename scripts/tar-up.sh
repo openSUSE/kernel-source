@@ -129,7 +129,8 @@ done
 
 for archive in config \
 	       patches.arch patches.drivers patches.fixes patches.rpmify \
-	       patches.suse patches.uml patches.xen patches.addon; do
+	       patches.suse patches.uml patches.xen patches.addon \
+	       patches.kernel.org; do
     if ! [ -e $BUILD_DIR/$archive.tar.bz2 ]; then
 	bzip2 -9 < /dev/null > $BUILD_DIR/$archive.tar.bz2
     fi
