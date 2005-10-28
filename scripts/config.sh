@@ -8,6 +8,6 @@ else
 fi
 
 # The version of the main tarball to use
-SRCVERSION=2.6.13
+SRCVERSION=2.6.14
 BUILD_DIR=kernel-source
 IGNORE_ARCHS=
