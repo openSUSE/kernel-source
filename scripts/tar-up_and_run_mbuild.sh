@@ -11,6 +11,7 @@ rpm_release_string=
 tolerate_unknown_new_config_options=
 external_modules=
 dist=
+prefer_rpms=
 specfiles=$important_specfiles
 # action item: learn why $LOGNAME or $USER is not exported...
 user="`id -nu`"
@@ -41,6 +42,10 @@ until [ "$#" = "0" ] ; do
 	mbuild_options="$mbuild_options $1 $2"
 	shift 2
 	;;
+    -p|--prefer-rpms)
+	prefer_rpms="--prefer-rpms $2"
+	shift 2
+	;;
     -s|--spec)
 	single_specfiles="$single_specfiles $2"
 	shift 2
@@ -63,6 +68,7 @@ these options are recognized:
     -D <distname>      "distribution name" to build for
                        to get a complete list of possible options:
                        '/work/src/bin/mbuild -D'
+    -p|--prefer-rpms   to pass --prefer-rpms <directory> to mbuild
     -s|--spec <config> to build only this kernel-<config>.rpm (option may be specified more than once)
     all                to build a kernel.rpm for all configured .config files:
     $all_specfiles
@@ -89,7 +95,7 @@ EOF
 	;;
     esac
 done
-mbuild_options="-l $user $mbuild_options"
+mbuild_options="-l $user $mbuild_options $prefer_rpms"
 if [ ! -z "$dist" ] ; then
 mbuild_options="$mbuild_options $dist"
 fi
