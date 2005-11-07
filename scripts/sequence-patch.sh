@@ -100,9 +100,11 @@ fi
 
 TMPDIR=$SCRATCH_AREA
 export TMPDIR
-PATCH_DIR=$SCRATCH_AREA/linux-$SRCVERSION
-PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION.log
-LAST_LOG=$SCRATCH_AREA/last-$SRCVERSION.log
+ORIG_DIR=$SCRATCH_AREA/linux-$SRCVERSION.orig
+TAG="$(sed -ne 's:^T::p' $(dirname $0)/../CVS/Tag 2>/dev/null)"
+PATCH_DIR=$SCRATCH_AREA/linux-$SRCVERSION${TAG:+-$TAG}
+PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION${TAG:+-$TAG}.log
+LAST_LOG=$SCRATCH_AREA/last-$SRCVERSION${TAG:+-$TAG}.log
 
 # Check if we can clean up backup files at the end
 # (slightly faster, but requires more disk space).
@@ -112,7 +114,7 @@ free_blocks="$(df -P "$SCRATCH_AREA" \
 
 echo "Creating tree in $PATCH_DIR"
 
-if [ ! -d $PATCH_DIR.orig ]; then
+if [ ! -d $ORIG_DIR ]; then
     # Check if linux-$SRCVERSION.tar.gz is accessible.
     for file in {$SCRATCH_AREA/,,$MIRROR/,$MIRROR/testing/}linux-$SRCVERSION.tar.{gz,bz2}; do
 	if [ -r $file ]; then
@@ -125,7 +127,7 @@ if [ ! -d $PATCH_DIR.orig ]; then
     if [ -z "$LINUX_ORIG_TARBALL" ]; then
 	echo "Kernel source archive \`linux-$SRCVERSION.tar.gz' not found," >&2
 	echo "alternatively you can put an unpatched kernel tree to" >&2
-	echo "$PATCH_DIR.orig." >&2
+	echo "$ORIG_DIR." >&2
 	exit 1
     fi
 fi
@@ -238,18 +240,20 @@ if [ -e $PATCH_DIR ]; then
 fi
 
 # Create fresh $SCRATCH_AREA/linux-$SRCVERSION.
-if [ -d $PATCH_DIR.orig ]; then
-    echo "Linking from $PATCH_DIR.orig"
-    cp -rld $PATCH_DIR.orig $PATCH_DIR
+if [ -d $ORIG_DIR ]; then
+    echo "Linking from $ORIG_DIR"
+    cp -rld $ORIG_DIR $PATCH_DIR
 else
     echo "Extracting $LINUX_ORIG_TARBALL"
     tar xf$COMPRESS_MODE $LINUX_ORIG_TARBALL --directory $SCRATCH_AREA
-    if [ ! -e $PATCH_DIR -a -e ${PATCH_DIR%-$SRCVERSION} ]; then
+    if [ -e $SCRATCH_AREA/linux-$SRCVERSION ]; then
+	mv $SCRATCH_AREA/linux-$SRCVERSION $ORIG_DIR || exit 1
+    elif [ -e $SCRATCH_AREA/linux ]; then
 	# Old kernels unpack into linux/ instead of linux-$SRCVERSION/.
-	mv ${PATCH_DIR%-$SRCVERSION} $PATCH_DIR
+	mv $SCRATCH_AREA/linux $ORIG_DIR || exit 1
     fi
-    cp -rld $PATCH_DIR $PATCH_DIR.orig
-    find $PATCH_DIR.orig -type f | xargs chmod a-w,a+r
+    find $ORIG_DIR -type f | xargs chmod a-w,a+r
+    cp -rld $ORIG_DIR $PATCH_DIR
 fi
 
 # Helper function to restore files backed up by patch. This is
@@ -365,7 +369,8 @@ if [ -n "$COMBINE" ]; then
     sed -i '/^#.*/d' combined.series
     (
 	    cd $SCRATCH_AREA
-	    diff -x .pc -U0 -rNa linux-$SRCVERSION.orig linux-$SRCVERSION
+	    diff -x .pc -U0 -rNa \
+		${ORIG_DIR#$SCRATCH_AREA/} ${PATCH_DIR#$SCRATCH_AREA/}
     ) | gzip -c9 > combined.patch.gz
     exit 0
 fi
@@ -383,6 +388,8 @@ ln -s $PWD $PATCH_DIR/patches
 if [ -n "$*" ]; then
     ( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
 fi
+
+echo "[ Tree: $PATCH_DIR ]"
 
 [ $# -gt 0 ] && exit $status
 
