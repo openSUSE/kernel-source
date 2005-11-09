@@ -16,6 +16,7 @@ specfiles=$important_specfiles
 # action item: learn why $LOGNAME or $USER is not exported...
 user="`id -nu`"
 mbuild_options=
+with_debug=
 until [ "$#" = "0" ] ; do
     case "$1" in
     -rs)
@@ -54,6 +55,14 @@ until [ "$#" = "0" ] ; do
 	specfiles=$all_specfiles
 	shift
 	;;
+    --debug)
+      with_debug=$1
+      shift
+      ;;
+    --no-debug)
+      with_debug=$1
+      shift
+      ;;
     -h|--help|-v|--version)
 	cat <<EOF
 
@@ -70,6 +79,8 @@ these options are recognized:
                        '/work/src/bin/mbuild -D'
     -p|--prefer-rpms   to pass --prefer-rpms <directory> to mbuild
     -s|--spec <config> to build only this kernel-<config>.rpm (option may be specified more than once)
+    --debug|--no-debug to build a kernel-flavor-debug package with debug info for lkcd
+                       requires MUCH diskspace
     all                to build a kernel.rpm for all configured .config files:
     $all_specfiles
 
@@ -102,7 +113,7 @@ fi
 if [ ! -z "$single_specfiles" ] ; then
 specfiles=`echo $single_specfiles | sort | xargs echo`
 fi
-scripts/tar-up.sh $rpm_release_string $timestamp $tolerate_unknown_new_config_options $external_modules
+scripts/tar-up.sh $rpm_release_string $timestamp $tolerate_unknown_new_config_options $external_modules $with_debug
 cd kernel-source
 for i in $specfiles
 do

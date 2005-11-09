@@ -4,6 +4,7 @@ rpm_release_timestamp=
 rpm_release_string=
 tolerate_unknown_new_config_options=0
 external_modules=yes
+with_debug=unknown
 until [ "$#" = "0" ] ; do
   case "$1" in
     -nem|--no_external_modules)
@@ -22,6 +23,14 @@ until [ "$#" = "0" ] ; do
       rpm_release_timestamp=yes
       shift
       ;;
+    --debug)
+      with_debug=1
+      shift
+      ;;
+    --no-debug)
+      with_debug=0
+      shift
+      ;;
     -h|--help|-v|--version)
 	cat <<EOF
 
@@ -32,6 +41,9 @@ these options are recognized:
     -ts                to use the current date as rpm release number
     -nf                to proceed if a new unknown .config option is found during make oldconfig
     -nem               to not build any external km_* module packages
+
+    --debug|--no-debug to build a kernel-flavor-debug package with debug info for lkcd
+                       requires MUCH diskspace
 
 EOF
 	exit 1
@@ -200,6 +212,20 @@ for flavor in $flavors ; do
     # of i386.
     archs="$(echo $archs | sed -e 's,i386,%ix86,g')"
 
+
+    if test "$with_debug" = "unknown" ; then
+	    case "$flavor" in
+		ppc64|s390|s390x|debug)
+		with_debug_spec=1
+		;;
+		*)
+		with_debug_spec=0
+		;;
+	    esac
+    else
+    	with_debug_spec=$with_debug
+    fi
+
     # Generate spec file
     sed -e "s,@NAME@,kernel-$flavor,g" \
 	-e "s,@FLAVOR@,$flavor,g" \
@@ -210,6 +236,7 @@ for flavor in $flavors ; do
 	-e "s,@PROVIDES_OBSOLETES@,${prov_obs//$'\n'/\\n},g" \
 	-e "s,@EXTRA_NEEDS@,$extra_needs,g" \
 	-e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options,g" \
+	-e "s,@WITH_DEBUG@,$with_debug_spec," \
       < rpm/kernel-binary.spec.in \
     > $BUILD_DIR/kernel-$flavor.spec
     if test "$external_modules" = "no" ; then
