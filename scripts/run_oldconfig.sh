@@ -89,7 +89,7 @@ for config in $(cd patches && \
     arch=${config%/*}
     flavor=${config#*/}
     case $flavor in
-    um|xen)
+    um)
 	MAKE_ARGS="ARCH=$flavor SUBARCH=$arch"
 	;;
     *)
