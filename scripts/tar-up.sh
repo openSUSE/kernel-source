@@ -340,7 +340,7 @@ cat > $BUILD_DIR/get_release_number.sh <<EOF
 echo "$rpm_release_string"
 EOF
 fi
-chmod -v a+rx $BUILD_DIR/get_release_number.sh
+chmod a+rx $BUILD_DIR/get_release_number.sh
 
 echo "If you want to submit the kernel to Autobuild now,"
 echo "how about running \`mbuild --obey-doesnotbuild' before?"
