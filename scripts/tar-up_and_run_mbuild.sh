@@ -60,7 +60,7 @@ until [ "$#" = "0" ] ; do
       shift
       ;;
     --no-debug)
-      with_debug=$1
+      with_debug="--debug=no"
       shift
       ;;
     -h|--help|-v|--version)
@@ -106,14 +106,14 @@ EOF
 	;;
     esac
 done
-mbuild_options="-l $user $mbuild_options $prefer_rpms"
+mbuild_options="-l $user $mbuild_options $prefer_rpms $with_debug"
 if [ ! -z "$dist" ] ; then
 mbuild_options="$mbuild_options $dist"
 fi
 if [ ! -z "$single_specfiles" ] ; then
 specfiles=`echo $single_specfiles | sort | xargs echo`
 fi
-scripts/tar-up.sh $rpm_release_string $timestamp $tolerate_unknown_new_config_options $external_modules $with_debug
+scripts/tar-up.sh $rpm_release_string $timestamp $tolerate_unknown_new_config_options $external_modules
 cd kernel-source
 for i in $specfiles
 do

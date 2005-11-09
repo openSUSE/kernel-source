@@ -215,11 +215,8 @@ for flavor in $flavors ; do
 
     if test "$with_debug" = "unknown" ; then
 	    case "$flavor" in
-		ppc64|s390|s390x|debug)
-		with_debug_spec=1
-		;;
 		*)
-		with_debug_spec=0
+		with_debug_spec=1
 		;;
 	    esac
     else
