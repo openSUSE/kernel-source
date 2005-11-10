@@ -59,10 +59,6 @@ until [ "$#" = "0" ] ; do
       with_debug=$1
       shift
       ;;
-    --no-debug)
-      with_debug="--debug=no"
-      shift
-      ;;
     -h|--help|-v|--version)
 	cat <<EOF
 
@@ -79,7 +75,7 @@ these options are recognized:
                        '/work/src/bin/mbuild -D'
     -p|--prefer-rpms   to pass --prefer-rpms <directory> to mbuild
     -s|--spec <config> to build only this kernel-<config>.rpm (option may be specified more than once)
-    --debug|--no-debug to build a kernel-flavor-debug package with debug info for lkcd
+    --debug            to build a kernel-flavor-debug package with debug info for lkcd
                        requires MUCH diskspace
     all                to build a kernel.rpm for all configured .config files:
     $all_specfiles
