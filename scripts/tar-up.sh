@@ -366,5 +366,3 @@ EOF
 fi
 chmod a+rx $BUILD_DIR/get_release_number.sh
 
-echo "If you want to submit the kernel to Autobuild now,"
-echo "how about running \` ./scripts/tar-up_and_run_mbuild.sh -l talk ' before?"
