@@ -44,7 +44,9 @@ if (!$tag0 || !$tag1) {
 
 foreach $patch (@ARGV) {
 
-	next unless(-f $patch);
+	# Patch doesn't have to exist in repo in order to
+	# query the log
+	# next unless(-f $patch);
 
 	open LOG, "cvs log $patch|" or die "Unable to start cvs log: $!\n";
 
