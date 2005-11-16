@@ -2,6 +2,7 @@
 #
 # Usage
 #   patch-classify.pl [-v] [-k kernel_rev] cvs_rev1 cvs_rev2 file ...
+#   patch-classify.pl [-v] [-k kernel_rev] [-P patchdir] -p cvs_rev1 file ...
 #
 # cvs_rev1 and cvs_rev2 are the CVS revisions to be compared.
 #	Usually, these should be symbolic names (branch names
@@ -18,6 +19,10 @@
 #	 -	has been killed in the target branch
 #	 -	evolved from a version in the source branch
 #	 -	does not exist in the source branch
+# -p
+#	Check whether the specified patches apply, or can be reverted.
+#	Use the -P option to specific the location of the patch you
+#	want to test
 # -v
 #	Increase verbosity
 #
@@ -28,9 +33,11 @@ $STATE_START    = 0;
 $STATE_BRANCHES = 1;
 
 
-getopts('k:rv');
+getopts('k:P:prv');
 $opt_review  = $opt_r;
 $opt_verbose = $opt_v;
+$opt_patch   = $opt_p;
+$patchdir    = $opt_P;
 $kernel_rev  = $opt_k;
 
 $tag0 = shift(@ARGV);
@@ -41,12 +48,57 @@ if (!$tag0 || !$tag1) {
 	1;
 }
 
+die "Options -p and -r are mutually exclusive, abort\n"
+		if ($opt_patch && $opt_review);
 
-foreach $patch (@ARGV) {
+&guess_kernel_rev unless ($kernel_rev);
+die "No kernel revision specified, and none divined\n"
+		if ($opt_patch && !$kernel_rev);
 
-	# Patch doesn't have to exist in repo in order to
-	# query the log
-	# next unless(-f $patch);
+if ($opt_patch) {
+	my $scratch = $ENV{SCRATCH_AREA};
+	my $basedir = "linux-$kernel_rev";
+	my @try = (
+		$basedir,
+		"$scratch/$basedir",
+		"$scratch/$basedir-$tag1",
+	);
+
+	foreach $try (@try) {
+		if (-d $try) {
+			$srcdir = $try;
+			last;
+		}
+	}
+	die "Cannot find kernel source dir $basedir\n" unless ($srcdir);
+	print "Using source dir $srcdir\n" if ($opt_verbose);
+
+	$patchcmd = "patch -p1 --quiet --force --dry-run --directory $srcdir >/dev/null";
+	$patchdir .= '/' if ($patchdir);
+}
+
+foreach $patch (<>) {
+
+	if ($opt_patch) {
+		# This little hack allows us to feed the output of
+		# a previous script run back to it, without losing the
+		# previous classification.
+		# (eg you first do a CVS scan, then run classify-patch -p
+		# to see which patches still apply)
+		if ($patch =~ /([^:]*): (.*)/o) {
+			$patch = $1;
+			$original_comment = $2;
+		}
+
+		print "$patch: $original_comment";
+		if (system("$patchcmd < $patchdir$patch") == 0) {
+			print " [STILL APPLIES]";
+		} elsif (system("$patchcmd -R < $patchdir$patch") == 0) {
+			print " [APPARENTLY MERGED]";
+		}
+		print "\n";
+		next;
+	}
 
 	open LOG, "cvs log $patch|" or die "Unable to start cvs log: $!\n";
 
@@ -298,4 +350,16 @@ sub rev_compare {
 
 	unshift @base, $diff;
 	return @base;
+}
+
+sub guess_kernel_rev {
+	open CFG, "<scripts/config.sh" or return;
+
+	while (<CFG>) {
+		if (/SRCVERSION=(.*)/o) {
+			$kernel_rev = $1;
+			last;
+		}
+	}
+	close CFG;
 }
