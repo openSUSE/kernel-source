@@ -6,6 +6,10 @@ tolerate_unknown_new_config_options=0
 external_modules=1
 until [ "$#" = "0" ] ; do
   case "$1" in
+    --dir=*)
+      build_dir=${1#*=}
+      shift
+      ;;
     -d|--dir)
       build_dir=$2
       shift 2
@@ -47,7 +51,8 @@ EOF
 	exit 1
 	;;
     *)
-      shift
+      echo "unknown option '$1'" >&2
+      exit 1
       ;;
   esac
 done
