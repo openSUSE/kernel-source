@@ -3,18 +3,28 @@
 rpm_release_timestamp=
 rpm_release_string=
 tolerate_unknown_new_config_options=0
-external_modules=yes
+external_modules=1
 until [ "$#" = "0" ] ; do
   case "$1" in
-    -nem|--no_external_modules)
-      external_modules=no
+    -d|--dir)
+      build_dir=$2
+      shift 2
+      ;;
+    -nem|--no-external-modules)
+      external_modules=
       shift
       ;;
     -nf|--tolerate-unknown-new-config-options)
       tolerate_unknown_new_config_options=1
       shift
       ;;
-    -rs|--release_string)
+    -rs|--release-string)
+      case "$2" in
+      *[' '-]*)
+        echo "$1 option argument must not contain dashes or spaces" >&2
+	exit 1
+	;;
+      esac
       rpm_release_string="$2"
       shift 2
       ;;
@@ -47,24 +57,9 @@ SRC_FILE=linux-$SRCVERSION.tar.bz2
 PATCHVERSION=$($(dirname $0)/compute-PATCHVERSION.sh)
 RPMVERSION=${PATCHVERSION//-/_}
 
-case "$rpm_release_string" in
-	*-*)
-		echo "rpm release can not contain a '-', but '$rpm_release_string' contains one"
-		exit 1
-		;;
-	*\ *)
-		echo "rpm release can not contain whitespaces, but '$rpm_release_string' contains one"
-		exit 1
-		;;
-	"")
-		if [ "$rpm_release_timestamp" = "" ] ; then
-			rpm_release_string="pkg:kernel-dummy"
-		fi
-		;;
-	*)
-		rpm_release_string="_$rpm_release_string"
-		;;
-esac
+if [ -n "$rpm_release_timestamp" ]; then
+    rpm_release_string="\`env -i - TZ=GMT date +%Y%m%d\`${rpm_release_string:+_$rpm_release_string}"
+fi
 
 if ! scripts/check-conf || \
    ! scripts/check-cvs-add; then
@@ -74,11 +69,17 @@ if ! scripts/check-conf || \
     read
 fi
 
-rm -rf $BUILD_DIR
-mkdir -p $BUILD_DIR
+[ -z "$build_dir" ] && build_dir=$BUILD_DIR
+if [ -z "$build_dir" ]; then
+    echo "Please define the build directory with the --dir option" >&2
+    exit 1
+fi
+
+rm -rf $build_dir
+mkdir -p $build_dir
 
 echo "Computing timestamp..."
-if ! scripts/cvs-wd-timestamp > $BUILD_DIR/build-source-timestamp; then
+if ! scripts/cvs-wd-timestamp > $build_dir/build-source-timestamp; then
     exit 1
 fi
 
@@ -92,49 +93,9 @@ if [ -e CVS/Tag ]; then
     *)	tag=
     esac
     if [ -n "$tag" ]; then
-	echo $tag >> $BUILD_DIR/build-source-timestamp
+	echo $tag >> $build_dir/build-source-timestamp
     fi
 fi
-
-# Generate list of all config files and patches used
-all_files="$( {
-	$(dirname $0)/guards --list < series.conf
-	$(dirname $0)/guards --prefix=config --list < config.conf
-    } | sort -u )"
-# The first directory level determines the archive name
-all_archives="$(
-    echo "$all_files" \
-    | sed -e 's,/.*,,' \
-    | uniq )"
-for archive in $all_archives patches.addon; do
-    echo "$archive.tar.bz2"
-    case " $IGNORE_ARCHS " in
-    *" ${archive#patches.} "*)
-	echo "Ignoring $d..."
-	continue ;;
-    esac
-
-    files="$( echo "$all_files" \
-	| sed -ne "\:^${archive//./\\.}/:p" \
-	| while read patch; do
-	    [ -e "$patch" ] && echo "$patch"
-	done)"
-    if [ -n "$files" ]; then
-	tar -cf - $files \
-	| bzip2 -9 > $BUILD_DIR/$archive.tar.bz2
-    else
-	bzip2 -9 < /dev/null > $BUILD_DIR/$archive.tar.bz2
-    fi
-done
-
-for archive in config \
-	       patches.arch patches.drivers patches.fixes patches.rpmify \
-	       patches.suse patches.uml patches.xen patches.addon \
-	       patches.kernel.org; do
-    if ! [ -e $BUILD_DIR/$archive.tar.bz2 ]; then
-	bzip2 -9 < /dev/null > $BUILD_DIR/$archive.tar.bz2
-    fi
-done
 
 # List all used configurations
 config_files="$(
@@ -172,11 +133,11 @@ for flavor in $flavors ; do
 	# Do we have an override config file or an additional patch?
 	if [ -e $arch-$flavor.conf ]; then
 	    echo "Override config: $arch-$flavor.conf"
-	    cp $arch-$flavor.conf $BUILD_DIR/
+	    cp $arch-$flavor.conf $build_dir/
 	fi
 	if [ -e $arch-$flavor.diff ]; then
 	    echo "Extra patch: $arch-$flavor.diff"
-	    cp $arch-$flavor.diff $BUILD_DIR/
+	    cp $arch-$flavor.diff $build_dir/
 	fi
 
 	[ $arch = i386 ] && arch="%ix86" && nl=$'\n'
@@ -200,6 +161,8 @@ for flavor in $flavors ; do
     # of i386.
     archs="$(echo $archs | sed -e 's,i386,%ix86,g')"
 
+    kernel_module_packages=${external_modules:+kernel-module-packages}
+
     # Generate spec file
     sed -e "s,@NAME@,kernel-$flavor,g" \
 	-e "s,@FLAVOR@,$flavor,g" \
@@ -210,12 +173,9 @@ for flavor in $flavors ; do
 	-e "s,@PROVIDES_OBSOLETES@,${prov_obs//$'\n'/\\n},g" \
 	-e "s,@EXTRA_NEEDS@,$extra_needs,g" \
 	-e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options,g" \
+	-e "s,@KERNEL_MODULE_PACKAGES@,$kernel_module_packages,g" \
       < rpm/kernel-binary.spec.in \
-    > $BUILD_DIR/kernel-$flavor.spec
-    if test "$external_modules" = "no" ; then
-	sed -e "/^# neededforbuild/s@kernel-module-packages@@g" < $BUILD_DIR/kernel-$flavor.spec > $BUILD_DIR/kernel-$flavor.spec.$$
-	mv -f $BUILD_DIR/kernel-$flavor.spec.$$ $BUILD_DIR/kernel-$flavor.spec
-    fi
+    > $build_dir/kernel-$flavor.spec
 done
 
 install_changes() {
@@ -225,7 +185,7 @@ install_changes() {
 }
 
 for flavor in $flavors ; do
-    install_changes $BUILD_DIR/kernel-$flavor.changes
+    install_changes $build_dir/kernel-$flavor.changes
 done
 
 binary_spec_files=$(
@@ -247,7 +207,7 @@ sed -e "s,@NAME@,kernel-source,g" \
     -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
     -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
   < rpm/kernel-source.spec.in \
-> $BUILD_DIR/kernel-source.spec
+> $build_dir/kernel-source.spec
 
 echo "kernel-dummy.spec"
 sed -e "s,@NAME@,kernel-dummy,g" \
@@ -255,7 +215,7 @@ sed -e "s,@NAME@,kernel-dummy,g" \
     -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
   < rpm/kernel-dummy.spec.in \
-> $BUILD_DIR/kernel-dummy.spec
+> $build_dir/kernel-dummy.spec
 
 echo "kernel-syms.spec"
 sed -e "s,@NAME@,kernel-syms,g" \
@@ -264,8 +224,8 @@ sed -e "s,@NAME@,kernel-syms,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
     -e "s,@PRECONF@,1,g" \
   < rpm/kernel-syms.spec.in \
-> $BUILD_DIR/kernel-syms.spec
-install_changes $BUILD_DIR/kernel-syms.changes
+> $build_dir/kernel-syms.spec
+install_changes $build_dir/kernel-syms.changes
 
 echo "Copying various files..."
 install -m 644					\
@@ -280,13 +240,12 @@ install -m 644					\
 	rpm/postun.sh				\
 	rpm/Makefile.suse			\
 	doc/README.SUSE				\
-	$BUILD_DIR
-install_changes $BUILD_DIR/kernel-source.changes
-install_changes $BUILD_DIR/kernel-dummy.changes
+	$build_dir
+install_changes $build_dir/kernel-source.changes
+install_changes $build_dir/kernel-dummy.changes
 
 install -m 755					\
 	rpm/config-subst 			\
-	rpm/get_release_number.sh		\
 	rpm/prepare-build.sh			\
 	rpm/check-for-config-changes		\
 	rpm/check-supported-list		\
@@ -294,22 +253,25 @@ install -m 755					\
 	scripts/guards				\
 	scripts/arch-symbols			\
 	rpm/install-configs			\
-	$BUILD_DIR
+	$build_dir
 
 if [ -e extra-symbols ]; then
 	install -m 755					\
 		extra-symbols				\
-		$BUILD_DIR
+		$build_dir
 fi
 
-# Force mbuild to choose build hosts with enough memory available:
-echo $((600*1024)) > $BUILD_DIR/minmem
-
-echo "hello.tar.bz2"
-(   cd doc
-    tar -cf - --exclude=CVS --exclude='.*.cmd' \
-    	      --exclude='*.ko' --exclude='*.o' hello
-) | bzip2 > $BUILD_DIR/hello.tar.bz2
+if [ -z "$rpm_release_string" ]; then
+    install -m 755					\
+	rpm/get_release_number.sh			\
+	$build_dir
+else
+    cat > $build_dir/get_release_number.sh <<-EOF
+	#!/bin/sh
+	echo "$rpm_release_string"
+	EOF
+    chmod a+rx $build_dir/get_release_number.sh
+fi
 
 if [ -r $SRC_FILE ]; then
   LINUX_ORIG_TARBALL=$SRC_FILE
@@ -321,24 +283,55 @@ else
   echo "Cannot find $SRC_FILE."
   exit 1
 fi
-if [ -r $LINUX_ORIG_TARBALL ]; then
-  cp -av $LINUX_ORIG_TARBALL $BUILD_DIR
-fi
+echo $SRC_FILE
+cp $LINUX_ORIG_TARBALL $build_dir
 
-if [ ! -r $LINUX_ORIG_TARBALL ]; then
-  echo "Please add $SRC_FILE to $BUILD_DIR"
-fi
+# Generate list of all config files and patches used
+all_files="$( {
+	$(dirname $0)/guards --list < series.conf
+	$(dirname $0)/guards --prefix=config --list < config.conf
+    } | sort -u )"
+# The first directory level determines the archive name
+all_archives="$(
+    echo "$all_files" \
+    | sed -e 's,/.*,,' \
+    | uniq )"
+for archive in $all_archives; do
+    echo "$archive.tar.bz2"
+    case " $IGNORE_ARCHS " in
+    *" ${archive#patches.} "*)
+	echo "Ignoring $d..."
+	continue ;;
+    esac
 
-if [ "$rpm_release_timestamp" = "yes" ] ; then
-cat > $BUILD_DIR/get_release_number.sh <<EOF
-#!/bin/sh
-echo "\`env -i - TZ=GMT date +%Y%m%d\`$rpm_release_string"
-EOF
-else
-cat > $BUILD_DIR/get_release_number.sh <<EOF
-#! /bin/sh
-echo "$rpm_release_string"
-EOF
-fi
-chmod a+rx $BUILD_DIR/get_release_number.sh
+    files="$( echo "$all_files" \
+	| sed -ne "\:^${archive//./\\.}/:p" \
+	| while read patch; do
+	    [ -e "$patch" ] && echo "$patch"
+	done)"
+    if [ -n "$files" ]; then
+	tar -cf - $files \
+	| bzip2 -9 > $build_dir/$archive.tar.bz2
+    fi
+done
 
+echo "hello.tar.bz2"
+(   cd doc
+    tar -cf - --exclude=CVS --exclude='.*.cmd' \
+    	      --exclude='*.ko' --exclude='*.o' hello
+) | bzip2 > $build_dir/hello.tar.bz2
+
+# Create empty dummys for any *.tar.bz2 archive mentioned in the spec file
+# not already created: patches.addon is empty by intention; others currently
+# may contain no patches.
+archives=$(sed -ne 's,^Source[0-9]*:.*[ \t/]\([^/]*\)\.tar\.bz2$,\1,p' \
+           $build_dir/*.spec | sort -u)
+for archive in $archives; do
+    if ! [ -e $build_dir/$archive.tar.bz2 ]; then
+	echo "$archive.tar.bz2 (empty)"
+	bzip2 -9 < /dev/null > $build_dir/$archive.tar.bz2
+    fi
+done
+
+# Force mbuild to choose build hosts with enough memory available:
+echo $((600*1024)) > $build_dir/minmem
