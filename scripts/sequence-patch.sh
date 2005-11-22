@@ -209,38 +209,50 @@ else
     cp -rld $ORIG_DIR $PATCH_DIR
 fi
 
-PATCHES=$(scripts/guards $SYMBOLS < series.conf)
-
-if [ -n "$COMBINE" ]; then
-    echo "Precomputing combined patches"
-    echo $PATCHES | sed -e 's: :\n:g' \
-    | $(dirname $0)/md5fast --cache combined --generate
-fi
+PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
 
 # Check if patch $LIMIT exists
 if [ -n "$LIMIT" ]; then
-    for PATCH in $PATCHES; do
+    for ((n=0; n<${#PATCHES[@]}; n++)); do
 	if [ "$LIMIT" = - ]; then
-	    LIMIT=$PATCH
+	    LIMIT=${PATCHES[n]}
+	    break
 	fi
-	case $PATCH in 
-	    $LIMIT|*/$LIMIT)
-		LIMIT=$PATCH
-		unset PATCH
-		break
-		;;
+	case "${PATCHES[n]}" in
+	$LIMIT|*/$LIMIT)
+	    LIMIT=${PATCHES[n]}
+	    break
+	    ;;
 	esac
     done
-    if [ -n "$PATCH" ]; then
+    if ((n == ${#PATCHES[@]})); then
 	echo "No patch \`$LIMIT' found."
 	exit 1
     fi
+    PATCHES_BEFORE=()
+    for ((m=0; m<n; m++)); do
+	PATCHES_BEFORE[m]=${PATCHES[m]}
+    done
+    PATCHES_AFTER=()
+    for ((m=n; m<${#PATCHES[@]}; m++)); do
+	PATCHES_AFTER[m-n]=${PATCHES[m]}
+    done
+else
+    PATCHES_BEFORE=( "${PATCHES[@]}" )
+    PATCHES_AFTER=()
 fi
 
-if [ -n "$FAST" ]; then
+if [ -n "$COMBINE" ]; then
+    echo "Precomputing combined patches"
+    (IFS=$'\n'; echo "${PATCHES[*]}") \
+    | $(dirname $0)/md5fast --dir "$SCRATCH_AREA" --cache combined --generate
+fi
+
+if [ ${#PATCHES_BEFORE[@]} -gt 0 -a -n "$FAST" ]; then
     echo "Checking for precomputed combined patches"
-    PATCHES=$(echo $PATCHES | sed -e 's: :\n:g' \
-	      | $(dirname $0)/md5fast --cache combined)
+    PATCHES=( $(IFS=$'\n'; echo "${PATCHES_BEFORE[*]}" \
+	        | $(dirname $0)/md5fast --dir "$SCRATCH_AREA" --cache combined)
+    	      "${PATCHES_AFTER[@]}" )
 fi
 
 # Helper function to restore files backed up by patch. This is
@@ -279,7 +291,7 @@ mkdir $PATCH_DIR/.pc
 echo 2 > $PATCH_DIR/.pc/.version
 
 # Patch kernel
-set -- $PATCHES
+set -- "${PATCHES[@]}"
 while [ $# -gt 0 ]; do
     PATCH="$1"
     if [ "$PATCH" = "$LIMIT" -a -n "$CLEAN" ]; then
