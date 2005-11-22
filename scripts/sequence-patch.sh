@@ -3,7 +3,7 @@
 source $(dirname $0)/config.sh
 
 usage() {
-    echo "SYNOPSIS: $0 [-qv] [--arch=...] [--symbol=...] [--dir=...] [--combine|--fast] [last-patch-name]"
+    echo "SYNOPSIS: $0 [-qv] [--arch=...] [--symbol=...] [--dir=...] [--combine] [--fast] [last-patch-name]"
     exit 1
 }
 
@@ -38,6 +38,7 @@ while true; do
 	    ;;
 	--combine)
 	    COMBINE=1
+	    FAST=1
 	    ;;
        	--fast)
 	    FAST=1
@@ -177,54 +178,6 @@ if [ -n "$EXTRA_SYMBOLS" ]; then
     SYMBOLS="$SYMBOLS $EXTRA_SYMBOLS"
 fi
 
-if [ -n "$FAST" ]; then
-    if [ -f combined.patch.gz -a -f combined.series ]; then
-	# Check if the combined patch and series file are current
-	[ combined.series -ot combined.patch.gz ] || FAST=
-	while read patch; do
-	    [ $patch -ot combined.patch.gz ] || FAST=
-	done < combined.series
-	if [ -z "$FAST" ]; then
-	    echo "Combined patch (--combine) out of date; ignoring"
-	fi
-    else
-	echo "Ignoring --fast option (create cache first with --combine)"
-	FAST=
-    fi
-fi
-
-if [ -n "$FAST" ]; then
-    echo "Using combined patch cache"
-
-    # Get the list of patches we haven't applied yet
-    UNAPPLIED=$(scripts/guards $SYMBOLS < series.conf |
-	    comm -23 - combined.series)
-    PATCHES="combined.patch.gz $UNAPPLIED"
-else
-    # Default case - get the list of all patches from series.conf
-    PATCHES=$(scripts/guards $SYMBOLS < series.conf)
-fi
-
-# Check if patch $LIMIT exists
-if [ -n "$LIMIT" ]; then
-    for PATCH in $PATCHES; do
-	if [ "$LIMIT" = - ]; then
-	    LIMIT=$PATCH
-	fi
-	case $PATCH in 
-	    $LIMIT|*/$LIMIT)
-		LIMIT=$PATCH
-		unset PATCH
-		break
-		;;
-	esac
-    done
-    if [ -n "$PATCH" ]; then
-	echo "No patch \`$LIMIT' found."
-	exit 1
-    fi
-fi
-
 # Clean up from previous run
 rm -f "$PATCH_LOG" "$LAST_LOG"
 if [ -e $PATCH_DIR ]; then
@@ -256,6 +209,40 @@ else
     cp -rld $ORIG_DIR $PATCH_DIR
 fi
 
+PATCHES=$(scripts/guards $SYMBOLS < series.conf)
+
+if [ -n "$COMBINE" ]; then
+    echo "Precomputing combined patches"
+    echo $PATCHES | sed -e 's: :\n:g' \
+    | $(dirname $0)/md5fast --cache combined --generate
+fi
+
+# Check if patch $LIMIT exists
+if [ -n "$LIMIT" ]; then
+    for PATCH in $PATCHES; do
+	if [ "$LIMIT" = - ]; then
+	    LIMIT=$PATCH
+	fi
+	case $PATCH in 
+	    $LIMIT|*/$LIMIT)
+		LIMIT=$PATCH
+		unset PATCH
+		break
+		;;
+	esac
+    done
+    if [ -n "$PATCH" ]; then
+	echo "No patch \`$LIMIT' found."
+	exit 1
+    fi
+fi
+
+if [ -n "$FAST" ]; then
+    echo "Checking for precomputed combined patches"
+    PATCHES=$(echo $PATCHES | sed -e 's: :\n:g' \
+	      | $(dirname $0)/md5fast --cache combined)
+fi
+
 # Helper function to restore files backed up by patch. This is
 # faster than doing a --dry-run first.
 restore_files() {
@@ -284,7 +271,7 @@ restore_files() {
 
 echo -e "# Symbols: $SYMBOLS\n#" > $PATCH_DIR/series
 SERIES_PFX=
-if [ -n "$CLEAN" -a -z "$COMBINE" ]; then
+if [ -n "$CLEAN" ]; then
     SERIES_PFX="# "
 fi
 
@@ -362,18 +349,6 @@ while [ $# -gt 0 ]; do
 	break
     fi
 done
-
-if [ -n "$COMBINE" ]; then
-    echo "[ Building combined patch ]"
-    mv $PATCH_DIR/series combined.series
-    sed -i '/^#.*/d' combined.series
-    (
-	    cd $SCRATCH_AREA
-	    diff -x .pc -U0 -rNa \
-		${ORIG_DIR#$SCRATCH_AREA/} ${PATCH_DIR#$SCRATCH_AREA/}
-    ) | gzip -c9 > combined.patch.gz
-    exit 0
-fi
 
 [ -n "$CLEAN" -a -n "$enough_free_space" ] \
     && rm -rf $PATCH_DIR/.pc/
