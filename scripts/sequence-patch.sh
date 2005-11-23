@@ -241,14 +241,16 @@ fi
 if [ -n "$COMBINE" ]; then
     echo "Precomputing combined patches"
     (IFS=$'\n'; echo "${PATCHES[*]}") \
-    | $(dirname $0)/md5fast --dir "$SCRATCH_AREA" --source-tree "$ORIG_DIR" \
+    | $(dirname $0)/md5fast --source-tree "$ORIG_DIR" \
     			    --cache combined --generate
+    echo $SRCVERSION > combined/srcversion
 fi
 
-if [ -n "$FAST" -a -d combined -a ${#PATCHES_BEFORE[@]} -gt 0 ]; then
+if [ -n "$FAST" -a ${#PATCHES_BEFORE[@]} -gt 0 -a \
+     $SRCVERSION = "$(cat combined/srcversion 2> /dev/null)" ]; then
     echo "Checking for precomputed combined patches"
     PATCHES=( $(IFS=$'\n'; echo "${PATCHES_BEFORE[*]}" \
-	        | $(dirname $0)/md5fast --dir "$SCRATCH_AREA" --cache combined)
+	        | $(dirname $0)/md5fast --cache combined)
     	      "${PATCHES_AFTER[@]}" )
 fi
 
