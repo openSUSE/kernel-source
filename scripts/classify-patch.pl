@@ -78,6 +78,7 @@ if ($opt_patch) {
 }
 
 foreach $patch (<>) {
+	$patch =~ s/\n//;
 
 	if ($opt_patch) {
 		# This little hack allows us to feed the output of
@@ -247,9 +248,13 @@ done:
 			if (/^Patch-mainline:\s+(.*)/o) {
 				$mainline = $1;
 				$mainline =~ s/ or earlier//o;
-				$mainline =~ s/-rc\d+$//o;
-				#$mainline =~ s/-mm\d+$//o;	# mm kernels don't count
-				if ($mainline eq 'yes') {
+				$mainline =~ s/\+$//o;
+				$mainline =~ s/-rc\d+//o;
+				$mainline =~ s/-git\d+//o;
+				#$mainline =~ s/-mm\d+//o;	# mm kernels don't count
+				if ($mainline eq 'yes'
+				 || $mainline eq 'obsolete'
+				 || $mainline eq 'unneeded') {
 					# Assume any mainline
 					$mainline = $kernel_rev;
 				}
@@ -257,8 +262,10 @@ done:
 			}
 		}
 		if ($mainline) {
-			($res, @ignore) = &rev_compare($kernel_rev, $mainline);
-			if ($res == 0 || $res == 1)  {
+			# We do not do the CVS rev compare here, but a
+			# simple string compare - in CVS, 1.3.3 is not less that 1.4.1,
+			# but in kernel rev numbering, 2.6.11.8 <= 2.6.14
+			if ($mainline <= $kernel_rev && !($mainline =~ /-[a-z]/o)) {
 				next if ($opt_review);
 				$verdict = "ignored (merged into mainline in $mainline)";
 			}
