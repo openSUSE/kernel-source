@@ -193,10 +193,7 @@ if [ -e $PATCH_DIR ]; then
 fi
 
 # Create fresh $SCRATCH_AREA/linux-$SRCVERSION.
-if [ -d $ORIG_DIR ]; then
-    echo "Linking from $ORIG_DIR"
-    cp -rld $ORIG_DIR $PATCH_DIR
-else
+if ! [ -d $ORIG_DIR ]; then
     echo "Extracting $LINUX_ORIG_TARBALL"
     tar xf$COMPRESS_MODE $LINUX_ORIG_TARBALL --directory $SCRATCH_AREA
     if [ -e $SCRATCH_AREA/linux-$SRCVERSION ]; then
@@ -206,7 +203,6 @@ else
 	mv $SCRATCH_AREA/linux $ORIG_DIR || exit 1
     fi
     find $ORIG_DIR -type f | xargs chmod a-w,a+r
-    cp -rld $ORIG_DIR $PATCH_DIR
 fi
 
 PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
@@ -245,10 +241,11 @@ fi
 if [ -n "$COMBINE" ]; then
     echo "Precomputing combined patches"
     (IFS=$'\n'; echo "${PATCHES[*]}") \
-    | $(dirname $0)/md5fast --dir "$SCRATCH_AREA" --cache combined --generate
+    | $(dirname $0)/md5fast --dir "$SCRATCH_AREA" --source-tree "$ORIG_DIR" \
+    			    --cache combined --generate
 fi
 
-if [ ${#PATCHES_BEFORE[@]} -gt 0 -a -n "$FAST" ]; then
+if [ -n "$FAST" -a -d combined -a ${#PATCHES_BEFORE[@]} -gt 0 ]; then
     echo "Checking for precomputed combined patches"
     PATCHES=( $(IFS=$'\n'; echo "${PATCHES_BEFORE[*]}" \
 	        | $(dirname $0)/md5fast --dir "$SCRATCH_AREA" --cache combined)
@@ -280,6 +277,10 @@ restore_files() {
 	popd > /dev/null
     fi
 }
+
+# Create hardlinked source tree
+echo "Linking from $ORIG_DIR"
+cp -rld $ORIG_DIR $PATCH_DIR
 
 echo -e "# Symbols: $SYMBOLS\n#" > $PATCH_DIR/series
 SERIES_PFX=
