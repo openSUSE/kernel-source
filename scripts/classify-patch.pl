@@ -245,7 +245,8 @@ done:
 		}
 		while (<PATCH>) {
 			s/\s+$//o;
-			if (/^Patch-mainline:\s+(.*)/o) {
+			if (/^Patch-mainline:\s+(.*)/oi
+			 || /^Mainline:\s+(.*)/oi) {
 				$mainline = $1;
 				$mainline =~ s/ or earlier//o;
 				$mainline =~ s/\+$//o;
