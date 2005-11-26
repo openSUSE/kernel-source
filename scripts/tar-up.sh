@@ -339,4 +339,4 @@ for archive in $archives; do
 done
 
 # Force mbuild to choose build hosts with enough memory available:
-echo $((600*1024)) > $build_dir/minmem
+echo $((1024*1024)) > $build_dir/minmem
