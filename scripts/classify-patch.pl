@@ -23,8 +23,31 @@
 #	Check whether the specified patches apply, or can be reverted.
 #	Use the -P option to specific the location of the patch you
 #	want to test
+# -P patchdir
+#	Directory to pick up the kernel patch files from. This should
+#	be a checked out copy of cvs_rev1
 # -v
 #	Increase verbosity
+#
+# Useful things you can do with this script:
+#
+# 1. The following will spit out a one-patch-per-line list of patches
+#    you will need to examine for inclusion in HEAD
+#	HEAD_DIR=...
+#	SP3_DIR=...
+#	cd $HEAD_DIR
+#	cat $SP3_DIR/series.conf | grep "patches.*/" |
+#		./scripts/classify-patch.pl -r -k 2.6.14 -P $SP3_DIR SLES9_SP3_BRANCH HEAD
+#    by adding -v, you can make the script spit out additional information
+#
+# 2. Feed the output of the above script into this command:
+#	cat output-list |
+#		./scripts/classify-patch.pl -p -k 2.6.14 -P $SP3_DIR SLES9_SP3_BRANCH
+#    This will try to reverse or apply any patches from the first run and see if the
+#    patch still applies, or has been merged fully.
+#
+# 3. Manually edit the list and cull "uninteresting" patches from this list.
+#    You can then feed it into step 1
 #
 
 use Getopt::Std;
@@ -38,6 +61,7 @@ $opt_review  = $opt_r;
 $opt_verbose = $opt_v;
 $opt_patch   = $opt_p;
 $patchdir    = $opt_P;
+$patchdir   .= '/' if ($patchdir);
 $kernel_rev  = $opt_k;
 
 $tag0 = shift(@ARGV);
@@ -45,7 +69,6 @@ $tag1 = shift(@ARGV);
 
 if (!$tag0 || !$tag1) {
 	print STDERR "Usage: $ARGV0 tag0 tag1 files...\n";
-	1;
 }
 
 die "Options -p and -r are mutually exclusive, abort\n"
@@ -74,23 +97,27 @@ if ($opt_patch) {
 	print "Using source dir $srcdir\n" if ($opt_verbose);
 
 	$patchcmd = "patch -p1 --quiet --force --dry-run --directory $srcdir >/dev/null";
-	$patchdir .= '/' if ($patchdir);
 }
 
 foreach $patch (<>) {
 	$patch =~ s/\n//;
 
-	if ($opt_patch) {
-		# This little hack allows us to feed the output of
-		# a previous script run back to it, without losing the
-		# previous classification.
-		# (eg you first do a CVS scan, then run classify-patch -p
-		# to see which patches still apply)
-		if ($patch =~ /([^:]*): (.*)/o) {
-			$patch = $1;
-			$original_comment = $2;
-		}
+	if ($patch =~ /^#/o || $patch =~ /^\s*$/o) {
+		print "$patch\n";
+		next;
+	}
 
+	# This little hack allows us to feed the output of
+	# a previous script run back to it, without losing the
+	# previous classification.
+	# (eg you first do a CVS scan, then run classify-patch -p
+	# to see which patches still apply)
+	if ($patch =~ /([^:]*): (.*)/o) {
+		$patch = $1;
+		$original_comment = $2;
+	}
+
+	if ($opt_patch) {
 		print "$patch: $original_comment";
 		if (system("$patchcmd < $patchdir$patch") == 0) {
 			print " [STILL APPLIES]";
@@ -237,11 +264,13 @@ done:
 	$mainline = '';
 	if ($kernel_rev && $dead != 3) {
 		$rev = ($dead == 1)? $rev1 : $rev0;
-		if (-f $patch) {
-			open PATCH, "<$patch" or die "Unable to open $patch: $!\n";
+		if (-f "$patchdir$patch") {
+			open PATCH, "<$patchdir$patch" or die "$patchdir$patch: $!\n";
+		} elsif (-f $patch) {
+			open PATCH, "<$patch" or die "$patch: $!\n";
 		} else {
 			open PATCH, "cvs up -p -r$rev $patch 2>/dev/null|"
-						or die "Unable to run cvs up: $!\n";
+						or die "cvs up -p $patch: $!\n";
 		}
 		while (<PATCH>) {
 			s/\s+$//o;
@@ -257,7 +286,7 @@ done:
 				 || $mainline eq 'obsolete'
 				 || $mainline eq 'unneeded') {
 					# Assume any mainline
-					$mainline = $kernel_rev;
+					$mainline = 'current';
 				}
 				last;
 			}
@@ -266,7 +295,8 @@ done:
 			# We do not do the CVS rev compare here, but a
 			# simple string compare - in CVS, 1.3.3 is not less that 1.4.1,
 			# but in kernel rev numbering, 2.6.11.8 <= 2.6.14
-			if ($mainline <= $kernel_rev && !($mainline =~ /-[a-z]/o)) {
+			if ($mainline eq 'current'
+			 || ($mainline =~ /^\d[0-9.]*$/o && $mainline <= $kernel_rev)) {
 				next if ($opt_review);
 				$verdict = "ignored (merged into mainline in $mainline)";
 			}
