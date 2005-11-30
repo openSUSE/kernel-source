@@ -11,7 +11,7 @@
 while (<>) {
 	chop;
 	$line = $_;
-	if (/^\s+(patches\.\S*)(.*)/o) {
+	if (/^\s*(patches\.[^\s:]*)(.*)/o) {
 		$name = $1;
 		$rest = $2;
 		$user = "anyone";
