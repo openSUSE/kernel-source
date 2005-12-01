@@ -93,7 +93,14 @@ for config in $(cd patches && \
 	MAKE_ARGS="ARCH=$flavor SUBARCH=$arch"
 	;;
     *)
-	MAKE_ARGS="ARCH=$arch"
+	case $arch in
+	ppc64)
+	    MAKE_ARGS="ARCH=powerpc"
+	    ;;
+	*)
+	    MAKE_ARGS="ARCH=$arch"
+	    ;;
+	esac
 	;;
     esac
     config="patches/config/$config"
