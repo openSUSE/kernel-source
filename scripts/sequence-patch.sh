@@ -373,7 +373,8 @@ if [ -n "$CLEAN" ]; then
     rm $PATCH_DIR/series
 fi
 
-ln -s $PWD $PATCH_DIR/patches
+[ -r $HOME/.quiltrc ] && . $HOME/.quiltrc
+ln -s $PWD $PATCH_DIR/${QUILT_PATCHES-patches}
 # If there are any remaining patches, add them to the series so
 # they can be fixed up with quilt (or similar).
 if [ -n "$*" ]; then
