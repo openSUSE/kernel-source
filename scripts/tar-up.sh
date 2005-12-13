@@ -258,6 +258,7 @@ install -m 755					\
 	scripts/guards				\
 	scripts/arch-symbols			\
 	rpm/install-configs			\
+	rpm/built-in-where			\
 	$build_dir
 
 if [ -e extra-symbols ]; then
