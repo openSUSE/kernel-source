@@ -250,6 +250,7 @@ install_changes $build_dir/kernel-source.changes
 install_changes $build_dir/kernel-dummy.changes
 
 install -m 755					\
+	rpm/find-provides			\
 	rpm/config-subst 			\
 	rpm/prepare-build.sh			\
 	rpm/check-for-config-changes		\
@@ -259,6 +260,7 @@ install -m 755					\
 	scripts/arch-symbols			\
 	rpm/install-configs			\
 	rpm/built-in-where			\
+	rpm/make-symsets			\
 	$build_dir
 
 if [ -e extra-symbols ]; then
