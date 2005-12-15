@@ -259,6 +259,7 @@ install -m 755					\
 	scripts/guards				\
 	scripts/arch-symbols			\
 	rpm/install-configs			\
+	rpm/find-types				\
 	rpm/built-in-where			\
 	rpm/make-symsets			\
 	$build_dir
