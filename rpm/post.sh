@@ -15,6 +15,10 @@ fi
 NOBOOTSPLASH=
 suffix=
 case @KERNELRELEASE@ in
+    (*kdump*)
+	NOBOOTSPLASH="-s off"
+	suffix=-kdump
+	;;
     (*xen*)
 	NOBOOTSPLASH="-s off"
 	suffix=-xen
@@ -45,7 +49,7 @@ if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
     fi
 
     case @KERNELRELEASE@ in
-	(*xen*|*um*)
+	(*kdump*|*xen*|*um*)
     	    ;;
   	(*)	
 	    #if [ -x /sbin/update-bootloader ]; then
