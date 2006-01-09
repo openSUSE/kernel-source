@@ -279,6 +279,7 @@ done:
 				$mainline = $1;
 				$mainline =~ s/ or earlier//o;
 				$mainline =~ s/\+$//o;
+				$mainline =~ s/(\d)([a-z])/\1-\2/og;
 				$mainline =~ s/-rc\d+//o;
 				$mainline =~ s/-git\d+//o;
 				#$mainline =~ s/-mm\d+//o;	# mm kernels don't count
@@ -299,6 +300,12 @@ done:
 			 || ($mainline =~ /^\d[0-9.]*$/o && $mainline <= $kernel_rev)) {
 				next if ($opt_review);
 				$verdict = "ignored (merged into mainline in $mainline)";
+			}
+
+			# Ignore externally maintained patches
+			if ($mainline eq 'external') {
+				next if ($opt_review);
+				$verdict = "ignored (externally maintained)";
 			}
 		} else {
 			$complain = 1;
