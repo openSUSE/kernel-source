@@ -41,6 +41,7 @@ until [ "$#" = "0" ] ; do
 	;;
     -d|-D)
 	mbuild_options="$mbuild_options $1 $2"
+	dist=yes
 	shift 2
 	;;
     -p|--prefer-rpms)
@@ -103,8 +104,9 @@ EOF
     esac
 done
 mbuild_options="-l $user $mbuild_options $prefer_rpms $with_debug"
-if [ ! -z "$dist" ] ; then
-mbuild_options="$mbuild_options $dist"
+if [ -z "$dist" ] ; then
+    source scripts/config.sh
+    mbuild_options="$mbuild_options ${DIST_SET:+-d $DIST_SET}"
 fi
 if [ ! -z "$single_specfiles" ] ; then
 specfiles=`echo $single_specfiles | sort | xargs echo`

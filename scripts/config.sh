@@ -11,3 +11,4 @@ fi
 SRCVERSION=2.6.15
 BUILD_DIR=kernel-source
 IGNORE_ARCHS=
+DIST_SET=''
