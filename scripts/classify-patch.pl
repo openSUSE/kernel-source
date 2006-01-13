@@ -112,9 +112,15 @@ foreach $patch (<>) {
 	# previous classification.
 	# (eg you first do a CVS scan, then run classify-patch -p
 	# to see which patches still apply)
+	$original_comment = '';
+	$extra_comment = '';
 	if ($patch =~ /([^:]*): (.*)/o) {
 		$patch = $1;
 		$original_comment = $2;
+		if ($original_comment =~ /(.*\S)(\s*\[.*\])$/o) {
+			$original_comment = $1;
+			$extra_comment = $2;
+		}
 	}
 
 	if ($opt_patch) {
@@ -236,6 +242,7 @@ foreach $patch (<>) {
 		$verdict = "$tag1 more recent than $tag0";
 	} else {
 		$verdict = "diverging";
+		# next if ($opt_review);
 	}
 
 	if ($dead) {
@@ -314,7 +321,7 @@ done:
 		close PATCH;
 	}
 
-	print "$patch: $verdict\n";
+	print "$patch: $verdict$extra_comment\n";
 	if ($opt_verbose) {
 		printf "  %-20s %s\n", $tag0, &rev_print($rev0, $base_rev0, $branch0);
 		printf "  %-20s %s\n", $tag1, &rev_print($rev1, $base_rev1, $branch1);
