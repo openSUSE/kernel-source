@@ -36,13 +36,25 @@ function _region_msg_ () {
     fi
 }
 
+function expand_config_option () {
+	local opt="$1"
+	opt="${opt%%=*}"
+	case "$opt" in
+		CONFIG_*) ;;
+		*) opt="CONFIG_$opt" ;;
+	esac
+	echo "$opt"
+}
+
 #########################################################
 # main
 
 arch="--list"
 YES=
 menuconfig=no
-new_config_option=no
+new_config_option_yes=no
+new_config_option_mod=no
+new_config_option_no=no
 until [ "$#" = "0" ] ; do
     case "$1" in
     y|-y|--yes)
@@ -57,19 +69,80 @@ until [ "$#" = "0" ] ; do
 	menuconfig=yes
 	shift
 	;;
-    -nco|--new-config-option)
-	new_config_option="$2"
+    -nco-y|--new-config-option-yes)
+	new_config_option_yes="$2"
 	shift 2
 	;;
+    -nco-m|--new-config-option-mod)
+	new_config_option_mod="$2"
+	shift 2
+	;;
+    -nco-n|--new-config-option-no|-dco|--disable-config-option)
+	new_config_option_no="$2"
+	shift 2
+	;;
+    -h|--help)
+	cat <<EOF
+
+${0##*/} does either:
+ * run make oldconfig to clean up the .config files
+ * modify kernel .config files in the CVS tree
+
+run it with no options in your SCRATCH_AREA $SCRATCH_AREA, like
+	patches/scripts/${0##*/}
+possible options in this mode:
+	called with no option will run just make oldconfig interactive
+	y|-y|--yes         to run 'yes "" | make oldconfig'
+	a|-a|--arch        to run make oldconfig only for the given arch
+	m|-m|--menuconfig  to run make menuconfig instead of oldconfig
+
+run it with one of the following options to modify all .config files listed
+in config.conf:
+	-nco-y|--new-config-option-yes   compile something into the kernel
+	-nco-m|--new-config-option-mod   compile something as a module
+	-nco-n|--new-config-option-no    disable a kenrel .config option
+	-dco|--disable-config-option     alias for -nco-n
+each of them takes a second argument, which can be either
+FOO
+FOO=X
+CONFIG_FOO
+CONFIG_FOO=X
+EOF
+	exit 1
+	;;
     *)
-	shift
+	echo ugh
+    	exit 1
 	;;
     esac
 done
-if [ "$new_config_option" != "no" ] ; then
-	echo "appending $new_config_option to all config files listed in config.conf"
+if [ "$new_config_option_yes" != "no" ] ; then
+	new_config_option_yes="`expand_config_option $new_config_option_yes`"
+	echo "appending $new_config_option_yes to all config files listed in config.conf"
 	for config in $(eval scripts/guards $arch < config.conf); do
-		echo "$new_config_option" >> config/$config
+		sed -i "/${new_config_option_yes}[ =]/d" config/$config
+		# '"
+		echo "${new_config_option_yes}=y" >> config/$config
+	done
+	exit 0
+fi
+if [ "$new_config_option_mod" != "no" ] ; then
+	new_config_option_mod="`expand_config_option $new_config_option_mod`"
+	echo "appending $new_config_option_mod to all config files listed in config.conf"
+	for config in $(eval scripts/guards $arch < config.conf); do
+		sed -i "/${new_config_option_mod}[ =]/d" config/$config
+		# '"
+		echo "${new_config_option_mod}=m" >> config/$config
+	done
+	exit 0
+fi
+if [ "$new_config_option_no" != "no" ] ; then
+	new_config_option_no="`expand_config_option $new_config_option_no`"
+	echo "disable $new_config_option_no in all config files listed in config.conf"
+	for config in $(eval scripts/guards $arch < config.conf); do
+		sed -i "/${new_config_option_no}[ =]/d" config/$config
+		# '"
+		echo "# ${new_config_option_no} is not set" >> config/$config
 	done
 	exit 0
 fi
