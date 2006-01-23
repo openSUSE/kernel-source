@@ -14,18 +14,10 @@ fi
 # Update the /boot/vmlinuz and /boot/initrd symlinks
 NOBOOTSPLASH=
 suffix=
-case @KERNELRELEASE@ in
-    (*kdump*)
+case @FLAVOR@ in
+    (kdump|um|xen)
 	NOBOOTSPLASH="-s off"
-	suffix=-kdump
-	;;
-    (*xen*)
-	NOBOOTSPLASH="-s off"
-	suffix=-xen
-	;;
-    (*um*)
-	NOBOOTSPLASH="-s off"
-	suffix=-um
+	suffix=-@FLAVOR@
 	;;
 esac
 for x in /boot/$image /boot/initrd; do
@@ -48,8 +40,8 @@ if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
 	echo "please run mkinitrd as soon as your system is complete"
     fi
 
-    case @KERNELRELEASE@ in
-	(*kdump*|*xen*|*um*)
+    case @FLAVOR@ in
+	(kdump|xen|um)
     	    ;;
   	(*)	
 	    #if [ -x /sbin/update-bootloader ]; then
