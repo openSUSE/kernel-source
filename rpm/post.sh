@@ -15,7 +15,7 @@ fi
 NOBOOTSPLASH=
 suffix=
 case @FLAVOR@ in
-    (kdump|um|xen)
+    (kdump|um|xen*)
 	NOBOOTSPLASH="-s off"
 	suffix=-@FLAVOR@
 	;;
@@ -41,7 +41,7 @@ if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
     fi
 
     case @FLAVOR@ in
-	(kdump|xen|um)
+	(kdump|um|xen*)
     	    ;;
   	(*)	
 	    #if [ -x /sbin/update-bootloader ]; then
