@@ -66,18 +66,35 @@ if [ -n "$rpm_release_timestamp" ]; then
     rpm_release_string="\`env -i - TZ=GMT date +%Y%m%d\`${rpm_release_string:+_$rpm_release_string}"
 fi
 
-if ! scripts/check-conf || \
+[ -z "$build_dir" ] && build_dir=$BUILD_DIR
+if [ -z "$build_dir" ]; then
+    echo "Please define the build directory with the --dir option" >&2
+    exit 1
+fi
+
+check_for_merge_conflicts() {
+    set -- $(grep -lP '^<{7}(?!<)|^>{7}(?!>)' "$@" 2> /dev/null)
+    if [ $# -gt 0 ]; then
+	printf "Merge conflicts in %s\n" "$@" >&2
+	return 1
+    fi
+}
+
+# All config files and patches used
+referenced_files="$( {
+	$(dirname $0)/guards --list < series.conf
+	$(dirname $0)/guards --prefix=config --list < config.conf
+    } | sort -u )"
+
+if ! check_for_merge_conflicts $referenced_files \
+			       kernel-source.changes \
+			       kernel-source.changes.old || \
+   ! scripts/check-conf || \
    ! scripts/check-cvs-add; then
     echo "Inconsistencies found."
     echo "Please clean up series.conf and/or the patches directories!"
     echo "Press <ENTER> to continue"
     read
-fi
-
-[ -z "$build_dir" ] && build_dir=$BUILD_DIR
-if [ -z "$build_dir" ]; then
-    echo "Please define the build directory with the --dir option" >&2
-    exit 1
 fi
 
 rm -rf $build_dir
@@ -295,14 +312,9 @@ fi
 echo $SRC_FILE
 cp $LINUX_ORIG_TARBALL $build_dir
 
-# Generate list of all config files and patches used
-all_files="$( {
-	$(dirname $0)/guards --list < series.conf
-	$(dirname $0)/guards --prefix=config --list < config.conf
-    } | sort -u )"
 # The first directory level determines the archive name
 all_archives="$(
-    echo "$all_files" \
+    echo "$referenced_files" \
     | sed -e 's,/.*,,' \
     | uniq )"
 for archive in $all_archives; do
@@ -313,7 +325,7 @@ for archive in $all_archives; do
 	continue ;;
     esac
 
-    files="$( echo "$all_files" \
+    files="$( echo "$referenced_files" \
 	| sed -ne "\:^${archive//./\\.}/:p" \
 	| while read patch; do
 	    [ -e "$patch" ] && echo "$patch"
