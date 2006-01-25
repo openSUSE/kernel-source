@@ -29,12 +29,6 @@ until [ "$#" = "0" ] ; do
 	exit 1
 	;;
       esac
-      rpm_release_string="`echo $2 | sed 's@^.\{,32\}@@'`"
-      if ! test -z "$rpm_release_string"
-      then
-      	echo "$2 will likely exceed the 64 byte 'uname -r' limit. Use a shorter string."
-	exit 1
-      fi
       rpm_release_string="$2"
       shift 2
       ;;
@@ -69,6 +63,11 @@ PATCHVERSION=$($(dirname $0)/compute-PATCHVERSION.sh)
 RPMVERSION=${PATCHVERSION//-/_}
 
 if [ -n "$rpm_release_timestamp" ]; then
+    if test $(( ${#RPMVERSION} + 10 + 2 + 8 + ${#rpm_release_string})) -gt 64
+    then
+    	echo "${RPMVERSION}-${rpm_release_string}-\${flavour} exceeds the 64 byte 'uname -r' limit. Use a shorter string."
+	exit 1
+    fi
     rpm_release_string="\`env -i - TZ=GMT date +%Y%m%d\`${rpm_release_string:+_$rpm_release_string}"
 fi
 
