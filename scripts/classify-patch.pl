@@ -19,6 +19,9 @@
 #	 -	has been killed in the target branch
 #	 -	evolved from a version in the source branch
 #	 -	does not exist in the source branch
+# -D
+#	Ignore patches that exist in both branches, but diverged from
+#	a common base revision
 # -p
 #	Check whether the specified patches apply, or can be reverted.
 #	Use the -P option to specific the location of the patch you
@@ -56,7 +59,8 @@ $STATE_START    = 0;
 $STATE_BRANCHES = 1;
 
 
-getopts('k:P:prv');
+getopts('Dk:P:prv');
+$opt_diverge = $opt_D;
 $opt_review  = $opt_r;
 $opt_verbose = $opt_v;
 $opt_patch   = $opt_p;
@@ -102,8 +106,27 @@ if ($opt_patch) {
 foreach $patch (<>) {
 	$patch =~ s/\n//;
 
-	if ($patch =~ /^#/o || $patch =~ /^\s*$/o) {
-		print "$patch\n";
+	$line = $patch;
+
+	$indent = '';
+	if ($patch =~ /^(\s+)(.*)/o) {
+		$indent = $1;
+		$patch = $2;
+	}
+
+	if ($indent ne $prev_indent or $line eq '') {
+		print "$prev_comment";
+		$prev_comment = '';
+		$prev_indent = $indent;
+	}
+
+	if ($patch =~ /^#/o) {
+		$prev_comment .= $line;
+		$prev_comment .= "\n";
+		next;
+	}
+	if ($patch =~ /^$/o) {
+		print "$line\n";
 		next;
 	}
 
@@ -124,7 +147,7 @@ foreach $patch (<>) {
 	}
 
 	if ($opt_patch) {
-		print "$patch: $original_comment";
+		print "$indent$patch: $original_comment";
 		if (system("$patchcmd < $patchdir$patch") == 0) {
 			print " [STILL APPLIES]";
 		} elsif (system("$patchcmd -R < $patchdir$patch") == 0) {
@@ -242,12 +265,12 @@ foreach $patch (<>) {
 		$verdict = "$tag1 more recent than $tag0";
 	} else {
 		$verdict = "diverging";
-		# next if ($opt_review);
+		goto skip if ($opt_diverge);
 	}
 
 	if ($dead) {
 		# Ignore patches killed in the target branch
-		next if ($opt_review && ($dead & 2));
+		goto skip if ($opt_review && ($dead & 2));
 
 		if ($dead == 3) {
 			$verdict = "completetely dead";
@@ -305,14 +328,18 @@ done:
 			# but in kernel rev numbering, 2.6.11.8 <= 2.6.14
 			if ($mainline eq 'current'
 			 || ($mainline =~ /^\d[0-9.]*$/o && $mainline <= $kernel_rev)) {
-				next if ($opt_review);
+				goto skip if ($opt_review);
 				$verdict = "ignored (merged into mainline in $mainline)";
 			}
 
 			# Ignore externally maintained patches
 			if ($mainline eq 'external') {
-				next if ($opt_review);
+				goto skip if ($opt_review);
 				$verdict = "ignored (externally maintained)";
+			}
+			if ($mainline =~ /^sles/o) {
+				goto skip if ($opt_review);
+				$verdict = "ignored ($mainline)";
 			}
 		} else {
 			$complain = 1;
@@ -321,7 +348,13 @@ done:
 		close PATCH;
 	}
 
-	print "$patch: $verdict$extra_comment\n";
+	if ($prev_comment) {
+		print $prev_comment;
+		$prev_comment = '';
+	}
+
+	print "$indent$patch: $verdict$extra_comment\n";
+
 	if ($opt_verbose) {
 		printf "  %-20s %s\n", $tag0, &rev_print($rev0, $base_rev0, $branch0);
 		printf "  %-20s %s\n", $tag1, &rev_print($rev1, $base_rev1, $branch1);
@@ -333,6 +366,12 @@ done:
 			print "  Patch doesn't have a patch-mainline tag\n";
 		}
 	}
+
+	next;
+
+skip:
+	$prev_comment = '';
+	$prev_indent = '';
 }
 
 sub check_branch {
