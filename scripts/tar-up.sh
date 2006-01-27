@@ -347,6 +347,11 @@ echo "hello.tar.bz2"
     	      --exclude='*.ko' --exclude='*.o' hello
 ) | bzip2 > $build_dir/hello.tar.bz2
 
+echo "novell-kmp.novell-kmp-1.1.tar.bz2"
+cp doc/novell-kmp/novell-kmp-1.1.tar.bz2 $build_dir/
+echo "novell-kmp.spec.example"
+cp doc/novell-kmp/novell-kmp.spec $build_dir/novell-kmp.spec.example
+
 # Create empty dummys for any *.tar.bz2 archive mentioned in the spec file
 # not already created: patches.addon is empty by intention; others currently
 # may contain no patches.
