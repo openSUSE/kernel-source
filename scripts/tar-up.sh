@@ -341,16 +341,11 @@ for archive in $all_archives; do
     fi
 done
 
-echo "hello.tar.bz2"
+echo "novell-kmp.tar.bz2"
 (   cd doc
     tar -cf - --exclude=CVS --exclude='.*.cmd' \
-    	      --exclude='*.ko' --exclude='*.o' hello
-) | bzip2 > $build_dir/hello.tar.bz2
-
-echo "novell-kmp.novell-kmp-1.1.tar.bz2"
-cp doc/novell-kmp/novell-kmp-1.1.tar.bz2 $build_dir/
-echo "novell-kmp.spec.example"
-cp doc/novell-kmp/novell-kmp.spec $build_dir/novell-kmp.spec.example
+	      --exclude='*.ko' --exclude='*.o' novell-kmp
+) | bzip2 > $build_dir/novell-kmp.tar.bz2
 
 # Create empty dummys for any *.tar.bz2 archive mentioned in the spec file
 # not already created: patches.addon is empty by intention; others currently
