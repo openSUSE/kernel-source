@@ -11,7 +11,7 @@ Release:      0
 Source0:      novell-kmp-%version.tar.bz2
 BuildRoot:    %{_tmppath}/%{name}-%{version}-build
 
-%suse_kernel_module_package kdump uml
+%suse_kernel_module_package kdump um
 %define arch %(echo %_target_cpu | sed -e 's/i.86/i386/')
 
 %description
