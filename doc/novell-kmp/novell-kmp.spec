@@ -1,8 +1,7 @@
 # norootforbuild
 
-BuildRequires: kernel-source kernel-syms
-
 Name:         novell-kmp
+BuildRequires: kernel-source kernel-syms
 License:      GPL
 Group:        System/Kernel
 Summary:      Example Kernel Module Package
@@ -12,7 +11,6 @@ Source0:      novell-kmp-%version.tar.bz2
 BuildRoot:    %{_tmppath}/%{name}-%{version}-build
 
 %suse_kernel_module_package kdump um
-%define arch %(echo %_target_cpu | sed -e 's/i.86/i386/')
 
 %description
 This is an example Kernel Module Package.
@@ -37,7 +35,7 @@ export EXTRA_CFLAGS='-DVERSION=\"%version\"'
 for flavor in %flavors_to_build; do
     rm -rf obj/$flavor
     cp -r source obj/$flavor
-    make -C /usr/src/linux-obj/%arch/$flavor modules \
+    make -C /usr/src/linux-obj/%_target_cpu/$flavor modules \
 	M=$PWD/obj/$flavor
 done
 
@@ -45,7 +43,7 @@ done
 export INSTALL_MOD_PATH=$RPM_BUILD_ROOT
 export INSTALL_MOD_DIR=updates
 for flavor in %flavors_to_build; do
-    make -C /usr/src/linux-obj/%arch/$flavor modules_install \
+    make -C /usr/src/linux-obj/%_target_cpu/$flavor modules_install \
 	 M=$PWD/obj/$flavor
 done
 
