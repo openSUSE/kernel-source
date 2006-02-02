@@ -203,6 +203,15 @@ for flavor in $flavors ; do
 	-e "s,@KERNEL_MODULE_PACKAGES@,$kernel_module_packages,g" \
       < rpm/kernel-binary.spec.in \
     > $build_dir/kernel-$flavor.spec
+    case "$flavor" in
+    	ppc64|iseries64|kdump)
+	sed -i '/^# norootforbuild/ {
+	a \
+# icecream 0\
+
+	}' $build_dir/kernel-$flavor.spec
+	;;
+    esac
 done
 
 install_changes() {
