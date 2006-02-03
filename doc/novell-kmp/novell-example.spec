@@ -1,13 +1,13 @@
 # norootforbuild
 
-Name:         novell-kmp
+Name:         novell-example
 BuildRequires: kernel-source kernel-syms
 License:      GPL
 Group:        System/Kernel
 Summary:      Example Kernel Module Package
 Version:      1.1
 Release:      0
-Source0:      novell-kmp-%version.tar.bz2
+Source0:      %name-%version.tar.bz2
 BuildRoot:    %{_tmppath}/%{name}-%{version}-build
 
 %suse_kernel_module_package kdump um
@@ -24,7 +24,7 @@ This is one of the sub-packages for a specific kernel. All the
 sub-packages will share the same summary, group, and description.
 
 %prep
-%setup -n novell-kmp-%version
+%setup
 set -- *
 mkdir source
 mv "$@" source/
