@@ -9,7 +9,6 @@ single_specfiles=
 timestamp=
 rpm_release_string=
 tolerate_unknown_new_config_options=
-external_modules=
 dist=
 prefer_rpms=
 specfiles=$important_specfiles
@@ -29,10 +28,6 @@ until [ "$#" = "0" ] ; do
 	;;
     -nf)
       tolerate_unknown_new_config_options=-nf
-      shift
-      ;;
-    -nem)
-      external_modules=-nem
       shift
       ;;
     -l)
@@ -85,12 +80,11 @@ the following 3 options are needed to build vanilla kernel with a stripped down 
     -rs <string>       to append specified string to rpm release number
     -ts                to use the current date as rpm release number
     -nf                to proceed if a new unknown .config option is found during make oldconfig
-    -nem               to not build any external km_* module packages
     
 example usage:
 sudo $0 -l talk -D ppc -D x86_64 -ts
-sudo $0 -l talk -d stable -ts -nf -nem
-sudo $0 -l talk -d stable -s um -s s390x -D i386 -D s390x -ts -nf -nem
+sudo $0 -l talk -d stable -ts -nf
+sudo $0 -l talk -d stable -s um -s s390x -D i386 -D s390x -ts -nf
 
 simple usage:
 sudo $0 -l talk
@@ -111,7 +105,7 @@ fi
 if [ ! -z "$single_specfiles" ] ; then
 specfiles=`echo $single_specfiles | sort | xargs echo`
 fi
-scripts/tar-up.sh $rpm_release_string $timestamp $tolerate_unknown_new_config_options $external_modules || exit 1
+scripts/tar-up.sh $rpm_release_string $timestamp $tolerate_unknown_new_config_options || exit 1
 cd kernel-source
 for i in $specfiles
 do

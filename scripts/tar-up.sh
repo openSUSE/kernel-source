@@ -3,7 +3,6 @@
 rpm_release_timestamp=
 rpm_release_string=
 tolerate_unknown_new_config_options=0
-external_modules=1
 until [ "$#" = "0" ] ; do
   case "$1" in
     --dir=*)
@@ -13,10 +12,6 @@ until [ "$#" = "0" ] ; do
     -d|--dir)
       build_dir=$2
       shift 2
-      ;;
-    -nem|--no-external-modules)
-      external_modules=
-      shift
       ;;
     -nf|--tolerate-unknown-new-config-options)
       tolerate_unknown_new_config_options=1
@@ -45,7 +40,6 @@ these options are recognized:
     -rs <string>       to append specified string to rpm release number
     -ts                to use the current date as rpm release number
     -nf                to proceed if a new unknown .config option is found during make oldconfig
-    -nem               to not build any external km_* module packages
 
 EOF
 	exit 1
@@ -188,8 +182,6 @@ for flavor in $flavors ; do
     # of i386.
     archs="$(echo $archs | sed -e 's,i386,%ix86,g')"
 
-    kernel_module_packages=${external_modules:+kernel-module-packages}
-
     # Generate spec file
     sed -e "s,@NAME@,kernel-$flavor,g" \
 	-e "s,@FLAVOR@,$flavor,g" \
@@ -200,7 +192,6 @@ for flavor in $flavors ; do
 	-e "s,@PROVIDES_OBSOLETES@,${prov_obs//$'\n'/\\n},g" \
 	-e "s,@EXTRA_NEEDS@,$extra_needs,g" \
 	-e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options,g" \
-	-e "s,@KERNEL_MODULE_PACKAGES@,$kernel_module_packages,g" \
       < rpm/kernel-binary.spec.in \
     > $build_dir/kernel-$flavor.spec
     case "$flavor" in
