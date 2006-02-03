@@ -12,11 +12,9 @@ if [ -z "$image" ]; then
 fi
 
 # Update the /boot/vmlinuz and /boot/initrd symlinks
-NOBOOTSPLASH=
 suffix=
 case @FLAVOR@ in
     (kdump|um|xen*)
-	NOBOOTSPLASH="-s off"
 	suffix=-@FLAVOR@
 	;;
 esac
@@ -32,7 +30,7 @@ done
 if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
     if [ -f /etc/fstab ]; then
 	if ! /sbin/mkinitrd -k /boot/$image-@KERNELRELEASE@ \
-			    -i /boot/initrd-@KERNELRELEASE@ $NOBOOTSPLASH; then
+			    -i /boot/initrd-@KERNELRELEASE@; then
 	    echo "/sbin/mkinitrd failed" >&2
 	    exit 1
 	fi
