@@ -42,20 +42,22 @@ if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
 	(kdump|um|xen*)
     	    ;;
   	(*)	
-	    #if [ -x /sbin/update-bootloader ]; then
-	    #	opt_initrd=
-	    #	[ -e /boot/initrd-@KERNELRELEASE@ ] \
-	    #	    && opt_initrd="--initrd /boot/initrd-@KERNELRELEASE@"
-	    #	/sbin/update-bootloader --image /boot/$image-@KERNELRELEASE@ \
-	    #	    $opt_initrd --add --default
-	    #fi
-	    if [ -x /sbin/new-kernel-pkg ]; then
-		# Notify boot loader that a new kernel image has been installed.
-		# (during initial installation the boot loader configuration
-		# does not yet exist when the kernel is installed, but yast
-		# kicks the boot loader itself later.)
-		/sbin/new-kernel-pkg @KERNELRELEASE@
+	    if [ -x /sbin/update-bootloader -a \
+		 -e /boot/$image.previous -a \
+		 -e /boot/initrd.previous ]; then
+                echo "updating bootloader configuration"
+		/sbin/update-bootloader --image /boot/$image.previous \
+					--initrd /boot/initrd.previous \
+					--previous --add
 	    fi
 	    ;;
     esac
 fi
+
+# Somewhen in the future: use the real image and initrd filenames instead
+# of the symlinks, and add/remove by the real filenames.
+#if [ -x /sbin/update-bootloader ]; then
+#    /sbin/update-bootloader --image /boot/$image-@KERNELRELEASE@ \
+#			     --initrd /boot/initrd-@KERNELRELEASE@ \
+#			     --name @KERNELRELEASE@ --add
+#fi

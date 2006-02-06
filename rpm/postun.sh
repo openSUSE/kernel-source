@@ -9,8 +9,12 @@ else
     exit 0
 fi
 
+# Somewhen in the future: use the real image and initrd filenames instead
+# of the symlinks, and add/remove by the real filenames.
 #if [ -x /sbin/update-bootloader ]; then
-#    /sbin/update-bootloader --image /boot/$image-@KERNELRELEASE@ --remove
+#    /sbin/update-bootloader --image /boot/$image-@KERNELRELEASE@ \
+#			     --initrd /boot/initrd-@KERNELRELEASE@ \
+#			     --name @KERNELRELEASE@ --remove
 #fi
 
 if [ "$(readlink /boot/$image)" = $image-@KERNELRELEASE@ ]; then
@@ -30,8 +34,10 @@ if [ "$(readlink /boot/$image)" = $image-@KERNELRELEASE@ ]; then
 	    relink $initrd /boot/${initrd%%%%-*}
 
 	    # Notify the boot loader that a new kernel image is active.
-	    if [ -x /sbin/new-kernel-pkg ]; then
-		/sbin/new-kernel-pkg $(/sbin/get_kernel_version /boot/$image)
+	    if [ -x /sbin/update-bootloader ]; then
+		/sbin/update-bootloader --image $image \
+					--initrd $initrd \
+					--refresh
 	    fi
 	    break
 	fi
@@ -42,7 +48,13 @@ fi
 # Created in the other kernel's %post
 case "$(readlink /boot/$image.previous)" in
 $image-@KERNELRELEASE@|$(readlink /boot/$image))
-    rm -f /boot/$image.previous ;;
+    if [ -x /sbin/update-bootloader ]; then
+	/sbin/update-bootloader --image /boot/$image.previous \
+				--initrd /boot/initrd.previous \
+				--remove
+    fi
+    rm -f /boot/$image.previous 
+    ;;
 esac
 case "$(readlink /boot/initrd.previous)" in
 initrd-@KERNELRELEASE@|$(readlink /boot/initrd))
