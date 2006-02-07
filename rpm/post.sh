@@ -32,6 +32,11 @@ if [ -x /sbin/module_upgrade ]; then
     /sbin/module_upgrade --rename mptscsih="mptspi mptfc mptsas"
 fi
 
+# Add symlinks of compatible modules to /lib/modules/$krel/weak-updates/.
+if [ -x /usr/lib/module-init-tools/weak-modules ]; then
+    /usr/lib/module-init-tools/weak-modules --add-kernel @KERNELRELEASE@
+fi
+
 if [ "$YAST_IS_RUNNING" != instsys ]; then
     if [ -f /etc/fstab ]; then
 	if ! /sbin/mkinitrd -k /boot/$image-@KERNELRELEASE@ \

@@ -1,3 +1,9 @@
+# Remove symlinks from /lib/modules/$krel/weak-updates/.
+if [ -x /usr/lib/module-init-tools/weak-modules ]; then
+    /usr/lib/module-init-tools/weak-modules\
+	--remove-kernel @KERNELRELEASE@
+fi
+
 if [ -L /boot/vmlinux ]; then
     image=vmlinux
 elif [ -L /boot/vmlinuz ]; then
