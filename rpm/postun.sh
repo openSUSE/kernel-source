@@ -14,7 +14,7 @@ fi
 #if [ -x /sbin/update-bootloader ]; then
 #    /sbin/update-bootloader --image /boot/$image-@KERNELRELEASE@ \
 #			     --initrd /boot/initrd-@KERNELRELEASE@ \
-#			     --name @KERNELRELEASE@ --remove
+#			     --name @KERNELRELEASE@ --remove --force
 #fi
 
 if [ "$(readlink /boot/$image)" = $image-@KERNELRELEASE@ ]; then
@@ -27,17 +27,17 @@ if [ "$(readlink /boot/$image)" = $image-@KERNELRELEASE@ ]; then
     # manager will always have a kernel to boot in its default
     # configuration.
     shopt -s nullglob
-    for image in $(cd /boot ; ls -dt $image-*); do
-	initrd=initrd-${image#*-}
-	if [ -f /boot/$image -a -f /boot/$initrd ]; then
-	    relink $image /boot/${image%%%%-*}
-	    relink $initrd /boot/${initrd%%%%-*}
+    for this_image in $(cd /boot ; ls -dt $image-*); do
+	this_initrd=initrd-${this_image#*-}
+	if [ -f /boot/$this_image -a -f /boot/$this_initrd ]; then
+	    relink $this_image /boot/$image
+	    relink $this_initrd /boot/initrd
 
 	    # Notify the boot loader that a new kernel image is active.
 	    if [ -x /sbin/update-bootloader ]; then
-		/sbin/update-bootloader --image $image \
-					--initrd $initrd \
-					--refresh
+		/sbin/update-bootloader --image /boot/$image \
+					--initrd /boot/initrd \
+					--add --force
 	    fi
 	    break
 	fi
@@ -51,7 +51,7 @@ $image-@KERNELRELEASE@|$(readlink /boot/$image))
     if [ -x /sbin/update-bootloader ]; then
 	/sbin/update-bootloader --image /boot/$image.previous \
 				--initrd /boot/initrd.previous \
-				--remove
+				--remove --force
     fi
     rm -f /boot/$image.previous 
     ;;
@@ -60,3 +60,6 @@ case "$(readlink /boot/initrd.previous)" in
 initrd-@KERNELRELEASE@|$(readlink /boot/initrd))
     rm -f /boot/initrd.previous ;;
 esac
+
+# Run the bootloader (e.g., lilo).
+/sbin/update-bootloader --refresh

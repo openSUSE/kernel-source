@@ -11,20 +11,21 @@ if [ -z "$image" ]; then
     exit 1
 fi
 
-# Update the /boot/vmlinuz and /boot/initrd symlinks
+# Update the /boot/vmlinuz and /boot/initrd symlinks, and rename
+# existing symlinks to *.previous.
 suffix=
 case @FLAVOR@ in
     (kdump|um|xen*)
 	suffix=-@FLAVOR@
 	;;
 esac
-for x in /boot/$image /boot/initrd; do
-    if [ -e $x$suffix -a \
-	 "$(readlink $x$suffix)" != ${x##*/}-@KERNELRELEASE@ ]; then
-	mv -f $x$suffix $x$suffix.previous
+for x in /boot/$image$suffix /boot/initrd$suffix; do
+    if [ -e $x -a \
+	 "$(readlink $x)" != ${x##*/}-@KERNELRELEASE@ ]; then
+	mv -f $x $x.previous
     fi
-    rm -f $x$suffix
-    ln -s ${x##*/}-@KERNELRELEASE@ $x$suffix
+    rm -f $x
+    ln -s ${x##*/}-@KERNELRELEASE@ $x
 done
 
 if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
@@ -45,19 +46,24 @@ if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
 	    if [ -x /sbin/update-bootloader -a \
 		 -e /boot/$image.previous -a \
 		 -e /boot/initrd.previous ]; then
-                echo "updating bootloader configuration"
 		/sbin/update-bootloader --image /boot/$image.previous \
 					--initrd /boot/initrd.previous \
-					--previous --add
+					--previous --add --force
 	    fi
 	    ;;
     esac
-fi
+    /sbin/update-bootloader --image /boot/$image \
+			    --initrd /boot/initrd \
+			    --add --force
 
-# Somewhen in the future: use the real image and initrd filenames instead
-# of the symlinks, and add/remove by the real filenames.
-#if [ -x /sbin/update-bootloader ]; then
-#    /sbin/update-bootloader --image /boot/$image-@KERNELRELEASE@ \
-#			     --initrd /boot/initrd-@KERNELRELEASE@ \
-#			     --name @KERNELRELEASE@ --add
-#fi
+    # Somewhen in the future: use the real image and initrd filenames instead
+    # of the symlinks, and add/remove by the real filenames.
+    #if [ -x /sbin/update-bootloader ]; then
+    #    /sbin/update-bootloader --image /boot/$image-@KERNELRELEASE@ \
+    #			     --initrd /boot/initrd-@KERNELRELEASE@ \
+    #			     --name @KERNELRELEASE@ --add --force
+    #fi
+
+    # Run the bootloader (e.g., lilo).
+    /sbin/update-bootloader --refresh
+fi
