@@ -28,7 +28,11 @@ for x in /boot/$image$suffix /boot/initrd$suffix; do
     ln -s ${x##*/}-@KERNELRELEASE@ $x
 done
 
-if [ "$YAST_IS_RUNNING" != instsys -a -n "$run_mkinitrd" ]; then
+if [ -x /sbin/module_upgrade ]; then
+    /sbin/module_upgrade --rename mptscsih="mptspi mptfc mptsas"
+fi
+
+if [ "$YAST_IS_RUNNING" != instsys ]; then
     if [ -f /etc/fstab ]; then
 	if ! /sbin/mkinitrd -k /boot/$image-@KERNELRELEASE@ \
 			    -i /boot/initrd-@KERNELRELEASE@; then
