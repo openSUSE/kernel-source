@@ -19,13 +19,13 @@ case @FLAVOR@ in
 	suffix=-@FLAVOR@
 	;;
 esac
-for x in /boot/$image$suffix /boot/initrd$suffix; do
-    if [ -e $x -a \
-	 "$(readlink $x)" != ${x##*/}-@KERNELRELEASE@ ]; then
-	mv -f $x $x.previous
+for x in /boot/$image /boot/initrd; do
+    if [ -e $x$suffix -a \
+	 "$(readlink $x$suffix)" != ${x##*/}-@KERNELRELEASE@ ]; then
+	mv -f $x$suffix $x$suffix.previous
     fi
-    rm -f $x
-    ln -s ${x##*/}-@KERNELRELEASE@ $x
+    rm -f $x$suffix
+    ln -s ${x##*/}-@KERNELRELEASE@ $x$suffix
 done
 
 if [ -x /sbin/module_upgrade ]; then
