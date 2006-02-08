@@ -15,13 +15,18 @@ else
     exit 0
 fi
 
+update_bootloader() {
+    # FIXME: we need an update of perl-Bootloader first !!!
+    return
+    [ -x /sbin/update-bootloader ] || return
+    /sbin/update-bootloader "$@"
+}
+
 # Somewhen in the future: use the real image and initrd filenames instead
 # of the symlinks, and add/remove by the real filenames.
-#if [ -x /sbin/update-bootloader ]; then
-#    /sbin/update-bootloader --image /boot/$image-@KERNELRELEASE@ \
-#			     --initrd /boot/initrd-@KERNELRELEASE@ \
-#			     --name @KERNELRELEASE@ --remove --force
-#fi
+#    update_bootloader --image /boot/$image-@KERNELRELEASE@ \
+#		       --initrd /boot/initrd-@KERNELRELEASE@ \
+#		       --name @KERNELRELEASE@ --remove --force
 
 if [ "$(readlink /boot/$image)" = $image-@KERNELRELEASE@ ]; then
     # This may be the last kernel RPM on the system, or it may
@@ -40,11 +45,9 @@ if [ "$(readlink /boot/$image)" = $image-@KERNELRELEASE@ ]; then
 	    relink $this_initrd /boot/initrd
 
 	    # Notify the boot loader that a new kernel image is active.
-	    if [ -x /sbin/update-bootloader ]; then
-		/sbin/update-bootloader --image /boot/$image \
-					--initrd /boot/initrd \
-					--add --force
-	    fi
+	    update_bootloader --image /boot/$image \
+			      --initrd /boot/initrd \
+			      --add --force
 	    break
 	fi
     done
@@ -54,11 +57,9 @@ fi
 # Created in the other kernel's %post
 case "$(readlink /boot/$image.previous)" in
 $image-@KERNELRELEASE@|$(readlink /boot/$image))
-    if [ -x /sbin/update-bootloader ]; then
-	/sbin/update-bootloader --image /boot/$image.previous \
-				--initrd /boot/initrd.previous \
-				--remove --force
-    fi
+    update_bootloader --image /boot/$image.previous \
+		      --initrd /boot/initrd.previous \
+		      --remove --force
     rm -f /boot/$image.previous 
     ;;
 esac
@@ -68,6 +69,4 @@ initrd-@KERNELRELEASE@|$(readlink /boot/initrd))
 esac
 
 # Run the bootloader (e.g., lilo).
-if [ -x /sbin/update-bootloader ]; then
-    /sbin/update-bootloader --refresh
-fi
+update_bootloader --refresh

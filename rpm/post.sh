@@ -37,6 +37,13 @@ if [ -x /usr/lib/module-init-tools/weak-modules ]; then
     /usr/lib/module-init-tools/weak-modules --add-kernel @KERNELRELEASE@
 fi
 
+update_bootloader() {
+    # FIXME: we need an update of perl-Bootloader first !!!
+    return
+    [ -x /sbin/update-bootloader ] || return
+    /sbin/update-bootloader "$@"
+}
+
 if [ "$YAST_IS_RUNNING" != instsys ]; then
     if [ -f /etc/fstab ]; then
 	if ! /sbin/mkinitrd -k /boot/$image-@KERNELRELEASE@ \
@@ -52,27 +59,23 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
 	(kdump|um|xen*)
     	    ;;
   	(*)	
-	    if [ -x /sbin/update-bootloader -a \
-		 -e /boot/$image.previous -a \
-		 -e /boot/initrd.previous ]; then
-		/sbin/update-bootloader --image /boot/$image.previous \
-					--initrd /boot/initrd.previous \
-					--previous --add --force
+	    if [ -e /boot/$image.previous -a -e /boot/initrd.previous ]; then
+		update_bootloader --image /boot/$image.previous \
+				  --initrd /boot/initrd.previous \
+				  --previous --add --force
 	    fi
 	    ;;
     esac
-    /sbin/update-bootloader --image /boot/$image \
-			    --initrd /boot/initrd \
-			    --add --force
+    update_bootloader --image /boot/$image \
+		      --initrd /boot/initrd \
+		      --add --force
 
     # Somewhen in the future: use the real image and initrd filenames instead
     # of the symlinks, and add/remove by the real filenames.
-    #if [ -x /sbin/update-bootloader ]; then
-    #    /sbin/update-bootloader --image /boot/$image-@KERNELRELEASE@ \
-    #			     --initrd /boot/initrd-@KERNELRELEASE@ \
-    #			     --name @KERNELRELEASE@ --add --force
-    #fi
+    #    update_bootloader --image /boot/$image-@KERNELRELEASE@ \
+    #			   --initrd /boot/initrd-@KERNELRELEASE@ \
+    #			   --name @KERNELRELEASE@ --add --force
 
     # Run the bootloader (e.g., lilo).
-    /sbin/update-bootloader --refresh
+    update_bootloader --refresh
 fi
