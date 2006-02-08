@@ -59,6 +59,9 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
 	(kdump|um|xen*)
     	    ;;
   	(*)	
+	    if [ -x /sbin/new-kernel-pkg ]; then
+		/sbin/new-kernel-pkg @KERNELRELEASE@
+	    fi
 	    if [ -e /boot/$image.previous -a -e /boot/initrd.previous ]; then
 		update_bootloader --image /boot/$image.previous \
 				  --initrd /boot/initrd.previous \
