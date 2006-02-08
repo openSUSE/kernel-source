@@ -68,4 +68,6 @@ initrd-@KERNELRELEASE@|$(readlink /boot/initrd))
 esac
 
 # Run the bootloader (e.g., lilo).
-/sbin/update-bootloader --refresh
+if [ -x /sbin/update-bootloader ]; then
+    /sbin/update-bootloader --refresh
+fi
