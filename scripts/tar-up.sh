@@ -278,12 +278,13 @@ install -m 755					\
 	rpm/check-for-config-changes		\
 	rpm/check-supported-list		\
 	rpm/check-build.sh			\
-	scripts/guards				\
-	scripts/arch-symbols			\
 	rpm/install-configs			\
 	rpm/find-types				\
 	rpm/built-in-where			\
 	rpm/make-symsets			\
+	scripts/guards				\
+	scripts/arch-symbols			\
+	scripts/kabi-checks			\
 	$build_dir
 
 if [ -e extra-symbols ]; then
@@ -340,6 +341,10 @@ for archive in $all_archives; do
 	| bzip2 -9 > $build_dir/$archive.tar.bz2
     fi
 done
+
+echo "kabi.tar.bz2"
+tar cf - --exclude CVS kabi \
+| bzip2 -9 > $build_dir/kabi.tar.bz2
 
 echo "novell-kmp.tar.bz2"
 (   cd doc
