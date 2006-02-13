@@ -38,9 +38,8 @@ if [ -x /usr/lib/module-init-tools/weak-modules ]; then
 fi
 
 update_bootloader() {
-    # FIXME: we need an update of perl-Bootloader first !!!
-    return
-    [ -x /sbin/update-bootloader ] || return
+    [ -x /sbin/update-bootloader -a \
+      "$YAST_IS_RUNNING" != instsys ] || return
     /sbin/update-bootloader "$@"
 }
 
