@@ -161,7 +161,8 @@ for flavor in $flavors ; do
 	    cp $arch-$flavor.diff $build_dir/
 	fi
 
-	[ $arch = i386 ] && arch="%ix86" && nl=$'\n'
+	[ $arch = i386 ] && arch="%ix86"
+	nl=$'\n'
 	if [ ${#p[@]} -o ${#p[@]} ]; then
 	    [ -n "$head" ] && head="${head}%else$nl"
 	    head="${head}%ifarch $arch$nl"
@@ -244,14 +245,32 @@ sed -e "s,@NAME@,kernel-dummy,g" \
   < rpm/kernel-dummy.spec.in \
 > $build_dir/kernel-dummy.spec
 
+# Compute @BUILD_REQUIRES@ expansion
+head="" ; tail=""
+for arch in $(scripts/arch-symbols --list) ; do
+    set -- $(scripts/guards $(scripts/arch-symbols $arch) < config.conf \
+	     | sed -e 's:.*/:kernel-:')
+    [ $arch = i386 ] && arch="%ix86"
+    nl=$'\n'
+    if [ $# -gt 0 ]; then
+	[ -n "$head" ] && head="${head}%else$nl"
+	head="${head}%ifarch $arch$nl"
+	head="${head}BuildRequires: $*$nl"
+	tail="%endif$nl$tail"
+    fi
+done
+build_req="$head${tail%$'\n'}"
+
 echo "kernel-syms.spec"
 sed -e "s,@NAME@,kernel-syms,g" \
     -e "s,@SRCVERSION@,$SRCVERSION,g" \
     -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
+    -e "s,@BUILD_REQUIRES@,${build_req//$'\n'/\\n},g" \
     -e "s,@PRECONF@,1,g" \
   < rpm/kernel-syms.spec.in \
 > $build_dir/kernel-syms.spec
+
 install_changes $build_dir/kernel-syms.changes
 
 echo "Copying various files..."
