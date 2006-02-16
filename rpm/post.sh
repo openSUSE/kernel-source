@@ -19,14 +19,16 @@ case @FLAVOR@ in
 	suffix=-@FLAVOR@
 	;;
 esac
-for x in /boot/$image /boot/initrd; do
-    if [ -e $x$suffix -a \
-	 "$(readlink $x$suffix)" != ${x##*/}-@KERNELRELEASE@ ]; then
-	mv -f $x$suffix $x$suffix.previous
-    fi
-    rm -f $x$suffix
-    ln -s ${x##*/}-@KERNELRELEASE@ $x$suffix
-done
+if [ $1 -gt 1 ]; then
+    for x in /boot/$image /boot/initrd; do
+	if [ -e $x$suffix -a \
+	     "$(readlink $x$suffix)" != ${x##*/}-@KERNELRELEASE@ ]; then
+	    mv -f $x$suffix $x$suffix.previous
+	fi
+	rm -f $x$suffix
+	ln -s ${x##*/}-@KERNELRELEASE@ $x$suffix
+    done
+fi
 
 if [ -x /sbin/module_upgrade ]; then
     /sbin/module_upgrade --rename mptscsih="mptspi mptfc mptsas"
@@ -58,9 +60,6 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
 	(kdump|um|xen*)
     	    ;;
   	(*)	
-	    if [ -x /sbin/new-kernel-pkg ]; then
-		/sbin/new-kernel-pkg @KERNELRELEASE@
-	    fi
 	    if [ -e /boot/$image.previous -a -e /boot/initrd.previous ]; then
 		update_bootloader --image /boot/$image.previous \
 				  --initrd /boot/initrd.previous \
