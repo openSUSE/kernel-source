@@ -62,8 +62,10 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
 		# Only create Previous Kernel bootloader entries for
 		# kernels >= 2.6.16; older kernels don't know how to
 		# remove their bootloader entries again in their %postun.
-		if [ 0$(readlink /boot/$image.previous \
-			| sed -re 's:.*2\.6\.([0-9]+).*:\1:') -ge 16 ]; then
+		set -- $(readlink /boot/$image.previous \
+			 | sed -nr -e 's:\.: :g' \
+				   -e 's:.*([0-9]+ [0-9]+ [0-9]+).*:\1:p')
+		if [ -n "$1" ] && (( ($1*100 + $2) * 100 + $3 >= 20616)); then
 		    update_bootloader --image /boot/$image.previous \
 				      --initrd /boot/initrd.previous \
 				      --previous --add --force
