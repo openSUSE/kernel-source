@@ -19,16 +19,14 @@ case @FLAVOR@ in
 	suffix=-@FLAVOR@
 	;;
 esac
-if [ $1 -gt 1 ]; then
-    for x in /boot/$image /boot/initrd; do
-	if [ -e $x$suffix -a \
-	     "$(readlink $x$suffix)" != ${x##*/}-@KERNELRELEASE@ ]; then
-	    mv -f $x$suffix $x$suffix.previous
-	fi
-	rm -f $x$suffix
-	ln -s ${x##*/}-@KERNELRELEASE@ $x$suffix
-    done
-fi
+for x in /boot/$image /boot/initrd; do
+    if [ -e $x$suffix -a \
+	 "$(readlink $x$suffix)" != ${x##*/}-@KERNELRELEASE@ ]; then
+	mv -f $x$suffix $x$suffix.previous
+    fi
+    rm -f $x$suffix
+    ln -s ${x##*/}-@KERNELRELEASE@ $x$suffix
+done
 
 if [ -x /sbin/module_upgrade ]; then
     /sbin/module_upgrade --rename mptscsih="mptspi mptfc mptsas"
@@ -61,9 +59,15 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
     	    ;;
   	(*)	
 	    if [ -e /boot/$image.previous -a -e /boot/initrd.previous ]; then
-		update_bootloader --image /boot/$image.previous \
-				  --initrd /boot/initrd.previous \
-				  --previous --add --force
+		# Only create Previous Kernel bootloader entries for
+		# kernels >= 2.6.16; older kernels don't know how to
+		# remove their bootloader entries again in their %postun.
+		if [ 0$(readlink /boot/$image.previous \
+			| sed -re 's:.*2\.6\.([0-9]+).*:\1:') -ge 16 ]; then
+		    update_bootloader --image /boot/$image.previous \
+				      --initrd /boot/initrd.previous \
+				      --previous --add --force
+		fi
 	    fi
 	    ;;
     esac
