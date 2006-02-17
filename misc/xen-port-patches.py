@@ -1,25 +1,17 @@
 #!/usr/bin/env python
 """
 xen-port-patches.py [CVS dir]
-Create custom patches for xen from custom patches that affect i386.
+Create custom patches for xen from custom patches that affect i386/x86-64.
 Turned out to be a little functional programming exercise for the author.
 (c) 2005-04-06, Kurt Garloff <garloff@suse.de>
 """
 __revision__ = '$Id'
 
-import re, glob, sys
-
-# global var 
-xenfnames = []	
-
-# Kernel CVS
-defkerncvs = "/usr/src/kernel-source-26"
+import re, glob, sys, os, filecmp
 
 # List of replacement rules
-replrules = [("arch/xen/i386", "arch/i386"),
-	   ("include/asm-xen/asm-i386", "include/asm-i386"),
-	   ("arch/xen/x86_64", "arch/x86_64"),
-	   ("include/asm-xen/asm-x86_64", "include/asm-x86_64")]
+replrules = [(r"arch/(i386|x86_64)/(.*)-xen(\.[^/\s])", r"arch/\1/\2\3"),
+	   (r"include/asm-(i386|x86_64)/mach-xen/asm/", r"include/asm-\1/")]
 # List of compiled rules (speed reasons)
 #comprules = map(lambda(x): (x[0], x[1], re.compile(x[0])), replrules)
 comprules = [ (x[0], x[1], re.compile(x[0])) for x in replrules ]
@@ -41,8 +33,7 @@ def applCorrFwd(path):
 def createReplList(patch):
 	"Creates a list of files to watch and their corresp xen file names"
 	pfile = open(patch, "r")
-	#srch = re.compile(r"^\+\+\+ linux\-2\.6\.[0-9]*[^\/]*\/([^	 \n]*)")
-	srch = re.compile(r"^\+\+\+ [^	 \/]*\/([^ 	\n]*)")
+	srch = re.compile(r"^\+\+\+ [^/\s]+/([\S]*)")
 	# Again illegi^W beautiful functional programming
 	# return matched string no 1
 	matches = map(lambda(m): m.group(1), \
@@ -69,14 +60,23 @@ def writePatch(fname, hdr, body):
 	xenfname = re.sub(xenrepl, r"xen3-\1", fname)
 	shortrepl = re.compile(r"^.*\/([^\/]*\/[^\/]*)$")
 	shortname = re.sub(shortrepl, r"\1", fname)
+	origname = ".".join([xenfname, "orig"])
 	print "%s -> %s" % (shortname, xenfname)
+	if os.access(xenfname, os.F_OK):
+		os.rename(xenfname, origname)
 	pfile = open(xenfname, "w")
 	pfile.write(hdr)
 	pfile.write("Automatically created from \"%s\" by " \
 			"xen-port-patches.py\n\n" % shortname)
 	pfile.write(body)
 	pfile.close()
-	xenfnames.append(xenfname)
+	if os.access(origname, os.F_OK):
+		if filecmp.cmp(xenfname, origname):
+			os.remove(xenfname)
+	else:
+		ser = open("xen3-series.conf", "a")
+		ser.write("\t\t%s\n" % xenfname)
+		ser.close()
 
 def mayCreatePatch(fname, repls):
 	"Try to apply the replacement rules to fname"
@@ -115,13 +115,9 @@ def mayCreatePatch(fname, repls):
 				# There should never be more than one match ...
 				rule = (matches[0][0], matches[0][1])
 				patch += re.sub(rule[1], rule[0], line)
+	pfile.close()
 	if patch:
 		writePatch(fname, patchheader, patch)
-	if xenfnames:
-		ser = open("xen3-series.conf", "w")
-		map(lambda(x): ser.write("\t\t%s\n" % x), xenfnames)
-		ser.close()
-	pfile.close()
 
 def createXenPatches(filelist, repls):
 	"For each file in the list, find hunks that may be needed for Xen"
@@ -137,9 +133,10 @@ def main(args):
 	if len(args) > 1:
 		kerncvs = args[1]
 	else:
-		kerncvs = defkerncvs
+		kerncvs = re.sub(r"^(.*)/[^/]+/[^/]+$", r"\1", os.path.abspath(args[0]))
+	print "Using kernel cvs at '%s'" % (kerncvs)
 	# Create list of replacements
-	repllist = createReplList(kerncvs + "/patches.xen/xen3-auto-arch.diff")
+	repllist = createReplList(kerncvs + "/patches.xen/xen3-auto-xen-arch.diff")
 	#print repllist
 	# ... and compile
 	complrepl = map(lambda(x): (x[0], x[1], re.compile(x[1])), repllist)
