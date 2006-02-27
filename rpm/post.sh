@@ -69,7 +69,7 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
 		    update_bootloader --image /boot/$image.previous \
 				      --initrd /boot/initrd.previous \
 				      --previous --add --force \
-				      $([[ "$1" =~ -xen ]] && echo --xen)
+				      $(case "$1" in (*-xen*) echo --xen;; esac)
 		fi
 	    fi
 	    ;;
@@ -77,7 +77,7 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
     update_bootloader --image /boot/$image \
 		      --initrd /boot/initrd \
 		      --add --force \
-		      $([[ @FLAVOR@ =~ -xen ]] && echo --xen)
+		      $(case "@FLAVOR@" in (xen*) echo --xen;; esac)
 
     # Somewhen in the future: use the real image and initrd filenames instead
     # of the symlinks, and add/remove by the real filenames.
