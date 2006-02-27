@@ -68,14 +68,16 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
 		if [ -n "$1" ] && (( ($1*100 + $2) * 100 + $3 >= 20616)); then
 		    update_bootloader --image /boot/$image.previous \
 				      --initrd /boot/initrd.previous \
-				      --previous --add --force
+				      --previous --add --force \
+				      $([[ "$1" =~ -xen ]] && echo --xen)
 		fi
 	    fi
 	    ;;
     esac
     update_bootloader --image /boot/$image \
 		      --initrd /boot/initrd \
-		      --add --force
+		      --add --force \
+		      $([[ @FLAVOR@ =~ -xen ]] && echo --xen)
 
     # Somewhen in the future: use the real image and initrd filenames instead
     # of the symlinks, and add/remove by the real filenames.

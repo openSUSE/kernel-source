@@ -44,9 +44,6 @@ if [ "$(readlink /boot/$image)" = $image-@KERNELRELEASE@ ]; then
 	    relink $this_initrd /boot/initrd
 
 	    # Notify the boot loader that a new kernel image is active.
-	    update_bootloader --image /boot/$image \
-			      --initrd /boot/initrd \
-			      --add --force
 	    refresh_bootloader=1
 	    break
 	fi
