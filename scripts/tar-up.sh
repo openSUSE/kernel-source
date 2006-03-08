@@ -304,6 +304,7 @@ install -m 755					\
 	scripts/guards				\
 	scripts/arch-symbols			\
 	scripts/kabi-checks			\
+	misc/extract-modaliases			\
 	$build_dir
 
 if [ -e extra-symbols ]; then
