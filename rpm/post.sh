@@ -1,6 +1,4 @@
 echo Setting up /lib/modules/@KERNELRELEASE@
-/sbin/depmod -a -F /boot/System.map-@KERNELRELEASE@ @KERNELRELEASE@
-
 for x in vmlinuz image vmlinux linux bzImage; do
     if [ -f /boot/$x-@KERNELRELEASE@ ]; then
 	image=$x
@@ -36,6 +34,7 @@ fi
 if [ -x /usr/lib/module-init-tools/weak-modules ]; then
     /usr/lib/module-init-tools/weak-modules --add-kernel @KERNELRELEASE@
 fi
+/sbin/depmod -a -F /boot/System.map-@KERNELRELEASE@ @KERNELRELEASE@
 
 update_bootloader() {
     [ -x /sbin/update-bootloader -a \
