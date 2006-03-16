@@ -271,7 +271,6 @@ install -m 644					\
 	supported.conf				\
 	rpm/running-kernel.init.in		\
 	rpm/functions.sh			\
-	rpm/trigger-script.sh.in		\
 	rpm/source-post.sh			\
 	rpm/post.sh				\
 	rpm/postun.sh				\
