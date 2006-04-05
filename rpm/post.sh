@@ -87,36 +87,41 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
     fi
 
     case @FLAVOR@ in
-	(kdump|um|xen*)
+	(kdump|um)
     	    ;;
   	(*)	
-	    if [ -e /boot/$image.previous -a -e /boot/initrd.previous ]; then
+	    opt_xen=
+	    case "@FLAVOR@" in
+	    xen*)
+		opt_xen=--xen
+		;;
+	    esac
+	    if [ -e /boot/$image$suffix.previous -a \
+		 -e /boot/initrd$suffix.previous ]; then
 		# Only create Previous Kernel bootloader entries for
 		# kernels >= 2.6.16; older kernels don't know how to
 		# remove their bootloader entries again in their %postun.
-		set -- $(readlink /boot/$image.previous \
+		set -- $(readlink /boot/$image$suffix.previous \
 			 | sed -nr -e 's:\.: :g' \
 				   -e 's:.*([0-9]+ [0-9]+ [0-9]+).*:\1:p')
 		if [ -n "$1" ] && (( ($1*100 + $2) * 100 + $3 >= 20616)); then
-		    update_bootloader --image /boot/$image.previous \
-				      --initrd /boot/initrd.previous \
-				      --previous --add --force \
-				      $(case "$1" in (*-xen*) echo --xen;; esac)
+		    update_bootloader --image /boot/$image$suffix.previous \
+				      --initrd /boot/initrd$suffix.previous \
+				      --previous --add --force $opt_xen
 		fi
 	    fi
+	    update_bootloader --image /boot/$image$suffix \
+			      --initrd /boot/initrd$suffix \
+			      --add --force $opt_xen
+
+	    # Somewhen in the future: use the real image and initrd filenames
+	    # instead of the symlinks, and add/remove by the real filenames.
+	    #    update_bootloader --image /boot/$image-@KERNELRELEASE@ \
+	    #			   --initrd /boot/initrd-@KERNELRELEASE@ \
+	    #			   --name @KERNELRELEASE@ --add --force
+
+	    # Run the bootloader (e.g., lilo).
+	    update_bootloader --refresh
 	    ;;
     esac
-    update_bootloader --image /boot/$image \
-		      --initrd /boot/initrd \
-		      --add --force \
-		      $(case "@FLAVOR@" in (xen*) echo --xen;; esac)
-
-    # Somewhen in the future: use the real image and initrd filenames instead
-    # of the symlinks, and add/remove by the real filenames.
-    #    update_bootloader --image /boot/$image-@KERNELRELEASE@ \
-    #			   --initrd /boot/initrd-@KERNELRELEASE@ \
-    #			   --name @KERNELRELEASE@ --add --force
-
-    # Run the bootloader (e.g., lilo).
-    update_bootloader --refresh
 fi
