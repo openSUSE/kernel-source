@@ -90,10 +90,12 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
 	(kdump|um)
     	    ;;
   	(*)	
-	    opt_xen=
+	    opt_xen_kernel=
 	    case "@FLAVOR@" in
 	    xen*)
-		opt_xen=--xen
+	    	set -- @FLAVOR@
+		set -- ${1#xen}
+		opt_xen_kernel=--xen-kernel=/boot/xen${1:+-$1}.gz
 		;;
 	    esac
 	    if [ -e /boot/$image$suffix.previous -a \
@@ -107,12 +109,12 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
 		if [ -n "$1" ] && (( ($1*100 + $2) * 100 + $3 >= 20616)); then
 		    update_bootloader --image /boot/$image$suffix.previous \
 				      --initrd /boot/initrd$suffix.previous \
-				      --previous --add --force $opt_xen
+				      --previous --add --force $opt_xen_kernel
 		fi
 	    fi
 	    update_bootloader --image /boot/$image$suffix \
 			      --initrd /boot/initrd$suffix \
-			      --add --force $opt_xen
+			      --add --force $opt_xen_kernel
 
 	    # Somewhen in the future: use the real image and initrd filenames
 	    # instead of the symlinks, and add/remove by the real filenames.
