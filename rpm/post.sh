@@ -110,9 +110,9 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
 				      --previous --add --force $opt_xen
 		fi
 	    fi
-	    #update_bootloader --image /boot/$image$suffix \
-	    #		      --initrd /boot/initrd$suffix \
-	    #		      --add --force $opt_xen
+	    update_bootloader --image /boot/$image$suffix \
+			      --initrd /boot/initrd$suffix \
+			      --add --force $opt_xen
 
 	    # Somewhen in the future: use the real image and initrd filenames
 	    # instead of the symlinks, and add/remove by the real filenames.

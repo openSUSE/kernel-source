@@ -15,6 +15,13 @@ else
     exit 0
 fi
 
+suffix=
+case @FLAVOR@ in
+    (kdump|um|xen*)
+	suffix=-@FLAVOR@
+	;;
+esac
+
 update_bootloader() {
     [ -x /sbin/update-bootloader -a \
       "$YAST_IS_RUNNING" != instsys ] || return 0
@@ -27,7 +34,7 @@ update_bootloader() {
 #		       --initrd /boot/initrd-@KERNELRELEASE@ \
 #		       --name @KERNELRELEASE@ --remove --force
 
-if [ "$(readlink /boot/$image)" = $image-@KERNELRELEASE@ ]; then
+if [ "$(readlink /boot/$image$suffix)" = $image-@KERNELRELEASE@ ]; then
     # This may be the last kernel RPM on the system, or it may
     # be an update. In both of those cases the symlinks will
     # eventually be correct. Only if this kernel
@@ -40,8 +47,8 @@ if [ "$(readlink /boot/$image)" = $image-@KERNELRELEASE@ ]; then
     for this_image in $(cd /boot ; ls -dt $image-*); do
 	this_initrd=initrd-${this_image#*-}
 	if [ -f /boot/$this_image -a -f /boot/$this_initrd ]; then
-	    relink $this_image /boot/$image
-	    relink $this_initrd /boot/initrd
+	    relink $this_image /boot/$image$suffix
+	    relink $this_initrd /boot/initrd$suffix
 
 	    # Notify the boot loader that a new kernel image is active.
 	    refresh_bootloader=1
@@ -52,18 +59,18 @@ if [ "$(readlink /boot/$image)" = $image-@KERNELRELEASE@ ]; then
 fi
 
 # Created in the other kernel's %post
-case "$(readlink /boot/$image.previous)" in
-$image-@KERNELRELEASE@|$(readlink /boot/$image))
-    update_bootloader --image /boot/$image.previous \
-		      --initrd /boot/initrd.previous \
+case "$(readlink /boot/$image$suffix.previous)" in
+$image-@KERNELRELEASE@|$(readlink /boot/$image$suffix))
+    update_bootloader --image /boot/$image$suffix.previous \
+		      --initrd /boot/initrd$suffix.previous \
 		      --remove --force
     refresh_bootloader=1
-    rm -f /boot/$image.previous 
+    rm -f /boot/$image$suffix.previous 
     ;;
 esac
-case "$(readlink /boot/initrd.previous)" in
-initrd-@KERNELRELEASE@|$(readlink /boot/initrd))
-    rm -f /boot/initrd.previous ;;
+case "$(readlink /boot/initrd$suffix.previous)" in
+initrd-@KERNELRELEASE@|$(readlink /boot/initrd$suffix))
+    rm -f /boot/initrd$suffix.previous ;;
 esac
 
 # Run the bootloader (e.g., lilo).
