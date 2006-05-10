@@ -274,7 +274,7 @@ install -m 644					\
 	rpm/source-post.sh			\
 	rpm/post.sh				\
 	rpm/postun.sh				\
-	rpm/Makefile.suse			\
+	rpm/module-renames			\
 	doc/README.SUSE				\
 	$build_dir
 install_changes $build_dir/kernel-source.changes
