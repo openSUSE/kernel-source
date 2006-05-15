@@ -9,6 +9,7 @@ single_specfiles=
 timestamp=
 rpm_release_string=
 tolerate_unknown_new_config_options=
+mbuild_no_checks=
 dist=
 prefer_rpms=
 specfiles=$important_specfiles
@@ -28,6 +29,7 @@ until [ "$#" = "0" ] ; do
 	;;
     -nf)
       tolerate_unknown_new_config_options=-nf
+	mbuild_no_checks=--no-checks
       shift
       ;;
     -l)
@@ -109,6 +111,6 @@ scripts/tar-up.sh $rpm_release_string $timestamp $tolerate_unknown_new_config_op
 cd kernel-source
 for i in $specfiles
 do
-echo	sudo /work/src/bin/mbuild $mbuild_options --obey-doesnotbuild kernel-$i.spec
- 	sudo /work/src/bin/mbuild $mbuild_options --obey-doesnotbuild kernel-$i.spec
+echo	sudo /work/src/bin/mbuild $mbuild_options $mbuild_no_checks --obey-doesnotbuild kernel-$i.spec
+ 	sudo /work/src/bin/mbuild $mbuild_options $mbuild_no_checks --obey-doesnotbuild kernel-$i.spec
 done
