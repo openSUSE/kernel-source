@@ -11,4 +11,4 @@ fi
 SRCVERSION=2.6.16
 BUILD_DIR=kernel-source
 IGNORE_ARCHS=
-DIST_SET='sles10'
+DIST_SET=
