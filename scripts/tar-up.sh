@@ -13,6 +13,10 @@ until [ "$#" = "0" ] ; do
       build_dir=$2
       shift 2
       ;;
+    --embargo)
+      embargo_filter=1
+      shift
+      ;;
     -nf|--tolerate-unknown-new-config-options)
       tolerate_unknown_new_config_options=1
       shift
@@ -79,9 +83,20 @@ check_for_merge_conflicts() {
     fi
 }
 
+rm -rf $build_dir
+mkdir -p $build_dir
+
+# generate the list of patches to include.
+if [ -n "$embargo_filter" ]; then
+    scripts/embargo-filter < series.conf > $build_dir/series.conf \
+	|| exit 1
+else
+    install -m 644 series.conf $build_dir/
+fi
+
 # All config files and patches used
 referenced_files="$( {
-	$(dirname $0)/guards --list < series.conf
+	$(dirname $0)/guards --list < $build_dir/series.conf
 	$(dirname $0)/guards --prefix=config --list < config.conf
     } | sort -u )"
 
@@ -95,9 +110,6 @@ if ! check_for_merge_conflicts $referenced_files \
     echo "Press <ENTER> to continue"
     read
 fi
-
-rm -rf $build_dir
-mkdir -p $build_dir
 
 echo "Computing timestamp..."
 if ! scripts/cvs-wd-timestamp > $build_dir/build-source-timestamp; then
@@ -266,7 +278,6 @@ install_changes $build_dir/kernel-syms.changes
 
 echo "Copying various files..."
 install -m 644					\
-	series.conf				\
 	config.conf				\
 	supported.conf				\
 	rpm/running-kernel.init.in		\
