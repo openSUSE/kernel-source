@@ -90,6 +90,7 @@ mkdir -p $build_dir
 if [ -n "$embargo_filter" ]; then
     scripts/embargo-filter < series.conf > $build_dir/series.conf \
 	|| exit 1
+    chmod 644 $build_dir/series.conf
 else
     install -m 644 series.conf $build_dir/
 fi
