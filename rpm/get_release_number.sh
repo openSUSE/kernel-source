@@ -1,3 +1,3 @@
 #! /bin/sh
 
-echo "pkg:kernel-dummy"
+rpm -q --qf %{RELEASE}\\\n kernel-dummy
