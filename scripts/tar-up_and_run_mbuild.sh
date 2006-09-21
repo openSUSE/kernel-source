@@ -4,7 +4,7 @@ echo "dont forget to update the defconfig files, or the mbuild may fail"
 sleep 1
 sudo -l
 important_specfiles="default smp ppc64 iseries64 s390 kdump"
-all_specfiles="`sed -e '/^\+/s@^.*/@@p;d' config.conf | sort -u | xargs echo source`"
+all_specfiles="`sed -e '/^\+/s@^.*/@@p;d' config.conf | sort -u | xargs echo source dummy`"
 single_specfiles=
 timestamp=
 rpm_release_string=
