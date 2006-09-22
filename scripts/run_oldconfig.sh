@@ -55,6 +55,7 @@ menuconfig=no
 new_config_option_yes=no
 new_config_option_mod=no
 new_config_option_no=no
+vanilla=no
 until [ "$#" = "0" ] ; do
     case "$1" in
     y|-y|--yes)
@@ -80,6 +81,10 @@ until [ "$#" = "0" ] ; do
     -nco-n|--new-config-option-no|-dco|--disable-config-option)
 	new_config_option_no="$2"
 	shift 2
+	;;
+    --vanilla)
+	vanilla=yes
+	shift
 	;;
     -h|--help)
 	cat <<EOF
@@ -157,8 +162,13 @@ if [ "$menuconfig" = "no" ] ; then
 	esac
 fi
 
-for config in $(cd patches && \
-	        eval scripts/guards $arch < config.conf); do
+if [ "$vanilla" = "no" ] ; then
+	config_files=$(cd patches && eval scripts/guards $arch < config.conf | grep -v vanilla)
+else
+	config_files=$(cd patches && eval scripts/guards $arch < config.conf | grep vanilla)
+fi
+
+for config in $config_files; do
     arch=${config%/*}
     flavor=${config#*/}
     case $flavor in
