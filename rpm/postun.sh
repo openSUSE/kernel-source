@@ -1,25 +1,25 @@
 # Remove symlinks from /lib/modules/$krel/weak-updates/.
 if [ -x /usr/lib/module-init-tools/weak-modules ]; then
-    /usr/lib/module-init-tools/weak-modules\
-	--remove-kernel @KERNELRELEASE@
-fi
-
-if [ -L /boot/vmlinux ]; then
-    image=vmlinux
-elif [ -L /boot/vmlinuz ]; then
-    image=vmlinuz
-elif [ -L /boot/image ]; then
-    image=image
-else
-    # nothing to do (UML kernels for example).
-    exit 0
+    /usr/lib/module-init-tools/weak-modules --remove-kernel @KERNELRELEASE@
 fi
 
 suffix=
 case @FLAVOR@ in
-    (kdump|um|xen*)
-	suffix=-@FLAVOR@
-	;;
+    kdump|um|xen*)
+        suffix=-@FLAVOR@
+        ;;
+esac
+
+# Created in %post of old kernels
+case "$(readlink /boot/@IMAGE@$suffix.previous)" in
+@IMAGE@-@KERNELRELEASE@|$(readlink /boot/@IMAGE@$suffix))
+    rm -f /boot/@IMAGE@$suffix.previous 
+    ;;
+esac
+case "$(readlink /boot/initrd$suffix.previous)" in
+initrd-@KERNELRELEASE@|$(readlink /boot/initrd$suffix))
+    rm -f /boot/initrd$suffix.previous
+    ;;
 esac
 
 update_bootloader() {
@@ -28,52 +28,34 @@ update_bootloader() {
     /sbin/update-bootloader "$@"
 }
 
-# Somewhen in the future: use the real image and initrd filenames instead
-# of the symlinks, and add/remove by the real filenames.
-#    update_bootloader --image /boot/$image-@KERNELRELEASE@ \
-#		       --initrd /boot/initrd-@KERNELRELEASE@ \
-#		       --name @KERNELRELEASE@ --remove --force
+case @FLAVOR@ in
+    kdump|um)
+	;;
+    *)
+	update_bootloader --image /boot/@IMAGE@-@KERNELRELEASE@ \
+			  --initrd /boot/initrd-@KERNELRELEASE@ \
+			  --name "Kernel-@KERNELRELEASE@" \
+			  --remove --force
 
-if [ "$(readlink /boot/$image$suffix)" = $image-@KERNELRELEASE@ ]; then
-    # This may be the last kernel RPM on the system, or it may
-    # be an update. In both of those cases the symlinks will
-    # eventually be correct. Only if this kernel
-    # is removed and other kernel rpms remain installed,
-    # find the most recent of the remaining kernels, and make
-    # the symlinks point to it. This makes sure that the boot
-    # manager will always have a kernel to boot in its default
-    # configuration.
-    shopt -s nullglob
-    for this_image in $(cd /boot ; ls -dt $image-*); do
-	this_initrd=initrd-${this_image#*-}
-	if [ -f /boot/$this_image -a -f /boot/$this_initrd ]; then
-	    relink $this_image /boot/$image$suffix
-	    relink $this_initrd /boot/initrd$suffix
+	if [ "$(readlink /boot/@IMAGE@$suffix)" = \
+	     @IMAGE@-@KERNELRELEASE@ ]; then
+	    # This symlink has just gone away. Find the most recent of the
+	    # remaining kernels, and make the symlinks point to it. This makes
+	    # sure that the boot manager will always have a kernel to boot in
+	    # its default configuration.
+	    shopt -s nullglob
+	    for image in $(cd /boot ; ls -dt @IMAGE@-*); do
+		initrd=initrd-${image#@IMAGE@-}
+		if [ -f /boot/$image -a -f /boot/$initrd ]; then
+		    relink $image /boot/@IMAGE@$suffix
+		    relink $initrd /boot/initrd$suffix
 
-	    # Notify the boot loader that a new kernel image is active.
-	    refresh_bootloader=1
-	    break
+		    # Trigger the bootloader (e.g., lilo).
+		    update_bootloader --refresh
+		    break
+		fi
+	    done
+	    shopt -u nullglob
 	fi
-    done
-    shopt -u nullglob
-fi
-
-# Created in the other kernel's %post
-case "$(readlink /boot/$image$suffix.previous)" in
-$image-@KERNELRELEASE@|$(readlink /boot/$image$suffix))
-    update_bootloader --image /boot/$image$suffix.previous \
-		      --initrd /boot/initrd$suffix.previous \
-		      --remove --force
-    refresh_bootloader=1
-    rm -f /boot/$image$suffix.previous 
-    ;;
+	;;
 esac
-case "$(readlink /boot/initrd$suffix.previous)" in
-initrd-@KERNELRELEASE@|$(readlink /boot/initrd$suffix))
-    rm -f /boot/initrd$suffix.previous ;;
-esac
-
-# Run the bootloader (e.g., lilo).
-if [ -n "$refresh_bootloader" ]; then
-    update_bootloader --refresh
-fi
