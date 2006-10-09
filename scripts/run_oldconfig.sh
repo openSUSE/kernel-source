@@ -191,7 +191,7 @@ for config in $config_files; do
 	;;
     *)
 	_region_msg_ "working on $config"
-	eval $YES KCONFIG_NOTIMESTAMP=1 make $MAKE_ARGS silentoldconfig
+	eval $YES KCONFIG_NOTIMESTAMP=1 make $MAKE_ARGS oldconfig
 	;;
     esac
     if ! diff -U0 $config .config; then
