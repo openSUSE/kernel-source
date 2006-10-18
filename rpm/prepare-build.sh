@@ -3,7 +3,7 @@
 #set -x
 set -e
 test -f /.buildenv || exit 0
-this_release=`bash /usr/src/packages/SOURCES/get_release_number.sh`
+this_release=`rpm -q --qf %{RELEASE} kernel-dummy`
 echo this_release $this_release
 test -n "$this_release" || exit 1
 shopt -s nullglob
