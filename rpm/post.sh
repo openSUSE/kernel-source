@@ -53,12 +53,6 @@ if [ -x /usr/lib/module-init-tools/weak-modules ]; then
 fi
 /sbin/depmod -a -F /boot/System.map-@KERNELRELEASE@ @KERNELRELEASE@
 
-update_bootloader() {
-    [ -x /sbin/update-bootloader -a \
-      "$YAST_IS_RUNNING" != instsys ] || return 0
-    /sbin/update-bootloader "$@"
-}
-
 if [ "$YAST_IS_RUNNING" != instsys ]; then
     if [ -f /etc/fstab ]; then
 	if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
@@ -66,43 +60,12 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
 	    echo "/sbin/mkinitrd failed" >&2
 	    exit 1
 	fi
-
-	case @FLAVOR@ in
-	    kdump|um)
-		;;
-	    *)
-		opt_xen_kernel=
-		case "@FLAVOR@" in
-		    xen*)
-			set -- @FLAVOR@
-			set -- ${1#xen}
-			opt_xen_kernel=--xen-kernel=/boot/xen${1:+-$1}.gz
-			;;
-		esac
-
-		# Make the new kernel the default when installing a non-xen
-		# kernel on a non-xen system, or a xen kernel on a xen system.
-		opt_default=
-		case @FLAVOR@ in
-		    xen*)
-		        if [[ "$(uname -r)" =~ "xen.*" ]]; then
-			    opt_default=--default
-			fi
-			;;
-		    *)
-		        if ! [[ "$(uname -r)" =~ "xen.*" ]]; then
-			    opt_default=--default
-			fi
-			;;
-		esac
-
-		update_bootloader --image /boot/@IMAGE@-@KERNELRELEASE@ \
-				  --initrd /boot/initrd-@KERNELRELEASE@ \
-				  --add --force $opt_xen_kernel $opt_default \
-				  --name "Kernel-@KERNELRELEASE@"
-		update_bootloader --refresh
-		;;
-	esac
+	if [ -x /usr/lib/bootloader/bootloader_entry ]; then
+	    /usr/lib/bootloader/bootloader_entry add \
+		kernel-@FLAVOR@-@KERNELRELEASE@.@ARCH@.rpm \
+		@IMAGE@-@KERNELRELEASE@ \
+		initrd-@KERNELRELEASE@
+	fi
     else
 	echo "please run mkinitrd as soon as your system is complete"
     fi
