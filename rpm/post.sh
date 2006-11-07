@@ -62,7 +62,8 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
 	fi
 	if [ -x /usr/lib/bootloader/bootloader_entry ]; then
 	    /usr/lib/bootloader/bootloader_entry add \
-		kernel-@FLAVOR@-@KERNELRELEASE@.@ARCH@.rpm \
+		@FLAVOR@ \
+		@KERNELRELEASE@ \
 		@IMAGE@-@KERNELRELEASE@ \
 		initrd-@KERNELRELEASE@
 	fi

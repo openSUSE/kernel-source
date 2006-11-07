@@ -25,7 +25,8 @@ esac
 if [ -x /usr/lib/bootloader/bootloader_entry ]; then
     /usr/lib/bootloader/bootloader_entry \
 	remove \
-	kernel-@FLAVOR@-@KERNELRELEASE@.@ARCH@.rpm \
+	@FLAVOR@ \
+	@KERNELRELEASE@ \
 	@IMAGE@-@KERNELRELEASE@ \
 	initrd-@KERNELRELEASE@
 fi
