@@ -1,0 +1,409 @@
+From: kraxel@suse.de
+Subject: Add support for barriers to blk{back,front} drivers.
+Patch-mainline: yes (xen unstable tree)
+
+Add support for barriers to blk{back,front} drivers.
+
+protocol changes:
+ * There is a new operation (BLKIF_OP_WRITE_BARRIER)
+   to pass on barrier requests.
+ * There is a new state (BLKIF_RSP_EOPNOTSUPP) to indicate
+   unsupported operations (barrier writes may fail depending
+   on the underlying block device).
+ * A new xenstore node named "feature-barrier" indicates the
+   backend is able to handle barrier writes.  The value can
+   be 1 (all is fine) or 0 (underlying block device doesn't
+   support barriers).
+
+blkback changes:  Add "feature-barrier" node to indicate barrier
+support, pass incoming barrier requests to the block layer using
+submit_bio(WRITE_BARRIER, bio).  Some error handling fixes to
+properly pass through barrier write failures, so the frontend
+can turn off barriers then.
+
+blkfront changes:  Check if the backend sets "feature-barrier", if
+present switch to QUEUE_ORDERED_DRAIN mode.  Send off barrier
+requests to the backend using the new BLKIF_OP_WRITE_BARRIER
+operation.  Also some error handling for the EOPNOTSUPP case.
+
+Background:  Barriers are needed to make journaling filesystems work
+reliable.  For some requests they need order constrains to make the
+transactions work correctly.  Barrier requests are used to pass that
+ordering information to the block layer and/or to the device, so the
+constrains are obeyed when reordering requests for better write
+performance.
+
+Signed-off-by: Gerd Hoffmann <kraxel@suse.de>
+---
+ drivers/xen/blkback/blkback.c    |   41 ++++++++++++++++++++++++++++++---------
+ drivers/xen/blkback/common.h     |    3 ++
+ drivers/xen/blkback/vbd.c        |    2 -
+ drivers/xen/blkback/xenbus.c     |   31 +++++++++++++++++++++++++++++
+ drivers/xen/blkfront/blkfront.c  |   30 ++++++++++++++++++++++------
+ drivers/xen/blkfront/block.h     |    2 +
+ drivers/xen/blkfront/vbd.c       |   20 +++++++++++++++++--
+ include/xen/interface/io/blkif.h |   10 +++++----
+ 8 files changed, 117 insertions(+), 22 deletions(-)
+
+===================================================================
+Index: linux-2.6.18/drivers/xen/blkback/blkback.c
+===================================================================
+--- linux-2.6.18.orig/drivers/xen/blkback/blkback.c
++++ linux-2.6.18/drivers/xen/blkback/blkback.c
+@@ -189,9 +189,9 @@ static void fast_flush_area(pending_req_
+ 
+ static void print_stats(blkif_t *blkif)
+ {
+-	printk(KERN_DEBUG "%s: oo %3d  |  rd %4d  |  wr %4d\n",
++	printk(KERN_DEBUG "%s: oo %3d  |  rd %4d  |  wr %4d  |  br %4d\n",
+ 	       current->comm, blkif->st_oo_req,
+-	       blkif->st_rd_req, blkif->st_wr_req);
++	       blkif->st_rd_req, blkif->st_wr_req, blkif->st_br_req);
+ 	blkif->st_print = jiffies + msecs_to_jiffies(10 * 1000);
+ 	blkif->st_rd_req = 0;
+ 	blkif->st_wr_req = 0;
+@@ -241,12 +241,17 @@ int blkif_schedule(void *arg)
+  * COMPLETION CALLBACK -- Called as bh->b_end_io()
+  */
+ 
+-static void __end_block_io_op(pending_req_t *pending_req, int uptodate)
++static void __end_block_io_op(pending_req_t *pending_req, int error)
+ {
+ 	/* An error fails the entire request. */
+-	if (!uptodate) {
+-		DPRINTK("Buffer not up-to-date at end of operation\n");
++	if (error) {
++		DPRINTK("Buffer not up-to-date at end of operation, error=%d\n", error);
+ 		pending_req->status = BLKIF_RSP_ERROR;
++		if (pending_req->operation == BLKIF_OP_WRITE_BARRIER  &&  error == -EOPNOTSUPP) {
++			pending_req->status = BLKIF_RSP_EOPNOTSUPP;
++			blkback_barrier(pending_req->blkif->be, 0);
++			printk("blkback: write barrier op failed, not supported\n");
++		}
+ 	}
+ 
+ 	if (atomic_dec_and_test(&pending_req->pendcnt)) {
+@@ -262,7 +267,7 @@ static int end_block_io_op(struct bio *b
+ {
+ 	if (bio->bi_size != 0)
+ 		return 1;
+-	__end_block_io_op(bio->bi_private, !error);
++	__end_block_io_op(bio->bi_private, error);
+ 	bio_put(bio);
+ 	return error;
+ }
+@@ -319,6 +324,9 @@ static int do_block_io_op(blkif_t *blkif
+ 			blkif->st_rd_req++;
+ 			dispatch_rw_block_io(blkif, req, pending_req);
+ 			break;
++		case BLKIF_OP_WRITE_BARRIER:
++			blkif->st_br_req++;
++			/* fall through */
+ 		case BLKIF_OP_WRITE:
+ 			blkif->st_wr_req++;
+ 			dispatch_rw_block_io(blkif, req, pending_req);
+@@ -340,7 +348,6 @@ static void dispatch_rw_block_io(blkif_t
+ 				 pending_req_t *pending_req)
+ {
+ 	extern void ll_rw_block(int rw, int nr, struct buffer_head * bhs[]);
+-	int operation = (req->operation == BLKIF_OP_WRITE) ? WRITE : READ;
+ 	struct gnttab_map_grant_ref map[BLKIF_MAX_SEGMENTS_PER_REQUEST];
+ 	struct phys_req preq;
+ 	struct { 
+@@ -349,6 +356,22 @@ static void dispatch_rw_block_io(blkif_t
+ 	unsigned int nseg;
+ 	struct bio *bio = NULL, *biolist[BLKIF_MAX_SEGMENTS_PER_REQUEST];
+ 	int ret, i, nbio = 0;
++	int operation;
++
++	switch (req->operation) {
++	case BLKIF_OP_READ:
++		operation = READ;
++		break;
++	case BLKIF_OP_WRITE:
++		operation = WRITE;
++		break;
++	case BLKIF_OP_WRITE_BARRIER:
++		operation = WRITE_BARRIER;
++		break;
++	default:
++		operation = 0; /* make gcc happy */
++		BUG();
++	}
+ 
+ 	/* Check that number of segments is sane. */
+ 	nseg = req->nr_segments;
+@@ -364,7 +387,7 @@ static void dispatch_rw_block_io(blkif_t
+ 
+ 	pending_req->blkif     = blkif;
+ 	pending_req->id        = req->id;
+-	pending_req->operation = operation;
++	pending_req->operation = req->operation;
+ 	pending_req->status    = BLKIF_RSP_OKAY;
+ 	pending_req->nr_pages  = nseg;
+ 
+@@ -380,7 +403,7 @@ static void dispatch_rw_block_io(blkif_t
+ 		preq.nr_sects += seg[i].nsec;
+ 
+ 		flags = GNTMAP_host_map;
+-		if ( operation == WRITE )
++		if ( operation != READ )
+ 			flags |= GNTMAP_readonly;
+ 		gnttab_set_map_op(&map[i], vaddr(pending_req, i), flags,
+ 				  req->seg[i].gref, blkif->domid);
+Index: linux-2.6.18/drivers/xen/blkback/common.h
+===================================================================
+--- linux-2.6.18.orig/drivers/xen/blkback/common.h
++++ linux-2.6.18/drivers/xen/blkback/common.h
+@@ -87,6 +87,7 @@ typedef struct blkif_st {
+ 	int                 st_rd_req;
+ 	int                 st_wr_req;
+ 	int                 st_oo_req;
++	int                 st_br_req;
+ 
+ 	wait_queue_head_t waiting_to_free;
+ 
+@@ -131,4 +132,6 @@ void blkif_xenbus_init(void);
+ irqreturn_t blkif_be_int(int irq, void *dev_id, struct pt_regs *regs);
+ int blkif_schedule(void *arg);
+ 
++int blkback_barrier(struct backend_info *be, int state);
++
+ #endif /* __BLKIF__BACKEND__COMMON_H__ */
+Index: linux-2.6.18/drivers/xen/blkback/xenbus.c
+===================================================================
+--- linux-2.6.18.orig/drivers/xen/blkback/xenbus.c
++++ linux-2.6.18/drivers/xen/blkback/xenbus.c
+@@ -91,11 +91,13 @@ static void update_blkif_status(blkif_t 
+ VBD_SHOW(oo_req, "%d\n", be->blkif->st_oo_req);
+ VBD_SHOW(rd_req, "%d\n", be->blkif->st_rd_req);
+ VBD_SHOW(wr_req, "%d\n", be->blkif->st_wr_req);
++VBD_SHOW(br_req, "%d\n", be->blkif->st_br_req);
+ 
+ static struct attribute *vbdstat_attrs[] = {
+ 	&dev_attr_oo_req.attr,
+ 	&dev_attr_rd_req.attr,
+ 	&dev_attr_wr_req.attr,
++	&dev_attr_br_req.attr,
+ 	NULL
+ };
+ 
+@@ -165,6 +167,31 @@ static int blkback_remove(struct xenbus_
+ 	return 0;
+ }
+ 
++int blkback_barrier(struct backend_info *be, int state)
++{
++	struct xenbus_device *dev = be->dev;
++	struct xenbus_transaction xbt;
++	int err;
++
++	do {
++		err = xenbus_transaction_start(&xbt);
++		if (err) {
++			xenbus_dev_fatal(dev, err, "starting transaction");
++			return -1;
++		}
++
++		err = xenbus_printf(xbt, dev->nodename, "feature-barrier",
++				    "%d", state);
++		if (err) {
++			xenbus_transaction_end(xbt, 1);
++			xenbus_dev_fatal(dev, err, "writing feature-barrier");
++			return -1;
++		}
++
++		err = xenbus_transaction_end(xbt, 0);
++	} while (err == -EAGAIN);
++	return 0;
++}
+ 
+ /**
+  * Entry point to this code when a new device is created.  Allocate the basic
+@@ -201,6 +228,10 @@ static int blkback_probe(struct xenbus_d
+ 	if (err)
+ 		goto fail;
+ 
++	err = blkback_barrier(be, 1);
++	if (err)
++		goto fail;
++
+ 	err = xenbus_switch_state(dev, XenbusStateInitWait);
+ 	if (err)
+ 		goto fail;
+Index: linux-2.6.18/drivers/xen/blkfront/blkfront.c
+===================================================================
+--- linux-2.6.18.orig/drivers/xen/blkfront/blkfront.c
++++ linux-2.6.18/drivers/xen/blkfront/blkfront.c
+@@ -316,6 +316,12 @@ static void connect(struct blkfront_info
+ 		return;
+ 	}
+ 
++	err = xenbus_gather(XBT_NIL, info->xbdev->otherend,
++			    "feature-barrier", "%lu", &info->feature_barrier,
++			    NULL);
++	if (err)
++		info->feature_barrier = 0;
++
+ 	err = xlvbd_add(sectors, info->vdevice, binfo, sector_size, info);
+ 	if (err) {
+ 		xenbus_dev_fatal(info->xbdev, err, "xlvbd_add at %s",
+@@ -544,11 +550,14 @@ static int blkif_queue_request(struct re
+ 	info->shadow[id].request = (unsigned long)req;
+ 
+ 	ring_req->id = id;
+-	ring_req->operation = rq_data_dir(req) ?
+-		BLKIF_OP_WRITE : BLKIF_OP_READ;
+ 	ring_req->sector_number = (blkif_sector_t)req->sector;
+ 	ring_req->handle = info->handle;
+ 
++	ring_req->operation = rq_data_dir(req) ?
++		BLKIF_OP_WRITE : BLKIF_OP_READ;
++	if (blk_barrier_rq(req))
++		ring_req->operation = BLKIF_OP_WRITE_BARRIER;
++
+ 	ring_req->nr_segments = 0;
+ 	rq_for_each_bio (bio, req) {
+ 		bio_for_each_segment (bvec, bio, idx) {
+@@ -645,6 +654,7 @@ static irqreturn_t blkif_int(int irq, vo
+ 	RING_IDX i, rp;
+ 	unsigned long flags;
+ 	struct blkfront_info *info = (struct blkfront_info *)dev_id;
++	int uptodate;
+ 
+ 	spin_lock_irqsave(&blkif_io_lock, flags);
+ 
+@@ -669,19 +679,27 @@ static irqreturn_t blkif_int(int irq, vo
+ 
+ 		ADD_ID_TO_FREELIST(info, id);
+ 
++		uptodate = (bret->status == BLKIF_RSP_OKAY);
+ 		switch (bret->operation) {
++		case BLKIF_OP_WRITE_BARRIER:
++			if (unlikely(bret->status == BLKIF_RSP_EOPNOTSUPP)) {
++				printk("blkfront: %s: write barrier op failed\n",
++				       info->gd->disk_name);
++				uptodate = -EOPNOTSUPP;
++				info->feature_barrier = 0;
++			        xlvbd_barrier(info);
++			}
++			/* fall through */
+ 		case BLKIF_OP_READ:
+ 		case BLKIF_OP_WRITE:
+ 			if (unlikely(bret->status != BLKIF_RSP_OKAY))
+ 				DPRINTK("Bad return from blkdev data "
+ 					"request: %x\n", bret->status);
+ 
+-			ret = end_that_request_first(
+-				req, (bret->status == BLKIF_RSP_OKAY),
++			ret = end_that_request_first(req, uptodate,
+ 				req->hard_nr_sectors);
+ 			BUG_ON(ret);
+-			end_that_request_last(
+-				req, (bret->status == BLKIF_RSP_OKAY));
++			end_that_request_last(req, uptodate);
+ 			break;
+ 		default:
+ 			BUG();
+Index: linux-2.6.18/drivers/xen/blkfront/block.h
+===================================================================
+--- linux-2.6.18.orig/drivers/xen/blkfront/block.h
++++ linux-2.6.18/drivers/xen/blkfront/block.h
+@@ -125,6 +125,7 @@ struct blkfront_info
+ 	struct gnttab_free_callback callback;
+ 	struct blk_shadow shadow[BLK_RING_SIZE];
+ 	unsigned long shadow_free;
++	int feature_barrier;
+ 
+ 	/**
+ 	 * The number of people holding this device open.  We won't allow a
+@@ -151,5 +152,6 @@ extern void do_blkif_request (request_qu
+ int xlvbd_add(blkif_sector_t capacity, int device,
+ 	      u16 vdisk_info, u16 sector_size, struct blkfront_info *info);
+ void xlvbd_del(struct blkfront_info *info);
++int xlvbd_barrier(struct blkfront_info *info);
+ 
+ #endif /* __XEN_DRIVERS_BLOCK_H__ */
+Index: linux-2.6.18/include/xen/interface/io/blkif.h
+===================================================================
+--- linux-2.6.18.orig/include/xen/interface/io/blkif.h
++++ linux-2.6.18/include/xen/interface/io/blkif.h
+@@ -29,8 +29,9 @@
+ #endif
+ #define blkif_sector_t uint64_t
+ 
+-#define BLKIF_OP_READ      0
+-#define BLKIF_OP_WRITE     1
++#define BLKIF_OP_READ              0
++#define BLKIF_OP_WRITE             1
++#define BLKIF_OP_WRITE_BARRIER     2
+ 
+ /*
+  * Maximum scatter/gather segments per request.
+@@ -61,8 +62,9 @@ struct blkif_response {
+ };
+ typedef struct blkif_response blkif_response_t;
+ 
+-#define BLKIF_RSP_ERROR  -1 /* non-specific 'error' */
+-#define BLKIF_RSP_OKAY    0 /* non-specific 'okay'  */
++#define BLKIF_RSP_EOPNOTSUPP  -2 /* operation not supported (can happen on barrier writes) */
++#define BLKIF_RSP_ERROR       -1 /* non-specific 'error' */
++#define BLKIF_RSP_OKAY         0 /* non-specific 'okay'  */
+ 
+ /*
+  * Generate blkif ring structures and types.
+Index: linux-2.6.18/drivers/xen/blkfront/vbd.c
+===================================================================
+--- linux-2.6.18.orig/drivers/xen/blkfront/vbd.c
++++ linux-2.6.18/drivers/xen/blkfront/vbd.c
+@@ -256,6 +256,10 @@ xlvbd_alloc_gendisk(int minor, blkif_sec
+ 	}
+ 
+ 	info->rq = gd->queue;
++	info->gd = gd;
++
++	if (info->feature_barrier)
++		xlvbd_barrier(info);
+ 
+ 	if (vdisk_info & VDISK_READONLY)
+ 		set_disk_ro(gd, 1);
+@@ -266,8 +270,6 @@ xlvbd_alloc_gendisk(int minor, blkif_sec
+ 	if (vdisk_info & VDISK_CDROM)
+ 		gd->flags |= GENHD_FL_CD;
+ 
+-	info->gd = gd;
+-
+ 	return 0;
+ 
+  out:
+@@ -315,3 +317,17 @@ xlvbd_del(struct blkfront_info *info)
+ 	blk_cleanup_queue(info->rq);
+ 	info->rq = NULL;
+ }
++
++int
++xlvbd_barrier(struct blkfront_info *info)
++{
++	int err;
++
++	err = blk_queue_ordered(info->rq,
++		info->feature_barrier ? QUEUE_ORDERED_DRAIN : QUEUE_ORDERED_NONE, NULL);
++	if (err)
++		return err;
++	printk("blkfront: %s: barriers %s\n",
++	       info->gd->disk_name, info->feature_barrier ? "enabled" : "disabled");
++	return 0;
++}
+Index: linux-2.6.18/drivers/xen/blkback/vbd.c
+===================================================================
+--- linux-2.6.18.orig/drivers/xen/blkback/vbd.c
++++ linux-2.6.18/drivers/xen/blkback/vbd.c
+@@ -104,7 +104,7 @@ int vbd_translate(struct phys_req *req, 
+ 	struct vbd *vbd = &blkif->vbd;
+ 	int rc = -EACCES;
+ 
+-	if ((operation == WRITE) && vbd->readonly)
++	if ((operation != READ) && vbd->readonly)
+ 		goto out;
+ 
+ 	if (unlikely((req->sector_number + req->nr_sects) > vbd_sz(vbd)))
