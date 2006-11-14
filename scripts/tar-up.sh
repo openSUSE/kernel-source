@@ -287,6 +287,8 @@ install -m 644					\
 	rpm/post.sh				\
 	rpm/postun.sh				\
 	rpm/module-renames			\
+	rpm/kernel-module-subpackage		\
+	rpm/macros.kernel-source		\
 	doc/README.SUSE				\
 	$build_dir
 install_changes $build_dir/kernel-source.changes
