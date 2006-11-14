@@ -29,4 +29,16 @@ if [ -x /usr/lib/bootloader/bootloader_entry ]; then
 	@KERNELRELEASE@ \
 	@IMAGE@-@KERNELRELEASE@ \
 	initrd-@KERNELRELEASE@
+
+elif [ -x /sbin/update-bootloader ]; then
+    # This is needed only for people who install new kernels on older SUSE Linux products.
+    # SUSE Linux does not consider this to be a maintained feature. It is provided as-is.
+    echo "bootloader_entry script is not available, using old update-bootloader script."
+    update_bootloader --image /boot/@IMAGE@-@KERNELRELEASE@ \
+                      --initrd /boot/initrd-@KERNELRELEASE@ \
+                      --remove \
+                      --force \
+                      --name "Kernel-@KERNELRELEASE@"
+
+    update_bootloader --refresh
 fi
