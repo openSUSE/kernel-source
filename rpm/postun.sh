@@ -22,6 +22,12 @@ initrd-@KERNELRELEASE@|$(readlink /boot/initrd$suffix))
     ;;
 esac
 
+update_bootloader() {
+    [ -x /sbin/update-bootloader -a \
+      "$YAST_IS_RUNNING" != instsys ] || return 0
+    /sbin/update-bootloader "$@"
+}
+
 if [ -x /usr/lib/bootloader/bootloader_entry ]; then
     /usr/lib/bootloader/bootloader_entry \
 	remove \

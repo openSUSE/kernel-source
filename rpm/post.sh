@@ -58,6 +58,12 @@ message_install_bl () {
 	echo "available bootloader for your platform (e.g. grub, lilo, zipl, ...)."
 }
 
+update_bootloader() {
+    [ -x /sbin/update-bootloader -a \
+      "$YAST_IS_RUNNING" != instsys ] || return 0
+    /sbin/update-bootloader "$@"
+}
+
 if [ "$YAST_IS_RUNNING" != instsys ]; then
     if [ -f /etc/fstab ]; then
 		if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
