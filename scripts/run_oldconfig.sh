@@ -100,6 +100,7 @@ possible options in this mode:
 	y|-y|--yes         to run 'yes "" | make oldconfig'
 	a|-a|--arch        to run make oldconfig only for the given arch
 	m|-m|--menuconfig  to run make menuconfig instead of oldconfig
+	--vanilla          to run make oldconfig only for the vanilla configs
 
 run it with one of the following options to modify all .config files listed
 in config.conf:
