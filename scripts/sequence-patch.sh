@@ -3,14 +3,14 @@
 source $(dirname $0)/config.sh
 
 usage() {
-    echo "SYNOPSIS: $0 [-qv] [--arch=...] [--symbol=...] [--dir=...] [--combine] [--fast] [last-patch-name]"
+    echo "SYNOPSIS: $0 [-qv] [--arch=...] [--symbol=...] [--dir=...] [--combine] [--fast] [last-patch-name] [--vanilla]"
     exit 1
 }
 
 # Allow to pass in default arguments via SEQUENCE_PATCH_ARGS.
 set -- $SEQUENCE_PATCH_ARGS "$@"
 
-options=`getopt -o qvd: --long quilt,arch:,symbol:,dir:,combine,fast -- "$@"`
+options=`getopt -o qvd: --long quilt,arch:,symbol:,dir:,combine,fast,vanilla -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -24,6 +24,7 @@ EXTRA_SYMBOLS=
 CLEAN=1
 COMBINE=
 FAST=
+VANILLA=no
 
 while true; do
     case "$1" in
@@ -54,6 +55,9 @@ while true; do
 	-d|--dir)
 	    SCRATCH_AREA=$2
 	    shift
+	    ;;
+	--vanilla)
+	    VANILLA=yes
 	    ;;
 	--)
 	    shift
@@ -205,7 +209,11 @@ if ! [ -d $ORIG_DIR ]; then
     find $ORIG_DIR -type f | xargs chmod a-w,a+r
 fi
 
+if [ "$VANILLA" = "yes" ]; then
+PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep kernel.org\|rpmify ) )
+else
 PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
+fi
 
 # Check if patch $LIMIT exists
 if [ -n "$LIMIT" ]; then
