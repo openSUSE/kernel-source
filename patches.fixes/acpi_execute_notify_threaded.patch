@@ -1,0 +1,176 @@
+From: Thomas Renninger <trenn@suse.de>
+Subject: Acpi: create a dedicated workqueue for notify() execution
+Patch-mainline: 2.6.20-rc2-mm1 
+References: http://bugzilla.kernel.org/show_bug.cgi?id=5534
+
+Novell-ref: #226069
+
+HP nx6125/nx6325/... machines have a _GPE handler with an infinite
+loop sending Notify() events to different ACPI subsystems.
+
+Notify handler in ACPI driver is a C-routine, which may call ACPI
+interpreter again to get access to some ACPI variables
+(acpi_evaluate_xxx).
+On these HP machines such an evaluation changes state of some variable
+and lets the loop above break.
+
+In the current ACPI implementation Notify requests are being deferred
+to the same kacpid workqueue on which the above GPE handler with
+infinite loop is executing. Thus we have a deadlock -- loop will
+continue to spin, sending notify events, and at the same time
+preventing these notify events from being run on a workqueue. All
+notify events are deferred, thus we see increase in memory consumption
+noticed by author of the thread. Also as GPE handling is bloked,
+machines overheat. Eventually by external poll of the same
+acpi_evaluate, kacpid is released and all the queued notify events are
+free to run, thus 100% cpu utilization by kacpid for several seconds
+or more.
+
+To prevent all these horrors it's needed to not put notify events to
+kacpid workqueue by either executing them immediately or putting them
+on some other thread. It's dangerous to execute notify events in
+place, as it will put several ACPI interpreter stacks on top of each
+other (at least 4 in case of nx6125), thus causing kernel  stack
+overflow.
+
+First attempt to create a new thread was done by Peter Wainwright
+He created a bunch of threads, which were stealing work from a kacpid 
+workqueue.
+This patch appeared in 2.6.15 kernel shipped with Ubuntu 6.06 LTS.
+
+Second attempt was done by me, I created a new thread for each Notify
+event. This worked OK on HP nx machines, but broke Linus' Compaq
+n620c, by producing threads with a speed what they stopped the machine
+completely. Thus this patch was reverted from 18-rc2 as I remember.
+I re-made the patch to create second workqueue just for notify events,
+thus hopping it will not break Linus' machine. Patch was tested on the
+same HP nx machines in #5534 and #7122, but I did not received reply
+from Linus on a test patch sent to him.
+Patch went to 19-rc and was rejected with much fanfare again.
+There was 4th patch, which inserted schedule_timeout(1) into deferred
+execution of kacpid, if we had any notify requests pending, but Linus
+decided that it was too complex (involved either changes to workqueue
+to see if it's empty or atomic inc/dec).
+Now you see last variant which adds yield() to every GPE execution.
+http://bugzilla.kernel.org/show_bug.cgi?id=5534
+
+Signed-off-by: Thomas Renninger <trenn@suse.de>
+
+---
+
+ drivers/acpi/osl.c |   53 +++++++++++++++++++++++++++++++++++-----------------
+ 1 files changed, 36 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/acpi/osl.c b/drivers/acpi/osl.c
+index 068fe4f..4bfcc93 100644
+--- a/drivers/acpi/osl.c
++++ b/drivers/acpi/osl.c
+@@ -73,6 +73,7 @@ static unsigned int acpi_irq_irq;
+ static acpi_osd_handler acpi_irq_handler;
+ static void *acpi_irq_context;
+ static struct workqueue_struct *kacpid_wq;
++static struct workqueue_struct *kacpi_notify_wq;
+ 
+ acpi_status acpi_os_initialize(void)
+ {
+@@ -91,8 +92,9 @@ acpi_status acpi_os_initialize1(void)
+ 		return AE_NULL_ENTRY;
+ 	}
+ 	kacpid_wq = create_singlethread_workqueue("kacpid");
++	kacpi_notify_wq = create_singlethread_workqueue("kacpi_notify");
+ 	BUG_ON(!kacpid_wq);
+-
++	BUG_ON(!kacpi_notify_wq);
+ 	return AE_OK;
+ }
+ 
+@@ -104,6 +106,7 @@ acpi_status acpi_os_terminate(void)
+ 	}
+ 
+ 	destroy_workqueue(kacpid_wq);
++	destroy_workqueue(kacpi_notify_wq);
+ 
+ 	return AE_OK;
+ }
+@@ -566,10 +569,24 @@ void acpi_os_derive_pci_id(acpi_handle r
+ 
+ static void acpi_os_execute_deferred(void *context)
+ {
+-	struct acpi_os_dpc *dpc = NULL;
++	struct acpi_os_dpc *dpc = context;
++	if (!dpc) {
++		printk(KERN_ERR PREFIX "Invalid (NULL) context\n");
++		return;
++	}
++
++	dpc->function(dpc->context);
++	kfree(dpc);
++
++	/* Yield cpu to notify thread */
++	cond_resched();
+ 
++	return;
++}
+ 
+-	dpc = (struct acpi_os_dpc *)context;
++static void acpi_os_execute_notify(void *context)
++{
++	struct acpi_os_dpc *dpc = context;
+ 	if (!dpc) {
+ 		printk(KERN_ERR PREFIX "Invalid (NULL) context\n");
+ 		return;
+@@ -604,14 +621,12 @@ acpi_status acpi_os_execute(acpi_execute
+ 	struct acpi_os_dpc *dpc;
+ 	struct work_struct *task;
+ 
+-	ACPI_FUNCTION_TRACE("os_queue_for_execution");
+-
+ 	ACPI_DEBUG_PRINT((ACPI_DB_EXEC,
+ 			  "Scheduling function [%p(%p)] for deferred execution.\n",
+ 			  function, context));
+ 
+ 	if (!function)
+-		return_ACPI_STATUS(AE_BAD_PARAMETER);
++		return AE_BAD_PARAMETER;
+ 
+ 	/*
+ 	 * Allocate/initialize DPC structure.  Note that this memory will be
+@@ -624,23 +639,27 @@ acpi_status acpi_os_execute(acpi_execute
+ 	 * from the same memory.
+ 	 */
+ 
+-	dpc =
+-	    kmalloc(sizeof(struct acpi_os_dpc) + sizeof(struct work_struct),
+-		    GFP_ATOMIC);
++	dpc = kzalloc(sizeof(struct acpi_os_dpc) +
++			sizeof(struct work_struct), GFP_ATOMIC);
+ 	if (!dpc)
+ 		return_ACPI_STATUS(AE_NO_MEMORY);
+ 
+ 	dpc->function = function;
+ 	dpc->context = context;
+ 
+-	task = (void *)(dpc + 1);
+-	INIT_WORK(task, acpi_os_execute_deferred, (void *)dpc);
+-
+-	if (!queue_work(kacpid_wq, task)) {
+-		ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
+-				  "Call to queue_work() failed.\n"));
+-		kfree(dpc);
+-		status = AE_ERROR;
++	task = (struct work_struct *)(dpc + 1);
++	if (type == OSL_NOTIFY_HANDLER) {
++		INIT_WORK(task, acpi_os_execute_notify, (void *)dpc);
++		if (!queue_work(kacpi_notify_wq, task)) {
++			status = AE_ERROR;
++			kfree(dpc);
++		}
++	} else {
++		INIT_WORK(task, acpi_os_execute_deferred, (void *)dpc);
++		if (!queue_work(kacpid_wq, task)) {
++			status = AE_ERROR;
++			kfree(dpc);
++		}
+ 	}
+ 
+ 	return_ACPI_STATUS(status);
