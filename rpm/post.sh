@@ -58,12 +58,6 @@ message_install_bl () {
 	echo "available bootloader for your platform (e.g. grub, lilo, zipl, ...)."
 }
 
-update_bootloader() {
-    [ -x /sbin/update-bootloader -a \
-      "$YAST_IS_RUNNING" != instsys ] || return 0
-    /sbin/update-bootloader "$@"
-}
-
 if [ "$YAST_IS_RUNNING" != instsys ]; then
     if [ -f /etc/fstab ]; then
 		if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
@@ -71,7 +65,8 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
 			echo "/sbin/mkinitrd failed" >&2
 			exit 1
 		fi
-		
+
+		# handle 10.2 and SLES10 SP1
 		if [ -x /usr/lib/bootloader/bootloader_entry ]; then
 			/usr/lib/bootloader/bootloader_entry \
 			add \
@@ -80,6 +75,7 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
 			@IMAGE@-@KERNELRELEASE@ \
 			initrd-@KERNELRELEASE@
 
+		# handle 10.1 and SLES10 GA
 		elif [ -x /sbin/update-bootloader ]; then
 			case @FLAVOR@ in
 				(kdump|um)
@@ -94,17 +90,14 @@ if [ "$YAST_IS_RUNNING" != instsys ]; then
 						;;
 					esac
 
-					# This is needed only for people who install new kernels on older SUSE Linux products.
-					# SUSE Linux does not consider this to be a maintained feature. It is provided as-is.
-					echo "bootloader_entry script is not available, using old update-bootloader script."
-					update_bootloader --image /boot/@IMAGE@-@KERNELRELEASE@ \
-									  --initrd /boot/initrd-@KERNELRELEASE@ \
-									  --default \
-									  --add \
-									  --force $opt_xen_kernel \
-									  --name "Kernel-@KERNELRELEASE@"
+					echo "bootloader_entry script unavailable, updating /boot/@IMAGE@"
+					/sbin/update-bootloader \
+						--image /boot/@IMAGE@ \
+						--initrd /boot/initrd \
+						--add \
+						--force $opt_xen_kernel
 
-					update_bootloader --refresh
+					/sbin/update-bootloader --refresh
 					;;
 			esac
 		else

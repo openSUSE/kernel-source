@@ -3,6 +3,9 @@ if [ -x /usr/lib/module-init-tools/weak-modules ]; then
     /usr/lib/module-init-tools/weak-modules --remove-kernel @KERNELRELEASE@
 fi
 
+# remove /boot/@IMAGE@.previous entry on a 10.1 and SLES10 GA system
+# when going back from 10.2 or SLES10 SP1 kernel to the original kernel
+remove_previos_entry=no
 suffix=
 case @FLAVOR@ in
     kdump|um|xen*)
@@ -13,6 +16,7 @@ esac
 # Created in %post of old kernels
 case "$(readlink /boot/@IMAGE@$suffix.previous)" in
 @IMAGE@-@KERNELRELEASE@|$(readlink /boot/@IMAGE@$suffix))
+    remove_previos_entry=yes
     rm -f /boot/@IMAGE@$suffix.previous 
     ;;
 esac
@@ -22,12 +26,7 @@ initrd-@KERNELRELEASE@|$(readlink /boot/initrd$suffix))
     ;;
 esac
 
-update_bootloader() {
-    [ -x /sbin/update-bootloader -a \
-      "$YAST_IS_RUNNING" != instsys ] || return 0
-    /sbin/update-bootloader "$@"
-}
-
+# handle 10.2 and SLES10 SP1
 if [ -x /usr/lib/bootloader/bootloader_entry ]; then
     /usr/lib/bootloader/bootloader_entry \
 	remove \
@@ -36,15 +35,12 @@ if [ -x /usr/lib/bootloader/bootloader_entry ]; then
 	@IMAGE@-@KERNELRELEASE@ \
 	initrd-@KERNELRELEASE@
 
+# handle 10.1 and SLES10 GA
 elif [ -x /sbin/update-bootloader ]; then
-    # This is needed only for people who install new kernels on older SUSE Linux products.
-    # SUSE Linux does not consider this to be a maintained feature. It is provided as-is.
-    echo "bootloader_entry script is not available, using old update-bootloader script."
-    update_bootloader --image /boot/@IMAGE@-@KERNELRELEASE@ \
-                      --initrd /boot/initrd-@KERNELRELEASE@ \
-                      --remove \
-                      --force \
-                      --name "Kernel-@KERNELRELEASE@"
-
-    update_bootloader --refresh
+	if [ "$remove_previos_entry" = "yes" ] ; then
+		/sbin/update-bootloader	--image /boot/@IMAGE@$suffix.previous \
+					--initrd /boot/initrd$suffix.previous \
+					--remove --force
+	fi
+	/sbin/update-bootloader --refresh
 fi
