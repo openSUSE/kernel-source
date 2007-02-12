@@ -142,12 +142,6 @@ flavors="$(echo "$config_files" | sed -e 's,.*/,,' | sort -u)"
 for flavor in $flavors ; do
     echo "kernel-$flavor.spec"
 
-    extra_needs=
-    case $flavor in
-	um)
-	    extra_needs="libpcap xorg-x11-devel" ;;
-    esac
-
     # Find all architectures for this spec file
     set -- $(
 	echo "$config_files" \
@@ -204,7 +198,6 @@ for flavor in $flavors ; do
 	-e "s,@RPMVERSION@,$RPMVERSION,g" \
 	-e "s,@ARCHS@,$archs,g" \
 	-e "s,@PROVIDES_OBSOLETES@,${prov_obs//$'\n'/\\n},g" \
-	-e "s,@EXTRA_NEEDS@,$extra_needs,g" \
 	-e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options,g" \
       < rpm/kernel-binary.spec.in \
     > $build_dir/kernel-$flavor.spec
