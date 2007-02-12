@@ -360,6 +360,8 @@ for archive in $all_archives; do
 done
 
 echo "kabi.tar.bz2"
+# reset kabi's times or we get a different archive after each CVS update
+scripts/newest-timestamp kabi
 tar cf - --exclude CVS kabi \
 | bzip2 -9 > $build_dir/kabi.tar.bz2
 
