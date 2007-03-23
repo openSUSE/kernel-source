@@ -10,7 +10,7 @@ __revision__ = '$Id'
 import re, glob, sys, os, filecmp
 
 # List of replacement rules
-replrules = [(r"arch/(i386|x86_64)/(.*)-xen(\.[^/\s])", r"arch/\1/\2\3"),
+replrules = [(r"(.*)-xen(\.[^/\s])", r"\1\2"),
 	   (r"include/asm-(i386|x86_64)/mach-xen/asm/", r"include/asm-\1/")]
 # List of compiled rules (speed reasons)
 #comprules = map(lambda(x): (x[0], x[1], re.compile(x[0])), replrules)
