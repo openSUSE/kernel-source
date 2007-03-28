@@ -57,6 +57,10 @@ until [ "$#" = "0" ] ; do
       with_debug=$1
       shift
       ;;
+    -i|--ignore-kabi)
+        ignore_kabi=1
+        shift
+        ;;
     -h|--help|-v|--version)
 	cat <<EOF
 
@@ -75,6 +79,7 @@ these options are recognized:
     -s|--spec <config> to build only this kernel-<config>.rpm (option may be specified more than once)
     --debug            to build a kernel-flavor-debug package with debug info for lkcd
                        requires MUCH diskspace
+    -i|--ignore-kabi   ignore changes in the kabi
     all                to build a kernel.rpm for all configured .config files:
     $all_specfiles
 
@@ -109,6 +114,9 @@ specfiles=`echo $single_specfiles | sort | xargs echo`
 fi
 scripts/tar-up.sh $rpm_release_string $timestamp $tolerate_unknown_new_config_options || exit 1
 cd kernel-source
+if [ -n "$ignore_kabi" ]; then
+    touch IGNORE-KABI-BADNESS
+fi
 for i in $specfiles
 do
 echo	sudo /work/src/bin/mbuild $mbuild_options $mbuild_no_checks --obey-doesnotbuild kernel-$i.spec
