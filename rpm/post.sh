@@ -16,8 +16,8 @@ if [ -f /proc/cpuinfo ]; then
 	    ;;
 	ppc64|kdump)
 	    if [ -d /proc/device-tree ]; then
-		if [ ! -d /proc/ppc64 -o -d /proc/iSeries ]; then
-		    wrong_boardtype "OpenFirmware based 64bit machines"
+		if [ ! -d /proc/ppc64 ]; then
+		    wrong_boardtype "OpenFirmware based 64bit machines or legacy iSeries"
 		fi
 	    fi
 	    ;;
