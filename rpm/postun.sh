@@ -26,21 +26,24 @@ initrd-@KERNELRELEASE@|$(readlink /boot/initrd$suffix))
     ;;
 esac
 
-# handle 10.2 and SLES10 SP1
-if [ -x /usr/lib/bootloader/bootloader_entry ]; then
-    /usr/lib/bootloader/bootloader_entry \
-	remove \
-	@FLAVOR@ \
-	@KERNELRELEASE@ \
-	@IMAGE@-@KERNELRELEASE@ \
-	initrd-@KERNELRELEASE@
+# remove fstab check once perl-Bootloader can cope with it
+if [ -f /etc/fstab ]; then
+	# handle 10.2 and SLES10 SP1
+	if [ -x /usr/lib/bootloader/bootloader_entry ]; then
+	    /usr/lib/bootloader/bootloader_entry \
+		remove \
+		@FLAVOR@ \
+		@KERNELRELEASE@ \
+		@IMAGE@-@KERNELRELEASE@ \
+		initrd-@KERNELRELEASE@
 
-# handle 10.1 and SLES10 GA
-elif [ -x /sbin/update-bootloader ]; then
-	if [ "$remove_previos_entry" = "yes" ] ; then
-		/sbin/update-bootloader	--image /boot/@IMAGE@$suffix.previous \
-					--initrd /boot/initrd$suffix.previous \
-					--remove --force
+	# handle 10.1 and SLES10 GA
+	elif [ -x /sbin/update-bootloader ]; then
+		if [ "$remove_previos_entry" = "yes" ] ; then
+			/sbin/update-bootloader	--image /boot/@IMAGE@$suffix.previous \
+						--initrd /boot/initrd$suffix.previous \
+						--remove --force
+		fi
+		/sbin/update-bootloader --refresh
 	fi
-	/sbin/update-bootloader --refresh
 fi
