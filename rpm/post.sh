@@ -9,11 +9,6 @@ wrong_boardtype() {
 }
 if [ -f /proc/cpuinfo ]; then
     case "@FLAVOR@" in
-	iseries64)
-	    if [ ! -d /proc/iSeries ]; then
-		wrong_boardtype "legacy iSeries"
-	    fi
-	    ;;
 	ppc64|kdump)
 	    if [ -d /proc/device-tree ]; then
 		if [ ! -d /proc/ppc64 ]; then
