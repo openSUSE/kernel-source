@@ -1,7 +1,5 @@
 relink linux-@KERNELRELEASE@ /usr/src/linux
 relink linux-@KERNELRELEASE@-obj /usr/src/linux-obj
-if [ 0%preconf -ne 0 ]; then
-/sbin/insserv running-kernel
 
 if [ -e /.buildenv ]; then
     # Autobuild has a modified version of uname that reports a specific
@@ -19,7 +17,4 @@ if [ -e /.buildenv ]; then
     )"
 
     echo @KERNELRELEASE@-$flavor > /.kernelversion
-fi
-
-/etc/init.d/running-kernel start
 fi

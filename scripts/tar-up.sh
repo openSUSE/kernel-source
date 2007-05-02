@@ -274,7 +274,6 @@ echo "Copying various files..."
 install -m 644					\
 	config.conf				\
 	supported.conf				\
-	rpm/running-kernel.init.in		\
 	rpm/functions.sh			\
 	rpm/source-post.sh			\
 	rpm/post.sh				\
