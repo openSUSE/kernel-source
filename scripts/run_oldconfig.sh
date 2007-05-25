@@ -106,7 +106,7 @@ run it with one of the following options to modify all .config files listed
 in config.conf:
 	-nco-y|--new-config-option-yes   compile something into the kernel
 	-nco-m|--new-config-option-mod   compile something as a module
-	-nco-n|--new-config-option-no    disable a kenrel .config option
+	-nco-n|--new-config-option-no    disable a kernel .config option
 	-dco|--disable-config-option     alias for -nco-n
 each of them takes a second argument, which can be either
 FOO
