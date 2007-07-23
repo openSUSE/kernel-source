@@ -384,4 +384,4 @@ done
 # Force mbuild to choose build hosts with enough memory available:
 echo $((1024*1024)) > $build_dir/minmem
 # Force mbuild to choose build hosts with enough disk space available:
-echo $((3*1024)) > $build_dir/needed_space_in_mb
+echo $((6*1024)) > $build_dir/needed_space_in_mb
