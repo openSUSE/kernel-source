@@ -178,6 +178,7 @@ if [ -s extra-symbols ]; then
 	EXTRA_SYMBOLS="$EXTRA_SYMBOLS $(cat extra-symbols)"
 fi
 if [ -n "$EXTRA_SYMBOLS" ]; then
+    EXTRA_SYMBOLS=${EXTRA_SYMBOLS# }
     echo "Extra symbols: $EXTRA_SYMBOLS"
     SYMBOLS="$SYMBOLS $EXTRA_SYMBOLS"
 fi
@@ -373,6 +374,10 @@ while [ $# -gt 0 ]; do
 	break
     fi
 done
+
+if [ -n "$EXTRA_SYMBOLS" ]; then
+    echo "$EXTRA_SYMBOLS" > $PATCH_DIR/extra-symbols
+fi
 
 [ -n "$CLEAN" -a -n "$enough_free_space" ] \
     && rm -rf $PATCH_DIR/.pc/

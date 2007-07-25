@@ -228,7 +228,6 @@ sed -e "s,@NAME@,kernel-source,g" \
     -e "s,@SRCVERSION@,$SRCVERSION,g" \
     -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
-    -e "s,@PRECONF@,1,g" \
     -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
     -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
   < rpm/kernel-source.spec.in \
@@ -264,7 +263,6 @@ sed -e "s,@NAME@,kernel-syms,g" \
     -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
     -e "s,@BUILD_REQUIRES@,${build_req//$'\n'/\\n},g" \
-    -e "s,@PRECONF@,1,g" \
   < rpm/kernel-syms.spec.in \
 > $build_dir/kernel-syms.spec
 
