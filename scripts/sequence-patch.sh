@@ -150,27 +150,25 @@ if [ -e scripts/check-patches ]; then
     }
 fi
 
-if [ -z "$SYMBOLS" ]; then
-    if [ -z "$ARCH_SYMBOLS" ]; then
-	if [ -x arch-symbols ]; then
-	    ARCH_SYMBOLS=arch-symbols
-	elif [ -x scripts/arch-symbols ]; then
-	    ARCH_SYMBOLS=scripts/arch-symbols
-	else
-	    echo "Cannot locate \`arch-symbols' script (export ARCH_SYMBOLS)"
-	    exit 1
-	fi
+if [ -z "$ARCH_SYMBOLS" ]; then
+    if [ -x arch-symbols ]; then
+	ARCH_SYMBOLS=arch-symbols
+    elif [ -x scripts/arch-symbols ]; then
+	ARCH_SYMBOLS=scripts/arch-symbols
     else
-	if [ ! -x "$ARCH_SYMBOLS" ]; then
-	    echo "Cannot execute \`arch-symbols' script"
-	    exit 1
-	fi
-    fi
-    SYMBOLS=$($ARCH_SYMBOLS)
-    if [ -z "$SYMBOLS" ]; then
-	echo "Unsupported architecture \`$ARCH'" >&2
+	echo "Cannot locate \`arch-symbols' script (export ARCH_SYMBOLS)"
 	exit 1
     fi
+else
+    if [ ! -x "$ARCH_SYMBOLS" ]; then
+	echo "Cannot execute \`arch-symbols' script"
+	exit 1
+    fi
+fi
+SYMBOLS=$($ARCH_SYMBOLS)
+if [ -z "$SYMBOLS" ]; then
+    echo "Unsupported architecture \`$ARCH'" >&2
+    exit 1
 fi
 
 echo "Architecture symbol(s): $SYMBOLS"

@@ -49,7 +49,7 @@ function expand_config_option () {
 #########################################################
 # main
 
-arch="--list"
+archs=
 YES=
 menuconfig=no
 new_config_option_yes=no
@@ -63,7 +63,7 @@ until [ "$#" = "0" ] ; do
 	shift
 	;;
     a|-a|--arch)
-	arch='$(scripts/arch-symbols '"$2"')'
+	archs="$archs $2"
 	shift 2
 	;;
     m|-m|--menuconfig)
@@ -122,10 +122,13 @@ EOF
 	;;
     esac
 done
+
+ARCH_SYMBOLS=$(patches/scripts/arch-symbols ${archs:---list})
+
 if [ "$new_config_option_yes" != "no" ] ; then
 	new_config_option_yes="`expand_config_option $new_config_option_yes`"
 	echo "appending $new_config_option_yes to all config files listed in config.conf"
-	for config in $(eval scripts/guards $arch < config.conf); do
+	for config in $(scripts/guards $ARCH_SYMBOLS < config.conf); do
 		sed -i "/${new_config_option_yes}[ =]/d" config/$config
 		# '"
 		echo "${new_config_option_yes}=y" >> config/$config
@@ -135,7 +138,7 @@ fi
 if [ "$new_config_option_mod" != "no" ] ; then
 	new_config_option_mod="`expand_config_option $new_config_option_mod`"
 	echo "appending $new_config_option_mod to all config files listed in config.conf"
-	for config in $(eval scripts/guards $arch < config.conf); do
+	for config in $(scripts/guards $ARCH_SYMBOLS < config.conf); do
 		sed -i "/${new_config_option_mod}[ =]/d" config/$config
 		# '"
 		echo "${new_config_option_mod}=m" >> config/$config
@@ -145,7 +148,7 @@ fi
 if [ "$new_config_option_no" != "no" ] ; then
 	new_config_option_no="`expand_config_option $new_config_option_no`"
 	echo "disable $new_config_option_no in all config files listed in config.conf"
-	for config in $(eval scripts/guards $arch < config.conf); do
+	for config in $(scripts/guards $ARCH_SYMBOLS < config.conf); do
 		sed -i "/${new_config_option_no}[ =]/d" config/$config
 		# '"
 		echo "# ${new_config_option_no} is not set" >> config/$config
@@ -163,15 +166,38 @@ if [ "$menuconfig" = "no" ] ; then
 	esac
 fi
 
+config_files=$(patches/scripts/guards $ARCH_SYMBOLS < patches/config.conf)
+
 if [ "$vanilla" = "no" ] ; then
-	config_files=$(cd patches && eval scripts/guards $arch < config.conf | grep -v vanilla)
+    config_files=$(printf "%s\n" $config_files | grep -v vanilla)
 else
-	config_files=$(cd patches && eval scripts/guards $arch < config.conf | grep vanilla)
+    config_files=$(printf "%s\n" $config_files | grep vanilla)
 fi
+
+TMPDIR=$(mktemp -td ${0##*/}.XXXXXX)
+trap "rm -rf $TMPDIR" EXIT
+
+EXTRA_SYMBOLS=
+if [ -s extra-symbols ]; then
+    EXTRA_SYMBOLS="$(cat extra-symbols)"
+fi
+
+patches/scripts/guards $ARCH_SYMBOLS $EXTRA_SYMBOLS < patches/series.conf \
+    > $TMPDIR/applied-patches
 
 for config in $config_files; do
     arch=${config%/*}
     flavor=${config#*/}
+
+    set -- kernel-$flavor $flavor $(case $flavor in (rt|rt_*) echo RT ;; esac)
+    patches/scripts/guards $* $ARCH_SYMBOLS \
+	< patches/series.conf > $TMPDIR/patches
+
+    if ! diff -q $TMPDIR/applied-patches $TMPDIR/patches > /dev/null; then
+	echo "Not all patches for $config are applied; skipping"
+	continue
+    fi
+
     case $flavor in
     um)
 	MAKE_ARGS="ARCH=$flavor SUBARCH=$arch"
