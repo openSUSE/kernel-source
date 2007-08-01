@@ -274,6 +274,7 @@ install -m 644					\
 	supported.conf				\
 	rpm/functions.sh			\
 	rpm/source-post.sh			\
+	rpm/pre.sh				\
 	rpm/post.sh				\
 	rpm/postun.sh				\
 	rpm/module-renames			\
