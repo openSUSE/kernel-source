@@ -49,7 +49,7 @@ function expand_config_option () {
 #########################################################
 # main
 
-archs=
+arch=
 YES=
 menuconfig=no
 new_config_option_yes=no
@@ -63,7 +63,7 @@ until [ "$#" = "0" ] ; do
 	shift
 	;;
     a|-a|--arch)
-	archs="$archs $2"
+	arch=$2
 	shift 2
 	;;
     m|-m|--menuconfig)
@@ -123,12 +123,20 @@ EOF
     esac
 done
 
-ARCH_SYMBOLS=$(patches/scripts/arch-symbols ${archs:---list})
+if [ -z "$arch" ]; then
+    CONFIG_SYMBOLS=$(
+    	for arch in $(patches/scripts/arch-symbols --list); do
+	    patches/scripts/arch-symbols $arch
+	done)
+else
+    ARCH_SYMBOLS=$(patches/scripts/arch-symbols $arch)
+    CONFIG_SYMBOLS=$ARCH_SYMBOLS
+fi
 
 if [ "$new_config_option_yes" != "no" ] ; then
 	new_config_option_yes="`expand_config_option $new_config_option_yes`"
 	echo "appending $new_config_option_yes to all config files listed in config.conf"
-	for config in $(scripts/guards $ARCH_SYMBOLS < config.conf); do
+	for config in $(scripts/guards $CONFIG_SYMBOLS < config.conf); do
 		sed -i "/${new_config_option_yes}[ =]/d" config/$config
 		# '"
 		echo "${new_config_option_yes}=y" >> config/$config
@@ -138,7 +146,7 @@ fi
 if [ "$new_config_option_mod" != "no" ] ; then
 	new_config_option_mod="`expand_config_option $new_config_option_mod`"
 	echo "appending $new_config_option_mod to all config files listed in config.conf"
-	for config in $(scripts/guards $ARCH_SYMBOLS < config.conf); do
+	for config in $(scripts/guards $CONFIG_SYMBOLS < config.conf); do
 		sed -i "/${new_config_option_mod}[ =]/d" config/$config
 		# '"
 		echo "${new_config_option_mod}=m" >> config/$config
@@ -148,7 +156,7 @@ fi
 if [ "$new_config_option_no" != "no" ] ; then
 	new_config_option_no="`expand_config_option $new_config_option_no`"
 	echo "disable $new_config_option_no in all config files listed in config.conf"
-	for config in $(scripts/guards $ARCH_SYMBOLS < config.conf); do
+	for config in $(scripts/guards $CONFIG_SYMBOLS < config.conf); do
 		sed -i "/${new_config_option_no}[ =]/d" config/$config
 		# '"
 		echo "# ${new_config_option_no} is not set" >> config/$config
@@ -166,7 +174,7 @@ if [ "$menuconfig" = "no" ] ; then
 	esac
 fi
 
-config_files=$(patches/scripts/guards $ARCH_SYMBOLS < patches/config.conf)
+config_files=$(patches/scripts/guards $CONFIG_SYMBOLS < patches/config.conf)
 
 if [ "$vanilla" = "no" ] ; then
     config_files=$(printf "%s\n" $config_files | grep -v vanilla)
@@ -195,6 +203,7 @@ for config in $config_files; do
 
     if ! diff -q $TMPDIR/applied-patches $TMPDIR/patches > /dev/null; then
 	echo "Not all patches for $config are applied; skipping"
+	diff -u $TMPDIR/applied-patches $TMPDIR/patches
 	continue
     fi
 
