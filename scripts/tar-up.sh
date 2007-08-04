@@ -255,7 +255,6 @@ for arch in $(scripts/arch-symbols --list) ; do
     # the user won't change series.conf so much that two flavors that differ
     # at tar-up.sh time will become identical later.
 
-    echo "<<$arch/source: $ARCH_SYMBOLS $EXTRA_SYMBOLS>>" >&2
     scripts/guards $ARCH_SYMBOLS $EXTRA_SYMBOLS < series.conf \
 	> $TMPDIR/kernel-source.patches
     packages=$(
@@ -296,8 +295,6 @@ sed -e "s,@NAME@,kernel-syms,g" \
     -e "s,@BUILD_REQUIRES@,${build_req//$'\n'/\\n},g" \
   < rpm/kernel-syms.spec.in \
 > $build_dir/kernel-syms.spec
-
-exit 123
 
 install_changes $build_dir/kernel-syms.changes
 
