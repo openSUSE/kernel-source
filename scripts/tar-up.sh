@@ -241,14 +241,45 @@ sed -e "s,@NAME@,kernel-dummy,g" \
   < rpm/kernel-dummy.spec.in \
 > $build_dir/kernel-dummy.spec
 
+TMPDIR=$(mktemp -dt ${0##*/}.XXXXXX)
+trap "rm -rf $TMPDIR" EXIT
+
+EXTRA_SYMBOLS=$([ -e extra-symbols ] && cat extra-symbols)
+
 # Compute @BUILD_REQUIRES@ expansion
 head="" ; tail=""
 for arch in $(scripts/arch-symbols --list) ; do
-    set -- $(scripts/guards $(scripts/arch-symbols $arch) < config.conf \
-	     | sed -e 's:.*/:kernel-:')
-    [ $arch = i386 ] && arch="%ix86"
-    nl=$'\n'
+    ARCH_SYMBOLS=$(scripts/arch-symbols $arch)
+
+    # Exclude flavors that have a different set of patches: we assume that
+    # the user won't change series.conf so much that two flavors that differ
+    # at tar-up.sh time will become identical later.
+
+    echo "<<$arch/source: $ARCH_SYMBOLS $EXTRA_SYMBOLS>>" >&2
+    scripts/guards $ARCH_SYMBOLS $EXTRA_SYMBOLS < series.conf \
+	> $TMPDIR/kernel-source.patches
+    packages=$(
+	for arch_flavor in $(scripts/guards $ARCH_SYMBOLS $EXTRA_SYMBOLS \
+				< config.conf); do
+	    flavor=${arch_flavor#*/}
+	    av=${arch_flavor//\//_}
+	    set -- kernel-$flavor $flavor \
+		   $(case $flavor in (rt|rt_*) echo RT ;; esac)
+
+	    # The patch selection for kernel-vanilla is a hack.
+	    [ $flavor = vanilla ] && continue
+
+	    scripts/guards $* $ARCH_SYMBOLS $EXTRA_SYMBOLS < series.conf \
+		> $TMPDIR/kernel-$av.patches
+	    diff -q $TMPDIR/kernel-{source,$av}.patches > /dev/null || continue
+	    echo kernel-$flavor
+	done
+    )
+    set -- $packages
+
     if [ $# -gt 0 ]; then
+	[ $arch = i386 ] && arch="%ix86"
+	nl=$'\n'
 	[ -n "$head" ] && head="${head}%else$nl"
 	head="${head}%ifarch $arch$nl"
 	head="${head}BuildRequires: $*$nl"
@@ -265,6 +296,8 @@ sed -e "s,@NAME@,kernel-syms,g" \
     -e "s,@BUILD_REQUIRES@,${build_req//$'\n'/\\n},g" \
   < rpm/kernel-syms.spec.in \
 > $build_dir/kernel-syms.spec
+
+exit 123
 
 install_changes $build_dir/kernel-syms.changes
 
