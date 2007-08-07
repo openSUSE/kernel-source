@@ -7,13 +7,15 @@
 # remove the files from the old packages to make room for the new initrd
 # rpm may complain about low disk space if /boot/vmlinux does not fit
 if [ "$YAST_IS_RUNNING" != "" ]; then
-	mydf="$(POSIXLY_CORRECT=1 df -P /boot/ | awk '/^\//{ print $4}')"
-	echo "Free diskspace below /boot: $mydf blocks"
-	# echo "512 byte blocks: $(( 2 * 1024 * 20 ))"
-	if test "$mydf" -lt  "40960" ; then
-		echo "make room for new kernel '@FLAVOR@' because there are less than 20MB available."
-		# disabled because it breaks patch rpms
-		#rm -fv /boot/@IMAGE@-*-@FLAVOR@
-		rm -fv /boot/initrd-*-@FLAVOR@
+	mydf="$( POSIXLY_CORRECT=1 df -P /boot/ | awk '/^(\/|-[[:blank:]])/{ print $4}' )"
+	if test "$mydf" != "" ; then
+		echo "Free diskspace below /boot: $mydf blocks"
+		# echo "512 byte blocks: $(( 2 * 1024 * 20 ))"
+		if test "$mydf" -lt  "40960" ; then
+			echo "make room for new kernel '@FLAVOR@' because there are less than 20MB available."
+			# disabled because it breaks patch rpms
+			#rm -fv /boot/@IMAGE@-*-@FLAVOR@
+			rm -fv /boot/initrd-*-@FLAVOR@
+		fi
 	fi
 fi
