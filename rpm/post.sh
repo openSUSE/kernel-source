@@ -53,7 +53,11 @@ message_install_bl () {
 	echo "available bootloader for your platform (e.g. grub, lilo, zipl, ...)."
 }
 
-if [ "$YAST_IS_RUNNING" != instsys ]; then
+if [ -f /boot/grub/menu.lst -o \
+             -f /etc/lilo.conf -o \
+             -f /etc/elilo.conf -o \
+             -f /etc/zipl.conf ] ; then
+
     if [ -f /etc/fstab ]; then
 		if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
 			-i /boot/initrd-@KERNELRELEASE@; then
