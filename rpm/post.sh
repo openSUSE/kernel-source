@@ -53,57 +53,70 @@ message_install_bl () {
 	echo "available bootloader for your platform (e.g. grub, lilo, zipl, ...)."
 }
 
-if [ -f /boot/grub/menu.lst -o \
-             -f /etc/lilo.conf -o \
-             -f /etc/elilo.conf -o \
-             -f /etc/zipl.conf ] ; then
+run_bootloader () {
+    if [ -f /etc/sysconfig/bootloader ] &&
+	    [ -f /boot/grub/menu.lst -o \
+	      -f /etc/lilo.conf      -o \
+	      -f /etc/elilo.conf     -o \
+	      -f /etc/zipl.conf ]
+    then
+	return 0
+    else
+	return 1
+    fi
+}
 
-    if [ -f /etc/fstab ]; then
-		if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
-			-i /boot/initrd-@KERNELRELEASE@; then
-			echo "/sbin/mkinitrd failed" >&2
-			exit 1
-		fi
 
-		# handle 10.2 and SLES10 SP1
-		if [ -x /usr/lib/bootloader/bootloader_entry ]; then
-			/usr/lib/bootloader/bootloader_entry \
-			add \
-			@FLAVOR@ \
-			@KERNELRELEASE@ \
-			@IMAGE@-@KERNELRELEASE@ \
-			initrd-@KERNELRELEASE@
+if [ -f /etc/fstab ]; then
+    if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
+	-i /boot/initrd-@KERNELRELEASE@; then
+	echo "/sbin/mkinitrd failed" >&2
+	exit 1
+    fi
 
-		# handle 10.1 and SLES10 GA
-		elif [ -x /sbin/update-bootloader ]; then
-			case @FLAVOR@ in
-				(kdump|um)
-					;;
-				(*)
-					opt_xen_kernel=
-					case @FLAVOR@ in
-						xen*)
-						set -- @FLAVOR@
-						set -- ${1#xen}
-						opt_xen_kernel=--xen-kernel=/boot/xen${1:+-$1}.gz
-						;;
-					esac
+    if run_bootloader ; then
 
-					echo "bootloader_entry script unavailable, updating /boot/@IMAGE@"
-					/sbin/update-bootloader \
-						--image /boot/@IMAGE@ \
-						--initrd /boot/initrd \
-						--add \
-						--force $opt_xen_kernel
+	# handle 10.2 and SLES10 SP1
+	if [ -x /usr/lib/bootloader/bootloader_entry ]; then
+	    /usr/lib/bootloader/bootloader_entry \
+		add \
+		@FLAVOR@ \
+		@KERNELRELEASE@ \
+		@IMAGE@-@KERNELRELEASE@ \
+		initrd-@KERNELRELEASE@
 
-					/sbin/update-bootloader --refresh
-					;;
-			esac
-		else
-			message_install_bl
-		fi
+	# handle 10.1 and SLES10 GA
+	elif [ -x /sbin/update-bootloader ]; then
+	    case @FLAVOR@ in
+		(kdump|um)
+		    ;;
+		(*)
+		    opt_xen_kernel=
+		    case @FLAVOR@ in
+			xen*)
+			    set -- @FLAVOR@
+			    set -- ${1#xen}
+			    opt_xen_kernel=--xen-kernel=/boot/xen${1:+-$1}.gz
+			    ;;
+		    esac
+
+		    echo "bootloader_entry script unavailable, updating /boot/@IMAGE@"
+		    /sbin/update-bootloader \
+			--image /boot/@IMAGE@ \
+			--initrd /boot/initrd \
+			--add \
+			--force $opt_xen_kernel
+
+		    /sbin/update-bootloader --refresh
+		    ;;
+	    esac
 	else
-		echo "Please run mkinitrd as soon as your system is complete."
-		message_install_bl
+	    message_install_bl
 	fi
+    fi
+else
+    echo "Please run mkinitrd as soon as your system is complete."
+    message_install_bl
 fi
+
+# vim: set sts=4 sw=4 ts=8 noet:
