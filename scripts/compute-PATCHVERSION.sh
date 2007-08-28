@@ -8,9 +8,9 @@ set -- $(IFS=.; echo $SRCVERSION)
 VERSION=$1
 PATCHLEVEL=$2
 SUBLEVEL=$3
-EXTRAVERSION=
+EXTRAVERSION=$4
 
-EXTRA_SYMBOLS=$([ -e extra-symbols ] && cat extra-symbols)
+EXTRA_SYMBOLS=$(set -- $([ -e $(dirname $0)/../extra-symbols ] && cat $(dirname $0)/../extra-symbols) ; echo $*)
 
 # Parse all the changes to KERNELRELEASE out of all patches and
 # convert them to shell code that can be evaluated. Evaluate it.
