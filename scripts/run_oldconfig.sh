@@ -198,7 +198,7 @@ for config in $config_files; do
     flavor=${config#*/}
 
     set -- kernel-$flavor $flavor $(case $flavor in (rt|rt_*) echo RT ;; esac)
-    patches/scripts/guards $* $ARCH_SYMBOLS \
+    patches/scripts/guards $* $ARCH_SYMBOLS $EXTRA_SYMBOLS \
 	< patches/series.conf > $TMPDIR/patches
 
     if ! diff -q $TMPDIR/applied-patches $TMPDIR/patches > /dev/null; then
