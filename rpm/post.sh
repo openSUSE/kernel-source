@@ -67,52 +67,51 @@ run_bootloader () {
 }
 
 
-if [ -f /etc/fstab -a ! -e /.buildenv ]; then
+if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] &&
+    run_bootloader ; then 
+
     if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
 	-i /boot/initrd-@KERNELRELEASE@; then
 	echo "/sbin/mkinitrd failed" >&2
 	exit 1
     fi
 
-    if run_bootloader ; then
+    # handle 10.2 and SLES10 SP1
+    if [ -x /usr/lib/bootloader/bootloader_entry ]; then
+	/usr/lib/bootloader/bootloader_entry \
+	    add \
+	    @FLAVOR@ \
+	    @KERNELRELEASE@ \
+	    @IMAGE@-@KERNELRELEASE@ \
+	    initrd-@KERNELRELEASE@
 
-	# handle 10.2 and SLES10 SP1
-	if [ -x /usr/lib/bootloader/bootloader_entry ]; then
-	    /usr/lib/bootloader/bootloader_entry \
-		add \
-		@FLAVOR@ \
-		@KERNELRELEASE@ \
-		@IMAGE@-@KERNELRELEASE@ \
-		initrd-@KERNELRELEASE@
+    # handle 10.1 and SLES10 GA
+    elif [ -x /sbin/update-bootloader ]; then
+	case @FLAVOR@ in
+	    kdump|um)
+		;;
+	    *)
+		opt_xen_kernel=
+		case @FLAVOR@ in
+		    xen*)
+			set -- @FLAVOR@
+			set -- ${1#xen}
+			opt_xen_kernel=--xen-kernel=/boot/xen${1:+-$1}.gz
+			;;
+		esac
 
-	# handle 10.1 and SLES10 GA
-	elif [ -x /sbin/update-bootloader ]; then
-	    case @FLAVOR@ in
-		(kdump|um)
-		    ;;
-		(*)
-		    opt_xen_kernel=
-		    case @FLAVOR@ in
-			xen*)
-			    set -- @FLAVOR@
-			    set -- ${1#xen}
-			    opt_xen_kernel=--xen-kernel=/boot/xen${1:+-$1}.gz
-			    ;;
-		    esac
+		echo "bootloader_entry script unavailable, updating /boot/@IMAGE@"
+		/sbin/update-bootloader \
+		    --image /boot/@IMAGE@ \
+		    --initrd /boot/initrd \
+		    --add \
+		    --force $opt_xen_kernel
 
-		    echo "bootloader_entry script unavailable, updating /boot/@IMAGE@"
-		    /sbin/update-bootloader \
-			--image /boot/@IMAGE@ \
-			--initrd /boot/initrd \
-			--add \
-			--force $opt_xen_kernel
-
-		    /sbin/update-bootloader --refresh
-		    ;;
-	    esac
-	else
-	    message_install_bl
-	fi
+		/sbin/update-bootloader --refresh
+		;;
+	esac
+    else
+	message_install_bl
     fi
 else
     echo "Please run mkinitrd as soon as your system is complete."
