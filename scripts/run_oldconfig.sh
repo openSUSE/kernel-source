@@ -46,6 +46,13 @@ function expand_config_option () {
 	echo "$opt"
 }
 
+function _cleanup_() {
+	test -d "$TMPDIR" && rm -rf $TMPDIR
+	test "$use_region" != 0 && _region_fini_
+}
+TMPDIR=
+trap _cleanup_ EXIT
+
 #########################################################
 # main
 
@@ -169,7 +176,6 @@ if [ "$menuconfig" = "no" ] ; then
 	linux | xterm | screen)
 	    use_region=1
 	    _region_init_
-	    trap "_region_fini_" EXIT
 	    ;;
 	esac
 fi
@@ -183,7 +189,6 @@ else
 fi
 
 TMPDIR=$(mktemp -td ${0##*/}.XXXXXX)
-trap "rm -rf $TMPDIR" EXIT
 
 EXTRA_SYMBOLS=
 if [ -s extra-symbols ]; then
