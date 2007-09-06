@@ -130,13 +130,22 @@ EOF
     esac
 done
 
+if [ -f patches/scripts/arch-symbols ] ; then
+	prefix=patches/
+elif [ -f scripts/arch-symbols ] ; then
+	prefix=
+else
+	echo "no arch-symbols found"
+	exit 1
+fi
+
 if [ -z "$arch" ]; then
     CONFIG_SYMBOLS=$(
-    	for arch in $(patches/scripts/arch-symbols --list); do
-	    patches/scripts/arch-symbols $arch
+    	for arch in $(${prefix}scripts/arch-symbols --list); do
+		${prefix}scripts/arch-symbols $arch
 	done)
 else
-    ARCH_SYMBOLS=$(patches/scripts/arch-symbols $arch)
+    ARCH_SYMBOLS=$(${prefix}scripts/arch-symbols $arch)
     CONFIG_SYMBOLS=$ARCH_SYMBOLS
 fi
 
