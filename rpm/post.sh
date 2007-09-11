@@ -70,10 +70,12 @@ run_bootloader () {
 if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] &&
     run_bootloader ; then 
 
-    if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
-	-i /boot/initrd-@KERNELRELEASE@; then
-	echo "/sbin/mkinitrd failed" >&2
-	exit 1
+    if [ "$YAST_IS_RUNNING" != instsys ] ; then
+	if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
+	    -i /boot/initrd-@KERNELRELEASE@; then
+	    echo "/sbin/mkinitrd failed" >&2
+	    exit 1
+	fi
     fi
 
     # handle 10.2 and SLES10 SP1
