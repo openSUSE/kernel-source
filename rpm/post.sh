@@ -66,10 +66,19 @@ run_bootloader () {
     fi
 }
 
+# Both perl-Bootloader and mkinitrd need valid partitioning
+# information in /etc/fstab, so only run the scripts in that
+# case. Also check for /.buildenv because of autobuild and
+# check for /sbin/mkinitrd because of the BuildService
+# (in a normal system, the RPM dependencies take care that
+# /sbin/mkinitrd is always there).
+if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] ; then
 
-if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] &&
-    run_bootloader ; then 
-
+    # Don't run mkinitrd when we are in the installation system
+    # because the yast2 bootloader runs at the end of stage
+    # 1 installation, so this one is useless (and it's also
+    # problematic if the yast2 storage converts the /etc/fstab
+    # e.g. from hda to sda device names)
     if [ "$YAST_IS_RUNNING" != instsys ] ; then
 	if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
 	    -i /boot/initrd-@KERNELRELEASE@; then
@@ -78,42 +87,46 @@ if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] &&
 	fi
     fi
 
-    # handle 10.2 and SLES10 SP1
-    if [ -x /usr/lib/bootloader/bootloader_entry ]; then
-	/usr/lib/bootloader/bootloader_entry \
-	    add \
-	    @FLAVOR@ \
-	    @KERNELRELEASE@ \
-	    @IMAGE@-@KERNELRELEASE@ \
-	    initrd-@KERNELRELEASE@
+    # only run the bootloader if the usual bootloader configuration
+    # files are there -- this is different on every architecture
+    if run_bootloader ; then
+	# handle 10.2 and SLES10 SP1
+	if [ -x /usr/lib/bootloader/bootloader_entry ]; then
+	    /usr/lib/bootloader/bootloader_entry \
+		add \
+		@FLAVOR@ \
+		@KERNELRELEASE@ \
+		@IMAGE@-@KERNELRELEASE@ \
+		initrd-@KERNELRELEASE@
 
-    # handle 10.1 and SLES10 GA
-    elif [ -x /sbin/update-bootloader ]; then
-	case @FLAVOR@ in
-	    kdump|um)
-		;;
-	    *)
-		opt_xen_kernel=
-		case @FLAVOR@ in
-		    xen*)
-			set -- @FLAVOR@
-			set -- ${1#xen}
-			opt_xen_kernel=--xen-kernel=/boot/xen${1:+-$1}.gz
-			;;
-		esac
+	# handle 10.1 and SLES10 GA
+	elif [ -x /sbin/update-bootloader ]; then
+	    case @FLAVOR@ in
+		kdump|um)
+		    ;;
+		*)
+		    opt_xen_kernel=
+		    case @FLAVOR@ in
+			xen*)
+			    set -- @FLAVOR@
+			    set -- ${1#xen}
+			    opt_xen_kernel=--xen-kernel=/boot/xen${1:+-$1}.gz
+			    ;;
+		    esac
 
-		echo "bootloader_entry script unavailable, updating /boot/@IMAGE@"
-		/sbin/update-bootloader \
-		    --image /boot/@IMAGE@ \
-		    --initrd /boot/initrd \
-		    --add \
-		    --force $opt_xen_kernel
+		    echo "bootloader_entry script unavailable, updating /boot/@IMAGE@"
+		    /sbin/update-bootloader \
+			--image /boot/@IMAGE@ \
+			--initrd /boot/initrd \
+			--add \
+			--force $opt_xen_kernel
 
-		/sbin/update-bootloader --refresh
-		;;
-	esac
-    else
-	message_install_bl
+		    /sbin/update-bootloader --refresh
+		    ;;
+	    esac
+	else
+	    message_install_bl
+	fi
     fi
 else
     echo "Please run mkinitrd as soon as your system is complete."
