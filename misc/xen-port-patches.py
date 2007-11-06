@@ -51,7 +51,7 @@ def findPatchFiles(kcvs):
 	"Returns a list of all files in patches.*/ on below kcvs"
 	list = glob.glob(kcvs + "/patches.*/*")
 	# Avoid patches in patches.xen, CVS subdirs, backup files
-	filterout = re.compile("(patches\.xen|CVS|~$|\.#)")
+	filterout = re.compile("(patches\.(xen|rt)|CVS|~$|\.#)")
 	return filter(lambda(x): not filterout.search(x), list)
 
 def writePatch(fname, hdr, body):
