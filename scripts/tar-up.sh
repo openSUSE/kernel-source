@@ -406,7 +406,12 @@ archives=$(sed -ne 's,^Source[0-9]*:.*[ \t/]\([^/]*\)\.tar\.bz2$,\1,p' \
 for archive in $archives; do
     if ! [ -e $build_dir/$archive.tar.bz2 ]; then
 	echo "$archive.tar.bz2 (empty)"
-	bzip2 -9 < /dev/null > $build_dir/$archive.tar.bz2
+	TMPDIR2=$(mktemp -dt ${0##*/}.XXXXXX)
+	trap "rm -rf $TMPDIR2" EXIT
+	mkdir -p $TMPDIR2/$archive
+	tar -C $TMPDIR2 -cf - $archive | \
+	    bzip2 -9 > $build_dir/$archive.tar.bz2
+	rmdir $TMPDIR2/$archive
     fi
 done
 
