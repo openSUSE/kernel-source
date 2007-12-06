@@ -409,6 +409,8 @@ for archive in $archives; do
 	TMPDIR2=$(mktemp -dt ${0##*/}.XXXXXX)
 	trap "rm -rf $TMPDIR2" EXIT
 	mkdir -p $TMPDIR2/$archive
+	touch -d "$(head -n 1 $build_dir/build-source-timestamp)" \
+	    $TMPDIR2/$archive
 	tar -C $TMPDIR2 -cf - $archive | \
 	    bzip2 -9 > $build_dir/$archive.tar.bz2
 	rmdir $TMPDIR2/$archive
