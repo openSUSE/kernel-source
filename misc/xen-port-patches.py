@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 xen-port-patches.py [CVS dir]
-Create custom patches for xen from custom patches that affect i386/x86-64.
+Create custom patches for xen from custom patches that affect x86.
 Turned out to be a little functional programming exercise for the author.
 (c) 2005-04-06, Kurt Garloff <garloff@suse.de>
 """
@@ -11,7 +11,7 @@ import re, glob, sys, os, filecmp
 
 # List of replacement rules
 replrules = [(r"(.*)-xen(\.[^/\s])", r"\1\2"),
-	   (r"include/asm-(i386|x86_64)/mach-xen/asm/", r"include/asm-\1/")]
+	   (r"include/asm-([^/\s]+86[^/\s]*)/mach-xen/asm/", r"include/asm-\1/")]
 # List of compiled rules (speed reasons)
 #comprules = map(lambda(x): (x[0], x[1], re.compile(x[0])), replrules)
 comprules = [ (x[0], x[1], re.compile(x[0])) for x in replrules ]
