@@ -207,6 +207,8 @@ fi
 patches/scripts/guards $ARCH_SYMBOLS $EXTRA_SYMBOLS < patches/series.conf \
     > $TMPDIR/applied-patches
 
+EXTRA_SYMBOLS="$(echo $EXTRA_SYMBOLS | sed -e 's# *[Rr][Tt] *##g')"
+
 for config in $config_files; do
     arch=${config%/*}
     flavor=${config#*/}
