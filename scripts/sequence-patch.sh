@@ -117,8 +117,6 @@ free_blocks="$(df -P "$SCRATCH_AREA" \
     | awk 'NR==2 && match($4, /^[0-9]*$/) { print $4 }' 2> /dev/null)"
 [ "0$free_blocks" -gt 262144 ] && enough_free_space=1
 
-echo "Creating tree in $PATCH_DIR"
-
 if [ ! -d $ORIG_DIR ]; then
     # Check if linux-$SRCVERSION.tar.gz is accessible.
     for file in {$SCRATCH_AREA/,,$MIRROR/,$MIRROR/testing/}linux-$SRCVERSION.tar.{gz,bz2}; do
@@ -180,6 +178,12 @@ if [ -n "$EXTRA_SYMBOLS" ]; then
     echo "Extra symbols: $EXTRA_SYMBOLS"
     SYMBOLS="$SYMBOLS $EXTRA_SYMBOLS"
 fi
+
+EXT=${EXTRA_SYMBOLS// /-}
+EXT=${EXT//\//}
+PATCH_DIR=${PATCH_DIR}-$EXT
+
+echo "Creating tree in $PATCH_DIR"
 
 # Clean up from previous run
 rm -f "$PATCH_LOG" "$LAST_LOG"
