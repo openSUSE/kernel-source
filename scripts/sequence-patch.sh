@@ -283,11 +283,12 @@ restore_files() {
 	done
 	#echo "Restore: ${restore[@]}"
 	[ ${#restore[@]} -ne 0 ] \
-	    && cp -f --parents "${restore[@]}" $patch_dir
+	    && printf "%s\n" "${restore[@]}" \
+	    	| xargs -I '{}' cp -f --parents '{}' $patch_dir
 	cd $patch_dir
 	#echo "Remove: ${remove[@]}"
 	[ ${#remove[@]} -ne 0 ] \
-	    && rm -f "${remove[@]}"
+	    && printf "%s\n" "${remove[@]}" | xargs rm -f
 	popd > /dev/null
     fi
 }
