@@ -181,7 +181,7 @@ fi
 
 EXT=${EXTRA_SYMBOLS// /-}
 EXT=${EXT//\//}
-PATCH_DIR=${PATCH_DIR}-$EXT
+PATCH_DIR=${PATCH_DIR}${EXT:+-}$EXT
 
 echo "Creating tree in $PATCH_DIR"
 
