@@ -29,7 +29,7 @@ fi
 echo Setting up /lib/modules/@KERNELRELEASE@
 suffix=
 case @FLAVOR@ in
-    kdump|um|xen*)
+    kdump|ps3|um|xen*)
 	suffix=-@FLAVOR@
 	;;
 esac
@@ -102,7 +102,7 @@ if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] ; then
 	# handle 10.1 and SLES10 GA
 	elif [ -x /sbin/update-bootloader ]; then
 	    case @FLAVOR@ in
-		kdump|um)
+		kdump|um|ps3)
 		    ;;
 		*)
 		    opt_xen_kernel=
