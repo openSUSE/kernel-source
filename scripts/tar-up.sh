@@ -58,7 +58,18 @@ source $(dirname $0)/config.sh
 export LANG=POSIX
 SRC_FILE=linux-$SRCVERSION.tar.bz2
 PATCHVERSION=$($(dirname $0)/compute-PATCHVERSION.sh)
-RPMVERSION=${PATCHVERSION//-/_}
+
+case "$PATCHVERSION" in
+*-*)
+    RPMVERSION=${PATCHVERSION%%-*}
+    RELEASE_PREFIX=${PATCHVERSION#*-}.
+    RELEASE_PREFIX=${RELEASE_PREFIX//-/.}
+    ;;
+*)
+    RPMVERSION=$PATCHVERSION
+    RELEASE_PREFIX=
+    ;;
+esac
 
 if [ -n "$rpm_release_timestamp" ]; then
     if test $(( ${#RPMVERSION} + 10 + 2 + 8 + ${#rpm_release_string})) -gt 64
@@ -339,9 +350,10 @@ if [ -e extra-symbols ]; then
 fi
 
 if [ -z "$rpm_release_string" ]; then
-    install -m 755					\
-	rpm/get_release_number.sh			\
-	$build_dir
+    sed -e "s:@RELEASE_PREFIX@:$RELEASE_PREFIX:"	\
+	rpm/get_release_number.sh.in			\
+	> $build_dir/get_release_number.sh
+    chmod 755 $build_dir/get_release_number.sh
 else
     cat > $build_dir/get_release_number.sh <<-EOF
 	#!/bin/sh
