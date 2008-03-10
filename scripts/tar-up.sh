@@ -349,18 +349,11 @@ if [ -e extra-symbols ]; then
 		$build_dir
 fi
 
-if [ -z "$rpm_release_string" ]; then
-    sed -e "s:@RELEASE_PREFIX@:$RELEASE_PREFIX:"	\
-	rpm/get_release_number.sh.in			\
-	> $build_dir/get_release_number.sh
-    chmod 755 $build_dir/get_release_number.sh
-else
-    cat > $build_dir/get_release_number.sh <<-EOF
-	#!/bin/sh
-	echo "$rpm_release_string"
-	EOF
-    chmod a+rx $build_dir/get_release_number.sh
-fi
+sed -e "s:@RELEASE_PREFIX@:$RELEASE_PREFIX:"		\
+    -e "s:@RELEASE_SUFFIX@:$rpm_release_string:"	\
+    rpm/get_release_number.sh.in			\
+    > $build_dir/get_release_number.sh
+chmod 755 $build_dir/get_release_number.sh
 
 if [ -r $SRC_FILE ]; then
   LINUX_ORIG_TARBALL=$SRC_FILE
