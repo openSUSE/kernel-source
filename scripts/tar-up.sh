@@ -2,6 +2,7 @@
 
 rpm_release_timestamp=
 rpm_release_string=
+kbuild=
 tolerate_unknown_new_config_options=0
 until [ "$#" = "0" ] ; do
   case "$1" in
@@ -35,6 +36,10 @@ until [ "$#" = "0" ] ; do
       rpm_release_timestamp=yes
       shift
       ;;
+    -k|--kbuild)
+      kbuild=yes
+      shift
+      ;;
     -h|--help|-v|--version)
 	cat <<EOF
 
@@ -44,6 +49,7 @@ these options are recognized:
     -rs <string>       to append specified string to rpm release number
     -ts                to use the current date as rpm release number
     -nf                to proceed if a new unknown .config option is found during make oldconfig
+    -k | --kbuild      to autogenerate a release number based on branch and timestamp (overrides -rs/-ts)
 
 EOF
 	exit 1
@@ -347,6 +353,16 @@ if [ -e extra-symbols ]; then
 	install -m 755					\
 		extra-symbols				\
 		$build_dir
+fi
+
+if [ -n "$kbuild" ]; then
+	ts="$(head -n 1 $build_dir/build-source-timestamp)"
+	branch=$(sed -n -e '/^CVS Branch/s,^.*: ,,gp' \
+		 $build_dir/build-source-timestamp)
+	rpm_release_string=$(date --utc '+%Y%m%d%H%M%S' -d "$ts")
+	if [ -n "$branch" ]; then
+		rpm_release_string="${branch}_$rpm_release_string"
+	fi
 fi
 
 sed -e "s:@RELEASE_PREFIX@:$RELEASE_PREFIX:"		\
