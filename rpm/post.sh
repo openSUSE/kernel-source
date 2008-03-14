@@ -73,18 +73,10 @@ run_bootloader () {
 # (in a normal system, the RPM dependencies take care that
 # /sbin/mkinitrd is always there).
 if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] ; then
-
-    # Don't run mkinitrd when we are in the installation system
-    # because the yast2 bootloader runs at the end of stage
-    # 1 installation, so this one is useless (and it's also
-    # problematic if the yast2 storage converts the /etc/fstab
-    # e.g. from hda to sda device names)
-    if [ "$YAST_IS_RUNNING" != instsys ] ; then
-	if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
-	    -i /boot/initrd-@KERNELRELEASE@; then
-	    echo "/sbin/mkinitrd failed" >&2
-	    exit 1
-	fi
+    if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ 
+			-i /boot/initrd-@KERNELRELEASE@; then
+	echo "/sbin/mkinitrd failed" >&2
+	exit 1
     fi
 
     # only run the bootloader if the usual bootloader configuration
