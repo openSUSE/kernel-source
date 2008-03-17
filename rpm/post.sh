@@ -73,7 +73,7 @@ run_bootloader () {
 # (in a normal system, the RPM dependencies take care that
 # /sbin/mkinitrd is always there).
 if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] ; then
-    if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ 
+    if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
 			-i /boot/initrd-@KERNELRELEASE@; then
 	echo "/sbin/mkinitrd failed" >&2
 	exit 1
