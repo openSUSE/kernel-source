@@ -2,7 +2,7 @@
 
 rpm_release_timestamp=
 rpm_release_string=
-kbuild=
+source_timestamp=
 tolerate_unknown_new_config_options=0
 until [ "$#" = "0" ] ; do
   case "$1" in
@@ -36,8 +36,8 @@ until [ "$#" = "0" ] ; do
       rpm_release_timestamp=yes
       shift
       ;;
-    -k|--kbuild)
-      kbuild=yes
+    -k|--kbuild|--source-timestamp)
+      source_timestamp=1
       shift
       ;;
     -h|--help|-v|--version)
@@ -49,7 +49,7 @@ these options are recognized:
     -rs <string>       to append specified string to rpm release number
     -ts                to use the current date as rpm release number
     -nf                to proceed if a new unknown .config option is found during make oldconfig
-    -k | --kbuild      to autogenerate a release number based on branch and timestamp (overrides -rs/-ts)
+    --source-timestamp to autogenerate a release number based on branch and timestamp (overrides -rs/-ts)
 
 EOF
 	exit 1
@@ -355,14 +355,11 @@ if [ -e extra-symbols ]; then
 		$build_dir
 fi
 
-if [ -n "$kbuild" ]; then
+if [ -n "$source_timestamp" ]; then
 	ts="$(head -n 1 $build_dir/build-source-timestamp)"
 	branch=$(sed -n -e '/^CVS Branch/s,^.*: ,,gp' \
 		 $build_dir/build-source-timestamp)
-	rpm_release_string=$(date --utc '+%Y%m%d%H%M%S' -d "$ts")
-	if [ -n "$branch" ]; then
-		rpm_release_string="${branch}_$rpm_release_string"
-	fi
+	rpm_release_string=${branch:-HEAD}_$(date --utc '+%Y%m%d%H%M%S' -d "$ts")
 fi
 
 sed -e "s:@RELEASE_PREFIX@:$RELEASE_PREFIX:"		\
