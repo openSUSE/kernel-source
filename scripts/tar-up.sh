@@ -216,6 +216,7 @@ for flavor in $flavors ; do
 	-e "s,@ARCHS@,$archs,g" \
 	-e "s,@PROVIDES_OBSOLETES@,${prov_obs//$'\n'/\\n},g" \
 	-e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options,g" \
+	-e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
       < rpm/kernel-binary.spec.in \
     > $build_dir/kernel-$flavor.spec
 done
@@ -247,6 +248,7 @@ sed -e "s,@NAME@,kernel-source,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
     -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
     -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
+    -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
   < rpm/kernel-source.spec.in \
 > $build_dir/kernel-source.spec
 
@@ -255,6 +257,7 @@ sed -e "s,@NAME@,kernel-dummy,g" \
     -e "s,@SRCVERSION@,$SRCVERSION,g" \
     -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
+    -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
   < rpm/kernel-dummy.spec.in \
 > $build_dir/kernel-dummy.spec
 
@@ -310,6 +313,7 @@ sed -e "s,@NAME@,kernel-syms,g" \
     -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
     -e "s,@BUILD_REQUIRES@,${build_req//$'\n'/\\n},g" \
+    -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
   < rpm/kernel-syms.spec.in \
 > $build_dir/kernel-syms.spec
 
