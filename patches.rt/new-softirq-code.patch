@@ -1,0 +1,303 @@
+Subject: Linux-RT 2.6.25-rt
+From: http://www.kernel.org/pub/linux/kernel/projects/rt/
+Acked-by: Sven-Thorsten Dietrich <sdietrich@suse.de>
+Subject: [patch] softirq preemption: optimization
+From: Ingo Molnar <mingo@elte.hu>
+
+optimize softirq preemption by allowing a hardirq context to pick up
+softirq processing.
+
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+---
+ kernel/irq/manage.c |   19 ++-----
+ kernel/softirq.c    |  138 +++++++++++++++++++++++++++++++++++++++++-----------
+ 2 files changed, 116 insertions(+), 41 deletions(-)
+
+Index: linux-2.6.25.2-rt1/kernel/irq/manage.c
+===================================================================
+--- linux-2.6.25.2-rt1.orig/kernel/irq/manage.c	2008-05-08 16:19:10.000000000 -0400
++++ linux-2.6.25.2-rt1/kernel/irq/manage.c	2008-05-08 16:19:23.000000000 -0400
+@@ -711,7 +711,6 @@ static void thread_edge_irq(irq_desc_t *
+ 		desc->status &= ~IRQ_PENDING;
+ 		spin_unlock(&desc->lock);
+ 		action_ret = handle_IRQ_event(irq, action);
+-		cond_resched_hardirq_context();
+ 		spin_lock_irq(&desc->lock);
+ 		if (!noirqdebug)
+ 			note_interrupt(irq, desc, action_ret);
+@@ -740,7 +739,6 @@ static void thread_do_irq(irq_desc_t *de
+ 		desc->status &= ~IRQ_PENDING;
+ 		spin_unlock(&desc->lock);
+ 		action_ret = handle_IRQ_event(irq, action);
+-		cond_resched_hardirq_context();
+ 		spin_lock_irq(&desc->lock);
+ 		if (!noirqdebug)
+ 			note_interrupt(irq, desc, action_ret);
+@@ -776,8 +774,6 @@ static void do_hardirq(struct irq_desc *
+ 		wake_up(&desc->wait_for_handler);
+ }
+ 
+-extern asmlinkage void __do_softirq(void);
+-
+ static int do_irqd(void * __desc)
+ {
+ 	struct sched_param param = { 0, };
+@@ -797,16 +793,13 @@ static int do_irqd(void * __desc)
+ 
+ 	while (!kthread_should_stop()) {
+ 		local_irq_disable_nort();
+-		set_current_state(TASK_INTERRUPTIBLE);
+-#ifndef CONFIG_PREEMPT_RT
+-		irq_enter();
+-#endif
+-		do_hardirq(desc);
+-#ifndef CONFIG_PREEMPT_RT
+-		irq_exit();
+-#endif
++		do {
++			set_current_state(TASK_INTERRUPTIBLE);
++			do_hardirq(desc);
++			do_softirq_from_hardirq();
++		} while (current->state == TASK_RUNNING);
++
+ 		local_irq_enable_nort();
+-		cond_resched();
+ #ifdef CONFIG_SMP
+ 		/*
+ 		 * Did IRQ affinities change?
+Index: linux-2.6.25.2-rt1/kernel/softirq.c
+===================================================================
+--- linux-2.6.25.2-rt1.orig/kernel/softirq.c	2008-05-08 16:19:06.000000000 -0400
++++ linux-2.6.25.2-rt1/kernel/softirq.c	2008-05-08 16:19:24.000000000 -0400
+@@ -103,8 +103,26 @@ static void wakeup_softirqd(int softirq)
+ 	/* Interrupts are disabled: no need to stop preemption */
+ 	struct task_struct *tsk = __get_cpu_var(ksoftirqd)[softirq].tsk;
+ 
+-	if (tsk && tsk->state != TASK_RUNNING)
+-		wake_up_process(tsk);
++	if (unlikely(!tsk))
++		return;
++#if defined(CONFIG_PREEMPT_SOFTIRQS) && defined(CONFIG_PREEMPT_HARDIRQS)
++	/*
++	 * Optimization: if we are in a hardirq thread context, and
++	 * if the priority of the softirq thread is the same as the
++	 * priority of the hardirq thread, then 'merge' softirq
++	 * processing into the hardirq context. (it will later on
++	 * execute softirqs via do_softirq_from_hardirq()).
++	 * So here we can skip the wakeup and can rely on the hardirq
++	 * context processing it later on.
++	 */
++	if ((current->flags & PF_HARDIRQ) && !hardirq_count() &&
++			(tsk->normal_prio == current->normal_prio))
++		return;
++#endif
++	/*
++	 * Wake up the softirq task:
++	 */
++	wake_up_process(tsk);
+ }
+ 
+ /*
+@@ -253,50 +271,100 @@ EXPORT_SYMBOL(local_bh_enable_ip);
+  * we want to handle softirqs as soon as possible, but they
+  * should not be able to lock up the box.
+  */
+-#define MAX_SOFTIRQ_RESTART 10
++#define MAX_SOFTIRQ_RESTART 20
++
++static DEFINE_PER_CPU(u32, softirq_running);
+ 
+-asmlinkage void ___do_softirq(void)
++static void ___do_softirq(const int same_prio_only)
+ {
++	int max_restart = MAX_SOFTIRQ_RESTART, max_loops = MAX_SOFTIRQ_RESTART;
++	__u32 pending, available_mask, same_prio_skipped;
+ 	struct softirq_action *h;
+-	__u32 pending;
+-	int max_restart = MAX_SOFTIRQ_RESTART;
+-	int cpu;
++	struct task_struct *tsk;
++	int cpu, softirq;
+ 
+ 	pending = local_softirq_pending();
+ 	account_system_vtime(current);
+ 
+ 	cpu = smp_processor_id();
+ restart:
++	available_mask = -1;
++	softirq = 0;
++	same_prio_skipped = 0;
+ 	/* Reset the pending bitmask before enabling irqs */
+ 	set_softirq_pending(0);
+ 
+-	local_irq_enable();
+-
+ 	h = softirq_vec;
+ 
+ 	do {
++		u32 softirq_mask = 1 << softirq;
++
+ 		if (pending & 1) {
+-			{
+-				u32 preempt_count = preempt_count();
+-				h->action(h);
+-				if (preempt_count != preempt_count()) {
+-					print_symbol("BUG: softirq exited %s with wrong preemption count!\n", (unsigned long) h->action);
+-					printk("entered with %08x, exited with %08x.\n", preempt_count, preempt_count());
+-					preempt_count() = preempt_count;
++			u32 preempt_count = preempt_count();
++
++#if defined(CONFIG_PREEMPT_SOFTIRQS) && defined(CONFIG_PREEMPT_HARDIRQS)
++			/*
++			 * If executed by a same-prio hardirq thread
++			 * then skip pending softirqs that belong
++			 * to softirq threads with different priority:
++			 */
++			if (same_prio_only) {
++				tsk = __get_cpu_var(ksoftirqd)[softirq].tsk;
++				if (tsk && tsk->normal_prio !=
++						current->normal_prio) {
++					same_prio_skipped |= softirq_mask;
++					available_mask &= ~softirq_mask;
++					goto next;
+ 				}
+ 			}
++#endif
++			/*
++			 * Is this softirq already being processed?
++			 */
++			if (per_cpu(softirq_running, cpu) & softirq_mask) {
++				available_mask &= ~softirq_mask;
++				goto next;
++			}
++			per_cpu(softirq_running, cpu) |= softirq_mask;
++			local_irq_enable();
++
++			h->action(h);
++			if (preempt_count != preempt_count()) {
++				print_symbol("BUG: softirq exited %s with wrong preemption count!\n", (unsigned long) h->action);
++				printk("entered with %08x, exited with %08x.\n", preempt_count, preempt_count());
++				preempt_count() = preempt_count;
++			}
+ 			rcu_bh_qsctr_inc(cpu);
+ 			cond_resched_softirq_context();
++			local_irq_disable();
++			per_cpu(softirq_running, cpu) &= ~softirq_mask;
+ 		}
++next:
+ 		h++;
++		softirq++;
+ 		pending >>= 1;
+ 	} while (pending);
+ 
+-	local_irq_disable();
+-
++	or_softirq_pending(same_prio_skipped);
+ 	pending = local_softirq_pending();
+-	if (pending && --max_restart)
+-		goto restart;
++	if (pending & available_mask) {
++		if (--max_restart)
++			goto restart;
++		/*
++		 * With softirq threading there's no reason not to
++		 * finish the workload we have:
++		 */
++#ifdef CONFIG_PREEMPT_SOFTIRQS
++		if (--max_loops) {
++			if (printk_ratelimit())
++				printk("INFO: softirq overload: %08x\n", pending);
++			max_restart = MAX_SOFTIRQ_RESTART;
++			goto restart;
++		}
++		if (printk_ratelimit())
++			printk("BUG: softirq loop! %08x\n", pending);
++#endif
++	}
+ 
+ 	if (pending)
+ 		trigger_softirqs();
+@@ -320,7 +388,7 @@ asmlinkage void __do_softirq(void)
+ 	__local_bh_disable((unsigned long)__builtin_return_address(0));
+ 	trace_softirq_enter();
+ 
+-	___do_softirq();
++	___do_softirq(0);
+ 
+ 	trace_softirq_exit();
+ 
+@@ -662,8 +730,9 @@ static int ksoftirqd(void * __data)
+ {
+ 	struct sched_param param = { .sched_priority = MAX_USER_RT_PRIO/2 };
+ 	struct softirqdata *data = __data;
+-	u32 mask = (1 << data->nr);
++	u32 softirq_mask = (1 << data->nr);
+ 	struct softirq_action *h;
++	int cpu = data->cpu;
+ 
+ #ifdef CONFIG_PREEMPT_SOFTIRQS
+ 	init_waitqueue_head(&data->wait);
+@@ -675,7 +744,8 @@ static int ksoftirqd(void * __data)
+ 
+ 	while (!kthread_should_stop()) {
+ 		preempt_disable();
+-		if (!(local_softirq_pending() & mask)) {
++		if (!(local_softirq_pending() & softirq_mask)) {
++sleep_more:
+ 			__preempt_enable_no_resched();
+ 			schedule();
+ 			preempt_disable();
+@@ -687,16 +757,26 @@ static int ksoftirqd(void * __data)
+ 		data->running = 1;
+ #endif
+ 
+-		while (local_softirq_pending() & mask) {
++		while (local_softirq_pending() & softirq_mask) {
+ 			/* Preempt disable stops cpu going offline.
+ 			   If already offline, we'll be on wrong CPU:
+ 			   don't process */
+-			if (cpu_is_offline(data->cpu))
++			if (cpu_is_offline(cpu))
+ 				goto wait_to_die;
+ 
+ 			local_irq_disable();
++			/*
++			 * Is the softirq already being executed by
++			 * a hardirq context?
++			 */
++			if (per_cpu(softirq_running, cpu) & softirq_mask) {
++				local_irq_enable();
++				set_current_state(TASK_INTERRUPTIBLE);
++				goto sleep_more;
++			}
++			per_cpu(softirq_running, cpu) |= softirq_mask;
+ 			__preempt_enable_no_resched();
+-			set_softirq_pending(local_softirq_pending() & ~mask);
++			set_softirq_pending(local_softirq_pending() & ~softirq_mask);
+ 			local_bh_disable();
+ 			local_irq_enable();
+ 
+@@ -706,6 +786,7 @@ static int ksoftirqd(void * __data)
+ 			rcu_bh_qsctr_inc(data->cpu);
+ 
+ 			local_irq_disable();
++			per_cpu(softirq_running, cpu) &= ~softirq_mask;
+ 			_local_bh_enable();
+ 			local_irq_enable();
+ 
+@@ -849,12 +930,13 @@ static int __cpuinit cpu_callback(struct
+ #endif
+ 	case CPU_DEAD:
+ 	case CPU_DEAD_FROZEN: {
+-		struct sched_param param = { .sched_priority = MAX_RT_PRIO-1 };
++		struct sched_param param;
+ 
+ 		for (i = 0; i < MAX_SOFTIRQ; i++) {
++			param.sched_priority = MAX_RT_PRIO-1;
+ 			p = per_cpu(ksoftirqd, hotcpu)[i].tsk;
+-			per_cpu(ksoftirqd, hotcpu)[i].tsk = NULL;
+ 			sched_setscheduler(p, SCHED_FIFO, &param);
++			per_cpu(ksoftirqd, hotcpu)[i].tsk = NULL;
+ 			kthread_stop(p);
+ 		}
+ 		takeover_tasklets(hotcpu);
