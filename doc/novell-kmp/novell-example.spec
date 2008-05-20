@@ -1,7 +1,7 @@
 # norootforbuild
 
 Name:         novell-example
-BuildRequires: kernel-source kernel-syms
+BuildRequires: kernel-source kernel-syms module-init-tools
 License:      GPL
 Group:        System/Kernel
 Summary:      Example Kernel Module Package
@@ -31,7 +31,6 @@ mv "$@" source/
 mkdir obj
 
 %build
-export EXTRA_CFLAGS='-DVERSION=\"%version\"'
 for flavor in %flavors_to_build; do
     rm -rf obj/$flavor
     cp -r source obj/$flavor
@@ -48,5 +47,3 @@ for flavor in %flavors_to_build; do
 done
 
 %changelog
-* Sat Jan 28 2006 - agruen@suse.de
-- Initial package.
