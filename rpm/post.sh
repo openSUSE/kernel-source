@@ -66,13 +66,7 @@ run_bootloader () {
     fi
 }
 
-# Both perl-Bootloader and mkinitrd need valid partitioning
-# information in /etc/fstab, so only run the scripts in that
-# case. Also check for /.buildenv because of autobuild and
-# check for /sbin/mkinitrd because of the BuildService
-# (in a normal system, the RPM dependencies take care that
-# /sbin/mkinitrd is always there).
-if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] ; then
+if [ -f /etc/fstab -a -x /sbin/mkinitrd ] ; then
     if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
 			-i /boot/initrd-@KERNELRELEASE@; then
 	echo "/sbin/mkinitrd failed" >&2
