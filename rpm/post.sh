@@ -66,7 +66,7 @@ run_bootloader () {
     fi
 }
 
-if [ -f /etc/fstab -a -x /sbin/mkinitrd ] ; then
+if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] ; then
     if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
 			-i /boot/initrd-@KERNELRELEASE@; then
 	echo "/sbin/mkinitrd failed" >&2
