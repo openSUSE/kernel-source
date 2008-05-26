@@ -1,0 +1,445 @@
+From: Steven Rostedt <srostedt@redhat.com>
+Subject: implement rwlocks management
+
+This patch adds the managment for rwlocks to have multiple readers.
+Like the rwsems, it does not do PI boosting on readers when a writer
+is blocked.
+
+Signed-off-by: Steven Rostedt <srostedt@redhat.com>
+
+Acked-by: Sven-Thorsten Dietrich <sdietrich@suse.de>
+
+---
+ include/linux/rt_lock.h  |    5 -
+ include/linux/spinlock.h |    2 
+ kernel/rt.c              |   56 ++-------------------
+ kernel/rtmutex.c         |  120 ++++++++++++++++++++++++++++++++++++-----------
+ kernel/rtmutex_common.h  |    4 +
+ 5 files changed, 107 insertions(+), 80 deletions(-)
+
+Index: linux-2.6.25.4-rt3/include/linux/rt_lock.h
+===================================================================
+--- linux-2.6.25.4-rt3.orig/include/linux/rt_lock.h	2008-05-20 14:55:13.000000000 -0400
++++ linux-2.6.25.4-rt3/include/linux/rt_lock.h	2008-05-20 14:55:13.000000000 -0400
+@@ -87,8 +87,7 @@ struct rw_semaphore {
+  * rwlocks - an RW semaphore plus lock-break field:
+  */
+ typedef struct {
+-	struct rt_mutex		lock;
+-	int			read_depth;
++	struct rw_mutex	owners;
+ 	unsigned int		break_lock;
+ #ifdef CONFIG_DEBUG_LOCK_ALLOC
+ 	struct lockdep_map	dep_map;
+@@ -96,7 +95,7 @@ typedef struct {
+ } rwlock_t;
+ 
+ #define __RW_LOCK_UNLOCKED(name) (rwlock_t) \
+-	{ .lock = __RT_SPIN_INITIALIZER(name),	\
++	{ .owners.mutex = __RT_SPIN_INITIALIZER(name.owners.mutex),	\
+ 	  RW_DEP_MAP_INIT(name) }
+ #else /* !PREEMPT_RT */
+ 
+Index: linux-2.6.25.4-rt3/include/linux/spinlock.h
+===================================================================
+--- linux-2.6.25.4-rt3.orig/include/linux/spinlock.h	2008-05-20 14:54:13.000000000 -0400
++++ linux-2.6.25.4-rt3/include/linux/spinlock.h	2008-05-20 14:55:13.000000000 -0400
+@@ -272,7 +272,7 @@ do {							\
+ 
+ #ifdef CONFIG_PREEMPT_RT
+ # define rt_read_can_lock(rwl)	(!rt_mutex_is_locked(&(rwl)->lock))
+-# define rt_write_can_lock(rwl)	(!rt_mutex_is_locked(&(rwl)->lock))
++# define rt_write_can_lock(rwl)	((rwl)->owners.owner == NULL)
+ #else
+  extern int rt_rwlock_can_lock_never_call_on_non_rt(rwlock_t *rwlock);
+ # define rt_read_can_lock(rwl)	rt_rwlock_can_lock_never_call_on_non_rt(rwl)
+Index: linux-2.6.25.4-rt3/kernel/rt.c
+===================================================================
+--- linux-2.6.25.4-rt3.orig/kernel/rt.c	2008-05-20 14:55:13.000000000 -0400
++++ linux-2.6.25.4-rt3/kernel/rt.c	2008-05-20 14:55:13.000000000 -0400
+@@ -189,7 +189,7 @@ EXPORT_SYMBOL(_mutex_unlock);
+  */
+ int __lockfunc rt_write_trylock(rwlock_t *rwlock)
+ {
+-	int ret = rt_mutex_trylock(&rwlock->lock);
++	int ret = rt_mutex_down_write_trylock(&rwlock->owners);
+ 
+ 	if (ret)
+ 		rwlock_acquire(&rwlock->dep_map, 0, 1, _RET_IP_);
+@@ -207,23 +207,9 @@ EXPORT_SYMBOL(rt_write_trylock_irqsave);
+ 
+ int __lockfunc rt_read_trylock(rwlock_t *rwlock)
+ {
+-	struct rt_mutex *lock = &rwlock->lock;
+-	unsigned long flags;
+ 	int ret;
+ 
+-	/*
+-	 * Read locks within the self-held write lock succeed.
+-	 */
+-	spin_lock_irqsave(&lock->wait_lock, flags);
+-	if (rt_mutex_real_owner(lock) == current) {
+-		spin_unlock_irqrestore(&lock->wait_lock, flags);
+-		rwlock->read_depth++;
+-		rwlock_acquire_read(&rwlock->dep_map, 0, 1, _RET_IP_);
+-		return 1;
+-	}
+-	spin_unlock_irqrestore(&lock->wait_lock, flags);
+-
+-	ret = rt_mutex_trylock(lock);
++	ret = rt_mutex_down_read_trylock(&rwlock->owners);
+ 	if (ret)
+ 		rwlock_acquire_read(&rwlock->dep_map, 0, 1, _RET_IP_);
+ 
+@@ -234,27 +220,14 @@ EXPORT_SYMBOL(rt_read_trylock);
+ void __lockfunc rt_write_lock(rwlock_t *rwlock)
+ {
+ 	rwlock_acquire(&rwlock->dep_map, 0, 0, _RET_IP_);
+-	LOCK_CONTENDED_RT(rwlock, rt_mutex_trylock, __rt_spin_lock);
++	LOCK_CONTENDED_RT_RW(rwlock, rt_mutex_down_write_trylock, rt_rwlock_write_lock);
+ }
+ EXPORT_SYMBOL(rt_write_lock);
+ 
+ void __lockfunc rt_read_lock(rwlock_t *rwlock)
+ {
+-	unsigned long flags;
+-	struct rt_mutex *lock = &rwlock->lock;
+-
+ 	rwlock_acquire_read(&rwlock->dep_map, 0, 0, _RET_IP_);
+-	/*
+-	 * Read locks within the write lock succeed.
+-	 */
+-	spin_lock_irqsave(&lock->wait_lock, flags);
+-	if (rt_mutex_real_owner(lock) == current) {
+-		spin_unlock_irqrestore(&lock->wait_lock, flags);
+-		rwlock->read_depth++;
+-		return;
+-	}
+-	spin_unlock_irqrestore(&lock->wait_lock, flags);
+-	LOCK_CONTENDED_RT(rwlock, rt_mutex_trylock, __rt_spin_lock);
++	LOCK_CONTENDED_RT_RW(rwlock, rt_mutex_down_read_trylock, rt_rwlock_read_lock);
+ }
+ 
+ EXPORT_SYMBOL(rt_read_lock);
+@@ -263,28 +236,14 @@ void __lockfunc rt_write_unlock(rwlock_t
+ {
+ 	/* NOTE: we always pass in '1' for nested, for simplicity */
+ 	rwlock_release(&rwlock->dep_map, 1, _RET_IP_);
+-	__rt_spin_unlock(&rwlock->lock);
++	rt_rwlock_write_unlock(&rwlock->owners);
+ }
+ EXPORT_SYMBOL(rt_write_unlock);
+ 
+ void __lockfunc rt_read_unlock(rwlock_t *rwlock)
+ {
+-	struct rt_mutex *lock = &rwlock->lock;
+-	unsigned long flags;
+-
+ 	rwlock_release(&rwlock->dep_map, 1, _RET_IP_);
+-	// TRACE_WARN_ON(lock->save_state != 1);
+-	/*
+-	 * Read locks within the self-held write lock succeed.
+-	 */
+-	spin_lock_irqsave(&lock->wait_lock, flags);
+-	if (rt_mutex_real_owner(lock) == current && rwlock->read_depth) {
+-		spin_unlock_irqrestore(&lock->wait_lock, flags);
+-		rwlock->read_depth--;
+-		return;
+-	}
+-	spin_unlock_irqrestore(&lock->wait_lock, flags);
+-	__rt_spin_unlock(&rwlock->lock);
++	rt_rwlock_read_unlock(&rwlock->owners);
+ }
+ EXPORT_SYMBOL(rt_read_unlock);
+ 
+@@ -313,8 +272,7 @@ void __rt_rwlock_init(rwlock_t *rwlock, 
+ 	debug_check_no_locks_freed((void *)rwlock, sizeof(*rwlock));
+ 	lockdep_init_map(&rwlock->dep_map, name, key, 0);
+ #endif
+-	__rt_mutex_init(&rwlock->lock, name);
+-	rwlock->read_depth = 0;
++	rt_mutex_rwsem_init(&rwlock->owners, name);
+ }
+ EXPORT_SYMBOL(__rt_rwlock_init);
+ 
+Index: linux-2.6.25.4-rt3/kernel/rtmutex.c
+===================================================================
+--- linux-2.6.25.4-rt3.orig/kernel/rtmutex.c	2008-05-20 14:55:13.000000000 -0400
++++ linux-2.6.25.4-rt3/kernel/rtmutex.c	2008-05-20 14:55:13.000000000 -0400
+@@ -1149,7 +1149,7 @@ rt_read_slowlock(struct rw_mutex *rwm, i
+ 	struct rt_mutex_waiter waiter;
+ 	struct rt_mutex *mutex = &rwm->mutex;
+ 	int saved_lock_depth = -1;
+-	unsigned long flags;
++	unsigned long saved_state = -1, state, flags;
+ 
+ 	spin_lock_irqsave(&mutex->wait_lock, flags);
+ 	init_lists(mutex);
+@@ -1168,13 +1168,19 @@ rt_read_slowlock(struct rw_mutex *rwm, i
+ 
+ 	init_lists(mutex);
+ 
+-	/*
+-	 * We drop the BKL here before we go into the wait loop to avoid a
+-	 * possible deadlock in the scheduler.
+-	 */
+-	if (unlikely(current->lock_depth >= 0))
+-		saved_lock_depth = rt_release_bkl(mutex, flags);
+-	set_current_state(TASK_UNINTERRUPTIBLE);
++	if (mtx) {
++		/*
++		 * We drop the BKL here before we go into the wait loop to avoid a
++		 * possible deadlock in the scheduler.
++		 */
++		if (unlikely(current->lock_depth >= 0))
++			saved_lock_depth = rt_release_bkl(mutex, flags);
++		set_current_state(TASK_UNINTERRUPTIBLE);
++	} else {
++		/* Spin lock must preserve BKL */
++		saved_state = xchg(&current->state, TASK_UNINTERRUPTIBLE);
++		saved_lock_depth = current->lock_depth;
++	}
+ 
+ 	for (;;) {
+ 		unsigned long saved_flags;
+@@ -1197,21 +1203,36 @@ rt_read_slowlock(struct rw_mutex *rwm, i
+ 		}
+ 		saved_flags = current->flags & PF_NOSCHED;
+ 		current->flags &= ~PF_NOSCHED;
++		if (!mtx)
++			current->lock_depth = -1;
+ 
+ 		spin_unlock_irqrestore(&mutex->wait_lock, flags);
+ 
+ 		debug_rt_mutex_print_deadlock(&waiter);
+ 
+-		if (waiter.task)
++		if (!mtx || waiter.task)
+ 			schedule_rt_mutex(mutex);
+ 
+ 		spin_lock_irqsave(&mutex->wait_lock, flags);
+ 
+ 		current->flags |= saved_flags;
+-		set_current_state(TASK_UNINTERRUPTIBLE);
++		if (mtx)
++			set_current_state(TASK_UNINTERRUPTIBLE);
++		else {
++			current->lock_depth = saved_lock_depth;
++			state = xchg(&current->state, TASK_UNINTERRUPTIBLE);
++			if (unlikely(state == TASK_RUNNING))
++				saved_state = TASK_RUNNING;
++		}
+ 	}
+ 
+-	set_current_state(TASK_RUNNING);
++	if (mtx)
++		set_current_state(TASK_RUNNING);
++	else {
++		state = xchg(&current->state, saved_state);
++		if (unlikely(state == TASK_RUNNING))
++			current->state = TASK_RUNNING;
++	}
+ 
+ 	if (unlikely(waiter.task))
+ 		remove_waiter(mutex, &waiter, flags);
+@@ -1224,7 +1245,7 @@ rt_read_slowlock(struct rw_mutex *rwm, i
+ 	spin_unlock_irqrestore(&mutex->wait_lock, flags);
+ 
+ 	/* Must we reaquire the BKL? */
+-	if (unlikely(saved_lock_depth >= 0))
++	if (mtx && unlikely(saved_lock_depth >= 0))
+ 		rt_reacquire_bkl(saved_lock_depth);
+ 
+ 	debug_rt_mutex_free_waiter(&waiter);
+@@ -1256,6 +1277,10 @@ void rt_mutex_down_read(struct rw_mutex 
+ 	rt_read_fastlock(rwm, rt_read_slowlock, 1);
+ }
+ 
++void rt_rwlock_read_lock(struct rw_mutex *rwm)
++{
++	rt_read_fastlock(rwm, rt_read_slowlock, 0);
++}
+ 
+ static inline int
+ rt_read_slowtrylock(struct rw_mutex *rwm, int mtx)
+@@ -1308,7 +1333,7 @@ rt_write_slowlock(struct rw_mutex *rwm, 
+ 	struct rt_mutex *mutex = &rwm->mutex;
+ 	struct rt_mutex_waiter waiter;
+ 	int saved_lock_depth = -1;
+-	unsigned long flags;
++	unsigned long flags, saved_state = -1, state;
+ 
+ 	debug_rt_mutex_init_waiter(&waiter);
+ 	waiter.task = NULL;
+@@ -1325,13 +1350,19 @@ rt_write_slowlock(struct rw_mutex *rwm, 
+ 	}
+ 	update_rw_mutex_owner(rwm);
+ 
+-	/*
+-	 * We drop the BKL here before we go into the wait loop to avoid a
+-	 * possible deadlock in the scheduler.
+-	 */
+-	if (unlikely(current->lock_depth >= 0))
+-		saved_lock_depth = rt_release_bkl(mutex, flags);
+-	set_current_state(TASK_UNINTERRUPTIBLE);
++	if (mtx) {
++		/*
++		 * We drop the BKL here before we go into the wait loop to avoid a
++		 * possible deadlock in the scheduler.
++		 */
++		if (unlikely(current->lock_depth >= 0))
++			saved_lock_depth = rt_release_bkl(mutex, flags);
++		set_current_state(TASK_UNINTERRUPTIBLE);
++	} else {
++		/* Spin locks must preserve the BKL */
++		saved_lock_depth = current->lock_depth;
++		saved_state = xchg(&current->state, TASK_UNINTERRUPTIBLE);
++	}
+ 
+ 	for (;;) {
+ 		unsigned long saved_flags;
+@@ -1354,21 +1385,36 @@ rt_write_slowlock(struct rw_mutex *rwm, 
+ 		}
+ 		saved_flags = current->flags & PF_NOSCHED;
+ 		current->flags &= ~PF_NOSCHED;
++		if (!mtx)
++			current->lock_depth = -1;
+ 
+ 		spin_unlock_irqrestore(&mutex->wait_lock, flags);
+ 
+ 		debug_rt_mutex_print_deadlock(&waiter);
+ 
+-		if (waiter.task)
++		if (!mtx || waiter.task)
+ 			schedule_rt_mutex(mutex);
+ 
+ 		spin_lock_irqsave(&mutex->wait_lock, flags);
+ 
+ 		current->flags |= saved_flags;
+-		set_current_state(TASK_UNINTERRUPTIBLE);
++		if (mtx)
++			set_current_state(TASK_UNINTERRUPTIBLE);
++		else {
++			current->lock_depth = saved_lock_depth;
++			state = xchg(&current->state, TASK_UNINTERRUPTIBLE);
++			if (unlikely(state == TASK_RUNNING))
++				saved_state = TASK_RUNNING;
++		}
+ 	}
+ 
+-	set_current_state(TASK_RUNNING);
++	if (mtx)
++		set_current_state(TASK_RUNNING);
++	else {
++		state = xchg(&current->state, saved_state);
++		if (unlikely(state == TASK_RUNNING))
++			current->state = TASK_RUNNING;
++	}
+ 
+ 	if (unlikely(waiter.task))
+ 		remove_waiter(mutex, &waiter, flags);
+@@ -1380,7 +1426,7 @@ rt_write_slowlock(struct rw_mutex *rwm, 
+ 	spin_unlock_irqrestore(&mutex->wait_lock, flags);
+ 
+ 	/* Must we reaquire the BKL? */
+-	if (unlikely(saved_lock_depth >= 0))
++	if (mtx && unlikely(saved_lock_depth >= 0))
+ 		rt_reacquire_bkl(saved_lock_depth);
+ 
+ 	WARN_ON(atomic_read(&rwm->count));
+@@ -1407,6 +1453,11 @@ void rt_mutex_down_write(struct rw_mutex
+ 	rt_write_fastlock(rwm, rt_write_slowlock, 1);
+ }
+ 
++void rt_rwlock_write_lock(struct rw_mutex *rwm)
++{
++	rt_write_fastlock(rwm, rt_write_slowlock, 0);
++}
++
+ static int
+ rt_write_slowtrylock(struct rw_mutex *rwm, int mtx)
+ {
+@@ -1449,6 +1500,7 @@ rt_read_slowunlock(struct rw_mutex *rwm,
+ {
+ 	struct rt_mutex *mutex = &rwm->mutex;
+ 	unsigned long flags;
++	int savestate = !mtx;
+ 	struct rt_mutex_waiter *waiter;
+ 
+ 	spin_lock_irqsave(&mutex->wait_lock, flags);
+@@ -1508,7 +1560,7 @@ rt_read_slowunlock(struct rw_mutex *rwm,
+ 	 * will steal the lock from the reader. This is the
+ 	 * only time we can have a reader pending on a lock.
+ 	 */
+-	wakeup_next_waiter(mutex, 0);
++	wakeup_next_waiter(mutex, savestate);
+ 
+  out:
+ 	spin_unlock_irqrestore(&mutex->wait_lock, flags);
+@@ -1535,12 +1587,18 @@ void rt_mutex_up_read(struct rw_mutex *r
+ 	rt_read_fastunlock(rwm, rt_read_slowunlock, 1);
+ }
+ 
++void rt_rwlock_read_unlock(struct rw_mutex *rwm)
++{
++	rt_read_fastunlock(rwm, rt_read_slowunlock, 0);
++}
++
+ static void noinline __sched
+ rt_write_slowunlock(struct rw_mutex *rwm, int mtx)
+ {
+ 	struct rt_mutex *mutex = &rwm->mutex;
+ 	struct rt_mutex_waiter *waiter;
+ 	struct task_struct *pendowner;
++	int savestate = !mtx;
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&mutex->wait_lock, flags);
+@@ -1571,7 +1629,7 @@ rt_write_slowunlock(struct rw_mutex *rwm
+ 
+ 	waiter = rt_mutex_top_waiter(mutex);
+ 	pendowner = waiter->task;
+-	wakeup_next_waiter(mutex, 0);
++	wakeup_next_waiter(mutex, savestate);
+ 
+ 	/* another writer is next? */
+ 	if (waiter->write_lock) {
+@@ -1607,7 +1665,10 @@ rt_write_slowunlock(struct rw_mutex *rwm
+ 		waiter->task = NULL;
+ 		reader->pi_blocked_on = NULL;
+ 
+-		wake_up_process(reader);
++		if (savestate)
++			wake_up_process_mutex(reader);
++		else
++			wake_up_process(reader);
+ 
+ 		if (rt_mutex_has_waiters(mutex))
+ 			waiter = rt_mutex_top_waiter(mutex);
+@@ -1653,6 +1714,11 @@ void rt_mutex_up_write(struct rw_mutex *
+ 	rt_write_fastunlock(rwm, rt_write_slowunlock, 1);
+ }
+ 
++void rt_rwlock_write_unlock(struct rw_mutex *rwm)
++{
++	rt_write_fastunlock(rwm, rt_write_slowunlock, 0);
++}
++
+ void rt_mutex_rwsem_init(struct rw_mutex *rwm, const char *name)
+ {
+ 	struct rt_mutex *mutex = &rwm->mutex;
+Index: linux-2.6.25.4-rt3/kernel/rtmutex_common.h
+===================================================================
+--- linux-2.6.25.4-rt3.orig/kernel/rtmutex_common.h	2008-05-20 14:55:13.000000000 -0400
++++ linux-2.6.25.4-rt3/kernel/rtmutex_common.h	2008-05-20 14:55:13.000000000 -0400
+@@ -166,6 +166,10 @@ extern void rt_mutex_down_write(struct r
+ extern int rt_mutex_down_read_trylock(struct rw_mutex *rwm);
+ extern void rt_mutex_down_read(struct rw_mutex *rwm);
+ extern void rt_mutex_rwsem_init(struct rw_mutex *rwm, const char *name);
++extern void rt_rwlock_write_lock(struct rw_mutex *rwm);
++extern void rt_rwlock_read_lock(struct rw_mutex *rwm);
++extern void rt_rwlock_write_unlock(struct rw_mutex *rwm);
++extern void rt_rwlock_read_unlock(struct rw_mutex *rwm);
+ 
+ #endif /* CONFIG_PREEMPT_RT */
+ 
