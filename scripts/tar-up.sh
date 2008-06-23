@@ -344,7 +344,7 @@ install -m 755					\
 	rpm/check-supported-list		\
 	rpm/check-build.sh			\
 	rpm/install-configs			\
-	rpm/find-types				\
+	rpm/modversions				\
 	rpm/built-in-where			\
 	rpm/make-symsets			\
 	scripts/guards				\
