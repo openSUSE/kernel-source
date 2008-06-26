@@ -17,6 +17,7 @@ specfiles=$important_specfiles
 user="`id -nu`"
 mbuild_options=
 with_debug=
+ignore_kabi=
 until [ "$#" = "0" ] ; do
     case "$1" in
     -rs)
@@ -58,7 +59,7 @@ until [ "$#" = "0" ] ; do
       shift
       ;;
     -i|--ignore-kabi)
-        ignore_kabi=1
+        ignore_kabi=-i
         shift
         ;;
     -h|--help|-v|--version)
@@ -112,11 +113,8 @@ fi
 if [ ! -z "$single_specfiles" ] ; then
 specfiles=`echo $single_specfiles | sort | xargs echo`
 fi
-scripts/tar-up.sh $rpm_release_string $timestamp $tolerate_unknown_new_config_options || exit 1
+scripts/tar-up.sh $ignore_kabi $rpm_release_string $timestamp $tolerate_unknown_new_config_options || exit 1
 cd kernel-source
-if [ -n "$ignore_kabi" ]; then
-    touch IGNORE-KABI-BADNESS
-fi
 for i in $specfiles
 do
 echo	sudo /work/src/bin/mbuild $mbuild_options $mbuild_no_checks --obey-doesnotbuild kernel-$i.spec

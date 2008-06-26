@@ -4,6 +4,7 @@ rpm_release_timestamp=
 rpm_release_string=
 source_timestamp=
 tolerate_unknown_new_config_options=0
+ignore_kabi=
 until [ "$#" = "0" ] ; do
   case "$1" in
     --dir=*)
@@ -20,6 +21,10 @@ until [ "$#" = "0" ] ; do
       ;;
     -nf|--tolerate-unknown-new-config-options)
       tolerate_unknown_new_config_options=1
+      shift
+      ;;
+    -i|--ignore-kabi)
+      ignore_kabi=1
       shift
       ;;
     -rs|--release-string)
@@ -49,6 +54,7 @@ these options are recognized:
     -rs <string>       to append specified string to rpm release number
     -ts                to use the current date as rpm release number
     -nf                to proceed if a new unknown .config option is found during make oldconfig
+    -i                 ignore kabi failures
     --source-timestamp to autogenerate a release number based on branch and timestamp (overrides -rs/-ts)
 
 EOF
@@ -443,3 +449,6 @@ done
 echo $((1024*1024)) > $build_dir/minmem
 # Force mbuild to choose build hosts with enough disk space available:
 echo $((6*1024)) > $build_dir/needed_space_in_mb
+if [ -n "$ignore_kabi" ]; then
+    touch $build_dir/IGNORE-KABI-BADNESS
+fi
