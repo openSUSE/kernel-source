@@ -348,7 +348,7 @@ while [ $# -gt 0 ]; do
     *.bz2)	exec < <(bzip2 -cd $PATCH) ;;
     *)		exec < $PATCH ;;
     esac
-    patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E \
+    patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E -F0 \
 	    --no-backup-if-mismatch > $LAST_LOG 2>&1
     STATUS=$?
     exec 0<&5  # restore stdin
