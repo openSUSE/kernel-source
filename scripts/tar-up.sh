@@ -131,8 +131,7 @@ if ! check_for_merge_conflicts $referenced_files \
    ! scripts/check-cvs-add; then
     echo "Inconsistencies found."
     echo "Please clean up series.conf and/or the patches directories!"
-    echo "Press <ENTER> to continue"
-    read
+    echo
 fi
 
 echo "Computing timestamp..."
