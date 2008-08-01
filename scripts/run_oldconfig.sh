@@ -30,9 +30,9 @@ function _region_msg_ () {
 	echo -e "##\x1b[K"	# message
 	echo -ne '\x1b8'	# restore cursor
     else
-	echo -ne "##"
-	echo -ne "## $msg"
-	echo -ne "##"
+	echo -e "##"
+	echo -e "## $msg"
+	echo -e "##"
     fi
 }
 
