@@ -1,0 +1,272 @@
+From 8a1e52ec85a186a4d277e98cbae9d4926e734f20 Mon Sep 17 00:00:00 2001
+From: Hannes Reinecke <hare@suse.de>
+Date: Fri, 8 Aug 2008 08:24:51 +0200
+Subject: rq-based multipathing: block layer changes
+References: FATE#302108
+
+Add the necessary infrastructure for request-based multipathing
+to the block layer.
+
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ block/blk-core.c        |  124 +++++++++++++++++++++++++++++++++++++++++++---
+ block/blk-sysfs.c       |    1 +
+ drivers/scsi/scsi_lib.c |   11 ++++-
+ include/linux/blkdev.h  |    7 +++
+ 4 files changed, 133 insertions(+), 10 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index fef79cc..8044655 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1496,6 +1496,71 @@ void submit_bio(int rw, struct bio *bio)
+ }
+ EXPORT_SYMBOL(submit_bio);
+ 
++/*
++ * Check a request for queue limits
++ */
++static int check_queue_limit(struct request_queue *q, struct request *rq)
++{
++	if (rq->nr_sectors > q->max_sectors ||
++	    rq->data_len >> 9 > q->max_hw_sectors) {
++		printk(KERN_ERR "%s: over max size limit.\n", __func__);
++		return 1;
++	}
++
++	/*
++	 * queue's settings related to segment counting like q->bounce_pfn
++	 * may differ from that of other stacking queues.
++	 * Recalculate it to check the request correctly on this queue's
++	 * limitation.
++	 */
++	blk_recalc_rq_segments(rq);
++	if (rq->nr_phys_segments > q->max_phys_segments ||
++	    rq->nr_hw_segments > q->max_hw_segments) {
++		printk(KERN_ERR "%s: over max segments limit.\n", __func__);
++		return 1;
++	}
++
++	return 0;
++}
++
++/**
++ * blk_submit_request - Helper for stacking drivers to submit the request
++ * @q:  the queue to submit the request
++ * @rq: the request being queued
++ **/
++void blk_submit_request(struct request_queue *q, struct request *rq)
++{
++	unsigned long flags;
++
++	if (check_queue_limit(q, rq))
++		goto end_io;
++
++#ifdef CONFIG_FAIL_MAKE_REQUEST
++	if (rq->rq_disk && rq->rq_disk->flags & GENHD_FL_FAIL &&
++	    should_fail(&fail_make_request, blk_rq_bytes(rq)))
++		goto end_io;
++#endif
++
++	spin_lock_irqsave(q->queue_lock, flags);
++
++	/*
++	 * Submitting request must be dequeued before calling this function
++	 * because it will be linked to another request_queue
++	 */
++	BUG_ON(blk_queued_rq(rq));
++
++	drive_stat_acct(rq, 1);
++	__elv_add_request(q, rq, ELEVATOR_INSERT_BACK, 0);
++
++	spin_unlock_irqrestore(q->queue_lock, flags);
++
++	return;
++
++end_io:
++	blk_end_request(rq, -EIO, blk_rq_bytes(rq));
++}
++EXPORT_SYMBOL_GPL(blk_submit_request);
++
+ /**
+  * __end_that_request_first - end I/O on a request
+  * @req:      the request being processed
+@@ -1842,6 +1907,22 @@ void end_request(struct request *req, int uptodate)
+ }
+ EXPORT_SYMBOL(end_request);
+ 
++static int end_that_request_data(struct request *rq, int error,
++				 unsigned int nr_bytes, unsigned int bidi_bytes)
++{
++	if (blk_fs_request(rq) || blk_pc_request(rq)) {
++		if (__end_that_request_first(rq, error, nr_bytes))
++			return 1;
++
++		/* Bidi request must be completed as a whole */
++		if (blk_bidi_rq(rq) &&
++		    __end_that_request_first(rq->next_rq, error, bidi_bytes))
++			return 1;
++	}
++
++	return 0;
++}
++
+ /**
+  * blk_end_io - Generic end_io function to complete a request.
+  * @rq:           the request being processed
+@@ -1868,15 +1949,8 @@ static int blk_end_io(struct request *rq, int error, unsigned int nr_bytes,
+ 	struct request_queue *q = rq->q;
+ 	unsigned long flags = 0UL;
+ 
+-	if (blk_fs_request(rq) || blk_pc_request(rq)) {
+-		if (__end_that_request_first(rq, error, nr_bytes))
+-			return 1;
+-
+-		/* Bidi request must be completed as a whole */
+-		if (blk_bidi_rq(rq) &&
+-		    __end_that_request_first(rq->next_rq, error, bidi_bytes))
+-			return 1;
+-	}
++	if (end_that_request_data(rq, error, nr_bytes, bidi_bytes))
++		return 1;
+ 
+ 	/* Special feature for tricky drivers */
+ 	if (drv_callback && drv_callback(rq))
+@@ -1961,6 +2035,38 @@ int blk_end_bidi_request(struct request *rq, int error, unsigned int nr_bytes,
+ EXPORT_SYMBOL_GPL(blk_end_bidi_request);
+ 
+ /**
++ * blk_update_request - Special helper function for request stacking drivers
++ * @rq:           the request being processed
++ * @error:        0 for success, < 0 for error
++ * @nr_bytes:     number of bytes to complete @rq
++ *
++ * Description:
++ *     Ends I/O on a number of bytes attached to @rq, but doesn't complete
++ *     the request structure even if @rq doesn't have leftover.
++ *     If @rq has leftover, sets it up for the next range of segments.
++ *
++ *     This special helper function is only for request stacking drivers
++ *     (e.g. request-based dm) so that they can handle partial completion.
++ *     Actual device drivers should use blk_end_request instead.
++ **/
++void blk_update_request(struct request *rq, int error, unsigned int nr_bytes)
++{
++	if (!end_that_request_data(rq, error, nr_bytes, 0)) {
++		/*
++		 * All bios in the request have been completed.
++		 * Then, members of the request are not updated.
++		 * Update those members to avoid double charge of diskstat
++		 * when the stacking driver calls blk_end_request()
++		 * to complete the request actually.
++		 */
++		rq->nr_sectors = rq->hard_nr_sectors = 0;
++		rq->current_nr_sectors = rq->hard_cur_sectors = 0;
++		rq->nr_phys_segments = rq->nr_hw_segments = 0;
++	}
++}
++EXPORT_SYMBOL_GPL(blk_update_request);
++
++/**
+  * blk_end_request_callback - Special helper function for tricky drivers
+  * @rq:           the request being processed
+  * @error:        0 for success, < 0 for error
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index 304ec73..a00ef7d 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -326,6 +326,7 @@ int blk_register_queue(struct gendisk *disk)
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(blk_register_queue);
+ 
+ void blk_unregister_queue(struct gendisk *disk)
+ {
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index ff5d56b..d992a8d 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -1495,9 +1495,14 @@ static void scsi_request_fn(struct request_queue *q)
+ 		 * accept it.
+ 		 */
+ 		req = elv_next_request(q);
+-		if (!req || !scsi_dev_queue_ready(q, sdev))
++		if (!req)
+ 			break;
+ 
++		if (!scsi_dev_queue_ready(q, sdev)) {
++			blk_set_lld_busy(q);
++			break;
++		}
++
+ 		if (unlikely(!scsi_device_online(sdev))) {
+ 			sdev_printk(KERN_ERR, sdev,
+ 				    "rejecting I/O to offline device\n");
+@@ -1568,6 +1573,8 @@ static void scsi_request_fn(struct request_queue *q)
+ 		rtn = scsi_dispatch_cmd(cmd);
+ 		spin_lock_irq(q->queue_lock);
+ 		if(rtn) {
++			blk_set_lld_busy(q);
++
+ 			/* we're refusing the command; because of
+ 			 * the way locks get dropped, we need to 
+ 			 * check here if plugging is required */
+@@ -1576,6 +1583,7 @@ static void scsi_request_fn(struct request_queue *q)
+ 
+ 			break;
+ 		}
++		blk_clear_lld_busy(q);
+ 	}
+ 
+ 	goto out;
+@@ -1592,6 +1600,7 @@ static void scsi_request_fn(struct request_queue *q)
+ 	 * later time.
+ 	 */
+ 	spin_lock_irq(q->queue_lock);
++	blk_set_lld_busy(q);
+ 	blk_requeue_request(q, req);
+ 	sdev->device_busy--;
+ 	if(sdev->device_busy == 0)
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 88d6808..3fbbea8 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -411,6 +411,7 @@ struct request_queue
+ #define QUEUE_FLAG_ELVSWITCH	8	/* don't use elevator, just do FIFO */
+ #define QUEUE_FLAG_BIDI		9	/* queue supports bidi requests */
+ #define QUEUE_FLAG_NOMERGES    10	/* disable merge attempts */
++#define QUEUE_FLAG_BUSY	       11	/* device/host under queue is busy */
+ 
+ static inline int queue_is_locked(struct request_queue *q)
+ {
+@@ -517,6 +518,9 @@ enum {
+ #define blk_queue_stopped(q)	test_bit(QUEUE_FLAG_STOPPED, &(q)->queue_flags)
+ #define blk_queue_nomerges(q)	test_bit(QUEUE_FLAG_NOMERGES, &(q)->queue_flags)
+ #define blk_queue_flushing(q)	((q)->ordseq)
++#define blk_lld_busy(q)		test_bit(QUEUE_FLAG_BUSY, &(q)->queue_flags)
++#define blk_set_lld_busy(q)	set_bit(QUEUE_FLAG_BUSY, &(q)->queue_flags)
++#define blk_clear_lld_busy(q)	clear_bit(QUEUE_FLAG_BUSY, &(q)->queue_flags)
+ 
+ #define blk_fs_request(rq)	((rq)->cmd_type == REQ_TYPE_FS)
+ #define blk_pc_request(rq)	((rq)->cmd_type == REQ_TYPE_BLOCK_PC)
+@@ -654,6 +658,7 @@ extern void __blk_put_request(struct request_queue *, struct request *);
+ extern struct request *blk_get_request(struct request_queue *, int, gfp_t);
+ extern void blk_insert_request(struct request_queue *, struct request *, int, void *);
+ extern void blk_requeue_request(struct request_queue *, struct request *);
++extern void blk_submit_request(struct request_queue *q, struct request *rq);
+ extern void blk_plug_device(struct request_queue *);
+ extern int blk_remove_plug(struct request_queue *);
+ extern void blk_recount_segments(struct request_queue *, struct bio *);
+@@ -745,6 +750,8 @@ extern int blk_end_request_callback(struct request *rq, int error,
+ 				unsigned int nr_bytes,
+ 				int (drv_callback)(struct request *));
+ extern void blk_complete_request(struct request *);
++extern void blk_update_request(struct request *rq, int error,
++			       unsigned int nr_bytes);
+ 
+ /*
+  * blk_end_request() takes bytes instead of sectors as a complete size.
+-- 
+1.5.2.4
+
