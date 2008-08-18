@@ -182,7 +182,7 @@ fi
 
 if [ "$menuconfig" = "no" ] ; then
 	case "$TERM" in
-	linux | xterm | screen)
+	linux* | xterm* | screen*)
 	    use_region=1
 	    _region_init_
 	    ;;
