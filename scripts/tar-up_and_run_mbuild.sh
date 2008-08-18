@@ -117,6 +117,8 @@ scripts/tar-up.sh $ignore_kabi $rpm_release_string $timestamp $tolerate_unknown_
 cd kernel-source
 for i in $specfiles
 do
+	/work/src/bin/tools/prepare_spec kernel-$i.spec > kernel-$i.spec.new
+	mv kernel-$i.spec.new kernel-$i.spec
 echo	sudo /work/src/bin/mbuild $mbuild_options $mbuild_no_checks --obey-doesnotbuild kernel-$i.spec
  	sudo /work/src/bin/mbuild $mbuild_options $mbuild_no_checks --obey-doesnotbuild kernel-$i.spec
 done
