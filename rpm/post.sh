@@ -54,6 +54,11 @@ message_install_bl () {
 }
 
 run_bootloader () {
+    # Only create the bootloader entry when installing kernel-$flavor-base.
+    if [ @SUBPACKAGE@ != kernel-@FLAVOR@-base ]; then
+	return 1
+    fi
+
     if [ -f /etc/sysconfig/bootloader ] &&
 	    [ -f /boot/grub/menu.lst -o \
 	      -f /etc/lilo.conf      -o \
