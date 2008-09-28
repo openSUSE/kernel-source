@@ -420,11 +420,6 @@ scripts/newest-timestamp kabi
 tar cf - --exclude CVS kabi \
 | bzip2 -9 > $build_dir/kabi.tar.bz2
 
-echo "novell-kmp.tar.bz2"
-(   tar -C doc -cf - --exclude=CVS --exclude='.*.cmd' \
-		     --exclude='*.ko' --exclude='*.o' novell-kmp
-) | bzip2 > $build_dir/novell-kmp.tar.bz2
-
 # Create empty dummys for any *.tar.bz2 archive mentioned in the spec file
 # not already created: patches.addon is empty by intention; others currently
 # may contain no patches.
