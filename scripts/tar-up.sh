@@ -336,6 +336,7 @@ install -m 644					\
 	rpm/module-renames			\
 	rpm/kernel-module-subpackage		\
 	rpm/macros.kernel-source		\
+	rpm/kernel-source.rpmlintrc		\
 	doc/README.SUSE				\
 	$build_dir
 install_changes $build_dir/kernel-source.changes
