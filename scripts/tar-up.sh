@@ -349,7 +349,6 @@ install -m 755					\
 	rpm/check-for-config-changes		\
 	rpm/check-supported-list		\
 	rpm/check-build.sh			\
-	rpm/install-configs			\
 	rpm/modversions				\
 	rpm/built-in-where			\
 	rpm/make-symsets			\
