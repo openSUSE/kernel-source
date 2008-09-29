@@ -1,14 +1,3 @@
-# Readlink is not present on some older distributions: emulate it.
-readlink() {
-    local path=$1 ll
-
-    if [ -L "$path" ]; then
-	ll="$(LC_ALL=C ls -l "$path" 2> /dev/null)" &&
-	echo "${ll/* -> }"
-    else
-	return 1
-    fi
-}
 relink() {
     if [ -h "$2" ]; then
 	local old=$(readlink "$2")
