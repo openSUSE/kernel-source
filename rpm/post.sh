@@ -26,18 +26,19 @@ if [ -f /proc/cpuinfo ]; then
     esac
 fi
 
+suffix=
+case @FLAVOR@ in
+    kdump|ps3|um|xen*)
+	suffix=-@FLAVOR@
+	;;
+esac
+for x in /boot/@IMAGE@ /boot/initrd; do
+    rm -f $x$suffix
+    ln -s ${x##*/}-@KERNELRELEASE@ $x$suffix
+done
+
 if [ -e /lib/modules/@KERNELRELEASE@ ]; then
     echo Setting up /lib/modules/@KERNELRELEASE@
-    suffix=
-    case @FLAVOR@ in
-	kdump|ps3|um|xen*)
-	    suffix=-@FLAVOR@
-	    ;;
-    esac
-    for x in /boot/@IMAGE@ /boot/initrd; do
-	rm -f $x$suffix
-	ln -s ${x##*/}-@KERNELRELEASE@ $x$suffix
-    done
 
     if [ -x /sbin/module_upgrade ]; then
 	/sbin/module_upgrade --rename mptscsih="mptspi mptfc mptsas"
