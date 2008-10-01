@@ -420,7 +420,13 @@ for config in $CONFIGS; do
 	echo "Configuration file config/$config not found"
     fi
     name=$(basename $config)
-    path=arch/$(dirname $config)/defconfig.$name
+    arch=$(dirname $config)
+    if [ "$arch" = "i386" -o "$arch" = "x86_64" ]; then
+	path=arch/x86/defconfig.$(dirname $config).$name
+    else
+	path=arch/$(dirname $config)/defconfig.$name
+    fi
+
     mkdir -p $(dirname $PATCH_DIR/$path)
 
     chmod +x rpm/config-subst

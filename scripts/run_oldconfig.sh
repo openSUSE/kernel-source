@@ -248,6 +248,10 @@ for config in $config_files; do
     esac
     if ! diff -U0 $config .config; then
 	sed '/^# Linux kernel version:/d' < .config > $config
-	cp -v .config arch/$arch/defconfig.$flavor
+	if [ "$arch" = "i386" -o "$arch" = "x86_64" ]; then
+		cp -v .config arch/x86/defconfig.$arch.$flavor
+	else
+		cp -v .config arch/$arch/defconfig.$flavor
+	fi
     fi
 done
