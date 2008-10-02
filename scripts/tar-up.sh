@@ -245,18 +245,6 @@ binary_spec_files=$(
 )
 binary_spec_files=${binary_spec_files//$'\n'/\\n}
 
-# The pre-configured kernel source package
-echo "kernel-source.spec"
-sed -e "s,@NAME@,kernel-source,g" \
-    -e "s,@SRCVERSION@,$SRCVERSION,g" \
-    -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
-    -e "s,@RPMVERSION@,$RPMVERSION,g" \
-    -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
-    -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
-    -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
-  < rpm/kernel-source.spec.in \
-> $build_dir/kernel-source.spec
-
 echo "kernel-dummy.spec"
 sed -e "s,@NAME@,kernel-dummy,g" \
     -e "s,@SRCVERSION@,$SRCVERSION,g" \
@@ -272,17 +260,29 @@ trap "rm -rf $TMPDIR" EXIT
 EXTRA_SYMBOLS=$([ -e extra-symbols ] && cat extra-symbols)
 
 # Compute @BUILD_REQUIRES@ expansion
-head="" ; tail=""
-for arch in $(scripts/arch-symbols --list) ; do
-    ARCH_SYMBOLS=$(scripts/arch-symbols $arch)
+prepare_source_and_syms() {
+    local name=$1
+    local head="" tail="" nl ARCH_SYMBOLS packages flavor av arch build_req
 
-    # Exclude flavors that have a different set of patches: we assume that
-    # the user won't change series.conf so much that two flavors that differ
-    # at tar-up.sh time will become identical later.
+    archs=
+    build_requires=
 
-    scripts/guards $ARCH_SYMBOLS $EXTRA_SYMBOLS < series.conf \
-	> $TMPDIR/kernel-source.patches
-    packages=$(
+    for arch in $(scripts/arch-symbols --list); do
+	ARCH_SYMBOLS=$(scripts/arch-symbols $arch)
+
+	# Exclude flavors that have a different set of patches: we assume that
+	# the user won't change series.conf so much that two flavors that differ
+	# at tar-up.sh time will become identical later.
+
+	set -- $ARCH_SYMBOLS $EXTRA_SYMBOLS
+	case $name in
+	(*-rt)
+	    set -- RT "$@"
+	    ;;
+	esac
+	scripts/guards "$@" < series.conf > $TMPDIR/$name.patches
+
+	packages=
 	for arch_flavor in $(scripts/guards $ARCH_SYMBOLS $EXTRA_SYMBOLS \
 				< config.conf); do
 	    flavor=${arch_flavor#*/}
@@ -295,34 +295,77 @@ for arch in $(scripts/arch-symbols --list) ; do
 
 	    scripts/guards $* $ARCH_SYMBOLS $EXTRA_SYMBOLS < series.conf \
 		> $TMPDIR/kernel-$av.patches
-	    diff -q $TMPDIR/kernel-{source,$av}.patches > /dev/null || continue
-	    echo kernel-$flavor
+	    diff -q $TMPDIR/{$name,kernel-$av}.patches > /dev/null \
+		|| continue
+	    packages="$packages kernel-$flavor"
 	done
-    )
-    set -- $packages
 
-    if [ $# -gt 0 ]; then
-	[ $arch = i386 ] && arch="%ix86"
-	nl=$'\n'
-	[ -n "$head" ] && head="${head}%else$nl"
-	head="${head}%ifarch $arch$nl"
-	head="${head}BuildRequires: $*$nl"
-	tail="%endif$nl$tail"
-    fi
-done
-build_req="$head${tail%$'\n'}"
+	set -- $packages
+	if [ $# -gt 0 ]; then
+	    [ $arch = i386 ] && arch="%ix86"
+	    nl=$'\n'
+	    [ -n "$head" ] && head="${head}%else$nl"
+	    head="${head}%ifarch $arch$nl"
+	    head="${head}BuildRequires: $*$nl"
+	    tail="%endif$nl$tail"
+	    archs="$archs $arch"
+	fi
+    done
+    build_requires="$head${tail%$'\n'}"
+    build_requires="${build_requires//$'\n'/\\n}"
+    archs=${archs# }
+}
+
+# The pre-configured kernel source package
+echo "kernel-source.spec"
+prepare_source_and_syms kernel-syms # computa archs and build_requires
+sed -e "s,@NAME@,kernel-source,g" \
+    -e "s,@SRCVERSION@,$SRCVERSION,g" \
+    -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
+    -e "s,@RPMVERSION@,$RPMVERSION,g" \
+    -e "s,@ARCHS@,$archs,g" \
+    -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
+    -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
+    -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+  < rpm/kernel-source.spec.in \
+> $build_dir/kernel-source.spec
 
 echo "kernel-syms.spec"
 sed -e "s,@NAME@,kernel-syms,g" \
     -e "s,@SRCVERSION@,$SRCVERSION,g" \
     -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
-    -e "s,@BUILD_REQUIRES@,${build_req//$'\n'/\\n},g" \
+    -e "s,@ARCHS@,$archs,g" \
+    -e "s,@BUILD_REQUIRES@,$build_requires,g" \
     -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
   < rpm/kernel-syms.spec.in \
 > $build_dir/kernel-syms.spec
-
 install_changes $build_dir/kernel-syms.changes
+
+echo "kernel-source-rt.spec"
+prepare_source_and_syms kernel-syms-rt # computa archs and build_requires
+sed -e "s,@NAME@,kernel-source-rt,g" \
+    -e "s,@SRCVERSION@,$SRCVERSION,g" \
+    -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
+    -e "s,@RPMVERSION@,$RPMVERSION,g" \
+    -e "s,@ARCHS@,$archs,g" \
+    -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
+    -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
+    -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+  < rpm/kernel-source.spec.in \
+> $build_dir/kernel-source-rt.spec
+
+echo "kernel-syms-rt.spec"
+sed -e "s,@NAME@,kernel-syms-rt,g" \
+    -e "s,@SRCVERSION@,$SRCVERSION,g" \
+    -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
+    -e "s,@RPMVERSION@,$RPMVERSION,g" \
+    -e "s,@ARCHS@,$archs,g" \
+    -e "s,@BUILD_REQUIRES@,$build_requires,g" \
+    -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+  < rpm/kernel-syms.spec.in \
+> $build_dir/kernel-syms-rt.spec
+install_changes $build_dir/kernel-syms-rt.changes
 
 echo "Copying various files..."
 install -m 644					\
@@ -339,6 +382,11 @@ install -m 644					\
 	rpm/kernel-source.rpmlintrc		\
 	doc/README.SUSE				\
 	$build_dir
+
+install -m 644					\
+	rpm/kernel-source.rpmlintrc		\
+	$build_dir/kernel-source-rt.rpmlintrc
+
 install_changes $build_dir/kernel-source.changes
 install_changes $build_dir/kernel-dummy.changes
 

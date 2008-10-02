@@ -1,2 +1,2 @@
 relink linux-@KERNELRELEASE@@VARIANT@ /usr/src/linux@VARIANT@
-relink linux-@KERNELRELEASE@-obj /usr/src/linux-obj
+relink linux-@KERNELRELEASE@@VARIANT@-obj /usr/src/linux@VARIANT@-obj
