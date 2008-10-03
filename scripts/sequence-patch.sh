@@ -408,38 +408,3 @@ echo "[ Tree: $PATCH_DIR ]"
 
 # Old kernels don't have a config.conf.
 [ -e config.conf ] || exit
-
-# Copy the config files that apply for this kernel.
-echo "[ Copying config files ]" >> $PATCH_LOG
-echo "[ Copying config files ]"
-TMPFILE=$(mktemp /tmp/$(basename $0).XXXXXX)
-chmod a+r $TMPFILE
-CONFIGS=$(scripts/guards --list < config.conf)
-for config in $CONFIGS; do
-    if ! [ -e config/$config ]; then
-	echo "Configuration file config/$config not found"
-    fi
-    name=$(basename $config)
-    arch=$(dirname $config)
-    if [ "$arch" = "i386" -o "$arch" = "x86_64" ]; then
-	path=arch/x86/defconfig.$(dirname $config).$name
-    else
-	path=arch/$(dirname $config)/defconfig.$name
-    fi
-
-    mkdir -p $(dirname $PATCH_DIR/$path)
-
-    chmod +x rpm/config-subst
-    cat config/$config \
-    | rpm/config-subst CONFIG_CFGNAME \"$name\" \
-    | rpm/config-subst CONFIG_RELEASE \"0\" \
-    | rpm/config-subst CONFIG_SUSE_KERNEL y \
-    > $TMPFILE
-
-    echo $path >> $PATCH_LOG
-    [ -z "$QUIET" ] && echo $path
-    # Make sure we don't override a hard-linked file.
-    rm -f $PATCH_DIR/$path
-    cp -f $TMPFILE $PATCH_DIR/$path
-done
-rm -f $TMPFILE

@@ -1,7 +1,5 @@
 #!/bin/bash
 #set -xev
-echo "dont forget to update the defconfig files, or the mbuild may fail"
-sleep 1
 sudo -l
 important_specfiles="default ppc64 s390 kdump vanilla ps3 xen"
 all_specfiles="`sed -e '/^\+/s@^.*/@@p;d' config.conf | sort -u | xargs echo source dummy`"
