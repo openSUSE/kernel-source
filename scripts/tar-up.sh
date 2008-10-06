@@ -354,6 +354,7 @@ sed -e "s,@NAME@,kernel-source-rt,g" \
     -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
   < rpm/kernel-source.spec.in \
 > $build_dir/kernel-source-rt.spec
+install_changes $build_dir/kernel-source-rt.changes
 
 echo "kernel-syms-rt.spec"
 sed -e "s,@NAME@,kernel-syms-rt,g" \
