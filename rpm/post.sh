@@ -57,11 +57,6 @@ message_install_bl () {
 }
 
 run_bootloader () {
-    # Only create the bootloader entry when installing kernel-$flavor-base.
-    if [ @SUBPACKAGE@ != kernel-@FLAVOR@-base ]; then
-	return 1
-    fi
-
     if [ -f /etc/sysconfig/bootloader ] &&
 	    [ -f /boot/grub/menu.lst -o \
 	      -f /etc/lilo.conf      -o \
@@ -77,21 +72,29 @@ run_bootloader () {
 if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] ; then
     if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
 			-i /boot/initrd-@KERNELRELEASE@; then
-	echo "/sbin/mkinitrd failed" >&2
-	exit 1
+	# mkinitrd fails with status 10 if any required kernel modules missing.
+	# We expect those modules to be added later (by one of the other
+	# kernel-$flavor packages).
+	if [ $? -ne 10 ]; then
+	    echo "/sbin/mkinitrd failed" >&2
+	    exit 1
+	fi
     fi
 
     # only run the bootloader if the usual bootloader configuration
     # files are there -- this is different on every architecture
-    if run_bootloader ; then
-	# handle 10.2 and SLES10 SP1
+    initrd=/boot/initrd-@KERNELRELEASE
+    if [ -e $initrd -o ! -e /lib/modules/@KERNELRELEASE@ ] && \
+       run_bootloader ; then
+       [ -e $initrd ] || initrd=
+	# handle 10.2 and SLES10 SP1 or later
 	if [ -x /usr/lib/bootloader/bootloader_entry ]; then
 	    /usr/lib/bootloader/bootloader_entry \
 		add \
 		@FLAVOR@ \
 		@KERNELRELEASE@ \
 		@IMAGE@-@KERNELRELEASE@ \
-		initrd-@KERNELRELEASE@
+		$initrd
 
 	# handle 10.1 and SLES10 GA
 	elif [ -x /sbin/update-bootloader ]; then
@@ -111,7 +114,7 @@ if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] ; then
 		    echo "bootloader_entry script unavailable, updating /boot/@IMAGE@"
 		    /sbin/update-bootloader \
 			--image /boot/@IMAGE@ \
-			--initrd /boot/initrd \
+			${initrd:+--initrd /boot/initrd} \
 			--add \
 			--force $opt_xen_kernel
 
