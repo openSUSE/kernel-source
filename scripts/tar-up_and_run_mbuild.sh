@@ -16,6 +16,7 @@ user="`id -nu`"
 mbuild_options=
 with_debug=
 ignore_kabi=
+ignore_unsupported_deps=
 until [ "$#" = "0" ] ; do
     case "$1" in
     -rs)
@@ -60,6 +61,10 @@ until [ "$#" = "0" ] ; do
         ignore_kabi=-i
         shift
         ;;
+    -iu|--ignore-unsupported-deps)
+        ignore_unsupported_deps=-iu
+	shift
+	;;
     -h|--help|-v|--version)
 	cat <<EOF
 
@@ -79,6 +84,8 @@ these options are recognized:
     --debug            to build a kernel-flavor-debug package with debug info for lkcd
                        requires MUCH diskspace
     -i|--ignore-kabi   ignore changes in the kabi
+    -iu|--ignore-unsupported-deps
+                       ignore supported modules depending on unsupported ones
     all                to build a kernel.rpm for all configured .config files:
     $all_specfiles
 
@@ -111,7 +118,7 @@ fi
 if [ ! -z "$single_specfiles" ] ; then
 specfiles=`echo $single_specfiles | sort | xargs echo`
 fi
-scripts/tar-up.sh $ignore_kabi $rpm_release_string $timestamp $tolerate_unknown_new_config_options || exit 1
+scripts/tar-up.sh $ignore_kabi $ignore_unsupported_deps $rpm_release_string $timestamp $tolerate_unknown_new_config_options || exit 1
 cd kernel-source
 for i in $specfiles
 do

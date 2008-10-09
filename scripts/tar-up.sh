@@ -5,6 +5,7 @@ rpm_release_string=
 source_timestamp=
 tolerate_unknown_new_config_options=0
 ignore_kabi=
+ignore_unsupported_deps=
 until [ "$#" = "0" ] ; do
   case "$1" in
     --dir=*)
@@ -25,6 +26,10 @@ until [ "$#" = "0" ] ; do
       ;;
     -i|--ignore-kabi)
       ignore_kabi=1
+      shift
+      ;;
+    -iu|--ignore-unsupported-deps)
+      ignore_unsupported_deps=1
       shift
       ;;
     -rs|--release-string)
@@ -494,4 +499,7 @@ echo $((1024*1024)) > $build_dir/minmem
 echo $((6*1024)) > $build_dir/needed_space_in_mb
 if [ -n "$ignore_kabi" ]; then
     touch $build_dir/IGNORE-KABI-BADNESS
+fi
+if [ -n "$ignore_unsupported_deps" ]; then
+    touch $build_dir/IGNORE-UNSUPPORTED-DEPS
 fi
