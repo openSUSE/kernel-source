@@ -83,7 +83,7 @@ if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] ; then
 
     # only run the bootloader if the usual bootloader configuration
     # files are there -- this is different on every architecture
-    initrd=/boot/initrd-@KERNELRELEASE
+    initrd=/boot/initrd-@KERNELRELEASE@
     if [ -e $initrd -o ! -e /lib/modules/@KERNELRELEASE@ ] && \
        run_bootloader ; then
        [ -e $initrd ] || initrd=
