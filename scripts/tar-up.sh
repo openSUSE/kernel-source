@@ -377,10 +377,10 @@ echo "Copying various files..."
 install -m 644					\
 	config.conf				\
 	supported.conf				\
-	rpm/functions.sh			\
 	rpm/source-post.sh			\
 	rpm/pre.sh				\
 	rpm/post.sh				\
+	rpm/preun.sh				\
 	rpm/postun.sh				\
 	rpm/module-renames			\
 	rpm/kernel-module-subpackage		\

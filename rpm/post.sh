@@ -43,12 +43,17 @@ if [ -e /lib/modules/@KERNELRELEASE@ ]; then
     if [ -x /sbin/module_upgrade ]; then
 	/sbin/module_upgrade --rename mptscsih="mptspi mptfc mptsas"
     fi
-
-    # Add symlinks of compatible modules to /lib/modules/$krel/weak-updates/.
-    if [ -x /usr/lib/module-init-tools/weak-modules ]; then
-	/usr/lib/module-init-tools/weak-modules --add-kernel @KERNELRELEASE@
+fi
+# Add symlinks of compatible modules to /lib/modules/$krel/weak-updates/, 
+# run depmod and mkinitrd
+wm2=/usr/lib/module-init-tools/weak-modules2
+if [ -x $wm2 ]; then
+    if [ @BASE_PACKAGE@ = 1 ]; then
+	$wm2 --add-kernel @KERNELRELEASE@
+    else
+	nvr=@SUBPACKAGE@-@RPM_VERSION_RELEASE@
+	rpm -ql $nvr | $wm2 --add-kernel-modules @KERNELRELEASE@
     fi
-    /sbin/depmod -a -F /boot/System.map-@KERNELRELEASE@ @KERNELRELEASE@
 fi
 
 message_install_bl () {
@@ -69,18 +74,7 @@ run_bootloader () {
     fi
 }
 
-if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] ; then
-    if ! /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
-			-i /boot/initrd-@KERNELRELEASE@; then
-	# mkinitrd fails with status 10 if any required kernel modules missing.
-	# We expect those modules to be added later (by one of the other
-	# kernel-$flavor packages).
-	if [ $? -ne 10 ]; then
-	    echo "/sbin/mkinitrd failed" >&2
-	    exit 1
-	fi
-    fi
-
+if [ -f /etc/fstab -a ! -e /.buildenv ] ; then
     # only run the bootloader if the usual bootloader configuration
     # files are there -- this is different on every architecture
     initrd=/boot/initrd-@KERNELRELEASE@
