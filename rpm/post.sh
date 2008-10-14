@@ -52,7 +52,7 @@ if [ -x $wm2 ]; then
 	$wm2 --add-kernel @KERNELRELEASE@
     else
 	nvr=@SUBPACKAGE@-@RPM_VERSION_RELEASE@
-	rpm -ql $nvr | $wm2 --add-kernel-modules @KERNELRELEASE@
+	rpm -ql $nvr | $wm2 --add-kernel-modules @KERNELRELEASE@ || :
     fi
 fi
 

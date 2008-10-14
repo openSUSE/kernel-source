@@ -2,7 +2,7 @@ wm2=/usr/lib/module-init-tools/weak-modules2
 if [ @BASE_PACKAGE@ = 0 ]; then
     if [ -x $wm2 ]; then
         nvr=@SUBPACKAGE@-@RPM_VERSION_RELEASE@
-        $wm2 --remove-kernel-modules @KERNELRELEASE@ < /var/run/rpm-$nvr-modules
+        $wm2 --remove-kernel-modules @KERNELRELEASE@ < /var/run/rpm-$nvr-modules || :
     fi
     rm -f /var/run/rpm-$nvr-modules
     exit 0
