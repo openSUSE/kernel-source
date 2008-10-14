@@ -234,8 +234,8 @@ for config in $config_files; do
     config="patches/config/$config"
 
     cat $config \
-    | $config_subst CONFIG_LOCALVERSION \"-${config##*/}\" \
-    | $config_subst CONFIG_SUSE_KERNEL y \
+    | bash $config_subst CONFIG_LOCALVERSION \"-${config##*/}\" \
+    | bash $config_subst CONFIG_SUSE_KERNEL y \
     > .config
     case "$menuconfig" in
     yes)
