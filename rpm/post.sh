@@ -77,7 +77,7 @@ run_bootloader () {
 if [ -f /etc/fstab -a ! -e /.buildenv ] ; then
     # only run the bootloader if the usual bootloader configuration
     # files are there -- this is different on every architecture
-    initrd=/boot/initrd-@KERNELRELEASE@
+    initrd=initrd-@KERNELRELEASE@
     if [ -e $initrd -o ! -e /lib/modules/@KERNELRELEASE@ ] && \
        run_bootloader ; then
        [ -e $initrd ] || initrd=
