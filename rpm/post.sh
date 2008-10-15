@@ -3,7 +3,7 @@
 # On powerpc, the different kernels are for different board/firmware types
 # They are not compatible.
 wrong_boardtype() {
-    echo "This kernel-@FLAVOR@ is for $1, it will not boot on your system."
+    echo "This kernel-@FLAVOR@ is for $1, it will not boot on this system."
     echo "The /boot/vmlinux symlink will not be created or updated."
     exit 0
 }
