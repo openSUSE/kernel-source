@@ -46,13 +46,33 @@ if [ -e /lib/modules/@KERNELRELEASE@ ]; then
 fi
 # Add symlinks of compatible modules to /lib/modules/$krel/weak-updates/, 
 # run depmod and mkinitrd
+wm=/usr/lib/module-init-tools/weak-modules
 wm2=/usr/lib/module-init-tools/weak-modules2
 if [ -x $wm2 ]; then
     if [ @BASE_PACKAGE@ = 1 ]; then
-	$wm2 --add-kernel @KERNELRELEASE@
+        $wm2 --add-kernel @KERNELRELEASE@
     else
-	nvr=@SUBPACKAGE@-@RPM_VERSION_RELEASE@
-	rpm -ql $nvr | $wm2 --add-kernel-modules @KERNELRELEASE@
+        nvr=@SUBPACKAGE@-@RPM_VERSION_RELEASE@
+        rpm -ql $nvr | $wm2 --add-kernel-modules @KERNELRELEASE@
+    fi
+elif [ -x $wm ]; then
+    # pre CODE11 compatibility
+    $wm --add-kernel @KERNELRELEASE@
+    /sbin/depmod -a -F /boot/System.map-@KERNELRELEASE@ @KERNELRELEASE@
+    if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] ; then
+        /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
+                       -i /boot/initrd-@KERNELRELEASE@
+        if [ $? -ne 0 ]; then
+            echo "/sbin/mkinitrd failed" >&2
+            case @SUBPACKAGE@ in
+            *-base)
+                echo "Ignoring this for the base subpackage" >&2
+                ;;
+            *)
+                exit 1
+                ;;
+            esac
+        fi
     fi
 fi
 
@@ -78,9 +98,9 @@ if [ -f /etc/fstab -a ! -e /.buildenv ] ; then
     # only run the bootloader if the usual bootloader configuration
     # files are there -- this is different on every architecture
     initrd=initrd-@KERNELRELEASE@
-    if [ -e $initrd -o ! -e /lib/modules/@KERNELRELEASE@ ] && \
+    if [ -e /boot/$initrd -o ! -e /lib/modules/@KERNELRELEASE@ ] && \
        run_bootloader ; then
-       [ -e $initrd ] || initrd=
+       [ -e /boot/$initrd ] || initrd=
 	# handle 10.2 and SLES10 SP1 or later
 	if [ -x /usr/lib/bootloader/bootloader_entry ]; then
 	    /usr/lib/bootloader/bootloader_entry \

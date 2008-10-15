@@ -1,3 +1,4 @@
+wm=/usr/lib/module-init-tools/weak-modules
 wm2=/usr/lib/module-init-tools/weak-modules2
 if [ @BASE_PACKAGE@ = 0 ]; then
     if [ -x $wm2 ]; then
@@ -10,6 +11,9 @@ fi
 # Remove symlinks from /lib/modules/$krel/weak-updates/.
 if [ -x $wm2 ]; then
     $wm2 --remove-kernel @KERNELRELEASE@
+elif [ -x $wm2 ]; then
+    # pre CODE11 compatibility
+    $wm --remove-kernel @KERNELRELEASE@
 fi
 
 # remove /boot/@IMAGE@.previous entry on a 10.1 and SLES10 GA system
