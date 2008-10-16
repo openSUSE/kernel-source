@@ -1,5 +1,7 @@
 #!/bin/sh
 
+. ${0%/*}/wd-functions.sh
+
 rpm_release_timestamp=
 rpm_release_string=
 source_timestamp=
@@ -157,6 +159,12 @@ if [ -e CVS/Tag ]; then
 	echo $tag >> $build_dir/build-source-timestamp
     fi
 fi
+
+if $using_git; then
+    # Always include the git revision
+    echo "GIT Revision: $(git rev-parse HEAD)" >> $build_dir/build-source-timestamp
+fi
+
 
 # List all used configurations
 config_files="$(
