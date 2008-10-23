@@ -13,4 +13,9 @@ else
     exit 1
 fi
 
+if $using_git && test -z "$COMPLAINED_ABOUT_GIT_HOOKS" && ! ${0%/*}/install-git-hooks --check; then
+    echo "WARNING: You should run ${0%/*}/install-git-hooks to enable pre-commit checks." >&2
+    export COMPLAINED_ABOUT_GIT_HOOKS=true
+fi
+
 # vim: sw=4:ts=4:et
