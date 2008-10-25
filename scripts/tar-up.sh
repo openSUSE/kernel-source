@@ -412,8 +412,9 @@ install -m 755					\
 	rpm/check-supported-list		\
 	rpm/check-build.sh			\
 	rpm/modversions				\
+	rpm/list-exported-symbols		\
+	rpm/split-into-symsets			\
 	rpm/built-in-where			\
-	rpm/make-symsets			\
 	scripts/guards				\
 	scripts/arch-symbols			\
 	scripts/kabi-checks			\
