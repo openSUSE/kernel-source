@@ -106,7 +106,8 @@ fi
 TMPDIR=$SCRATCH_AREA
 export TMPDIR
 ORIG_DIR=$SCRATCH_AREA/linux-$SRCVERSION.orig
-TAG="$(sed -ne 's:^T::p' $(dirname $0)/../CVS/Tag 2>/dev/null)"
+TAG="$(sed -ne 's|^ref: refs/heads/||p' $(dirname $0)/../.git/HEAD 2>/dev/null)"
+test "$TAG" = master && TAG=
 PATCH_DIR=$SCRATCH_AREA/linux-$SRCVERSION${TAG:+-$TAG}
 PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION${TAG:+-$TAG}.log
 LAST_LOG=$SCRATCH_AREA/last-$SRCVERSION${TAG:+-$TAG}.log
