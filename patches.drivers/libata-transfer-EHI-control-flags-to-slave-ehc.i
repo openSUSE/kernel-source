@@ -21,11 +21,9 @@ Signed-off-by: Tejun Heo <teheo@suse.de>
  include/linux/libata.h  |    3 +++
  2 files changed, 8 insertions(+)
 
-Index: linux-2.6.27/drivers/ata/libata-eh.c
-===================================================================
---- linux-2.6.27.orig/drivers/ata/libata-eh.c
-+++ linux-2.6.27/drivers/ata/libata-eh.c
-@@ -1974,8 +1974,13 @@ void ata_eh_autopsy(struct ata_port *ap)
+--- a/drivers/ata/libata-eh.c
++++ b/drivers/ata/libata-eh.c
+@@ -1973,8 +1973,13 @@ void ata_eh_autopsy(struct ata_port *ap)
  		struct ata_eh_context *mehc = &ap->link.eh_context;
  		struct ata_eh_context *sehc = &ap->slave_link->eh_context;
  
@@ -39,10 +37,8 @@ Index: linux-2.6.27/drivers/ata/libata-eh.c
  		ata_eh_about_to_do(ap->slave_link, NULL, ATA_EH_ALL_ACTIONS);
  		mehc->i.action		|= sehc->i.action;
  		mehc->i.dev_action[1]	|= sehc->i.dev_action[1];
-Index: linux-2.6.27/include/linux/libata.h
-===================================================================
---- linux-2.6.27.orig/include/linux/libata.h
-+++ linux-2.6.27/include/linux/libata.h
+--- a/include/linux/libata.h
++++ b/include/linux/libata.h
 @@ -337,6 +337,9 @@ enum {
  
  	ATA_EHI_DID_RESET	= ATA_EHI_DID_SOFTRESET | ATA_EHI_DID_HARDRESET,
