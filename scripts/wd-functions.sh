@@ -4,7 +4,7 @@ if test -d CVS; then
     scm=CVS
     using_cvs=true
     using_git=false
-elif git rev-parse --is-inside-work-tree >/dev/null 2>&1 && `git rev-parse --is-inside-work-tree`; then
+elif git rev-parse HEAD >/dev/null 2>&1; then
     scm=GIT
     using_git=true
     using_cvs=false
