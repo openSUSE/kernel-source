@@ -404,6 +404,15 @@ install -m 644					\
 install_changes $build_dir/kernel-source.changes
 install_changes $build_dir/kernel-dummy.changes
 
+if [ -x /work/src/bin/tools/convert_changes_to_rpm_changelog ]; then
+    ls "$build_dir"
+    /work/src/bin/tools/convert_changes_to_rpm_changelog <$build_dir/kernel-source.changes >"$build_dir"/rpm_changelog
+    for spec in "$build_dir"/*.spec; do
+        (echo "%changelog"; cat "$build_dir"/rpm_changelog) >>"$spec"
+    done
+    rm -f "$build_dir"/rpm_changelog
+fi
+
 install -m 755					\
 	rpm/find-provides			\
 	rpm/config-subst 			\
