@@ -223,6 +223,11 @@ for config in $config_files; do
 	continue
     fi
 
+    case $arch in
+    ppc|ppc64)
+	arch=powerpc
+	;;
+    esac
     case $flavor in
     um)
 	MAKE_ARGS="ARCH=$flavor SUBARCH=$arch"
