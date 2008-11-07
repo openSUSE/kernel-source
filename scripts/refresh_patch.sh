@@ -23,5 +23,4 @@ quilt refresh \
 	--diffstat \
 	--sort \
 	--backup \
-	--strip-trailing-whitespace \
 	-p ab
