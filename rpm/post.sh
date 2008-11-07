@@ -11,8 +11,8 @@ if [ -f /proc/cpuinfo ]; then
     case "@FLAVOR@" in
 	ppc64|kdump)
 	    if [ -d /proc/device-tree ]; then
-		if [ ! -d /proc/ppc64 ]; then
-		    wrong_boardtype "OpenFirmware based 64bit machines or legacy iSeries"
+		if [ -d /proc/iSeries -o ! -d /proc/ppc64 ]; then
+		    wrong_boardtype "OpenFirmware based 64bit machines"
 		fi
 	    fi
 	    ;;
