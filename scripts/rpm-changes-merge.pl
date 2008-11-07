@@ -4,8 +4,8 @@
 # To install the script as a git merge driver:
 #
 #   git config merge.rpm-changes.name "*.changes merge driver"
-#   git config merge.rpm-changes.driver "/path/to/rpm-changes-merge.pl %A %O %B"
-#   echo '*.changes merge=rpm-changes' >.git/info/attributes
+#   git config merge.rpm-changes.driver "scripts/rpm-changes-merge.pl %A %O %B"
+#   echo '*.changes merge=rpm-changes' >>.git/info/attributes
 
 use strict;
 use warnings;
@@ -24,23 +24,46 @@ use File::Temp qw(tempfile);
 
 my $conflicts = 0;
 
+sub usage {
+    print STDERR
+"Usage:
+  Three-way merge:
+    $0 [-p] my.changes orig.changes their.changes
+  Two-way merge:
+    $0 [-p] -2 my.changes their.changes
+  Fixup mode:
+    $0 [-p] -1 my.changes
+";
+    exit 1;
+}
+
 sub main {
     $ENV{'TZ'} = "UTC";
 
-    our $opt_p;
+    our ($opt_p, $opt_1, $opt_2, $opt_3) = (0, 0, 0, 0);
     my (%O, %A, %B, $out);
-    if (!getopts('p') || @ARGV != 3) {
-        print STDERR "Usage: $0 [-p] my.changes orig.changes someone-elses.changes\n";
-        exit 1;
+    if (!getopts('p123') || $opt_1 + $opt_2 + $opt_3 > 1) {
+        usage();
     }
-    loadchanges($ARGV[0], \%A);
-    loadchanges($ARGV[1], \%O);
-    loadchanges($ARGV[2], \%B);
+    if ($opt_1) {
+        usage() if @ARGV != 1;
+        loadchanges($ARGV[0], \%A);
+    } elsif ($opt_2) {
+        usage() if @ARGV != 2;
+        loadchanges($ARGV[0], \%A);
+        loadchanges($ARGV[1], \%B);
+    } else {
+        usage() if @ARGV != 3;
+        loadchanges($ARGV[0], \%A);
+        loadchanges($ARGV[1], \%O);
+        loadchanges($ARGV[2], \%B);
+    }
     if ($opt_p) {
         $out = \*STDOUT;
     } else {
         open($out, '>', $ARGV[0]) or die "$ARGV[0]: $!\n";
     }
+
     my %seen;
     for my $key (reverse(sort(keys(%A), keys(%O), keys(%B)))) {
         next if $seen{$key};
