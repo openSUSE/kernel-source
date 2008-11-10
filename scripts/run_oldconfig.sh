@@ -56,7 +56,7 @@ trap _cleanup_ EXIT
 #########################################################
 # main
 
-arch=
+cpu_arch=
 YES=
 menuconfig=no
 new_config_option_yes=no
@@ -70,7 +70,7 @@ until [ "$#" = "0" ] ; do
 	shift
 	;;
     a|-a|--arch)
-	arch=$2
+	cpu_arch=$2
 	shift 2
 	;;
     m|-m|--menuconfig)
@@ -139,13 +139,13 @@ else
 	exit 1
 fi
 
-if [ -z "$arch" ]; then
+if [ -z "$cpu_arch" ]; then
     CONFIG_SYMBOLS=$(
     	for arch in $(${prefix}scripts/arch-symbols --list); do
 		${prefix}scripts/arch-symbols $arch
 	done)
 else
-    ARCH_SYMBOLS=$(${prefix}scripts/arch-symbols $arch)
+    ARCH_SYMBOLS=$(${prefix}scripts/arch-symbols $cpu_arch)
     CONFIG_SYMBOLS=$ARCH_SYMBOLS
 fi
 
@@ -210,7 +210,7 @@ patches/scripts/guards $ARCH_SYMBOLS $EXTRA_SYMBOLS < patches/series.conf \
 EXTRA_SYMBOLS="$(echo $EXTRA_SYMBOLS | sed -e 's# *[Rr][Tt] *##g')"
 
 for config in $config_files; do
-    arch=${config%/*}
+    cpu_arch=${config%/*}
     flavor=${config#*/}
 
     set -- kernel-$flavor $flavor $(case $flavor in (rt|rt_*) echo RT ;; esac)
@@ -223,19 +223,11 @@ for config in $config_files; do
 	continue
     fi
 
-    case $arch in
-    ppc|ppc64)
-	arch=powerpc
-	;;
+    case $cpu_arch in
+	ppc|ppc64) kbuild_arch=powerpc ;;
+	*) kbuild_arch=$cpu_arch ;;
     esac
-    case $flavor in
-    um)
-	MAKE_ARGS="ARCH=$flavor SUBARCH=$arch"
-	;;
-    *)
-	MAKE_ARGS="ARCH=$arch"
-	;;
-    esac
+    MAKE_ARGS="ARCH=$kbuild_arch"
     config="patches/config/$config"
 
     cat $config \
