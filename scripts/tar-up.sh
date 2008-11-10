@@ -331,7 +331,7 @@ prepare_source_and_syms() {
 
 # The pre-configured kernel source package
 echo "kernel-source.spec"
-prepare_source_and_syms kernel-syms # computa archs and build_requires
+prepare_source_and_syms kernel-syms # compute archs and build_requires
 sed -e "s,@NAME@,kernel-source,g" \
     -e "s,@SRCVERSION@,$SRCVERSION,g" \
     -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
@@ -355,31 +355,33 @@ sed -e "s,@NAME@,kernel-syms,g" \
 > $build_dir/kernel-syms.spec
 install_changes $build_dir/kernel-syms.changes
 
-echo "kernel-source-rt.spec"
-prepare_source_and_syms kernel-syms-rt # computa archs and build_requires
-sed -e "s,@NAME@,kernel-source-rt,g" \
-    -e "s,@SRCVERSION@,$SRCVERSION,g" \
-    -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
-    -e "s,@RPMVERSION@,$RPMVERSION,g" \
-    -e "s,@ARCHS@,$archs,g" \
-    -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
-    -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
-    -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
-  < rpm/kernel-source.spec.in \
-> $build_dir/kernel-source-rt.spec
-install_changes $build_dir/kernel-source-rt.changes
+if test -e $build_dir/kernel-rt.spec; then
+    echo "kernel-source-rt.spec"
+    prepare_source_and_syms kernel-syms-rt # compute archs and build_requires
+    sed -e "s,@NAME@,kernel-source-rt,g" \
+        -e "s,@SRCVERSION@,$SRCVERSION,g" \
+        -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
+        -e "s,@RPMVERSION@,$RPMVERSION,g" \
+        -e "s,@ARCHS@,$archs,g" \
+        -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
+        -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
+        -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+      < rpm/kernel-source.spec.in \
+    > $build_dir/kernel-source-rt.spec
+    install_changes $build_dir/kernel-source-rt.changes
 
-echo "kernel-syms-rt.spec"
-sed -e "s,@NAME@,kernel-syms-rt,g" \
-    -e "s,@SRCVERSION@,$SRCVERSION,g" \
-    -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
-    -e "s,@RPMVERSION@,$RPMVERSION,g" \
-    -e "s,@ARCHS@,$archs,g" \
-    -e "s,@BUILD_REQUIRES@,$build_requires,g" \
-    -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
-  < rpm/kernel-syms.spec.in \
-> $build_dir/kernel-syms-rt.spec
-install_changes $build_dir/kernel-syms-rt.changes
+    echo "kernel-syms-rt.spec"
+    sed -e "s,@NAME@,kernel-syms-rt,g" \
+        -e "s,@SRCVERSION@,$SRCVERSION,g" \
+        -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
+        -e "s,@RPMVERSION@,$RPMVERSION,g" \
+        -e "s,@ARCHS@,$archs,g" \
+        -e "s,@BUILD_REQUIRES@,$build_requires,g" \
+        -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+      < rpm/kernel-syms.spec.in \
+    > $build_dir/kernel-syms-rt.spec
+    install_changes $build_dir/kernel-syms-rt.changes
+fi
 
 echo "Copying various files..."
 install -m 644					\
