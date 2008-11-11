@@ -381,6 +381,10 @@ if test -e $build_dir/kernel-rt.spec; then
       < rpm/kernel-syms.spec.in \
     > $build_dir/kernel-syms-rt.spec
     install_changes $build_dir/kernel-syms-rt.changes
+
+    install -m 644                              \
+        rpm/kernel-source.rpmlintrc             \
+        $build_dir/kernel-source-rt.rpmlintrc
 fi
 
 echo "Copying various files..."
@@ -398,10 +402,6 @@ install -m 644					\
 	rpm/kernel-source.rpmlintrc		\
 	doc/README.SUSE				\
 	$build_dir
-
-install -m 644					\
-	rpm/kernel-source.rpmlintrc		\
-	$build_dir/kernel-source-rt.rpmlintrc
 
 install_changes $build_dir/kernel-source.changes
 install_changes $build_dir/kernel-dummy.changes
@@ -472,7 +472,7 @@ for archive in $all_archives; do
     echo "$archive.tar.bz2"
     case " $IGNORE_ARCHS " in
     *" ${archive#patches.} "*)
-	echo "Ignoring $d..."
+	echo "Ignoring $archive..."
 	continue ;;
     esac
 
