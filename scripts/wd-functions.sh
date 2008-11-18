@@ -13,9 +13,15 @@ else
     exit 1
 fi
 
-if $using_git && test -z "$COMPLAINED_ABOUT_GIT_HOOKS" && ! ${0%/*}/install-git-hooks --check; then
-    echo "WARNING: You should run ${0%/*}/install-git-hooks to enable pre-commit checks." >&2
-    export COMPLAINED_ABOUT_GIT_HOOKS=true
+if $using_git && test -z "$CHECKED_GIT_HOOKS"; then
+    export CHECKED_GIT_HOOKS=1
+    if ! ${0%/*}/install-git-hooks --check; then
+        echo "WARNING: You should run ${0%/*}/install-git-hooks to enable pre-commit checks." >&2
+    fi
+    if ! git var GIT_COMMITTER_IDENT | grep -Eiq '@(suse\.(de|com|cz)|novell\.com)>'; then
+        echo "WARNING: You should set your suse email address in git"  >&2
+        echo "WARNING: E.g. by running 'git config --global <your login>@suse.de'" >&2
+    fi
 fi
 
-# vim: sw=4:ts=4:et
+# vim: sw=4:sts=4:et
