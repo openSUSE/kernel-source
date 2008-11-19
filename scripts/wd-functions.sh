@@ -34,7 +34,7 @@ if $using_git && test -z "$CHECKED_GIT_HOOKS"; then
     fi
     if ! git var GIT_COMMITTER_IDENT | grep -Eiq '@(suse\.(de|com|cz)|novell\.com)>'; then
         echo "WARNING: You should set your suse email address in git"  >&2
-        echo "WARNING: E.g. by running 'git config --global <your login>@suse.de'" >&2
+        echo "WARNING: E.g. by running 'git config --global user.email <your login>@suse.de'" >&2
     fi
 fi
 
