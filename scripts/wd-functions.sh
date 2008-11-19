@@ -12,11 +12,25 @@ else
     echo "Error: not in CVS / GIT working directory" >&2
     exit 1
 fi
+scripts_dir=$(dirname "$0")
+
+get_branch_name()
+{
+    if $using_cvs; then
+        sed -ne 's:^T::p' "$scripts_dir"/../CVS/Tag 2>/dev/null || :
+    else
+        # FIXME: guess a branch name when a non-branch revision is checked
+        # out
+        local res=$(sed -ne 's|^ref: refs/heads/||p' "$scripts_dir"/../.git/HEAD 2>/dev/null)
+        test "$res" = "master" && res=
+        echo "$res"
+    fi
+}
 
 if $using_git && test -z "$CHECKED_GIT_HOOKS"; then
     export CHECKED_GIT_HOOKS=1
-    if ! ${0%/*}/install-git-hooks --check; then
-        echo "WARNING: You should run ${0%/*}/install-git-hooks to enable pre-commit checks." >&2
+    if ! "$scripts_dir"/install-git-hooks --check; then
+        echo "WARNING: You should run $scripts_dir/install-git-hooks to enable pre-commit checks." >&2
     fi
     if ! git var GIT_COMMITTER_IDENT | grep -Eiq '@(suse\.(de|com|cz)|novell\.com)>'; then
         echo "WARNING: You should set your suse email address in git"  >&2

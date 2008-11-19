@@ -163,6 +163,10 @@ fi
 if $using_git; then
     # Always include the git revision
     echo "GIT Revision: $(git rev-parse HEAD)" >> $build_dir/build-source-timestamp
+    tag=$(get_branch_name)
+    if test -n "$tag"; then
+	echo "GIT Branch: $tag" >>$build_dir/build-source-timestamp
+    fi
 fi
 
 
