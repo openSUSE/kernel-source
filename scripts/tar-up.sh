@@ -426,12 +426,10 @@ install -m 755					\
 	rpm/check-supported-list		\
 	rpm/check-build.sh			\
 	rpm/modversions				\
-	rpm/list-exported-symbols		\
-	rpm/split-into-symsets			\
 	rpm/built-in-where			\
+	rpm/symsets.pl                          \
 	scripts/guards				\
 	scripts/arch-symbols			\
-	scripts/kabi-checks			\
 	misc/extract-modaliases			\
 	$build_dir
 
