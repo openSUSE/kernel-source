@@ -183,7 +183,7 @@ sub module_exports {
     my ($file) = @_;
     my (%crcs, %types, @res);
     my $mod = $file;
-    $mod =~ s/.*?kernel\///;
+    $mod =~ s/.*\/lib\/modules\/[^\/]*\/kernel\///;
     $mod =~ s/\.(k?o|a)$//;
     
     open(my $pipe, '-|', 'objdump', '-t', $file) or die "objdump -t $file: $!\n";
