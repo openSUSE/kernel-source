@@ -262,15 +262,6 @@ binary_spec_files=$(
 )
 binary_spec_files=${binary_spec_files//$'\n'/\\n}
 
-echo "kernel-dummy.spec"
-sed -e "s,@NAME@,kernel-dummy,g" \
-    -e "s,@SRCVERSION@,$SRCVERSION,g" \
-    -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
-    -e "s,@RPMVERSION@,$RPMVERSION,g" \
-    -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
-  < rpm/kernel-dummy.spec.in \
-> $build_dir/kernel-dummy.spec
-
 TMPDIR=$(mktemp -dt ${0##*/}.XXXXXX)
 trap "rm -rf $TMPDIR" EXIT
 
@@ -334,30 +325,49 @@ prepare_source_and_syms() {
 }
 
 # The pre-configured kernel source package
-echo "kernel-source.spec"
-prepare_source_and_syms kernel-syms # compute archs and build_requires
-sed -e "s,@NAME@,kernel-source,g" \
-    -e "s,@SRCVERSION@,$SRCVERSION,g" \
-    -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
-    -e "s,@RPMVERSION@,$RPMVERSION,g" \
-    -e "s,@ARCHS@,$archs,g" \
-    -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
-    -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
-    -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
-  < rpm/kernel-source.spec.in \
-> $build_dir/kernel-source.spec
+if test -e $build_dir/kernel-default.spec; then
+    # if there is no kernel-default, assume that this is a "special"
+    # branch (such as slert) with it's own kernel-source
+    echo "kernel-source.spec"
+    prepare_source_and_syms kernel-syms # compute archs and build_requires
+    sed -e "s,@NAME@,kernel-source,g" \
+        -e "s,@SRCVERSION@,$SRCVERSION,g" \
+        -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
+        -e "s,@RPMVERSION@,$RPMVERSION,g" \
+        -e "s,@ARCHS@,$archs,g" \
+        -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
+        -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
+        -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+      < rpm/kernel-source.spec.in \
+    > $build_dir/kernel-source.spec
+    install_changes $build_dir/kernel-source.changes
 
-echo "kernel-syms.spec"
-sed -e "s,@NAME@,kernel-syms,g" \
-    -e "s,@SRCVERSION@,$SRCVERSION,g" \
-    -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
-    -e "s,@RPMVERSION@,$RPMVERSION,g" \
-    -e "s,@ARCHS@,$archs,g" \
-    -e "s,@BUILD_REQUIRES@,$build_requires,g" \
-    -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
-  < rpm/kernel-syms.spec.in \
-> $build_dir/kernel-syms.spec
-install_changes $build_dir/kernel-syms.changes
+    echo "kernel-syms.spec"
+    sed -e "s,@NAME@,kernel-syms,g" \
+        -e "s,@SRCVERSION@,$SRCVERSION,g" \
+        -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
+        -e "s,@RPMVERSION@,$RPMVERSION,g" \
+        -e "s,@ARCHS@,$archs,g" \
+        -e "s,@BUILD_REQUIRES@,$build_requires,g" \
+        -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+      < rpm/kernel-syms.spec.in \
+    > $build_dir/kernel-syms.spec
+    install_changes $build_dir/kernel-syms.changes
+
+    echo "kernel-dummy.spec"
+    sed -e "s,@NAME@,kernel-dummy,g" \
+        -e "s,@SRCVERSION@,$SRCVERSION,g" \
+        -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
+        -e "s,@RPMVERSION@,$RPMVERSION,g" \
+        -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+      < rpm/kernel-dummy.spec.in \
+    > $build_dir/kernel-dummy.spec
+    install_changes $build_dir/kernel-dummy.changes
+
+    install -m 644                              \
+        rpm/kernel-source.rpmlintrc             \
+        $build_dir/kernel-source.rpmlintrc
+fi
 
 if test -e $build_dir/kernel-rt.spec; then
     echo "kernel-source-rt.spec"
@@ -403,15 +413,13 @@ install -m 644					\
 	rpm/module-renames			\
 	rpm/kernel-module-subpackage		\
 	rpm/macros.kernel-source		\
-	rpm/kernel-source.rpmlintrc		\
 	doc/README.SUSE				\
 	$build_dir
 
-install_changes $build_dir/kernel-source.changes
-install_changes $build_dir/kernel-dummy.changes
 
 if [ -x /work/src/bin/tools/convert_changes_to_rpm_changelog ]; then
-    /work/src/bin/tools/convert_changes_to_rpm_changelog <$build_dir/kernel-source.changes >"$build_dir"/rpm_changelog
+    /work/src/bin/tools/convert_changes_to_rpm_changelog kernel-source.changes \
+	kernel-source.changes.old >"$build_dir"/rpm_changelog
     for spec in "$build_dir"/*.spec; do
         (echo "%changelog"; cat "$build_dir"/rpm_changelog) >>"$spec"
     done
