@@ -371,6 +371,8 @@ fi
 
 if test -e $build_dir/kernel-rt.spec; then
     echo "kernel-source-rt.spec"
+    # workaround
+    binary_spec_files=${binary_spec_files/kernel-syms.spec/kernel-syms-rt.spec}
     prepare_source_and_syms kernel-syms-rt # compute archs and build_requires
     sed -e "s,@NAME@,kernel-source-rt,g" \
         -e "s,@SRCVERSION@,$SRCVERSION,g" \
