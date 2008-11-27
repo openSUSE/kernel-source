@@ -28,7 +28,7 @@ fi
 
 suffix=
 case @FLAVOR@ in
-    kdump|ps3|um|xen*)
+    kdump|ps3|xen*)
 	suffix=-@FLAVOR@
 	;;
 esac
@@ -113,7 +113,7 @@ if [ -f /etc/fstab -a ! -e /.buildenv ] ; then
 	# handle 10.1 and SLES10 GA
 	elif [ -x /sbin/update-bootloader ]; then
 	    case @FLAVOR@ in
-		kdump|um|ps3)
+		kdump|ps3)
 		    ;;
 		*)
 		    opt_xen_kernel=

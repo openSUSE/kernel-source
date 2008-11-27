@@ -21,7 +21,7 @@ fi
 remove_previos_entry=no
 suffix=
 case @FLAVOR@ in
-    kdump|ps3|um|xen*)
+    kdump|ps3|xen*)
         suffix=-@FLAVOR@
         ;;
 esac

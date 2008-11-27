@@ -97,7 +97,7 @@ the following 3 options are needed to build vanilla kernel with a stripped down 
 example usage:
 sudo $0 -l talk -D ppc -D x86_64 -ts
 sudo $0 -l talk -d stable -ts -nf
-sudo $0 -l talk -d stable -s um -s s390x -D i386 -D s390x -ts -nf
+sudo $0 -l talk -d stable -s s390x -D i386 -D s390x -ts -nf
 
 simple usage:
 sudo $0 -l talk
