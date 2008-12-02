@@ -167,6 +167,8 @@ if $using_git; then
     if test -n "$tag"; then
 	echo "GIT Branch: $tag" >>$build_dir/build-source-timestamp
     fi
+    git_commit=$(git rev-parse HEAD)
+    git_commit=${git_commit:0:8}
 fi
 
 
@@ -458,6 +460,7 @@ fi
 
 sed -e "s:@RELEASE_PREFIX@:$RELEASE_PREFIX:"		\
     -e "s:@RELEASE_SUFFIX@:$rpm_release_string:"	\
+    -e "s:@COMMIT@:$git_commit:"                        \
     rpm/get_release_number.sh.in			\
     > $build_dir/get_release_number.sh
 chmod 755 $build_dir/get_release_number.sh
