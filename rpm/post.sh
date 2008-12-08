@@ -8,13 +8,13 @@ wrong_boardtype() {
     exit 0
 }
 if [ -f /proc/cpuinfo ]; then
-    case "@RPM_TARGET_CPU@" in
-	ppc64)
+    case "@FLAVOR@-@RPM_TARGET_CPU@" in
+	vanilla-ppc64|default-ppc64|ps3-ppc64|ppc64-ppc64|kdump-ppc64|ps3-ppc|ppc64-ppc|kdump-ppc)
 		if [ -d /proc/iSeries -o ! -d /proc/ppc64 ]; then
 			wrong_boardtype "OpenFirmware based 64bit machines"
 		fi
 	;;
-	ppc)
+	vanilla-ppc|default-ppc)
 		if [ -d /proc/ppc64 -o -d /proc/iSeries ]; then
 			wrong_boardtype "32bit systems"
 		fi
