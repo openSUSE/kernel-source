@@ -3,26 +3,24 @@
 # On powerpc, the different kernels are for different board/firmware types
 # They are not compatible.
 wrong_boardtype() {
-    echo "This kernel-@FLAVOR@ is for $1, it will not boot on this system."
+    echo "This kernel-@FLAVOR@.@RPM_TARGET_CPU@.rpm is for $1, it will not boot on this system."
     echo "The /boot/vmlinux symlink will not be created or updated."
     exit 0
 }
 if [ -f /proc/cpuinfo ]; then
-    case "@FLAVOR@" in
-	ppc64|kdump)
-	    if [ -d /proc/device-tree ]; then
+    case "@RPM_TARGET_CPU@" in
+	ppc64)
 		if [ -d /proc/iSeries -o ! -d /proc/ppc64 ]; then
-		    wrong_boardtype "OpenFirmware based 64bit machines"
+			wrong_boardtype "OpenFirmware based 64bit machines"
 		fi
-	    fi
-	    ;;
-	default)
-	    if [ -d /proc/ppc64 -o -d /proc/iSeries ]; then
-		wrong_boardtype "32bit systems"
-	    fi
-	    ;;
+	;;
+	ppc)
+		if [ -d /proc/ppc64 -o -d /proc/iSeries ]; then
+			wrong_boardtype "32bit systems"
+		fi
+	;;
 	*)
-	    ;;
+	;;
     esac
 fi
 
