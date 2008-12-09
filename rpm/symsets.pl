@@ -1,30 +1,145 @@
 #!/usr/bin/env perl
+=head1 NAME
+
+symsets.pl - tool to generate symsets for the kernel packages
+
+=head1 SYNOPSIS
+
+symsets.pl --list-exported-symbols modules...
+
+symsets.pl --generate-symsets [--reference=DIR] --output-dir=DIR modules...
+
+symsets.pl --list-symsets [--reference=DIR] modules...
+
+symsets.pl --check-kabi --reference=DIR modules...
+
+=head1 OPTIONS
+
+=head3 MODE OPTIONS
+
+One of the following options has to be selected:
+
+=over
+
+=item B<--list-exported-symbols>
+
+List symbols exported by modules in a Module.symvers style format.
+
+=item B<--generate-symsets>
+
+Group exported symbols into symsets. Symbols from modules from the same
+directory end up in one symset. This option requires B<--output-dir>.
+
+=item B<--list-symsets>
+
+Like B<--generate-symsets>, but only print the symset names on stdout.
+
+=item B<--check-kabi>
+
+Check for kabi changes. This requires B<--reference>.
+
+=back
+
+=head3 OTHER OPTIONS
+
+=over
+
+=item B<-v, --verbose>
+
+Increase verbosity.
+
+=item B<--symvers-file=Module.symvers>
+
+Load built-in symbols from Module.symvers. Only symbols provided by the main
+kernel image (marked as vmlinux or built-in) are read from this file.
+
+=item B<--modules=FILE>
+
+Read list of modules from FILE instead of command line. This option can be used
+multiple times to read modules from multiple files.
+
+=item B<--required-modules=FILE>
+
+List of modules that are installed by packages required by this package. If
+a module moves from subpackage A to subpackage B, this can result in a changed
+symset checksum in A. Together with B<--reference>, this option ensures that
+the old checksum is provided in the subpackage that installs or requires
+all modules from the symset.
+
+=item B<--reference=DIR>
+
+Load symsets of a previous kernel package from DIR and add them to the output
+if the symbols are still provided by this kernel package.
+
+=item B<--output-dir=DIR>
+
+Write symsets into DIR (B<--generate-symsets> only).
+
+=item B<--max-badness=NUM>
+
+Set maximum allowed badness to NUM. Meaningful values are 4, 6, 8, 15 or 31
+(B<--check-kabi> only).
+
+=item B<--commonsyms=FILE>
+
+Read common symbols from FILE. Badness for changes to common symbols is
+incremented by 8 (the resulting badness is 16 by default). (B<--check-kabi>
+only).
+
+=item B<--usedsyms=FILE>
+
+Read used symbols from FILE. Badness for changes to used symbols is incremented
+by 16 (the resulting badness is 24 by default). (B<--check-kabi> only).
+
+=item B<--severities=FILE>
+
+Read a table of kabi change severities from FILE.  Each line consists of a
+GLOB-SEVERITY pair separated by whitespace. Changes in modules matching GLOB
+will have severity SEVERITY instead of the default 8. (B<--check-kabi> only).
+
+=back
+
+=cut
 
 use strict;
 use warnings;
-use diagnostics;
+#use diagnostics;
 
 use Digest::MD5 qw(md5_hex);
 use Getopt::Long;
-use Data::Dumper;
-
-
-our $usage = 
+eval { require Pod::Usage; };
+if ($@) {
+    sub pod2usage {
+        my %opts = @_;
+        print STDERR
 "Usage:
-  $0 --list-exported-symbols ...
-  $0 --generate-symsets [--reference=DIR] --output-dir=DIR ...
-  $0 --list-symsets [--reference=DIR] ...
-  $0 --check-kabi --reference=DIR ...
+    symsets.pl --list-exported-symbols ...
+    symsets.pl --generate-symsets [--reference=DIR] --output-dir=DIR ...
+    symsets.pl --list-symsets [--reference=DIR] ...
+    symsets.pl --check-kabi --reference=DIR ...
+
+Install Pod::Usage for a better help message.
 ";
+        exit $opts{-exitval};
+    }
+} else {
+    Pod::Usage->import('pod2usage');
+}
+
+
 our ($opt_verbose);
 our $kabi_badness = 0;
 our (%commonsyms, %usedsyms, @severities);
 our ($opt_list_exp, $opt_gen_sets, $opt_list_sets, $opt_check_kabi) = (0,0,0,0);
 our ($opt_max_badness, $opt_commonsyms, $opt_usedsyms, $opt_severities);
-our ($opt_output_dir, $opt_reference, $opt_modules, $opt_symvers_file);
+our ($opt_symvers_file, $opt_reference);
+our ($opt_output_dir);
 
 sub main {
-     my $res = GetOptions(
+    my (@modules, @pulled_modules);
+    my $res = GetOptions(
+        'verbose|v' => \$opt_verbose,
+
         'list-exported-symbols' => \$opt_list_exp,
         'generate-symsets' => \$opt_gen_sets,
         'list-symsets' => \$opt_list_sets,
@@ -36,11 +151,14 @@ sub main {
         'severities=s' => \$opt_severities,
 
         'symvers-file=s' => \$opt_symvers_file,
-        'modules=s' => \$opt_modules,
+        'modules=s' => sub { push(@modules, load_list($_[1])); },
+        'required-modules=s' => sub { push(@pulled_modules, load_list($_[1])); },
         'reference=s' => \$opt_reference,
 
         'output-dir=s' => \$opt_output_dir,
-        'verbose|v' => \$opt_verbose,
+
+        'usage' => sub { pod2usage(-exitval => 0, -verbose => 0); },
+        'help' => sub { pod2usage(-exitval => 0, -verbose => 1); },
     );
     # boring option checking
     my $opt_err = sub  {
@@ -69,30 +187,18 @@ sub main {
         }
     }
     # get list of modules
-    my @modules;
-    if (defined($opt_modules)) {
-        my $fh;
-        if ($opt_modules eq '-') {
-            open($fh, '<&STDIN');
-        } else {
-            open($fh, '<', $opt_modules) or die "Can't open module list $opt_modules: $!\n";
-        }
-        @modules = <$fh>;
-        chomp(@modules);
-        close($fh);
-    } else {
+    if (@modules == 0) {
         @modules = @ARGV;
     }
     if (@modules == 0) {
         &$opt_err("No modules supplied");
     }
     if (!$res) {
-        print STDERR $usage;
-        exit 1;
+        pod2usage(-exitval => 1, -verbose => 0, -output => ">&2");
     }
 
     # get list of exports
-    my @exports;
+    my (@exports, @pulled_exports);
     for my $file (@modules) {
         push(@exports, module_exports($file));
     }
@@ -102,6 +208,9 @@ sub main {
     if ($opt_list_exp) {
         print format_exports(@exports);
         exit 0;
+    }
+    for my $file (@pulled_modules) {
+        push(@pulled_exports, module_exports($file));
     }
 
     # generate symsets and optionally check kabi
@@ -113,7 +222,7 @@ sub main {
             load_kabi_files($opt_commonsyms, $opt_usedsyms, $opt_severities);
         }
         # records kabi breakage if $opt_check_kabi is set
-        preserve_symsets(\@ref, \@sets);
+        preserve_symsets(\@sets, \@ref, \@pulled_exports);
     }
     if ($opt_gen_sets) {
         write_symsets($opt_output_dir, @sets);
@@ -245,7 +354,7 @@ sub load_symsets {
     opendir(my $dh, $dir) or die "Error reading directory $dir: $!\n";
     for my $file (readdir($dh)) {
         next if $file =~ /^\.\.?$/;
-        if (!-f "$dir/$file" || $file !~ /^(\w+)\.[0-9a-f]{16}$/) {
+        if (!-f "$dir/$file" || $file !~ /^([\w-]+)\.[0-9a-f]{16}$/) {
             print STDERR "Ignoring unknown file $dir/$file\n";
             next;
         }
@@ -321,6 +430,22 @@ sub load_kabi_files {
     }
 }
 
+# loads a list of filenames from file
+sub load_list {
+    my ($file) = @_;
+    my ($fh, @res);
+
+    if ($file eq '-') {
+        open($fh, '<&STDIN');
+    } else {
+        open($fh, '<', $file) or die "Error opening $file: $!\n";
+    }
+    @res = <$fh>;
+    chomp(@res);
+    close($fh);
+    return @res;
+}
+
 # record kabi changes
 sub kabi_change {
     my $exp = shift;
@@ -346,9 +471,11 @@ sub kabi_change {
 
 # check if all symbols from $old symsetlist are provided by $new symsetlist,
 # add compatible symsets to $new
+# $pulled_exports is a exportlist of modules, that are pulled as dependencies
+# of this package (thus also "provided" by this package).
 sub preserve_symsets {
-    my ($old, $new) = @_;
-    my (%symcrcs, %symsethashes);
+    my ($new, $old, $pulled_exports) = @_;
+    my (%symcrcs, %pulled_symcrcs, %symsethashes);
 
     for my $set (@$new) {
         my $name = $set->[0];
@@ -358,6 +485,9 @@ sub preserve_symsets {
             $symcrcs{$exp->{sym}} = $exp->{crc};
         }
     }
+    for my $exp (@$pulled_exports) {
+        $pulled_symcrcs{$exp->{sym}} = $exp->{crc};
+    }
     for my $set (@$old) {
         my $name = $set->[0];
         my $exports = $set->[1];
@@ -366,22 +496,36 @@ sub preserve_symsets {
             next;
         }
         my $compatible = 1;
+        my $oursyms = 0;
         for my $exp (@$exports) {
-            if (!exists($symcrcs{$exp->{sym}})) {
+            my $crc;
+            if (exists($symcrcs{$exp->{sym}})) {
+                $oursyms++;
+                $crc = $symcrcs{$exp->{sym}};
+            } elsif (exists($pulled_symcrcs{$exp->{sym}})) {
+                $crc = $pulled_symcrcs{$exp->{sym}};
+            } else {
                 kabi_change($exp, "missing");
                 $compatible = 0;
                 next;
             }
-            if ($symcrcs{$exp->{sym}} ne $exp->{crc}) {
+            if ($crc ne $exp->{crc}) {
                 kabi_change($exp, "crc changed to $symcrcs{$exp->{sym}}\n");
                 $compatible = 0;
             }
         }
         if ($compatible) {
-            print STDERR "KABI: symset $name.$hash preserved\n" if $opt_verbose;
+            if ($oursyms == 0) {
+                # this symset is fully provided by a package we require,
+                # so do not duplicate it in our symsets
+                next;
+            }
+            print STDERR "KABI: symset $name.$hash preserved\n"
+                if $opt_verbose && $opt_check_kabi;
             push(@$new, $set);
         } else {
-            print STDERR "KABI: symset $name.$hash is NOT preserved\n" if $opt_verbose;
+            print STDERR "KABI: symset $name.$hash NOT preserved\n"
+                if $opt_check_kabi;
         }
     }
 }
