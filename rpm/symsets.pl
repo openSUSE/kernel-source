@@ -510,7 +510,7 @@ sub preserve_symsets {
                 next;
             }
             if ($crc ne $exp->{crc}) {
-                kabi_change($exp, "crc changed to $symcrcs{$exp->{sym}}\n");
+                kabi_change($exp, "crc changed to $crc\n");
                 $compatible = 0;
             }
         }
