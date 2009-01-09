@@ -1,8 +1,9 @@
 #!/bin/bash
 #set -xev
+source scripts/config.sh
 sudo -l
 important_specfiles="default ppc64 s390 kdump vanilla ps3 xen"
-all_specfiles="`sed -e '/^\+/s@^.*/@@p;d' config.conf | sort -u | xargs echo source dummy`"
+all_specfiles="`sed -e '/^\+/s@^.*/@@p;d' config.conf | sort -u | xargs echo source${VARIANT} dummy`"
 single_specfiles=
 timestamp=
 rpm_release_string=
@@ -112,7 +113,6 @@ EOF
 done
 mbuild_options="-l $user $mbuild_options $prefer_rpms $with_debug"
 if [ -z "$dist" ] ; then
-    source scripts/config.sh
     mbuild_options="$mbuild_options ${DIST_SET:+-d $DIST_SET}"
 fi
 if [ ! -z "$single_specfiles" ] ; then
