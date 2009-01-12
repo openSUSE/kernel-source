@@ -119,7 +119,7 @@ if [ ! -z "$single_specfiles" ] ; then
 specfiles=`echo $single_specfiles | sort | xargs echo`
 fi
 scripts/tar-up.sh $ignore_kabi $ignore_unsupported_deps $rpm_release_string $timestamp $tolerate_unknown_new_config_options || exit 1
-cd kernel-source
+cd $BUILD_DIR
 for i in $specfiles
 do
 	/work/src/bin/tools/prepare_spec kernel-$i.spec > kernel-$i.spec.new
