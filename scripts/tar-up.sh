@@ -234,6 +234,7 @@ for flavor in $flavors ; do
     # Generate spec file
     sed -e "s,@NAME@,kernel-$flavor,g" \
 	-e "s,@FLAVOR@,$flavor,g" \
+	-e "s,@VARIANT@,$VARIANT,g" \
 	-e "s,@SRCVERSION@,$SRCVERSION,g" \
 	-e "s,@PATCHVERSION@,$PATCHVERSION,g" \
 	-e "s,@RPMVERSION@,$RPMVERSION,g" \
@@ -346,6 +347,7 @@ if test -e $build_dir/kernel-default.spec; then
 
     echo "kernel-syms.spec"
     sed -e "s,@NAME@,kernel-syms,g" \
+        -e "s,@VARIANT@,,g" \
         -e "s,@SRCVERSION@,$SRCVERSION,g" \
         -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
         -e "s,@RPMVERSION@,$RPMVERSION,g" \
@@ -390,6 +392,7 @@ if test -e $build_dir/kernel-rt.spec; then
 
     echo "kernel-syms-rt.spec"
     sed -e "s,@NAME@,kernel-syms-rt,g" \
+        -e "s,@VARIANT@,-rt,g" \
         -e "s,@SRCVERSION@,$SRCVERSION,g" \
         -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
         -e "s,@RPMVERSION@,$RPMVERSION,g" \
@@ -409,6 +412,7 @@ echo "Copying various files..."
 install -m 644					\
 	config.conf				\
 	supported.conf				\
+	rpm/source-pre.sh			\
 	rpm/source-post.sh			\
 	rpm/pre.sh				\
 	rpm/post.sh				\

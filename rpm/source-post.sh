@@ -11,4 +11,8 @@ relink() {
 }
 
 relink linux-@KERNELRELEASE@@VARIANT@ /usr/src/linux@VARIANT@
-relink linux-@KERNELRELEASE@@VARIANT@-obj /usr/src/linux@VARIANT@-obj
+cd /usr/src
+for d in linux-@KERNELRELEASE@@VARIANT@-obj/*/*; do
+    arch_flavor=${d#*/}
+    relink ../../"$d" /usr/src/linux-obj/"$arch_flavor"
+done
