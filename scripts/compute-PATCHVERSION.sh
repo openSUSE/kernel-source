@@ -3,7 +3,7 @@
 export LANG=POSIX
 
 source $(dirname $0)/config.sh
-set -- $(IFS=.; echo $SRCVERSION)
+set -- $(echo $SRCVERSION | sed -ne 's/\([0-9]\+\).\([0-9]\+\).\([0-9]\+\)\(.*\)/\1 \2 \3 \4/p')
 
 VERSION=$1
 PATCHLEVEL=$2
