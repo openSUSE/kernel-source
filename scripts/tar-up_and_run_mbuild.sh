@@ -2,7 +2,7 @@
 #set -xev
 source scripts/config.sh
 sudo -l
-important_specfiles="default ppc64 s390 kdump vanilla ps3 xen"
+important_specfiles="default ppc64 kdump vanilla ps3 xen"
 all_specfiles="`sed -e '/^\+/s@^.*/@@p;d' config.conf | sort -u | xargs echo source${VARIANT} dummy`"
 single_specfiles=
 timestamp=
