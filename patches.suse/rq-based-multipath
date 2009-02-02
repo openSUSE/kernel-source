@@ -8,65 +8,502 @@ posted to dm-devel and linux-scsi on 03.10.2008.
 Signed-off-by: Hannes Reinecke <hare@suse.de>
 
 ---
- drivers/md/dm-ioctl.c         |   13 
- drivers/md/dm-mpath.c         |  192 +++++---
- drivers/md/dm-table.c         |   82 +++
- drivers/md/dm.c               |  952 +++++++++++++++++++++++++++++++++++++++---
- drivers/md/dm.h               |   17 
- include/linux/device-mapper.h |   24 +
- 6 files changed, 1158 insertions(+), 122 deletions(-)
 
+ drivers/md/dm-ioctl.c         |   13 
+ drivers/md/dm-mpath.c         |  193 ++++++---
+ drivers/md/dm-table.c         |   82 +++
+ drivers/md/dm.c               |  871 ++++++++++++++++++++++++++++++++++++++++--
+ drivers/md/dm.h               |   17 
+ include/linux/device-mapper.h |    9 
+ 6 files changed, 1089 insertions(+), 96 deletions(-)
+
+--- a/drivers/md/dm-ioctl.c
++++ b/drivers/md/dm-ioctl.c
+@@ -1043,6 +1043,12 @@ static int populate_table(struct dm_tabl
+ 		next = spec->next;
+ 	}
+ 
++	r = dm_table_set_type(table);
++	if (r) {
++		DMWARN("unable to set table type");
++		return r;
++	}
++
+ 	return dm_table_complete(table);
+ }
+ 
+@@ -1066,6 +1072,13 @@ static int table_load(struct dm_ioctl *p
+ 		dm_table_put(t);
+ 		goto out;
+ 	}
++
++	r = dm_init_md_mempool(md, dm_table_get_type(t));
++	if (r) {
++		DMWARN("unable to initialize the md mempools for this table");
++		dm_table_put(t);
++		goto out;
++	}
+ 
+ 	down_write(&_hash_lock);
+ 	hc = dm_get_mdptr(md);
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@ -8,9 +8,8 @@
+ #include <linux/device-mapper.h>
+ 
+ #include "dm-path-selector.h"
+-#include "dm-bio-list.h"
+-#include "dm-bio-record.h"
+ #include "dm-uevent.h"
++#include "dm.h"
+ 
+ #include <linux/ctype.h>
+ #include <linux/init.h>
+@@ -85,7 +84,7 @@ struct multipath {
+ 	unsigned pg_init_count;		/* Number of times pg_init called */
+ 
+ 	struct work_struct process_queued_ios;
+-	struct bio_list queued_ios;
++	struct list_head queued_ios;
+ 	unsigned queue_size;
+ 
+ 	struct work_struct trigger_event;
+@@ -102,7 +101,6 @@ struct multipath {
+  */
+ struct dm_mpath_io {
+ 	struct pgpath *pgpath;
+-	struct dm_bio_details details;
+ };
+ 
+ typedef int (*action_fn) (struct pgpath *pgpath);
+@@ -199,6 +197,7 @@ static struct multipath *alloc_multipath
+ 	m = kzalloc(sizeof(*m), GFP_KERNEL);
+ 	if (m) {
+ 		INIT_LIST_HEAD(&m->priority_groups);
++		INIT_LIST_HEAD(&m->queued_ios);
+ 		spin_lock_init(&m->lock);
+ 		m->queue_io = 1;
+ 		INIT_WORK(&m->process_queued_ios, process_queued_ios);
+@@ -323,12 +322,13 @@ static int __must_push_back(struct multi
+ 		dm_noflush_suspending(m->ti));
+ }
+ 
+-static int map_io(struct multipath *m, struct bio *bio,
++static int map_io(struct multipath *m, struct request *clone,
+ 		  struct dm_mpath_io *mpio, unsigned was_queued)
+ {
+ 	int r = DM_MAPIO_REMAPPED;
+ 	unsigned long flags;
+ 	struct pgpath *pgpath;
++	struct block_device *bdev;
+ 
+ 	spin_lock_irqsave(&m->lock, flags);
+ 
+@@ -345,16 +345,18 @@ static int map_io(struct multipath *m, s
+ 	if ((pgpath && m->queue_io) ||
+ 	    (!pgpath && m->queue_if_no_path)) {
+ 		/* Queue for the daemon to resubmit */
+-		bio_list_add(&m->queued_ios, bio);
++		list_add_tail(&clone->queuelist, &m->queued_ios);
+ 		m->queue_size++;
+ 		if ((m->pg_init_required && !m->pg_init_in_progress) ||
+ 		    !m->queue_io)
+ 			queue_work(kmultipathd, &m->process_queued_ios);
+ 		pgpath = NULL;
+ 		r = DM_MAPIO_SUBMITTED;
+-	} else if (pgpath)
+-		bio->bi_bdev = pgpath->path.dev->bdev;
+-	else if (__must_push_back(m))
++	} else if (pgpath) {
++		bdev = pgpath->path.dev->bdev;
++		clone->q = bdev_get_queue(bdev);
++		clone->rq_disk = bdev->bd_disk;
++	} else if (__must_push_back(m))
+ 		r = DM_MAPIO_REQUEUE;
+ 	else
+ 		r = -EIO;	/* Failed */
+@@ -397,30 +399,31 @@ static void dispatch_queued_ios(struct m
+ {
+ 	int r;
+ 	unsigned long flags;
+-	struct bio *bio = NULL, *next;
+ 	struct dm_mpath_io *mpio;
+ 	union map_info *info;
++	struct request *clone, *n;
++	LIST_HEAD(cl);
+ 
+ 	spin_lock_irqsave(&m->lock, flags);
+-	bio = bio_list_get(&m->queued_ios);
++	list_splice_init(&m->queued_ios, &cl);
+ 	spin_unlock_irqrestore(&m->lock, flags);
+ 
+-	while (bio) {
+-		next = bio->bi_next;
+-		bio->bi_next = NULL;
++	list_for_each_entry_safe(clone, n, &cl, queuelist) {
++		list_del_init(&clone->queuelist);
+ 
+-		info = dm_get_mapinfo(bio);
++		info = dm_get_rq_mapinfo(clone);
+ 		mpio = info->ptr;
+ 
+-		r = map_io(m, bio, mpio, 1);
+-		if (r < 0)
+-			bio_endio(bio, r);
+-		else if (r == DM_MAPIO_REMAPPED)
+-			generic_make_request(bio);
+-		else if (r == DM_MAPIO_REQUEUE)
+-			bio_endio(bio, -EIO);
+-
+-		bio = next;
++		r = map_io(m, clone, mpio, 1);
++		if (r < 0) {
++			mempool_free(mpio, m->mpio_pool);
++			dm_kill_request(clone, r);
++		} else if (r == DM_MAPIO_REMAPPED)
++			dm_dispatch_request(clone);
++		else if (r == DM_MAPIO_REQUEUE) {
++			mempool_free(mpio, m->mpio_pool);
++			dm_requeue_request(clone);
++		}
+ 	}
+ }
+ 
+@@ -841,21 +844,24 @@ static void multipath_dtr(struct dm_targ
+ }
+ 
+ /*
+- * Map bios, recording original fields for later in case we have to resubmit
++ * Map cloned requests
+  */
+-static int multipath_map(struct dm_target *ti, struct bio *bio,
++static int multipath_map(struct dm_target *ti, struct request *clone,
+ 			 union map_info *map_context)
+ {
+ 	int r;
+ 	struct dm_mpath_io *mpio;
+ 	struct multipath *m = (struct multipath *) ti->private;
+ 
+-	mpio = mempool_alloc(m->mpio_pool, GFP_NOIO);
+-	dm_bio_record(&mpio->details, bio);
++	mpio = mempool_alloc(m->mpio_pool, GFP_ATOMIC);
++	if (!mpio)
++		/* ENOMEM, requeue */
++		return DM_MAPIO_REQUEUE;
++	memset(mpio, 0, sizeof(*mpio));
+ 
+ 	map_context->ptr = mpio;
+-	bio->bi_rw |= (1 << BIO_RW_FAILFAST_TRANSPORT);
+-	r = map_io(m, bio, mpio, 0);
++	clone->cmd_flags |= REQ_FAILFAST_TRANSPORT;
++	r = map_io(m, clone, mpio, 0);
+ 	if (r < 0 || r == DM_MAPIO_REQUEUE)
+ 		mempool_free(mpio, m->mpio_pool);
+ 
+@@ -1137,53 +1143,41 @@ static void activate_path(struct work_st
+ /*
+  * end_io handling
+  */
+-static int do_end_io(struct multipath *m, struct bio *bio,
++static int do_end_io(struct multipath *m, struct request *clone,
+ 		     int error, struct dm_mpath_io *mpio)
+ {
++	/*
++	 * We don't queue any clone request inside the multipath target
++	 * during end I/O handling, since those clone requests don't have
++	 * bio clones.  If we queue them inside the multipath target,
++	 * we need to make bio clones, that requires memory allocation.
++	 * (See drivers/md/dm.c:end_clone_bio() about why the clone requests
++	 *  don't have bio clones.)
++	 * Instead of queueing the clone request here, we queue the original
++	 * request into dm core, which will remake a clone request and
++	 * clone bios for it and resubmit it later.
++	 */
++	int r = DM_ENDIO_REQUEUE;
+ 	unsigned long flags;
+ 
+-	if (!error)
++	if (!error && !clone->errors)
+ 		return 0;	/* I/O complete */
+ 
+-	if ((error == -EWOULDBLOCK) && bio_rw_ahead(bio))
+-		return error;
+-
+ 	if (error == -EOPNOTSUPP)
+ 		return error;
+ 
+-	spin_lock_irqsave(&m->lock, flags);
+-	if (!m->nr_valid_paths) {
+-		if (__must_push_back(m)) {
+-			spin_unlock_irqrestore(&m->lock, flags);
+-			return DM_ENDIO_REQUEUE;
+-		} else if (!m->queue_if_no_path) {
+-			spin_unlock_irqrestore(&m->lock, flags);
+-			return -EIO;
+-		} else {
+-			spin_unlock_irqrestore(&m->lock, flags);
+-			goto requeue;
+-		}
+-	}
+-	spin_unlock_irqrestore(&m->lock, flags);
+-
+ 	if (mpio->pgpath)
+ 		fail_path(mpio->pgpath);
+ 
+-      requeue:
+-	dm_bio_restore(&mpio->details, bio);
+-
+-	/* queue for the daemon to resubmit or fail */
+ 	spin_lock_irqsave(&m->lock, flags);
+-	bio_list_add(&m->queued_ios, bio);
+-	m->queue_size++;
+-	if (!m->queue_io)
+-		queue_work(kmultipathd, &m->process_queued_ios);
++	if (!m->nr_valid_paths && !m->queue_if_no_path && !__must_push_back(m))
++		r = -EIO;
+ 	spin_unlock_irqrestore(&m->lock, flags);
+ 
+-	return DM_ENDIO_INCOMPLETE;	/* io not complete */
++	return r;
+ }
+ 
+-static int multipath_end_io(struct dm_target *ti, struct bio *bio,
++static int multipath_end_io(struct dm_target *ti, struct request *clone,
+ 			    int error, union map_info *map_context)
+ {
+ 	struct multipath *m = ti->private;
+@@ -1192,14 +1186,13 @@ static int multipath_end_io(struct dm_ta
+ 	struct path_selector *ps;
+ 	int r;
+ 
+-	r  = do_end_io(m, bio, error, mpio);
++	r  = do_end_io(m, clone, error, mpio);
+ 	if (pgpath) {
+ 		ps = &pgpath->pg->ps;
+ 		if (ps->type->end_io)
+ 			ps->type->end_io(ps, &pgpath->path);
+ 	}
+-	if (r != DM_ENDIO_INCOMPLETE)
+-		mempool_free(mpio, m->mpio_pool);
++	mempool_free(mpio, m->mpio_pool);
+ 
+ 	return r;
+ }
+@@ -1429,6 +1422,75 @@ static int multipath_ioctl(struct dm_tar
+ 	return r ? : __blkdev_driver_ioctl(bdev, mode, cmd, arg);
+ }
+ 
++static int __pgpath_busy(struct pgpath *pgpath)
++{
++	struct request_queue *q = bdev_get_queue(pgpath->path.dev->bdev);
++
++	return dm_underlying_device_busy(q);
++}
++
++/*
++ * We return "busy", only when we can map I/Os but underlying devices
++ * are busy (so even if we map I/Os now, the I/Os will wait on
++ * the underlying queue).
++ * In other words, if we want to kill I/Os or queue them inside us
++ * due to map unavailability, we don't return "busy".  Otherwise,
++ * dm core won't give us the I/Os and we can't do what we want.
++ */
++static int multipath_busy(struct dm_target *ti)
++{
++	int busy = 0, has_active = 0;
++	struct multipath *m = (struct multipath *) ti->private;
++	struct priority_group *pg;
++	struct pgpath *pgpath;
++	unsigned long flags;
++
++	spin_lock_irqsave(&m->lock, flags);
++
++	/* Guess which priority_group will be used at next mapping time */
++	if (unlikely(!m->current_pgpath && m->next_pg))
++		pg = m->next_pg;
++	else if (likely(m->current_pg))
++		pg = m->current_pg;
++	else
++		/*
++		 * We don't know which pg will be used at next mapping time.
++		 * We don't call __choose_pgpath() here to avoid to trigger
++		 * pg_init just by busy checking.
++		 * So we don't know whether underlying devices we will be using
++		 * at next mapping time are busy or not. Just try mapping.
++		 */
++		goto out;
++
++	/*
++	 * If there is one non-busy active path at least, the path selector
++	 * will be able to select it. So we consider such a pg as not busy.
++	 */
++	busy = 1;
++	list_for_each_entry(pgpath, &pg->pgpaths, list)
++		if (pgpath->is_active) {
++			has_active = 1;
++
++			if (!__pgpath_busy(pgpath)) {
++				busy = 0;
++				break;
++			}
++		}
++
++	if (!has_active)
++		/*
++		 * No active path in this pg, so this pg won't be used and
++		 * the current_pg will be changed at next mapping time.
++		 * We need to try mapping to determine it.
++		 */
++		busy = 0;
++
++out:
++	spin_unlock_irqrestore(&m->lock, flags);
++
++	return busy;
++}
++
+ /*-----------------------------------------------------------------
+  * Module setup
+  *---------------------------------------------------------------*/
+@@ -1438,13 +1500,14 @@ static struct target_type multipath_targ
+ 	.module = THIS_MODULE,
+ 	.ctr = multipath_ctr,
+ 	.dtr = multipath_dtr,
+-	.map = multipath_map,
+-	.end_io = multipath_end_io,
++	.map_rq = multipath_map,
++	.rq_end_io = multipath_end_io,
+ 	.presuspend = multipath_presuspend,
+ 	.resume = multipath_resume,
+ 	.status = multipath_status,
+ 	.message = multipath_message,
+ 	.ioctl  = multipath_ioctl,
++	.busy = multipath_busy,
+ };
+ 
+ static int __init dm_multipath_init(void)
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -124,6 +124,8 @@ static void combine_restrictions_low(str
+ 	lhs->bounce_pfn = min_not_zero(lhs->bounce_pfn, rhs->bounce_pfn);
+ 
+ 	lhs->no_cluster |= rhs->no_cluster;
++
++	lhs->no_request_stacking |= rhs->no_request_stacking;
+ }
+ 
+ /*
+@@ -545,6 +547,8 @@ void dm_set_device_limits(struct dm_targ
+ 	rs->bounce_pfn = min_not_zero(rs->bounce_pfn, q->bounce_pfn);
+ 
+ 	rs->no_cluster |= !test_bit(QUEUE_FLAG_CLUSTER, &q->queue_flags);
++
++	rs->no_request_stacking |= !blk_queue_stackable(q);
+ }
+ EXPORT_SYMBOL_GPL(dm_set_device_limits);
+ 
+@@ -761,6 +765,66 @@ int dm_table_add_target(struct dm_table
+ 	return r;
+ }
+ 
++int dm_table_set_type(struct dm_table *t)
++{
++	int i;
++	int bio_based = 0, request_based = 0;
++	struct dm_target *tgt;
++
++	for (i = 0; i < t->num_targets; i++) {
++		tgt = t->targets + i;
++		if (tgt->type->map_rq)
++			request_based = 1;
++		else
++			bio_based = 1;
++
++		if (bio_based && request_based) {
++			DMWARN("Inconsistent table: different target types"
++			       " can't be mixed up");
++			return -EINVAL;
++		}
++	}
++
++	if (bio_based) {
++		/* We must use this table as bio-based */
++		t->limits.no_request_stacking = 1;
++		return 0;
++	}
++
++	BUG_ON(!request_based); /* No targets in this table */
++
++	/* Non-request-stackable devices can't be used for request-based dm */
++	if (t->limits.no_request_stacking) {
++		DMWARN("table load rejected: including non-request-stackable"
++		       " devices");
++		return -EINVAL;
++	}
++
++	/*
++	 * Request-based dm supports only tables that have a single target now.
++	 * To support multiple targets, request splitting support is needed,
++	 * and that needs lots of changes in the block-layer.
++	 * (e.g. request completion process for partial completion.)
++	 */
++	if (t->num_targets > 1) {
++		DMWARN("Request-based dm doesn't support multiple targets yet");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++int dm_table_get_type(struct dm_table *t)
++{
++	return t->limits.no_request_stacking ?
++		DM_TYPE_BIO_BASED : DM_TYPE_REQUEST_BASED;
++}
++
++int dm_table_request_based(struct dm_table *t)
++{
++	return dm_table_get_type(t) == DM_TYPE_REQUEST_BASED;
++}
++
+ static int setup_indexes(struct dm_table *t)
+ {
+ 	int i;
+@@ -897,6 +961,10 @@ void dm_table_set_restrictions(struct dm
+ 	else
+ 		queue_flag_set_unlocked(QUEUE_FLAG_CLUSTER, q);
+ 
++	if (t->limits.no_request_stacking)
++		queue_flag_clear_unlocked(QUEUE_FLAG_STACKABLE, q);
++	else
++		queue_flag_set_unlocked(QUEUE_FLAG_STACKABLE, q);
+ }
+ 
+ unsigned int dm_table_get_num_targets(struct dm_table *t)
+@@ -992,6 +1060,20 @@ int dm_table_any_congested(struct dm_tab
+ 	return r;
+ }
+ 
++int dm_table_any_busy_target(struct dm_table *t)
++{
++	int i;
++	struct dm_target *ti;
++
++	for (i = 0; i < t->num_targets; i++) {
++		ti = t->targets + i;
++		if (ti->type->busy && ti->type->busy(ti))
++			return 1;
++	}
++
++	return 0;
++}
++
+ void dm_table_unplug_all(struct dm_table *t)
+ {
+ 	struct dm_dev_internal *dd;
 --- a/drivers/md/dm.c
 +++ b/drivers/md/dm.c
-@@ -32,6 +32,7 @@ static unsigned int _major = 0;
- 
- static DEFINE_SPINLOCK(_minor_lock);
- /*
-+ * For bio based dm.
-  * One of these is allocated per bio.
-  */
- struct dm_io {
-@@ -43,6 +44,7 @@ struct dm_io {
- };
- 
- /*
-+ * For bio based dm.
-  * One of these is allocated per target within a bio.  Hopefully
-  * this will be simplified out one day.
-  */
-@@ -52,6 +54,31 @@ struct dm_target_io {
- 	union map_info info;
- };
- 
-+/*
-+ * For request based dm.
-+ * One of these is allocated per request.
-+ *
-+ * Since assuming "original request : cloned request = 1 : 1" and
-+ * a counter for number of clones like struct dm_io.io_count isn't needed,
-+ * struct dm_io and struct target_io can be merged.
-+ */
-+struct dm_rq_target_io {
-+	struct mapped_device *md;
-+	struct dm_target *ti;
-+	struct request *orig, clone;
-+	int error;
-+	union map_info info;
-+};
-+
-+/*
-+ * For request based dm.
-+ * One of these is allocated per bio.
-+ */
-+struct dm_clone_bio_info {
-+	struct bio *orig;
-+	struct request *rq;
-+};
-+
- union map_info *dm_get_mapinfo(struct bio *bio)
- {
- 	if (bio && bio->bi_private)
-@@ -59,6 +86,14 @@ union map_info *dm_get_mapinfo(struct bi
+@@ -84,6 +84,14 @@ union map_info *dm_get_mapinfo(struct bi
  	return NULL;
  }
  
@@ -81,15 +518,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  #define MINOR_ALLOCED ((void *)-1)
  
  /*
-@@ -76,7 +111,6 @@ union map_info *dm_get_mapinfo(struct bi
-  */
- struct dm_wq_req {
- 	enum {
--		DM_WQ_FLUSH_ALL,
- 		DM_WQ_FLUSH_DEFERRED,
- 	} type;
- 	struct work_struct work;
-@@ -126,6 +160,8 @@ struct mapped_device {
+@@ -150,6 +158,8 @@ struct mapped_device {
  
  	struct bio_set *bs;
  
@@ -98,10 +527,10 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  	/*
  	 * Event handling.
  	 */
-@@ -143,52 +179,74 @@ struct mapped_device {
+@@ -170,6 +180,12 @@ struct mapped_device {
  
- 	/* forced geometry settings */
- 	struct hd_geometry geometry;
+ 	/* sysfs handle */
+ 	struct kobject kobj;
 +
 +	/* marker of flush suspend for request-based dm */
 +	struct request suspend_rq;
@@ -111,86 +540,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  };
  
  #define MIN_IOS 256
- static struct kmem_cache *_io_cache;
- static struct kmem_cache *_tio_cache;
-+static struct kmem_cache *_rq_tio_cache;
-+static struct kmem_cache *_bio_info_cache;
- 
- static int __init local_init(void)
- {
--	int r;
-+	int r = -ENOMEM;
- 
- 	/* allocate a slab for the dm_ios */
- 	_io_cache = KMEM_CACHE(dm_io, 0);
- 	if (!_io_cache)
--		return -ENOMEM;
-+		return r;
- 
- 	/* allocate a slab for the target ios */
- 	_tio_cache = KMEM_CACHE(dm_target_io, 0);
--	if (!_tio_cache) {
--		kmem_cache_destroy(_io_cache);
--		return -ENOMEM;
--	}
-+	if (!_tio_cache)
-+		goto out_free_io_cache;
-+
-+	_rq_tio_cache = KMEM_CACHE(dm_rq_target_io, 0);
-+	if (!_rq_tio_cache)
-+		goto out_free_tio_cache;
-+
-+	_bio_info_cache = KMEM_CACHE(dm_clone_bio_info, 0);
-+	if (!_bio_info_cache)
-+		goto out_free_rq_tio_cache;
- 
- 	r = dm_uevent_init();
--	if (r) {
--		kmem_cache_destroy(_tio_cache);
--		kmem_cache_destroy(_io_cache);
--		return r;
--	}
-+	if (r)
-+		goto out_free_bio_info_cache;
- 
- 	_major = major;
- 	r = register_blkdev(_major, _name);
--	if (r < 0) {
--		kmem_cache_destroy(_tio_cache);
--		kmem_cache_destroy(_io_cache);
--		dm_uevent_exit();
--		return r;
--	}
-+	if (r < 0)
-+		goto out_uevent_exit;
- 
- 	if (!_major)
- 		_major = r;
- 
- 	return 0;
-+
-+out_uevent_exit:
-+	dm_uevent_exit();
-+out_free_bio_info_cache:
-+	kmem_cache_destroy(_bio_info_cache);
-+out_free_rq_tio_cache:
-+	kmem_cache_destroy(_rq_tio_cache);
-+out_free_tio_cache:
-+	kmem_cache_destroy(_tio_cache);
-+out_free_io_cache:
-+	kmem_cache_destroy(_io_cache);
-+
-+	return r;
- }
- 
- static void local_exit(void)
- {
-+	kmem_cache_destroy(_bio_info_cache);
-+	kmem_cache_destroy(_rq_tio_cache);
- 	kmem_cache_destroy(_tio_cache);
- 	kmem_cache_destroy(_io_cache);
- 	unregister_blkdev(_major, _name);
-@@ -380,6 +438,28 @@ static void free_tio(struct mapped_devic
+@@ -413,6 +429,28 @@ static void free_tio(struct mapped_devic
  	mempool_free(tio, md->tio_pool);
  }
  
@@ -205,13 +555,13 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
 +	mempool_free(tio, md->tio_pool);
 +}
 +
-+static inline struct dm_clone_bio_info *alloc_bio_info(struct mapped_device *md)
++static inline struct dm_rq_clone_bio_info *alloc_bio_info(struct mapped_device *md)
 +{
 +	return mempool_alloc(md->io_pool, GFP_ATOMIC);
 +}
 +
 +static inline void free_bio_info(struct mapped_device *md,
-+				 struct dm_clone_bio_info *info)
++				 struct dm_rq_clone_bio_info *info)
 +{
 +	mempool_free(info, md->io_pool);
 +}
@@ -219,7 +569,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  static void start_io_acct(struct dm_io *io)
  {
  	struct mapped_device *md = io->md;
-@@ -568,6 +648,266 @@ static void clone_endio(struct bio *bio,
+@@ -602,6 +640,266 @@ static void clone_endio(struct bio *bio,
  	free_tio(md, tio);
  }
  
@@ -228,7 +578,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
 + */
 +static void end_clone_bio(struct bio *clone, int error)
 +{
-+	struct dm_clone_bio_info *info = clone->bi_private;
++	struct dm_rq_clone_bio_info *info = clone->bi_private;
 +	struct dm_rq_target_io *tio = info->rq->end_io_data;
 +	struct bio *bio = info->orig;
 +	unsigned int nr_bytes = info->orig->bi_size;
@@ -280,7 +630,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
 +	struct dm_rq_target_io *tio = clone->end_io_data;
 +	struct mapped_device *md = tio->md;
 +	struct bio *bio;
-+	struct dm_clone_bio_info *info;
++	struct dm_rq_clone_bio_info *info;
 +
 +	while ((bio = clone->bio) != NULL) {
 +		clone->bio = bio->bi_next;
@@ -486,7 +836,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  static sector_t max_io_len(struct mapped_device *md,
  			   sector_t sector, struct dm_target *ti)
  {
-@@ -886,7 +1226,7 @@ out:
+@@ -925,7 +1223,7 @@ out:
   * The request function that just remaps the bio built up by
   * dm_merge_bvec.
   */
@@ -495,7 +845,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  {
  	int r = -EIO;
  	int rw = bio_data_dir(bio);
-@@ -936,12 +1276,335 @@ out_req:
+@@ -969,12 +1267,335 @@ out_req:
  	return 0;
  }
  
@@ -569,7 +919,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
 +			      struct mapped_device *md)
 +{
 +	struct bio *bio, *clone_bio;
-+	struct dm_clone_bio_info *info;
++	struct dm_rq_clone_bio_info *info;
 +
 +	for (bio = rq->bio; bio; bio = bio->bi_next) {
 +		info = alloc_bio_info(md);
@@ -831,20 +1181,30 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  		dm_table_unplug_all(map);
  		dm_table_put(map);
  	}
-@@ -955,6 +1618,12 @@ static int dm_any_congested(void *conges
+@@ -987,10 +1608,18 @@ static int dm_any_congested(void *conges
+ 	struct dm_table *map;
  
- 	if (!map || test_bit(DMF_BLOCK_IO, &md->flags))
- 		r = bdi_bits;
-+	else if (dm_request_based(md))
-+		/*
-+		 * Request-based dm cares about only own queue for
-+		 * the query about congestion status of request_queue
-+		 */
-+		r = md->queue->backing_dev_info.state & bdi_bits;
- 	else
- 		r = dm_table_any_congested(map, bdi_bits);
+ 	if (!test_bit(DMF_BLOCK_IO, &md->flags)) {
+-		map = dm_get_table(md);
+-		if (map) {
+-			r = dm_table_any_congested(map, bdi_bits);
+-			dm_table_put(map);
++		if (dm_request_based(md))
++			/*
++			 * Request-based dm cares about only own queue for
++			 * the query about congestion status of request_queue
++			 */
++			r = md->queue->backing_dev_info.state & bdi_bits;
++		else {
++			map = dm_get_table(md);
++			if (map) {
++				r = dm_table_any_congested(map, bdi_bits);
++				dm_table_put(map);
++			}
+ 		}
+ 	}
  
-@@ -1075,10 +1744,22 @@ static struct mapped_device *alloc_dev(i
+@@ -1110,10 +1739,22 @@ static struct mapped_device *alloc_dev(i
  	INIT_LIST_HEAD(&md->uevent_list);
  	spin_lock_init(&md->uevent_lock);
  
@@ -868,7 +1228,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  	md->queue->queuedata = md;
  	md->queue->backing_dev_info.congested_fn = dm_any_congested;
  	md->queue->backing_dev_info.congested_data = md;
-@@ -1086,18 +1767,9 @@ static struct mapped_device *alloc_dev(i
+@@ -1121,18 +1762,9 @@ static struct mapped_device *alloc_dev(i
  	blk_queue_bounce_limit(md->queue, BLK_BOUNCE_ANY);
  	md->queue->unplug_fn = dm_unplug_all;
  	blk_queue_merge_bvec(md->queue, dm_merge_bvec);
@@ -881,7 +1241,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
 -	if (!md->tio_pool)
 -		goto bad_tio_pool;
 -
--	md->bs = bioset_create(16, 16);
+-	md->bs = bioset_create(16, 0);
 -	if (!md->bs)
 -		goto bad_no_bioset;
 +	blk_queue_softirq_done(md->queue, dm_softirq_done);
@@ -890,7 +1250,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  
  	md->disk = alloc_disk(1);
  	if (!md->disk)
-@@ -1132,12 +1804,6 @@ static struct mapped_device *alloc_dev(i
+@@ -1167,12 +1799,6 @@ static struct mapped_device *alloc_dev(i
  bad_thread:
  	put_disk(md->disk);
  bad_disk:
@@ -903,7 +1263,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  	blk_cleanup_queue(md->queue);
  bad_queue:
  	free_minor(minor);
-@@ -1159,9 +1825,12 @@ static void free_dev(struct mapped_devic
+@@ -1194,9 +1820,12 @@ static void free_dev(struct mapped_devic
  		bdput(md->suspended_bdev);
  	}
  	destroy_workqueue(md->wq);
@@ -919,8 +1279,8 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  	del_gendisk(md->disk);
  	free_minor(minor);
  
-@@ -1224,6 +1893,16 @@ static int __bind(struct mapped_device *
- 	dm_table_get(t);
+@@ -1261,6 +1890,16 @@ static int __bind(struct mapped_device *
+ 
  	dm_table_event_callback(t, event_callback, md);
  
 +	/*
@@ -936,7 +1296,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  	write_lock(&md->map_lock);
  	md->map = t;
  	dm_table_set_restrictions(t, q);
-@@ -1346,7 +2025,11 @@ static int dm_wait_for_completion(struct
+@@ -1387,7 +2026,11 @@ static int dm_wait_for_completion(struct
  		set_current_state(TASK_INTERRUPTIBLE);
  
  		smp_mb();
@@ -949,7 +1309,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  			break;
  
  		if (signal_pending(current)) {
-@@ -1369,7 +2052,13 @@ static void __flush_deferred_io(struct m
+@@ -1410,7 +2053,13 @@ static void __flush_deferred_io(struct m
  	struct bio *c;
  
  	while ((c = bio_list_pop(&md->deferred))) {
@@ -964,17 +1324,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  			bio_io_error(c);
  	}
  
-@@ -1394,9 +2083,6 @@ static void dm_wq_work(struct work_struc
- 
- 	down_write(&md->io_lock);
- 	switch (req->type) {
--	case DM_WQ_FLUSH_ALL:
--		__merge_pushback_list(md);
--		/* pass through */
- 	case DM_WQ_FLUSH_DEFERRED:
- 		__flush_deferred_io(md);
- 		break;
-@@ -1451,6 +2137,88 @@ out:
+@@ -1489,6 +2138,88 @@ out:
  	return r;
  }
  
@@ -1063,16 +1413,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  /*
   * Functions to lock and unlock any filesystem running on the
   * device.
-@@ -1526,7 +2294,7 @@ int dm_suspend(struct mapped_device *md,
- 		if (!md->suspended_bdev) {
- 			DMWARN("bdget failed in dm_suspend");
- 			r = -ENOMEM;
--			goto flush_and_out;
-+			goto out;
- 		}
- 
- 		/*
-@@ -1549,6 +2317,9 @@ int dm_suspend(struct mapped_device *md,
+@@ -1587,6 +2318,9 @@ int dm_suspend(struct mapped_device *md,
  	add_wait_queue(&md->wait, &wait);
  	up_write(&md->io_lock);
  
@@ -1082,7 +1423,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  	/* unplug */
  	if (map)
  		dm_table_unplug_all(map);
-@@ -1561,14 +2332,22 @@ int dm_suspend(struct mapped_device *md,
+@@ -1599,14 +2333,22 @@ int dm_suspend(struct mapped_device *md,
  	down_write(&md->io_lock);
  	remove_wait_queue(&md->wait, &wait);
  
@@ -1107,22 +1448,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  		unlock_fs(md);
  		goto out; /* pushback list is already flushed, so skip flush */
  	}
-@@ -1577,14 +2356,6 @@ int dm_suspend(struct mapped_device *md,
- 
- 	set_bit(DMF_SUSPENDED, &md->flags);
- 
--flush_and_out:
--	if (r && noflush)
--		/*
--		 * Because there may be already I/Os in the pushback list,
--		 * flush them before return.
--		 */
--		dm_queue_flush(md, DM_WQ_FLUSH_ALL, NULL);
--
- out:
- 	if (r && md->suspended_bdev) {
- 		bdput(md->suspended_bdev);
-@@ -1617,6 +2388,14 @@ int dm_resume(struct mapped_device *md)
+@@ -1647,6 +2389,14 @@ int dm_resume(struct mapped_device *md)
  
  	dm_queue_flush(md, DM_WQ_FLUSH_DEFERRED, NULL);
  
@@ -1137,7 +1463,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  	unlock_fs(md);
  
  	if (md->suspended_bdev) {
-@@ -1698,6 +2477,65 @@ int dm_noflush_suspending(struct dm_targ
+@@ -1749,6 +2499,65 @@ int dm_noflush_suspending(struct dm_targ
  }
  EXPORT_SYMBOL_GPL(dm_noflush_suspending);
  
@@ -1170,7 +1496,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
 +
 +	md->io_pool = (type == DM_TYPE_BIO_BASED) ?
 +		      mempool_create_slab_pool(MIN_IOS, _io_cache) :
-+		      mempool_create_slab_pool(MIN_IOS, _bio_info_cache);
++		      mempool_create_slab_pool(MIN_IOS, _rq_bio_info_cache);
 +	if (!md->io_pool)
 +		return -ENOMEM;
 +
@@ -1218,8 +1544,8 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
 +/*
   * List of devices that a metadevice uses and should open/close.
   */
- struct dm_dev {
-@@ -49,6 +56,10 @@ void dm_table_presuspend_targets(struct 
+ struct dm_dev_internal {
+@@ -47,6 +54,10 @@ void dm_table_presuspend_targets(struct
  void dm_table_postsuspend_targets(struct dm_table *t);
  int dm_table_resume_targets(struct dm_table *t);
  int dm_table_any_congested(struct dm_table *t, int bdi_bits);
@@ -1227,11 +1553,11 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
 +int dm_table_set_type(struct dm_table *t);
 +int dm_table_get_type(struct dm_table *t);
 +int dm_table_request_based(struct dm_table *t);
- void dm_table_unplug_all(struct dm_table *t);
  
  /*
-@@ -97,10 +108,16 @@ void *dm_vcalloc(unsigned long nmemb, un
- union map_info *dm_get_mapinfo(struct bio *bio);
+  * To check the return value from dm_table_find_target().
+@@ -92,10 +103,16 @@ void dm_stripe_exit(void);
+ 
  int dm_open_count(struct mapped_device *md);
  int dm_lock_for_deletion(struct mapped_device *md);
 +union map_info *dm_get_rq_mapinfo(struct request *rq);
@@ -1247,542 +1573,9 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
 +int dm_init_md_mempool(struct mapped_device *md, int type);
 +
  #endif
---- a/drivers/md/dm-ioctl.c
-+++ b/drivers/md/dm-ioctl.c
-@@ -1045,6 +1045,12 @@ static int populate_table(struct dm_tabl
- 		next = spec->next;
- 	}
- 
-+	r = dm_table_set_type(table);
-+	if (r) {
-+		DMWARN("unable to set table type");
-+		return r;
-+	}
-+
- 	return dm_table_complete(table);
- }
- 
-@@ -1069,6 +1075,13 @@ static int table_load(struct dm_ioctl *p
- 		goto out;
- 	}
- 
-+	r = dm_init_md_mempool(md, dm_table_get_type(t));
-+	if (r) {
-+		DMWARN("unable to initialize the md mempools for this table");
-+		dm_table_put(t);
-+		goto out;
-+	}
-+
- 	down_write(&_hash_lock);
- 	hc = dm_get_mdptr(md);
- 	if (!hc || hc->md != md) {
---- a/drivers/md/dm-mpath.c
-+++ b/drivers/md/dm-mpath.c
-@@ -7,8 +7,6 @@
- 
- #include "dm.h"
- #include "dm-path-selector.h"
--#include "dm-bio-list.h"
--#include "dm-bio-record.h"
- #include "dm-uevent.h"
- 
- #include <linux/ctype.h>
-@@ -83,7 +81,7 @@ struct multipath {
- 	unsigned pg_init_count;		/* Number of times pg_init called */
- 
- 	struct work_struct process_queued_ios;
--	struct bio_list queued_ios;
-+	struct list_head queued_ios;
- 	unsigned queue_size;
- 
- 	struct work_struct trigger_event;
-@@ -100,7 +98,6 @@ struct multipath {
-  */
- struct dm_mpath_io {
- 	struct pgpath *pgpath;
--	struct dm_bio_details details;
- };
- 
- typedef int (*action_fn) (struct pgpath *pgpath);
-@@ -197,6 +194,7 @@ static struct multipath *alloc_multipath
- 	m = kzalloc(sizeof(*m), GFP_KERNEL);
- 	if (m) {
- 		INIT_LIST_HEAD(&m->priority_groups);
-+		INIT_LIST_HEAD(&m->queued_ios);
- 		spin_lock_init(&m->lock);
- 		m->queue_io = 1;
- 		INIT_WORK(&m->process_queued_ios, process_queued_ios);
-@@ -321,12 +319,13 @@ static int __must_push_back(struct multi
- 		dm_noflush_suspending(m->ti));
- }
- 
--static int map_io(struct multipath *m, struct bio *bio,
-+static int map_io(struct multipath *m, struct request *clone,
- 		  struct dm_mpath_io *mpio, unsigned was_queued)
- {
- 	int r = DM_MAPIO_REMAPPED;
- 	unsigned long flags;
- 	struct pgpath *pgpath;
-+	struct block_device *bdev;
- 
- 	spin_lock_irqsave(&m->lock, flags);
- 
-@@ -343,16 +342,18 @@ static int map_io(struct multipath *m, s
- 	if ((pgpath && m->queue_io) ||
- 	    (!pgpath && m->queue_if_no_path)) {
- 		/* Queue for the daemon to resubmit */
--		bio_list_add(&m->queued_ios, bio);
-+		list_add_tail(&clone->queuelist, &m->queued_ios);
- 		m->queue_size++;
- 		if ((m->pg_init_required && !m->pg_init_in_progress) ||
- 		    !m->queue_io)
- 			queue_work(kmultipathd, &m->process_queued_ios);
- 		pgpath = NULL;
- 		r = DM_MAPIO_SUBMITTED;
--	} else if (pgpath)
--		bio->bi_bdev = pgpath->path.dev->bdev;
--	else if (__must_push_back(m))
-+	} else if (pgpath) {
-+		bdev = pgpath->path.dev->bdev;
-+		clone->q = bdev_get_queue(bdev);
-+		clone->rq_disk = bdev->bd_disk;
-+	} else if (__must_push_back(m))
- 		r = DM_MAPIO_REQUEUE;
- 	else
- 		r = -EIO;	/* Failed */
-@@ -395,30 +396,31 @@ static void dispatch_queued_ios(struct m
- {
- 	int r;
- 	unsigned long flags;
--	struct bio *bio = NULL, *next;
- 	struct dm_mpath_io *mpio;
- 	union map_info *info;
-+	struct request *clone, *n;
-+	LIST_HEAD(cl);
- 
- 	spin_lock_irqsave(&m->lock, flags);
--	bio = bio_list_get(&m->queued_ios);
-+	list_splice_init(&m->queued_ios, &cl);
- 	spin_unlock_irqrestore(&m->lock, flags);
- 
--	while (bio) {
--		next = bio->bi_next;
--		bio->bi_next = NULL;
-+	list_for_each_entry_safe(clone, n, &cl, queuelist) {
-+		list_del_init(&clone->queuelist);
- 
--		info = dm_get_mapinfo(bio);
-+		info = dm_get_rq_mapinfo(clone);
- 		mpio = info->ptr;
- 
--		r = map_io(m, bio, mpio, 1);
--		if (r < 0)
--			bio_endio(bio, r);
--		else if (r == DM_MAPIO_REMAPPED)
--			generic_make_request(bio);
--		else if (r == DM_MAPIO_REQUEUE)
--			bio_endio(bio, -EIO);
--
--		bio = next;
-+		r = map_io(m, clone, mpio, 1);
-+		if (r < 0) {
-+			mempool_free(mpio, m->mpio_pool);
-+			dm_kill_request(clone, r);
-+		} else if (r == DM_MAPIO_REMAPPED)
-+			dm_dispatch_request(clone);
-+		else if (r == DM_MAPIO_REQUEUE) {
-+			mempool_free(mpio, m->mpio_pool);
-+			dm_requeue_request(clone);
-+		}
- 	}
- }
- 
-@@ -833,21 +835,24 @@ static void multipath_dtr(struct dm_targ
- }
- 
- /*
-- * Map bios, recording original fields for later in case we have to resubmit
-+ * Map cloned requests
-  */
--static int multipath_map(struct dm_target *ti, struct bio *bio,
-+static int multipath_map(struct dm_target *ti, struct request *clone,
- 			 union map_info *map_context)
- {
- 	int r;
- 	struct dm_mpath_io *mpio;
- 	struct multipath *m = (struct multipath *) ti->private;
- 
--	mpio = mempool_alloc(m->mpio_pool, GFP_NOIO);
--	dm_bio_record(&mpio->details, bio);
-+	mpio = mempool_alloc(m->mpio_pool, GFP_ATOMIC);
-+	if (!mpio)
-+		/* ENOMEM, requeue */
-+		return DM_MAPIO_REQUEUE;
-+	memset(mpio, 0, sizeof(*mpio));
- 
- 	map_context->ptr = mpio;
--	bio->bi_rw |= (1 << BIO_RW_FAILFAST_TRANSPORT);
--	r = map_io(m, bio, mpio, 0);
-+	clone->cmd_flags |= REQ_FAILFAST_TRANSPORT;
-+	r = map_io(m, clone, mpio, 0);
- 	if (r < 0 || r == DM_MAPIO_REQUEUE)
- 		mempool_free(mpio, m->mpio_pool);
- 
-@@ -1129,53 +1134,41 @@ static void activate_path(struct work_st
- /*
-  * end_io handling
-  */
--static int do_end_io(struct multipath *m, struct bio *bio,
-+static int do_end_io(struct multipath *m, struct request *clone,
- 		     int error, struct dm_mpath_io *mpio)
- {
-+	/*
-+	 * We don't queue any clone request inside the multipath target
-+	 * during end I/O handling, since those clone requests don't have
-+	 * bio clones.  If we queue them inside the multipath target,
-+	 * we need to make bio clones, that requires memory allocation.
-+	 * (See drivers/md/dm.c:end_clone_bio() about why the clone requests
-+	 *  don't have bio clones.)
-+	 * Instead of queueing the clone request here, we queue the original
-+	 * request into dm core, which will remake a clone request and
-+	 * clone bios for it and resubmit it later.
-+	 */
-+	int r = DM_ENDIO_REQUEUE;
- 	unsigned long flags;
- 
--	if (!error)
-+	if (!error && !clone->errors)
- 		return 0;	/* I/O complete */
- 
--	if ((error == -EWOULDBLOCK) && bio_rw_ahead(bio))
--		return error;
--
- 	if (error == -EOPNOTSUPP)
- 		return error;
- 
--	spin_lock_irqsave(&m->lock, flags);
--	if (!m->nr_valid_paths) {
--		if (__must_push_back(m)) {
--			spin_unlock_irqrestore(&m->lock, flags);
--			return DM_ENDIO_REQUEUE;
--		} else if (!m->queue_if_no_path) {
--			spin_unlock_irqrestore(&m->lock, flags);
--			return -EIO;
--		} else {
--			spin_unlock_irqrestore(&m->lock, flags);
--			goto requeue;
--		}
--	}
--	spin_unlock_irqrestore(&m->lock, flags);
--
- 	if (mpio->pgpath)
- 		fail_path(mpio->pgpath);
- 
--      requeue:
--	dm_bio_restore(&mpio->details, bio);
--
--	/* queue for the daemon to resubmit or fail */
- 	spin_lock_irqsave(&m->lock, flags);
--	bio_list_add(&m->queued_ios, bio);
--	m->queue_size++;
--	if (!m->queue_io)
--		queue_work(kmultipathd, &m->process_queued_ios);
-+	if (!m->nr_valid_paths && !m->queue_if_no_path && !__must_push_back(m))
-+		r = -EIO;
- 	spin_unlock_irqrestore(&m->lock, flags);
- 
--	return DM_ENDIO_INCOMPLETE;	/* io not complete */
-+	return r;
- }
- 
--static int multipath_end_io(struct dm_target *ti, struct bio *bio,
-+static int multipath_end_io(struct dm_target *ti, struct request *clone,
- 			    int error, union map_info *map_context)
- {
- 	struct multipath *m = ti->private;
-@@ -1184,14 +1177,13 @@ static int multipath_end_io(struct dm_ta
- 	struct path_selector *ps;
- 	int r;
- 
--	r  = do_end_io(m, bio, error, mpio);
-+	r  = do_end_io(m, clone, error, mpio);
- 	if (pgpath) {
- 		ps = &pgpath->pg->ps;
- 		if (ps->type->end_io)
- 			ps->type->end_io(ps, &pgpath->path);
- 	}
--	if (r != DM_ENDIO_INCOMPLETE)
--		mempool_free(mpio, m->mpio_pool);
-+	mempool_free(mpio, m->mpio_pool);
- 
- 	return r;
- }
-@@ -1427,6 +1419,75 @@ static int multipath_ioctl(struct dm_tar
- 					 bdev->bd_disk, cmd, arg);
- }
- 
-+static int __pgpath_busy(struct pgpath *pgpath)
-+{
-+	struct request_queue *q = bdev_get_queue(pgpath->path.dev->bdev);
-+
-+	return dm_underlying_device_busy(q);
-+}
-+
-+/*
-+ * We return "busy", only when we can map I/Os but underlying devices
-+ * are busy (so even if we map I/Os now, the I/Os will wait on
-+ * the underlying queue).
-+ * In other words, if we want to kill I/Os or queue them inside us
-+ * due to map unavailability, we don't return "busy".  Otherwise,
-+ * dm core won't give us the I/Os and we can't do what we want.
-+ */
-+static int multipath_busy(struct dm_target *ti)
-+{
-+	int busy = 0, has_active = 0;
-+	struct multipath *m = (struct multipath *) ti->private;
-+	struct priority_group *pg;
-+	struct pgpath *pgpath;
-+	unsigned long flags;
-+
-+	spin_lock_irqsave(&m->lock, flags);
-+
-+	/* Guess which priority_group will be used at next mapping time */
-+	if (unlikely(!m->current_pgpath && m->next_pg))
-+		pg = m->next_pg;
-+	else if (likely(m->current_pg))
-+		pg = m->current_pg;
-+	else
-+		/*
-+		 * We don't know which pg will be used at next mapping time.
-+		 * We don't call __choose_pgpath() here to avoid to trigger
-+		 * pg_init just by busy checking.
-+		 * So we don't know whether underlying devices we will be using
-+		 * at next mapping time are busy or not. Just try mapping.
-+		 */
-+		goto out;
-+
-+	/*
-+	 * If there is one non-busy active path at least, the path selector
-+	 * will be able to select it. So we consider such a pg as not busy.
-+	 */
-+	busy = 1;
-+	list_for_each_entry(pgpath, &pg->pgpaths, list)
-+		if (pgpath->is_active) {
-+			has_active = 1;
-+
-+			if (!__pgpath_busy(pgpath)) {
-+				busy = 0;
-+				break;
-+			}
-+		}
-+
-+	if (!has_active)
-+		/*
-+		 * No active path in this pg, so this pg won't be used and
-+		 * the current_pg will be changed at next mapping time.
-+		 * We need to try mapping to determine it.
-+		 */
-+		busy = 0;
-+
-+out:
-+	spin_unlock_irqrestore(&m->lock, flags);
-+
-+	return busy;
-+}
-+
- /*-----------------------------------------------------------------
-  * Module setup
-  *---------------------------------------------------------------*/
-@@ -1436,13 +1497,14 @@ static struct target_type multipath_targ
- 	.module = THIS_MODULE,
- 	.ctr = multipath_ctr,
- 	.dtr = multipath_dtr,
--	.map = multipath_map,
--	.end_io = multipath_end_io,
-+	.map_rq = multipath_map,
-+	.rq_end_io = multipath_end_io,
- 	.presuspend = multipath_presuspend,
- 	.resume = multipath_resume,
- 	.status = multipath_status,
- 	.message = multipath_message,
- 	.ioctl  = multipath_ioctl,
-+	.busy = multipath_busy,
- };
- 
- static int __init dm_multipath_init(void)
---- a/drivers/md/dm-table.c
-+++ b/drivers/md/dm-table.c
-@@ -108,6 +108,8 @@ static void combine_restrictions_low(str
- 	lhs->bounce_pfn = min_not_zero(lhs->bounce_pfn, rhs->bounce_pfn);
- 
- 	lhs->no_cluster |= rhs->no_cluster;
-+
-+	lhs->no_request_stacking |= rhs->no_request_stacking;
- }
- 
- /*
-@@ -522,6 +524,8 @@ void dm_set_device_limits(struct dm_targ
- 	rs->bounce_pfn = min_not_zero(rs->bounce_pfn, q->bounce_pfn);
- 
- 	rs->no_cluster |= !test_bit(QUEUE_FLAG_CLUSTER, &q->queue_flags);
-+
-+	rs->no_request_stacking |= !blk_queue_stackable(q);
- }
- EXPORT_SYMBOL_GPL(dm_set_device_limits);
- 
-@@ -731,6 +735,66 @@ int dm_table_add_target(struct dm_table 
- 	return r;
- }
- 
-+int dm_table_set_type(struct dm_table *t)
-+{
-+	int i;
-+	int bio_based = 0, request_based = 0;
-+	struct dm_target *tgt;
-+
-+	for (i = 0; i < t->num_targets; i++) {
-+		tgt = t->targets + i;
-+		if (tgt->type->map_rq)
-+			request_based = 1;
-+		else
-+			bio_based = 1;
-+
-+		if (bio_based && request_based) {
-+			DMWARN("Inconsistent table: different target types"
-+			       " can't be mixed up");
-+			return -EINVAL;
-+		}
-+	}
-+
-+	if (bio_based) {
-+		/* We must use this table as bio-based */
-+		t->limits.no_request_stacking = 1;
-+		return 0;
-+	}
-+
-+	BUG_ON(!request_based); /* No targets in this table */
-+
-+	/* Non-request-stackable devices can't be used for request-based dm */
-+	if (t->limits.no_request_stacking) {
-+		DMWARN("table load rejected: including non-request-stackable"
-+		       " devices");
-+		return -EINVAL;
-+	}
-+
-+	/*
-+	 * Request-based dm supports only tables that have a single target now.
-+	 * To support multiple targets, request splitting support is needed,
-+	 * and that needs lots of changes in the block-layer.
-+	 * (e.g. request completion process for partial completion.)
-+	 */
-+	if (t->num_targets > 1) {
-+		DMWARN("Request-based dm doesn't support multiple targets yet");
-+		return -EINVAL;
-+	}
-+
-+	return 0;
-+}
-+
-+int dm_table_get_type(struct dm_table *t)
-+{
-+	return t->limits.no_request_stacking ?
-+		DM_TYPE_BIO_BASED : DM_TYPE_REQUEST_BASED;
-+}
-+
-+int dm_table_request_based(struct dm_table *t)
-+{
-+	return dm_table_get_type(t) == DM_TYPE_REQUEST_BASED;
-+}
-+
- static int setup_indexes(struct dm_table *t)
- {
- 	int i;
-@@ -861,6 +925,10 @@ void dm_table_set_restrictions(struct dm
- 	else
- 		queue_flag_set_unlocked(QUEUE_FLAG_CLUSTER, q);
- 
-+	if (t->limits.no_request_stacking)
-+		queue_flag_clear_unlocked(QUEUE_FLAG_STACKABLE, q);
-+	else
-+		queue_flag_set_unlocked(QUEUE_FLAG_STACKABLE, q);
- }
- 
- unsigned int dm_table_get_num_targets(struct dm_table *t)
-@@ -949,6 +1017,20 @@ int dm_table_any_congested(struct dm_tab
- 	return r;
- }
- 
-+int dm_table_any_busy_target(struct dm_table *t)
-+{
-+	int i;
-+	struct dm_target *ti;
-+
-+	for (i = 0; i < t->num_targets; i++) {
-+		ti = t->targets + i;
-+		if (ti->type->busy && ti->type->busy(ti))
-+			return 1;
-+	}
-+
-+	return 0;
-+}
-+
- void dm_table_unplug_all(struct dm_table *t)
- {
- 	struct dm_dev *dd;
 --- a/include/linux/device-mapper.h
 +++ b/include/linux/device-mapper.h
-@@ -46,6 +46,8 @@ typedef void (*dm_dtr_fn) (struct dm_tar
-  */
- typedef int (*dm_map_fn) (struct dm_target *ti, struct bio *bio,
- 			  union map_info *map_context);
-+typedef int (*dm_map_request_fn) (struct dm_target *ti, struct request *clone,
-+				  union map_info *map_context);
- 
- /*
-  * Returns:
-@@ -58,6 +60,9 @@ typedef int (*dm_map_fn) (struct dm_targ
- typedef int (*dm_endio_fn) (struct dm_target *ti,
- 			    struct bio *bio, int error,
- 			    union map_info *map_context);
-+typedef int (*dm_request_endio_fn) (struct dm_target *ti,
-+				    struct request *clone, int error,
-+				    union map_info *map_context);
- 
- typedef void (*dm_flush_fn) (struct dm_target *ti);
- typedef void (*dm_presuspend_fn) (struct dm_target *ti);
-@@ -77,6 +82,13 @@ typedef int (*dm_ioctl_fn) (struct dm_ta
- typedef int (*dm_merge_fn) (struct dm_target *ti, struct bvec_merge_data *bvm,
- 			    struct bio_vec *biovec, int max_size);
- 
-+/*
-+ * Returns:
-+ *    0: The target can handle the next I/O immediately.
-+ *    1: The target can't handle the next I/O immediately.
-+ */
-+typedef int (*dm_busy_fn) (struct dm_target *ti);
-+
- void dm_error(const char *message);
- 
- /*
-@@ -103,7 +115,9 @@ struct target_type {
- 	dm_ctr_fn ctr;
- 	dm_dtr_fn dtr;
- 	dm_map_fn map;
-+	dm_map_request_fn map_rq;
- 	dm_endio_fn end_io;
-+	dm_request_endio_fn rq_end_io;
- 	dm_flush_fn flush;
- 	dm_presuspend_fn presuspend;
- 	dm_postsuspend_fn postsuspend;
-@@ -113,6 +127,7 @@ struct target_type {
- 	dm_message_fn message;
- 	dm_ioctl_fn ioctl;
- 	dm_merge_fn merge;
-+	dm_busy_fn busy;
- };
- 
- struct io_restrictions {
-@@ -125,6 +140,7 @@ struct io_restrictions {
+@@ -151,6 +151,7 @@ struct io_restrictions {
  	unsigned short max_hw_segments;
  	unsigned short max_phys_segments;
  	unsigned char no_cluster; /* inverted so that 0 is default */
@@ -1790,7 +1583,7 @@ Signed-off-by: Hannes Reinecke <hare@suse.de>
  };
  
  struct dm_target {
-@@ -348,4 +364,12 @@ static inline unsigned long to_bytes(sec
+@@ -390,4 +391,12 @@ static inline unsigned long to_bytes(sec
  	return (n << SECTOR_SHIFT);
  }
  
