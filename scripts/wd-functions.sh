@@ -22,7 +22,6 @@ get_branch_name()
         # FIXME: guess a branch name when a non-branch revision is checked
         # out
         local res=$(sed -ne 's|^ref: refs/heads/||p' "$scripts_dir"/../.git/HEAD 2>/dev/null)
-        test "$res" = "master" && res=
         echo "$res"
     fi
 }

@@ -48,10 +48,10 @@ wm=/usr/lib/module-init-tools/weak-modules
 wm2=/usr/lib/module-init-tools/weak-modules2
 if [ -x $wm2 ]; then
     if [ @BASE_PACKAGE@ = 1 ]; then
-        $wm2 --add-kernel @KERNELRELEASE@
+        /bin/bash -${-/e/} $wm2 --add-kernel @KERNELRELEASE@
     else
         nvr=@SUBPACKAGE@-@RPM_VERSION_RELEASE@
-        rpm -ql $nvr | $wm2 --add-kernel-modules @KERNELRELEASE@
+        rpm -ql $nvr | /bin/bash -${-/e/} $wm2 --add-kernel-modules @KERNELRELEASE@
     fi
 elif [ -x $wm ]; then
     # pre CODE11 compatibility

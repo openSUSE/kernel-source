@@ -457,7 +457,7 @@ fi
 
 if [ -n "$source_timestamp" ]; then
 	ts="$(head -n 1 $build_dir/build-source-timestamp)"
-	branch=$(sed -n -e '/^CVS Branch/s,^.*: ,,gp' \
+	branch=$(sed -nre 's/^(CVS|GIT) Branch: //p' \
 		 $build_dir/build-source-timestamp)
 	rpm_release_string=${branch:-HEAD}_$(date --utc '+%Y%m%d%H%M%S' -d "$ts")
 fi
