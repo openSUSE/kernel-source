@@ -536,7 +536,7 @@ echo $((1024*1024)) > $build_dir/minmem
 # Force mbuild to choose build hosts with enough disk space available:
 echo $((6*1024)) > $build_dir/needed_space_in_mb
 if [ -n "$ignore_kabi" ]; then
-    touch $build_dir/IGNORE-KABI-BADNESS
+    ( for i in `seq 0 42` ; do echo "This file named IGNORE-KABI-BADNESS is not empty." ; done ) > $build_dir/IGNORE-KABI-BADNESS
 fi
 if [ -n "$ignore_unsupported_deps" ]; then
     touch $build_dir/IGNORE-UNSUPPORTED-DEPS
