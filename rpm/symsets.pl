@@ -190,7 +190,7 @@ sub main {
     if (@modules == 0) {
         @modules = @ARGV;
     }
-    if (@modules == 0) {
+    if (@modules == 0 && !defined($opt_symvers_file)) {
         &$opt_err("No modules supplied");
     }
     if (!$res) {
