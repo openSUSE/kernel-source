@@ -131,11 +131,12 @@ referenced_files="$( {
 	$(dirname $0)/guards --prefix=config --list < config.conf
     } | sort -u )"
 
-if ! check_for_merge_conflicts $referenced_files \
-			       kernel-source.changes \
-			       kernel-source.changes.old || \
-   ! scripts/check-conf || \
-   ! scripts/check-cvs-add; then
+inconsistent=false
+check_for_merge_conflicts $referenced_files kernel-source.changes{,.old} || \
+	inconsistent=true
+scripts/check-conf || inconsistent=true
+scripts/check-cvs-add || inconsistent=true
+if $inconsistent; then
     echo "Inconsistencies found."
     echo "Please clean up series.conf and/or the patches directories!"
     echo
