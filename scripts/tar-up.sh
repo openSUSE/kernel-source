@@ -131,11 +131,12 @@ referenced_files="$( {
 	$(dirname $0)/guards --prefix=config --list < config.conf
     } | sort -u )"
 
-if ! check_for_merge_conflicts $referenced_files \
-			       kernel-source.changes \
-			       kernel-source.changes.old || \
-   ! scripts/check-conf || \
-   ! scripts/check-cvs-add; then
+inconsistent=false
+check_for_merge_conflicts $referenced_files kernel-source.changes{,.old} || \
+	inconsistent=true
+scripts/check-conf || inconsistent=true
+scripts/check-cvs-add || inconsistent=true
+if $inconsistent; then
     echo "Inconsistencies found."
     echo "Please clean up series.conf and/or the patches directories!"
     echo
@@ -536,7 +537,7 @@ echo $((1024*1024)) > $build_dir/minmem
 # Force mbuild to choose build hosts with enough disk space available:
 echo $((6*1024)) > $build_dir/needed_space_in_mb
 if [ -n "$ignore_kabi" ]; then
-    touch $build_dir/IGNORE-KABI-BADNESS
+    ( for i in `seq 0 42` ; do echo "This file named IGNORE-KABI-BADNESS is not empty." ; done ) > $build_dir/IGNORE-KABI-BADNESS
 fi
 if [ -n "$ignore_unsupported_deps" ]; then
     touch $build_dir/IGNORE-UNSUPPORTED-DEPS

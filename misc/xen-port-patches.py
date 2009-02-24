@@ -11,7 +11,8 @@ import re, glob, sys, os, filecmp
 
 # List of replacement rules
 replrules = [(r"(.*)-xen(\.[^/\s])", r"\1\2"),
-	   (r"include/asm-([^/\s]+86[^/\s]*)/mach-xen/asm/", r"include/asm-\1/")]
+	   (r"include/asm-([^/\s]+86[^/\s]*)/mach-xen/asm/", r"include/asm-\1/"),
+	   (r"arch/([^/\s]+86[^/\s]*)/include/mach-xen/asm/", r"arch/\1/include/asm/")]
 # List of compiled rules (speed reasons)
 #comprules = map(lambda(x): (x[0], x[1], re.compile(x[0])), replrules)
 comprules = [ (x[0], x[1], re.compile(x[0])) for x in replrules ]
