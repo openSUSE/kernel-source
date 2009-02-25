@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 . ${0%/*}/wd-functions.sh
 
@@ -499,6 +499,28 @@ fi
 echo $SRC_FILE
 cp $LINUX_ORIG_TARBALL $build_dir
 
+tar_override_works=
+stable_tar() {
+    local tarball=$1 tar_opts=()
+    shift
+    if [ -z "$tar_override_works" ]; then
+        if tar --mtime="Tue, 3 Feb 2009 10:52:55 +0100" --owner=nobody \
+                    --group=nobody --help >/dev/null; then
+            tar_override_works=true
+        else
+            echo "warning: created tarballs will differ between runs" >&2
+            tar_override_works=false
+        fi
+    fi
+    if $tar_override_works; then
+        tar_opts=(--owner=nobody --group=nobody
+                  --mtime="$(git log --pretty=format:%cD "$@" | head -n 1)")
+    fi
+    find "$@" -type f -print0 | LC_ALL=C sort -z | \
+        tar cf - --null -T - --exclude CVS  "${tar_opts[@]}" | \
+        bzip2 -9 >"$tarball"
+}
+
 # The first directory level determines the archive name
 all_archives="$(
     echo "$referenced_files" \
@@ -518,16 +540,14 @@ for archive in $all_archives; do
 	    [ -e "$patch" ] && echo "$patch"
 	done)"
     if [ -n "$files" ]; then
-	tar -cf - $files \
-	| bzip2 -9 > $build_dir/$archive.tar.bz2
+	stable_tar $build_dir/$archive.tar.bz2 $files
     fi
 done
 
 echo "kabi.tar.bz2"
 # reset kabi's times or we get a different archive after each CVS update
 scripts/newest-timestamp kabi
-tar cf - --exclude CVS kabi \
-| bzip2 -9 > $build_dir/kabi.tar.bz2
+stable_tar $build_dir/kabi.tar.bz2 kabi
 
 # Create empty dummys for any *.tar.bz2 archive mentioned in the spec file
 # not already created: patches.addon is empty by intention; others currently
