@@ -135,7 +135,7 @@ inconsistent=false
 check_for_merge_conflicts $referenced_files kernel-source.changes{,.old} || \
 	inconsistent=true
 scripts/check-conf || inconsistent=true
-scripts/check-cvs-add || inconsistent=true
+scripts/check-cvs-add --committed || inconsistent=true
 if $inconsistent; then
     echo "Inconsistencies found."
     echo "Please clean up series.conf and/or the patches directories!"
