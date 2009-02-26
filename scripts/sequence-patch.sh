@@ -4,14 +4,14 @@ source $(dirname $0)/config.sh
 source $(dirname $0)/wd-functions.sh
 
 usage() {
-    echo "SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...] [--combine] [--fast] [last-patch-name] [--vanilla]"
+    echo "SYNOPSIS: $0 [-qv] [--arch=...] [--symbol=...] [--dir=...] [--combine] [--fast] [last-patch-name] [--vanilla]"
     exit 1
 }
 
 # Allow to pass in default arguments via SEQUENCE_PATCH_ARGS.
 set -- $SEQUENCE_PATCH_ARGS "$@"
 
-options=`getopt -o qvd: --long quilt,symbol:,dir:,combine,fast,vanilla -- "$@"`
+options=`getopt -o qvd: --long quilt,arch:,symbol:,dir:,combine,fast,vanilla -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -44,6 +44,10 @@ while true; do
 	    ;;
        	--fast)
 	    FAST=1
+	    ;;
+	--arch)
+	    export PATCH_ARCH=$2
+	    shift
 	    ;;
 	--symbol)
 	    EXTRA_SYMBOLS="$EXTRA_SYMBOLS $2"
@@ -145,6 +149,28 @@ if [ -e scripts/check-patches ]; then
     }
 fi
 
+if [ -z "$ARCH_SYMBOLS" ]; then
+    if [ -x arch-symbols ]; then
+	ARCH_SYMBOLS=arch-symbols
+    elif [ -x scripts/arch-symbols ]; then
+	ARCH_SYMBOLS=scripts/arch-symbols
+    else
+	echo "Cannot locate \`arch-symbols' script (export ARCH_SYMBOLS)"
+	exit 1
+    fi
+else
+    if [ ! -x "$ARCH_SYMBOLS" ]; then
+	echo "Cannot execute \`arch-symbols' script"
+	exit 1
+    fi
+fi
+SYMBOLS=$($ARCH_SYMBOLS)
+if [ -z "$SYMBOLS" ]; then
+    echo "Unsupported architecture \`$ARCH'" >&2
+    exit 1
+fi
+
+echo "Architecture symbol(s): $SYMBOLS"
 if [ -s extra-symbols ]; then
 	EXTRA_SYMBOLS="$EXTRA_SYMBOLS $(cat extra-symbols)"
 fi

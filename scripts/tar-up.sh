@@ -205,7 +205,7 @@ for flavor in $flavors ; do
     archs="$*"
     
     # Compute @PROVIDES_OBSOLETES@ expansion
-    head=""
+    head="" ; tail=""
     for arch in $archs ; do
 	p=( $(scripts/guards $(scripts/arch-symbols $arch) $flavor p \
 		< rpm/old-packages.conf) )
@@ -224,14 +224,15 @@ for flavor in $flavors ; do
 
 	[ $arch = i386 ] && arch="%ix86"
 	nl=$'\n'
-	if [ -n "$p" -o -n "$p" ]; then
+	if [ ${#p[@]} -o ${#p[@]} ]; then
+	    [ -n "$head" ] && head="${head}%else$nl"
 	    head="${head}%ifarch $arch$nl"
 	    [ -n "$p" ] && head="${head}Provides:     ${p[@]}$nl"
 	    [ -n "$o" ] && head="${head}Obsoletes:    ${o[@]}$nl"
-	    head="${head}%endif$nl"
+	    tail="%endif$nl$tail"
 	fi
     done
-    prov_obs="${head%$'\n'}"
+    prov_obs="$head${tail%$'\n'}"
 
     # If we build this spec file for only one architecture,  the
     # enclosing if is not needed
@@ -244,7 +245,8 @@ for flavor in $flavors ; do
     archs="$(echo $archs | sed -e 's,i386,%ix86,g')"
 
     # Generate spec file
-    sed -e "s,@FLAVOR@,$flavor,g" \
+    sed -e "s,@NAME@,kernel-$flavor,g" \
+	-e "s,@FLAVOR@,$flavor,g" \
 	-e "s,@VARIANT@,$VARIANT,g" \
 	-e "s,@SRCVERSION@,$SRCVERSION,g" \
 	-e "s,@PATCHVERSION@,$PATCHVERSION,g" \
@@ -284,57 +286,58 @@ EXTRA_SYMBOLS=$([ -e extra-symbols ] && cat extra-symbols)
 # Compute @BUILD_REQUIRES@ expansion
 prepare_source_and_syms() {
     local name=$1
-    local head="" nl ARCH_SYMBOLS packages flavor av arch build_req
+    local head="" tail="" nl ARCH_SYMBOLS packages flavor av arch build_req
 
     archs=
     build_requires=
 
-    # Exclude flavors that have a different set of patches: we assume
-    # that the user won't change series.conf so much that two flavors
-    # that differ at tar-up.sh time will become identical later.
-    set -- $EXTRA_SYMBOLS
-    case $name in
-    (*-rt)
-	set -- RT "$@"
-	;;
-    esac
-    scripts/guards "$@" < series.conf > $TMPDIR/$name.patches
+    for arch in $(scripts/arch-symbols --list); do
+	ARCH_SYMBOLS=$(scripts/arch-symbols $arch)
 
-    for flavor in $flavors; do
-	build_archs=
-	for arch_flavor in $(scripts/guards $(scripts/arch-symbols --list) \
-				 $EXTRA_SYMBOLS < config.conf); do
-	    [ "${arch_flavor%/$flavor}" = "$arch_flavor" ] && continue
+	# Exclude flavors that have a different set of patches: we assume that
+	# the user won't change series.conf so much that two flavors that differ
+	# at tar-up.sh time will become identical later.
+
+	set -- $ARCH_SYMBOLS $EXTRA_SYMBOLS
+	case $name in
+	(*-rt)
+	    set -- RT "$@"
+	    ;;
+	esac
+	scripts/guards "$@" < series.conf > $TMPDIR/$name.patches
+
+	packages=
+	for arch_flavor in $(scripts/guards $ARCH_SYMBOLS $EXTRA_SYMBOLS \
+				< config.conf); do
+	    flavor=${arch_flavor#*/}
 	    av=${arch_flavor//\//_}
-	    arch=${arch_flavor%/*}
-	    [ "$arch" = i386 ] && arch="%ix86"
 	    set -- kernel-$flavor $flavor \
 		   $(case $flavor in (rt|rt_*) echo RT ;; esac)
 
 	    # The patch selection for kernel-vanilla is a hack.
 	    [ $flavor = vanilla ] && continue
 
-	    scripts/guards $* $EXTRA_SYMBOLS < series.conf \
+	    scripts/guards $* $ARCH_SYMBOLS $EXTRA_SYMBOLS < series.conf \
 		> $TMPDIR/kernel-$av.patches
 	    diff -q $TMPDIR/{$name,kernel-$av}.patches > /dev/null \
-		|| (echo skipping $av ; continue)
-	    build_archs="$build_archs $arch"
+		|| continue
+	    packages="$packages kernel-$flavor"
 	done
 
-	build_archs=${build_archs# }
-
-	if [ -n "$build_archs" ]; then
+	set -- $packages
+	if [ $# -gt 0 ]; then
+	    [ $arch = i386 ] && arch="%ix86"
 	    nl=$'\n'
-	    or='%'
-	    head="${head}%ifarch ${build_archs// / || ifarch }$nl"
-	    head="${head}BuildRequires: kernel-$flavor-devel$nl"
-	    head="${head}%endif$nl"
+	    [ -n "$head" ] && head="${head}%else$nl"
+	    head="${head}%ifarch $arch$nl"
+	    head="${head}BuildRequires: $*$nl"
+	    tail="%endif$nl$tail"
+	    archs="$archs $arch"
 	fi
-	archs="$archs $build_archs"
     done
-    build_requires="${head//$'\n'/\\n}"
-    archs=$(echo -n $archs |tr ' ' '\n'|sort -u|tr '\n' ' ')
-    archs=${archs% }
+    build_requires="$head${tail%$'\n'}"
+    build_requires="${build_requires//$'\n'/\\n}"
+    archs=${archs# }
 }
 
 # The pre-configured kernel source package
