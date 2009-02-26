@@ -52,6 +52,10 @@ until [ "$#" = "0" ] ; do
       source_timestamp=1
       shift
       ;;
+    -u|--update-only)
+      update_only=1
+      shift
+      ;;
     -h|--help|-v|--version)
 	cat <<EOF
 
@@ -61,6 +65,7 @@ these options are recognized:
     -rs <string>       to append specified string to rpm release number
     -ts                to use the current date as rpm release number
     -nf                to proceed if a new unknown .config option is found during make oldconfig
+    -u		       update generated files in an existing kernel-source dir
     -i                 ignore kabi failures
     --source-timestamp to autogenerate a release number based on branch and timestamp (overrides -rs/-ts)
 
@@ -113,8 +118,15 @@ check_for_merge_conflicts() {
     fi
 }
 
-rm -rf $build_dir
-mkdir -p $build_dir
+if [ -n "$update_only" ]; then
+	if [ ! -d "$build_dir" ]; then
+		echo "$build_dir must exist in update mode."
+		exit 1
+	fi
+else
+	rm -rf $build_dir
+	mkdir -p $build_dir
+fi
 
 # generate the list of patches to include.
 if [ -n "$embargo_filter" ]; then
@@ -469,6 +481,10 @@ sed -e "s:@RELEASE_PREFIX@:$RELEASE_PREFIX:"		\
     rpm/get_release_number.sh.in			\
     > $build_dir/get_release_number.sh
 chmod 755 $build_dir/get_release_number.sh
+
+if [ -n "$update_only" ]; then
+	exit 0
+fi
 
 if [ -r $SRC_FILE ]; then
   LINUX_ORIG_TARBALL=$SRC_FILE
