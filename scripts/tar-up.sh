@@ -244,8 +244,7 @@ for flavor in $flavors ; do
     archs="$(echo $archs | sed -e 's,i386,%ix86,g')"
 
     # Generate spec file
-    sed -e "s,@NAME@,kernel-$flavor,g" \
-	-e "s,@FLAVOR@,$flavor,g" \
+    sed -e "s,@FLAVOR@,$flavor,g" \
 	-e "s,@VARIANT@,$VARIANT,g" \
 	-e "s,@SRCVERSION@,$SRCVERSION,g" \
 	-e "s,@PATCHVERSION@,$PATCHVERSION,g" \
