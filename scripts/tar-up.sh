@@ -329,13 +329,12 @@ prepare_source_and_syms() {
 	    head="${head}%ifarch ${build_archs// / || ifarch }$nl"
 	    head="${head}BuildRequires: kernel-$flavor-devel$nl"
 	    head="${head}%endif$nl"
-	    for arch in $build_archs; do
-		    [ "${archs%$arch*}" = "$archs" ] && archs="$archs $arch"
-	    done
 	fi
+	archs="$archs $build_archs"
     done
     build_requires="${head//$'\n'/\\n}"
-    archs=${archs# }
+    archs=$(echo -n $archs |tr ' ' '\n'|sort -u|tr '\n' ' ')
+    archs=${archs% }
 }
 
 # The pre-configured kernel source package
