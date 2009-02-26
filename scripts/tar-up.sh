@@ -328,7 +328,7 @@ prepare_source_and_syms() {
 	    nl=$'\n'
 	    or='%'
 	    head="${head}%ifarch ${build_archs// / || ifarch }$nl"
-	    head="${head}BuildRequires: kernel-$flavor$nl"
+	    head="${head}BuildRequires: kernel-$flavor-devel$nl"
 	    head="${head}%endif$nl"
 	    for arch in $build_archs; do
 		    [ "${archs%$arch*}" = "$archs" ] && archs="$archs $arch"
