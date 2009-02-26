@@ -290,46 +290,50 @@ prepare_source_and_syms() {
     archs=
     build_requires=
 
-    for arch in $(scripts/arch-symbols --list); do
-	ARCH_SYMBOLS=$(scripts/arch-symbols $arch)
-
-	# Exclude flavors that have a different set of patches: we assume that
-	# the user won't change series.conf so much that two flavors that differ
-	# at tar-up.sh time will become identical later.
-
-	set -- $ARCH_SYMBOLS $EXTRA_SYMBOLS
-	case $name in
-	(*-rt)
-	    set -- RT "$@"
-	    ;;
-	esac
-	scripts/guards "$@" < series.conf > $TMPDIR/$name.patches
-
-	packages=
-	for arch_flavor in $(scripts/guards $ARCH_SYMBOLS $EXTRA_SYMBOLS \
-				< config.conf); do
-	    flavor=${arch_flavor#*/}
+    for flavor in $flavors; do
+	build_archs=
+	for arch_flavor in $(scripts/guards $(scripts/arch-symbols --list) \
+				 $EXTRA_SYMBOLS < config.conf); do
+	    [ "${arch_flavor%/$flavor}" = "$arch_flavor" ] && continue
 	    av=${arch_flavor//\//_}
+	    arch=${arch_flavor%/*}
+	    [ "$arch" = i386 ] && arch="%ix86"
 	    set -- kernel-$flavor $flavor \
 		   $(case $flavor in (rt|rt_*) echo RT ;; esac)
 
 	    # The patch selection for kernel-vanilla is a hack.
 	    [ $flavor = vanilla ] && continue
 
+	    # Exclude flavors that have a different set of patches: we assume
+	    # that the user won't change series.conf so much that two flavors
+	    # that differ at tar-up.sh time will become identical later.
+	    ARCH_SYMBOLS=$(scripts/arch-symbols $arch)
+	    set -- $ARCH_SYMBOLS $EXTRA_SYMBOLS
+	    case $name in
+	    (*-rt)
+	        set -- RT "$@"
+	        ;;
+	    esac
+	    scripts/guards "$@" < series.conf > $TMPDIR/$name.patches
+
 	    scripts/guards $* $ARCH_SYMBOLS $EXTRA_SYMBOLS < series.conf \
 		> $TMPDIR/kernel-$av.patches
 	    diff -q $TMPDIR/{$name,kernel-$av}.patches > /dev/null \
-		|| continue
-	    packages="$packages kernel-$flavor"
+		|| (echo skipping $av ; continue)
+	    build_archs="$build_archs $arch"
 	done
 
-	if [ -n "$packages" ]; then
-	    [ $arch = i386 ] && arch="%ix86"
+	build_archs=${build_archs# }
+
+	if [ -n "$build_archs" ]; then
 	    nl=$'\n'
-	    head="${head}%ifarch $arch$nl"
-	    head="${head}BuildRequires: $packages$nl"
+	    or='%'
+	    head="${head}%ifarch ${build_archs// / || ifarch }$nl"
+	    head="${head}BuildRequires: kernel-$flavor$nl"
 	    head="${head}%endif$nl"
-	    archs="$archs $arch"
+	    for arch in $build_archs; do
+		    [ "${archs%$arch*}" = "$archs" ] && archs="$archs $arch"
+	    done
 	fi
     done
     build_requires="${head//$'\n'/\\n}"
