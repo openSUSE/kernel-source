@@ -371,16 +371,6 @@ if test -e $build_dir/kernel-default.spec; then
     > $build_dir/kernel-syms.spec
     install_changes $build_dir/kernel-syms.changes
 
-    echo "kernel-dummy.spec"
-    sed -e "s,@NAME@,kernel-dummy,g" \
-        -e "s,@SRCVERSION@,$SRCVERSION,g" \
-        -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
-        -e "s,@RPMVERSION@,$RPMVERSION,g" \
-        -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
-      < rpm/kernel-dummy.spec.in \
-    > $build_dir/kernel-dummy.spec
-    install_changes $build_dir/kernel-dummy.changes
-
     install -m 644                              \
         rpm/kernel-source.rpmlintrc             \
         $build_dir/kernel-source.rpmlintrc
@@ -450,7 +440,6 @@ fi
 install -m 755					\
 	rpm/find-provides			\
 	rpm/config-subst 			\
-	rpm/prepare-build.sh			\
 	rpm/check-for-config-changes		\
 	rpm/check-supported-list		\
 	rpm/check-build.sh			\
