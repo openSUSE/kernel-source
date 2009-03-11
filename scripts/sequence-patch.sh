@@ -91,8 +91,8 @@ esac
 
 # Check SCRATCH_AREA.
 if [ -z "$SCRATCH_AREA" ]; then
-    echo "SCRATCH_AREA not defined (set to /var/tmp/scratch or similar)"
-    exit 1
+    echo "SCRATCH_AREA not defined (defaulting to "tmp")"
+    SCRATCH_AREA=tmp
 fi
 if [ ! -d "$SCRATCH_AREA" ]; then
     if ! mkdir -p $SCRATCH_AREA; then
@@ -129,10 +129,20 @@ if [ ! -d $ORIG_DIR ]; then
 	fi
     done
     if [ -z "$LINUX_ORIG_TARBALL" ]; then
-	echo "Kernel source archive \`linux-$SRCVERSION.tar.gz' not found," >&2
-	echo "alternatively you can put an unpatched kernel tree to" >&2
-	echo "$ORIG_DIR." >&2
-	exit 1
+	echo Source version is $SRCVERSION. Original tarball not found,
+	echo trying ketchup.
+	(
+	    cd $SCRATCH_AREA
+	    mkdir linux-$SRCVERSION.orig
+	    cd linux-$SRCVERSION.orig
+	    ketchup $SRCVERSION
+	)
+	if [ -z "$LINUX_ORIG_TARBALL" ]; then
+	    echo "Kernel source archive \`linux-$SRCVERSION.tar.gz' not found," >&2
+	    echo "alternatively you can put an unpatched kernel tree to" >&2
+	    echo "$ORIG_DIR." >&2
+	    exit 1
+	fi
     fi
 fi
 
