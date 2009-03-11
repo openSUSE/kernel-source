@@ -278,8 +278,10 @@ binary_spec_files=$(
 )
 binary_spec_files=${binary_spec_files//$'\n'/\\n}
 
-TMPDIR=$(mktemp -dt ${0##*/}.XXXXXX)
-trap "rm -rf $TMPDIR" EXIT
+CLEANFILES=()
+trap 'if test -n "$CLEANFILES"; then rm -rf "${CLEANFILES[@]}"; fi' EXIT
+tmpdir=$(mktemp -dt ${0##*/}.XXXXXX)
+CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
 EXTRA_SYMBOLS=$([ -e extra-symbols ] && cat extra-symbols)
 
@@ -304,7 +306,7 @@ prepare_source_and_syms() {
 	    set -- RT "$@"
 	    ;;
 	esac
-	scripts/guards "$@" < series.conf > $TMPDIR/$name.patches
+	scripts/guards "$@" < series.conf > $tmpdir/$name.patches
 
 	packages=
 	for arch_flavor in $(scripts/guards $ARCH_SYMBOLS $EXTRA_SYMBOLS \
@@ -318,8 +320,8 @@ prepare_source_and_syms() {
 	    [ $flavor = vanilla ] && continue
 
 	    scripts/guards $* $ARCH_SYMBOLS $EXTRA_SYMBOLS < series.conf \
-		> $TMPDIR/kernel-$av.patches
-	    diff -q $TMPDIR/{$name,kernel-$av}.patches > /dev/null \
+		> $tmpdir/kernel-$av.patches
+	    diff -q $tmpdir/{$name,kernel-$av}.patches > /dev/null \
 		|| continue
 	    packages="$packages kernel-$flavor"
 	done
@@ -546,14 +548,13 @@ archives=$(sed -ne 's,^Source[0-9]*:.*[ \t/]\([^/]*\)\.tar\.bz2$,\1,p' \
 for archive in $archives; do
     if ! [ -e $build_dir/$archive.tar.bz2 ]; then
 	echo "$archive.tar.bz2 (empty)"
-	TMPDIR2=$(mktemp -dt ${0##*/}.XXXXXX)
-	trap "rm -rf $TMPDIR2" EXIT
-	mkdir -p $TMPDIR2/$archive
+	tmpdir2=$(mktemp -dt ${0##*/}.XXXXXX)
+	CLEANFILES=("${CLEANFILES[@]}" "$tmpdir2")
+	mkdir -p $tmpdir2/$archive
 	touch -d "$(head -n 1 $build_dir/build-source-timestamp)" \
-	    $TMPDIR2/$archive
-	tar -C $TMPDIR2 -cf - $archive | \
+	    $tmpdir2/$archive
+	tar -C $tmpdir2 -cf - $archive | \
 	    bzip2 -9 > $build_dir/$archive.tar.bz2
-	rmdir $TMPDIR2/$archive
     fi
 done
 
