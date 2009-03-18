@@ -184,6 +184,20 @@ if $using_git; then
     git_commit=${git_commit:0:8}
 fi
 
+if [ -n "$source_timestamp" ]; then
+	ts="$(head -n 1 $build_dir/build-source-timestamp)"
+	branch=$(sed -nre 's/^(CVS|GIT) Branch: //p' \
+		 $build_dir/build-source-timestamp)
+	rpm_release_string=${branch}_$(date --utc '+%Y%m%d%H%M%S' -d "$ts")
+fi
+
+sed -e "s:@RELEASE_PREFIX@:$RELEASE_PREFIX:"     \
+    -e "s:@RELEASE_SUFFIX@:$rpm_release_string:" \
+    -e "s:@COMMIT@:$git_commit:"                 \
+    rpm/get_release_number.sh.in                 \
+    > $build_dir/get_release_number.sh
+chmod 755 $build_dir/get_release_number.sh
+RELEASE=$($build_dir/get_release_number.sh)
 
 # List all used configurations
 config_files="$(
@@ -254,7 +268,7 @@ for flavor in $flavors ; do
 	-e "s,@ARCHS@,$archs,g" \
 	-e "s,@PROVIDES_OBSOLETES@,${prov_obs//$'\n'/\\n},g" \
 	-e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options,g" \
-	-e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+	-e "s,@RELEASE@,$RELEASE,g" \
       < rpm/kernel-binary.spec.in \
     > $build_dir/kernel-$flavor.spec
 done
@@ -355,7 +369,7 @@ if test -e $build_dir/kernel-default.spec; then
         -e "s,@ARCHS@,$archs,g" \
         -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
         -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
-        -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+        -e "s,@RELEASE@,$RELEASE,g" \
       < rpm/kernel-source.spec.in \
     > $build_dir/kernel-source.spec
     install_changes $build_dir/kernel-source.changes
@@ -368,7 +382,7 @@ if test -e $build_dir/kernel-default.spec; then
         -e "s,@RPMVERSION@,$RPMVERSION,g" \
         -e "s,@ARCHS@,$archs,g" \
         -e "s,@BUILD_REQUIRES@,$build_requires,g" \
-        -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+        -e "s,@RELEASE@,$RELEASE,g" \
       < rpm/kernel-syms.spec.in \
     > $build_dir/kernel-syms.spec
     install_changes $build_dir/kernel-syms.changes
@@ -390,7 +404,7 @@ if test -e $build_dir/kernel-rt.spec; then
         -e "s,@ARCHS@,$archs,g" \
         -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
         -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
-        -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+        -e "s,@RELEASE@,$RELEASE,g" \
       < rpm/kernel-source.spec.in \
     > $build_dir/kernel-source-rt.spec
     install_changes $build_dir/kernel-source-rt.changes
@@ -403,7 +417,7 @@ if test -e $build_dir/kernel-rt.spec; then
         -e "s,@RPMVERSION@,$RPMVERSION,g" \
         -e "s,@ARCHS@,$archs,g" \
         -e "s,@BUILD_REQUIRES@,$build_requires,g" \
-        -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+        -e "s,@RELEASE@,$RELEASE,g" \
       < rpm/kernel-syms.spec.in \
     > $build_dir/kernel-syms-rt.spec
     install_changes $build_dir/kernel-syms-rt.changes
@@ -458,20 +472,6 @@ if [ -e extra-symbols ]; then
 		extra-symbols				\
 		$build_dir
 fi
-
-if [ -n "$source_timestamp" ]; then
-	ts="$(head -n 1 $build_dir/build-source-timestamp)"
-	branch=$(sed -nre 's/^(CVS|GIT) Branch: //p' \
-		 $build_dir/build-source-timestamp)
-	rpm_release_string=${branch:-HEAD}_$(date --utc '+%Y%m%d%H%M%S' -d "$ts")
-fi
-
-sed -e "s:@RELEASE_PREFIX@:$RELEASE_PREFIX:"		\
-    -e "s:@RELEASE_SUFFIX@:$rpm_release_string:"	\
-    -e "s:@COMMIT@:$git_commit:"                        \
-    rpm/get_release_number.sh.in			\
-    > $build_dir/get_release_number.sh
-chmod 755 $build_dir/get_release_number.sh
 
 if [ -n "$update_only" ]; then
 	exit 0
