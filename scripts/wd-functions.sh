@@ -1,24 +1,17 @@
-# to be sourced by scripts that need a GIT / CVS working directory
+# to be sourced by scripts that need a GIT working directory
 
-if test -d CVS; then
-    scm=CVS
-    using_cvs=true
-    using_git=false
-elif git rev-parse HEAD >/dev/null 2>&1; then
-    scm=GIT
+if git rev-parse HEAD >/dev/null 2>&1; then
     using_git=true
-    using_cvs=false
 else
-    echo "Error: not in CVS / GIT working directory" >&2
-    exit 1
+    using_git=false
+    echo "WARNING: not in a GIT working directory, things might break." >&2
+    echo >&2
 fi
 scripts_dir=$(dirname "$0")
 
 get_branch_name()
 {
-    if $using_cvs; then
-        sed -ne 's:^T::p' "$scripts_dir"/../CVS/Tag 2>/dev/null || :
-    else
+    if $using_git; then
         # FIXME: guess a branch name when a non-branch revision is checked
         # out
         local res=$(sed -ne 's|^ref: refs/heads/||p' "$scripts_dir"/../.git/HEAD 2>/dev/null)

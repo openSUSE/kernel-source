@@ -154,23 +154,8 @@ if $inconsistent; then
     echo
 fi
 
-echo "Computing timestamp..."
 if ! scripts/cvs-wd-timestamp > $build_dir/build-source-timestamp; then
     exit 1
-fi
-
-# If we are on a CVS branch, included the branch name as well:
-if [ -e CVS/Tag ]; then
-    read tag < CVS/Tag
-    case "$tag" in
-    T*)	tag="CVS Branch: ${tag:1}" ;;
-    N*)	tag="CVS Tag: ${tag:1}" ;;
-    D*)	tag="CVS Date: ${tag:1}" ;;
-    *)	tag=
-    esac
-    if [ -n "$tag" ]; then
-	echo $tag >> $build_dir/build-source-timestamp
-    fi
 fi
 
 if $using_git; then
@@ -186,7 +171,7 @@ fi
 
 if [ -n "$source_timestamp" ]; then
 	ts="$(head -n 1 $build_dir/build-source-timestamp)"
-	branch=$(sed -nre 's/^(CVS|GIT) Branch: //p' \
+	branch=$(sed -nre 's/^GIT Branch: //p' \
 		 $build_dir/build-source-timestamp)
 	rpm_release_string=${branch}_$(date --utc '+%Y%m%d%H%M%S' -d "$ts")
 fi
@@ -508,7 +493,7 @@ stable_tar() {
                   --mtime="$(git log --pretty=format:%cD "$@" | head -n 1)")
     fi
     find "$@" -type f -print0 | LC_ALL=C sort -z | \
-        tar cf - --null -T - --exclude CVS  "${tar_opts[@]}" | \
+        tar cf - --null -T - "${tar_opts[@]}" | \
         bzip2 -9 >"$tarball"
 }
 
@@ -536,8 +521,6 @@ for archive in $all_archives; do
 done
 
 echo "kabi.tar.bz2"
-# reset kabi's times or we get a different archive after each CVS update
-scripts/newest-timestamp kabi
 stable_tar $build_dir/kabi.tar.bz2 kabi
 
 # Create empty dummys for any *.tar.bz2 archive mentioned in the spec file
