@@ -475,10 +475,30 @@ fi
 echo $SRC_FILE
 cp $LINUX_ORIG_TARBALL $build_dir
 
+# Usage: stable_tar [-t <timestamp>] [-C <directory] <tarball> <files> ...
+# if -t is not given, files must be within a git repository and -C must not be
+# used
 tar_override_works=
 stable_tar() {
-    local tarball=$1 tar_opts=()
+    local tarball mtime chdir tar_opts=()
+
+    while test $# -gt 2; do
+        case "$1" in
+        -t)
+            mtime=$2
+            shift 2
+            ;;
+        -C)
+            chdir=$2
+            shift 2
+            ;;
+        *)
+            break
+        esac
+    done
+    tarball=$1
     shift
+
     if [ -z "$tar_override_works" ]; then
         if tar --mtime="Tue, 3 Feb 2009 10:52:55 +0100" --owner=nobody \
                     --group=nobody --help >/dev/null; then
@@ -489,12 +509,19 @@ stable_tar() {
         fi
     fi
     if $tar_override_works; then
-        tar_opts=(--owner=nobody --group=nobody
-                  --mtime="$(git log --pretty=format:%cD "$@" | head -n 1)")
+        if test -z "$mtime"; then
+            mtime="$(git log --pretty=format:%cD "$@" | head -n 1)"
+        fi
+        tar_opts=(--owner=nobody --group=nobody --mtime="$mtime")
     fi
-    find "$@" -type f -print0 | LC_ALL=C sort -z | \
-        tar cf - --null -T - "${tar_opts[@]}" | \
-        bzip2 -9 >"$tarball"
+    (
+        if test -n "$chdir"; then
+            cd "$chdir"
+        fi
+        find "$@" \( -type f -o -type d -a -empty \) -print0 | \
+            LC_ALL=C sort -z | \
+            tar cf - --null -T - "${tar_opts[@]}"
+    ) | bzip2 -9 >"$tarball"
 }
 
 # The first directory level determines the archive name
@@ -536,8 +563,8 @@ for archive in $archives; do
 	mkdir -p $tmpdir2/$archive
 	touch -d "$(head -n 1 $build_dir/build-source-timestamp)" \
 	    $tmpdir2/$archive
-	tar -C $tmpdir2 -cf - $archive | \
-	    bzip2 -9 > $build_dir/$archive.tar.bz2
+	stable_tar -C $tmpdir2 -t "Wed, 01 Apr 2009 12:00:00 +0200" \
+	    $build_dir/$archive.tar.bz2 $archive
     fi
 done
 
