@@ -283,13 +283,12 @@ CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
 EXTRA_SYMBOLS=$([ -e extra-symbols ] && cat extra-symbols)
 
-# Compute @BUILD_REQUIRES@ expansion
+# Compute @REQUIRES@ expansion
 prepare_source_and_syms() {
     local name=$1
-    local head="" nl ARCH_SYMBOLS packages flavor av arch build_req
+    local head="" nl ARCH_SYMBOLS packages flavor av arch
 
-    archs=
-    build_requires=
+    requires=
 
     # Exclude flavors that have a different set of patches: we assume
     # that the user won't change series.conf so much that two flavors
@@ -329,14 +328,11 @@ prepare_source_and_syms() {
 	    nl=$'\n'
 	    or='%'
 	    head="${head}%ifarch ${build_archs// / || ifarch }$nl"
-	    head="${head}BuildRequires: kernel-$flavor-devel$nl"
+	    head="${head}Requires: kernel-$flavor-devel = %version-%release$nl"
 	    head="${head}%endif$nl"
 	fi
-	archs="$archs $build_archs"
     done
-    build_requires="${head//$'\n'/\\n}"
-    archs=$(echo $archs | tr ' ' '\n' | sort -u | tr '\n' ' ')
-    archs=${archs% }
+    requires="${head//$'\n'/\\n}"
 }
 
 # The pre-configured kernel source package
@@ -344,13 +340,12 @@ if test -e $build_dir/kernel-default.spec; then
     # if there is no kernel-default, assume that this is a "special"
     # branch (such as slert) with it's own kernel-source
     echo "kernel-source.spec"
-    prepare_source_and_syms kernel-syms # compute archs and build_requires
+    prepare_source_and_syms kernel-syms # compute archs and requires
     sed -e "s,@NAME@,kernel-source,g" \
         -e "s,@VARIANT@,$VARIANT,g" \
         -e "s,@SRCVERSION@,$SRCVERSION,g" \
         -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
         -e "s,@RPMVERSION@,$RPMVERSION,g" \
-        -e "s,@ARCHS@,$archs,g" \
         -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
         -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
         -e "s,@RELEASE@,$RELEASE,g" \
@@ -364,8 +359,7 @@ if test -e $build_dir/kernel-default.spec; then
         -e "s,@SRCVERSION@,$SRCVERSION,g" \
         -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
         -e "s,@RPMVERSION@,$RPMVERSION,g" \
-        -e "s,@ARCHS@,$archs,g" \
-        -e "s,@BUILD_REQUIRES@,$build_requires,g" \
+        -e "s,@REQUIRES@,$requires,g" \
         -e "s,@RELEASE@,$RELEASE,g" \
       < rpm/kernel-syms.spec.in \
     > $build_dir/kernel-syms.spec
@@ -380,13 +374,12 @@ if test -e $build_dir/kernel-rt.spec; then
     echo "kernel-source-rt.spec"
     # workaround
     binary_spec_files=${binary_spec_files/kernel-syms.spec/kernel-syms-rt.spec}
-    prepare_source_and_syms kernel-syms-rt # compute archs and build_requires
+    prepare_source_and_syms kernel-syms-rt # compute archs and requires
     sed -e "s,@NAME@,kernel-source-rt,g" \
         -e "s,@VARIANT@,$VARIANT,g" \
         -e "s,@SRCVERSION@,$SRCVERSION,g" \
         -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
         -e "s,@RPMVERSION@,$RPMVERSION,g" \
-        -e "s,@ARCHS@,$archs,g" \
         -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
         -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
         -e "s,@RELEASE@,$RELEASE,g" \
@@ -400,8 +393,7 @@ if test -e $build_dir/kernel-rt.spec; then
         -e "s,@SRCVERSION@,$SRCVERSION,g" \
         -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
         -e "s,@RPMVERSION@,$RPMVERSION,g" \
-        -e "s,@ARCHS@,$archs,g" \
-        -e "s,@BUILD_REQUIRES@,$build_requires,g" \
+        -e "s,@REQUIRES@,$requires,g" \
         -e "s,@RELEASE@,$RELEASE,g" \
       < rpm/kernel-syms.spec.in \
     > $build_dir/kernel-syms-rt.spec
@@ -426,6 +418,7 @@ install -m 644					\
 	rpm/kernel-module-subpackage		\
 	rpm/macros.kernel-source		\
 	doc/README.SUSE				\
+	doc/README.KSYMS			\
 	$build_dir
 
 
