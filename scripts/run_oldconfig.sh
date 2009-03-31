@@ -140,13 +140,9 @@ else
 fi
 
 if [ -z "$cpu_arch" ]; then
-    CONFIG_SYMBOLS=$(
-    	for arch in $(${prefix}scripts/arch-symbols --list); do
-		${prefix}scripts/arch-symbols $arch
-	done)
+    CONFIG_SYMBOLS=$(${prefix}scripts/arch-symbols --list)
 else
-    ARCH_SYMBOLS=$(${prefix}scripts/arch-symbols $cpu_arch)
-    CONFIG_SYMBOLS=$ARCH_SYMBOLS
+    CONFIG_SYMBOLS=$(${prefix}scripts/arch-symbols $cpu_arch)
 fi
 
 if [ "$new_config_option_yes" != "no" ] ; then
@@ -204,7 +200,7 @@ if [ -s extra-symbols ]; then
     EXTRA_SYMBOLS="$(cat extra-symbols)"
 fi
 
-patches/scripts/guards $ARCH_SYMBOLS $EXTRA_SYMBOLS < patches/series.conf \
+patches/scripts/guards $EXTRA_SYMBOLS < patches/series.conf \
     > $TMPDIR/applied-patches
 
 EXTRA_SYMBOLS="$(echo $EXTRA_SYMBOLS | sed -e 's# *[Rr][Tt] *##g')"
@@ -214,7 +210,7 @@ for config in $config_files; do
     flavor=${config#*/}
 
     set -- kernel-$flavor $flavor $(case $flavor in (rt|rt_*) echo RT ;; esac)
-    patches/scripts/guards $* $ARCH_SYMBOLS $EXTRA_SYMBOLS \
+    patches/scripts/guards $* $EXTRA_SYMBOLS \
 	< patches/series.conf > $TMPDIR/patches
 
     if ! diff -q $TMPDIR/applied-patches $TMPDIR/patches > /dev/null; then

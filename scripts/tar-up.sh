@@ -187,7 +187,7 @@ RELEASE=$($build_dir/get_release_number.sh)
 # List all used configurations
 config_files="$(
     for arch in $(scripts/arch-symbols --list) ; do
-	scripts/guards $(scripts/arch-symbols $arch) < config.conf \
+	scripts/guards $arch < config.conf \
 	| sed -e "s,^,$arch ,"
     done)"
 flavors="$(echo "$config_files" | sed -e 's,.*/,,' | sort -u)"
@@ -206,9 +206,9 @@ for flavor in $flavors ; do
     # Compute @PROVIDES_OBSOLETES@ expansion
     head=""
     for arch in $archs ; do
-	p=( $(scripts/guards $(scripts/arch-symbols $arch) $flavor p \
+	p=( $(scripts/guards $arch $flavor p \
 		< rpm/old-packages.conf) )
-	o=( $(scripts/guards $(scripts/arch-symbols $arch) $flavor o \
+	o=( $(scripts/guards $arch $flavor o \
 		< rpm/old-packages.conf) )
 
 	# Do we have an override config file or an additional patch?
@@ -304,8 +304,7 @@ prepare_source_and_syms() {
     for flavor in $flavors; do
 	build_archs=
 	for arch in $(scripts/arch-symbols --list); do
-	    arch_flavor=$(scripts/guards $(scripts/arch-symbols $arch) < \
-			  config.conf | grep "/$flavor$")
+	    arch_flavor=$(scripts/guards $arch < config.conf | grep "/$flavor$")
 	    [ -z "$arch_flavor" ] && continue
 	    av="${arch}_${flavor}"
 	    [ "$arch" = i386 ] && arch="%ix86"
