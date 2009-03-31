@@ -244,7 +244,6 @@ for flavor in $flavors ; do
 
     # Generate spec file
     sed -e "s,@NAME@,kernel-$flavor,g" \
-	-e "s,@FLAVOR@,$flavor,g" \
 	-e "s,@VARIANT@,$VARIANT,g" \
 	-e "s,@SRCVERSION@,$SRCVERSION,g" \
 	-e "s,@PATCHVERSION@,$PATCHVERSION,g" \
