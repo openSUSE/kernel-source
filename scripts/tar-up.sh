@@ -291,6 +291,17 @@ prepare_source_and_syms() {
     archs=
     build_requires=
 
+    # Exclude flavors that have a different set of patches: we assume
+    # that the user won't change series.conf so much that two flavors
+    # that differ at tar-up.sh time will become identical later.
+    set -- $EXTRA_SYMBOLS
+    case $name in
+    (*-rt)
+	set -- RT "$@"
+	;;
+    esac
+    scripts/guards "$@" < series.conf > $tmpdir/$name.patches
+
     for flavor in $flavors; do
 	build_archs=
 	for arch in $(scripts/arch-symbols --list); do
@@ -305,19 +316,7 @@ prepare_source_and_syms() {
 	    # The patch selection for kernel-vanilla is a hack.
 	    [ $flavor = vanilla ] && continue
 
-	    # Exclude flavors that have a different set of patches: we assume
-	    # that the user won't change series.conf so much that two flavors
-	    # that differ at tar-up.sh time will become identical later.
-	    ARCH_SYMBOLS=$(scripts/arch-symbols $arch)
-	    set -- $ARCH_SYMBOLS $EXTRA_SYMBOLS
-	    case $name in
-	    (*-rt)
-	        set -- RT "$@"
-	        ;;
-	    esac
-	    scripts/guards "$@" < series.conf > $tmpdir/$name.patches
-
-	    scripts/guards $* $ARCH_SYMBOLS $EXTRA_SYMBOLS < series.conf \
+	    scripts/guards $* $EXTRA_SYMBOLS < series.conf \
 		> $tmpdir/kernel-$av.patches
 	    diff -q $tmpdir/{$name,kernel-$av}.patches > /dev/null \
 		|| (echo skipping $av ; continue)
