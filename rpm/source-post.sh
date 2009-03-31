@@ -10,9 +10,9 @@ relink() {
     && ln -s "$1" "$2"
 }
 
-relink linux-@KERNELRELEASE@@VARIANT@ /usr/src/linux@VARIANT@
+relink linux-@KERNELRELEASE@@SRCVARIANT@ /usr/src/linux@SRCVARIANT@
 cd /usr/src
-for a in linux-@KERNELRELEASE@@VARIANT@-obj/*; do
+for a in linux-@KERNELRELEASE@@SRCVARIANT@-obj/*; do
     if [ ! -d "$a" -o -h "$a" ]; then
         # skip symlinks like i586 -> i386
         continue

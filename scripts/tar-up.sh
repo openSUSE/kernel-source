@@ -204,7 +204,7 @@ for flavor in $flavors ; do
     archs="$*"
     
     # Compute @PROVIDES_OBSOLETES@ expansion
-    head="" ; tail=""
+    head=""
     for arch in $archs ; do
 	p=( $(scripts/guards $(scripts/arch-symbols $arch) $flavor p \
 		< rpm/old-packages.conf) )
@@ -223,15 +223,14 @@ for flavor in $flavors ; do
 
 	[ $arch = i386 ] && arch="%ix86"
 	nl=$'\n'
-	if [ ${#p[@]} -o ${#p[@]} ]; then
-	    [ -n "$head" ] && head="${head}%else$nl"
+	if [ -n "$p" -o -n "$p" ]; then
 	    head="${head}%ifarch $arch$nl"
 	    [ -n "$p" ] && head="${head}Provides:     ${p[@]}$nl"
 	    [ -n "$o" ] && head="${head}Obsoletes:    ${o[@]}$nl"
-	    tail="%endif$nl$tail"
+	    head="${head}%endif$nl"
 	fi
     done
-    prov_obs="$head${tail%$'\n'}"
+    prov_obs="${head%$'\n'}"
 
     # If we build this spec file for only one architecture,  the
     # enclosing if is not needed
@@ -284,61 +283,56 @@ CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
 EXTRA_SYMBOLS=$([ -e extra-symbols ] && cat extra-symbols)
 
-# Compute @BUILD_REQUIRES@ expansion
+# Compute @REQUIRES@ expansion
 prepare_source_and_syms() {
     local name=$1
-    local head="" tail="" nl ARCH_SYMBOLS packages flavor av arch build_req
+    local head="" nl ARCH_SYMBOLS packages flavor av arch
 
-    archs=
-    build_requires=
+    requires=
 
-    for arch in $(scripts/arch-symbols --list); do
-	ARCH_SYMBOLS=$(scripts/arch-symbols $arch)
+    # Exclude flavors that have a different set of patches: we assume
+    # that the user won't change series.conf so much that two flavors
+    # that differ at tar-up.sh time will become identical later.
+    set -- $EXTRA_SYMBOLS
+    case $name in
+    (*-rt)
+	set -- RT "$@"
+	;;
+    esac
+    scripts/guards "$@" < series.conf > $tmpdir/$name.patches
 
-	# Exclude flavors that have a different set of patches: we assume that
-	# the user won't change series.conf so much that two flavors that differ
-	# at tar-up.sh time will become identical later.
-
-	set -- $ARCH_SYMBOLS $EXTRA_SYMBOLS
-	case $name in
-	(*-rt)
-	    set -- RT "$@"
-	    ;;
-	esac
-	scripts/guards "$@" < series.conf > $tmpdir/$name.patches
-
-	packages=
-	for arch_flavor in $(scripts/guards $ARCH_SYMBOLS $EXTRA_SYMBOLS \
-				< config.conf); do
-	    flavor=${arch_flavor#*/}
-	    av=${arch_flavor//\//_}
+    for flavor in $flavors; do
+	build_archs=
+	for arch in $(scripts/arch-symbols --list); do
+	    arch_flavor=$(scripts/guards $(scripts/arch-symbols $arch) < \
+			  config.conf | grep "/$flavor$")
+	    [ -z "$arch_flavor" ] && continue
+	    av="${arch}_${flavor}"
+	    [ "$arch" = i386 ] && arch="%ix86"
 	    set -- kernel-$flavor $flavor \
 		   $(case $flavor in (rt|rt_*) echo RT ;; esac)
 
 	    # The patch selection for kernel-vanilla is a hack.
 	    [ $flavor = vanilla ] && continue
 
-	    scripts/guards $* $ARCH_SYMBOLS $EXTRA_SYMBOLS < series.conf \
+	    scripts/guards $* $EXTRA_SYMBOLS < series.conf \
 		> $tmpdir/kernel-$av.patches
 	    diff -q $tmpdir/{$name,kernel-$av}.patches > /dev/null \
-		|| continue
-	    packages="$packages kernel-$flavor"
+		|| (echo skipping $av ; continue)
+	    build_archs="$build_archs $arch"
 	done
 
-	set -- $packages
-	if [ $# -gt 0 ]; then
-	    [ $arch = i386 ] && arch="%ix86"
+	build_archs=${build_archs# }
+
+	if [ -n "$build_archs" ]; then
 	    nl=$'\n'
-	    [ -n "$head" ] && head="${head}%else$nl"
-	    head="${head}%ifarch $arch$nl"
-	    head="${head}BuildRequires: $*$nl"
-	    tail="%endif$nl$tail"
-	    archs="$archs $arch"
+	    or='%'
+	    head="${head}%ifarch ${build_archs// / || ifarch }$nl"
+	    head="${head}Requires: kernel-$flavor-devel = %version-%release$nl"
+	    head="${head}%endif$nl"
 	fi
     done
-    build_requires="$head${tail%$'\n'}"
-    build_requires="${build_requires//$'\n'/\\n}"
-    archs=${archs# }
+    requires="${head//$'\n'/\\n}"
 }
 
 # The pre-configured kernel source package
@@ -346,12 +340,12 @@ if test -e $build_dir/kernel-default.spec; then
     # if there is no kernel-default, assume that this is a "special"
     # branch (such as slert) with it's own kernel-source
     echo "kernel-source.spec"
-    prepare_source_and_syms kernel-syms # compute archs and build_requires
+    prepare_source_and_syms kernel-syms # compute archs and requires
     sed -e "s,@NAME@,kernel-source,g" \
+        -e "s,@VARIANT@,$VARIANT,g" \
         -e "s,@SRCVERSION@,$SRCVERSION,g" \
         -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
         -e "s,@RPMVERSION@,$RPMVERSION,g" \
-        -e "s,@ARCHS@,$archs,g" \
         -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
         -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
         -e "s,@RELEASE@,$RELEASE,g" \
@@ -365,8 +359,7 @@ if test -e $build_dir/kernel-default.spec; then
         -e "s,@SRCVERSION@,$SRCVERSION,g" \
         -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
         -e "s,@RPMVERSION@,$RPMVERSION,g" \
-        -e "s,@ARCHS@,$archs,g" \
-        -e "s,@BUILD_REQUIRES@,$build_requires,g" \
+        -e "s,@REQUIRES@,$requires,g" \
         -e "s,@RELEASE@,$RELEASE,g" \
       < rpm/kernel-syms.spec.in \
     > $build_dir/kernel-syms.spec
@@ -381,12 +374,12 @@ if test -e $build_dir/kernel-rt.spec; then
     echo "kernel-source-rt.spec"
     # workaround
     binary_spec_files=${binary_spec_files/kernel-syms.spec/kernel-syms-rt.spec}
-    prepare_source_and_syms kernel-syms-rt # compute archs and build_requires
+    prepare_source_and_syms kernel-syms-rt # compute archs and requires
     sed -e "s,@NAME@,kernel-source-rt,g" \
+        -e "s,@VARIANT@,$VARIANT,g" \
         -e "s,@SRCVERSION@,$SRCVERSION,g" \
         -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
         -e "s,@RPMVERSION@,$RPMVERSION,g" \
-        -e "s,@ARCHS@,$archs,g" \
         -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
         -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
         -e "s,@RELEASE@,$RELEASE,g" \
@@ -400,8 +393,7 @@ if test -e $build_dir/kernel-rt.spec; then
         -e "s,@SRCVERSION@,$SRCVERSION,g" \
         -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
         -e "s,@RPMVERSION@,$RPMVERSION,g" \
-        -e "s,@ARCHS@,$archs,g" \
-        -e "s,@BUILD_REQUIRES@,$build_requires,g" \
+        -e "s,@REQUIRES@,$requires,g" \
         -e "s,@RELEASE@,$RELEASE,g" \
       < rpm/kernel-syms.spec.in \
     > $build_dir/kernel-syms-rt.spec
@@ -426,6 +418,7 @@ install -m 644					\
 	rpm/kernel-module-subpackage		\
 	rpm/macros.kernel-source		\
 	doc/README.SUSE				\
+	doc/README.KSYMS			\
 	$build_dir
 
 
@@ -556,6 +549,7 @@ stable_tar $build_dir/kabi.tar.bz2 kabi
 archives=$(sed -ne 's,^Source[0-9]*:.*[ \t/]\([^/]*\)\.tar\.bz2$,\1,p' \
            $build_dir/*.spec | sort -u)
 for archive in $archives; do
+    [ "$archive" = "linux-%srcversion" ] && continue
     if ! [ -e $build_dir/$archive.tar.bz2 ]; then
 	echo "$archive.tar.bz2 (empty)"
 	tmpdir2=$(mktemp -dt ${0##*/}.XXXXXX)
