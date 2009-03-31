@@ -286,7 +286,7 @@ EXTRA_SYMBOLS=$([ -e extra-symbols ] && cat extra-symbols)
 # Compute @BUILD_REQUIRES@ expansion
 prepare_source_and_syms() {
     local name=$1
-    local head="" tail="" nl ARCH_SYMBOLS packages flavor av arch build_req
+    local head="" nl ARCH_SYMBOLS packages flavor av arch build_req
 
     archs=
     build_requires=
@@ -324,19 +324,16 @@ prepare_source_and_syms() {
 	    packages="$packages kernel-$flavor"
 	done
 
-	set -- $packages
-	if [ $# -gt 0 ]; then
+	if [ -n "$packages" ]; then
 	    [ $arch = i386 ] && arch="%ix86"
 	    nl=$'\n'
-	    [ -n "$head" ] && head="${head}%else$nl"
 	    head="${head}%ifarch $arch$nl"
-	    head="${head}BuildRequires: $*$nl"
-	    tail="%endif$nl$tail"
+	    head="${head}BuildRequires: $packages$nl"
+	    head="${head}%endif$nl"
 	    archs="$archs $arch"
 	fi
     done
-    build_requires="$head${tail%$'\n'}"
-    build_requires="${build_requires//$'\n'/\\n}"
+    build_requires="${head//$'\n'/\\n}"
     archs=${archs# }
 }
 
