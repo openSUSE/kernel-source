@@ -204,7 +204,7 @@ for flavor in $flavors ; do
     archs="$*"
     
     # Compute @PROVIDES_OBSOLETES@ expansion
-    head="" ; tail=""
+    head=""
     for arch in $archs ; do
 	p=( $(scripts/guards $(scripts/arch-symbols $arch) $flavor p \
 		< rpm/old-packages.conf) )
@@ -223,15 +223,14 @@ for flavor in $flavors ; do
 
 	[ $arch = i386 ] && arch="%ix86"
 	nl=$'\n'
-	if [ ${#p[@]} -o ${#p[@]} ]; then
-	    [ -n "$head" ] && head="${head}%else$nl"
+	if [ -n "$p" -o -n "$p" ]; then
 	    head="${head}%ifarch $arch$nl"
 	    [ -n "$p" ] && head="${head}Provides:     ${p[@]}$nl"
 	    [ -n "$o" ] && head="${head}Obsoletes:    ${o[@]}$nl"
-	    tail="%endif$nl$tail"
+	    head="${head}%endif$nl"
 	fi
     done
-    prov_obs="$head${tail%$'\n'}"
+    prov_obs="${head%$'\n'}"
 
     # If we build this spec file for only one architecture,  the
     # enclosing if is not needed
