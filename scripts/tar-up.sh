@@ -2,7 +2,7 @@
 
 . ${0%/*}/wd-functions.sh
 
-tolerate_unknown_new_config_options=0
+tolerate_unknown_new_config_options=
 ignore_kabi=
 ignore_unsupported_deps=
 until [ "$#" = "0" ] ; do
@@ -29,10 +29,6 @@ until [ "$#" = "0" ] ; do
       ;;
     -iu|--ignore-unsupported-deps)
       ignore_unsupported_deps=1
-      shift
-      ;;
-    --source-timestamp)
-      # ignored
       shift
       ;;
     -h|--help|-v|--version)
@@ -280,6 +276,9 @@ if [ -n "$ignore_kabi" ]; then
 fi
 if [ -n "$ignore_unsupported_deps" ]; then
     echo > $build_dir/IGNORE-UNSUPPORTED-DEPS
+fi
+if [ -n "$tolerate_unknown_new_config_options" ]; then
+    echo > $build_dir/TOLERATE-UNKNOWN-NEW-CONFIG-OPTIONS
 fi
 
 echo "cd $build_dir; ./mkspec"
