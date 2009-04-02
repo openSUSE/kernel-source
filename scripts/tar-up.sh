@@ -31,6 +31,10 @@ until [ "$#" = "0" ] ; do
       ignore_unsupported_deps=1
       shift
       ;;
+    --source-timestamp)
+      # ignored
+      shift
+      ;;
     -h|--help|-v|--version)
 	cat <<EOF
 
