@@ -8,4 +8,4 @@ if test -e $(dirname -- "$0")/../rpm/config.sh; then
 fi
 BUILD_DIR=kernel-source${VARIANT}
 IGNORE_ARCHS=
-DIST_SET=
+DIST_SET=head
