@@ -130,6 +130,7 @@ install -m 644					\
 	rpm/module-renames			\
 	rpm/kernel-module-subpackage		\
 	rpm/macros.kernel-source		\
+	rpm/package-descriptions                \
 	doc/README.SUSE				\
 	doc/README.KSYMS			\
 	$build_dir
