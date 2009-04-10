@@ -97,16 +97,17 @@ if $inconsistent; then
     echo
 fi
 
-if ! scripts/cvs-wd-timestamp > $build_dir/build-source-timestamp; then
+tsfile=source-timestamp
+if ! scripts/cvs-wd-timestamp > $build_dir/$tsfile; then
     exit 1
 fi
 
 if $using_git; then
     # Always include the git revision
-    echo "GIT Revision: $(git rev-parse HEAD)" >> $build_dir/build-source-timestamp
+    echo "GIT Revision: $(git rev-parse HEAD)" >> $build_dir/$tsfile
     tag=$(get_branch_name)
     if test -n "$tag"; then
-	echo "GIT Branch: $tag" >>$build_dir/build-source-timestamp
+	echo "GIT Branch: $tag" >>$build_dir/$tsfile
     fi
 fi
 
@@ -261,8 +262,6 @@ for archive in $archives; do
 	tmpdir2=$(mktemp -dt ${0##*/}.XXXXXX)
 	CLEANFILES=("${CLEANFILES[@]}" "$tmpdir2")
 	mkdir -p $tmpdir2/$archive
-	touch -d "$(head -n 1 $build_dir/build-source-timestamp)" \
-	    $tmpdir2/$archive
 	stable_tar -C $tmpdir2 -t "Wed, 01 Apr 2009 12:00:00 +0200" \
 	    $build_dir/$archive.tar.bz2 $archive
     fi
