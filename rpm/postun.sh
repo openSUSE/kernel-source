@@ -3,17 +3,17 @@ wm2=/usr/lib/module-init-tools/weak-modules2
 if [ @BASE_PACKAGE@ = 0 ]; then
     if [ -x $wm2 ]; then
         nvr=@SUBPACKAGE@-@RPM_VERSION_RELEASE@
-        /bin/bash -${-/e/} $wm2 --remove-kernel-modules @KERNELRELEASE@ < /var/run/rpm-$nvr-modules
+        /bin/bash -${-/e/} $wm2 --remove-kernel-modules @KERNELRELEASE@-@FLAVOR@ < /var/run/rpm-$nvr-modules
     fi
     rm -f /var/run/rpm-$nvr-modules
     exit 0
 fi
 # Remove symlinks from /lib/modules/$krel/weak-updates/.
 if [ -x $wm2 ]; then
-    /bin/bash -${-/e/} $wm2 --remove-kernel @KERNELRELEASE@
+    /bin/bash -${-/e/} $wm2 --remove-kernel @KERNELRELEASE@-@FLAVOR@
 elif [ -x $wm ]; then
     # pre CODE11 compatibility
-    $wm --remove-kernel @KERNELRELEASE@
+    $wm --remove-kernel @KERNELRELEASE@-@FLAVOR@
 fi
 
 # remove /boot/@IMAGE@.previous entry on a 10.1 and SLES10 GA system
@@ -28,13 +28,13 @@ esac
 
 # Created in %post of old kernels
 case "$(readlink /boot/@IMAGE@$suffix.previous)" in
-@IMAGE@-@KERNELRELEASE@|$(readlink /boot/@IMAGE@$suffix))
+@IMAGE@-@KERNELRELEASE@-@FLAVOR@|$(readlink /boot/@IMAGE@$suffix))
     remove_previos_entry=yes
     rm -f /boot/@IMAGE@$suffix.previous 
     ;;
 esac
 case "$(readlink /boot/initrd$suffix.previous)" in
-initrd-@KERNELRELEASE@|$(readlink /boot/initrd$suffix))
+initrd-@KERNELRELEASE@-@FLAVOR@|$(readlink /boot/initrd$suffix))
     rm -f /boot/initrd$suffix.previous
     ;;
 esac
@@ -46,9 +46,9 @@ if [ -f /etc/fstab ]; then
 	    /usr/lib/bootloader/bootloader_entry \
 		remove \
 		@FLAVOR@ \
-		@KERNELRELEASE@ \
-		@IMAGE@-@KERNELRELEASE@ \
-		initrd-@KERNELRELEASE@
+		@KERNELRELEASE@-@FLAVOR@ \
+		@IMAGE@-@KERNELRELEASE@-@FLAVOR@ \
+		initrd-@KERNELRELEASE@-@FLAVOR@
 
 	# handle 10.1 and SLES10 GA
 	elif [ -x /sbin/update-bootloader ]; then

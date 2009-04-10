@@ -408,7 +408,8 @@ echo "Copying various files..."
 install -m 644					\
 	config.conf				\
 	supported.conf				\
-	rpm/source-pre.sh			\
+	rpm/devel-pre.sh			\
+	rpm/devel-post.sh			\
 	rpm/source-post.sh			\
 	rpm/pre.sh				\
 	rpm/post.sh				\
