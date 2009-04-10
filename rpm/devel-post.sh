@@ -11,6 +11,6 @@ relink() {
 }
 
 release="@KERNELRELEASE@@SRCVARIANT@-obj"
-arch_flavor="@RPM_TARGET_CPU@/@FLAVOR@"
+arch_flavor="@CPU_ARCH_FLAVOR@"
 
 relink ../../linux-$release/"$arch_flavor" /usr/src/linux-obj/"$arch_flavor"
