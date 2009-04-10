@@ -10,4 +10,7 @@ relink() {
     && ln -s "$1" "$2"
 }
 
-relink linux-@KERNELRELEASE@@SRCVARIANT@ /usr/src/linux@SRCVARIANT@
+release="@KERNELRELEASE@@SRCVARIANT@-obj"
+arch_flavor="@RPM_TARGET_CPU@/@FLAVOR@"
+
+relink ../../linux-$release/"$arch_flavor" /usr/src/linux-obj/"$arch_flavor"
