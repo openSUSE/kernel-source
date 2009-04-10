@@ -468,21 +468,29 @@ fi
 echo $SRC_FILE
 cp $LINUX_ORIG_TARBALL $build_dir
 
-# Usage: stable_tar [-t <timestamp>] [-C <directory] <tarball> <files> ...
-# if -t is not given, files must be within a git repository and -C must not be
-# used
+# Usage:
+# stable_tar [-t <timestamp>] [-C <dir>] [--exclude=...] <tarball> <files> ...
+# if -t is not given, files must be within a git repository
 tar_override_works=
 stable_tar() {
-    local tarball mtime chdir tar_opts=()
+    local tarball mtime=() chdir="." tar_opts=()
 
     while test $# -gt 2; do
         case "$1" in
         -t)
-            mtime=$2
+            mtime=(--mtime "$2")
             shift 2
             ;;
         -C)
             chdir=$2
+            shift 2
+            ;;
+        --exclude=*)
+            tar_opts=("${tar_opts[@]}" "$1")
+            shift
+            ;;
+        --exclude)
+            tar_opts=("${tar_opts[@]}" "$1" "$2")
             shift 2
             ;;
         *)
@@ -502,15 +510,13 @@ stable_tar() {
         fi
     fi
     if $tar_override_works; then
-        if test -z "$mtime"; then
-            mtime="$(git log --pretty=format:%cD "$@" | head -n 1)"
+        if test -z "$mtime" && $using_git; then
+            mtime=(--mtime "$(cd "$chdir"; git log --pretty=format:%cD "$@" | head -n 1)")
         fi
-        tar_opts=(--owner=nobody --group=nobody --mtime="$mtime")
+        tar_opts=("${tar_opts[@]}" --owner=nobody --group=nobody "${mtime[@]}")
     fi
     (
-        if test -n "$chdir"; then
-            cd "$chdir"
-        fi
+        cd "$chdir"
         find "$@" \( -type f -o -type d -a -empty \) -print0 | \
             LC_ALL=C sort -z | \
             tar cf - --null -T - "${tar_opts[@]}"
