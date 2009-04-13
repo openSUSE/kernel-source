@@ -139,7 +139,12 @@ sub loadchanges {
             }
             if (defined $text) {
                 my $key = sprintf("%010d %s", $date, $email);
-                $res->{$key} = $text;
+                if (defined $res->{$key}) {
+                    print STDERR "$file:$.: duplicate key: $key\n";
+                    $res->{$key} .= $text;
+                } else {
+                    $res->{$key} = $text
+                }
             }
             undef $text;
             $date--;
