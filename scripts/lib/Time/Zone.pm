@@ -164,6 +164,7 @@ CONFIG: {
 	    "fst"  =>   +2*3600,  	 # French Summer
             "cest" =>   +2*3600,         # Central European Daylight
             "eest" =>   +3*3600,         # Eastern European Summer
+	    "msd"  =>   +4*3600,         # Moscow Daylight
 	    "wadt" =>   +8*3600,  	 # West Australian Daylight
 	    "kdt"  =>  +10*3600,	 # Korean Daylight
 	#   "cadt" =>  +10*3600+1800,	 # Central Australian Daylight
@@ -211,6 +212,7 @@ CONFIG: {
 	    "eet"	=>  +2*3600, 	 # Eastern Europe, USSR Zone 1
 	    "ukr"	=>  +2*3600, 	 # Ukraine
 	    "bt"	=>  +3*3600, 	 # Baghdad, USSR Zone 2
+	    "msk"       =>  +3*3600,     # Moscow
 	#   "it"	=>  +3*3600+1800,# Iran
 	    "zp4"	=>  +4*3600, 	 # USSR Zone 3
 	    "zp5"	=>  +5*3600, 	 # USSR Zone 4

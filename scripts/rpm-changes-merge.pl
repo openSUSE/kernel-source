@@ -12,9 +12,9 @@ use warnings;
 
 BEGIN {
     if ($0 =~ /^(.*)\/[^\/]*/) {
-        push @INC, "$1/lib";
+        unshift @INC, "$1/lib";
     } else {
-        push @INC,  "./lib";
+        unshift @INC,  "./lib";
     }
 }
 use Time::Zone;
