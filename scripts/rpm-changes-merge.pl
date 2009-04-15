@@ -172,7 +172,7 @@ my %monthnum = (
 
 sub parse_date {
     my $l = shift;
-    if ($l !~ /^(?:mon|tue|wed|thu|fri|sat|sun) +(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec) +(\d+) +(\d\d):(\d\d):(\d\d) +([A-Z]+) +(\d\d\d\d) +- +([^ ]*)$/i) {
+    if ($l !~ /^(?:mon|tue|wed|thu|fri|sat|sun) +(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec) +(\d+) +(\d\d):(\d\d):(\d\d) +([A-Z]+) +(\d\d\d\d) +- +([^ ]*) *$/i) {
         return (undef, "");
     }
     my ($b, $d, $H, $M, $S, $Z, $Y, $email) = ($1, $2, $3, $4, $5, $6, $7, $8);
