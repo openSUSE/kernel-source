@@ -32,11 +32,11 @@ case @FLAVOR@ in
 esac
 for x in /boot/@IMAGE@ /boot/initrd; do
     rm -f $x$suffix
-    ln -s ${x##*/}-@KERNELRELEASE@ $x$suffix
+    ln -s ${x##*/}-@KERNELRELEASE@-@FLAVOR@ $x$suffix
 done
 
-if [ -e /lib/modules/@KERNELRELEASE@ ]; then
-    echo Setting up /lib/modules/@KERNELRELEASE@
+if [ -e /lib/modules/@KERNELRELEASE@-@FLAVOR@ ]; then
+    echo Setting up /lib/modules/@KERNELRELEASE@-@FLAVOR@
 
     if [ -x /sbin/module_upgrade ]; then
 	/sbin/module_upgrade --rename mptscsih="mptspi mptfc mptsas"
@@ -48,18 +48,18 @@ wm=/usr/lib/module-init-tools/weak-modules
 wm2=/usr/lib/module-init-tools/weak-modules2
 if [ -x $wm2 ]; then
     if [ @BASE_PACKAGE@ = 1 ]; then
-        /bin/bash -${-/e/} $wm2 --add-kernel @KERNELRELEASE@
+        /bin/bash -${-/e/} $wm2 --add-kernel @KERNELRELEASE@-@FLAVOR@
     else
         nvr=@SUBPACKAGE@-@RPM_VERSION_RELEASE@
-        rpm -ql $nvr | /bin/bash -${-/e/} $wm2 --add-kernel-modules @KERNELRELEASE@
+        rpm -ql $nvr | /bin/bash -${-/e/} $wm2 --add-kernel-modules @KERNELRELEASE@-@FLAVOR@
     fi
 elif [ -x $wm ]; then
     # pre CODE11 compatibility
-    $wm --add-kernel @KERNELRELEASE@
-    /sbin/depmod -a -F /boot/System.map-@KERNELRELEASE@ @KERNELRELEASE@
+    $wm --add-kernel @KERNELRELEASE@-@FLAVOR@
+    /sbin/depmod -a -F /boot/System.map-@KERNELRELEASE@-@FLAVOR@ @KERNELRELEASE@-@FLAVOR@
     if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] ; then
-        /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@ \
-                       -i /boot/initrd-@KERNELRELEASE@
+        /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@-@FLAVOR@ \
+                       -i /boot/initrd-@KERNELRELEASE@-@FLAVOR@
         if [ $? -ne 0 ]; then
             echo "/sbin/mkinitrd failed" >&2
             case @SUBPACKAGE@ in
@@ -95,8 +95,8 @@ run_bootloader () {
 if [ -f /etc/fstab -a ! -e /.buildenv ] ; then
     # only run the bootloader if the usual bootloader configuration
     # files are there -- this is different on every architecture
-    initrd=initrd-@KERNELRELEASE@
-    if [ -e /boot/$initrd -o ! -e /lib/modules/@KERNELRELEASE@ ] && \
+    initrd=initrd-@KERNELRELEASE@-@FLAVOR@
+    if [ -e /boot/$initrd -o ! -e /lib/modules/@KERNELRELEASE@-@FLAVOR@ ] && \
        run_bootloader ; then
        [ -e /boot/$initrd ] || initrd=
 	# handle 10.2 and SLES10 SP1 or later
@@ -104,8 +104,8 @@ if [ -f /etc/fstab -a ! -e /.buildenv ] ; then
 	    /usr/lib/bootloader/bootloader_entry \
 		add \
 		@FLAVOR@ \
-		@KERNELRELEASE@ \
-		@IMAGE@-@KERNELRELEASE@ \
+		@KERNELRELEASE@-@FLAVOR@ \
+		@IMAGE@-@KERNELRELEASE@-@FLAVOR@ \
 		$initrd
 
 	# handle 10.1 and SLES10 GA

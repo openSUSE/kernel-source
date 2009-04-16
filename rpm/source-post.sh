@@ -11,14 +11,3 @@ relink() {
 }
 
 relink linux-@KERNELRELEASE@@SRCVARIANT@ /usr/src/linux@SRCVARIANT@
-cd /usr/src
-for a in linux-@KERNELRELEASE@@SRCVARIANT@-obj/*; do
-    if [ ! -d "$a" -o -h "$a" ]; then
-        # skip symlinks like i586 -> i386
-        continue
-    fi
-    for d in "$a"/*; do
-        arch_flavor=${d#*/}
-        relink ../../"$d" /usr/src/linux-obj/"$arch_flavor"
-    done
-done

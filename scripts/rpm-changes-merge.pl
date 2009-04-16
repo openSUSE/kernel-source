@@ -12,9 +12,9 @@ use warnings;
 
 BEGIN {
     if ($0 =~ /^(.*)\/[^\/]*/) {
-        push @INC, "$1/lib";
+        unshift @INC, "$1/lib";
     } else {
-        push @INC,  "./lib";
+        unshift @INC,  "./lib";
     }
 }
 use Time::Zone;
@@ -139,7 +139,12 @@ sub loadchanges {
             }
             if (defined $text) {
                 my $key = sprintf("%010d %s", $date, $email);
-                $res->{$key} = $text;
+                if (defined $res->{$key}) {
+                    print STDERR "$file:$.: duplicate key: $key\n";
+                    $res->{$key} .= $text;
+                } else {
+                    $res->{$key} = $text
+                }
             }
             undef $text;
             $date--;
@@ -167,7 +172,7 @@ my %monthnum = (
 
 sub parse_date {
     my $l = shift;
-    if ($l !~ /^(?:mon|tue|wed|thu|fri|sat|sun) +(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec) +(\d+) +(\d\d):(\d\d):(\d\d) +([A-Z]+) +(\d\d\d\d) +- +([^ ]*)$/i) {
+    if ($l !~ /^(?:mon|tue|wed|thu|fri|sat|sun) +(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec) +(\d+) +(\d\d):(\d\d):(\d\d) +([A-Z]+) +(\d\d\d\d) +- +([^ ]*) *$/i) {
         return (undef, "");
     }
     my ($b, $d, $H, $M, $S, $Z, $Y, $email) = ($1, $2, $3, $4, $5, $6, $7, $8);
