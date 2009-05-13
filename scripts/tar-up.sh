@@ -68,7 +68,9 @@ check_for_merge_conflicts() {
     fi
 }
 
-rm -rf $build_dir
+# dot files are skipped by intention, in order not to break osc working
+# copies
+rm -f $build_dir/*
 mkdir -p $build_dir
 
 # generate the list of patches to include.
