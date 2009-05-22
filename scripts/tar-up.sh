@@ -5,6 +5,7 @@
 tolerate_unknown_new_config_options=
 ignore_kabi=
 ignore_unsupported_deps=
+mkspec_args=()
 until [ "$#" = "0" ] ; do
   case "$1" in
     --dir=*)
@@ -30,6 +31,15 @@ until [ "$#" = "0" ] ; do
     -iu|--ignore-unsupported-deps)
       ignore_unsupported_deps=1
       shift
+      ;;
+    -rs|--release-string)
+      case "$2" in
+      *' '*)
+        echo "$1 option argument must not contain spaces" >&2
+        exit 1
+      esac
+      mkspec_args=("${mkspec_args[@]}" --release "$2")
+      shift 2
       ;;
     -h|--help|-v|--version)
 	cat <<EOF
@@ -291,6 +301,6 @@ if [ -n "$tolerate_unknown_new_config_options" ]; then
     echo > $build_dir/TOLERATE-UNKNOWN-NEW-CONFIG-OPTIONS
 fi
 
-echo "cd $build_dir; ./mkspec"
+echo "cd $build_dir; ./mkspec ${mkspec_args[@]}"
 cd "$build_dir"
-./mkspec
+./mkspec "${mkspec_args[@]}"
