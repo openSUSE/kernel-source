@@ -302,5 +302,6 @@ if [ -n "$tolerate_unknown_new_config_options" ]; then
 fi
 
 echo "cd $build_dir; ./mkspec ${mkspec_args[@]}"
+patches=$PWD
 cd "$build_dir"
-./mkspec "${mkspec_args[@]}"
+./mkspec --patches "$patches" "${mkspec_args[@]}"
