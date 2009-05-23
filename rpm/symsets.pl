@@ -107,6 +107,7 @@ use warnings;
 
 use Digest::MD5 qw(md5_hex);
 use Getopt::Long;
+use File::Temp qw(tempfile);
 eval { require Pod::Usage; };
 if ($@) {
     sub pod2usage {
@@ -126,6 +127,10 @@ Install Pod::Usage for a better help message.
     Pod::Usage->import('pod2usage');
 }
 
+my @cleanfiles = ();
+END {
+    unlink @cleanfiles;
+}
 
 our ($opt_verbose);
 our $kabi_badness = 0;
@@ -292,8 +297,20 @@ sub module_exports {
     my ($file) = @_;
     my (%crcs, %types, @res);
     my $mod = $file;
-    $mod =~ s/.*\/lib\/modules\/[^\/]*\/kernel\///;
-    $mod =~ s/\.(k?o|a)$//;
+
+    if ($file =~ /\/vmlinu[xz]/) {
+        $mod = "vmlinux";
+    } else {
+        $mod =~ s/.*\/lib\/modules\/[^\/]*\/kernel\///;
+        $mod =~ s/\.(k?o|a)$//;
+    }
+    if ($file =~ /\.gz$|\/vmlinuz/) {
+        my ($fh, $newfile) = tempfile();
+        close($fh);
+        push(@cleanfiles, $newfile);
+        system("gzip -cd $file >$newfile");
+        $file = $newfile;
+    }
     
     open(my $pipe, '-|', 'objdump', '-t', $file) or die "objdump -t $file: $!\n";
     while (<$pipe>) {
