@@ -125,16 +125,15 @@ if [ ! -d $ORIG_DIR ]; then
 	fi
     done
     if [ -z "$LINUX_ORIG_TARBALL" ]; then
-        if type ketchup 2>/dev/null; then
-	    cd $SCRATCH_AREA && \
-	    rm -rf linux-$SRCVERSION && \
-	    mkdir linux-$SRCVERSION && \
-	    cd linux-$SRCVERSION && \
-	    ketchup $SRCVERSION && \
-	    cd $SCRATCH_AREA && \
-	    mv linux-$SRCVERSION linux-$SRCVERSION.orig
-	fi
-	if [ -z "$LINUX_ORIG_TARBALL" ]; then
+	echo Source version is $SRCVERSION. Original tarball not found,
+	echo trying ketchup.
+	(
+	    cd $SCRATCH_AREA
+	    mkdir linux-$SRCVERSION.orig
+	    cd linux-$SRCVERSION.orig
+	    ketchup $SRCVERSION
+	)
+	if [ ! -d $ORIG_DIR ]; then
 	    echo "Kernel source archive \`linux-$SRCVERSION.tar.gz' not found," >&2
 	    echo "alternatively you can put an unpatched kernel tree to" >&2
 	    echo "$ORIG_DIR." >&2
