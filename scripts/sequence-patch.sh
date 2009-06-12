@@ -3,15 +3,33 @@
 source $(dirname $0)/config.sh
 source $(dirname $0)/wd-functions.sh
 
+have_arch_patches=false
+have_defconfig_files=false
+fuzz="-F0"
+case "$DIST_SET" in
+sles9 | sles10 | 11.0)
+	fuzz=
+esac
+case "$DIST_SET" in
+sles9* | sles10* | sle10* | 9.* | 10.* | 11.0)
+	have_arch_patches=true
+	have_defconfig_files=true
+esac
+
 usage() {
-    echo "SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...] [--combine] [--fast] [last-patch-name] [--vanilla]"
+    echo "SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...] [--combine] [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]"
     exit 1
 }
 
 # Allow to pass in default arguments via SEQUENCE_PATCH_ARGS.
 set -- $SEQUENCE_PATCH_ARGS "$@"
 
-options=`getopt -o qvd: --long quilt,symbol:,dir:,combine,fast,vanilla -- "$@"`
+if $have_arch_patches; then
+	arch_opt="arch:"
+else
+	arch_opt=""
+fi
+options=`getopt -o qvd:F: --long quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -25,7 +43,7 @@ EXTRA_SYMBOLS=
 CLEAN=1
 COMBINE=
 FAST=
-VANILLA=no
+VANILLA=false
 
 while true; do
     case "$1" in
@@ -45,6 +63,10 @@ while true; do
        	--fast)
 	    FAST=1
 	    ;;
+	--arch)
+	    export PATCH_ARCH=$2
+	    shift
+	    ;;
 	--symbol)
 	    EXTRA_SYMBOLS="$EXTRA_SYMBOLS $2"
 	    shift
@@ -54,7 +76,11 @@ while true; do
 	    shift
 	    ;;
 	--vanilla)
-	    VANILLA=yes
+	    VANILLA=true
+	    ;;
+	-F|--fuzz)
+	    fuzz="-F$2"
+	    shift
 	    ;;
 	--)
 	    shift
@@ -87,7 +113,7 @@ esac
 
 # Check SCRATCH_AREA.
 if [ -z "$SCRATCH_AREA" ]; then
-    echo "SCRATCH_AREA not defined (defaulting to "tmp")"
+    echo "SCRATCH_AREA not defined (defaulting to \"tmp\")"
     SCRATCH_AREA=tmp
 fi
 if [ ! -d "$SCRATCH_AREA" ]; then
@@ -125,15 +151,16 @@ if [ ! -d $ORIG_DIR ]; then
 	fi
     done
     if [ -z "$LINUX_ORIG_TARBALL" ]; then
-	echo Source version is $SRCVERSION. Original tarball not found,
-	echo trying ketchup.
-	(
-	    cd $SCRATCH_AREA
-	    mkdir linux-$SRCVERSION.orig
-	    cd linux-$SRCVERSION.orig
-	    ketchup $SRCVERSION
-	)
-	if [ ! -d $ORIG_DIR ]; then
+        if type ketchup 2>/dev/null; then
+	    cd $SCRATCH_AREA && \
+	    rm -rf linux-$SRCVERSION && \
+	    mkdir linux-$SRCVERSION && \
+	    cd linux-$SRCVERSION && \
+	    ketchup $SRCVERSION && \
+	    cd $SCRATCH_AREA && \
+	    mv linux-$SRCVERSION linux-$SRCVERSION.orig
+	fi
+	if [ -d "$ORIG_DIR" ]; then
 	    echo "Kernel source archive \`linux-$SRCVERSION.tar.gz' not found," >&2
 	    echo "alternatively you can put an unpatched kernel tree to" >&2
 	    echo "$ORIG_DIR." >&2
@@ -153,6 +180,30 @@ if [ -e scripts/check-patches ]; then
 	echo "Please clean up series.conf and/or the patches directories!"
 	read
     }
+fi
+
+if $have_arch_patches; then
+    if [ -z "$ARCH_SYMBOLS" ]; then
+        if [ -x arch-symbols ]; then
+            ARCH_SYMBOLS=arch-symbols
+        elif [ -x scripts/arch-symbols ]; then
+            ARCH_SYMBOLS=scripts/arch-symbols
+        else
+            echo "Cannot locate \`arch-symbols' script (export ARCH_SYMBOLS)"
+            exit 1
+        fi
+    else
+        if [ ! -x "$ARCH_SYMBOLS" ]; then
+            echo "Cannot execute \`arch-symbols' script"
+            exit 1
+        fi
+    fi
+    SYMBOLS=$($ARCH_SYMBOLS)
+    if [ -z "$SYMBOLS" ]; then
+        echo "Unsupported architecture \`$ARCH'" >&2
+        exit 1
+    fi
+echo "Architecture symbol(s): $SYMBOLS"
 fi
 
 if [ -s extra-symbols ]; then
@@ -197,7 +248,7 @@ if ! [ -d $ORIG_DIR ]; then
     find $ORIG_DIR -type f | xargs chmod a-w,a+r
 fi
 
-if [ "$VANILLA" = "yes" ]; then
+if $VANILLA; then
 PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep kernel.org\|rpmify ) )
 else
 PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
@@ -269,7 +320,7 @@ restore_files() {
 	#echo "Restore: ${restore[@]}"
 	[ ${#restore[@]} -ne 0 ] \
 	    && printf "%s\n" "${restore[@]}" \
-	    	| xargs -I '{}' cp -f --parents '{}' $patch_dir
+		| xargs cp -f --parents --target $patch_dir
 	cd $patch_dir
 	#echo "Remove: ${remove[@]}"
 	[ ${#remove[@]} -ne 0 ] \
@@ -333,7 +384,7 @@ while [ $# -gt 0 ]; do
     *.bz2)	exec < <(bzip2 -cd $PATCH) ;;
     *)		exec < $PATCH ;;
     esac
-    patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E -F0 \
+    patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
 	    --no-backup-if-mismatch > $LAST_LOG 2>&1
     STATUS=$?
     exec 0<&5  # restore stdin
@@ -391,5 +442,35 @@ echo "[ Tree: $PATCH_DIR ]"
 
 [ $# -gt 0 ] && exit $status
 
-# Old kernels don't have a config.conf.
-[ -e config.conf ] || exit
+if ! $have_defconfig_files || test ! -e config.conf; then
+    exit 0
+fi
+
+# Copy the config files that apply for this kernel.
+echo "[ Copying config files ]" >> $PATCH_LOG
+echo "[ Copying config files ]"
+TMPFILE=$(mktemp /tmp/$(basename $0).XXXXXX)
+chmod a+r $TMPFILE
+CONFIGS=$(scripts/guards --list < config.conf)
+for config in $CONFIGS; do
+    if ! [ -e config/$config ]; then
+	echo "Configuration file config/$config not found"
+    fi
+    name=$(basename $config)
+    path=arch/$(dirname $config)/defconfig.$name
+    mkdir -p $(dirname $PATCH_DIR/$path)
+
+    chmod +x rpm/config-subst
+    cat config/$config \
+    | rpm/config-subst CONFIG_CFGNAME \"$name\" \
+    | rpm/config-subst CONFIG_RELEASE \"0\" \
+    | rpm/config-subst CONFIG_SUSE_KERNEL y \
+    > $TMPFILE
+
+    echo $path >> $PATCH_LOG
+    [ -z "$QUIET" ] && echo $path
+    # Make sure we don't override a hard-linked file.
+    rm -f $PATCH_DIR/$path
+    cp -f $TMPFILE $PATCH_DIR/$path
+done
+rm -f $TMPFILE
