@@ -160,7 +160,7 @@ if [ ! -d $ORIG_DIR ]; then
 	    cd $SCRATCH_AREA && \
 	    mv linux-$SRCVERSION linux-$SRCVERSION.orig
 	fi
-	if [ -d "$ORIG_DIR" ]; then
+	if [ ! -d "$ORIG_DIR" ]; then
 	    echo "Kernel source archive \`linux-$SRCVERSION.tar.gz' not found," >&2
 	    echo "alternatively you can put an unpatched kernel tree to" >&2
 	    echo "$ORIG_DIR." >&2
