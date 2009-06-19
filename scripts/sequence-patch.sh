@@ -152,6 +152,7 @@ if [ ! -d $ORIG_DIR ]; then
     done
     if [ -z "$LINUX_ORIG_TARBALL" ]; then
         if type ketchup 2>/dev/null; then
+	    pushd . > /dev/null
 	    cd $SCRATCH_AREA && \
 	    rm -rf linux-$SRCVERSION && \
 	    mkdir linux-$SRCVERSION && \
@@ -159,6 +160,7 @@ if [ ! -d $ORIG_DIR ]; then
 	    ketchup $SRCVERSION && \
 	    cd $SCRATCH_AREA && \
 	    mv linux-$SRCVERSION linux-$SRCVERSION.orig
+	    popd > /dev/null
 	fi
 	if [ ! -d "$ORIG_DIR" ]; then
 	    echo "Kernel source archive \`linux-$SRCVERSION.tar.gz' not found," >&2
