@@ -4,7 +4,6 @@
 
 tolerate_unknown_new_config_options=
 ignore_kabi=
-ignore_unsupported_deps=
 mkspec_args=()
 until [ "$#" = "0" ] ; do
   case "$1" in
@@ -29,7 +28,7 @@ until [ "$#" = "0" ] ; do
       shift
       ;;
     -iu|--ignore-unsupported-deps)
-      ignore_unsupported_deps=1
+      # ignored, set %supported_modules_check in the spec instead
       shift
       ;;
     -rs|--release-string)
@@ -160,6 +159,7 @@ install -m 755					\
 	rpm/modversions				\
 	rpm/built-in-where			\
 	rpm/symsets.pl                          \
+	rpm/split-modules                       \
 	scripts/guards				\
 	scripts/arch-symbols			\
 	misc/extract-modaliases			\
@@ -293,9 +293,6 @@ echo $((1024*1024)) > $build_dir/minmem
 echo $((6*1024)) > $build_dir/needed_space_in_mb
 if [ -n "$ignore_kabi" ]; then
     echo > $build_dir/IGNORE-KABI-BADNESS
-fi
-if [ -n "$ignore_unsupported_deps" ]; then
-    echo > $build_dir/IGNORE-UNSUPPORTED-DEPS
 fi
 if [ -n "$tolerate_unknown_new_config_options" ]; then
     echo > $build_dir/TOLERATE-UNKNOWN-NEW-CONFIG-OPTIONS
