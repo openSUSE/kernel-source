@@ -152,7 +152,6 @@ install -m 644					\
 install -m 755					\
 	rpm/mkspec                              \
 	rpm/find-provides			\
-	rpm/config-subst 			\
 	rpm/check-for-config-changes		\
 	rpm/check-supported-list		\
 	rpm/check-build.sh			\
