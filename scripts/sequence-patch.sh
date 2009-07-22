@@ -7,7 +7,7 @@ have_arch_patches=false
 have_defconfig_files=false
 fuzz="-F0"
 case "$DIST_SET" in
-sles9 | sles10 | 11.0)
+sles9 | sles10)
 	fuzz=
 esac
 case "$DIST_SET" in
@@ -130,6 +130,7 @@ TMPDIR=$SCRATCH_AREA
 export TMPDIR
 ORIG_DIR=$SCRATCH_AREA/linux-$SRCVERSION.orig
 TAG=$(get_branch_name)
+TAG=${TAG//\//_}
 PATCH_DIR=$SCRATCH_AREA/linux-$SRCVERSION${TAG:+-$TAG}
 PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION${TAG:+-$TAG}.log
 LAST_LOG=$SCRATCH_AREA/last-$SRCVERSION${TAG:+-$TAG}.log
