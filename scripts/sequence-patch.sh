@@ -7,7 +7,7 @@ have_arch_patches=false
 have_defconfig_files=false
 fuzz="-F0"
 case "$DIST_SET" in
-sles9 | sles10 | 11.0)
+sles9 | sles10)
 	fuzz=
 esac
 case "$DIST_SET" in
