@@ -200,7 +200,7 @@ stable_tar() {
     fi
     (
         cd "$chdir"
-        find "$@" \( -type f -o -type d -a -empty \) -print0 | \
+        find "$@" \( -type f -o -type l -o -type d -a -empty \) -print0 | \
             LC_ALL=C sort -z | \
             tar cf - --null -T - "${tar_opts[@]}"
     ) | bzip2 -9 >"$tarball"
