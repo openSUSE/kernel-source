@@ -1,5 +1,25 @@
 #! /bin/bash
 
+#############################################################################
+# Copyright (c) 2003-2005,2007-2009 Novell, Inc.
+# All Rights Reserved.
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.   See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, contact Novell, Inc.
+#
+# To contact Novell about this file by physical or electronic mail,
+# you may find current contact information at www.novell.com
+#############################################################################
+
 source $(dirname $0)/config.sh
 source $(dirname $0)/wd-functions.sh
 
@@ -7,7 +27,7 @@ have_arch_patches=false
 have_defconfig_files=false
 fuzz="-F0"
 case "$DIST_SET" in
-sles9 | sles10 | 11.0)
+sles9 | sles10)
 	fuzz=
 esac
 case "$DIST_SET" in
@@ -130,6 +150,7 @@ TMPDIR=$SCRATCH_AREA
 export TMPDIR
 ORIG_DIR=$SCRATCH_AREA/linux-$SRCVERSION.orig
 TAG=$(get_branch_name)
+TAG=${TAG//\//_}
 PATCH_DIR=$SCRATCH_AREA/linux-$SRCVERSION${TAG:+-$TAG}
 PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION${TAG:+-$TAG}.log
 LAST_LOG=$SCRATCH_AREA/last-$SRCVERSION${TAG:+-$TAG}.log

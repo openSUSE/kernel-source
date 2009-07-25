@@ -209,6 +209,9 @@ for config in $config_files; do
     cpu_arch=${config%/*}
     flavor=${config#*/}
 
+    if test -L "patches/config/$config"; then
+        continue
+    fi
     set -- kernel-$flavor $flavor $(case $flavor in (rt|rt_*) echo RT ;; esac)
     patches/scripts/guards $* $EXTRA_SYMBOLS \
 	< patches/series.conf > $TMPDIR/patches
@@ -221,6 +224,7 @@ for config in $config_files; do
 
     case $cpu_arch in
 	ppc|ppc64) kbuild_arch=powerpc ;;
+	s390x) kbuild_arch=s390 ;;
 	*) kbuild_arch=$cpu_arch ;;
     esac
     MAKE_ARGS="ARCH=$kbuild_arch"

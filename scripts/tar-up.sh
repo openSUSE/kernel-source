@@ -127,47 +127,10 @@ trap 'if test -n "$CLEANFILES"; then rm -rf "${CLEANFILES[@]}"; fi' EXIT
 tmpdir=$(mktemp -dt ${0##*/}.XXXXXX)
 CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
-EXTRA_SYMBOLS=$([ -e extra-symbols ] && cat extra-symbols)
-
-
-echo "Copying various files..."
-install -m 644					\
-	config.conf				\
-	supported.conf				\
-	rpm/config.sh                           \
-	rpm/old-packages.conf                   \
-	rpm/kernel-{binary,source,syms}.spec.in \
-	rpm/devel-pre.sh			\
-	rpm/devel-post.sh			\
-	rpm/source-post.sh		        \
-	rpm/{pre,post,preun,postun}.sh		\
-	rpm/module-renames			\
-	rpm/kernel-module-subpackage		\
-	rpm/macros.kernel-source		\
-	rpm/package-descriptions                \
-	doc/README.SUSE				\
-	doc/README.KSYMS			\
-	$build_dir
-
-install -m 755					\
-	rpm/mkspec                              \
-	rpm/find-provides			\
-	rpm/check-for-config-changes		\
-	rpm/check-supported-list		\
-	rpm/check-build.sh			\
-	rpm/modversions				\
-	rpm/built-in-where			\
-	rpm/symsets.pl                          \
-	rpm/split-modules                       \
-	scripts/guards				\
-	scripts/arch-symbols			\
-	misc/extract-modaliases			\
-	rpm/compute-PATCHVERSION.sh             \
-	$build_dir
+cp -p rpm/* config.conf supported.conf doc/README.{SUSE,KSYMS} \
+	misc/extract-modaliases $build_dir
 
 cat kernel-source.changes{,.old} > "$build_dir/kernel-source$VARIANT.changes"
-install -m 644 rpm/kernel-source.rpmlintrc \
-	"$build_dir/kernel-source$VARIANT.rpmlintrc"
 
 if [ -e extra-symbols ]; then
 	install -m 755					\
@@ -237,7 +200,7 @@ stable_tar() {
     fi
     (
         cd "$chdir"
-        find "$@" \( -type f -o -type d -a -empty \) -print0 | \
+        find "$@" \( -type f -o -type l -o -type d -a -empty \) -print0 | \
             LC_ALL=C sort -z | \
             tar cf - --null -T - "${tar_opts[@]}"
     ) | bzip2 -9 >"$tarball"
