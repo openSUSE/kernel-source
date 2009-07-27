@@ -129,6 +129,8 @@ CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
 cp -p rpm/* config.conf supported.conf doc/README.{SUSE,KSYMS} \
 	misc/extract-modaliases $build_dir
+# FIXME: move config-subst out of rpm/
+rm "$build_dir/config-subst"
 
 cat kernel-source.changes{,.old} > "$build_dir/kernel-source$VARIANT.changes"
 
