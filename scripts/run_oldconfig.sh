@@ -55,15 +55,28 @@ function _region_msg_ () {
     fi
 }
 
-function expand_config_option () {
-	local opt="$1"
-	opt="${opt%%=*}"
-	case "$opt" in
+set_var()
+{
+	local name=$1 val=$2 config
+
+	name="${name%%=*}"
+	case "$name" in
 		CONFIG_*) ;;
-		*) opt="CONFIG_$opt" ;;
+		*) name="CONFIG_$name" ;;
 	esac
-	echo "$opt"
+	echo "appending $name=$val to all config files listed in config.conf"
+	for config in $(scripts/guards $CONFIG_SYMBOLS < config.conf); do
+		if test -L "config/$config"; then
+			continue
+		fi
+		sed -i "/\\<$name[ =]/d" "config/$config"
+		case "$val" in
+		y | m) echo "$name=$val" ;;
+		n) echo "# $name is not set" ;;
+		esac >> config/$config
+	done
 }
+
 
 function _cleanup_() {
 	test -d "$TMPDIR" && rm -rf $TMPDIR
@@ -165,33 +178,15 @@ else
 fi
 
 if [ "$new_config_option_yes" != "no" ] ; then
-	new_config_option_yes="`expand_config_option $new_config_option_yes`"
-	echo "appending $new_config_option_yes to all config files listed in config.conf"
-	for config in $(scripts/guards $CONFIG_SYMBOLS < config.conf); do
-		sed -i "/${new_config_option_yes}[ =]/d" config/$config
-		# '"
-		echo "${new_config_option_yes}=y" >> config/$config
-	done
+	set_var "$new_config_option_yes" y
 	exit 0
 fi
 if [ "$new_config_option_mod" != "no" ] ; then
-	new_config_option_mod="`expand_config_option $new_config_option_mod`"
-	echo "appending $new_config_option_mod to all config files listed in config.conf"
-	for config in $(scripts/guards $CONFIG_SYMBOLS < config.conf); do
-		sed -i "/${new_config_option_mod}[ =]/d" config/$config
-		# '"
-		echo "${new_config_option_mod}=m" >> config/$config
-	done
+	set_var "$new_config_option_mod" m
 	exit 0
 fi
 if [ "$new_config_option_no" != "no" ] ; then
-	new_config_option_no="`expand_config_option $new_config_option_no`"
-	echo "disable $new_config_option_no in all config files listed in config.conf"
-	for config in $(scripts/guards $CONFIG_SYMBOLS < config.conf); do
-		sed -i "/${new_config_option_no}[ =]/d" config/$config
-		# '"
-		echo "# ${new_config_option_no} is not set" >> config/$config
-	done
+	set_var "$new_config_option_no" n
 	exit 0
 fi
 
