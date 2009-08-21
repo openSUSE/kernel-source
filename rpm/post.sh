@@ -44,7 +44,6 @@ if [ -e /lib/modules/@KERNELRELEASE@-@FLAVOR@ ]; then
 fi
 # Add symlinks of compatible modules to /lib/modules/$krel/weak-updates/, 
 # run depmod and mkinitrd
-wm=/usr/lib/module-init-tools/weak-modules
 wm2=/usr/lib/module-init-tools/weak-modules2
 if [ -x $wm2 ]; then
     if [ @BASE_PACKAGE@ = 1 ]; then
@@ -53,25 +52,8 @@ if [ -x $wm2 ]; then
         nvr=@SUBPACKAGE@-@RPM_VERSION_RELEASE@
         rpm -ql $nvr | /bin/bash -${-/e/} $wm2 --add-kernel-modules @KERNELRELEASE@-@FLAVOR@
     fi
-elif [ -x $wm ]; then
-    # pre CODE11 compatibility
-    $wm --add-kernel @KERNELRELEASE@-@FLAVOR@
-    /sbin/depmod -a -F /boot/System.map-@KERNELRELEASE@-@FLAVOR@ @KERNELRELEASE@-@FLAVOR@
-    if [ -f /etc/fstab -a ! -e /.buildenv -a -x /sbin/mkinitrd ] ; then
-        /sbin/mkinitrd -k /boot/@IMAGE@-@KERNELRELEASE@-@FLAVOR@ \
-                       -i /boot/initrd-@KERNELRELEASE@-@FLAVOR@
-        if [ $? -ne 0 ]; then
-            echo "/sbin/mkinitrd failed" >&2
-            case @SUBPACKAGE@ in
-            *-base)
-                echo "Ignoring this for the base subpackage" >&2
-                ;;
-            *)
-                exit 1
-                ;;
-            esac
-        fi
-    fi
+else
+    echo "$wm does not exist, please run depmod and mkinitrd manually" >&2
 fi
 
 message_install_bl () {
@@ -99,7 +81,6 @@ if [ -f /etc/fstab -a ! -e /.buildenv ] ; then
     if [ -e /boot/$initrd -o ! -e /lib/modules/@KERNELRELEASE@-@FLAVOR@ ] && \
        run_bootloader ; then
        [ -e /boot/$initrd ] || initrd=
-	# handle 10.2 and SLES10 SP1 or later
 	if [ -x /usr/lib/bootloader/bootloader_entry ]; then
 	    /usr/lib/bootloader/bootloader_entry \
 		add \
@@ -107,38 +88,11 @@ if [ -f /etc/fstab -a ! -e /.buildenv ] ; then
 		@KERNELRELEASE@-@FLAVOR@ \
 		@IMAGE@-@KERNELRELEASE@-@FLAVOR@ \
 		$initrd
-
-	# handle 10.1 and SLES10 GA
-	elif [ -x /sbin/update-bootloader ]; then
-	    case @FLAVOR@ in
-		kdump|ps3)
-		    ;;
-		*)
-		    opt_xen_kernel=
-		    case @FLAVOR@ in
-			xen*)
-			    set -- @FLAVOR@
-			    set -- ${1#xen}
-			    opt_xen_kernel=--xen-kernel=/boot/xen${1:+-$1}.gz
-			    ;;
-		    esac
-
-		    echo "bootloader_entry script unavailable, updating /boot/@IMAGE@"
-		    /sbin/update-bootloader \
-			--image /boot/@IMAGE@ \
-			${initrd:+--initrd /boot/initrd} \
-			--add \
-			--force $opt_xen_kernel
-
-		    /sbin/update-bootloader --refresh
-		    ;;
-	    esac
 	else
 	    message_install_bl
 	fi
     fi
 else
-    echo "Please run mkinitrd as soon as your system is complete."
     message_install_bl
 fi
 
