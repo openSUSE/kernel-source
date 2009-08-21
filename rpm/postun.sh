@@ -1,4 +1,3 @@
-wm=/usr/lib/module-init-tools/weak-modules
 wm2=/usr/lib/module-init-tools/weak-modules2
 if [ @BASE_PACKAGE@ = 0 ]; then
     if [ -x $wm2 ]; then
@@ -11,14 +10,8 @@ fi
 # Remove symlinks from /lib/modules/$krel/weak-updates/.
 if [ -x $wm2 ]; then
     /bin/bash -${-/e/} $wm2 --remove-kernel @KERNELRELEASE@-@FLAVOR@
-elif [ -x $wm ]; then
-    # pre CODE11 compatibility
-    $wm --remove-kernel @KERNELRELEASE@-@FLAVOR@
 fi
 
-# remove /boot/@IMAGE@.previous entry on a 10.1 and SLES10 GA system
-# when going back from 10.2 or SLES10 SP1 kernel to the original kernel
-remove_previos_entry=no
 suffix=
 case @FLAVOR@ in
     kdump|ps3|xen*|vanilla)
@@ -26,22 +19,8 @@ case @FLAVOR@ in
         ;;
 esac
 
-# Created in %post of old kernels
-case "$(readlink /boot/@IMAGE@$suffix.previous)" in
-@IMAGE@-@KERNELRELEASE@-@FLAVOR@|$(readlink /boot/@IMAGE@$suffix))
-    remove_previos_entry=yes
-    rm -f /boot/@IMAGE@$suffix.previous 
-    ;;
-esac
-case "$(readlink /boot/initrd$suffix.previous)" in
-initrd-@KERNELRELEASE@-@FLAVOR@|$(readlink /boot/initrd$suffix))
-    rm -f /boot/initrd$suffix.previous
-    ;;
-esac
-
 # remove fstab check once perl-Bootloader can cope with it
 if [ -f /etc/fstab ]; then
-	# handle 10.2 and SLES10 SP1
 	if [ -x /usr/lib/bootloader/bootloader_entry ]; then
 	    /usr/lib/bootloader/bootloader_entry \
 		remove \
@@ -49,14 +28,5 @@ if [ -f /etc/fstab ]; then
 		@KERNELRELEASE@-@FLAVOR@ \
 		@IMAGE@-@KERNELRELEASE@-@FLAVOR@ \
 		initrd-@KERNELRELEASE@-@FLAVOR@
-
-	# handle 10.1 and SLES10 GA
-	elif [ -x /sbin/update-bootloader ]; then
-		if [ "$remove_previos_entry" = "yes" ] ; then
-			/sbin/update-bootloader	--image /boot/@IMAGE@$suffix.previous \
-						--initrd /boot/initrd$suffix.previous \
-						--remove --force
-		fi
-		/sbin/update-bootloader --refresh
 	fi
 fi
