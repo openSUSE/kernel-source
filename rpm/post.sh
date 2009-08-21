@@ -35,13 +35,6 @@ for x in /boot/@IMAGE@ /boot/initrd; do
     ln -s ${x##*/}-@KERNELRELEASE@-@FLAVOR@ $x$suffix
 done
 
-if [ -e /lib/modules/@KERNELRELEASE@-@FLAVOR@ ]; then
-    echo Setting up /lib/modules/@KERNELRELEASE@-@FLAVOR@
-
-    if [ -x /sbin/module_upgrade ]; then
-	/sbin/module_upgrade --rename mptscsih="mptspi mptfc mptsas"
-    fi
-fi
 # Add symlinks of compatible modules to /lib/modules/$krel/weak-updates/, 
 # run depmod and mkinitrd
 wm2=/usr/lib/module-init-tools/weak-modules2
