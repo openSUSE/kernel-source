@@ -24,6 +24,8 @@
 
 . ${0%/*}/wd-functions.sh
 
+export LC_COLLATE=C
+
 tolerate_unknown_new_config_options=
 ignore_kabi=
 mkspec_args=()
