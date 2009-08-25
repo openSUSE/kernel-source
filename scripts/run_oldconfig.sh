@@ -65,15 +65,15 @@ set_var()
 		*) name="CONFIG_$name" ;;
 	esac
 	echo "appending $name=$val to all config files listed in config.conf"
-	for config in $(scripts/guards $CONFIG_SYMBOLS < config.conf); do
-		if test -L "config/$config"; then
+	for config in $(${prefix}scripts/guards $CONFIG_SYMBOLS < ${prefix}config.conf); do
+		if test -L "${prefix}config/$config"; then
 			continue
 		fi
-		sed -i "/\\<$name[ =]/d" "config/$config"
+		sed -i "/\\<$name[ =]/d" "${prefix}config/$config"
 		case "$val" in
 		y | m) echo "$name=$val" ;;
 		n) echo "# $name is not set" ;;
-		esac >> config/$config
+		esac >> ${prefix}config/$config
 	done
 }
 
@@ -199,7 +199,7 @@ if [ "$menuconfig" = "no" ] ; then
 	esac
 fi
 
-config_files=$(patches/scripts/guards $CONFIG_SYMBOLS < patches/config.conf)
+config_files=$(${prefix}scripts/guards $CONFIG_SYMBOLS < ${prefix}config.conf)
 
 if [ "$vanilla" = "no" ] ; then
     config_files=$(printf "%s\n" $config_files | grep -v vanilla)
@@ -214,7 +214,7 @@ if [ -s extra-symbols ]; then
     EXTRA_SYMBOLS="$(cat extra-symbols)"
 fi
 
-patches/scripts/guards $EXTRA_SYMBOLS < patches/series.conf \
+${prefix}scripts/guards $EXTRA_SYMBOLS < ${prefix}series.conf \
     > $TMPDIR/applied-patches
 
 EXTRA_SYMBOLS="$(echo $EXTRA_SYMBOLS | sed -e 's# *[Rr][Tt] *##g')"
@@ -223,12 +223,12 @@ for config in $config_files; do
     cpu_arch=${config%/*}
     flavor=${config#*/}
 
-    if test -L "patches/config/$config"; then
+    if test -L "${prefix}config/$config"; then
         continue
     fi
     set -- kernel-$flavor $flavor $(case $flavor in (rt|rt_*) echo RT ;; esac)
-    patches/scripts/guards $* $EXTRA_SYMBOLS \
-	< patches/series.conf > $TMPDIR/patches
+    ${prefix}scripts/guards $* $EXTRA_SYMBOLS \
+	< ${prefix}series.conf > $TMPDIR/patches
 
     if ! diff -q $TMPDIR/applied-patches $TMPDIR/patches > /dev/null; then
 	echo "Not all patches for $config are applied; skipping"
@@ -242,7 +242,7 @@ for config in $config_files; do
 	*) kbuild_arch=$cpu_arch ;;
     esac
     MAKE_ARGS="ARCH=$kbuild_arch"
-    config="patches/config/$config"
+    config="${prefix}config/$config"
 
     cat $config \
     | bash $config_subst CONFIG_LOCALVERSION \"-${config##*/}\" \
