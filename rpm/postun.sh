@@ -12,13 +12,6 @@ if [ -x $wm2 ]; then
     /bin/bash -${-/e/} $wm2 --remove-kernel @KERNELRELEASE@-@FLAVOR@
 fi
 
-suffix=
-case @FLAVOR@ in
-    kdump|ps3|xen*|vanilla)
-        suffix=-@FLAVOR@
-        ;;
-esac
-
 # remove fstab check once perl-Bootloader can cope with it
 if [ -f /etc/fstab ]; then
 	if [ -x /usr/lib/bootloader/bootloader_entry ]; then
