@@ -1,7 +1,16 @@
 wm2=/usr/lib/module-init-tools/weak-modules2
+nvr=@SUBPACKAGE@-@RPM_VERSION_RELEASE@
+
+if [ -e /boot/System.map-@KERNELRELEASE@-@FLAVOR@ ]; then
+    # the same package was reinstalled or just rebuilt, otherwise the files
+    # would have been deleted by now
+    # do not remove anything in this case (bnc#533766)
+    rm -f /var/run/rpm-$nvr-modules
+    exit 0
+fi
+
 if [ @BASE_PACKAGE@ = 0 ]; then
     if [ -x $wm2 ]; then
-        nvr=@SUBPACKAGE@-@RPM_VERSION_RELEASE@
         /bin/bash -${-/e/} $wm2 --remove-kernel-modules @KERNELRELEASE@-@FLAVOR@ < /var/run/rpm-$nvr-modules
     fi
     rm -f /var/run/rpm-$nvr-modules
