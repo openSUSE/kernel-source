@@ -19,9 +19,18 @@
 # you may find current contact information at www.novell.com
 #############################################################################
 source scripts/config.sh
-sudo -l
-important_specfiles="default ppc64 kdump vanilla ps3 xen pae"
-all_specfiles="`sed -e '/^\+/s@^.*/@@p;d' config.conf | sort -u | xargs echo source${VARIANT} dummy`"
+all_specfiles="$(echo $(sed -n 's:^+.*/::p' config.conf | sort -u)) source${VARIANT}"
+if test -e "rpm/kernel-dummy.spec.in"; then
+	all_specfiles="$all_specfiles dummy"
+fi
+important_specfiles=
+for spec in $all_specfiles; do
+	case "$spec" in
+	debug | dummy | ec2 | pmac* | power3 | SLRS | source* | trace | um | vmi*)
+		continue
+	esac
+	important_specfiles="$important_specfiles $spec"
+done
 single_specfiles=
 timestamp=
 rpm_release_string=
@@ -84,9 +93,8 @@ until [ "$#" = "0" ] ; do
         ignore_unsupported_deps=-iu
 	shift
 	;;
-    -h|--help|-v|--version)
+    -h|--help)
 	cat <<EOF
-
 ${0##*/} builds a kernel.rpm via mbuild for the following list of specfiles:
 $specfiles
 
@@ -115,14 +123,15 @@ the following 3 options are needed to build vanilla kernel with a stripped down 
     
 example usage:
 sudo $0 -l talk -D ppc -D x86_64 -ts
-sudo $0 -l talk -d stable -ts -nf
-sudo $0 -l talk -d stable -s s390x -D i386 -D s390x -ts -nf
+sudo $0 -l talk -d head -ts -nf
+sudo $0 -l talk -d head -s s390x -D i386 -D s390x -ts -nf
 
 simple usage:
 sudo $0 -l talk
 
+This script only works in the suse internal network.
 EOF
-	exit 1
+	exit 0
 	;;
     *)
 	shift
@@ -134,7 +143,7 @@ if [ -z "$dist" ] ; then
     mbuild_options="$mbuild_options ${DIST_SET:+-d $DIST_SET}"
 fi
 if [ ! -z "$single_specfiles" ] ; then
-specfiles=`echo $single_specfiles | sort | xargs echo`
+specfiles="$single_specfiles"
 fi
 scripts/tar-up.sh $ignore_kabi $ignore_unsupported_deps $rpm_release_string $timestamp $tolerate_unknown_new_config_options || exit 1
 cd $BUILD_DIR
