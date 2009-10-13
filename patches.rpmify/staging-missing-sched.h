@@ -11,10 +11,14 @@ Signed-off-by: Jeff Mahoney <jeffm@suse.com>
  drivers/staging/hv/osd.c                   |    1 +
  drivers/staging/iio/industrialio-core.c    |    2 ++
  drivers/staging/poch/poch.c                |    1 +
+ drivers/staging/rt2860/common/cmm_info.c   |    1 +
+ drivers/staging/rt2860/rt_linux.c          |    1 +
+ drivers/staging/rt3090/common/cmm_info.c   |    1 +
+ drivers/staging/rt3090/rt_linux.c          |    1 +
  drivers/staging/sep/sep_driver.c           |    1 +
  drivers/staging/vme/bridges/vme_ca91cx42.c |    1 +
  drivers/staging/vme/bridges/vme_tsi148.c   |    1 +
- 7 files changed, 8 insertions(+)
+ 11 files changed, 12 insertions(+)
 
 --- a/drivers/staging/b3dfg/b3dfg.c
 +++ b/drivers/staging/b3dfg/b3dfg.c
@@ -57,6 +61,46 @@ Signed-off-by: Jeff Mahoney <jeffm@suse.com>
  
  #include "poch.h"
  
+--- a/drivers/staging/rt2860/common/cmm_info.c
++++ b/drivers/staging/rt2860/common/cmm_info.c
+@@ -25,6 +25,7 @@
+  *************************************************************************
+ */
+ 
++#include <linux/sched.h>
+ #include "../rt_config.h"
+ 
+ INT	Show_SSID_Proc(
+--- a/drivers/staging/rt2860/rt_linux.c
++++ b/drivers/staging/rt2860/rt_linux.c
+@@ -25,6 +25,7 @@
+  *************************************************************************
+  */
+ 
++#include <linux/sched.h>
+ #include "rt_config.h"
+ 
+ ULONG	RTDebugLevel = RT_DEBUG_ERROR;
+--- a/drivers/staging/rt3090/common/cmm_info.c
++++ b/drivers/staging/rt3090/common/cmm_info.c
+@@ -34,6 +34,7 @@
+     ---------    ----------    ----------------------------------------------
+  */
+ 
++#include <linux/sched.h>
+ #include "../rt_config.h"
+ 
+ 
+--- a/drivers/staging/rt3090/rt_linux.c
++++ b/drivers/staging/rt3090/rt_linux.c
+@@ -25,6 +25,7 @@
+  *************************************************************************
+  */
+ 
++#include <linux/sched.h>
+ #include "rt_config.h"
+ 
+ ULONG	RTDebugLevel = RT_DEBUG_ERROR;
 --- a/drivers/staging/sep/sep_driver.c
 +++ b/drivers/staging/sep/sep_driver.c
 @@ -38,6 +38,7 @@
