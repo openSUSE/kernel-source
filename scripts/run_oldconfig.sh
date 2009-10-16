@@ -219,6 +219,8 @@ ${prefix}scripts/guards $EXTRA_SYMBOLS < ${prefix}series.conf \
 
 EXTRA_SYMBOLS="$(echo $EXTRA_SYMBOLS | sed -e 's# *[Rr][Tt] *##g')"
 
+last_arch=
+
 for config in $config_files; do
     cpu_arch=${config%/*}
     flavor=${config#*/}
