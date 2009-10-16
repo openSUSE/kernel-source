@@ -246,8 +246,6 @@ for config in $config_files; do
     MAKE_ARGS="ARCH=$kbuild_arch"
     config="${prefix}config/$config"
 
-    [ "$last_arch" != "$kbuild_arch" ] && make mrproper
-
     cat $config \
     | bash $config_subst CONFIG_LOCALVERSION \"-${config##*/}\" \
     | bash $config_subst CONFIG_SUSE_KERNEL y \
@@ -264,9 +262,4 @@ for config in $config_files; do
     if ! diff -U0 $config .config; then
 	sed '/^# Linux kernel version:/d' < .config > $config
     fi
-    last_arch=$kbuild_arch
 done
-
-# This is so the caller doesn't have to do it themselves afterwards since
-# it's likely they're not on s/390.
-make mrproper
