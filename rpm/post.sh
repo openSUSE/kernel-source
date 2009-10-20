@@ -26,7 +26,7 @@ fi
 
 suffix=
 case @FLAVOR@ in
-    kdump|ps3|xen*|vanilla)
+    kdump|ps3|xen*|ec2|vanilla)
 	suffix=-@FLAVOR@
 	;;
 esac
