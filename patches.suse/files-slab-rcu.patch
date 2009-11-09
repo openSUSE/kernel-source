@@ -1,0 +1,364 @@
+From: Nick Piggin <npiggin@suse.de>
+Subject: SLAB_DESTROY_BY_RCU for file slab
+Patch-mainline: not yet
+
+Use SLAB_DESTROY_BY_RCU for file slab cache. Ensure we have the correct
+object by using a spinlock to protect the refcount rather than having it
+atomic (problem with it being atomic is having to release the last ref
+on a file we have incorrectly picked up a reference to).
+
+This improves single threaded repeated open/close performance by 28% by
+avoiding the full RCU cycle.
+
+Signed-off-by: Nick Piggin <npiggin@suse.de>
+---
+ drivers/net/ppp_generic.c         |    4 +-
+ drivers/scsi/osst.c               |    2 -
+ drivers/scsi/st.c                 |    2 -
+ fs/aio.c                          |    4 +-
+ fs/file_table.c                   |   70 +++++++++++++++++++-------------------
+ fs/open.c                         |    2 -
+ include/linux/fs.h                |   25 +++++++++++--
+ kernel/perf_event.c               |    4 +-
+ net/sched/sch_atm.c               |    4 +-
+ net/unix/garbage.c                |    2 -
+ security/integrity/ima/ima_main.c |    2 -
+ 11 files changed, 70 insertions(+), 51 deletions(-)
+
+Index: linux-2.6/fs/aio.c
+===================================================================
+--- linux-2.6.orig/fs/aio.c
++++ linux-2.6/fs/aio.c
+@@ -531,7 +531,7 @@ static void aio_fput_routine(struct work
+ static int __aio_put_req(struct kioctx *ctx, struct kiocb *req)
+ {
+ 	dprintk(KERN_DEBUG "aio_put(%p): f_count=%ld\n",
+-		req, atomic_long_read(&req->ki_filp->f_count));
++		req, req->ki_filp->f_count);
+ 
+ 	assert_spin_locked(&ctx->ctx_lock);
+ 
+@@ -549,7 +549,7 @@ static int __aio_put_req(struct kioctx *
+ 	 * we would not be holding the last reference to the file*, so
+ 	 * this function will be executed w/out any aio kthread wakeup.
+ 	 */
+-	if (unlikely(atomic_long_dec_and_test(&req->ki_filp->f_count))) {
++	if (unlikely(file_dec_and_test(req->ki_filp))) {
+ 		get_ioctx(ctx);
+ 		spin_lock(&fput_lock);
+ 		list_add(&req->ki_list, &fput_head);
+Index: linux-2.6/fs/file_table.c
+===================================================================
+--- linux-2.6.orig/fs/file_table.c
++++ linux-2.6/fs/file_table.c
+@@ -38,19 +38,12 @@ static struct kmem_cache *filp_cachep __
+ 
+ static struct percpu_counter nr_files __cacheline_aligned_in_smp;
+ 
+-static inline void file_free_rcu(struct rcu_head *head)
+-{
+-	struct file *f = container_of(head, struct file, f_u.fu_rcuhead);
+-
+-	put_cred(f->f_cred);
+-	kmem_cache_free(filp_cachep, f);
+-}
+-
+ static inline void file_free(struct file *f)
+ {
+ 	percpu_counter_dec(&nr_files);
+ 	file_check_state(f);
+-	call_rcu(&f->f_u.fu_rcuhead, file_free_rcu);
++	put_cred(f->f_cred);
++	kmem_cache_free(filp_cachep, f);
+ }
+ 
+ /*
+@@ -125,7 +118,7 @@ struct file *get_empty_filp(void)
+ 		goto fail_sec;
+ 
+ 	INIT_LIST_HEAD(&f->f_u.fu_list);
+-	atomic_long_set(&f->f_count, 1);
++	f->f_count = 1;
+ 	rwlock_init(&f->f_owner.lock);
+ 	f->f_cred = get_cred(cred);
+ 	spin_lock_init(&f->f_lock);
+@@ -223,7 +216,7 @@ EXPORT_SYMBOL(init_file);
+ 
+ void fput(struct file *file)
+ {
+-	if (atomic_long_dec_and_test(&file->f_count))
++	if (unlikely(file_dec_and_test(file)))
+ 		__fput(file);
+ }
+ 
+@@ -295,21 +288,38 @@ void __fput(struct file *file)
+ 	mntput(mnt);
+ }
+ 
+-struct file *fget(unsigned int fd)
++static inline struct file *get_stable_file(struct files_struct *files, unsigned int fd)
+ {
++	struct fdtable *fdt;
+ 	struct file *file;
+-	struct files_struct *files = current->files;
+ 
+ 	rcu_read_lock();
+-	file = fcheck_files(files, fd);
+-	if (file) {
+-		if (!atomic_long_inc_not_zero(&file->f_count)) {
+-			/* File object ref couldn't be taken */
+-			rcu_read_unlock();
+-			return NULL;
++	fdt = files_fdtable(files);
++	if (likely(fd < fdt->max_fds)) {
++		file = rcu_dereference(fdt->fd[fd]);
++		if (file) {
++			spin_lock(&file->f_lock);
++			if (unlikely(file != fdt->fd[fd] || !file->f_count)) {
++				spin_unlock(&file->f_lock);
++				file = NULL;
++				goto out;
++			}
++			file->f_count++;
++			spin_unlock(&file->f_lock);
+ 		}
+-	}
++	} else
++		file = NULL;
++out:
+ 	rcu_read_unlock();
++	return file;
++}
++
++struct file *fget(unsigned int fd)
++{
++	struct file *file;
++	struct files_struct *files = current->files;
++
++	file = get_stable_file(files, fd);
+ 
+ 	return file;
+ }
+@@ -328,20 +338,12 @@ struct file *fget_light(unsigned int fd,
+ 	struct file *file;
+ 	struct files_struct *files = current->files;
+ 
+-	*fput_needed = 0;
+ 	if (likely((atomic_read(&files->count) == 1))) {
++		*fput_needed = 0;
+ 		file = fcheck_files(files, fd);
+ 	} else {
+-		rcu_read_lock();
+-		file = fcheck_files(files, fd);
+-		if (file) {
+-			if (atomic_long_inc_not_zero(&file->f_count))
+-				*fput_needed = 1;
+-			else
+-				/* Didn't get the reference, someone's freed */
+-				file = NULL;
+-		}
+-		rcu_read_unlock();
++		*fput_needed = 1;
++		file = get_stable_file(files, fd);
+ 	}
+ 
+ 	return file;
+@@ -350,7 +352,7 @@ struct file *fget_light(unsigned int fd,
+ 
+ void put_filp(struct file *file)
+ {
+-	if (atomic_long_dec_and_test(&file->f_count)) {
++	if (unlikely(file_dec_and_test(file))) {
+ 		security_file_free(file);
+ 		file_kill(file);
+ 		file_free(file);
+@@ -416,7 +418,7 @@ retry:
+ 		struct vfsmount *mnt;
+ 		if (!S_ISREG(f->f_path.dentry->d_inode->i_mode))
+ 		       continue;
+-		if (!file_count(f))
++		if (!f->f_count)
+ 			continue;
+ 		if (!(f->f_mode & FMODE_WRITE))
+ 			continue;
+@@ -442,7 +444,7 @@ void __init files_init(unsigned long mem
+ 	int n; 
+ 
+ 	filp_cachep = kmem_cache_create("filp", sizeof(struct file), 0,
+-			SLAB_HWCACHE_ALIGN | SLAB_PANIC, NULL);
++			SLAB_HWCACHE_ALIGN | SLAB_DESTROY_BY_RCU | SLAB_PANIC, NULL);
+ 
+ 	/*
+ 	 * One file with associated inode and dcache is very roughly 1K.
+Index: linux-2.6/include/linux/fs.h
+===================================================================
+--- linux-2.6.orig/include/linux/fs.h
++++ linux-2.6/include/linux/fs.h
+@@ -918,9 +918,10 @@ struct file {
+ #define f_dentry	f_path.dentry
+ #define f_vfsmnt	f_path.mnt
+ 	const struct file_operations	*f_op;
+-	spinlock_t		f_lock;  /* f_ep_links, f_flags, no IRQ */
+-	atomic_long_t		f_count;
++	/* f_lock protects f_count, f_ep_links, f_flags, no IRQ */
++	spinlock_t		f_lock;
+ 	unsigned int 		f_flags;
++	long			f_count;
+ 	fmode_t			f_mode;
+ 	loff_t			f_pos;
+ 	struct fown_struct	f_owner;
+@@ -947,8 +948,24 @@ extern spinlock_t files_lock;
+ #define file_list_lock() spin_lock(&files_lock);
+ #define file_list_unlock() spin_unlock(&files_lock);
+ 
+-#define get_file(x)	atomic_long_inc(&(x)->f_count)
+-#define file_count(x)	atomic_long_read(&(x)->f_count)
++static inline void get_file(struct file *f)
++{
++	spin_lock(&f->f_lock);
++	f->f_count++;
++	spin_unlock(&f->f_lock);
++}
++
++static inline int file_dec_and_test(struct file *f)
++{
++	int ret;
++
++	spin_lock(&f->f_lock);
++	f->f_count--;
++	ret = (f->f_count == 0);
++	spin_unlock(&f->f_lock);
++
++	return ret;
++}
+ 
+ #ifdef CONFIG_DEBUG_WRITECOUNT
+ static inline void file_take_write(struct file *f)
+Index: linux-2.6/drivers/net/ppp_generic.c
+===================================================================
+--- linux-2.6.orig/drivers/net/ppp_generic.c
++++ linux-2.6/drivers/net/ppp_generic.c
+@@ -590,12 +590,12 @@ static long ppp_ioctl(struct file *file,
+ 			if (file == ppp->owner)
+ 				ppp_shutdown_interface(ppp);
+ 		}
+-		if (atomic_long_read(&file->f_count) <= 2) {
++		if (file->f_count <= 2) {
+ 			ppp_release(NULL, file);
+ 			err = 0;
+ 		} else
+ 			printk(KERN_DEBUG "PPPIOCDETACH file->f_count=%ld\n",
+-			       atomic_long_read(&file->f_count));
++			       file->f_count);
+ 		unlock_kernel();
+ 		return err;
+ 	}
+Index: linux-2.6/kernel/perf_event.c
+===================================================================
+--- linux-2.6.orig/kernel/perf_event.c
++++ linux-2.6/kernel/perf_event.c
+@@ -4444,7 +4444,7 @@ int perf_event_set_output(struct perf_ev
+ 	if (event->data)
+ 		goto out;
+ 
+-	atomic_long_inc(&output_file->f_count);
++	get_file(output_file);
+ 
+ set:
+ 	mutex_lock(&event->mmap_mutex);
+@@ -4648,7 +4648,7 @@ inherit_event(struct perf_event *parent_
+ 	 * we are in the parent and we know that the filp still
+ 	 * exists and has a nonzero count:
+ 	 */
+-	atomic_long_inc(&parent_event->filp->f_count);
++	get_file(parent_event->filp);
+ 
+ 	/*
+ 	 * Link this into the parent event's child list
+Index: linux-2.6/security/integrity/ima/ima_main.c
+===================================================================
+--- linux-2.6.orig/security/integrity/ima/ima_main.c
++++ linux-2.6/security/integrity/ima/ima_main.c
+@@ -59,7 +59,7 @@ void ima_file_free(struct file *file)
+ 		       "%s: %s open/free imbalance (r:%ld w:%ld o:%ld f:%ld)\n",
+ 		       __FUNCTION__, file->f_dentry->d_name.name,
+ 		       iint->readcount, iint->writecount,
+-		       iint->opencount, atomic_long_read(&file->f_count));
++		       iint->opencount, file->f_count);
+ 		if (!(iint->flags & IMA_IINT_DUMP_STACK)) {
+ 			dump_stack();
+ 			iint->flags |= IMA_IINT_DUMP_STACK;
+Index: linux-2.6/drivers/scsi/osst.c
+===================================================================
+--- linux-2.6.orig/drivers/scsi/osst.c
++++ linux-2.6/drivers/scsi/osst.c
+@@ -4824,7 +4824,7 @@ static int os_scsi_tape_flush(struct fil
+ 	struct osst_request * SRpnt  = NULL;
+ 	char		    * name   = tape_name(STp);
+ 
+-	if (file_count(filp) > 1)
++	if (filp->f_count > 1)
+ 		return 0;
+ 
+ 	if ((STps->rw == ST_WRITING || STp->dirty) && !STp->pos_unknown) {
+Index: linux-2.6/drivers/scsi/st.c
+===================================================================
+--- linux-2.6.orig/drivers/scsi/st.c
++++ linux-2.6/drivers/scsi/st.c
+@@ -1270,7 +1270,7 @@ static int st_flush(struct file *filp, f
+ 	struct st_partstat *STps = &(STp->ps[STp->partition]);
+ 	char *name = tape_name(STp);
+ 
+-	if (file_count(filp) > 1)
++	if (filp->f_count > 1)
+ 		return 0;
+ 
+ 	if (STps->rw == ST_WRITING && !STp->pos_unknown) {
+Index: linux-2.6/fs/open.c
+===================================================================
+--- linux-2.6.orig/fs/open.c
++++ linux-2.6/fs/open.c
+@@ -1098,7 +1098,7 @@ int filp_close(struct file *filp, fl_own
+ {
+ 	int retval = 0;
+ 
+-	if (!file_count(filp)) {
++	if (unlikely(!filp->f_count)) {
+ 		printk(KERN_ERR "VFS: Close: file count is 0\n");
+ 		return 0;
+ 	}
+Index: linux-2.6/net/sched/sch_atm.c
+===================================================================
+--- linux-2.6.orig/net/sched/sch_atm.c
++++ linux-2.6/net/sched/sch_atm.c
+@@ -164,7 +164,7 @@ static void atm_tc_put(struct Qdisc *sch
+ 	tcf_destroy_chain(&flow->filter_list);
+ 	if (flow->sock) {
+ 		pr_debug("atm_tc_put: f_count %ld\n",
+-			file_count(flow->sock->file));
++			flow->sock->file->f_count);
+ 		flow->vcc->pop = flow->old_pop;
+ 		sockfd_put(flow->sock);
+ 	}
+@@ -260,7 +260,7 @@ static int atm_tc_change(struct Qdisc *s
+ 	sock = sockfd_lookup(fd, &error);
+ 	if (!sock)
+ 		return error;	/* f_count++ */
+-	pr_debug("atm_tc_change: f_count %ld\n", file_count(sock->file));
++	pr_debug("atm_tc_change: f_count %ld\n", sock->file->f_count);
+ 	if (sock->ops->family != PF_ATMSVC && sock->ops->family != PF_ATMPVC) {
+ 		error = -EPROTOTYPE;
+ 		goto err_out;
+Index: linux-2.6/net/unix/garbage.c
+===================================================================
+--- linux-2.6.orig/net/unix/garbage.c
++++ linux-2.6/net/unix/garbage.c
+@@ -311,7 +311,7 @@ void unix_gc(void)
+ 		long total_refs;
+ 		long inflight_refs;
+ 
+-		total_refs = file_count(u->sk.sk_socket->file);
++		total_refs = u->sk.sk_socket->file->f_count;
+ 		inflight_refs = atomic_long_read(&u->inflight);
+ 
+ 		BUG_ON(inflight_refs < 1);
