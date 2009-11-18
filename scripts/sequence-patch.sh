@@ -463,6 +463,10 @@ fi
 
 echo "[ Tree: $PATCH_DIR ]"
 
+# Generate Module.supported
+echo "[ Generating Module.supported ]"
+scripts/guards external < supported.conf > $PATCH_DIR/Module.supported
+
 [ $# -gt 0 ] && exit $status
 
 if ! $have_defconfig_files || test ! -e config.conf; then
