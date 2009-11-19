@@ -463,9 +463,10 @@ fi
 
 echo "[ Tree: $PATCH_DIR ]"
 
-# Generate Module.supported
-echo "[ Generating Module.supported ]"
-scripts/guards external < supported.conf > $PATCH_DIR/Module.supported
+if test -e supported.conf; then
+    echo "[ Generating Module.supported ]"
+    scripts/guards external < supported.conf > $PATCH_DIR/Module.supported
+fi
 
 [ $# -gt 0 ] && exit $status
 
