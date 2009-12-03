@@ -24,6 +24,7 @@ fi
 # exit out early for Moblin as we don't want to touch the bootloader menu
 if [ -f /etc/SuSE-moblin-release ] ; then
     exit 0
+fi
 
 # remove fstab check once perl-Bootloader can cope with it
 if [ -f /etc/fstab ]; then

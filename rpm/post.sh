@@ -70,6 +70,7 @@ run_bootloader () {
 # exit out early for Moblin as we don't want to touch the bootloader menu
 if [ -f /etc/SuSE-moblin-release ] ; then
     exit 0
+fi
 
 if [ -f /etc/fstab -a ! -e /.buildenv ] ; then
     # only run the bootloader if the usual bootloader configuration
