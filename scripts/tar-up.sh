@@ -40,7 +40,7 @@ until [ "$#" = "0" ] ; do
       shift 2
       ;;
     --embargo)
-      embargo_filter=1
+      # obsolete
       shift
       ;;
     -nf|--tolerate-unknown-new-config-options)
@@ -106,14 +106,8 @@ check_for_merge_conflicts() {
 rm -f $build_dir/*
 mkdir -p $build_dir
 
-# generate the list of patches to include.
-if [ -n "$embargo_filter" ]; then
-    scripts/embargo-filter < series.conf > $build_dir/series.conf \
-	|| exit 1
-    chmod 644 $build_dir/series.conf
-else
-    install -m 644 series.conf $build_dir/
-fi
+# list of patches to include.
+install -m 644 series.conf $build_dir/
 
 # All config files and patches used
 referenced_files="$( {
