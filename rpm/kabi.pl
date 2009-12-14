@@ -7,6 +7,7 @@ use Data::Dumper;
 
 # ( { sym => regexp, mod => regexp, fail => 0/1 }, ... )
 my @rules;
+my ($opt_verbose, $opt_rules);
 
 sub load_rules {
 	my $file = shift;
@@ -82,6 +83,7 @@ sub kabi_change {
 			last;
 		}
 	}
+	return unless $fail or $opt_verbose;
 	print STDERR "KABI: symbol $sym($mod) ";
 	if ($newcrc) {
 		print STDERR "changed crc from $oldcrc to $newcrc"
@@ -100,7 +102,6 @@ sub xopen {
 	open($_[0], $_[1], @_[2..$#_]) or die "$_[2]: $!\n";
 }
 
-my ($opt_verbose, $opt_rules);
 my $res = GetOptions(
 	'verbose|v' => \$opt_verbose,
 	'rules|r=s' => \$opt_rules,
