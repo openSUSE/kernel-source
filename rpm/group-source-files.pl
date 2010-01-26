@@ -37,16 +37,20 @@ sub scan
 			m{^\Q$loc\E/arch/[^/]+/include\b} ||
 			m{^\Q$loc\E/include/[^/]+\b} ||
 			m{^\Q$loc\E/scripts\b};
-		if (substr($_, 0, 1) ne "/") {
-			# We cannot use an absolute path during find,
-			# but rpm wants one later.
-			$_ = "/$_";
+		if ($is_devel) {
+			if (substr($_, 0, 1) ne "/") {
+				# We cannot use an absolute path during find,
+				# but rpm wants one later.
+				$_ = "/$_";
+			}
+			push(@dev, $_);
+		} else {
+			# Files to be removed. Needs relative path.
+			push(@ndev, $_);
 		}
-		$is_devel ? push(@dev, $_) : push(@ndev, $_);
 	}
 
 	push(@dev, &calc_dirs("/$loc", \@dev));
-	push(@ndev, &calc_dirs("/$loc", \@ndev));
 	return (\@dev, \@ndev);
 }
 
