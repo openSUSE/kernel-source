@@ -100,7 +100,6 @@ menuconfig=no
 new_config_option_yes=no
 new_config_option_mod=no
 new_config_option_no=no
-vanilla=no
 until [ "$#" = "0" ] ; do
     case "$1" in
     y|-y|--yes)
