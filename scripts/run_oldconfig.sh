@@ -254,7 +254,11 @@ for config in $config_files; do
 
     case $config in
     ppc/*|ppc64/*)
-        MAKE_ARGS="ARCH=powerpc"
+        if test -e arch/powerpc/Makefile; then
+            MAKE_ARGS="ARCH=powerpc"
+        else
+            MAKE_ARGS="ARCH=$cpu_arch"
+        fi
         ;;
     s390x/*)
         MAKE_ARGS="ARCH=s390"
@@ -268,8 +272,14 @@ for config in $config_files; do
     esac
     config="${prefix}config/$config"
 
-    cat $config \
-    | bash $config_subst CONFIG_LOCALVERSION \"-${config##*/}\" \
+
+    cat $config | \
+    if grep -qw CONFIG_CFGNAME "$config"; then
+        # SLES9
+        cat
+    else
+        bash $config_subst CONFIG_LOCALVERSION \"-$flavor\"
+    fi \
     | bash $config_subst CONFIG_SUSE_KERNEL y \
     > .config
     case "$menuconfig" in
