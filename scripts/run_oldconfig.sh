@@ -20,8 +20,6 @@
 # you may find current contact information at www.novell.com
 #############################################################################
 
-config_subst=${0%/*}/../rpm/config-subst
-
 #########################################################
 # dirty scroll region tricks ...
 
@@ -272,15 +270,14 @@ for config in $config_files; do
     esac
     config="${prefix}config/$config"
 
-
     cat $config | \
     if grep -qw CONFIG_CFGNAME "$config"; then
         # SLES9
         cat
     else
-        bash $config_subst CONFIG_LOCALVERSION \"-$flavor\"
+        bash ${prefix}rpm/config-subst CONFIG_LOCALVERSION \"-$flavor\"
     fi \
-    | bash $config_subst CONFIG_SUSE_KERNEL y \
+    | bash ${prefix}rpm/config-subst CONFIG_SUSE_KERNEL y \
     > .config
     case "$menuconfig" in
     yes)

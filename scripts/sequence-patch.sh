@@ -449,7 +449,7 @@ if [ -n "$CLEAN" ]; then
 fi
 
 ln -s $PWD $PATCH_DIR/patches
-ln -s patches/scripts/refresh_patch.sh $PATCH_DIR/refresh_patch.sh
+ln -s patches/scripts/{refresh_patch,run_oldconfig}.sh $PATCH_DIR/
 if [ -z "$CLEAN" ]; then
   [ -r $HOME/.quiltrc ] && . $HOME/.quiltrc
   [ ${QUILT_PATCHES-patches} != patches ] \
