@@ -252,12 +252,20 @@ for config in $config_files; do
 	continue
     fi
 
-    case $cpu_arch in
-	ppc|ppc64) kbuild_arch=powerpc ;;
-	s390x) kbuild_arch=s390 ;;
-	*) kbuild_arch=$cpu_arch ;;
+    case $config in
+    ppc/*|ppc64/*)
+        MAKE_ARGS="ARCH=powerpc"
+        ;;
+    s390x/*)
+        MAKE_ARGS="ARCH=s390"
+        ;;
+    */um)
+        MAKE_ARGS="ARCH=um SUBARCH=$cpu_arch"
+        ;;
+    *)
+        MAKE_ARGS="ARCH=$cpu_arch"
+        ;;
     esac
-    MAKE_ARGS="ARCH=$kbuild_arch"
     config="${prefix}config/$config"
 
     cat $config \
