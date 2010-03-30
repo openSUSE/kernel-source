@@ -20,8 +20,6 @@
 # you may find current contact information at www.novell.com
 #############################################################################
 
-config_subst=${0%/*}/../rpm/config-subst
-
 #########################################################
 # dirty scroll region tricks ...
 
@@ -252,17 +250,34 @@ for config in $config_files; do
 	continue
     fi
 
-    case $cpu_arch in
-	ppc|ppc64) kbuild_arch=powerpc ;;
-	s390x) kbuild_arch=s390 ;;
-	*) kbuild_arch=$cpu_arch ;;
+    case $config in
+    ppc/*|ppc64/*)
+        if test -e arch/powerpc/Makefile; then
+            MAKE_ARGS="ARCH=powerpc"
+        else
+            MAKE_ARGS="ARCH=$cpu_arch"
+        fi
+        ;;
+    s390x/*)
+        MAKE_ARGS="ARCH=s390"
+        ;;
+    */um)
+        MAKE_ARGS="ARCH=um SUBARCH=$cpu_arch"
+        ;;
+    *)
+        MAKE_ARGS="ARCH=$cpu_arch"
+        ;;
     esac
-    MAKE_ARGS="ARCH=$kbuild_arch"
     config="${prefix}config/$config"
 
-    cat $config \
-    | bash $config_subst CONFIG_LOCALVERSION \"-${config##*/}\" \
-    | bash $config_subst CONFIG_SUSE_KERNEL y \
+    cat $config | \
+    if grep -qw CONFIG_CFGNAME "$config"; then
+        # SLES9
+        cat
+    else
+        bash ${prefix}rpm/config-subst CONFIG_LOCALVERSION \"-$flavor\"
+    fi \
+    | bash ${prefix}rpm/config-subst CONFIG_SUSE_KERNEL y \
     > .config
     case "$menuconfig" in
     yes)
