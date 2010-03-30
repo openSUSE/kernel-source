@@ -57,15 +57,21 @@ function _region_msg_ () {
 
 set_var()
 {
-	local name=$1 val=$2 config
+	local name=$1 val=$2 config config_files
 
 	name="${name%%=*}"
 	case "$name" in
 		CONFIG_*) ;;
 		*) name="CONFIG_$name" ;;
 	esac
-	echo "appending $name=$val to all config files listed in config.conf"
-	for config in $(${prefix}scripts/guards $CONFIG_SYMBOLS < ${prefix}config.conf); do
+	config_files=$(${prefix}scripts/guards $CONFIG_SYMBOLS < ${prefix}config.conf)
+	if [ -n "$set_flavor" ] ; then
+		echo "appending $name=$val to all -$set_flavor config files listed in config.conf"
+		config_files=$(printf "%s\n" $config_files | grep "/$set_flavor\$")
+	else
+		echo "appending $name=$val to all config files listed in config.conf"
+	fi
+	for config in $config_files; do
 		if test -L "${prefix}config/$config"; then
 			continue
 		fi
@@ -121,8 +127,12 @@ until [ "$#" = "0" ] ; do
 	new_config_option_no="$2"
 	shift 2
 	;;
+    --flavor)
+	set_flavor="$2"
+	shift 2
+	;;
     --vanilla)
-	vanilla=yes
+	set_flavor="vanilla"
 	shift
 	;;
     -h|--help)
@@ -139,7 +149,8 @@ possible options in this mode:
 	y|-y|--yes         to run 'yes "" | make oldconfig'
 	a|-a|--arch        to run make oldconfig only for the given arch
 	m|-m|--menuconfig  to run make menuconfig instead of oldconfig
-	--vanilla          to run make oldconfig only for the vanilla configs
+	--flavor <flavor>  to run only for configs of specified flavor
+	--vanilla          an alias for "--flavor vanilla"
 
 run it with one of the following options to modify all .config files listed
 in config.conf:
@@ -205,10 +216,10 @@ fi
 
 config_files=$(${prefix}scripts/guards $CONFIG_SYMBOLS < ${prefix}config.conf)
 
-if [ "$vanilla" = "no" ] ; then
+if [ -z "$set_flavor" ] ; then
     config_files=$(printf "%s\n" $config_files | grep -v vanilla)
 else
-    config_files=$(printf "%s\n" $config_files | grep vanilla)
+    config_files=$(printf "%s\n" $config_files | grep "/$set_flavor\$")
 fi
 
 TMPDIR=$(mktemp -td ${0##*/}.XXXXXX)
