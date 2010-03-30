@@ -172,7 +172,11 @@ else
 fi
 
 if [ -z "$cpu_arch" ]; then
-    CONFIG_SYMBOLS=$(${prefix}scripts/arch-symbols --list)
+    CONFIG_SYMBOLS=$(
+        for arch in $(${prefix}scripts/arch-symbols --list); do
+            ${prefix}scripts/arch-symbols $arch
+        done
+    )
 else
     CONFIG_SYMBOLS=$(${prefix}scripts/arch-symbols $cpu_arch)
 fi
