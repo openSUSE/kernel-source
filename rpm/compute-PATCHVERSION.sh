@@ -49,7 +49,7 @@ while read patch; do
 				warned=true
 			fi
 			tmp_files="$tmp_files $dir"
-			tar xjf "$p/$dir.tar.bz2"
+			tar -xjf "$p/$dir.tar.bz2"
 			echo "$patch"
 			continue 2
 		fi
