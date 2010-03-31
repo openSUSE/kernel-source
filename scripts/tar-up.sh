@@ -256,7 +256,7 @@ stable_tar $build_dir/kabi.tar.bz2 kabi
 # not already created: patches.addon is empty by intention; others currently
 # may contain no patches.
 archives=$(sed -ne 's,^Source[0-9]*:.*[ \t/]\([^/]*\)\.tar\.bz2$,\1,p' \
-           $build_dir/kernel-binary.spec.in | sort -u)
+           $build_dir/kernel-source.spec.in | sort -u)
 for archive in $archives; do
     [ "$archive" = "linux-%srcversion" ] && continue
     if ! [ -e $build_dir/$archive.tar.bz2 ]; then
