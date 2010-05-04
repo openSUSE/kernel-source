@@ -411,7 +411,7 @@ while [ $# -gt 0 ]; do
     *)		exec < $PATCH ;;
     esac
     patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
-	    --no-backup-if-mismatch > $LAST_LOG 2>&1
+	    --no-backup-if-mismatch --force > $LAST_LOG 2>&1
     STATUS=$?
     exec 0<&5  # restore stdin
     
