@@ -49,7 +49,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -60,7 +60,7 @@ eval set -- "$options"
 
 QUIET=1
 EXTRA_SYMBOLS=
-CLEAN=1
+QUILT=true
 COMBINE=
 FAST=
 VANILLA=false
@@ -74,7 +74,10 @@ while true; do
 	    QUIET=
 	    ;;
 	--quilt)
-	    CLEAN=
+	    QUILT=true
+	    ;;
+	--no-quilt)
+	    QUILT=false
 	    ;;
 	--combine)
 	    COMBINE=1
@@ -358,7 +361,7 @@ cp -rld $ORIG_DIR $PATCH_DIR
 
 echo -e "# Symbols: $SYMBOLS\n#" > $PATCH_DIR/series
 SERIES_PFX=
-if [ -n "$CLEAN" ]; then
+if ! $QUILT; then
     SERIES_PFX="# "
 fi
 
@@ -369,7 +372,7 @@ echo 2 > $PATCH_DIR/.pc/.version
 set -- "${PATCHES[@]}"
 while [ $# -gt 0 ]; do
     PATCH="$1"
-    if [ "$PATCH" = "$LIMIT" -a -n "$CLEAN" ]; then
+    if ! $QUILT && test "$PATCH" = "$LIMIT"; then
 	STEP_BY_STEP=1
 	echo "Stopping before $PATCH"
     fi
@@ -408,14 +411,16 @@ while [ $# -gt 0 ]; do
     *)		exec < $PATCH ;;
     esac
     patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
-	    --no-backup-if-mismatch > $LAST_LOG 2>&1
+	    --no-backup-if-mismatch --force > $LAST_LOG 2>&1
     STATUS=$?
     exec 0<&5  # restore stdin
     
-    [ $STATUS -ne 0 ] \
-	&& restore_files $backup_dir $PATCH_DIR
-    [ -n "$CLEAN" -a -z "$enough_free_space" ] \
-	&& rm -rf $PATCH_DIR/.pc/
+    if [ $STATUS -ne 0 ]; then
+        restore_files $backup_dir $PATCH_DIR
+    fi
+    if ! $QUILT && test -z "$enough_free_space"; then
+	rm -rf $PATCH_DIR/.pc/
+    fi
     cat $LAST_LOG >> $PATCH_LOG
     [ -z "$QUIET" ] && cat $LAST_LOG
     if [ $STATUS -ne 0 ]; then
@@ -426,13 +431,14 @@ while [ $# -gt 0 ]; do
 	break
     else
 	echo "$SERIES_PFX$PATCH" >> $PATCH_DIR/series
-	[ -z "$CLEAN" ] \
-	    && echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
+	if $QUILT; then
+	    echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
+	fi
 	rm -f $LAST_LOG
     fi
 
     shift
-    if [ "$PATCH" = "$LIMIT" -a -z "$CLEAN" ]; then
+    if $QUILT && test "$PATCH" = "$LIMIT"; then
 	break
     fi
 done
@@ -441,19 +447,19 @@ if [ -n "$EXTRA_SYMBOLS" ]; then
     echo "$EXTRA_SYMBOLS" > $PATCH_DIR/extra-symbols
 fi
 
-[ -n "$CLEAN" -a -n "$enough_free_space" ] \
-    && rm -rf $PATCH_DIR/.pc/
-
-if [ -n "$CLEAN" ]; then
+if ! $QUILT; then
+    if test -n "$enough_free_space"; then
+        rm -rf $PATCH_DIR/.pc/
+    fi
     rm $PATCH_DIR/series
 fi
 
 ln -s $PWD $PATCH_DIR/patches
 ln -s patches/scripts/{refresh_patch,run_oldconfig}.sh $PATCH_DIR/
-if [ -z "$CLEAN" ]; then
-  [ -r $HOME/.quiltrc ] && . $HOME/.quiltrc
-  [ ${QUILT_PATCHES-patches} != patches ] \
-    && ln -s $PWD $PATCH_DIR/${QUILT_PATCHES-patches}
+if $QUILT; then
+    [ -r $HOME/.quiltrc ] && . $HOME/.quiltrc
+    [ ${QUILT_PATCHES-patches} != patches ] \
+        && ln -s $PWD $PATCH_DIR/${QUILT_PATCHES-patches}
 fi
 # If there are any remaining patches, add them to the series so
 # they can be fixed up with quilt (or similar).
