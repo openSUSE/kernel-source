@@ -210,8 +210,8 @@ fi
 
 if $have_arch_patches; then
     if [ -z "$ARCH_SYMBOLS" ]; then
-        if [ -x arch-symbols ]; then
-            ARCH_SYMBOLS=arch-symbols
+        if [ -x ./arch-symbols ]; then
+            ARCH_SYMBOLS=./arch-symbols
         elif [ -x scripts/arch-symbols ]; then
             ARCH_SYMBOLS=scripts/arch-symbols
         else
