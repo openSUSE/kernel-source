@@ -1,0 +1,631 @@
+From: Yan, Zheng <zheng.yan@oracle.com>
+Date: Sun, 16 May 2010 10:49:58 -0400
+Subject: [PATCH] Btrfs: Introduce global metadata reservation
+Git-commit: 8929ecfa50f266163832eeacfbc3642ed5eb83b6
+Patch-mainline: v2.6.35-rc3
+
+Reserve metadata space for extent tree, checksum tree and root tree
+
+Signed-off-by: Yan Zheng <zheng.yan@oracle.com>
+Signed-off-by: Chris Mason <chris.mason@oracle.com>
+Acked-by: Jeff Mahoney <jeffm@suse.com>
+---
+
+ fs/btrfs/ctree.h       |    8 --
+ fs/btrfs/disk-io.c     |   59 +++++++++----------
+ fs/btrfs/extent-tree.c |  147 ++++++++++++++++++++++++++++++++++++++++++-------
+ fs/btrfs/inode.c       |   13 +++-
+ fs/btrfs/ioctl.c       |   10 ++-
+ fs/btrfs/transaction.c |   70 +++++++++++++++++++----
+ fs/btrfs/transaction.h |    3 +
+ fs/btrfs/tree-defrag.c |    7 +-
+ 8 files changed, 241 insertions(+), 76 deletions(-)
+
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index d474419..504d5da 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -683,21 +683,15 @@ struct btrfs_space_info {
+ 	u64 bytes_reserved;	/* total bytes the allocator has reserved for
+ 				   current allocations */
+ 	u64 bytes_readonly;	/* total bytes that are read only */
+-	u64 bytes_super;	/* total bytes reserved for the super blocks */
+-	u64 bytes_root;		/* the number of bytes needed to commit a
+-				   transaction */
++
+ 	u64 bytes_may_use;	/* number of bytes that may be used for
+ 				   delalloc/allocations */
+-	u64 bytes_delalloc;	/* number of bytes currently reserved for
+-				   delayed allocation */
+ 	u64 disk_used;		/* total bytes used on disk */
+ 
+ 	int full;		/* indicates that we cannot allocate any more
+ 				   chunks for this space */
+ 	int force_alloc;	/* set if we need to force a chunk alloc for
+ 				   this space */
+-	int force_delalloc;	/* make people start doing filemap_flush until
+-				   we're under a threshold */
+ 
+ 	struct list_head list;
+ 
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index 054b447..309d8c0 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -1463,10 +1463,6 @@ static int cleaner_kthread(void *arg)
+ 	struct btrfs_root *root = arg;
+ 
+ 	do {
+-		smp_mb();
+-		if (root->fs_info->closing)
+-			break;
+-
+ 		vfs_check_frozen(root->fs_info->sb, SB_FREEZE_WRITE);
+ 
+ 		if (!(root->fs_info->sb->s_flags & MS_RDONLY) &&
+@@ -1479,11 +1475,9 @@ static int cleaner_kthread(void *arg)
+ 		if (freezing(current)) {
+ 			refrigerator();
+ 		} else {
+-			smp_mb();
+-			if (root->fs_info->closing)
+-				break;
+ 			set_current_state(TASK_INTERRUPTIBLE);
+-			schedule();
++			if (!kthread_should_stop())
++				schedule();
+ 			__set_current_state(TASK_RUNNING);
+ 		}
+ 	} while (!kthread_should_stop());
+@@ -1495,36 +1489,40 @@ static int transaction_kthread(void *arg)
+ 	struct btrfs_root *root = arg;
+ 	struct btrfs_trans_handle *trans;
+ 	struct btrfs_transaction *cur;
++	u64 transid;
+ 	unsigned long now;
+ 	unsigned long delay;
+ 	int ret;
+ 
+ 	do {
+-		smp_mb();
+-		if (root->fs_info->closing)
+-			break;
+-
+ 		delay = HZ * 30;
+ 		vfs_check_frozen(root->fs_info->sb, SB_FREEZE_WRITE);
+ 		mutex_lock(&root->fs_info->transaction_kthread_mutex);
+ 
+-		mutex_lock(&root->fs_info->trans_mutex);
++		spin_lock(&root->fs_info->new_trans_lock);
+ 		cur = root->fs_info->running_transaction;
+ 		if (!cur) {
+-			mutex_unlock(&root->fs_info->trans_mutex);
++			spin_unlock(&root->fs_info->new_trans_lock);
+ 			goto sleep;
+ 		}
+ 
+ 		now = get_seconds();
+-		if (now < cur->start_time || now - cur->start_time < 30) {
+-			mutex_unlock(&root->fs_info->trans_mutex);
++		if (!cur->blocked &&
++		    (now < cur->start_time || now - cur->start_time < 30)) {
++			spin_unlock(&root->fs_info->new_trans_lock);
+ 			delay = HZ * 5;
+ 			goto sleep;
+ 		}
+-		mutex_unlock(&root->fs_info->trans_mutex);
+-		trans = btrfs_join_transaction(root, 1);
+-		ret = btrfs_commit_transaction(trans, root);
++		transid = cur->transid;
++		spin_unlock(&root->fs_info->new_trans_lock);
+ 
++		trans = btrfs_join_transaction(root, 1);
++		if (transid == trans->transid) {
++			ret = btrfs_commit_transaction(trans, root);
++			BUG_ON(ret);
++		} else {
++			btrfs_end_transaction(trans, root);
++		}
+ sleep:
+ 		wake_up_process(root->fs_info->cleaner_kthread);
+ 		mutex_unlock(&root->fs_info->transaction_kthread_mutex);
+@@ -1532,10 +1530,10 @@ sleep:
+ 		if (freezing(current)) {
+ 			refrigerator();
+ 		} else {
+-			if (root->fs_info->closing)
+-				break;
+ 			set_current_state(TASK_INTERRUPTIBLE);
+-			schedule_timeout(delay);
++			if (!kthread_should_stop() &&
++			    !btrfs_transaction_blocked(root->fs_info))
++				schedule_timeout(delay);
+ 			__set_current_state(TASK_RUNNING);
+ 		}
+ 	} while (!kthread_should_stop());
+@@ -1917,17 +1915,18 @@ struct btrfs_root *open_ctree(struct super_block *sb,
+ 
+ 	csum_root->track_dirty = 1;
+ 
++	fs_info->generation = generation;
++	fs_info->last_trans_committed = generation;
++	fs_info->data_alloc_profile = (u64)-1;
++	fs_info->metadata_alloc_profile = (u64)-1;
++	fs_info->system_alloc_profile = fs_info->metadata_alloc_profile;
++
+ 	ret = btrfs_read_block_groups(extent_root);
+ 	if (ret) {
+ 		printk(KERN_ERR "Failed to read block groups: %d\n", ret);
+ 		goto fail_block_groups;
+ 	}
+ 
+-	fs_info->generation = generation;
+-	fs_info->last_trans_committed = generation;
+-	fs_info->data_alloc_profile = (u64)-1;
+-	fs_info->metadata_alloc_profile = (u64)-1;
+-	fs_info->system_alloc_profile = fs_info->metadata_alloc_profile;
+ 	fs_info->cleaner_kthread = kthread_run(cleaner_kthread, tree_root,
+ 					       "btrfs-cleaner");
+ 	if (IS_ERR(fs_info->cleaner_kthread))
+@@ -2430,15 +2429,15 @@ int close_ctree(struct btrfs_root *root)
+ 	fs_info->closing = 1;
+ 	smp_mb();
+ 
+-	kthread_stop(root->fs_info->transaction_kthread);
+-	kthread_stop(root->fs_info->cleaner_kthread);
+-
+ 	if (!(fs_info->sb->s_flags & MS_RDONLY)) {
+ 		ret =  btrfs_commit_super(root);
+ 		if (ret)
+ 			printk(KERN_ERR "btrfs: commit super ret %d\n", ret);
+ 	}
+ 
++	kthread_stop(root->fs_info->transaction_kthread);
++	kthread_stop(root->fs_info->cleaner_kthread);
++
+ 	fs_info->closing = 2;
+ 	smp_mb();
+ 
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index b1822e7..cb814a7 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -2895,10 +2895,9 @@ int btrfs_check_data_free_space(struct inode *inode, u64 bytes)
+ again:
+ 	/* make sure we have enough space to handle the data first */
+ 	spin_lock(&data_sinfo->lock);
+-	used = data_sinfo->bytes_used + data_sinfo->bytes_delalloc +
+-		data_sinfo->bytes_reserved + data_sinfo->bytes_pinned +
+-		data_sinfo->bytes_readonly + data_sinfo->bytes_may_use +
+-		data_sinfo->bytes_super;
++	used = data_sinfo->bytes_used + data_sinfo->bytes_reserved +
++		data_sinfo->bytes_pinned + data_sinfo->bytes_readonly +
++		data_sinfo->bytes_may_use;
+ 
+ 	if (used + bytes > data_sinfo->total_bytes) {
+ 		struct btrfs_trans_handle *trans;
+@@ -2922,7 +2921,7 @@ alloc:
+ 					     bytes + 2 * 1024 * 1024,
+ 					     alloc_target, 0);
+ 			btrfs_end_transaction(trans, root);
+-			if (ret)
++			if (ret < 0)
+ 				return ret;
+ 
+ 			if (!data_sinfo) {
+@@ -2945,11 +2944,10 @@ alloc:
+ 			goto again;
+ 		}
+ 
+-		printk(KERN_ERR "no space left, need %llu, %llu delalloc bytes"
+-		       ", %llu bytes_used, %llu bytes_reserved, "
+-		       "%llu bytes_pinned, %llu bytes_readonly, %llu may use "
+-		       "%llu total\n", (unsigned long long)bytes,
+-		       (unsigned long long)data_sinfo->bytes_delalloc,
++		printk(KERN_ERR "no space left, need %llu, %llu bytes_used, "
++		       "%llu bytes_reserved, " "%llu bytes_pinned, "
++		       "%llu bytes_readonly, %llu may use %llu total\n",
++		       (unsigned long long)bytes,
+ 		       (unsigned long long)data_sinfo->bytes_used,
+ 		       (unsigned long long)data_sinfo->bytes_reserved,
+ 		       (unsigned long long)data_sinfo->bytes_pinned,
+@@ -3464,6 +3462,91 @@ void btrfs_block_rsv_release(struct btrfs_root *root,
+ 	block_rsv_release_bytes(block_rsv, global_rsv, num_bytes);
+ }
+ 
++/*
++ * helper to calculate size of global block reservation.
++ * the desired value is sum of space used by extent tree,
++ * checksum tree and root tree
++ */
++static u64 calc_global_metadata_size(struct btrfs_fs_info *fs_info)
++{
++	struct btrfs_space_info *sinfo;
++	u64 num_bytes;
++	u64 meta_used;
++	u64 data_used;
++	int csum_size = btrfs_super_csum_size(&fs_info->super_copy);
++#if 0
++	/*
++	 * per tree used space accounting can be inaccuracy, so we
++	 * can't rely on it.
++	 */
++	spin_lock(&fs_info->extent_root->accounting_lock);
++	num_bytes = btrfs_root_used(&fs_info->extent_root->root_item);
++	spin_unlock(&fs_info->extent_root->accounting_lock);
++
++	spin_lock(&fs_info->csum_root->accounting_lock);
++	num_bytes += btrfs_root_used(&fs_info->csum_root->root_item);
++	spin_unlock(&fs_info->csum_root->accounting_lock);
++
++	spin_lock(&fs_info->tree_root->accounting_lock);
++	num_bytes += btrfs_root_used(&fs_info->tree_root->root_item);
++	spin_unlock(&fs_info->tree_root->accounting_lock);
++#endif
++	sinfo = __find_space_info(fs_info, BTRFS_BLOCK_GROUP_DATA);
++	spin_lock(&sinfo->lock);
++	data_used = sinfo->bytes_used;
++	spin_unlock(&sinfo->lock);
++
++	sinfo = __find_space_info(fs_info, BTRFS_BLOCK_GROUP_METADATA);
++	spin_lock(&sinfo->lock);
++	meta_used = sinfo->bytes_used;
++	spin_unlock(&sinfo->lock);
++
++	num_bytes = (data_used >> fs_info->sb->s_blocksize_bits) *
++		    csum_size * 2;
++	num_bytes += div64_u64(data_used + meta_used, 50);
++
++	if (num_bytes * 3 > meta_used)
++		num_bytes = div64_u64(meta_used, 3);
++
++	return ALIGN(num_bytes, fs_info->extent_root->leafsize << 10);
++}
++
++static void update_global_block_rsv(struct btrfs_fs_info *fs_info)
++{
++	struct btrfs_block_rsv *block_rsv = &fs_info->global_block_rsv;
++	struct btrfs_space_info *sinfo = block_rsv->space_info;
++	u64 num_bytes;
++
++	num_bytes = calc_global_metadata_size(fs_info);
++
++	spin_lock(&block_rsv->lock);
++	spin_lock(&sinfo->lock);
++
++	block_rsv->size = num_bytes;
++
++	num_bytes = sinfo->bytes_used + sinfo->bytes_pinned +
++		    sinfo->bytes_reserved + sinfo->bytes_readonly;
++
++	if (sinfo->total_bytes > num_bytes) {
++		num_bytes = sinfo->total_bytes - num_bytes;
++		block_rsv->reserved += num_bytes;
++		sinfo->bytes_reserved += num_bytes;
++	}
++
++	if (block_rsv->reserved >= block_rsv->size) {
++		num_bytes = block_rsv->reserved - block_rsv->size;
++		sinfo->bytes_reserved -= num_bytes;
++		block_rsv->reserved = block_rsv->size;
++		block_rsv->full = 1;
++	}
++#if 0
++	printk(KERN_INFO"global block rsv size %llu reserved %llu\n",
++		block_rsv->size, block_rsv->reserved);
++#endif
++	spin_unlock(&sinfo->lock);
++	spin_unlock(&block_rsv->lock);
++}
++
+ static void init_global_block_rsv(struct btrfs_fs_info *fs_info)
+ {
+ 	struct btrfs_space_info *space_info;
+@@ -3473,11 +3556,36 @@ static void init_global_block_rsv(struct btrfs_fs_info *fs_info)
+ 	fs_info->chunk_block_rsv.priority = 10;
+ 
+ 	space_info = __find_space_info(fs_info, BTRFS_BLOCK_GROUP_METADATA);
++	fs_info->global_block_rsv.space_info = space_info;
++	fs_info->global_block_rsv.priority = 10;
++	fs_info->global_block_rsv.refill_used = 1;
++	fs_info->delalloc_block_rsv.space_info = space_info;
+ 	fs_info->trans_block_rsv.space_info = space_info;
+ 	fs_info->empty_block_rsv.space_info = space_info;
+ 	fs_info->empty_block_rsv.priority = 10;
+ 
++	fs_info->extent_root->block_rsv = &fs_info->global_block_rsv;
++	fs_info->csum_root->block_rsv = &fs_info->global_block_rsv;
++	fs_info->dev_root->block_rsv = &fs_info->global_block_rsv;
++	fs_info->tree_root->block_rsv = &fs_info->global_block_rsv;
+ 	fs_info->chunk_root->block_rsv = &fs_info->chunk_block_rsv;
++
++	btrfs_add_durable_block_rsv(fs_info, &fs_info->global_block_rsv);
++
++	btrfs_add_durable_block_rsv(fs_info, &fs_info->delalloc_block_rsv);
++
++	update_global_block_rsv(fs_info);
++}
++
++static void release_global_block_rsv(struct btrfs_fs_info *fs_info)
++{
++	block_rsv_release_bytes(&fs_info->global_block_rsv, NULL, (u64)-1);
++	WARN_ON(fs_info->delalloc_block_rsv.size > 0);
++	WARN_ON(fs_info->delalloc_block_rsv.reserved > 0);
++	WARN_ON(fs_info->trans_block_rsv.size > 0);
++	WARN_ON(fs_info->trans_block_rsv.reserved > 0);
++	WARN_ON(fs_info->chunk_block_rsv.size > 0);
++	WARN_ON(fs_info->chunk_block_rsv.reserved > 0);
+ }
+ 
+ static u64 calc_trans_metadata_size(struct btrfs_root *root, int num_items)
+@@ -3826,6 +3934,8 @@ int btrfs_prepare_extent_commit(struct btrfs_trans_handle *trans,
+ 		fs_info->pinned_extents = &fs_info->freed_extents[0];
+ 
+ 	up_write(&fs_info->extent_commit_sem);
++
++	update_global_block_rsv(fs_info);
+ 	return 0;
+ }
+ 
+@@ -4818,19 +4928,16 @@ static void dump_space_info(struct btrfs_space_info *info, u64 bytes,
+ 	printk(KERN_INFO "space_info has %llu free, is %sfull\n",
+ 	       (unsigned long long)(info->total_bytes - info->bytes_used -
+ 				    info->bytes_pinned - info->bytes_reserved -
+-				    info->bytes_super),
++				    info->bytes_readonly),
+ 	       (info->full) ? "" : "not ");
+-	printk(KERN_INFO "space_info total=%llu, pinned=%llu, delalloc=%llu,"
+-	       " may_use=%llu, used=%llu, root=%llu, super=%llu, reserved=%llu"
+-	       "\n",
++	printk(KERN_INFO "space_info total=%llu, used=%llu, pinned=%llu, "
++	       "reserved=%llu, may_use=%llu, readonly=%llu\n",
+ 	       (unsigned long long)info->total_bytes,
++	       (unsigned long long)info->bytes_used,
+ 	       (unsigned long long)info->bytes_pinned,
+-	       (unsigned long long)info->bytes_delalloc,
++	       (unsigned long long)info->bytes_reserved,
+ 	       (unsigned long long)info->bytes_may_use,
+-	       (unsigned long long)info->bytes_used,
+-	       (unsigned long long)info->bytes_root,
+-	       (unsigned long long)info->bytes_super,
+-	       (unsigned long long)info->bytes_reserved);
++	       (unsigned long long)info->bytes_readonly);
+ 	spin_unlock(&info->lock);
+ 
+ 	if (!dump_block_groups)
+@@ -7727,6 +7834,8 @@ int btrfs_free_block_groups(struct btrfs_fs_info *info)
+ 	 */
+ 	synchronize_rcu();
+ 
++	release_global_block_rsv(info);
++
+ 	while(!list_empty(&info->space_info)) {
+ 		space_info = list_entry(info->space_info.next,
+ 					struct btrfs_space_info,
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 6e54665..f9c40b8 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -4060,7 +4060,7 @@ int btrfs_write_inode(struct inode *inode, struct writeback_control *wbc)
+ 	struct btrfs_trans_handle *trans;
+ 	int ret = 0;
+ 
+-	if (root->fs_info->btree_inode == inode)
++	if (BTRFS_I(inode)->dummy_inode)
+ 		return 0;
+ 
+ 	if (wbc->sync_mode == WB_SYNC_ALL) {
+@@ -4081,10 +4081,19 @@ void btrfs_dirty_inode(struct inode *inode)
+ {
+ 	struct btrfs_root *root = BTRFS_I(inode)->root;
+ 	struct btrfs_trans_handle *trans;
++	int ret;
++
++	if (BTRFS_I(inode)->dummy_inode)
++		return;
+ 
+ 	trans = btrfs_join_transaction(root, 1);
+ 	btrfs_set_trans_block_group(trans, inode);
+-	btrfs_update_inode(trans, root, inode);
++
++	ret = btrfs_update_inode(trans, root, inode);
++	if (ret)
++		printk(KERN_ERR"btrfs: fail to dirty inode %lu error %d\n",
++			inode->i_ino, ret);
++
+ 	btrfs_end_transaction(trans, root);
+ }
+ 
+diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+index 6a706e6..a068665 100644
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -1341,8 +1341,10 @@ static int btrfs_ioctl_defrag(struct file *file, void __user *argp)
+ 			ret = -EPERM;
+ 			goto out;
+ 		}
+-		btrfs_defrag_root(root, 0);
+-		btrfs_defrag_root(root->fs_info->extent_root, 0);
++		ret = btrfs_defrag_root(root, 0);
++		if (ret)
++			goto out;
++		ret = btrfs_defrag_root(root->fs_info->extent_root, 0);
+ 		break;
+ 	case S_IFREG:
+ 		if (!(file->f_mode & FMODE_WRITE)) {
+@@ -1372,9 +1374,11 @@ static int btrfs_ioctl_defrag(struct file *file, void __user *argp)
+ 			/* the rest are all set to zero by kzalloc */
+ 			range->len = (u64)-1;
+ 		}
+-		btrfs_defrag_file(file, range);
++		ret = btrfs_defrag_file(file, range);
+ 		kfree(range);
+ 		break;
++	default:
++		ret = -EINVAL;
+ 	}
+ out:
+ 	mnt_drop_write(file->f_path.mnt);
+diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
+index 2616491..6217bb6 100644
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@ -321,10 +321,36 @@ void btrfs_throttle(struct btrfs_root *root)
+ 	mutex_unlock(&root->fs_info->trans_mutex);
+ }
+ 
++static int should_end_transaction(struct btrfs_trans_handle *trans,
++				  struct btrfs_root *root)
++{
++	int ret;
++	ret = btrfs_block_rsv_check(trans, root,
++				    &root->fs_info->global_block_rsv, 0, 5);
++	return ret ? 1 : 0;
++}
++
++int btrfs_should_end_transaction(struct btrfs_trans_handle *trans,
++				 struct btrfs_root *root)
++{
++	struct btrfs_transaction *cur_trans = trans->transaction;
++	int updates;
++
++	if (cur_trans->blocked || cur_trans->delayed_refs.flushing)
++		return 1;
++
++	updates = trans->delayed_ref_updates;
++	trans->delayed_ref_updates = 0;
++	if (updates)
++		btrfs_run_delayed_refs(trans, root, updates);
++
++	return should_end_transaction(trans, root);
++}
++
+ static int __btrfs_end_transaction(struct btrfs_trans_handle *trans,
+ 			  struct btrfs_root *root, int throttle)
+ {
+-	struct btrfs_transaction *cur_trans;
++	struct btrfs_transaction *cur_trans = trans->transaction;
+ 	struct btrfs_fs_info *info = root->fs_info;
+ 	int count = 0;
+ 
+@@ -350,9 +376,19 @@ static int __btrfs_end_transaction(struct btrfs_trans_handle *trans,
+ 
+ 	btrfs_trans_release_metadata(trans, root);
+ 
++	if (!root->fs_info->open_ioctl_trans &&
++	    should_end_transaction(trans, root))
++		trans->transaction->blocked = 1;
++
++	if (cur_trans->blocked && !cur_trans->in_commit) {
++		if (throttle)
++			return btrfs_commit_transaction(trans, root);
++		else
++			wake_up_process(info->transaction_kthread);
++	}
++
+ 	mutex_lock(&info->trans_mutex);
+-	cur_trans = info->running_transaction;
+-	WARN_ON(cur_trans != trans->transaction);
++	WARN_ON(cur_trans != info->running_transaction);
+ 	WARN_ON(cur_trans->num_writers < 1);
+ 	cur_trans->num_writers--;
+ 
+@@ -664,30 +700,30 @@ static noinline int commit_fs_roots(struct btrfs_trans_handle *trans,
+ int btrfs_defrag_root(struct btrfs_root *root, int cacheonly)
+ {
+ 	struct btrfs_fs_info *info = root->fs_info;
+-	int ret;
+ 	struct btrfs_trans_handle *trans;
++	int ret;
+ 	unsigned long nr;
+ 
+-	smp_mb();
+-	if (root->defrag_running)
++	if (xchg(&root->defrag_running, 1))
+ 		return 0;
+-	trans = btrfs_start_transaction(root, 1);
++
+ 	while (1) {
+-		root->defrag_running = 1;
++		trans = btrfs_start_transaction(root, 0);
++		if (IS_ERR(trans))
++			return PTR_ERR(trans);
++
+ 		ret = btrfs_defrag_leaves(trans, root, cacheonly);
++
+ 		nr = trans->blocks_used;
+ 		btrfs_end_transaction(trans, root);
+ 		btrfs_btree_balance_dirty(info->tree_root, nr);
+ 		cond_resched();
+ 
+-		trans = btrfs_start_transaction(root, 1);
+ 		if (root->fs_info->closing || ret != -EAGAIN)
+ 			break;
+ 	}
+ 	root->defrag_running = 0;
+-	smp_mb();
+-	btrfs_end_transaction(trans, root);
+-	return 0;
++	return ret;
+ }
+ 
+ #if 0
+@@ -924,6 +960,16 @@ int btrfs_transaction_in_commit(struct btrfs_fs_info *info)
+ 	return ret;
+ }
+ 
++int btrfs_transaction_blocked(struct btrfs_fs_info *info)
++{
++	int ret = 0;
++	spin_lock(&info->new_trans_lock);
++	if (info->running_transaction)
++		ret = info->running_transaction->blocked;
++	spin_unlock(&info->new_trans_lock);
++	return ret;
++}
++
+ int btrfs_commit_transaction(struct btrfs_trans_handle *trans,
+ 			     struct btrfs_root *root)
+ {
+diff --git a/fs/btrfs/transaction.h b/fs/btrfs/transaction.h
+index 14b3841..e104986 100644
+--- a/fs/btrfs/transaction.h
++++ b/fs/btrfs/transaction.h
+@@ -106,6 +106,8 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans,
+ 			     struct btrfs_root *root);
+ int btrfs_end_transaction_throttle(struct btrfs_trans_handle *trans,
+ 				   struct btrfs_root *root);
++int btrfs_should_end_transaction(struct btrfs_trans_handle *trans,
++				 struct btrfs_root *root);
+ void btrfs_throttle(struct btrfs_root *root);
+ int btrfs_record_root_in_trans(struct btrfs_trans_handle *trans,
+ 				struct btrfs_root *root);
+@@ -115,5 +117,6 @@ int btrfs_write_marked_extents(struct btrfs_root *root,
+ 				struct extent_io_tree *dirty_pages, int mark);
+ int btrfs_wait_marked_extents(struct btrfs_root *root,
+ 				struct extent_io_tree *dirty_pages, int mark);
++int btrfs_transaction_blocked(struct btrfs_fs_info *info);
+ int btrfs_transaction_in_commit(struct btrfs_fs_info *info);
+ #endif
+diff --git a/fs/btrfs/tree-defrag.c b/fs/btrfs/tree-defrag.c
+index b10eacd..f7ac8e0 100644
+--- a/fs/btrfs/tree-defrag.c
++++ b/fs/btrfs/tree-defrag.c
+@@ -117,13 +117,14 @@ int btrfs_defrag_leaves(struct btrfs_trans_handle *trans,
+ 				 path->nodes[1], 0,
+ 				 cache_only, &last_ret,
+ 				 &root->defrag_progress);
+-	WARN_ON(ret && ret != -EAGAIN);
++	if (ret) {
++		WARN_ON(ret == -EAGAIN);
++		goto out;
++	}
+ 	if (next_key_ret == 0) {
+ 		memcpy(&root->defrag_progress, &key, sizeof(key));
+ 		ret = -EAGAIN;
+ 	}
+-
+-	btrfs_release_path(root, path);
+ out:
+ 	if (path)
+ 		btrfs_free_path(path);
