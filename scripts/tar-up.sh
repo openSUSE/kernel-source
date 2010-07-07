@@ -145,7 +145,7 @@ trap 'if test -n "$CLEANFILES"; then rm -rf "${CLEANFILES[@]}"; fi' EXIT
 tmpdir=$(mktemp -dt ${0##*/}.XXXXXX)
 CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
-cp -p rpm/* config.conf supported.conf doc/README.{SUSE,KSYMS} \
+cp -p rpm/* config.conf supported.conf doc/* \
 	misc/extract-modaliases $build_dir
 # FIXME: move config-subst out of rpm/
 rm "$build_dir/config-subst"
