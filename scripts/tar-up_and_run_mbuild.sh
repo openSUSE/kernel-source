@@ -26,7 +26,8 @@ fi
 important_specfiles=
 for spec in $all_specfiles; do
 	case "$spec" in
-	debug | dummy | ec2 | pmac* | power3 | SLRS | source* | trace | um | vmi*)
+	*debug | dummy | ec2 | pmac* | power3 | SLRS | source* | trace | um | \
+	vmi* | rt_timing )
 		continue
 	esac
 	important_specfiles="$important_specfiles $spec"
