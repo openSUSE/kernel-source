@@ -147,10 +147,43 @@ CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
 cp -p rpm/* config.conf supported.conf doc/* \
 	misc/extract-modaliases $build_dir
+rm -f "$build_dir/kernel-source.changes.old"
 # FIXME: move config-subst out of rpm/
 rm "$build_dir/config-subst"
 
-cat kernel-source.changes{,.old} > "$build_dir/kernel-source$VARIANT.changes"
+changelog=$build_dir/kernel-source$VARIANT.changes
+if test -e kernel-source.changes; then
+    cat kernel-source.changes{,.old} >"$changelog"
+elif $using_git; then
+    exclude=()
+    # Exclude commits in the scripts branch, these are rarely interesting for
+    # users of the rpm packages.
+    # FIXME: the remote might have a different name than "origin" or there
+    # might be no remote at all.
+    if git cat-file -e origin/scripts 2>/dev/null; then
+        exclude[${#exclude[@]}]=^origin/scripts
+    fi
+    if git cat-file -e scripts 2>/dev/null; then
+        exclude[${#exclude[@]}]=^scripts
+    fi
+    if test ${#exclude[@]} -eq 0; then
+        echo "warning: no scripts or origin/scripts branch found" >&2
+        echo "warning: rpm changelog will have some useless entries" >&2
+    fi
+    changes_stop=$(sed 1q rpm/kernel-source.changes.old)
+    case "$changes_stop" in
+    last\ commit:\ *)
+        exclude[${#exclude[@]}]=^${changes_stop#*: }
+        ;;
+    *)
+        echo "expected \"last commit: <commit>\" in rpm/kernel-source.changes.old" >&2
+        exit 1
+    esac
+    scripts/gitlog2changes "${exclude[@]}" HEAD -- >"$changelog"
+    sed 1d rpm/kernel-source.changes.old >>"$changelog"
+else
+    touch "$changelog"
+fi
 
 if [ -e extra-symbols ]; then
 	install -m 755					\
