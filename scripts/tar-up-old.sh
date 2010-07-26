@@ -442,6 +442,9 @@ for f in misc/extract-modaliases scripts/kabi-checks; do
         cp -a "$f" "$build_dir"
     fi
 done
+if grep -q '^Source.*:[[:space:]]*log\.sh[[:space:]]*$' rpm/kernel-source.spec.in; then
+	cp -p scripts/rpm-log.sh "$build_dir"/log.sh
+fi
 
 if [ -e extra-symbols ]; then
 	install -m 755					\
