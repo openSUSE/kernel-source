@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 #############################################################################
 # Copyright (c) 2003-2009 Novell, Inc.
@@ -206,6 +206,12 @@ flavors="$(echo "$config_files" | sed -e 's,.*/,,' | sort -u)"
 for flavor in $flavors ; do
     echo "kernel-$flavor.spec"
 
+    extra_needs=
+    case $flavor in
+	um)
+	    extra_needs="BuildRequires:  libpcap xorg-x11-devel" ;;
+    esac
+
     # Find all architectures for this spec file
     set -- $(
 	echo "$config_files" \
@@ -261,8 +267,10 @@ for flavor in $flavors ; do
 	-e "s,@SRCVERSION@,$SRCVERSION,g" \
 	-e "s,@PATCHVERSION@,$PATCHVERSION,g" \
 	-e "s,@RPMVERSION@,$RPMVERSION,g" \
+	-e "s,@PRECONF@,1,g" \
 	-e "s,@ARCHS@,$archs,g" \
 	-e "s,@PROVIDES_OBSOLETES@,${prov_obs//$'\n'/\\n},g" \
+	-e "s,@EXTRA_NEEDS@,$extra_needs,g" \
 	-e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options,g" \
 	-e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
       < rpm/kernel-binary.spec.in \
@@ -271,7 +279,10 @@ done
 
 install_changes() {
     local changes=$1
-    cat kernel-source.changes kernel-source.changes.old > $changes
+    cat kernel-source.changes > "$changes"
+    if test -e kernel-source.changes.old; then
+        cat "$_" >>"$changes"
+    fi
     chmod 644 $changes
 }
 
@@ -324,7 +335,7 @@ prepare_source_and_syms() {
 	scripts/guards "$@" < series.conf > $tmpdir/$name.patches
 
 	packages=
-	for arch_flavor in $(scripts/guards $ARCH_SYMBOLS $EXTRA_SYMBOLS \
+	for arch_flavor in $(scripts/guards $ARCH_SYMBOLS $EXTRA_SYMBOLS syms \
 				< config.conf); do
 	    flavor=${arch_flavor#*/}
 	    av=${arch_flavor//\//_}
@@ -357,134 +368,75 @@ prepare_source_and_syms() {
     archs=${archs# }
 }
 
-# The pre-configured kernel source package
-if test -e $build_dir/kernel-default.spec; then
-    # if there is no kernel-default, assume that this is a "special"
-    # branch (such as slert) with it's own kernel-source
-    echo "kernel-source.spec"
-    prepare_source_and_syms kernel-syms # compute archs and build_requires
-    sed -e "s,@NAME@,kernel-source,g" \
-        -e "s,@SRCVERSION@,$SRCVERSION,g" \
-        -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
-        -e "s,@RPMVERSION@,$RPMVERSION,g" \
-        -e "s,@ARCHS@,$archs,g" \
-        -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
-        -e "s,@BINARY_SPEC_FILES_LIST@,$binary_spec_files_list,g" \
-        -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
-        -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
-      < rpm/kernel-source.spec.in \
-    > $build_dir/kernel-source.spec
-    install_changes $build_dir/kernel-source.changes
+echo "kernel-source.spec"
+prepare_source_and_syms kernel-syms # compute archs and build_requires
+sed -e "s,@NAME@,kernel-source,g" \
+    -e "s,@SRCVERSION@,$SRCVERSION,g" \
+    -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
+    -e "s,@RPMVERSION@,$RPMVERSION,g" \
+    -e "s,@PRECONF@,1,g" \
+    -e "s,@ARCHS@,$archs,g" \
+    -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
+    -e "s,@BINARY_SPEC_FILES_LIST@,$binary_spec_files_list,g" \
+    -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
+    -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+  < rpm/kernel-source.spec.in \
+> $build_dir/kernel-source.spec
+install_changes $build_dir/kernel-source.changes
 
-    echo "kernel-syms.spec"
-    sed -e "s,@NAME@,kernel-syms,g" \
-        -e "s,@VARIANT@,,g" \
-        -e "s,@SRCVERSION@,$SRCVERSION,g" \
-        -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
-        -e "s,@RPMVERSION@,$RPMVERSION,g" \
-        -e "s,@ARCHS@,$archs,g" \
-        -e "s,@BUILD_REQUIRES@,$build_requires,g" \
-        -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
-      < rpm/kernel-syms.spec.in \
-    > $build_dir/kernel-syms.spec
-    install_changes $build_dir/kernel-syms.changes
+echo "kernel-syms.spec"
+sed -e "s,@NAME@,kernel-syms,g" \
+    -e "s,@VARIANT@,,g" \
+    -e "s,@SRCVERSION@,$SRCVERSION,g" \
+    -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
+    -e "s,@RPMVERSION@,$RPMVERSION,g" \
+    -e "s,@PRECONF@,1,g" \
+    -e "s,@ARCHS@,$archs,g" \
+    -e "s,@BUILD_REQUIRES@,$build_requires,g" \
+    -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+  < rpm/kernel-syms.spec.in \
+> $build_dir/kernel-syms.spec
+install_changes $build_dir/kernel-syms.changes
 
-    echo "kernel-dummy.spec"
-    sed -e "s,@NAME@,kernel-dummy,g" \
-        -e "s,@SRCVERSION@,$SRCVERSION,g" \
-        -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
-        -e "s,@RPMVERSION@,$RPMVERSION,g" \
-        -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
-      < rpm/kernel-dummy.spec.in \
-    > $build_dir/kernel-dummy.spec
-    install_changes $build_dir/kernel-dummy.changes
-
-    install -m 644                              \
-        rpm/kernel-source.rpmlintrc             \
-        $build_dir/kernel-source.rpmlintrc
-fi
-
-if test -e $build_dir/kernel-rt.spec; then
-    echo "kernel-source-rt.spec"
-    # workaround
-    binary_spec_files=${binary_spec_files/kernel-syms.spec/kernel-syms-rt.spec}
-    prepare_source_and_syms kernel-syms-rt # compute archs and build_requires
-    sed -e "s,@NAME@,kernel-source-rt,g" \
-        -e "s,@SRCVERSION@,$SRCVERSION,g" \
-        -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
-        -e "s,@RPMVERSION@,$RPMVERSION,g" \
-        -e "s,@ARCHS@,$archs,g" \
-        -e "s,@BINARY_SPEC_FILES@,$binary_spec_files,g" \
-        -e "s,@TOLERATE_UNKNOWN_NEW_CONFIG_OPTIONS@,$tolerate_unknown_new_config_options," \
-        -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
-      < rpm/kernel-source.spec.in \
-    > $build_dir/kernel-source-rt.spec
-    install_changes $build_dir/kernel-source-rt.changes
-
-    echo "kernel-syms-rt.spec"
-    sed -e "s,@NAME@,kernel-syms-rt,g" \
-        -e "s,@VARIANT@,-rt,g" \
-        -e "s,@SRCVERSION@,$SRCVERSION,g" \
-        -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
-        -e "s,@RPMVERSION@,$RPMVERSION,g" \
-        -e "s,@ARCHS@,$archs,g" \
-        -e "s,@BUILD_REQUIRES@,$build_requires,g" \
-        -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
-      < rpm/kernel-syms.spec.in \
-    > $build_dir/kernel-syms-rt.spec
-    install_changes $build_dir/kernel-syms-rt.changes
-
-    install -m 644                              \
-        rpm/kernel-source.rpmlintrc             \
-        $build_dir/kernel-source-rt.rpmlintrc
-fi
+echo "kernel-dummy.spec"
+sed -e "s,@NAME@,kernel-dummy,g" \
+    -e "s,@SRCVERSION@,$SRCVERSION,g" \
+    -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
+    -e "s,@RPMVERSION@,$RPMVERSION,g" \
+    -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
+  < rpm/kernel-dummy.spec.in \
+> $build_dir/kernel-dummy.spec
+install_changes $build_dir/kernel-dummy.changes
 
 echo "Copying various files..."
-install -m 644					\
-	config.conf				\
-	supported.conf				\
-	rpm/source-pre.sh			\
-	rpm/source-post.sh			\
-	rpm/pre.sh				\
-	rpm/post.sh				\
-	rpm/preun.sh				\
-	rpm/postun.sh				\
-	rpm/module-renames			\
-	rpm/generic_serial-blacklist            \
-	rpm/kernel-module-subpackage		\
-	rpm/macros.kernel-source		\
-	doc/README.SUSE				\
-	$build_dir
-
-
-if [ -x /work/src/bin/tools/convert_changes_to_rpm_changelog ]; then
-    /work/src/bin/tools/convert_changes_to_rpm_changelog kernel-source.changes \
-	kernel-source.changes.old >"$build_dir"/rpm_changelog
-    for spec in "$build_dir"/*.spec; do
-        (echo "%changelog"; cat "$build_dir"/rpm_changelog) >>"$spec"
-    done
-    rm -f "$build_dir"/rpm_changelog
-fi
-
-install -m 755					\
-	rpm/find-provides			\
-	rpm/config-subst 			\
-	rpm/check-for-config-changes		\
-	rpm/check-supported-list		\
-	rpm/check-build.sh			\
-	rpm/modversions				\
-	rpm/built-in-where			\
-	rpm/symsets.pl                          \
-	scripts/guards				\
-	scripts/arch-symbols			\
-	misc/extract-modaliases			\
-	$build_dir
+cp -a                       \
+    config.conf             \
+    supported.conf          \
+    rpm/*                   \
+    scripts/guards          \
+    scripts/arch-symbols    \
+    misc/extract-modaliases \
+    doc/README.SUSE         \
+    $build_dir
+rm -f "$build_dir"/*spec.in "$build_dir"/get_release_number.sh.in \
+    "$build_dir"/old-packages.conf
 
 if [ -e extra-symbols ]; then
 	install -m 755					\
 		extra-symbols				\
 		$build_dir
 fi
+
+
+if [ -x /work/src/bin/tools/convert_changes_to_rpm_changelog ]; then
+    /work/src/bin/tools/convert_changes_to_rpm_changelog \
+	"$build_dir"/kernel-source*.changes >"$build_dir"/rpm_changelog
+    for spec in "$build_dir"/*.spec; do
+        (echo "%changelog"; cat "$build_dir"/rpm_changelog) >>"$spec"
+    done
+    rm -f "$build_dir"/rpm_changelog
+fi
+
 
 if [ -n "$source_timestamp" ]; then
 	ts="$(head -n 1 $build_dir/build-source-timestamp)"
@@ -591,9 +543,13 @@ for archive in $all_archives; do
 done
 
 echo "kabi.tar.bz2"
-# reset kabi's times or we get a different archive after each CVS update
-scripts/newest-timestamp kabi
 stable_tar $build_dir/kabi.tar.bz2 kabi
+
+if test -d doc/novell-kmp; then
+    echo "novell-kmp.tar.bz2"
+    stable_tar -C doc --exclude='*.o' --exclude='*.ko' --exclude='*.*.cmd' \
+        $build_dir/novell-kmp.tar.bz2 novell-kmp
+fi
 
 # Create empty dummys for any *.tar.bz2 archive mentioned in the spec file
 # not already created: patches.addon is empty by intention; others currently
