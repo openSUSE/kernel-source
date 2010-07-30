@@ -100,19 +100,21 @@ done
 source $(dirname $0)/config.sh
 export LANG=POSIX
 SRC_FILE=linux-$SRCVERSION.tar.bz2
-PATCHVERSION=$($(dirname $0)/compute-PATCHVERSION.sh)
+if test -e scripts/compute-PATCHVERSION.sh; then
+    PATCHVERSION=$($(dirname $0)/compute-PATCHVERSION.sh)
 
-case "$PATCHVERSION" in
-*-*)
-    RPMVERSION=${PATCHVERSION%%-*}
-    RELEASE_PREFIX=${PATCHVERSION#*-}.
-    RELEASE_PREFIX=${RELEASE_PREFIX//-/.}
-    ;;
-*)
-    RPMVERSION=$PATCHVERSION
-    RELEASE_PREFIX=
-    ;;
-esac
+    case "$PATCHVERSION" in
+    *-*)
+        RPMVERSION=${PATCHVERSION%%-*}
+        RELEASE_PREFIX=${PATCHVERSION#*-}.
+        RELEASE_PREFIX=${RELEASE_PREFIX//-/.}
+        ;;
+    *)
+        RPMVERSION=$PATCHVERSION
+        RELEASE_PREFIX=
+        ;;
+    esac
+fi
 
 if [ -n "$rpm_release_timestamp" ]; then
     if test $(( ${#RPMVERSION} + 10 + 2 + 8 + ${#rpm_release_string})) -gt 64
@@ -215,7 +217,7 @@ for flavor in $flavors ; do
     # Find all architectures for this spec file
     set -- $(
 	echo "$config_files" \
-	| sed -e "/\/$flavor/!d" \
+	| sed -e "/\/$flavor\$/!d" \
 	      -e "s, .*,,g" \
 	| sort -u)
     archs="$*"
@@ -256,18 +258,33 @@ for flavor in $flavors ; do
 	prov_obs="$(echo "$prov_obs" | grep -v '%ifarch\|%endif')"
     fi
 
+    # Special km modules for this kernel (SLES9)
+    if test -e rpm/km.conf; then
+        set -- $(scripts/guards $(
+                    for arch in $archs; do
+                        scripts/arch-symbols $arch
+                    done
+                    ) $flavor < rpm/km.conf)
+        extra_kms=$*
+    else
+        extra_kms=
+    fi
+
     # In ExclusiveArch in the spec file, we must specify %ix86 instead
     # of i386.
     archs="$(echo $archs | sed -e 's,i386,%ix86,g')"
 
     # Generate spec file
-    sed -e "s,@NAME@,kernel-$flavor,g" \
-	-e "s,@FLAVOR@,$flavor,g" \
+    sed -r -e "s,@NAME@,kernel-$flavor,g" \
+	-e "s,@(FLAVOR|CFGNAME)@,$flavor,g" \
 	-e "s,@VARIANT@,$VARIANT,g" \
-	-e "s,@SRCVERSION@,$SRCVERSION,g" \
+	-e "s,@(SRC)?VERSION@,$SRCVERSION,g" \
 	-e "s,@PATCHVERSION@,$PATCHVERSION,g" \
 	-e "s,@RPMVERSION@,$RPMVERSION,g" \
 	-e "s,@PRECONF@,1,g" \
+	-e "s,@NO_DEBUG@,,g" \
+	-e "s,@KERNEL_MODULE_PACKAGES@,kernel-module-packages,g" \
+	-e "s,@EXTRA_KMS@,$extra_kms,g" \
 	-e "s,@ARCHS@,$archs,g" \
 	-e "s,@PROVIDES_OBSOLETES@,${prov_obs//$'\n'/\\n},g" \
 	-e "s,@EXTRA_NEEDS@,$extra_needs,g" \
@@ -370,8 +387,8 @@ prepare_source_and_syms() {
 
 echo "kernel-source.spec"
 prepare_source_and_syms kernel-syms # compute archs and build_requires
-sed -e "s,@NAME@,kernel-source,g" \
-    -e "s,@SRCVERSION@,$SRCVERSION,g" \
+sed -r -e "s,@NAME@,kernel-source,g" \
+    -e "s,@(SRC)?VERSION@,$SRCVERSION,g" \
     -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
     -e "s,@PRECONF@,1,g" \
@@ -385,9 +402,9 @@ sed -e "s,@NAME@,kernel-source,g" \
 install_changes $build_dir/kernel-source.changes
 
 echo "kernel-syms.spec"
-sed -e "s,@NAME@,kernel-syms,g" \
+sed -r -e "s,@NAME@,kernel-syms,g" \
     -e "s,@VARIANT@,,g" \
-    -e "s,@SRCVERSION@,$SRCVERSION,g" \
+    -e "s,@(SRC)?VERSION@,$SRCVERSION,g" \
     -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
     -e "s,@PRECONF@,1,g" \
@@ -399,8 +416,8 @@ sed -e "s,@NAME@,kernel-syms,g" \
 install_changes $build_dir/kernel-syms.changes
 
 echo "kernel-dummy.spec"
-sed -e "s,@NAME@,kernel-dummy,g" \
-    -e "s,@SRCVERSION@,$SRCVERSION,g" \
+sed -r -e "s,@NAME@,kernel-dummy,g" \
+    -e "s,@(SRC)?VERSION@,$SRCVERSION,g" \
     -e "s,@PATCHVERSION@,$PATCHVERSION,g" \
     -e "s,@RPMVERSION@,$RPMVERSION,g" \
     -e "s,@RELEASE_PREFIX@,$RELEASE_PREFIX,g" \
@@ -415,11 +432,16 @@ cp -a                       \
     rpm/*                   \
     scripts/guards          \
     scripts/arch-symbols    \
-    misc/extract-modaliases \
     doc/README.SUSE         \
     $build_dir
 rm -f "$build_dir"/*spec.in "$build_dir"/get_release_number.sh.in \
-    "$build_dir"/old-packages.conf
+    "$build_dir"/old-packages.conf "$build_dir"/km.conf
+# Not all files are in all branches
+for f in misc/extract-modaliases scripts/kabi-checks; do
+    if test -e "$f"; then
+        cp -a "$f" "$build_dir"
+    fi
+done
 
 if [ -e extra-symbols ]; then
 	install -m 755					\
@@ -545,11 +567,14 @@ done
 echo "kabi.tar.bz2"
 stable_tar $build_dir/kabi.tar.bz2 kabi
 
-if test -d doc/novell-kmp; then
-    echo "novell-kmp.tar.bz2"
+for kmp in  novell-kmp hello; do
+    if test ! -d "doc/$kmp"; then
+        continue
+    fi
+    echo "$kmp.tar.bz2"
     stable_tar -C doc --exclude='*.o' --exclude='*.ko' --exclude='*.*.cmd' \
-        $build_dir/novell-kmp.tar.bz2 novell-kmp
-fi
+        "$build_dir/$kmp.tar.bz2" "$kmp"
+done
 
 # Create empty dummys for any *.tar.bz2 archive mentioned in the spec file
 # not already created: patches.addon is empty by intention; others currently
@@ -557,14 +582,20 @@ fi
 archives=$(sed -ne 's,^Source[0-9]*:.*[ \t/]\([^/]*\)\.tar\.bz2$,\1,p' \
            $build_dir/*.spec | sort -u)
 for archive in $archives; do
-    if ! [ -e $build_dir/$archive.tar.bz2 ]; then
-	echo "$archive.tar.bz2 (empty)"
-	tmpdir2=$(mktemp -dt ${0##*/}.XXXXXX)
-	CLEANFILES=("${CLEANFILES[@]}" "$tmpdir2")
-	mkdir -p $tmpdir2/$archive
-	stable_tar -C $tmpdir2 -t "Wed, 01 Apr 2009 12:00:00 +0200" \
-	    $build_dir/$archive.tar.bz2 $archive
+    case "$archive" in
+    *%*)
+        # workaround for SLES9's linux-%kversion.tar.bz2
+        continue
+    esac
+    if test -e "$build_dir/$archive.tar.bz2"; then
+        continue
     fi
+    echo "$archive.tar.bz2 (empty)"
+    tmpdir2=$(mktemp -dt ${0##*/}.XXXXXX)
+    CLEANFILES=("${CLEANFILES[@]}" "$tmpdir2")
+    mkdir -p $tmpdir2/$archive
+    stable_tar -C $tmpdir2 -t "Wed, 01 Apr 2009 12:00:00 +0200" \
+        $build_dir/$archive.tar.bz2 $archive
 done
 
 # Force mbuild to choose build hosts with enough memory available:
