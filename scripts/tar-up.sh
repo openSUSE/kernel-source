@@ -22,6 +22,11 @@
 
 # generate a kernel-source rpm package
 
+# if this is SLE11_BRANCH and earlier, hand over to scripts/tar-up-old.sh
+if test ! -x rpm/mkspec; then
+    exec ${0%.sh}-old.sh "$@"
+fi
+
 . ${0%/*}/wd-functions.sh
 
 export LC_COLLATE=C
@@ -147,6 +152,10 @@ CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
 cp -p rpm/* config.conf supported.conf doc/* \
 	misc/extract-modaliases $build_dir
+# install this file only if the spec file references it
+if grep -q '^Source.*:[[:space:]]*log\.sh[[:space:]]*$' rpm/kernel-source.spec.in; then
+	cp -p scripts/rpm-log.sh "$build_dir"/log.sh
+fi
 rm -f "$build_dir/kernel-source.changes.old"
 # FIXME: move config-subst out of rpm/
 rm "$build_dir/config-subst"
