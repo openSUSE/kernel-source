@@ -300,15 +300,20 @@ stable_tar $build_dir/kabi.tar.bz2 kabi
 archives=$(sed -ne 's,^Source[0-9]*:.*[ \t/]\([^/]*\)\.tar\.bz2$,\1,p' \
            $build_dir/kernel-source.spec.in | sort -u)
 for archive in $archives; do
-    [ "$archive" = "linux-%srcversion" ] && continue
-    if ! [ -e $build_dir/$archive.tar.bz2 ]; then
-	echo "$archive.tar.bz2 (empty)"
-	tmpdir2=$(mktemp -dt ${0##*/}.XXXXXX)
-	CLEANFILES=("${CLEANFILES[@]}" "$tmpdir2")
-	mkdir -p $tmpdir2/$archive
-	stable_tar -C $tmpdir2 -t "Wed, 01 Apr 2009 12:00:00 +0200" \
-	    $build_dir/$archive.tar.bz2 $archive
+    case "$archive" in
+    *%*)
+        # skip archive names with macros
+        continue
+    esac
+    if test -e "$build_dir/$archive.tar.bz2"; then
+        continue
     fi
+    echo "$archive.tar.bz2 (empty)"
+    tmpdir2=$(mktemp -dt ${0##*/}.XXXXXX)
+    CLEANFILES=("${CLEANFILES[@]}" "$tmpdir2")
+    mkdir -p $tmpdir2/$archive
+    stable_tar -C $tmpdir2 -t "Wed, 01 Apr 2009 12:00:00 +0200" \
+        $build_dir/$archive.tar.bz2 $archive
 done
 
 # Force mbuild to choose build hosts with enough memory available:
