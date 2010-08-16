@@ -24,7 +24,10 @@
 
 . ${0%/*}/wd-functions.sh
 
-export LC_COLLATE=C
+sort()
+{
+	LC_ALL=C command sort "$@"
+}
 
 rpm_release_timestamp=
 rpm_release_string=

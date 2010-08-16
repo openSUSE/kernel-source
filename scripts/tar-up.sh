@@ -29,7 +29,10 @@ fi
 
 . ${0%/*}/wd-functions.sh
 
-export LC_COLLATE=C
+sort()
+{
+	LC_ALL=C command sort "$@"
+}
 
 tolerate_unknown_new_config_options=
 ignore_kabi=
