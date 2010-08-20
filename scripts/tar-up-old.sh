@@ -24,7 +24,10 @@
 
 . ${0%/*}/wd-functions.sh
 
-export LC_COLLATE=C
+sort()
+{
+	LC_ALL=C command sort "$@"
+}
 
 rpm_release_timestamp=
 rpm_release_string=
@@ -139,17 +142,13 @@ check_for_merge_conflicts() {
     fi
 }
 
-rm -rf $build_dir
+# dot files are skipped by intention, in order not to break osc working
+# copies
+rm -f $build_dir/*
 mkdir -p $build_dir
 
-# generate the list of patches to include.
-if [ -n "$embargo_filter" ]; then
-    scripts/embargo-filter < series.conf > $build_dir/series.conf \
-	|| exit 1
-    chmod 644 $build_dir/series.conf
-else
-    install -m 644 series.conf $build_dir/
-fi
+# list of patches to include.
+install -m 644 series.conf $build_dir/
 
 # All config files and patches used
 referenced_files="$( {
@@ -168,31 +167,17 @@ if $inconsistent; then
     echo
 fi
 
-echo "Computing timestamp..."
-if ! scripts/cvs-wd-timestamp > $build_dir/build-source-timestamp; then
+tsfile=build-source-timestamp
+if ! scripts/cvs-wd-timestamp > $build_dir/$tsfile; then
     exit 1
-fi
-
-# If we are on a CVS branch, included the branch name as well:
-if [ -e CVS/Tag ]; then
-    read tag < CVS/Tag
-    case "$tag" in
-    T*)	tag="CVS Branch: ${tag:1}" ;;
-    N*)	tag="CVS Tag: ${tag:1}" ;;
-    D*)	tag="CVS Date: ${tag:1}" ;;
-    *)	tag=
-    esac
-    if [ -n "$tag" ]; then
-	echo $tag >> $build_dir/build-source-timestamp
-    fi
 fi
 
 if $using_git; then
     # Always include the git revision
-    echo "GIT Revision: $(git rev-parse HEAD)" >> $build_dir/build-source-timestamp
+    echo "GIT Revision: $(git rev-parse HEAD)" >> $build_dir/$tsfile
     tag=$(get_branch_name)
     if test -n "$tag"; then
-	echo "GIT Branch: $tag" >>$build_dir/build-source-timestamp
+	echo "GIT Branch: $tag" >>$build_dir/$tsfile
     fi
 fi
 
@@ -464,9 +449,9 @@ fi
 
 
 if [ -n "$source_timestamp" ]; then
-	ts="$(head -n 1 $build_dir/build-source-timestamp)"
+	ts="$(head -n 1 $build_dir/$tsfile)"
 	branch=$(sed -nre 's/^(CVS|GIT) Branch: //p' \
-		 $build_dir/build-source-timestamp)
+		 $build_dir/$tsfile)
 	rpm_release_string=${branch:-HEAD}_$(date --utc '+%Y%m%d%H%M%S' -d "$ts")
 fi
 
@@ -540,7 +525,7 @@ stable_tar() {
         cd "$chdir"
         find "$@" \( -type f -o -type l -o -type d -a -empty \) -print0 | \
             LC_ALL=C sort -z | \
-            tar cf - --null -T - "${tar_opts[@]}"
+            tar -cf - --null -T - "${tar_opts[@]}"
     ) | bzip2 -9 >"$tarball"
 }
 
@@ -587,7 +572,7 @@ archives=$(sed -ne 's,^Source[0-9]*:.*[ \t/]\([^/]*\)\.tar\.bz2$,\1,p' \
 for archive in $archives; do
     case "$archive" in
     *%*)
-        # workaround for SLES9's linux-%kversion.tar.bz2
+        # skip archive names with macros
         continue
     esac
     if test -e "$build_dir/$archive.tar.bz2"; then
@@ -606,8 +591,8 @@ echo $((1024*1024)) > $build_dir/minmem
 # Force mbuild to choose build hosts with enough disk space available:
 echo $((6*1024)) > $build_dir/needed_space_in_mb
 if [ -n "$ignore_kabi" ]; then
-    touch $build_dir/IGNORE-KABI-BADNESS
+    echo > $build_dir/IGNORE-KABI-BADNESS
 fi
 if [ -n "$ignore_unsupported_deps" ]; then
-    touch $build_dir/IGNORE-UNSUPPORTED-DEPS
+    echo > $build_dir/IGNORE-UNSUPPORTED-DEPS
 fi
