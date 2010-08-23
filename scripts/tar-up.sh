@@ -37,6 +37,7 @@ sort()
 tolerate_unknown_new_config_options=
 ignore_kabi=
 mkspec_args=()
+source $(dirname $0)/config.sh
 until [ "$#" = "0" ] ; do
   case "$1" in
     --dir=*)
@@ -81,6 +82,7 @@ these options are recognized:
     -nf                to proceed if a new unknown .config option is found during make oldconfig
     -u		       update generated files in an existing kernel-source dir
     -i                 ignore kabi failures
+    -d, --dir=DIR      create package in DIR instead of default $BUILD_DIR
 
 EOF
 	exit 1
@@ -91,7 +93,6 @@ EOF
       ;;
   esac
 done
-source $(dirname $0)/config.sh
 export LANG=POSIX
 SRC_FILE=linux-$SRCVERSION.tar.bz2
 
