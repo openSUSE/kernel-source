@@ -155,6 +155,7 @@ CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
 cp -p rpm/* config.conf supported.conf doc/* \
 	misc/extract-modaliases $build_dir
+mv $build_dir/config-options.changes $build_dir/config-options.changes.txt
 # install this file only if the spec file references it
 if grep -q '^Source.*:[[:space:]]*log\.sh[[:space:]]*$' rpm/kernel-source.spec.in; then
 	cp -p scripts/rpm-log.sh "$build_dir"/log.sh
