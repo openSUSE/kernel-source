@@ -37,6 +37,7 @@ sort()
 tolerate_unknown_new_config_options=
 ignore_kabi=
 mkspec_args=()
+source $(dirname $0)/config.sh
 until [ "$#" = "0" ] ; do
   case "$1" in
     --dir=*)
@@ -81,6 +82,7 @@ these options are recognized:
     -nf                to proceed if a new unknown .config option is found during make oldconfig
     -u		       update generated files in an existing kernel-source dir
     -i                 ignore kabi failures
+    -d, --dir=DIR      create package in DIR instead of default $BUILD_DIR
 
 EOF
 	exit 1
@@ -91,7 +93,6 @@ EOF
       ;;
   esac
 done
-source $(dirname $0)/config.sh
 export LANG=POSIX
 SRC_FILE=linux-$SRCVERSION.tar.bz2
 
@@ -155,12 +156,16 @@ CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
 cp -p rpm/* config.conf supported.conf doc/* \
 	misc/extract-modaliases $build_dir
-mv $build_dir/config-options.changes $build_dir/config-options.changes.txt
 # install this file only if the spec file references it
 if grep -q '^Source.*:[[:space:]]*log\.sh[[:space:]]*$' rpm/kernel-source.spec.in; then
 	cp -p scripts/rpm-log.sh "$build_dir"/log.sh
 fi
 rm -f "$build_dir/kernel-source.changes.old"
+if test -e "$build_dir"/config-options.changes; then
+	# Rename to  avoid triggering a build service rule error
+	mv "$build_dir"/config-options.changes \
+		"$build_dir"/config-options.changes.txt
+fi
 # FIXME: move config-subst out of rpm/
 rm "$build_dir/config-subst"
 
