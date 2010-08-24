@@ -161,6 +161,11 @@ if grep -q '^Source.*:[[:space:]]*log\.sh[[:space:]]*$' rpm/kernel-source.spec.i
 	cp -p scripts/rpm-log.sh "$build_dir"/log.sh
 fi
 rm -f "$build_dir/kernel-source.changes.old"
+if test -e "$build_dir"/config-options.changes; then
+	# Rename to  avoid triggering a build service rule error
+	mv "$build_dir"/config-options.changes \
+		"$build_dir"/config-options.changes.txt
+fi
 # FIXME: move config-subst out of rpm/
 rm "$build_dir/config-subst"
 
