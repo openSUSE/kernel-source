@@ -94,7 +94,6 @@ EOF
   esac
 done
 export LANG=POSIX
-SRC_FILE=linux-$SRCVERSION.tar.bz2
 
 [ -z "$build_dir" ] && build_dir=$BUILD_DIR
 if [ -z "$build_dir" ]; then
@@ -209,18 +208,8 @@ if [ -e extra-symbols ]; then
 		$build_dir
 fi
 
-if [ -r $SRC_FILE ]; then
-  LINUX_ORIG_TARBALL=$SRC_FILE
-elif [ -r $MIRROR/$SRC_FILE ]; then
-  LINUX_ORIG_TARBALL=$MIRROR/$SRC_FILE
-elif [ -r $MIRROR/testing/$SRC_FILE ]; then
-  LINUX_ORIG_TARBALL=$MIRROR/testing/$SRC_FILE
-else
-  echo "Cannot find $SRC_FILE."
-  exit 1
-fi
-echo $SRC_FILE
-cp $LINUX_ORIG_TARBALL $build_dir
+echo "linux-$SRCVERSION.tar.bz2"
+get_tarball "$SRCVERSION" "$build_dir"
 
 # Usage:
 # stable_tar [-t <timestamp>] [-C <dir>] [--exclude=...] <tarball> <files> ...
