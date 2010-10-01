@@ -59,7 +59,7 @@ _get_tarball_from_git()
         echo "No linux-2.6 git tree found (try setting the LINUX_GIT variable)" >&2
         exit 1
     fi
-    git --git-dir="$git/.git" fetch git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
+    git --git-dir="$git/.git" fetch --tags git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git refs/heads/master:refs/tags/latest
     git --git-dir="$git/.git" archive --prefix="linux-$version/" "v$version"
 }
 
