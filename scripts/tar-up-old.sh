@@ -35,6 +35,7 @@ source_timestamp=
 tolerate_unknown_new_config_options=0
 ignore_kabi=
 ignore_unsupported_deps=
+source $(dirname $0)/config.sh
 until [ "$#" = "0" ] ; do
   case "$1" in
     --dir=*)
@@ -90,6 +91,7 @@ these options are recognized:
     -nf                to proceed if a new unknown .config option is found during make oldconfig
     -i                 ignore kabi failures
     --source-timestamp to autogenerate a release number based on branch and timestamp (overrides -rs/-ts)
+    -d, --dir=DIR      create package in DIR instead of default $BUILD_DIR
 
 EOF
 	exit 1
@@ -100,9 +102,7 @@ EOF
       ;;
   esac
 done
-source $(dirname $0)/config.sh
 export LANG=POSIX
-SRC_FILE=linux-$SRCVERSION.tar.bz2
 if test -e scripts/compute-PATCHVERSION.sh; then
     PATCHVERSION=$($(dirname $0)/compute-PATCHVERSION.sh)
 
@@ -461,18 +461,8 @@ sed -e "s:@RELEASE_PREFIX@:$RELEASE_PREFIX:"		\
     > $build_dir/get_release_number.sh
 chmod 755 $build_dir/get_release_number.sh
 
-if [ -r $SRC_FILE ]; then
-  LINUX_ORIG_TARBALL=$SRC_FILE
-elif [ -r $MIRROR/$SRC_FILE ]; then
-  LINUX_ORIG_TARBALL=$MIRROR/$SRC_FILE
-elif [ -r $MIRROR/testing/$SRC_FILE ]; then
-  LINUX_ORIG_TARBALL=$MIRROR/testing/$SRC_FILE
-else
-  echo "Cannot find $SRC_FILE."
-  exit 1
-fi
-echo $SRC_FILE
-cp $LINUX_ORIG_TARBALL $build_dir
+echo "linux-$SRCVERSION.tar.bz2"
+get_tarball "$SRCVERSION" "$build_dir"
 
 # Usage:
 # stable_tar [-t <timestamp>] [-C <dir>] [--exclude=...] <tarball> <files> ...

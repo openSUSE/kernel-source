@@ -39,6 +39,48 @@ get_branch_name()
     fi
 }
 
+_find_tarball()
+{
+    local version=$1 dir
+
+    for dir in . /mounts/mirror/kernel/v2.6{,/testing}; do
+        if test -r "$dir/linux-$version.tar.bz2"; then
+            echo "$dir/linux-$version.tar.bz2"
+        fi
+    done
+}
+
+_get_tarball_from_git()
+{
+    local version=$1
+
+    git=${LINUX_GIT:-$HOME/linux-2.6}
+    if test ! -d "$git/.git"; then
+        echo "No linux-2.6 git tree found (try setting the LINUX_GIT variable)" >&2
+        exit 1
+    fi
+    git --git-dir="$git/.git" fetch git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
+    git --git-dir="$git/.git" archive --prefix="linux-$version/" "v$version"
+}
+
+get_tarball()
+{
+    local version=$1 dest=$2 tarball
+
+    tarball=$(_find_tarball "$version")
+    if test -n "$tarball"; then
+        cp "$tarball" "$dest"
+        return
+    fi
+    echo "Warning: could not find linux-$version.tar.bz2, trying to create it from git" >&2
+    set -o pipefail
+    _get_tarball_from_git "$version" | bzip2 -9 >"$dest/linux-$version.tar.bz2"
+    if test $? -ne 0; then
+        exit 1
+    fi
+    set +o pipefail
+}
+
 if $using_git && test -z "$CHECKED_GIT_HOOKS"; then
     export CHECKED_GIT_HOOKS=1
     if ! "$scripts_dir"/install-git-hooks --check; then

@@ -37,6 +37,7 @@ sort()
 tolerate_unknown_new_config_options=
 ignore_kabi=
 mkspec_args=()
+source $(dirname $0)/config.sh
 until [ "$#" = "0" ] ; do
   case "$1" in
     --dir=*)
@@ -81,6 +82,7 @@ these options are recognized:
     -nf                to proceed if a new unknown .config option is found during make oldconfig
     -u		       update generated files in an existing kernel-source dir
     -i                 ignore kabi failures
+    -d, --dir=DIR      create package in DIR instead of default $BUILD_DIR
 
 EOF
 	exit 1
@@ -91,9 +93,7 @@ EOF
       ;;
   esac
 done
-source $(dirname $0)/config.sh
 export LANG=POSIX
-SRC_FILE=linux-$SRCVERSION.tar.bz2
 
 [ -z "$build_dir" ] && build_dir=$BUILD_DIR
 if [ -z "$build_dir" ]; then
@@ -160,6 +160,11 @@ if grep -q '^Source.*:[[:space:]]*log\.sh[[:space:]]*$' rpm/kernel-source.spec.i
 	cp -p scripts/rpm-log.sh "$build_dir"/log.sh
 fi
 rm -f "$build_dir/kernel-source.changes.old"
+if test -e "$build_dir"/config-options.changes; then
+	# Rename to  avoid triggering a build service rule error
+	mv "$build_dir"/config-options.changes \
+		"$build_dir"/config-options.changes.txt
+fi
 # FIXME: move config-subst out of rpm/
 rm "$build_dir/config-subst"
 
@@ -203,18 +208,8 @@ if [ -e extra-symbols ]; then
 		$build_dir
 fi
 
-if [ -r $SRC_FILE ]; then
-  LINUX_ORIG_TARBALL=$SRC_FILE
-elif [ -r $MIRROR/$SRC_FILE ]; then
-  LINUX_ORIG_TARBALL=$MIRROR/$SRC_FILE
-elif [ -r $MIRROR/testing/$SRC_FILE ]; then
-  LINUX_ORIG_TARBALL=$MIRROR/testing/$SRC_FILE
-else
-  echo "Cannot find $SRC_FILE."
-  exit 1
-fi
-echo $SRC_FILE
-cp $LINUX_ORIG_TARBALL $build_dir
+echo "linux-$SRCVERSION.tar.bz2"
+get_tarball "$SRCVERSION" "$build_dir"
 
 # Usage:
 # stable_tar [-t <timestamp>] [-C <dir>] [--exclude=...] <tarball> <files> ...
