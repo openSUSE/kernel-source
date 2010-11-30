@@ -164,37 +164,6 @@ free_blocks="$(df -P "$SCRATCH_AREA" \
     | awk 'NR==2 && match($4, /^[0-9]*$/) { print $4 }' 2> /dev/null)"
 [ "0$free_blocks" -gt 262144 ] && enough_free_space=1
 
-if [ ! -d $ORIG_DIR ]; then
-    # Check if linux-$SRCVERSION.tar.gz is accessible.
-    for file in {$SCRATCH_AREA/,,$MIRROR/,$MIRROR/testing/}linux-$SRCVERSION.tar.{gz,bz2}; do
-	if [ -r $file ]; then
-	    LINUX_ORIG_TARBALL=$file
-	    [ ${file:(-3)} = .gz  ] && COMPRESS_MODE=z
-	    [ ${file:(-4)} = .bz2 ] && COMPRESS_MODE=j
-	    break
-	fi
-    done
-    if [ -z "$LINUX_ORIG_TARBALL" ]; then
-        if type ketchup 2>/dev/null; then
-	    pushd . > /dev/null
-	    cd $SCRATCH_AREA && \
-	    rm -rf linux-$SRCVERSION && \
-	    mkdir linux-$SRCVERSION && \
-	    cd linux-$SRCVERSION && \
-	    ketchup $SRCVERSION && \
-	    cd $SCRATCH_AREA && \
-	    mv linux-$SRCVERSION linux-$SRCVERSION.orig
-	    popd > /dev/null
-	fi
-	if [ ! -d "$ORIG_DIR" ]; then
-	    echo "Kernel source archive \`linux-$SRCVERSION.tar.gz' not found," >&2
-	    echo "alternatively you can put an unpatched kernel tree to" >&2
-	    echo "$ORIG_DIR." >&2
-	    exit 1
-	fi
-    fi
-fi
-
 # Check series.conf.
 if [ ! -r series.conf ]; then
     echo "Configuration file \`series.conf' not found"
@@ -263,14 +232,7 @@ fi
 
 # Create fresh $SCRATCH_AREA/linux-$SRCVERSION.
 if ! [ -d $ORIG_DIR ]; then
-    echo "Extracting $LINUX_ORIG_TARBALL"
-    tar xf$COMPRESS_MODE $LINUX_ORIG_TARBALL --directory $SCRATCH_AREA
-    if [ -e $SCRATCH_AREA/linux-$SRCVERSION ]; then
-	mv $SCRATCH_AREA/linux-$SRCVERSION $ORIG_DIR || exit 1
-    elif [ -e $SCRATCH_AREA/linux ]; then
-	# Old kernels unpack into linux/ instead of linux-$SRCVERSION/.
-	mv $SCRATCH_AREA/linux $ORIG_DIR || exit 1
-    fi
+    unpack_tarball "$SRCVERSION" "$ORIG_DIR"
     find $ORIG_DIR -type f | xargs chmod a-w,a+r
 fi
 

@@ -81,6 +81,28 @@ get_tarball()
     set +o pipefail
 }
 
+unpack_tarball()
+{
+    local version=$1 dest=$2 tarball
+
+    tarball=$(_find_tarball "$version")
+    mkdir -p "$dest"
+    if test -n "$tarball"; then
+        echo "Extracting $tarball"
+        tar -xjf "$tarball" -C "$dest" --strip-components=1
+        return
+    fi
+    echo "Warning: could not find linux-$version.tar.bz2, trying to create it from git" >&2
+    echo "alternatively you can put an unpatched kernel tree to $dest" >&2
+    set -o pipefail
+    _get_tarball_from_git "$version" | tar -xf - -C "$dest" --strip-components=1
+    if test $? -ne 0; then
+        rm -rf "$dest"
+        exit 1
+    fi
+    set +o pipefail
+}
+
 if $using_git && test -z "$CHECKED_GIT_HOOKS"; then
     export CHECKED_GIT_HOOKS=1
     if ! "$scripts_dir"/install-git-hooks --check; then
