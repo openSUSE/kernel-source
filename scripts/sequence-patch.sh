@@ -205,6 +205,9 @@ export TMPDIR
 ORIG_DIR=$SCRATCH_AREA/linux-$SRCVERSION.orig
 TAG=$(get_branch_name)
 TAG=${TAG//\//_}
+if [ "$VANILLA" = "true" ]; then
+	TAG=${TAG}-vanilla
+fi
 PATCH_DIR=$SCRATCH_AREA/linux-$SRCVERSION${TAG:+-$TAG}
 PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION${TAG:+-$TAG}.log
 LAST_LOG=$SCRATCH_AREA/last-$SRCVERSION${TAG:+-$TAG}.log
