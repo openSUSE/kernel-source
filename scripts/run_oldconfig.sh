@@ -102,6 +102,10 @@ until [ "$#" = "0" ] ; do
 		mode=yes
 		shift
 		;;
+	--mod)
+		mode=allmodconfig
+		shift
+		;;
 	a|-a|--arch)
 		cpu_arch=$2
 		shift 2
@@ -148,6 +152,7 @@ run it with no options in your SCRATCH_AREA $SCRATCH_AREA, like
 possible options in this mode:
 	called with no option will run just make oldconfig interactive
 	y|-y|--yes         to run 'yes "" | make oldconfig'
+	--mod              to set all new options to 'm' (booleans to 'y')
 	a|-a|--arch        to run make oldconfig only for the given arch
 	m|-m|--menuconfig  to run make menuconfig instead of oldconfig
 	--flavor <flavor>  to run only for configs of specified flavor
@@ -284,6 +289,12 @@ for config in $config_files; do
     yes)
 	_region_msg_ "working on $config"
 	yes '' | make $MAKE_ARGS oldconfig
+	;;
+    allmodconfig)
+	_region_msg_ "working on $config"
+	cp .config config-old
+	KCONFIG_ALLCONFIG=config-old make $MAKE_ARGS allmodconfig
+	rm config-old
 	;;
     *)
 	_region_msg_ "working on $config"
