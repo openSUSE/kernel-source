@@ -93,47 +93,55 @@ trap _cleanup_ EXIT
 # main
 
 cpu_arch=
-YES=
-menuconfig=no
-new_config_option_yes=no
-new_config_option_mod=no
-new_config_option_no=no
+mode=oldconfig
+option=
+value=
 until [ "$#" = "0" ] ; do
-    case "$1" in
-    y|-y|--yes)
-	YES="yes '' | "
-	shift
-	;;
-    a|-a|--arch)
-	cpu_arch=$2
-	shift 2
-	;;
-    m|-m|--menuconfig)
-	menuconfig=yes
-	shift
-	;;
-    -nco-y|--new-config-option-yes)
-	new_config_option_yes="$2"
-	shift 2
-	;;
-    -nco-m|--new-config-option-mod)
-	new_config_option_mod="$2"
-	shift 2
-	;;
-    -nco-n|--new-config-option-no|-dco|--disable-config-option)
-	new_config_option_no="$2"
-	shift 2
-	;;
-    --flavor)
-	set_flavor="$2"
-	shift 2
-	;;
-    --vanilla)
-	set_flavor="vanilla"
-	shift
-	;;
-    -h|--help)
-	cat <<EOF
+	case "$1" in
+	y|-y|--yes)
+		mode=yes
+		shift
+		;;
+	--mod)
+		mode=allmodconfig
+		shift
+		;;
+	a|-a|--arch)
+		cpu_arch=$2
+		shift 2
+		;;
+	m|-m|--menuconfig)
+		mode=menuconfig
+		shift
+		;;
+	-nco-y|--new-config-option-yes)
+		mode=single
+		option=$2
+		value=y
+		shift 2
+		;;
+	-nco-m|--new-config-option-mod)
+		mode=single
+		option=$2
+		value=m
+		shift 2
+		;;
+	-nco-n|--new-config-option-no|-dco|--disable-config-option)
+		mode=single
+		option=$2
+		value=n
+		shift 2
+		;;
+	--flavor)
+		set_flavor="$2"
+		shift 2
+		;;
+	--vanilla)
+		set_flavor="vanilla"
+		shift
+		;;
+	-h|--help)
+		cat <<EOF
 
 ${0##*/} does either:
  * run make oldconfig to clean up the .config files
@@ -144,6 +152,7 @@ run it with no options in your SCRATCH_AREA $SCRATCH_AREA, like
 possible options in this mode:
 	called with no option will run just make oldconfig interactive
 	y|-y|--yes         to run 'yes "" | make oldconfig'
+	--mod              to set all new options to 'm' (booleans to 'y')
 	a|-a|--arch        to run make oldconfig only for the given arch
 	m|-m|--menuconfig  to run make menuconfig instead of oldconfig
 	--flavor <flavor>  to run only for configs of specified flavor
@@ -161,13 +170,13 @@ FOO=X
 CONFIG_FOO
 CONFIG_FOO=X
 EOF
-	exit 1
-	;;
-    *)
-	echo ugh
-    	exit 1
-	;;
-    esac
+		exit 1
+		;;
+	*)
+		echo ugh
+		exit 1
+		;;
+	esac
 done
 
 if [ -f patches/scripts/arch-symbols ] ; then
@@ -189,27 +198,20 @@ else
     CONFIG_SYMBOLS=$(${prefix}scripts/arch-symbols $cpu_arch)
 fi
 
-if [ "$new_config_option_yes" != "no" ] ; then
-	set_var "$new_config_option_yes" y
+case "$mode" in
+single)
+	set_var "$option" "$value"
 	exit 0
-fi
-if [ "$new_config_option_mod" != "no" ] ; then
-	set_var "$new_config_option_mod" m
-	exit 0
-fi
-if [ "$new_config_option_no" != "no" ] ; then
-	set_var "$new_config_option_no" n
-	exit 0
-fi
-
-if [ "$menuconfig" = "no" ] ; then
+	;;
+menuconfig)
+	;;
+*)
 	case "$TERM" in
 	linux* | xterm* | screen*)
-	    use_region=1
-	    _region_init_
-	    ;;
+		use_region=1
+		_region_init_
 	esac
-fi
+esac
 
 config_files=$(${prefix}scripts/guards $CONFIG_SYMBOLS < ${prefix}config.conf)
 
@@ -279,14 +281,24 @@ for config in $config_files; do
     fi \
     | bash ${prefix}rpm/config-subst CONFIG_SUSE_KERNEL y \
     > .config
-    case "$menuconfig" in
+    export KCONFIG_NOTIMESTAMP=1
+    case "$mode" in
+    menuconfig)
+	make $MAKE_ARGS menuconfig
+	;;
     yes)
-	KCONFIG_NOTIMESTAMP=1 make $MAKE_ARGS menuconfig
+	_region_msg_ "working on $config"
+	yes '' | make $MAKE_ARGS oldconfig
+	;;
+    allmodconfig)
+	_region_msg_ "working on $config"
+	cp .config config-old
+	KCONFIG_ALLCONFIG=config-old make $MAKE_ARGS allmodconfig
+	rm config-old
 	;;
     *)
 	_region_msg_ "working on $config"
-	eval $YES KCONFIG_NOTIMESTAMP=1 make $MAKE_ARGS oldconfig
-	;;
+	make $MAKE_ARGS oldconfig
     esac
     if ! diff -U0 $config .config; then
 	sed '/^# Linux kernel version:/d' < .config > $config
