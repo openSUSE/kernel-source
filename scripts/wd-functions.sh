@@ -46,6 +46,7 @@ _find_tarball()
     for dir in . /mounts/mirror/kernel/v2.6{,/testing}; do
         if test -r "$dir/linux-$version.tar.bz2"; then
             echo "$dir/linux-$version.tar.bz2"
+            return
         fi
     done
 }
@@ -69,7 +70,7 @@ get_tarball()
 
     tarball=$(_find_tarball "$version")
     if test -n "$tarball"; then
-        cp "$tarball" "$dest"
+        cp "$tarball" "$dest" || exit
         return
     fi
     echo "Warning: could not find linux-$version.tar.bz2, trying to create it from git" >&2
