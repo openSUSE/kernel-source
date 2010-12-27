@@ -43,7 +43,7 @@ _find_tarball()
 {
     local version=$1 dir
 
-    for dir in . /mounts/mirror/kernel/v2.6{,/testing}; do
+    for dir in . /mounts/mirror/kernel/v2.6{,/testing} ${MIRROR}; do
         if test -r "$dir/linux-$version.tar.bz2"; then
             echo "$dir/linux-$version.tar.bz2"
             return
