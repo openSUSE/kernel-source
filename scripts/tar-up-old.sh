@@ -156,11 +156,21 @@ referenced_files="$( {
 	$(dirname $0)/guards --prefix=config --list < config.conf
     } | sort -u )"
 
+for file in $referenced_files; do
+	case $file in
+	config/* | patches.*/*)
+		;;
+	*)
+		echo "Error: Patches must be placed in the patches.*/ subdirectories: $file" >&2
+		exit 1
+	esac
+done
 inconsistent=false
 check_for_merge_conflicts $referenced_files kernel-source.changes{,.old} || \
 	inconsistent=true
 scripts/check-conf || inconsistent=true
 scripts/check-cvs-add --committed || inconsistent=true
+# FIXME: someone should clean up the mess and make this check fatal
 if $inconsistent; then
     echo "Inconsistencies found."
     echo "Please clean up series.conf and/or the patches directories!"
