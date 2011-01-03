@@ -1,5 +1,5 @@
 # The version of the main tarball to use
-SRCVERSION=2.6.37-rc8-32-g9109f4e
+SRCVERSION=2.6.37-rc8-46-g03ed6a3
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=
 # buildservice projects to build the kernel against
