@@ -94,7 +94,6 @@ EOF
   esac
 done
 export LANG=POSIX
-SRC_FILE=linux-$SRCVERSION.tar.bz2
 
 [ -z "$build_dir" ] && build_dir=$BUILD_DIR
 if [ -z "$build_dir" ]; then
@@ -124,11 +123,21 @@ referenced_files="$( {
 	$(dirname $0)/guards --prefix=config --list < config.conf
     } | sort -u )"
 
+for file in $referenced_files; do
+	case $file in
+	config/* | patches.*/*)
+		;;
+	*)
+		echo "Error: Patches must be placed in the patches.*/ subdirectories: $file" >&2
+		exit 1
+	esac
+done
 inconsistent=false
 check_for_merge_conflicts $referenced_files kernel-source.changes{,.old} || \
 	inconsistent=true
 scripts/check-conf || inconsistent=true
 scripts/check-cvs-add --committed || inconsistent=true
+# FIXME: someone should clean up the mess and make this check fatal
 if $inconsistent; then
     echo "Inconsistencies found."
     echo "Please clean up series.conf and/or the patches directories!"
@@ -209,18 +218,8 @@ if [ -e extra-symbols ]; then
 		$build_dir
 fi
 
-if [ -r $SRC_FILE ]; then
-  LINUX_ORIG_TARBALL=$SRC_FILE
-elif [ -r $MIRROR/$SRC_FILE ]; then
-  LINUX_ORIG_TARBALL=$MIRROR/$SRC_FILE
-elif [ -r $MIRROR/testing/$SRC_FILE ]; then
-  LINUX_ORIG_TARBALL=$MIRROR/testing/$SRC_FILE
-else
-  echo "Cannot find $SRC_FILE."
-  exit 1
-fi
-echo $SRC_FILE
-cp $LINUX_ORIG_TARBALL $build_dir
+echo "linux-$SRCVERSION.tar.bz2"
+get_tarball "$SRCVERSION" "$build_dir"
 
 # Usage:
 # stable_tar [-t <timestamp>] [-C <dir>] [--exclude=...] <tarball> <files> ...
