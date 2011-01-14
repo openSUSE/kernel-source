@@ -43,7 +43,7 @@ _find_tarball()
 {
     local version=$1 dir
 
-    for dir in . /mounts/mirror/kernel/v2.6{,/testing}; do
+    for dir in . /mounts/mirror/kernel/v2.6{,/testing} ${MIRROR}; do
         if test -r "$dir/linux-$version.tar.bz2"; then
             echo "$dir/linux-$version.tar.bz2"
             return
@@ -53,15 +53,23 @@ _find_tarball()
 
 _get_tarball_from_git()
 {
-    local version=$1
+    local version=$1 tag
 
     git=${LINUX_GIT:-$HOME/linux-2.6}
     if test ! -d "$git/.git"; then
         echo "No linux-2.6 git tree found (try setting the LINUX_GIT variable)" >&2
         exit 1
     fi
-    git --git-dir="$git/.git" fetch --tags git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git refs/heads/master:refs/tags/latest
-    git --git-dir="$git/.git" archive --prefix="linux-$version/" "v$version"
+    case "$version" in
+    next-*)
+        tag=$version
+        git --git-dir="$git/.git" fetch git://git.kernel.org/pub/scm/linux/kernel/git/sfr/linux-next.git "refs/tags/$tag:refs/tags/$tag"
+        ;;
+    *)
+        tag="v$version"
+        git --git-dir="$git/.git" fetch --tags git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git refs/heads/master:refs/tags/latest
+    esac
+    git --git-dir="$git/.git" archive --prefix="linux-$version/" "$tag"
 }
 
 get_tarball()
