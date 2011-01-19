@@ -40,7 +40,7 @@ usage() {
     cat <<END
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
           [--combine] [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
-          [--build-dir=PATH] [--config=ARCH-FLAVOR]
+          [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]]
 
   The --build-dir option supports internal shell aliases, like ~, and variable
   expansion when the variables are properly escaped.  Environment variables
@@ -65,7 +65,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,build-dir:,config: -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,build-dir:,config:,kabi -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -84,6 +84,7 @@ SP_BUILD_DIR=
 CONFIG=
 CONFIG_ARCH=
 CONFIG_FLAVOR=
+KABI=false
 
 while true; do
     case "$1" in
@@ -132,6 +133,9 @@ while true; do
 	--config)
 	    CONFIG="$2"
 	    shift
+	    ;;
+	--kabi)
+	    KABI=true
 	    ;;
 	--)
 	    shift
@@ -497,6 +501,18 @@ if test -n "$CONFIG"; then
 	cp -a "config/$CONFIG_ARCH/$CONFIG_FLAVOR" "$SP_BUILD_DIR/.config"
     else
 	echo "[ Config $CONFIG does not exist. ]"
+    fi
+
+    if $KABI; then
+	if [ ! -x rpm/modversions ]; then
+	    echo "[ This branch does not support the modversions kABI mechanism. Skipping. ]"
+	elif [ -e "kabi/$CONFIG_ARCH/symtypes-$CONFIG_FLAVOR" ]; then
+	    echo "[ Expanding kABI references for $CONFIG ]"
+	    rpm/modversions --unpack "$SP_BUILD_DIR" < \
+		"kabi/$CONFIG_ARCH/symtypes-$CONFIG_FLAVOR"
+	else
+	    echo "[ No kABI references for $CONFIG ]"
+	fi
     fi
 fi
 
