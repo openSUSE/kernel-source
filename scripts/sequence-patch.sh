@@ -40,7 +40,7 @@ usage() {
     cat <<END
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
           [--combine] [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
-          [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]]
+          [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]] [--ctags]
 
   The --build-dir option supports internal shell aliases, like ~, and variable
   expansion when the variables are properly escaped.  Environment variables
@@ -65,7 +65,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,build-dir:,config:,kabi -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,build-dir:,config:,kabi,ctags -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -85,6 +85,7 @@ CONFIG=
 CONFIG_ARCH=
 CONFIG_FLAVOR=
 KABI=false
+CTAGS=false
 
 while true; do
     case "$1" in
@@ -136,6 +137,9 @@ while true; do
 	    ;;
 	--kabi)
 	    KABI=true
+	    ;;
+	--ctags)
+	    CTAGS=true
 	    ;;
 	--)
 	    shift
@@ -513,6 +517,15 @@ if test -n "$CONFIG"; then
 	else
 	    echo "[ No kABI references for $CONFIG ]"
 	fi
+    fi
+fi
+
+if $CTAGS; then
+    if ctags --version > /dev/null; then
+	echo "[ Generating ctags (this may take a while)]"
+	make -s --no-print-directory -C "$PATCH_DIR" O="$SP_BUILD_DIR" tags
+    else
+	echo "[ Could not generate ctags: ctags not found ]"
     fi
 fi
 
