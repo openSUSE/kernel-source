@@ -40,7 +40,7 @@ usage() {
     cat <<END
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
           [--combine] [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
-          [--build-dir=PATH]
+          [--build-dir=PATH] [--config=ARCH-FLAVOR]
 
   The --build-dir option supports internal shell aliases, like ~, and variable
   expansion when the variables are properly escaped.  Environment variables
@@ -49,6 +49,10 @@ SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
   \$SRCVERSION:		The current linux source tarball version
   \$TAG:			The current tag or branch of this repo
   \$EXT:			A string expanded from current \$EXTRA_SYMBOLS
+  With --config=ARCH-FLAVOR, these have values. Otherwise they are empty.
+  \$CONFIG:		The current ARCH-FLAVOR.
+  \$CONFIG_ARCH:		The current ARCH.
+  \$CONFIG_FLAVOR:	The current FLAVOR.
 END
     exit 1
 }
@@ -61,7 +65,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,build-dir: -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,build-dir:,config: -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -77,6 +81,9 @@ COMBINE=
 FAST=
 VANILLA=false
 SP_BUILD_DIR=
+CONFIG=
+CONFIG_ARCH=
+CONFIG_FLAVOR=
 
 while true; do
     case "$1" in
@@ -122,6 +129,10 @@ while true; do
 	    SP_BUILD_DIR="$2"
 	    shift
 	    ;;
+	--config)
+	    CONFIG="$2"
+	    shift
+	    ;;
 	--)
 	    shift
 	    break ;;
@@ -135,6 +146,16 @@ unset LIMIT
 if [ $# -ge 1 ]; then
     LIMIT=$1
     shift
+fi
+
+if test -n "$CONFIG"; then
+    CONFIG_ARCH=${CONFIG%%-*}
+    CONFIG_FLAVOR=${CONFIG##*-}
+    if [ "$CONFIG" = "$CONFIG_ARCH" -o "$CONFIG" = "$CONFIG_FLAVOR" -o \
+         -z "$CONFIG_ARCH" -o -z "$CONFIG_FLAVOR" ]; then
+	echo "Invalid config spec: --config=ARCH-FLAVOR is expected."
+	usage
+    fi
 fi
 
 if [ $# -ne 0 ]; then
@@ -468,6 +489,15 @@ fi
 if test -e supported.conf; then
     echo "[ Generating Module.supported ]"
     scripts/guards base external < supported.conf > "$SP_BUILD_DIR/Module.supported"
+fi
+
+if test -n "$CONFIG"; then
+    if test -e "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
+	echo "[ Copying config/$CONFIG_ARCH/$CONFIG ]"
+	cp -a "config/$CONFIG_ARCH/$CONFIG_FLAVOR" "$SP_BUILD_DIR/.config"
+    else
+	echo "[ Config $CONFIG does not exist. ]"
+    fi
 fi
 
 [ $# -gt 0 ] && exit $status
