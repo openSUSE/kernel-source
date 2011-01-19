@@ -37,7 +37,19 @@ sles9* | sles10* | sle10* | 9.* | 10.* | 11.0)
 esac
 
 usage() {
-    echo "SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...] [--combine] [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]"
+    cat <<END
+SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
+          [--combine] [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
+          [--build-dir=PATH]
+
+  The --build-dir option supports internal shell aliases, like ~, and variable
+  expansion when the variables are properly escaped.  Environment variables
+  and the following list of internal variables are permitted:
+  \$PATCH_DIR:		The expanded source tree
+  \$SRCVERSION:		The current linux source tarball version
+  \$TAG:			The current tag or branch of this repo
+  \$EXT:			A string expanded from current \$EXTRA_SYMBOLS
+END
     exit 1
 }
 
@@ -49,7 +61,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,build-dir: -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -64,6 +76,7 @@ QUILT=true
 COMBINE=
 FAST=
 VANILLA=false
+SP_BUILD_DIR=
 
 while true; do
     case "$1" in
@@ -103,6 +116,10 @@ while true; do
 	    ;;
 	-F|--fuzz)
 	    fuzz="-F$2"
+	    shift
+	    ;;
+	--build-dir)
+	    SP_BUILD_DIR="$2"
 	    shift
 	    ;;
 	--)
@@ -213,6 +230,13 @@ fi
 EXT=${EXTRA_SYMBOLS// /-}
 EXT=${EXT//\//}
 PATCH_DIR=${PATCH_DIR}${EXT:+-}$EXT
+
+if [ -n "$SP_BUILD_DIR" ]; then
+    # This allows alias (~) and variable expansion
+    SP_BUILD_DIR=$(eval echo "$SP_BUILD_DIR")
+else
+    SP_BUILD_DIR="$PATCH_DIR"
+fi
 
 echo "Creating tree in $PATCH_DIR"
 
@@ -431,9 +455,19 @@ fi
 
 echo "[ Tree: $PATCH_DIR ]"
 
+append=
+if test "$SP_BUILD_DIR" != "$PATCH_DIR"; then
+    mkdir -p "$SP_BUILD_DIR"
+    echo "[ Build Dir: $SP_BUILD_DIR ]"
+    rm -f "$SP_BUILD_DIR/source"
+    rm -f "$SP_BUILD_DIR/patches"
+    ln -sf "$PATCH_DIR" "$SP_BUILD_DIR/source"
+    ln -sf "source/patches" "$SP_BUILD_DIR/patches"
+fi
+
 if test -e supported.conf; then
     echo "[ Generating Module.supported ]"
-    scripts/guards base external < supported.conf > $PATCH_DIR/Module.supported
+    scripts/guards base external < supported.conf > "$SP_BUILD_DIR/Module.supported"
 fi
 
 [ $# -gt 0 ] && exit $status
