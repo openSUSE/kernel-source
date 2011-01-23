@@ -63,7 +63,7 @@ _get_tarball_from_git()
     case "$version" in
     next-*)
         tag=$version
-        git --git-dir="$git/.git" fetch git://git.kernel.org/pub/scm/linux/kernel/git/sfr/linux-next.git "refs/tags/$tag:refs/tags/$tag"
+        git --git-dir="$git/.git" fetch git://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git "refs/tags/$tag:refs/tags/$tag"
         ;;
     *)
         tag="v$version"
