@@ -20,7 +20,7 @@ fi
 
 
 source $(dirname $0)/config.sh
-set -- $(echo $SRCVERSION | sed -ne 's/\([0-9]\+\).\([0-9]\+\).\([0-9]\+\)\(.*\)/\1 \2 \3 \4/p')
+set -- $(echo $SRCVERSION | sed -rn 's/([0-9]+)\.([0-9]+)\.([0-9]+)(.*)/\1 \2 \3 \4/p')
 
 VERSION=$1
 PATCHLEVEL=$2
