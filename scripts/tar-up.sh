@@ -109,10 +109,20 @@ check_for_merge_conflicts() {
     fi
 }
 
-# dot files are skipped by intention, in order not to break osc working
-# copies
-rm -f $build_dir/*
-mkdir -p $build_dir
+# Dot files are skipped by intention, in order not to break osc working
+# copies. The linux tarball is not deleted if it is already there
+for f in "$build_dir"/*; do
+	case "$f" in
+	*/"linux-$SRCVERSION.tar.bz2")
+		continue
+	esac
+	rm -f "$f"
+done
+mkdir -p "$build_dir"
+if test ! -e "$build_dir/linux-$SRCVERSION.tar.bz2"; then
+	echo "linux-$SRCVERSION.tar.bz2"
+	get_tarball "$SRCVERSION" "$build_dir"
+fi
 
 # list of patches to include.
 install -m 644 series.conf $build_dir/
@@ -217,9 +227,6 @@ if [ -e extra-symbols ]; then
 		extra-symbols				\
 		$build_dir
 fi
-
-echo "linux-$SRCVERSION.tar.bz2"
-get_tarball "$SRCVERSION" "$build_dir"
 
 # Usage:
 # stable_tar [-t <timestamp>] [-C <dir>] [--exclude=...] <tarball> <files> ...
