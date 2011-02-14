@@ -1,0 +1,323 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use File::Copy;
+use Getopt::Long;
+
+my $dir = ".";
+my $rpmrelease;
+my $patches="";
+
+GetOptions(
+	"patches=s" => \$patches,
+	"release=s" => \$rpmrelease
+) or die "Usage: $0 [--release <release>] [--patches <dir>]\n";
+
+# flavor -> [supported archs]
+my %flavor_archs = parse_config_conf();
+# subset to include in kernel-syms
+my %syms_flavor_archs = parse_config_conf("syms");
+
+# template name -> template body
+my %templates = read_spec_templates();
+
+# config.sh variables
+my %vars = parse_config_sh();
+my ($srcversion, $variant, $vanilla_only) =
+	($vars{'SRCVERSION'}, $vars{'VARIANT'}, $vars{'VANILLA_ONLY'});
+$vanilla_only ||= "0";
+
+# rpm changelog
+my $changelog = convert_changes();
+
+# package name -> [summary, description]
+my %binary_descriptions = parse_descriptions();
+
+$patches="--patches $patches" if $patches;
+my $patchversion = `$dir/compute-PATCHVERSION.sh $patches`;
+chomp $patchversion;
+my $rpmversion;
+if (defined($rpmrelease)) {
+	($rpmversion = $patchversion) =~ s/-.*//;
+	# convince abuild that we really want this release number
+	xopen(my $fh, '>', "$dir/get_release_number.sh");
+	print $fh "#!/bin/sh\n";
+	print $fh "echo \"$rpmrelease.0\"\n";
+	close($fh);
+	chmod(0755, "$dir/get_release_number.sh");
+} else {
+	($rpmversion, $rpmrelease) = (split(/-/, $patchversion, 2), "");
+}
+$rpmrelease =~ s/[^.]$/$&./;
+$rpmrelease =~ s/-/./g;
+
+my $sources = join("", $templates{source} =~ /\nSource\d+:[^\n]*/mg);
+# Find all SourceN: foo.tar.bz2 lines and generate the NoSource:
+# lines and the %setup line
+my @tarballs = ($sources =~ /\nSource(\d+):[^\n]*\.tar\.bz2/mg);
+my $nosource = join("\n", map { "NoSource:       $_" } @tarballs);
+# Source0 (the linux tarball) is unpacked manually
+@tarballs = grep { $_ > 0 } @tarballs;
+my $unpack_patches = join(" ", map { "-a $_" } @tarballs);
+# List of scripts to automatically chmod +x before build
+my $scripts = join(",", grep { is_script($_) }
+			($sources =~ /\nSource\d+:\s*([^\s]*)/mg));
+
+my %macros = (
+	VARIANT => $variant,
+	VANILLA_ONLY => $vanilla_only,
+	SRCVERSION => $srcversion,
+	PATCHVERSION => $patchversion,
+	RPMVERSION => $rpmversion,
+	RELEASE_PREFIX => $rpmrelease,
+	SOURCES => $sources,
+	NOSOURCE => $nosource,
+	UNPACK_PATCHES => $unpack_patches,
+	SCRIPTS => $scripts,
+);
+
+# binary spec files
+for my $flavor (sort keys(%flavor_archs)) {
+	my ($summary, $description);
+	if (!exists($binary_descriptions{"kernel-$flavor"})) {
+		print STDERR "warning: no description for kernel-$flavor found\n";
+		$summary = "The Linux Kernel";
+		$description = "The Linux Kernel.";
+	} else {
+		$summary = $binary_descriptions{"kernel-$flavor"}->[0];
+		$description = $binary_descriptions{"kernel-$flavor"}->[1];
+	}
+
+	do_spec('binary', "kernel-$flavor.spec", %macros,
+		FLAVOR => $flavor,
+		SUMMARY => $summary,
+		DESCRIPTION => $description,
+		ARCHS => join(" ", arch2rpm(@{$flavor_archs{$flavor}})),
+		PROVIDES_OBSOLETES => provides_obsoletes($flavor, @{$flavor_archs{$flavor}}),
+	);
+}
+# kernel-source.spec
+do_spec('source', "kernel-source$variant.spec", %macros);
+
+# kernel-docs.spec
+do_spec('docs', "kernel-docs$variant.spec", %macros);
+
+# kernel-syms.spec
+{
+	my $requires = "";
+	my %all_archs;
+	for my $flavor (sort keys(%syms_flavor_archs)) {
+		next if $flavor eq "vanilla";
+		my @archs = arch2rpm(@{$syms_flavor_archs{$flavor}});
+		$all_archs{$_} = 1 for @archs;
+		$requires .= "%ifarch @archs\n";
+		$requires .= "Requires:       kernel-$flavor-devel = \%version-\%source_rel\n";
+		$requires .= "%endif\n";
+	}
+	chomp $requires;
+	do_spec('syms', "kernel-syms$variant.spec", %macros,
+		REQUIRES => $requires,
+		ARCHS => join(" ", sort(keys(%all_archs))));
+}
+
+exit 0;
+
+
+
+sub parse_config_conf {
+	my @symbols = @_;
+	my $symbols = join(' ', @symbols);
+	my %res;
+
+	for my $arch (split(/\s+/, `$dir/arch-symbols --list`)) {
+		my @flavors = `$dir/guards $arch $symbols < $dir/config.conf`;
+		next if @flavors == 0;
+		chomp @flavors;
+		@flavors = map { s/.*\///; $_ } @flavors;
+		for my $flavor (@flavors) {
+			$res{$flavor} ||= [];
+			push(@{$res{$flavor}}, $arch);
+		}
+	}
+	for my $flavor (keys(%res)) {
+		$res{$flavor} = [sort @{$res{$flavor}}];
+	}
+	return %res;
+}
+
+sub read_spec_templates {
+	my %res;
+
+	for my $template qw(binary source syms docs) {
+		xopen(my $fh, '<', "$dir/kernel-$template.spec.in");
+		local $/ = undef;
+		$res{$template} = <$fh>;
+		close($fh);
+	}
+	return %res;
+}
+
+# return a hash of config.sh variables
+sub parse_config_sh {
+	my %res;
+
+	xopen(my $fh, '<', "$dir/config.sh");
+	while (<$fh>) {
+		chomp;
+		if (/^\s*([A-Z_]+)=(.*)/) {
+			$res{$1} = $2;
+		}
+	}
+	close($fh);
+	return %res;
+}
+
+# convert kernel-source.changes to rpm changelog
+sub convert_changes {
+	my $res = "\%changelog\n";
+	my @progs = qw(/usr/lib/build/changelog2spec
+	               /work/src/bin/tools/convert_changes_to_rpm_changelog);
+
+	my $changesfile = "$dir/kernel-source$variant.changes";
+	if (-e $changesfile) {
+		for my $prog (@progs) {
+			if (-x $prog) {
+				$res .= `$prog $changesfile`;
+				last;
+			}
+		}
+	}
+	chomp $res;
+	return $res;
+}
+
+sub parse_descriptions {
+	my %res;
+	my $current;
+	my $blank = "";
+	# 0 - expect summary, 1 - eating blank lines, 2 - reading description
+	my $state = 0;
+
+	xopen(my $fh, '<', "$dir/package-descriptions");
+	while (<$fh>) {
+		next if /^\s*#/;
+
+		if (/^==+\s+([^\s]+)\s+==+\s*$/) {
+			my $package = $1;
+			if ($current) {
+				chomp $current->[1];
+			}
+			$current = ["", ""];
+			$res{$package} = $current;
+			$state = 0;
+			next;
+		}
+		if (/^$/) {
+			if ($state == 2) {
+				$blank .= $_;
+			}
+			next;
+		}
+		# non-blank line and not === package ===
+		if ($state == 0) {
+			chomp;
+			$current->[0] = $_;
+			$state = 1;
+		} elsif ($state == 1) {
+			$current->[1] = $_;
+			$blank = "";
+			$state = 2;
+		} else {
+			$current->[1] .= $blank;
+			$blank = "";
+			$current->[1] .= $_;
+		}
+	}
+	if ($current) {
+		chomp $current->[1];
+	}
+	close($fh);
+	return %res;
+}
+
+sub is_script {
+	my $script = shift;
+
+	return undef if $script =~ /\.(tar\.(gz|bz2)|in|conf)$/;
+	return undef if $script =~ /^README/;
+	return 1 if $script =~ /\.pl$/;
+	open(my $fh, '<', $script) or return undef;
+	sysread($fh, my $shebang, 2);
+	close($fh);
+	return 1 if $shebang eq "#!";
+	return undef;
+}
+
+sub arch2rpm {
+	if (wantarray) {
+		return map { _arch2rpm($_) } @_;
+	}
+	return _arch2rpm($_[0]);
+}
+sub _arch2rpm {
+	my $arch = shift;
+	return "\%ix86" if $arch eq "i386";
+	return $arch;
+}
+
+sub append_changelog {
+	my $changelog = $_[1];
+	if ($_[0] =~ s/\%changelog$/$changelog/) {
+		return;
+	}
+	$_[0] .= $changelog;
+}
+
+sub provides_obsoletes {
+	my $flavor = shift;
+	my @archs = @_;
+	my $res = "";
+
+	for my $arch (@archs) {
+		my @packs = `$dir/guards $arch $flavor <$dir/old-packages.conf`;
+		chomp @packs;
+		next if (!@packs);
+		my $rpmarch = arch2rpm($arch);
+		chomp $rpmarch;
+		$res .= "\%ifarch $rpmarch\n";
+		$res .= "Provides:       @packs\n";
+		$res .= "Obsoletes:      @packs\n";
+		$res .= "\%endif\n";
+	}
+	chomp $res;
+	return $res;
+}
+
+sub do_spec {
+	my $template = shift;
+	my $specfile = shift;
+	my %macros = @_;
+
+	my $text = $templates{$template};
+	for my $m (keys %macros) {
+		$text =~ s/\@$m\@/$macros{$m}/g;
+	}
+	append_changelog($text, $changelog);
+	print "$specfile\n";
+	xopen(my $fh, '>', "$dir/$specfile");
+	print $fh $text;
+	close($fh);
+
+	return if $specfile eq "kernel-source$variant.spec";
+	my $changesfile = $specfile;
+	$changesfile =~ s/\.spec$//;
+	$changesfile .= ".changes";
+	copy("$dir/kernel-source$variant.changes", $changesfile);
+}
+
+sub xopen {
+        open($_[0], $_[1], $_[2]) or die "$_[2]: $!\n";
+}
+
