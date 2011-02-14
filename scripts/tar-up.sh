@@ -173,8 +173,10 @@ trap 'if test -n "$CLEANFILES"; then rm -rf "${CLEANFILES[@]}"; fi' EXIT
 tmpdir=$(mktemp -dt ${0##*/}.XXXXXX)
 CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
-cp -p rpm/* config.conf supported.conf doc/* \
-	misc/extract-modaliases $build_dir
+cp -p rpm/* config.conf supported.conf doc/* $build_dir
+if test -e misc/extract-modaliases; then
+	cp misc/extract-modaliases $build_dir
+fi
 # install this file only if the spec file references it
 if grep -q '^Source.*:[[:space:]]*log\.sh[[:space:]]*$' rpm/kernel-source.spec.in; then
 	cp -p scripts/rpm-log.sh "$build_dir"/log.sh
