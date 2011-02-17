@@ -188,6 +188,13 @@ else
 	exit 1
 fi
 
+if test -e "${prefix}rpm/config.sh"; then
+	source "$_"
+fi
+if test -z "$set_flavor" -a "$VANILLA_ONLY" = 1; then
+	set_flavor=vanilla
+fi
+
 if [ -z "$cpu_arch" ]; then
     CONFIG_SYMBOLS=$(
         for arch in $(${prefix}scripts/arch-symbols --list); do
