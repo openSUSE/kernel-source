@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-xen-port-patches.py [CVS dir]
+xen-port-patches.py [git dir]
 Create custom patches for xen from custom patches that affect x86.
 Turned out to be a little functional programming exercise for the author.
 (c) 2005-04-06, Kurt Garloff <garloff@suse.de>
@@ -48,11 +48,11 @@ def createReplList(patch):
 	return map(lambda(x): (x[0][0], x[0][1]), \
 			filter(lambda(x): x, map(applCorrFwd, matches)))
 
-def findPatchFiles(kcvs):
-	"Returns a list of all files in patches.*/ on below kcvs"
-	list = glob.glob(kcvs + "/patches.*/*")
-	# Avoid patches in patches.xen, CVS subdirs, backup files
-	filterout = re.compile("(patches\.(xen|rt)|CVS|~$|\.#)")
+def findPatchFiles(kgit):
+	"Returns a list of all files in patches.*/ on below kgit"
+	list = glob.glob(kgit + "/patches.*/*")
+	# Avoid patches in patches.xen, backup files
+	filterout = re.compile("(patches\.xen|~$|\.#)")
 	return filter(lambda(x): not filterout.search(x), list)
 
 def writePatch(fname, hdr, body):
@@ -81,7 +81,21 @@ def writePatch(fname, hdr, body):
 
 def mayCreatePatch(fname, repls):
 	"Try to apply the replacement rules to fname"
-	pfile = open(fname, "r")
+	if fname.endswith(".gz"):
+		decomp ="gzip"
+	elif fname.endswith(".bz2"):
+		decomp = "bzip2"
+	elif fname.endswith(".xz"):
+		decomp = "xz"
+	else:
+		decomp = ""
+	if decomp == "":
+		pfile = open(fname, "r")
+	else:
+		pfile = os.popen(" ".join([decomp, "-dc", fname]), "r")
+		parts = fname.split(".")
+		del parts[-1]
+		fname = ".".join(parts)
 	# Again an unelegant loop with an ugly state machine
 	active = 0; header = 0
 	patch = ""; rule = ()
@@ -130,19 +144,19 @@ def createXenPatches(filelist, repls):
 
 def main(args):
 	"Main program"
-	# Allow overriding kernel CVS dir
+	# Allow overriding kernel git dir
 	if len(args) > 1:
-		kerncvs = args[1]
+		kerngit = args[1]
 	else:
-		kerncvs = re.sub(r"^(.*)/[^/]+/[^/]+$", r"\1", os.path.abspath(args[0]))
-	print "Using kernel cvs at '%s'" % (kerncvs)
+		kerngit = re.sub(r"^(.*)/[^/]+/[^/]+$", r"\1", os.path.abspath(args[0]))
+	print "Using kernel git at '%s'" % (kerngit)
 	# Create list of replacements
-	repllist = createReplList(kerncvs + "/patches.xen/xen3-auto-xen-arch.diff")
+	repllist = createReplList(kerngit + "/patches.xen/xen3-auto-xen-arch.diff")
 	#print repllist
 	# ... and compile
 	complrepl = map(lambda(x): (x[0], x[1], re.compile(x[1])), repllist)
 	# Create a list of patch files
-	patchfiles = findPatchFiles(kerncvs)
+	patchfiles = findPatchFiles(kerngit)
 	#print patchfiles
 	createXenPatches(patchfiles, complrepl)
 
