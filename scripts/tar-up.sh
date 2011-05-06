@@ -311,6 +311,14 @@ done
 echo "kabi.tar.bz2"
 stable_tar $build_dir/kabi.tar.bz2 kabi
 
+if test -d sysctl && \
+	grep -q '^Source.*\<sysctl\.tar\.bz2' "$build_dir/kernel-source.spec.in"
+then
+	echo "sysctl.tar.bz2"
+	stable_tar $build_dir/sysctl.tar.bz2 sysctl
+fi
+
+
 # Create empty dummys for any *.tar.bz2 archive mentioned in the spec file
 # not already created: patches.addon is empty by intention; others currently
 # may contain no patches.
