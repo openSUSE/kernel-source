@@ -78,15 +78,18 @@ get_tarball()
 
     tarball=$(_find_tarball "$version")
     if test -n "$tarball"; then
-        cp "$tarball" "$dest" || exit
+        cp "$tarball" "$dest/linux-$version.tar.bz2.part" || exit
+        mv "$dest/linux-$version.tar.bz2.part" "$dest/linux-$version.tar.bz2"
         return
     fi
     echo "Warning: could not find linux-$version.tar.bz2, trying to create it from git" >&2
     set -o pipefail
-    _get_tarball_from_git "$version" | bzip2 -9 >"$dest/linux-$version.tar.bz2"
+    _get_tarball_from_git "$version" | bzip2 -9 \
+        >"$dest/linux-$version.tar.bz2.part"
     if test $? -ne 0; then
         exit 1
     fi
+    mv "$dest/linux-$version.tar.bz2.part" "$dest/linux-$version.tar.bz2"
     set +o pipefail
 }
 
