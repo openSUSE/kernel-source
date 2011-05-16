@@ -53,7 +53,7 @@ _find_tarball()
 
 _get_tarball_from_git()
 {
-    local version=$1 tag
+    local version=$1 tag url
 
     git=${LINUX_GIT:-$HOME/linux-2.6}
     if test ! -d "$git/.git"; then
@@ -62,13 +62,28 @@ _get_tarball_from_git()
     fi
     case "$version" in
     *next-*)
-        tag=next-${version##*next-}
-        git --git-dir="$git/.git" fetch git://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git "refs/tags/$tag:refs/tags/$tag"
+        tag=refs/tags/next-${version##*next-}
+        url=git://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git
+        ;;
+    2.6.*-*-g???????)
+        tag="v$version"
+        url=git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
         ;;
     *)
-        tag="v$version"
-        git --git-dir="$git/.git" fetch --tags git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git refs/heads/master:refs/tags/latest
+        tag=refs/tags/"v$version"
+        url=git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
     esac
+    if ! git --git-dir="$git/.git" cat-file -e "$tag" 2>/dev/null; then
+        case "$tag" in
+        refs/tags/*)
+            git --git-dir="$git/.git" fetch "$url" "$tag:$tag"
+            ;;
+        *)
+            # v2.6.X.Y-rcZ-gabcdef1, not a real tag
+            git --git-dir="$git/.git" fetch --tags "$url" \
+                refs/heads/master:refs/tags/latest
+        esac
+    fi
     git --git-dir="$git/.git" archive --prefix="linux-$version/" "$tag"
 }
 
@@ -78,15 +93,18 @@ get_tarball()
 
     tarball=$(_find_tarball "$version")
     if test -n "$tarball"; then
-        cp "$tarball" "$dest" || exit
+        cp "$tarball" "$dest/linux-$version.tar.bz2.part" || exit
+        mv "$dest/linux-$version.tar.bz2.part" "$dest/linux-$version.tar.bz2"
         return
     fi
     echo "Warning: could not find linux-$version.tar.bz2, trying to create it from git" >&2
     set -o pipefail
-    _get_tarball_from_git "$version" | bzip2 -9 >"$dest/linux-$version.tar.bz2"
+    _get_tarball_from_git "$version" | bzip2 -9 \
+        >"$dest/linux-$version.tar.bz2.part"
     if test $? -ne 0; then
         exit 1
     fi
+    mv "$dest/linux-$version.tar.bz2.part" "$dest/linux-$version.tar.bz2"
     set +o pipefail
 }
 
