@@ -4,4 +4,4 @@ SRCVERSION=2.6.39
 VARIANT=
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:11.4:Update
-IBS_PROJECT=
+IBS_PROJECT=SUSE:openSUSE:11.4:Update:Test
