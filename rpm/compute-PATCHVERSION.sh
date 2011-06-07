@@ -27,8 +27,7 @@ parse_srcversion()
 	VERSION=$1
 	PATCHLEVEL=$2
 	SUBLEVEL=$3
-	EXTRAVERSION=${SRCVERSION#*-}
-	EXTRAVERSION=${EXTRAVERSION:+-$EXTRAVERSION}
+	EXTRAVERSION=${SRCVERSION#${SRCVERSION%%-*}}
 }
 parse_srcversion
 
@@ -67,7 +66,7 @@ done >"$series" < <($(dirname $0)/guards $EXTRA_SYMBOLS <series.conf)
 # convert them to shell code that can be evaluated. Evaluate it.
 eval "$(
     <"$series" xargs awk '
-    /^--- |^+++ / \
+    /^--- |^\+\+\+ / \
 	{ M = match($2, /^[^\/]+\/Makefile( \t|$)/) }
     M && /^+(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)/ \
 	{ print }
