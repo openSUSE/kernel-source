@@ -20,12 +20,16 @@ fi
 
 
 source $(dirname $0)/config.sh
-set -- $(echo $SRCVERSION | sed -rn 's/([0-9]+)\.([0-9]+)\.([0-9]+)(.*)/\1 \2 \3 \4/p')
-
-VERSION=$1
-PATCHLEVEL=$2
-SUBLEVEL=$3
-EXTRAVERSION=$4
+parse_srcversion()
+{
+	local IFS=.
+	set -- ${SRCVERSION%%-*}
+	VERSION=$1
+	PATCHLEVEL=$2
+	SUBLEVEL=$3
+	EXTRAVERSION=${SRCVERSION#${SRCVERSION%%-*}}
+}
+parse_srcversion
 
 EXTRA_SYMBOLS=$(set -- $([ -e $(dirname $0)/extra-symbols ] && cat $(dirname $0)/extra-symbols) ; echo $*)
 
@@ -62,11 +66,11 @@ done >"$series" < <($(dirname $0)/guards $EXTRA_SYMBOLS <series.conf)
 # convert them to shell code that can be evaluated. Evaluate it.
 eval "$(
     <"$series" xargs awk '
-    /^--- |^+++ / \
+    /^--- |^\+\+\+ / \
 	{ M = match($2, /^[^\/]+\/Makefile( \t|$)/) }
     M && /^+(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)/ \
 	{ print }
     ' \
     | sed -e 's,^+,,' -e 's, *= *\(.*\),="\1",'
 )"
-echo "$VERSION.$PATCHLEVEL.$SUBLEVEL$EXTRAVERSION"
+echo "$VERSION${PATCHLEVEL:+.$PATCHLEVEL}${SUBLEVEL:+.$SUBLEVEL}$EXTRAVERSION"
