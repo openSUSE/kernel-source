@@ -524,13 +524,18 @@ stable_tar() {
     fi
     if $tar_override_works; then
         if test -z "$mtime" && $using_git; then
-            mtime=(--mtime "$(cd "$chdir"; git log --pretty=format:%cD "$@" | head -n 1)")
+            mtime=(--mtime "$(cd "$chdir"
+                echo "$@" | xargs git log -1 --pretty=tformat:"%ct %cD" -- | \
+                sort -rn | sed 's/^[^ ]* //; q')")
         fi
         tar_opts=("${tar_opts[@]}" --owner=nobody --group=nobody "${mtime[@]}")
     fi
     (
         cd "$chdir"
-        find "$@" \( -type f -o -type l -o -type d -a -empty \) -print0 | \
+        # See 'info xargs' for an explanation of the below construct
+        printf '%s\n' "$@" | xargs sh -c \
+            'find "$@" \( -type f -o -type l -o -type d -a -empty \) -print0' \
+            dummy | \
             LC_ALL=C sort -z | \
             tar -cf - --null -T - "${tar_opts[@]}"
     ) | bzip2 -9 >"$tarball"
