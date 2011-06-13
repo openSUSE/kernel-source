@@ -25,8 +25,8 @@ parse_srcversion()
 	local IFS=.
 	set -- ${SRCVERSION%%-*}
 	VERSION=$1
-	PATCHLEVEL=$2
-	SUBLEVEL=$3
+	PATCHLEVEL=${2:-0}
+	SUBLEVEL=${3:-0}
 	EXTRAVERSION=${SRCVERSION#${SRCVERSION%%-*}}
 }
 parse_srcversion
@@ -73,4 +73,5 @@ eval "$(
     ' \
     | sed -e 's,^+,,' -e 's, *= *\(.*\),="\1",'
 )"
-echo "$VERSION${PATCHLEVEL:+.$PATCHLEVEL}${SUBLEVEL:+.$SUBLEVEL}$EXTRAVERSION"
+
+echo "$VERSION.$PATCHLEVEL.$SUBLEVEL$EXTRAVERSION"
