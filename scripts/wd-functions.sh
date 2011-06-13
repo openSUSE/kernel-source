@@ -73,7 +73,6 @@ _get_tarball_from_git()
         tag=refs/tags/"v$version"
         url=git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
     esac
-    tag=${tag/v3.0.0/v3.0}
     if ! git --git-dir="$git/.git" cat-file -e "$tag" 2>/dev/null; then
         case "$tag" in
         refs/tags/*)
