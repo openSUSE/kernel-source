@@ -65,7 +65,7 @@ _get_tarball_from_git()
         tag=refs/tags/next-${version##*next-}
         url=git://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git
         ;;
-    2.6.*-*-g???????)
+    [0-9]*-g???????)
         tag="v$version"
         url=git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
         ;;
