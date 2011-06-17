@@ -1,3 +1,8 @@
+# If a kernel package is removed before the next reboot, we assume that the
+# multiversion variable in /etc/zypp/zypp.conf is not configured and we delete
+# the flag again (fate#312018)
+rm -f /boot/do_purge_kernels
+
 wm2=/usr/lib/module-init-tools/weak-modules2
 nvr=@SUBPACKAGE@-@RPM_VERSION_RELEASE@
 
