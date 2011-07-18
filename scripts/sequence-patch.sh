@@ -298,7 +298,7 @@ if ! [ -d $ORIG_DIR ]; then
 fi
 
 if $VANILLA; then
-PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep kernel.org\|rpmify ) )
+PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep '^patches\.(kernel\.org|rpmify)/') )
 else
 PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
 fi
