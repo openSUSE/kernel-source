@@ -240,7 +240,60 @@ ${prefix}scripts/guards $EXTRA_SYMBOLS < ${prefix}series.conf \
 
 EXTRA_SYMBOLS="$(echo $EXTRA_SYMBOLS | sed -e 's# *[Rr][Tt] *##g')"
 
-last_arch=
+mkdir $TMPDIR/reuse
+
+ask_reuse_config()
+{
+    local old=$1 new=$2
+
+    # if the user either asked to never reuse the config or if this config
+    # already reused something, do nothing
+    for f in $TMPDIR/reuse/{never,all,$cpu_arch-all,all-$flavor}; do
+        if test -e "$f"; then
+            return
+        fi
+    done
+    diff $old $new | awk >$TMPDIR/reuse/diff '
+        /< .*CONFIG_/ { x[substr($0, 3)]--; }
+        /> .*CONFIG_/ { x[substr($0, 3)]++; }
+        END {
+            for (l in x)
+                if (x[l] > 0)
+                    print l;
+        }'
+
+    if test ! -s $TMPDIR/reuse/diff; then
+        return
+    fi
+    while :; do
+        echo
+        cat $TMPDIR/reuse/diff | sed 's/^/  /'
+        echo
+        echo "Use these settings for other configurations?"
+        read -p "[Y]es/for [A]rch $cpu_arch/for [F]lavor $flavor/[N]o/[E]dit/ne[V]er "
+        case "$REPLY" in
+        [Yy] | "")
+            mv $TMPDIR/reuse/diff $TMPDIR/reuse/all
+            break ;;
+        [Aa])
+            mv $TMPDIR/reuse/diff $TMPDIR/reuse/$cpu_arch-all
+            break ;;
+        [Ff])
+            mv $TMPDIR/reuse/diff $TMPDIR/reuse/all-$flavor
+            break ;;
+        [Ee])
+            ${VISUAL:-${EDITOR:-vi}} $TMPDIR/reuse/diff
+            ;;
+        [Nn])
+            rm $TMPDIR/reuse/diff
+            break ;;
+        [Vv])
+            rm $TMPDIR/reuse/diff
+                touch $TMPDIR/reuse/never
+            break ;;
+        esac
+    done
+}
 
 for config in $config_files; do
     cpu_arch=${config%/*}
@@ -288,6 +341,12 @@ for config in $config_files; do
     fi \
     | bash ${prefix}rpm/config-subst CONFIG_SUSE_KERNEL y \
     > .config
+    for f in $TMPDIR/reuse/{all,$cpu_arch-all,all-$flavor}; do
+        if test -e "$f"; then
+            echo "Reusing choice for ${f##*/}"
+            cat "$f" >>.config
+        fi
+    done
     export KCONFIG_NOTIMESTAMP=1
     case "$mode" in
     menuconfig)
@@ -296,17 +355,20 @@ for config in $config_files; do
     yes)
 	_region_msg_ "working on $config"
 	yes '' | make $MAKE_ARGS oldconfig
+	touch $TMPDIR/reuse/never
 	;;
     allmodconfig)
 	_region_msg_ "working on $config"
 	cp .config config-old
 	KCONFIG_ALLCONFIG=config-old make $MAKE_ARGS allmodconfig
 	rm config-old
+	touch $TMPDIR/reuse/never
 	;;
     *)
 	_region_msg_ "working on $config"
 	make $MAKE_ARGS oldconfig
     esac
+    ask_reuse_config $config .config
     if ! diff -U0 $config .config; then
 	sed '/^# Linux kernel version:/d' < .config > $config
     fi

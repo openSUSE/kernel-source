@@ -1,3 +1,6 @@
+# Flag to trigger /etc/init.d/purge-kernels on next reboot (fate#312018)
+touch /boot/do_purge_kernels
+
 # It must be possible to install different kernel.rpm packages in parallel.
 # But in this post install script, the /boot/vmlinux symlink is replaced.
 # On powerpc, the different kernels are for different board/firmware types

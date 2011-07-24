@@ -41,13 +41,17 @@ get_branch_name()
 
 _find_tarball()
 {
-    local version=$1 dir
+    local version=$1 dir subdir major
 
-    for dir in . /mounts/mirror/kernel/v2.6{,/testing} ${MIRROR}; do
-        if test -r "$dir/linux-$version.tar.bz2"; then
-            echo "$dir/linux-$version.tar.bz2"
-            return
-        fi
+    set -- ${version//[.-]/ }
+    major=$1.$2
+    for dir in . $MIRROR {/mounts,/cml,}/mirror/kernel; do
+        for subdir in "" "/v$major" "/testing" "/v$major/testing"; do
+            if test -r "$dir$subdir/linux-$version.tar.bz2"; then
+                echo "$dir$subdir/linux-$version.tar.bz2"
+                return
+            fi
+        done
     done
 }
 
@@ -73,7 +77,6 @@ _get_tarball_from_git()
         tag=refs/tags/"v$version"
         url=git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
     esac
-    tag=${tag/v3.0.0/v3.0}
     if ! git --git-dir="$git/.git" cat-file -e "$tag" 2>/dev/null; then
         case "$tag" in
         refs/tags/*)
