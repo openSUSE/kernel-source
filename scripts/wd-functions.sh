@@ -41,13 +41,17 @@ get_branch_name()
 
 _find_tarball()
 {
-    local version=$1 dir
+    local version=$1 dir subdir major
 
-    for dir in . /mounts/mirror/kernel/v2.6{,/testing} ${MIRROR}; do
-        if test -r "$dir/linux-$version.tar.bz2"; then
-            echo "$dir/linux-$version.tar.bz2"
-            return
-        fi
+    set -- ${version//[.-]/ }
+    major=$1.$2
+    for dir in . $MIRROR {/mounts,/cml,}/mirror/kernel; do
+        for subdir in "" "/v$major" "/testing" "/v$major/testing"; do
+            if test -r "$dir$subdir/linux-$version.tar.bz2"; then
+                echo "$dir$subdir/linux-$version.tar.bz2"
+                return
+            fi
+        done
     done
 }
 
