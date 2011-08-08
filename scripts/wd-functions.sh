@@ -45,7 +45,11 @@ _find_tarball()
 
     set -- ${version//[.-]/ }
     major=$1.$2
-    for dir in . $MIRROR {/mounts,/cml,}/mirror/kernel; do
+    case "$major" in
+    3.*)
+        major=3.x
+    esac
+    for dir in . $MIRROR {/mounts,/labs,}/mirror/kernel; do
         for subdir in "" "/v$major" "/testing" "/v$major/testing"; do
             if test -r "$dir$subdir/linux-$version.tar.bz2"; then
                 echo "$dir$subdir/linux-$version.tar.bz2"
