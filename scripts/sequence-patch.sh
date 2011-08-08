@@ -212,12 +212,6 @@ PATCH_DIR=$SCRATCH_AREA/linux-$SRCVERSION${TAG:+-$TAG}
 PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION${TAG:+-$TAG}.log
 LAST_LOG=$SCRATCH_AREA/last-$SRCVERSION${TAG:+-$TAG}.log
 
-# Check if we can clean up backup files at the end
-# (slightly faster, but requires more disk space).
-free_blocks="$(df -P "$SCRATCH_AREA" \
-    | awk 'NR==2 && match($4, /^[0-9]*$/) { print $4 }' 2> /dev/null)"
-[ "0$free_blocks" -gt 262144 ] && enough_free_space=1
-
 # Check series.conf.
 if [ ! -r series.conf ]; then
     echo "Configuration file \`series.conf' not found"
@@ -441,7 +435,7 @@ while [ $# -gt 0 ]; do
     if [ $STATUS -ne 0 ]; then
         restore_files $backup_dir $PATCH_DIR
     fi
-    if ! $QUILT && test -z "$enough_free_space"; then
+    if ! $QUILT; then
 	rm -rf $PATCH_DIR/.pc/
     fi
     cat $LAST_LOG >> $PATCH_LOG
@@ -471,9 +465,6 @@ if [ -n "$EXTRA_SYMBOLS" ]; then
 fi
 
 if ! $QUILT; then
-    if test -n "$enough_free_space"; then
-        rm -rf $PATCH_DIR/.pc/
-    fi
     rm $PATCH_DIR/series
 fi
 
