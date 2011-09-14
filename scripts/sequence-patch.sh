@@ -40,8 +40,8 @@ usage() {
     cat <<END
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
           [--combine] [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
-          [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]] [--ctags]
-	  [--cscope]
+          [--patch-dir=PATH] [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]]
+          [--ctags] [--cscope]
 
   The --build-dir option supports internal shell aliases, like ~, and variable
   expansion when the variables are properly escaped.  Environment variables
@@ -66,7 +66,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,build-dir:,config:,kabi,ctags,cscope -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -129,6 +129,10 @@ while true; do
 	    fuzz="-F$2"
 	    shift
 	    ;;
+        --patch-dir)
+            PATCH_DIR=$2
+            shift
+            ;;
 	--build-dir)
 	    SP_BUILD_DIR="$2"
 	    shift
@@ -208,7 +212,6 @@ TAG=${TAG//\//_}
 if [ "$VANILLA" = "true" ]; then
 	TAG=${TAG}-vanilla
 fi
-PATCH_DIR=$SCRATCH_AREA/linux-$SRCVERSION${TAG:+-$TAG}
 PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION${TAG:+-$TAG}.log
 LAST_LOG=$SCRATCH_AREA/last-$SRCVERSION${TAG:+-$TAG}.log
 
@@ -260,7 +263,10 @@ fi
 
 EXT=${EXTRA_SYMBOLS// /-}
 EXT=${EXT//\//}
-PATCH_DIR=${PATCH_DIR}${EXT:+-}$EXT
+
+if test -z "$PATCH_DIR"; then
+    PATCH_DIR=$SCRATCH_AREA/linux-$SRCVERSION${TAG:+-$TAG}{$EXT:+-}$EXT
+fi
 
 if [ -n "$SP_BUILD_DIR" ]; then
     # This allows alias (~) and variable expansion
