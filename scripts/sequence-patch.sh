@@ -265,7 +265,7 @@ EXT=${EXTRA_SYMBOLS// /-}
 EXT=${EXT//\//}
 
 if test -z "$PATCH_DIR"; then
-    PATCH_DIR=$SCRATCH_AREA/linux-$SRCVERSION${TAG:+-$TAG}{$EXT:+-}$EXT
+    PATCH_DIR=$SCRATCH_AREA/linux-$SRCVERSION${TAG:+-$TAG}${EXT:+-}$EXT
 fi
 
 if [ -n "$SP_BUILD_DIR" ]; then
