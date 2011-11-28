@@ -3,5 +3,4 @@ SRCVERSION=3.1
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=
 # buildservice projects to build the kernel against
-OBS_PROJECT=openSUSE:Factory
-IBS_PROJECT=SUSE:Factory:Head
+OBS_PROJECT=openSUSE:12.1
