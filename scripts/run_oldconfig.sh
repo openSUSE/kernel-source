@@ -323,6 +323,9 @@ for config in $config_files; do
     s390x/*)
         MAKE_ARGS="ARCH=s390"
         ;;
+   armv7l/*)
+        MAKE_ARGS="ARCH=arm"
+        ;;
     */um)
         MAKE_ARGS="ARCH=um SUBARCH=$cpu_arch"
         ;;
