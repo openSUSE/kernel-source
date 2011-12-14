@@ -1,0 +1,261 @@
+From: Josef Bacik <josef@redhat.com>
+Date: Wed, 30 Nov 2011 10:45:38 -0500
+Patch-mainline: pending
+References: FATE#306586
+Subject: [PATCH] Btrfs: deal with enospc from dirtying inodes
+ properly
+
+Now that we're properly keeping track of delayed inode space we've been getting
+a lot of warnings out of btrfs_dirty_inode() when running xfstest 83.  This is
+because a bunch of people call mark_inode_dirty, which is void so we can't
+return ENOSPC.  This needs to be fixed in a few areas
+
+1) file_update_time - this updates the mtime and such when writing to a file,
+which will call mark_inode_dirty.  So copy file_update_time into btrfs so we can
+call btrfs_dirty_inode directly and return an error if we get one appropriately.
+
+2) fix symlinks to use btrfs_setattr for ->setattr.  For some reason we weren't
+setting ->setattr for symlinks, even though we should have been.  This catches
+one of the cases where we were getting errors in mark_inode_dirty.
+
+3) Fix btrfs_setattr and btrfs_setsize to call btrfs_dirty_inode directly
+instead of mark_inode_dirty.  This lets us return errors properly for truncate
+and chown/anything related to setattr.
+
+4) Add a new btrfs_fs_dirty_inode which will just call btrfs_dirty_inode and
+print an error if we have one.  The only remaining user we can't control for
+this is touch_atime(), but we don't really want to keep people from walking
+down the tree if we don't have space to save the atime update, so just complain
+but don't worry about it.
+
+With this patch xfstests 83 complains a handful of times instead of hundreds of
+times.  Thanks,
+
+Signed-off-by: Josef Bacik <josef@redhat.com>
+Signed-off-by: David Sterba <dsterba@suse.cz>
+---
+ fs/btrfs/ctree.h |    3 +-
+ fs/btrfs/file.c  |    6 +++-
+ fs/btrfs/inode.c |   80 +++++++++++++++++++++++++++++++++++++++++-------------
+ fs/btrfs/super.c |   13 ++++++++-
+ 4 files changed, 80 insertions(+), 22 deletions(-)
+
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index 50634abe..6738503 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -2692,7 +2692,8 @@ int btrfs_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf);
+ int btrfs_readpage(struct file *file, struct page *page);
+ void btrfs_evict_inode(struct inode *inode);
+ int btrfs_write_inode(struct inode *inode, struct writeback_control *wbc);
+-void btrfs_dirty_inode(struct inode *inode, int flags);
++int btrfs_dirty_inode(struct inode *inode);
++int btrfs_update_time(struct file *file);
+ struct inode *btrfs_alloc_inode(struct super_block *sb);
+ void btrfs_destroy_inode(struct inode *inode);
+ int btrfs_drop_inode(struct inode *inode);
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index f2e9282..cc7492c 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -1387,7 +1387,11 @@ static ssize_t btrfs_file_aio_write(struct kiocb *iocb,
+ 		goto out;
+ 	}
+ 
+-	file_update_time(file);
++	err = btrfs_update_time(file);
++	if (err) {
++		mutex_unlock(&inode->i_mutex);
++		goto out;
++	}
+ 	BTRFS_I(inode)->sequence++;
+ 
+ 	start_pos = round_down(pos, root->sectorsize);
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index c5ccec2..eec33b9 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -38,6 +38,7 @@
+ #include <linux/falloc.h>
+ #include <linux/slab.h>
+ #include <linux/ratelimit.h>
++#include <linux/mount.h>
+ #include "compat.h"
+ #include "ctree.h"
+ #include "disk-io.h"
+@@ -3386,7 +3387,7 @@ static int btrfs_setsize(struct inode *inode, loff_t newsize)
+ 			return ret;
+ 		}
+ 
+-		mark_inode_dirty(inode);
++		ret = btrfs_dirty_inode(inode);
+ 	} else {
+ 
+ 		/*
+@@ -3426,9 +3427,9 @@ static int btrfs_setattr(struct dentry *dentry, struct iattr *attr)
+ 
+ 	if (attr->ia_valid) {
+ 		setattr_copy(inode, attr);
+-		mark_inode_dirty(inode);
++		err = btrfs_dirty_inode(inode);
+ 
+-		if (attr->ia_valid & ATTR_MODE)
++		if (!err && attr->ia_valid & ATTR_MODE)
+ 			err = btrfs_acl_chmod(inode);
+ 	}
+ 
+@@ -4204,42 +4205,80 @@ int btrfs_write_inode(struct inode *inode, struct writeback_control *wbc)
+  * FIXME, needs more benchmarking...there are no reasons other than performance
+  * to keep or drop this code.
+  */
+-void btrfs_dirty_inode(struct inode *inode, int flags)
++int btrfs_dirty_inode(struct inode *inode)
+ {
+ 	struct btrfs_root *root = BTRFS_I(inode)->root;
+ 	struct btrfs_trans_handle *trans;
+ 	int ret;
+ 
+ 	if (BTRFS_I(inode)->dummy_inode)
+-		return;
++		return 0;
+ 
+ 	trans = btrfs_join_transaction(root);
+-	BUG_ON(IS_ERR(trans));
++	if (IS_ERR(trans))
++		return PTR_ERR(trans);
+ 
+ 	ret = btrfs_update_inode(trans, root, inode);
+ 	if (ret && ret == -ENOSPC) {
+ 		/* whoops, lets try again with the full transaction */
+ 		btrfs_end_transaction(trans, root);
+ 		trans = btrfs_start_transaction(root, 1);
+-		if (IS_ERR(trans)) {
+-			printk_ratelimited(KERN_ERR "btrfs: fail to "
+-				       "dirty  inode %llu error %ld\n",
+-				       (unsigned long long)btrfs_ino(inode),
+-				       PTR_ERR(trans));
+-			return;
+-		}
++		if (IS_ERR(trans))
++			return PTR_ERR(trans);
+ 
+ 		ret = btrfs_update_inode(trans, root, inode);
+-		if (ret) {
+-			printk_ratelimited(KERN_ERR "btrfs: fail to "
+-				       "dirty  inode %llu error %d\n",
+-				       (unsigned long long)btrfs_ino(inode),
+-				       ret);
+-		}
+ 	}
+ 	btrfs_end_transaction(trans, root);
+ 	if (BTRFS_I(inode)->delayed_node)
+ 		btrfs_balance_delayed_items(root);
++
++	return ret;
++}
++
++/*
++ * This is a copy of file_update_time.  We need this so we can return error on
++ * ENOSPC for updating the inode in the case of file write and mmap writes.
++ */
++int btrfs_update_time(struct file *file)
++{
++	struct inode *inode = file->f_path.dentry->d_inode;
++	struct timespec now;
++	int ret;
++	enum { S_MTIME = 1, S_CTIME = 2, S_VERSION = 4 } sync_it = 0;
++
++	/* First try to exhaust all avenues to not sync */
++	if (IS_NOCMTIME(inode))
++		return 0;
++
++	now = current_fs_time(inode->i_sb);
++	if (!timespec_equal(&inode->i_mtime, &now))
++		sync_it = S_MTIME;
++
++	if (!timespec_equal(&inode->i_ctime, &now))
++		sync_it |= S_CTIME;
++
++	if (IS_I_VERSION(inode))
++		sync_it |= S_VERSION;
++
++	if (!sync_it)
++		return 0;
++
++	/* Finally allowed to write? Takes lock. */
++	if (mnt_want_write_file(file))
++		return 0;
++
++	/* Only change inode inside the lock region */
++	if (sync_it & S_VERSION)
++		inode_inc_iversion(inode);
++	if (sync_it & S_CTIME)
++		inode->i_ctime = now;
++	if (sync_it & S_MTIME)
++		inode->i_mtime = now;
++	ret = btrfs_dirty_inode(inode);
++	if (!ret)
++		mark_inode_dirty_sync(inode);
++	mnt_drop_write(file->f_path.mnt);
++	return ret;
+ }
+ 
+ /*
+@@ -6304,6 +6343,8 @@ int btrfs_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
+ 	u64 page_end;
+ 
+ 	ret  = btrfs_delalloc_reserve_space(inode, PAGE_CACHE_SIZE);
++	if (!ret)
++		ret = btrfs_update_time(vma->vm_file);
+ 	if (ret) {
+ 		if (ret == -ENOMEM)
+ 			ret = VM_FAULT_OOM;
+@@ -7353,6 +7394,7 @@ static const struct inode_operations btrfs_symlink_inode_operations = {
+ 	.follow_link	= page_follow_link_light,
+ 	.put_link	= page_put_link,
+ 	.getattr	= btrfs_getattr,
++	.setattr	= btrfs_setattr,
+ 	.permission	= btrfs_permission,
+ 	.setxattr	= btrfs_setxattr,
+ 	.getxattr	= btrfs_getxattr,
+diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+index 1a3ce9e..05b4045 100644
+--- a/fs/btrfs/super.c
++++ b/fs/btrfs/super.c
+@@ -41,6 +41,7 @@
+ #include <linux/slab.h>
+ #include <linux/cleancache.h>
+ #include <linux/mnt_namespace.h>
++#include <linux/ratelimit.h>
+ #include "compat.h"
+ #include "delayed-inode.h"
+ #include "ctree.h"
+@@ -1290,6 +1291,16 @@ static int btrfs_unfreeze(struct super_block *sb)
+ 	return 0;
+ }
+ 
++static void btrfs_fs_dirty_inode(struct inode *inode, int flags)
++{
++	int ret;
++
++	ret = btrfs_dirty_inode(inode);
++	if (ret)
++		printk_ratelimited(KERN_ERR "btrfs: fail to dirty inode %Lu "
++				   "error %d\n", btrfs_ino(inode), ret);
++}
++
+ static const struct super_operations btrfs_super_ops = {
+ 	.drop_inode	= btrfs_drop_inode,
+ 	.evict_inode	= btrfs_evict_inode,
+@@ -1297,7 +1308,7 @@ static const struct super_operations btrfs_super_ops = {
+ 	.sync_fs	= btrfs_sync_fs,
+ 	.show_options	= btrfs_show_options,
+ 	.write_inode	= btrfs_write_inode,
+-	.dirty_inode	= btrfs_dirty_inode,
++	.dirty_inode	= btrfs_fs_dirty_inode,
+ 	.alloc_inode	= btrfs_alloc_inode,
+ 	.destroy_inode	= btrfs_destroy_inode,
+ 	.statfs		= btrfs_statfs,
+-- 
+1.7.7.3
+
