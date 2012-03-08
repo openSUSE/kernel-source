@@ -5,5 +5,5 @@ VARIANT=
 # Set to 1 if the tree does not contain any non-vanilla patches at all
 VANILLA_ONLY=1
 # buildservice projects to build the kernel against
-OBS_PROJECT=openSUSE:11.3
+OBS_PROJECT=openSUSE:12.1
 IBS_PROJECT=SUSE:Factory:Head
