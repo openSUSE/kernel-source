@@ -145,7 +145,7 @@ def createXenPatches(filelist, repls):
 def main(args):
 	"Main program"
 	# Allow overriding kernel git dir
-	if len(args) > 1:
+	if len(args) > 1 and args[1] != ".":
 		kerngit = args[1]
 	else:
 		kerngit = re.sub(r"^(.*)/[^/]+/[^/]+$", r"\1", os.path.abspath(args[0]))
@@ -158,7 +158,7 @@ def main(args):
 	# Create a list of patch files
 	patchfiles = findPatchFiles(kerngit)
 	#print patchfiles
-	createXenPatches(patchfiles, complrepl)
+	createXenPatches(patchfiles + args[2:], complrepl)
 
 # Entry point
 if __name__ == '__main__':
