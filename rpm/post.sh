@@ -49,6 +49,9 @@ if [ -f /etc/fstab -a ! -e /.buildenv ] ; then
     # only run the bootloader if the usual bootloader configuration
     # files are there -- this is different on every architecture
     initrd=initrd-@KERNELRELEASE@-@FLAVOR@
+    if [ @FLAVOR@ = rt ]; then
+	    default=force-default
+    fi
     if [ -e /boot/$initrd -o ! -e /lib/modules/@KERNELRELEASE@-@FLAVOR@ ] && \
        run_bootloader ; then
        [ -e /boot/$initrd ] || initrd=
@@ -58,7 +61,8 @@ if [ -f /etc/fstab -a ! -e /.buildenv ] ; then
 		@FLAVOR@ \
 		@KERNELRELEASE@-@FLAVOR@ \
 		@IMAGE@-@KERNELRELEASE@-@FLAVOR@ \
-		$initrd
+		$initrd \
+		$default
 	else
 	    message_install_bl
 	fi
