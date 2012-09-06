@@ -233,18 +233,18 @@ fi
 # Usage:
 # stable_tar [-t <timestamp>] [-C <dir>] [--exclude=...] <tarball> <files> ...
 # if -t is not given, files must be within a git repository
-tar_override_works=
 stable_tar() {
-    local tarball mtime=() chdir="." tar_opts=()
+    local tarball mtime chdir="." tar_opts=()
 
     while test $# -gt 2; do
         case "$1" in
         -t)
-            mtime=(--mtime "$2")
+            mtime=$2
             shift 2
             ;;
         -C)
             chdir=$2
+	    tar_opts=("${tar_opts[@]}" -C "$2")
             shift 2
             ;;
         --exclude=*)
@@ -262,32 +262,12 @@ stable_tar() {
     tarball=$1
     shift
 
-    if [ -z "$tar_override_works" ]; then
-        if tar --mtime="Tue, 3 Feb 2009 10:52:55 +0100" --owner=nobody \
-                    --group=nobody --help >/dev/null; then
-            tar_override_works=true
-        else
-            echo "warning: created tarballs will differ between runs" >&2
-            tar_override_works=false
-        fi
+    if test -z "$mtime" && $using_git; then
+        mtime="$(cd "$chdir"
+            echo "$@" | xargs git log -1 --pretty=tformat:%ct -- | head -n 1)"
     fi
-    if $tar_override_works; then
-        if test -z "$mtime" && $using_git; then
-            mtime=(--mtime "$(cd "$chdir"
-                echo "$@" | xargs git log -1 --pretty=tformat:"%ct %cD" -- | \
-                sort -rn | sed 's/^[^ ]* //; q')")
-        fi
-        tar_opts=("${tar_opts[@]}" --owner=nobody --group=nobody "${mtime[@]}")
-    fi
-    (
-        cd "$chdir"
-        # See 'info xargs' for an explanation of the below construct
-        printf '%s\n' "$@" | xargs sh -c \
-            'find "$@" \( -type f -o -type l -o -type d -a -empty \) -print0' \
-            dummy | \
-            LC_ALL=C sort -z | \
-            tar -cf - --null -T - "${tar_opts[@]}"
-    ) | bzip2 -9 >"$tarball"
+    tar_opts=("${tar_opts[@]}" --mtime "$mtime")
+    scripts/stable-tar.pl "${tar_opts[@]}" "$@" | bzip2 -9 >"$tarball"
 }
 
 # The first directory level determines the archive name
@@ -342,8 +322,7 @@ for archive in $archives; do
     tmpdir2=$(mktemp -dt ${0##*/}.XXXXXX)
     CLEANFILES=("${CLEANFILES[@]}" "$tmpdir2")
     mkdir -p $tmpdir2/$archive
-    stable_tar -C $tmpdir2 -t "Wed, 01 Apr 2009 12:00:00 +0200" \
-        $build_dir/$archive.tar.bz2 $archive
+    stable_tar -C $tmpdir2 -t 1234567890 $build_dir/$archive.tar.bz2 $archive
 done
 
 # Force mbuild to choose build hosts with enough memory available:
