@@ -66,15 +66,38 @@ for my $file (@ARGV) {
 }
 $| = 1;
 my $total_size = 0;
-for my $file (sort(@files)) {
-	my $header = "";
 
-	my $prefix = "";
-	my $name = $file;
+# Tar header format description
+# filed => <width><type>
+# where type is either _s_string or _o_ctal
+my @header_layout = (
+	name => "100s",
+	mode => "8o",
+	uid => "8o",
+	gid => "8o",
+	size => "12o",
+	mtime => "12o",
+	csum => "8s",
+	typeflag => "1s",
+	linktarget => "100s",
+	magic => "6s",
+	version => "2s",
+	user => "32s",
+	group => "32s",
+	devmajor => "8o",
+	devminor => "8o",
+	prefix => "155s"
+);
+
+for my $file (sort(@files)) {
+	my %header = ();
+
+	$header{name} = $file;
 	if (length($file) > 100) {
-		($prefix = $file) =~ s:/[^/]*$::;
-		($name = $file) =~ s:^.*/::;
-		if (length($name) > 100 || length($prefix) > 155) {
+		($header{prefix} = $file) =~ s:/[^/]*$::;
+		($header{name} = $file) =~ s:^.*/::;
+		if (length($header{name}) > 100 ||
+					length($header{prefix}) > 155) {
 			# We could generate a pax extended header with a path
 			# keyword, but let's hope that all developers are sane
 			# enough not to use such long filenames for their
@@ -84,69 +107,36 @@ for my $file (sort(@files)) {
 	}
 	my @stat = lstat($file) or die "$file: $!\n";
 	my $mode = $stat[2];
-	my $size = 0;
-	my $typeflag;
-	my $linktarget = "";
+	$header{mode} = ($mode & 0111) ? 0755 : 0644;
 	if (S_ISREG($mode)) {
-		$size = $stat[7];
-		$typeflag = "0";
+		$header{size} = $stat[7];
+		$header{typeflag} = "0";
 	} elsif (S_ISLNK($mode)) {
-		$linktarget = readlink($file);
-		$typeflag = "2";
+		$header{linktarget} = readlink($file);
+		$header{typeflag} = "2";
 	} elsif (S_ISDIR($mode)) {
-		$typeflag = "5";
+		$header{typeflag} = "5";
 	} else {
 		die "Only regular files, symlinks and directories supported: $file\n";
 	}
+	# 65534:65534 is commonly used for nobody:nobody
+	$header{uid} = 65534;
+	$header{gid} = 65533;
+	$header{user} = "nobody";
+	$header{group} = "nobody";
 
-	# HEADER
-	# name
-	$header = pad($name, 100);
-	# mode
-	$header .= pad_octal(($mode & 0111) ? 0755 : 0644, 8);
-	# uid and gid; we use 65534 and 65534, which is commonly used for
-	# nobody:nobody
-	$header .= pad_octal(65534, 8);
-	$header .= pad_octal(65533, 8);
-	# size
-	$header .= pad_octal($size, 12);
-	# mtime
-	$header .= pad_octal($mtime, 12);
-	# checksum placeholder
-	my $checksum_pos = length($header);
-	$header .= " " x 8;
-	# type flag
-	$header .= $typeflag;
-	# name of linked file
-	$header .= pad($linktarget, 100);
-	# magic
-	$header .= pad("ustar", 6);
-	# version
-	$header .= "00";
-	# user and group
-	$header .= pad("nobody", 32);
-	$header .= pad("nobody", 32);
-	# device major and minor
-	$header .= pad_octal(0, 8);
-	$header .= pad_octal(0, 8);
-	# prefix
-	$header .= pad($prefix, 155);
-	# add the checksum, using the "%06o\0 " format like GNU tar
-	my $csum = header_checksum($header);
-	substr($header, $checksum_pos, 7) = pad_octal($csum, 7);
-	# padding to 512 byte boundary
-	$header .= pad("", 12);
-	die "error: header is not 512 bytes long" unless length($header) == 512;
-	print $header;
+	$header{mtime} = $mtime;
+
+	print gen_header(\%header);
 	$total_size += 512;
 	next unless S_ISREG($mode);
 
 	# PAYLOAD
 	copy($file, \*STDOUT);
-	$total_size += $size;
+	$total_size += $header{size};
 	# padding to 512 byte boundary
-	if ($size % 512) {
-		my $padding = 512 - $size % 512;
+	if ($header{size} % 512) {
+		my $padding = 512 - $header{size} % 512;
 		$total_size += $padding;
 		print pad("", $padding);
 	}
@@ -159,6 +149,48 @@ if ($total_size % 10240) {
 	print pad("", 10240 - $total_size % 10240);
 }
 exit;
+
+sub gen_header {
+	my $header = shift;
+
+	$header->{magic} = "ustar";
+	$header->{version} = "00";
+
+	my $res = "";
+	my $csum_pos = 0;
+	for (my $i = 0; $i < scalar(@header_layout); $i += 2) {
+		my $field = $header_layout[$i];
+		my $fmt = $header_layout[$i + 1];
+		(my $length = $fmt) =~ s/.$//;
+		(my $type = $fmt) =~ s/^\d*//;
+		my $value = $header->{$field};
+
+		# special case
+		if ($field eq "csum") {
+			$csum_pos = length($res);
+			$res .= " " x 8;
+			next;
+		}
+		if ($type eq "s") {
+			$value = "" unless defined($value);
+			$res .= pad($value, $length);
+		} elsif ($type eq "o") {
+			$value = 0 unless defined($value);
+			$res .= pad_octal($value, $length);
+		} else {
+			die "Invalid format for $field: $fmt";
+		}
+	}
+	# add the checksum, using the "%06o\0 " format like GNU tar
+	my $csum = header_checksum($res);
+	substr($res, $csum_pos, 7) = pad_octal($csum, 7);
+
+	# padding to 512 byte boundary
+	$res .= pad("", 12);
+	die "error: header is not 512 bytes long" unless length($res) == 512;
+
+	return $res;
+}
 
 sub pad {
 	my ($string, $length) = @_;
