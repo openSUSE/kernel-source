@@ -48,8 +48,10 @@ warn "$0: --mtime not specified, using the beginning of the epoch\n" unless $mti
 chdir($chdir) if $chdir;
 my @files;
 
+s/\./\\./g for @exclude;
 s/\*/.*/g for @exclude;
 s/\?/./g for @exclude;
+s/.*/^$&\$/ for @exclude;
 sub wanted {
 	for my $pattern (@exclude) {
 		return if $_ =~ $pattern;
