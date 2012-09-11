@@ -518,6 +518,10 @@ stable_tar() {
             echo "$@" | xargs git log -1 --pretty=tformat:%ct -- | head -n 1)"
     fi
     tar_opts=("${tar_opts[@]}" --mtime "$mtime")
+    case "$DIST_SET" in
+    sles9*)
+        tar_opts=("${tar_opts[@]}" --no-paxheaders)
+    esac
     scripts/stable-tar.pl "${tar_opts[@]}" "$@" | bzip2 -9 >"$tarball"
 }
 
