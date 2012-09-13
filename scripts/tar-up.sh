@@ -267,7 +267,8 @@ stable_tar() {
             echo "$@" | xargs git log -1 --pretty=tformat:%ct -- | head -n 1)"
     fi
     tar_opts=("${tar_opts[@]}" --mtime "$mtime")
-    scripts/stable-tar.pl "${tar_opts[@]}" "$@" | bzip2 -9 >"$tarball"
+    scripts/stable-tar.pl "${tar_opts[@]}" "$@" >"${tarball%.bz2}" || exit
+    bzip2 -9 "${tarball%.bz2}" || exit
 }
 
 # The first directory level determines the archive name
