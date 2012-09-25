@@ -20,17 +20,14 @@
 # you may find current contact information at www.novell.com
 #############################################################################
 
-source $(dirname $0)/config.sh
+source $(dirname $0)/../rpm/config.sh
 source $(dirname $0)/wd-functions.sh
 
 have_arch_patches=false
 fuzz="-F0"
-case "$DIST_SET" in
-sles9 | sles10)
+case "$IBS_PROJECT" in
+SUSE:SLE-9*)
 	fuzz=
-esac
-case "$DIST_SET" in
-sles9* | sles10* | sle10* | 9.* | 10.* | 11.0)
 	have_arch_patches=true
 esac
 
