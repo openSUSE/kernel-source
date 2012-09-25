@@ -18,7 +18,7 @@
 # To contact Novell about this file by physical or electronic mail,
 # you may find current contact information at www.novell.com
 #############################################################################
-source scripts/config.sh
+source scripts/config.sh >/dev/null
 all_specfiles="$(echo $(sed -n 's:^+.*/::p' config.conf | sort -u)) source${VARIANT}"
 if test -e "rpm/kernel-dummy.spec.in"; then
 	all_specfiles="$all_specfiles dummy"
