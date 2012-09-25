@@ -37,7 +37,7 @@ sort()
 tolerate_unknown_new_config_options=
 ignore_kabi=
 mkspec_args=()
-source $(dirname $0)/config.sh
+source rpm/config.sh
 until [ "$#" = "0" ] ; do
   case "$1" in
     --dir=*)
@@ -82,7 +82,7 @@ these options are recognized:
     -nf                to proceed if a new unknown .config option is found during make oldconfig
     -u		       update generated files in an existing kernel-source dir
     -i                 ignore kabi failures
-    -d, --dir=DIR      create package in DIR instead of default $BUILD_DIR
+    -d, --dir=DIR      create package in DIR instead of default kernel-source$VARIANT
 
 EOF
 	exit 1
@@ -95,7 +95,7 @@ EOF
 done
 export LANG=POSIX
 
-[ -z "$build_dir" ] && build_dir=$BUILD_DIR
+[ -z "$build_dir" ] && build_dir=kernel-source$VARIANT
 if [ -z "$build_dir" ]; then
     echo "Please define the build directory with the --dir option" >&2
     exit 1
@@ -267,7 +267,8 @@ stable_tar() {
             echo "$@" | xargs git log -1 --pretty=tformat:%ct -- | head -n 1)"
     fi
     tar_opts=("${tar_opts[@]}" --mtime "$mtime")
-    scripts/stable-tar.pl "${tar_opts[@]}" "$@" | bzip2 -9 >"$tarball"
+    scripts/stable-tar.pl "${tar_opts[@]}" "$@" >"${tarball%.bz2}" || exit
+    bzip2 -9 "${tarball%.bz2}" || exit
 }
 
 # The first directory level determines the archive name
@@ -277,11 +278,6 @@ all_archives="$(
     | uniq )"
 for archive in $all_archives; do
     echo "$archive.tar.bz2"
-    case " $IGNORE_ARCHS " in
-    *" ${archive#patches.} "*)
-	echo "Ignoring $archive..."
-	continue ;;
-    esac
 
     files="$( echo "$referenced_files" \
 	| sed -ne "\:^${archive//./\\.}/:p" \

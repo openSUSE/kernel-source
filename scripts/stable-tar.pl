@@ -34,11 +34,13 @@ use File::Copy;
 use Fcntl ':mode';
 
 my $mtime = 0;
+my $disable_paxheaders;
 my $chdir;
 my @exclude = ();
 GetOptions(
 	"t|mtime=i" => \$mtime,
 	"exclude=s" => \@exclude,
+	"no-paxheaders" => \$disable_paxheaders,
 	"C=s" => \$chdir,
 ) or die($USAGE);
 die $USAGE unless @ARGV;
@@ -48,8 +50,10 @@ warn "$0: --mtime not specified, using the beginning of the epoch\n" unless $mti
 chdir($chdir) if $chdir;
 my @files;
 
+s/\./\\./g for @exclude;
 s/\*/.*/g for @exclude;
 s/\?/./g for @exclude;
+s/.*/^$&\$/ for @exclude;
 sub wanted {
 	for my $pattern (@exclude) {
 		return if $_ =~ $pattern;
@@ -99,6 +103,9 @@ for my $file (sort(@files)) {
 		($header{name} = $file) =~ s:^.*/::;
 		if (length($header{name}) > 100 ||
 					length($header{prefix}) > 155) {
+			if ($disable_paxheaders) {
+				die "Too long filenames are impossible with --no-paxheaders: $file\n";
+			}
 			$header{name} = substr($header{name}, 0, 100);
 			$header{prefix} = substr($header{prefix}, 0, 155);
 			$need_paxheader = 1;
