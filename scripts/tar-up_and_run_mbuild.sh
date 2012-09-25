@@ -147,7 +147,7 @@ if [ ! -z "$single_specfiles" ] ; then
 specfiles="$single_specfiles"
 fi
 scripts/tar-up.sh $ignore_kabi $ignore_unsupported_deps $rpm_release_string $timestamp $tolerate_unknown_new_config_options || exit 1
-cd $BUILD_DIR
+cd kernel-source$VARIANT
 for i in $specfiles
 do
 echo	sudo /work/src/bin/mbuild $mbuild_options $mbuild_no_checks --obey-doesnotbuild kernel-$i.spec

@@ -37,7 +37,7 @@ sort()
 tolerate_unknown_new_config_options=
 ignore_kabi=
 mkspec_args=()
-source $(dirname $0)/config.sh
+source rpm/config.sh
 until [ "$#" = "0" ] ; do
   case "$1" in
     --dir=*)
@@ -82,7 +82,7 @@ these options are recognized:
     -nf                to proceed if a new unknown .config option is found during make oldconfig
     -u		       update generated files in an existing kernel-source dir
     -i                 ignore kabi failures
-    -d, --dir=DIR      create package in DIR instead of default $BUILD_DIR
+    -d, --dir=DIR      create package in DIR instead of default kernel-source$VARIANT
 
 EOF
 	exit 1
@@ -95,7 +95,7 @@ EOF
 done
 export LANG=POSIX
 
-[ -z "$build_dir" ] && build_dir=$BUILD_DIR
+[ -z "$build_dir" ] && build_dir=kernel-source$VARIANT
 if [ -z "$build_dir" ]; then
     echo "Please define the build directory with the --dir option" >&2
     exit 1

@@ -91,7 +91,7 @@ these options are recognized:
     -nf                to proceed if a new unknown .config option is found during make oldconfig
     -i                 ignore kabi failures
     --source-timestamp to autogenerate a release number based on branch and timestamp (overrides -rs/-ts)
-    -d, --dir=DIR      create package in DIR instead of default $BUILD_DIR
+    -d, --dir=DIR      create package in DIR instead of default kernel-source$VARIANT
 
 EOF
 	exit 1
@@ -128,7 +128,7 @@ if [ -n "$rpm_release_timestamp" ]; then
     rpm_release_string="\`env -i - TZ=GMT date +%Y%m%d\`${rpm_release_string:+_$rpm_release_string}"
 fi
 
-[ -z "$build_dir" ] && build_dir=$BUILD_DIR
+[ -z "$build_dir" ] && build_dir=kernel-source$VARIANT
 if [ -z "$build_dir" ]; then
     echo "Please define the build directory with the --dir option" >&2
     exit 1
