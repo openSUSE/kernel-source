@@ -278,11 +278,6 @@ all_archives="$(
     | uniq )"
 for archive in $all_archives; do
     echo "$archive.tar.bz2"
-    case " $IGNORE_ARCHS " in
-    *" ${archive#patches.} "*)
-	echo "Ignoring $archive..."
-	continue ;;
-    esac
 
     files="$( echo "$referenced_files" \
 	| sed -ne "\:^${archive//./\\.}/:p" \
