@@ -266,7 +266,9 @@ stable_tar() {
         mtime="$(cd "$chdir"
             echo "$@" | xargs git log -1 --pretty=tformat:%ct -- | head -n 1)"
     fi
-    tar_opts=("${tar_opts[@]}" --mtime "$mtime")
+    if test -n "$mtime"; then
+        tar_opts=("${tar_opts[@]}" --mtime "$mtime")
+    fi
     scripts/stable-tar.pl "${tar_opts[@]}" "$@" >"${tarball%.bz2}" || exit
     bzip2 -9 "${tarball%.bz2}" || exit
 }

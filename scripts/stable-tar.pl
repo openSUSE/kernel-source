@@ -33,7 +33,7 @@ use File::Find;
 use File::Copy;
 use Fcntl ':mode';
 
-my $mtime = 0;
+my $mtime;
 my $disable_paxheaders;
 my $chdir;
 my @exclude = ();
@@ -45,7 +45,10 @@ GetOptions(
 ) or die($USAGE);
 die $USAGE unless @ARGV;
 
-warn "$0: --mtime not specified, using the beginning of the epoch\n" unless $mtime;
+if (!defined($mtime)) {
+	warn "$0: --mtime not specified, using 2000-01-01\n";
+	$mtime = 946681200;
+}
 
 chdir($chdir) if $chdir;
 my @files;
