@@ -476,15 +476,8 @@ if $QUILT; then
     [ ${QUILT_PATCHES-patches} != patches ] \
         && ln -s $PWD $PATCH_DIR/${QUILT_PATCHES-patches}
 fi
-# If there are any remaining patches, add them to the series so
-# they can be fixed up with quilt (or similar).
-if [ -n "$*" ]; then
-    ( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
-fi
-
 echo "[ Tree: $PATCH_DIR ]"
 
-append=
 if test "$SP_BUILD_DIR" != "$PATCH_DIR"; then
     mkdir -p "$SP_BUILD_DIR"
     echo "[ Build Dir: $SP_BUILD_DIR ]"
@@ -492,6 +485,13 @@ if test "$SP_BUILD_DIR" != "$PATCH_DIR"; then
     rm -f "$SP_BUILD_DIR/patches"
     ln -sf "$PATCH_DIR" "$SP_BUILD_DIR/source"
     ln -sf "source/patches" "$SP_BUILD_DIR/patches"
+fi
+
+# If there are any remaining patches, add them to the series so
+# they can be fixed up with quilt (or similar).
+if [ -n "$*" ]; then
+    ( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
+    exit $status
 fi
 
 if test -e supported.conf; then
@@ -538,4 +538,3 @@ if $CSCOPE; then
     fi
 fi
 
-[ $# -gt 0 ] && exit $status
