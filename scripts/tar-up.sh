@@ -220,6 +220,7 @@ elif $using_git; then
     esac
     scripts/gitlog2changes "${exclude[@]}" HEAD -- >"$changelog"
     sed 1d rpm/kernel-source.changes.old >>"$changelog"
+    scripts/rpm-changes-merge.pl -1 "$changelog"
 else
     touch "$changelog"
 fi
