@@ -525,7 +525,8 @@ stable_tar() {
     SUSE:SLE-9*)
         tar_opts=("${tar_opts[@]}" --no-paxheaders)
     esac
-    scripts/stable-tar.pl "${tar_opts[@]}" "$@" >"${tarball%.bz2}" || exit
+    printf '%s\n' "$@" | \
+	    scripts/stable-tar.pl "${tar_opts[@]}" -T - >"${tarball%.bz2}" || exit
     bzip2 -9 "${tarball%.bz2}" || exit
 }
 
