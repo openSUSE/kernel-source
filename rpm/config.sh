@@ -1,5 +1,5 @@
 # The version of the main tarball to use
-SRCVERSION=3.7-rc6-41-g99b6e1e
+SRCVERSION=3.7-rc6-76-gef6c5be
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=
 # Set to 1 if the tree does not contain any non-vanilla patches at all
