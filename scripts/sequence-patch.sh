@@ -36,7 +36,7 @@ usage() {
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
           [--combine] [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
           [--patch-dir=PATH] [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]]
-          [--ctags] [--cscope]
+          [--ctags] [--cscope] [--no-xen]
 
   The --build-dir option supports internal shell aliases, like ~, and variable
   expansion when the variables are properly escaped.  Environment variables
@@ -61,7 +61,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,no-xen -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -83,6 +83,7 @@ CONFIG_FLAVOR=
 KABI=false
 CTAGS=false
 CSCOPE=false
+SKIP_XEN=false
 
 while true; do
     case "$1" in
@@ -144,6 +145,9 @@ while true; do
 	    ;;
 	--cscope)
 	    CSCOPE=true
+	    ;;
+	--no-xen)
+	    SKIP_XEN=true
 	    ;;
 	--)
 	    shift
@@ -393,6 +397,13 @@ while [ $# -gt 0 ]; do
     if ! $QUILT && test "$PATCH" = "$LIMIT"; then
 	STEP_BY_STEP=1
 	echo "Stopping before $PATCH"
+    fi
+    if $SKIP_XEN; then
+        case "$PATCH" in
+        patches.xen/*)
+            echo "Stopping before patches.xen"
+            break
+        esac
     fi
     if [ -n "$STEP_BY_STEP" ]; then
 	while true; do
