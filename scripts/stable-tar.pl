@@ -36,18 +36,36 @@ use Fcntl ':mode';
 my $mtime;
 my $disable_paxheaders;
 my $chdir;
+my $files_from;
 my @exclude = ();
 GetOptions(
 	"t|mtime=i" => \$mtime,
 	"exclude=s" => \@exclude,
 	"no-paxheaders" => \$disable_paxheaders,
 	"C=s" => \$chdir,
+	"T|files-from=s" => \$files_from,
 ) or die($USAGE);
-die $USAGE unless @ARGV;
 
 if (!defined($mtime)) {
 	warn "$0: --mtime not specified, using 2000-01-01\n";
 	$mtime = 946681200;
+}
+my @args;
+if ($files_from) {
+	if ($files_from eq '-') {
+		@args = <>;
+	} else {
+		open(my $fh, '<', $files_from) or die "$files_from: $!\n";
+		@args = <$fh>;
+		close($fh);
+	}
+	chomp(@args);
+} else {
+	@args = @ARGV;
+}
+if (!@args) {
+	print STDERR "No arguments given\n";
+	die($USAGE);
 }
 
 chdir($chdir) if $chdir;
@@ -64,7 +82,7 @@ sub wanted {
 	push(@files, $File::Find::name);
 }
 
-for my $file (@ARGV) {
+for my $file (@args) {
 	if (-d $file) {
 		find(\&wanted, $file);
 	} else {

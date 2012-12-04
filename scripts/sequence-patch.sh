@@ -36,7 +36,7 @@ usage() {
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
           [--combine] [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
           [--patch-dir=PATH] [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]]
-          [--ctags] [--cscope]
+          [--ctags] [--cscope] [--no-xen]
 
   The --build-dir option supports internal shell aliases, like ~, and variable
   expansion when the variables are properly escaped.  Environment variables
@@ -61,7 +61,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,no-xen -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -83,6 +83,7 @@ CONFIG_FLAVOR=
 KABI=false
 CTAGS=false
 CSCOPE=false
+SKIP_XEN=false
 
 while true; do
     case "$1" in
@@ -144,6 +145,9 @@ while true; do
 	    ;;
 	--cscope)
 	    CSCOPE=true
+	    ;;
+	--no-xen)
+	    SKIP_XEN=true
 	    ;;
 	--)
 	    shift
@@ -394,6 +398,13 @@ while [ $# -gt 0 ]; do
 	STEP_BY_STEP=1
 	echo "Stopping before $PATCH"
     fi
+    if $SKIP_XEN; then
+        case "$PATCH" in
+        patches.xen/*)
+            echo "Stopping before patches.xen"
+            break
+        esac
+    fi
     if [ -n "$STEP_BY_STEP" ]; then
 	while true; do
 	    echo -n "Continue ([y]es/[n]o/yes to [a]ll)?"
@@ -476,15 +487,8 @@ if $QUILT; then
     [ ${QUILT_PATCHES-patches} != patches ] \
         && ln -s $PWD $PATCH_DIR/${QUILT_PATCHES-patches}
 fi
-# If there are any remaining patches, add them to the series so
-# they can be fixed up with quilt (or similar).
-if [ -n "$*" ]; then
-    ( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
-fi
-
 echo "[ Tree: $PATCH_DIR ]"
 
-append=
 if test "$SP_BUILD_DIR" != "$PATCH_DIR"; then
     mkdir -p "$SP_BUILD_DIR"
     echo "[ Build Dir: $SP_BUILD_DIR ]"
@@ -492,6 +496,13 @@ if test "$SP_BUILD_DIR" != "$PATCH_DIR"; then
     rm -f "$SP_BUILD_DIR/patches"
     ln -sf "$PATCH_DIR" "$SP_BUILD_DIR/source"
     ln -sf "source/patches" "$SP_BUILD_DIR/patches"
+fi
+
+# If there are any remaining patches, add them to the series so
+# they can be fixed up with quilt (or similar).
+if [ -n "$*" ]; then
+    ( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
+    exit $status
 fi
 
 if test -e supported.conf; then
@@ -538,4 +549,3 @@ if $CSCOPE; then
     fi
 fi
 
-[ $# -gt 0 ] && exit $status
