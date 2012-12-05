@@ -72,7 +72,8 @@ apply_fast_patches() {
     after=$(echo ${PATCHES_AFTER[@]}|wc -w)
     echo "[ Fast-applying $before patches. $after remain. ]"
     cat "${PATCHES_BEFORE[@]}" | \
-        patch -d $PATCH_DIR -p1 -E $fuzz --force -s > $LAST_LOG 2>&1
+        patch -d $PATCH_DIR -p1 -E $fuzz --force --no-backup-if-mismatch \
+		-s > $LAST_LOG 2>&1
     STATUS=$?
 
     if [ $STATUS -ne 0 ]; then
