@@ -162,10 +162,10 @@ apply_patches() {
         fi
 
         shift
-	let n++
 	if $QUILT; then
 		unset PATCHES[$n]
 	fi
+	let n++
         if $QUILT && test "$PATCH" = "$LIMIT"; then
             break
         fi
