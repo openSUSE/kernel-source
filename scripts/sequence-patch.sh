@@ -303,7 +303,7 @@ PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
 fi
 
 # Check if patch $LIMIT exists
-if [ -n "$LIMIT" ]; then
+if [ -n "$LIMIT" ] || $SKIP_XEN; then
     for ((n=0; n<${#PATCHES[@]}; n++)); do
 	if [ "$LIMIT" = - ]; then
 	    LIMIT=${PATCHES[n]}
@@ -314,6 +314,12 @@ if [ -n "$LIMIT" ]; then
 	    LIMIT=${PATCHES[n]}
 	    break
 	    ;;
+	patches.xen/*)
+            if $SKIP_XEN; then
+                LIMIT=${PATCHES[n-1]}
+                break
+            fi
+            ;;
 	esac
     done
     if ((n == ${#PATCHES[@]})); then
@@ -397,13 +403,6 @@ while [ $# -gt 0 ]; do
     if ! $QUILT && test "$PATCH" = "$LIMIT"; then
 	STEP_BY_STEP=1
 	echo "Stopping before $PATCH"
-    fi
-    if $SKIP_XEN; then
-        case "$PATCH" in
-        patches.xen/*)
-            echo "Stopping before patches.xen"
-            break
-        esac
     fi
     if [ -n "$STEP_BY_STEP" ]; then
 	while true; do
