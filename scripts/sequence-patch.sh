@@ -23,6 +23,8 @@
 source $(dirname $0)/../rpm/config.sh
 source $(dirname $0)/wd-functions.sh
 
+set -o pipefail
+
 have_arch_patches=false
 fuzz="-F0"
 case "$IBS_PROJECT" in
@@ -34,7 +36,7 @@ esac
 usage() {
     cat <<END
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
-          [--combine] [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
+          [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
           [--patch-dir=PATH] [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]]
           [--ctags] [--cscope] [--no-xen]
 
@@ -49,8 +51,127 @@ SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
   \$CONFIG:		The current ARCH-FLAVOR.
   \$CONFIG_ARCH:		The current ARCH.
   \$CONFIG_FLAVOR:	The current FLAVOR.
+
+  The --no-quilt option will still create quilt-style backups for each
+  file that is modified but the backups will be removed if the patch
+  is successful. This can be fast because the new files may be created
+  and removed before writeback occurs so they only exist in memory. A
+  failed patch will be rolled back and the caller will be able to diagnose it.
+
+  The --fast option will concatenate all the patches to be applied and
+  call patch just once. This is even faster than --no-quilt but if any
+  of the component patches fail to apply the tree will not be rolled
+  back.
+
+  When used with last-patch-name or --no-xen, both --fast and --no-quilt
+  will set up a quilt environment for the remaining patches.
 END
     exit 1
+}
+
+apply_fast_patches() {
+    before=$(echo ${PATCHES_BEFORE[@]}|wc -w)
+    after=$(echo ${PATCHES_AFTER[@]}|wc -w)
+    echo "[ Fast-applying $before patches. $after remain. ]"
+    cat "${PATCHES_BEFORE[@]}" | \
+        patch -d $PATCH_DIR -p1 -E $fuzz --force --no-backup-if-mismatch \
+		-s > $LAST_LOG 2>&1
+    STATUS=$?
+
+    if [ $STATUS -ne 0 ]; then
+        if [ $STATUS -ne 0 ]; then
+            [ -n "$QUIET" ] && cat $LAST_LOG
+            echo "All-in-one patch failed (not rolled back)."
+            echo "Logfile: $LAST_LOG"
+            status=1
+        fi
+    else
+        rm -f $LAST_LOG
+    fi
+
+    PATCHES=( ${PATCHES_AFTER[@]} )
+}
+
+# Patch kernel normally
+apply_patches() {
+    set -- "${PATCHES[@]}"
+    n=0
+    while [ $# -gt 0 ]; do
+        PATCH="$1"
+        if ! $QUILT && test "$PATCH" = "$LIMIT"; then
+            STEP_BY_STEP=1
+            echo "Stopping before $PATCH"
+        fi
+        if [ -n "$STEP_BY_STEP" ]; then
+            while true; do
+                echo -n "Continue ([y]es/[n]o/yes to [a]ll)?"
+                read YESNO
+                case $YESNO in
+                    ([yYjJsS])
+                        break
+                        ;;
+                    ([nN])
+                        break 2	# break out of outer loop
+                        ;;
+                    ([aA])
+                        unset STEP_BY_STEP
+                        break
+                        ;;
+                esac
+            done
+        fi
+
+        if [ ! -r "$PATCH" ]; then
+            echo "Patch $PATCH not found."
+            status=1
+            break
+        fi
+        echo "[ $PATCH ]"
+        echo "[ $PATCH ]" >> $PATCH_LOG
+        backup_dir=$PATCH_DIR/.pc/$PATCH
+
+        exec 5<&1  # duplicate stdin
+        case $PATCH in
+        *.gz)	exec < <(gzip -cd $PATCH) ;;
+        *.bz2)	exec < <(bzip2 -cd $PATCH) ;;
+        *)		exec < $PATCH ;;
+        esac
+        patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
+                --no-backup-if-mismatch --force > $LAST_LOG 2>&1
+        STATUS=$?
+        exec 0<&5  # restore stdin
+
+        if [ $STATUS -ne 0 ]; then
+            restore_files $backup_dir $PATCH_DIR
+        fi
+        if ! $QUILT; then
+            rm -rf $PATCH_DIR/.pc/
+        fi
+        cat $LAST_LOG >> $PATCH_LOG
+        [ -z "$QUIET" ] && cat $LAST_LOG
+        if [ $STATUS -ne 0 ]; then
+            [ -n "$QUIET" ] && cat $LAST_LOG
+            echo "Patch $PATCH failed (rolled back)."
+            echo "Logfile: $PATCH_LOG"
+            status=1
+            break
+        else
+            echo "$SERIES_PFX$PATCH" >> $PATCH_DIR/series
+            if $QUILT; then
+                echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
+            fi
+            rm -f $LAST_LOG
+        fi
+
+        shift
+	if $QUILT; then
+		unset PATCHES[$n]
+	fi
+	let n++
+        if $QUILT && test "$PATCH" = "$LIMIT"; then
+            break
+        fi
+    done
 }
 
 # Allow to pass in default arguments via SEQUENCE_PATCH_ARGS.
@@ -73,7 +194,6 @@ eval set -- "$options"
 QUIET=1
 EXTRA_SYMBOLS=
 QUILT=true
-COMBINE=
 FAST=
 VANILLA=false
 SP_BUILD_DIR=
@@ -100,8 +220,7 @@ while true; do
 	    QUILT=false
 	    ;;
 	--combine)
-	    COMBINE=1
-	    FAST=1
+	    # ignored
 	    ;;
        	--fast)
 	    FAST=1
@@ -303,7 +422,7 @@ PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
 fi
 
 # Check if patch $LIMIT exists
-if [ -n "$LIMIT" ]; then
+if [ -n "$LIMIT" ] || $SKIP_XEN; then
     for ((n=0; n<${#PATCHES[@]}; n++)); do
 	if [ "$LIMIT" = - ]; then
 	    LIMIT=${PATCHES[n]}
@@ -314,6 +433,12 @@ if [ -n "$LIMIT" ]; then
 	    LIMIT=${PATCHES[n]}
 	    break
 	    ;;
+	patches.xen/*)
+            if $SKIP_XEN; then
+                LIMIT=${PATCHES[n-1]}
+                break
+            fi
+            ;;
 	esac
     done
     if ((n == ${#PATCHES[@]})); then
@@ -331,23 +456,6 @@ if [ -n "$LIMIT" ]; then
 else
     PATCHES_BEFORE=( "${PATCHES[@]}" )
     PATCHES_AFTER=()
-fi
-
-if [ -n "$COMBINE" ]; then
-    echo "Precomputing combined patches"
-    (IFS=$'\n'; echo "${PATCHES[*]}") \
-    | $(dirname $0)/md5fast --source-tree "$ORIG_DIR" \
-			    --temp "$SCRATCH_AREA" \
-    			    --cache combined --generate
-    echo $SRCVERSION > combined/srcversion
-fi
-
-if [ -n "$FAST" -a ${#PATCHES_BEFORE[@]} -gt 0 -a \
-     $SRCVERSION = "$(cat combined/srcversion 2> /dev/null)" ]; then
-    echo "Checking for precomputed combined patches"
-    PATCHES=( $(IFS=$'\n'; echo "${PATCHES_BEFORE[*]}" \
-	        | $(dirname $0)/md5fast --cache combined)
-    	      "${PATCHES_AFTER[@]}" )
 fi
 
 # Helper function to restore files backed up by patch. This is
@@ -390,87 +498,11 @@ fi
 mkdir $PATCH_DIR/.pc
 echo 2 > $PATCH_DIR/.pc/.version
 
-# Patch kernel
-set -- "${PATCHES[@]}"
-while [ $# -gt 0 ]; do
-    PATCH="$1"
-    if ! $QUILT && test "$PATCH" = "$LIMIT"; then
-	STEP_BY_STEP=1
-	echo "Stopping before $PATCH"
-    fi
-    if $SKIP_XEN; then
-        case "$PATCH" in
-        patches.xen/*)
-            echo "Stopping before patches.xen"
-            break
-        esac
-    fi
-    if [ -n "$STEP_BY_STEP" ]; then
-	while true; do
-	    echo -n "Continue ([y]es/[n]o/yes to [a]ll)?"
-	    read YESNO
-	    case $YESNO in
-		([yYjJsS])
-		    break
-		    ;;
-		([nN])
-		    break 2	# break out of outer loop
-		    ;;
-		([aA])
-		    unset STEP_BY_STEP
-		    break
-		    ;;
-	    esac
-	done
-    fi
-
-    if [ ! -r "$PATCH" ]; then
-	echo "Patch $PATCH not found."
-	status=1
-	break
-    fi
-    echo "[ $PATCH ]"
-    echo "[ $PATCH ]" >> $PATCH_LOG
-    backup_dir=$PATCH_DIR/.pc/$PATCH
-
-    exec 5<&1  # duplicate stdin
-    case $PATCH in
-    *.gz)	exec < <(gzip -cd $PATCH) ;;
-    *.bz2)	exec < <(bzip2 -cd $PATCH) ;;
-    *)		exec < $PATCH ;;
-    esac
-    patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
-	    --no-backup-if-mismatch --force > $LAST_LOG 2>&1
-    STATUS=$?
-    exec 0<&5  # restore stdin
-    
-    if [ $STATUS -ne 0 ]; then
-        restore_files $backup_dir $PATCH_DIR
-    fi
-    if ! $QUILT; then
-	rm -rf $PATCH_DIR/.pc/
-    fi
-    cat $LAST_LOG >> $PATCH_LOG
-    [ -z "$QUIET" ] && cat $LAST_LOG
-    if [ $STATUS -ne 0 ]; then
-	[ -n "$QUIET" ] && cat $LAST_LOG
-	echo "Patch $PATCH failed (rolled back)."
-	echo "Logfile: $PATCH_LOG"
-	status=1
-	break
-    else
-	echo "$SERIES_PFX$PATCH" >> $PATCH_DIR/series
-	if $QUILT; then
-	    echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
-	fi
-	rm -f $LAST_LOG
-    fi
-
-    shift
-    if $QUILT && test "$PATCH" = "$LIMIT"; then
-	break
-    fi
-done
+if [ -z "$FAST" ]; then
+    apply_patches
+else
+    apply_fast_patches
+fi
 
 if [ -n "$EXTRA_SYMBOLS" ]; then
     echo "$EXTRA_SYMBOLS" > $PATCH_DIR/extra-symbols
@@ -500,8 +532,8 @@ fi
 
 # If there are any remaining patches, add them to the series so
 # they can be fixed up with quilt (or similar).
-if [ -n "$*" ]; then
-    ( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
+if [ -n "${PATCHES[*]}" ]; then
+    ( IFS=$'\n' ; echo "${PATCHES[*]}" ) >> $PATCH_DIR/series
     exit $status
 fi
 
