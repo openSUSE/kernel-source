@@ -181,7 +181,7 @@ fi
 if grep -q '^Source.*:[[:space:]]*log\.sh[[:space:]]*$' rpm/kernel-source.spec.in; then
 	cp -p scripts/rpm-log.sh "$build_dir"/log.sh
 fi
-rm -f "$build_dir/kernel-source.changes.old"
+rm -f "$build_dir/kernel-source.changes.old" "$build_dir/gitlog-fixups"
 if test -e "$build_dir"/config-options.changes; then
 	# Rename to  avoid triggering a build service rule error
 	mv "$build_dir"/config-options.changes \
@@ -218,6 +218,9 @@ elif $using_git; then
         echo "expected \"last commit: <commit>\" in rpm/kernel-source.changes.old" >&2
         exit 1
     esac
+    if test -e rpm/gitlog-fixups; then
+	    exclude=(--fixups "$_" "${exclude[@]}")
+    fi
     scripts/gitlog2changes "${exclude[@]}" HEAD -- >"$changelog"
     sed 1d rpm/kernel-source.changes.old >>"$changelog"
     scripts/rpm-changes-merge.pl -1 "$changelog"
