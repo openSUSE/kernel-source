@@ -488,6 +488,8 @@ restore_files() {
 # Create hardlinked source tree
 echo "Linking from $ORIG_DIR"
 cp -rld $ORIG_DIR $PATCH_DIR
+# create a relative symlink
+ln -sf ${PATCH_DIR#${SCRATCH_AREA%%/}/} $SCRATCH_AREA/current
 
 echo -e "# Symbols: $SYMBOLS\n#" > $PATCH_DIR/series
 SERIES_PFX=
