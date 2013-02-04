@@ -5,3 +5,5 @@ VARIANT=
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:12.2:Update
 IBS_PROJECT=
+OBS_PROJECT_ARM=openSUSE:Factory:ARM
+IBS_PROJECT_ARM=Devel:ARM:12.3
