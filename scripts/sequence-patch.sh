@@ -489,7 +489,7 @@ restore_files() {
 echo "Linking from $ORIG_DIR"
 cp -rld $ORIG_DIR $PATCH_DIR
 # create a relative symlink
-ln -snf ${PATCH_DIR#${SCRATCH_AREA%%/}/} $SCRATCH_AREA/current
+ln -snf ${PATCH_DIR#$SCRATCH_AREA/} $SCRATCH_AREA/current
 
 echo -e "# Symbols: $SYMBOLS\n#" > $PATCH_DIR/series
 SERIES_PFX=
