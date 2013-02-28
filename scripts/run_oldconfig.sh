@@ -323,7 +323,10 @@ for config in $config_files; do
     s390x/*)
         MAKE_ARGS="ARCH=s390"
         ;;
-   arm*/*)
+    arm64/*)
+        MAKE_ARGS="ARCH=arm64"
+        ;;
+    armv*/*)
         MAKE_ARGS="ARCH=arm"
         ;;
     */um)
