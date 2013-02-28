@@ -18,7 +18,7 @@
 # To contact Novell about this file by physical or electronic mail,
 # you may find current contact information at www.novell.com
 #############################################################################
-source scripts/config.sh
+source scripts/config.sh 2>/dev/null
 all_specfiles="$(echo $(sed -n 's:^+.*/::p' config.conf | sort -u)) source${VARIANT}"
 if test -e "rpm/kernel-dummy.spec.in"; then
 	all_specfiles="$all_specfiles dummy"
@@ -147,7 +147,7 @@ if [ ! -z "$single_specfiles" ] ; then
 specfiles="$single_specfiles"
 fi
 scripts/tar-up.sh $ignore_kabi $ignore_unsupported_deps $rpm_release_string $timestamp $tolerate_unknown_new_config_options || exit 1
-cd $BUILD_DIR
+cd kernel-source$VARIANT
 for i in $specfiles
 do
 echo	sudo /work/src/bin/mbuild $mbuild_options $mbuild_no_checks --obey-doesnotbuild kernel-$i.spec
