@@ -20,28 +20,25 @@
 # you may find current contact information at www.novell.com
 #############################################################################
 
-source $(dirname $0)/config.sh
+source $(dirname $0)/../rpm/config.sh
 source $(dirname $0)/wd-functions.sh
 
+set -o pipefail
+
 have_arch_patches=false
-have_defconfig_files=false
 fuzz="-F0"
-case "$DIST_SET" in
-sles9 | sles10)
+case "$IBS_PROJECT" in
+SUSE:SLE-9*)
 	fuzz=
-esac
-case "$DIST_SET" in
-sles9* | sles10* | sle10* | 9.* | 10.* | 11.0)
 	have_arch_patches=true
-	have_defconfig_files=true
 esac
 
 usage() {
     cat <<END
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
-          [--combine] [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
-          [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]] [--ctags]
-	  [--cscope]
+          [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
+          [--patch-dir=PATH] [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]]
+          [--ctags] [--cscope] [--no-xen]
 
   The --build-dir option supports internal shell aliases, like ~, and variable
   expansion when the variables are properly escaped.  Environment variables
@@ -54,8 +51,127 @@ SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
   \$CONFIG:		The current ARCH-FLAVOR.
   \$CONFIG_ARCH:		The current ARCH.
   \$CONFIG_FLAVOR:	The current FLAVOR.
+
+  The --no-quilt option will still create quilt-style backups for each
+  file that is modified but the backups will be removed if the patch
+  is successful. This can be fast because the new files may be created
+  and removed before writeback occurs so they only exist in memory. A
+  failed patch will be rolled back and the caller will be able to diagnose it.
+
+  The --fast option will concatenate all the patches to be applied and
+  call patch just once. This is even faster than --no-quilt but if any
+  of the component patches fail to apply the tree will not be rolled
+  back.
+
+  When used with last-patch-name or --no-xen, both --fast and --no-quilt
+  will set up a quilt environment for the remaining patches.
 END
     exit 1
+}
+
+apply_fast_patches() {
+    before=$(echo ${PATCHES_BEFORE[@]}|wc -w)
+    after=$(echo ${PATCHES_AFTER[@]}|wc -w)
+    echo "[ Fast-applying $before patches. $after remain. ]"
+    cat "${PATCHES_BEFORE[@]}" | \
+        patch -d $PATCH_DIR -p1 -E $fuzz --force --no-backup-if-mismatch \
+		-s > $LAST_LOG 2>&1
+    STATUS=$?
+
+    if [ $STATUS -ne 0 ]; then
+        if [ $STATUS -ne 0 ]; then
+            [ -n "$QUIET" ] && cat $LAST_LOG
+            echo "All-in-one patch failed (not rolled back)."
+            echo "Logfile: $LAST_LOG"
+            status=1
+        fi
+    else
+        rm -f $LAST_LOG
+    fi
+
+    PATCHES=( ${PATCHES_AFTER[@]} )
+}
+
+# Patch kernel normally
+apply_patches() {
+    set -- "${PATCHES[@]}"
+    n=0
+    while [ $# -gt 0 ]; do
+        PATCH="$1"
+        if ! $QUILT && test "$PATCH" = "$LIMIT"; then
+            STEP_BY_STEP=1
+            echo "Stopping before $PATCH"
+        fi
+        if [ -n "$STEP_BY_STEP" ]; then
+            while true; do
+                echo -n "Continue ([y]es/[n]o/yes to [a]ll)?"
+                read YESNO
+                case $YESNO in
+                    ([yYjJsS])
+                        break
+                        ;;
+                    ([nN])
+                        break 2	# break out of outer loop
+                        ;;
+                    ([aA])
+                        unset STEP_BY_STEP
+                        break
+                        ;;
+                esac
+            done
+        fi
+
+        if [ ! -r "$PATCH" ]; then
+            echo "Patch $PATCH not found."
+            status=1
+            break
+        fi
+        echo "[ $PATCH ]"
+        echo "[ $PATCH ]" >> $PATCH_LOG
+        backup_dir=$PATCH_DIR/.pc/$PATCH
+
+        exec 5<&1  # duplicate stdin
+        case $PATCH in
+        *.gz)	exec < <(gzip -cd $PATCH) ;;
+        *.bz2)	exec < <(bzip2 -cd $PATCH) ;;
+        *)		exec < $PATCH ;;
+        esac
+        patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
+                --no-backup-if-mismatch --force > $LAST_LOG 2>&1
+        STATUS=$?
+        exec 0<&5  # restore stdin
+
+        if [ $STATUS -ne 0 ]; then
+            restore_files $backup_dir $PATCH_DIR
+        fi
+        if ! $QUILT; then
+            rm -rf $PATCH_DIR/.pc/
+        fi
+        cat $LAST_LOG >> $PATCH_LOG
+        [ -z "$QUIET" ] && cat $LAST_LOG
+        if [ $STATUS -ne 0 ]; then
+            [ -n "$QUIET" ] && cat $LAST_LOG
+            echo "Patch $PATCH failed (rolled back)."
+            echo "Logfile: $PATCH_LOG"
+            status=1
+            break
+        else
+            echo "$SERIES_PFX$PATCH" >> $PATCH_DIR/series
+            if $QUILT; then
+                echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
+            fi
+            rm -f $LAST_LOG
+        fi
+
+        shift
+	if $QUILT; then
+		unset PATCHES[$n]
+	fi
+	let n++
+        if $QUILT && test "$PATCH" = "$LIMIT"; then
+            break
+        fi
+    done
 }
 
 # Allow to pass in default arguments via SEQUENCE_PATCH_ARGS.
@@ -66,7 +182,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,build-dir:,config:,kabi,ctags,cscope -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,no-xen -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -78,7 +194,6 @@ eval set -- "$options"
 QUIET=1
 EXTRA_SYMBOLS=
 QUILT=true
-COMBINE=
 FAST=
 VANILLA=false
 SP_BUILD_DIR=
@@ -88,6 +203,7 @@ CONFIG_FLAVOR=
 KABI=false
 CTAGS=false
 CSCOPE=false
+SKIP_XEN=false
 
 while true; do
     case "$1" in
@@ -104,8 +220,7 @@ while true; do
 	    QUILT=false
 	    ;;
 	--combine)
-	    COMBINE=1
-	    FAST=1
+	    # ignored
 	    ;;
        	--fast)
 	    FAST=1
@@ -129,6 +244,10 @@ while true; do
 	    fuzz="-F$2"
 	    shift
 	    ;;
+        --patch-dir)
+            PATCH_DIR=$2
+            shift
+            ;;
 	--build-dir)
 	    SP_BUILD_DIR="$2"
 	    shift
@@ -145,6 +264,9 @@ while true; do
 	    ;;
 	--cscope)
 	    CSCOPE=true
+	    ;;
+	--no-xen)
+	    SKIP_XEN=true
 	    ;;
 	--)
 	    shift
@@ -205,15 +327,11 @@ export TMPDIR
 ORIG_DIR=$SCRATCH_AREA/linux-$SRCVERSION.orig
 TAG=$(get_branch_name)
 TAG=${TAG//\//_}
-PATCH_DIR=$SCRATCH_AREA/linux-$SRCVERSION${TAG:+-$TAG}
+if [ "$VANILLA" = "true" ]; then
+	TAG=${TAG}-vanilla
+fi
 PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION${TAG:+-$TAG}.log
 LAST_LOG=$SCRATCH_AREA/last-$SRCVERSION${TAG:+-$TAG}.log
-
-# Check if we can clean up backup files at the end
-# (slightly faster, but requires more disk space).
-free_blocks="$(df -P "$SCRATCH_AREA" \
-    | awk 'NR==2 && match($4, /^[0-9]*$/) { print $4 }' 2> /dev/null)"
-[ "0$free_blocks" -gt 262144 ] && enough_free_space=1
 
 # Check series.conf.
 if [ ! -r series.conf ]; then
@@ -263,7 +381,10 @@ fi
 
 EXT=${EXTRA_SYMBOLS// /-}
 EXT=${EXT//\//}
-PATCH_DIR=${PATCH_DIR}${EXT:+-}$EXT
+
+if test -z "$PATCH_DIR"; then
+    PATCH_DIR=$SCRATCH_AREA/linux-$SRCVERSION${TAG:+-$TAG}${EXT:+-}$EXT
+fi
 
 if [ -n "$SP_BUILD_DIR" ]; then
     # This allows alias (~) and variable expansion
@@ -295,13 +416,13 @@ if ! [ -d $ORIG_DIR ]; then
 fi
 
 if $VANILLA; then
-PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep kernel.org\|rpmify ) )
+PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep '^patches\.(kernel\.org|rpmify)/') )
 else
 PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
 fi
 
 # Check if patch $LIMIT exists
-if [ -n "$LIMIT" ]; then
+if [ -n "$LIMIT" ] || $SKIP_XEN; then
     for ((n=0; n<${#PATCHES[@]}; n++)); do
 	if [ "$LIMIT" = - ]; then
 	    LIMIT=${PATCHES[n]}
@@ -312,6 +433,12 @@ if [ -n "$LIMIT" ]; then
 	    LIMIT=${PATCHES[n]}
 	    break
 	    ;;
+	patches.xen/*)
+            if $SKIP_XEN; then
+                LIMIT=${PATCHES[n-1]}
+                break
+            fi
+            ;;
 	esac
     done
     if ((n == ${#PATCHES[@]})); then
@@ -329,23 +456,6 @@ if [ -n "$LIMIT" ]; then
 else
     PATCHES_BEFORE=( "${PATCHES[@]}" )
     PATCHES_AFTER=()
-fi
-
-if [ -n "$COMBINE" ]; then
-    echo "Precomputing combined patches"
-    (IFS=$'\n'; echo "${PATCHES[*]}") \
-    | $(dirname $0)/md5fast --source-tree "$ORIG_DIR" \
-			    --temp "$SCRATCH_AREA" \
-    			    --cache combined --generate
-    echo $SRCVERSION > combined/srcversion
-fi
-
-if [ -n "$FAST" -a ${#PATCHES_BEFORE[@]} -gt 0 -a \
-     $SRCVERSION = "$(cat combined/srcversion 2> /dev/null)" ]; then
-    echo "Checking for precomputed combined patches"
-    PATCHES=( $(IFS=$'\n'; echo "${PATCHES_BEFORE[*]}" \
-	        | $(dirname $0)/md5fast --cache combined)
-    	      "${PATCHES_AFTER[@]}" )
 fi
 
 # Helper function to restore files backed up by patch. This is
@@ -378,6 +488,8 @@ restore_files() {
 # Create hardlinked source tree
 echo "Linking from $ORIG_DIR"
 cp -rld $ORIG_DIR $PATCH_DIR
+# create a relative symlink
+ln -snf ${PATCH_DIR#$SCRATCH_AREA/} $SCRATCH_AREA/current
 
 echo -e "# Symbols: $SYMBOLS\n#" > $PATCH_DIR/series
 SERIES_PFX=
@@ -388,89 +500,17 @@ fi
 mkdir $PATCH_DIR/.pc
 echo 2 > $PATCH_DIR/.pc/.version
 
-# Patch kernel
-set -- "${PATCHES[@]}"
-while [ $# -gt 0 ]; do
-    PATCH="$1"
-    if ! $QUILT && test "$PATCH" = "$LIMIT"; then
-	STEP_BY_STEP=1
-	echo "Stopping before $PATCH"
-    fi
-    if [ -n "$STEP_BY_STEP" ]; then
-	while true; do
-	    echo -n "Continue ([y]es/[n]o/yes to [a]ll)?"
-	    read YESNO
-	    case $YESNO in
-		([yYjJsS])
-		    break
-		    ;;
-		([nN])
-		    break 2	# break out of outer loop
-		    ;;
-		([aA])
-		    unset STEP_BY_STEP
-		    break
-		    ;;
-	    esac
-	done
-    fi
-
-    if [ ! -r "$PATCH" ]; then
-	echo "Patch $PATCH not found."
-	status=1
-	break
-    fi
-    echo "[ $PATCH ]"
-    echo "[ $PATCH ]" >> $PATCH_LOG
-    backup_dir=$PATCH_DIR/.pc/$PATCH
-
-    exec 5<&1  # duplicate stdin
-    case $PATCH in
-    *.gz)	exec < <(gzip -cd $PATCH) ;;
-    *.bz2)	exec < <(bzip2 -cd $PATCH) ;;
-    *)		exec < $PATCH ;;
-    esac
-    patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
-	    --no-backup-if-mismatch --force > $LAST_LOG 2>&1
-    STATUS=$?
-    exec 0<&5  # restore stdin
-    
-    if [ $STATUS -ne 0 ]; then
-        restore_files $backup_dir $PATCH_DIR
-    fi
-    if ! $QUILT && test -z "$enough_free_space"; then
-	rm -rf $PATCH_DIR/.pc/
-    fi
-    cat $LAST_LOG >> $PATCH_LOG
-    [ -z "$QUIET" ] && cat $LAST_LOG
-    if [ $STATUS -ne 0 ]; then
-	[ -n "$QUIET" ] && cat $LAST_LOG
-	echo "Patch $PATCH failed (rolled back)."
-	echo "Logfile: $PATCH_LOG"
-	status=1
-	break
-    else
-	echo "$SERIES_PFX$PATCH" >> $PATCH_DIR/series
-	if $QUILT; then
-	    echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
-	fi
-	rm -f $LAST_LOG
-    fi
-
-    shift
-    if $QUILT && test "$PATCH" = "$LIMIT"; then
-	break
-    fi
-done
+if [ -z "$FAST" ]; then
+    apply_patches
+else
+    apply_fast_patches
+fi
 
 if [ -n "$EXTRA_SYMBOLS" ]; then
     echo "$EXTRA_SYMBOLS" > $PATCH_DIR/extra-symbols
 fi
 
 if ! $QUILT; then
-    if test -n "$enough_free_space"; then
-        rm -rf $PATCH_DIR/.pc/
-    fi
     rm $PATCH_DIR/series
 fi
 
@@ -481,15 +521,8 @@ if $QUILT; then
     [ ${QUILT_PATCHES-patches} != patches ] \
         && ln -s $PWD $PATCH_DIR/${QUILT_PATCHES-patches}
 fi
-# If there are any remaining patches, add them to the series so
-# they can be fixed up with quilt (or similar).
-if [ -n "$*" ]; then
-    ( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
-fi
-
 echo "[ Tree: $PATCH_DIR ]"
 
-append=
 if test "$SP_BUILD_DIR" != "$PATCH_DIR"; then
     mkdir -p "$SP_BUILD_DIR"
     echo "[ Build Dir: $SP_BUILD_DIR ]"
@@ -497,6 +530,13 @@ if test "$SP_BUILD_DIR" != "$PATCH_DIR"; then
     rm -f "$SP_BUILD_DIR/patches"
     ln -sf "$PATCH_DIR" "$SP_BUILD_DIR/source"
     ln -sf "source/patches" "$SP_BUILD_DIR/patches"
+fi
+
+# If there are any remaining patches, add them to the series so
+# they can be fixed up with quilt (or similar).
+if [ -n "${PATCHES[*]}" ]; then
+    ( IFS=$'\n' ; echo "${PATCHES[*]}" ) >> $PATCH_DIR/series
+    exit $status
 fi
 
 if test -e supported.conf; then
@@ -543,37 +583,3 @@ if $CSCOPE; then
     fi
 fi
 
-[ $# -gt 0 ] && exit $status
-
-if ! $have_defconfig_files || test ! -e config.conf; then
-    exit 0
-fi
-
-# Copy the config files that apply for this kernel.
-echo "[ Copying config files ]" >> $PATCH_LOG
-echo "[ Copying config files ]"
-TMPFILE=$(mktemp /tmp/$(basename $0).XXXXXX)
-chmod a+r $TMPFILE
-CONFIGS=$(scripts/guards --list < config.conf)
-for config in $CONFIGS; do
-    if ! [ -e config/$config ]; then
-	echo "Configuration file config/$config not found"
-    fi
-    name=$(basename $config)
-    path=arch/$(dirname $config)/defconfig.$name
-    mkdir -p $(dirname $PATCH_DIR/$path)
-
-    chmod +x rpm/config-subst
-    cat config/$config \
-    | rpm/config-subst CONFIG_CFGNAME \"$name\" \
-    | rpm/config-subst CONFIG_RELEASE \"0\" \
-    | rpm/config-subst CONFIG_SUSE_KERNEL y \
-    > $TMPFILE
-
-    echo $path >> $PATCH_LOG
-    [ -z "$QUIET" ] && echo $path
-    # Make sure we don't override a hard-linked file.
-    rm -f $PATCH_DIR/$path
-    cp -f $TMPFILE $PATCH_DIR/$path
-done
-rm -f $TMPFILE
