@@ -297,8 +297,10 @@ for archive in $all_archives; do
     fi
 done
 
-echo "kabi.tar.bz2"
-stable_tar $build_dir/kabi.tar.bz2 kabi
+if test -d kabi; then
+    echo "kabi.tar.bz2"
+    stable_tar $build_dir/kabi.tar.bz2 kabi
+fi
 
 if test -d sysctl && \
 	grep -q '^Source.*\<sysctl\.tar\.bz2' "$build_dir/kernel-source.spec.in"
