@@ -548,8 +548,10 @@ for archive in $all_archives; do
     fi
 done
 
-echo "kabi.tar.bz2"
-stable_tar $build_dir/kabi.tar.bz2 kabi
+if test -d kabi; then
+    echo "kabi.tar.bz2"
+    stable_tar $build_dir/kabi.tar.bz2 kabi
+fi
 
 for kmp in  novell-kmp hello; do
     if test ! -d "doc/$kmp"; then
