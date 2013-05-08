@@ -279,8 +279,28 @@ for flavor in $flavors ; do
     # of i386.
     archs="$(echo $archs | sed -e 's,i386,%ix86,g')"
 
+    # Summary and description
+    if test -e rpm/package-descriptions; then
+	description=$(sed "1,/^=== kernel-$flavor ===/d; /^===/,\$ d" rpm/package-descriptions)
+	if test -z "$description"; then
+	    echo "warning: no description for kernel-$flavor found" >&2
+	    summary="The Linux Kernel"
+	    description="The Linux Kernel."
+	else
+	    summary=$(echo "$description"  | head -n 1)
+	    # escape newlines for the sed 's' command
+	    description=$(echo "$description" | tail -n +3 | \
+		sed 's/$/\\/; $ s/\\$//')
+	fi
+    else
+	summary="The Linux Kernel"
+	description="The Linux Kernel."
+    fi
+
     # Generate spec file
     sed -r -e "s,@NAME@,kernel-$flavor,g" \
+	-e "s,@SUMMARY@,$summary,g" \
+	-e "s~@DESCRIPTION@~$description~g" \
 	-e "s,@(FLAVOR|CFGNAME)@,$flavor,g" \
 	-e "s,@VARIANT@,$VARIANT,g" \
 	-e "s,@(SRC)?VERSION@,$SRCVERSION,g" \
