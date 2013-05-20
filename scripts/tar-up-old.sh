@@ -460,7 +460,8 @@ cp -a                       \
     doc/README.SUSE         \
     $build_dir
 rm -f "$build_dir"/*spec.in "$build_dir"/get_release_number.sh.in \
-    "$build_dir"/old-packages.conf "$build_dir"/km.conf
+    "$build_dir"/old-packages.conf "$build_dir"/km.conf \
+    "$build_dir"/package-descriptions
 # Not all files are in all branches
 for f in misc/extract-modaliases scripts/kabi-checks; do
     if test -e "$f"; then
