@@ -26,7 +26,7 @@ sub scan
 	foreach $_ (`find "$loc"`)
 	{
 		chomp $_;
-		if (!-f $_) {
+		if (-d $_ && !-l $_) {
 			# Generate directory list later.
 			next;
 		}
@@ -34,6 +34,7 @@ sub scan
 			m{^\Q$loc\E.*/Kconfig} ||
 			m{^\Q$loc\E.*/Kbuild} ||
 			m{^\Q$loc\E.*/Makefile} ||
+			m{^\Q$loc\E/arch/[^/]+/boot/dts/include/dt-bindings\b} ||
 			m{^\Q$loc\E/arch/[^/]+/include\b} ||
 			m{^\Q$loc\E/arch/arm/[^/]+/include/mach\b} ||
 			m{^\Q$loc\E/arch/arm/[^/]+/include/plat\b} ||
