@@ -1,11 +1,11 @@
-From: jbeulich@novell.com
+From: jbeulich@suse.com
 Subject: netback: use multicall for send multiple notifications
-Patch-mainline: obsolete
+Patch-mainline: n/a
 
-This also yields a small fairness improvement since now notifications
+This also yields a small fairness improvement since now RX notifications
 get sent in the order requests came in rather than in the inverse one.
 
---- head.orig/drivers/xen/core/evtchn.c	2013-01-30 12:35:49.000000000 +0100
+--- head.orig/drivers/xen/core/evtchn.c	2013-06-05 08:47:55.000000000 +0200
 +++ head/drivers/xen/core/evtchn.c	2013-01-30 12:37:42.000000000 +0100
 @@ -34,6 +34,7 @@
  #include <linux/slab.h>
@@ -43,32 +43,303 @@ get sent in the order requests came in rather than in the inverse one.
  int irq_to_evtchn_port(int irq)
  {
  	const struct irq_cfg *cfg = irq_cfg(irq);
---- head.orig/drivers/xen/netback/netback.c	2013-01-30 12:37:32.000000000 +0100
-+++ head/drivers/xen/netback/netback.c	2013-01-30 12:37:38.000000000 +0100
-@@ -814,10 +814,20 @@ static void net_rx_action(unsigned long 
+--- head.orig/drivers/xen/netback/common.h	2013-06-05 08:47:55.000000000 +0200
++++ head/drivers/xen/netback/common.h	2013-06-04 15:05:14.000000000 +0200
+@@ -55,6 +55,12 @@ typedef struct netif_st {
+ 
+ 	unsigned int     irq;
+ 
++	struct netif_st *notify_link[2];
++#define RX_IDX 0
++#define TX_IDX 1
++#define rx_notify_link notify_link[RX_IDX]
++#define tx_notify_link notify_link[TX_IDX]
++
+ 	/* The shared rings and indexes. */
+ 	netif_tx_back_ring_t tx;
+ 	netif_rx_back_ring_t rx;
+--- head.orig/drivers/xen/netback/netback.c	2013-06-05 08:47:55.000000000 +0200
++++ head/drivers/xen/netback/netback.c	2013-06-05 08:48:36.000000000 +0200
+@@ -59,9 +59,8 @@ struct netbk_tx_pending_inuse {
+ };
+ 
+ static void netif_idx_release(u16 pending_idx);
+-static void make_tx_response(netif_t *netif, 
+-			     netif_tx_request_t *txp,
+-			     s8       st);
++static bool make_tx_response(netif_t *, const netif_tx_request_t *, s8 st,
++			     netif_t **);
+ static netif_rx_response_t *make_rx_response(netif_t *netif, 
+ 					     u16      id, 
+ 					     s8       st,
+@@ -155,8 +154,11 @@ static LIST_HEAD(pending_inuse_head);
+ static struct sk_buff_head tx_queue;
+ 
+ static grant_handle_t grant_tx_handle[MAX_PENDING_REQS];
+-static gnttab_unmap_grant_ref_t tx_unmap_ops[MAX_PENDING_REQS];
+-static gnttab_map_grant_ref_t tx_map_ops[MAX_PENDING_REQS];
++static union {
++	gnttab_map_grant_ref_t map_ops[MAX_PENDING_REQS];
++	gnttab_unmap_grant_ref_t unmap_ops[MAX_PENDING_REQS];
++	multicall_entry_t mcl[0];
++} tx;
+ 
+ static struct list_head net_schedule_list;
+ static spinlock_t net_schedule_list_lock;
+@@ -201,6 +203,32 @@ static int check_mfn(int nr)
+ 	return alloc_index >= nr ? 0 : -ENOMEM;
+ }
+ 
++static void flush_notify_list(netif_t *list, unsigned int idx,
++			      multicall_entry_t mcl[],
++			      unsigned int limit)
++{
++	unsigned int used = 0;
++
++	do {
++		netif_t *cur = list;
++
++		list = cur->notify_link[idx];
++		cur->notify_link[idx] = NULL;
++
++		if ((!used && !list) ||
++		    multi_notify_remote_via_irq(mcl + used, cur->irq))
++			notify_remote_via_irq(cur->irq);
++		else if (++used == limit) {
++			if (HYPERVISOR_multicall(mcl, used))
++				BUG();
++			used = 0;
++		}
++		netif_put(cur);
++	} while (list);
++	if (used && HYPERVISOR_multicall(mcl, used))
++		BUG();
++}
++
+ static inline void maybe_schedule_tx_action(void)
+ {
+ 	smp_mb();
+@@ -626,14 +654,13 @@ static unsigned int netbk_add_frag_respo
+ 
+ static void net_rx_action(unsigned long unused)
+ {
+-	netif_t *netif = NULL;
++	netif_t *netif, *notify_head = NULL, *notify_tail = NULL;
+ 	s8 status;
+-	u16 id, irq, flags;
++	u16 id, flags;
+ 	netif_rx_response_t *resp;
+ 	multicall_entry_t *mcl;
+ 	struct sk_buff_head rxq;
+ 	struct sk_buff *skb;
+-	int notify_nr = 0;
+ 	int ret;
+ 	int nr_frags;
+ 	int count;
+@@ -647,8 +674,6 @@ static void net_rx_action(unsigned long 
+ 	static mmu_update_t rx_mmu[NET_RX_RING_SIZE];
+ 	static gnttab_transfer_t grant_trans_op[NET_RX_RING_SIZE];
+ 	static gnttab_copy_t grant_copy_op[NET_RX_RING_SIZE];
+-	static unsigned char rx_notify[NR_IRQS];
+-	static u16 notify_list[NET_RX_RING_SIZE];
+ 	static struct netbk_rx_meta meta[NET_RX_RING_SIZE];
+ 
+ 	struct netrx_pending_operations npo = {
+@@ -795,28 +820,29 @@ static void net_rx_action(unsigned long 
+ 						    nr_frags);
+ 
+ 		RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(&netif->rx, ret);
+-		irq = netif->irq;
+-		if (ret && !rx_notify[irq]) {
+-			rx_notify[irq] = 1;
+-			notify_list[notify_nr++] = irq;
+-		}
+ 
+ 		if (netif_queue_stopped(netif->dev) &&
+ 		    netif_schedulable(netif) &&
+ 		    !netbk_queue_full(netif))
+ 			netif_wake_queue(netif->dev);
+ 
+-		netif_put(netif);
++		if (ret && netif != notify_tail && !netif->rx_notify_link) {
++			if (notify_tail)
++				notify_tail->rx_notify_link = netif;
++			else
++				notify_head = netif;
++			notify_tail = netif;
++		} else
++			netif_put(netif);
++
+ 		dev_kfree_skb(skb);
+ 
  		npo.meta_cons += nr_frags + 1;
  	}
  
 -	while (notify_nr != 0) {
 -		irq = notify_list[--notify_nr];
-+	if (notify_nr == 1) {
-+		irq = *notify_list;
- 		__clear_bit(irq, rx_notify);
- 		notify_remote_via_irq(irq + DYNIRQ_BASE);
-+	} else {
-+		for (count = ret = 0; ret < notify_nr; ++ret) {
-+			irq = notify_list[ret];
-+			__clear_bit(irq, rx_notify);
-+			if (!multi_notify_remote_via_irq(rx_mcl + count,
-+							 irq + DYNIRQ_BASE))
-+				++count;
-+		}
-+		if (HYPERVISOR_multicall(rx_mcl, count))
-+			BUG();
- 	}
+-		rx_notify[irq] = 0;
+-		notify_remote_via_irq(irq);
+-	}
++	if (notify_head)
++		flush_notify_list(notify_head, RX_IDX, rx_mcl,
++				  ARRAY_SIZE(rx_mcl));
  
  	/* More work to do? */
---- head.orig/include/xen/evtchn.h	2012-02-10 11:32:59.000000000 +0100
+ 	if (!skb_queue_empty(&rx_queue) && !timer_pending(&net_timer))
+@@ -972,11 +998,11 @@ inline static void net_tx_action_dealloc
+ 	gnttab_unmap_grant_ref_t *gop;
+ 	u16 pending_idx;
+ 	PEND_RING_IDX dc, dp;
+-	netif_t *netif;
++	netif_t *netif, *notify_head = NULL, *notify_tail = NULL;
+ 	LIST_HEAD(list);
+ 
+ 	dc = dealloc_cons;
+-	gop = tx_unmap_ops;
++	gop = tx.unmap_ops;
+ 
+ 	/*
+ 	 * Free up any grants we have finished using
+@@ -1012,7 +1038,7 @@ inline static void net_tx_action_dealloc
+ 	dealloc_cons = dc;
+ 
+ 	if (HYPERVISOR_grant_table_op(GNTTABOP_unmap_grant_ref,
+-				      tx_unmap_ops, gop - tx_unmap_ops))
++				      tx.unmap_ops, gop - tx.unmap_ops))
+ 		BUG();
+ 
+ 	/* Copy any entries that have been pending for too long. */
+@@ -1046,18 +1072,22 @@ inline static void net_tx_action_dealloc
+ 
+ 		netif = pending_tx_info[pending_idx].netif;
+ 
+-		make_tx_response(netif, &pending_tx_info[pending_idx].req, 
+-				 XEN_NETIF_RSP_OKAY);
++		if (!make_tx_response(netif, &pending_tx_info[pending_idx].req,
++				      XEN_NETIF_RSP_OKAY, &notify_tail))
++			netif_put(netif);
++		else if (!notify_head)
++			notify_head = netif;
+ 
+ 		/* Ready for next use. */
+ 		gnttab_reset_grant_page(mmap_pages[pending_idx]);
+ 
+ 		pending_ring[MASK_PEND_IDX(pending_prod++)] = pending_idx;
+ 
+-		netif_put(netif);
+-
+ 		list_del_init(&inuse->list);
+ 	}
++	if (notify_head)
++		flush_notify_list(notify_head, TX_IDX, tx.mcl,
++				  sizeof(tx) / sizeof(tx.mcl[0]));
+ }
+ 
+ static void netbk_tx_err(netif_t *netif, netif_tx_request_t *txp, RING_IDX end)
+@@ -1065,7 +1095,7 @@ static void netbk_tx_err(netif_t *netif,
+ 	RING_IDX cons = netif->tx.req_cons;
+ 
+ 	do {
+-		make_tx_response(netif, txp, XEN_NETIF_RSP_ERROR);
++		make_tx_response(netif, txp, XEN_NETIF_RSP_ERROR, NULL);
+ 		if (cons == end)
+ 			break;
+ 		txp = RING_GET_REQUEST(&netif->tx, cons++);
+@@ -1188,7 +1218,7 @@ static int netbk_tx_check_mop(struct sk_
+ 	err = mop->status;
+ 	if (unlikely(err != GNTST_okay)) {
+ 		txp = &pending_tx_info[pending_idx].req;
+-		make_tx_response(netif, txp, XEN_NETIF_RSP_ERROR);
++		make_tx_response(netif, txp, XEN_NETIF_RSP_ERROR, NULL);
+ 		pending_ring[MASK_PEND_IDX(pending_prod++)] = pending_idx;
+ 		netif_put(netif);
+ 	} else {
+@@ -1219,7 +1249,7 @@ static int netbk_tx_check_mop(struct sk_
+ 
+ 		/* Error on this fragment: respond to client with an error. */
+ 		txp = &pending_tx_info[pending_idx].req;
+-		make_tx_response(netif, txp, XEN_NETIF_RSP_ERROR);
++		make_tx_response(netif, txp, XEN_NETIF_RSP_ERROR, NULL);
+ 		pending_ring[MASK_PEND_IDX(pending_prod++)] = pending_idx;
+ 		netif_put(netif);
+ 
+@@ -1340,7 +1370,7 @@ static void net_tx_action(unsigned long 
+ 
+ 	net_tx_action_dealloc();
+ 
+-	mop = tx_map_ops;
++	mop = tx.map_ops;
+ 	BUILD_BUG_ON(MAX_SKB_FRAGS >= MAX_PENDING_REQS);
+ 	while (((NR_PENDING_REQS + MAX_SKB_FRAGS) < MAX_PENDING_REQS) &&
+ 		!list_empty(&net_schedule_list)) {
+@@ -1506,11 +1536,11 @@ static void net_tx_action(unsigned long 
+ 		netif->tx.req_cons = i;
+ 		netif_schedule_work(netif);
+ 
+-		if ((mop - tx_map_ops) >= ARRAY_SIZE(tx_map_ops))
++		if ((mop - tx.map_ops) >= ARRAY_SIZE(tx.map_ops))
+ 			break;
+ 	}
+ 
+-	if (mop == tx_map_ops)
++	if (mop == tx.map_ops)
+ 		goto out;
+ 
+     /* NOTE: some maps may fail with GNTST_eagain, which could be successfully
+@@ -1519,10 +1549,10 @@ static void net_tx_action(unsigned long 
+      * because it is unlikely that a network buffer will be paged out or shared,
+      * and therefore it is unlikely to fail with GNTST_eagain. */
+ 	ret = HYPERVISOR_grant_table_op(
+-		GNTTABOP_map_grant_ref, tx_map_ops, mop - tx_map_ops);
++		GNTTABOP_map_grant_ref, tx.map_ops, mop - tx.map_ops);
+ 	BUG_ON(ret);
+ 
+-	mop = tx_map_ops;
++	mop = tx.map_ops;
+ 	while ((skb = __skb_dequeue(&tx_queue)) != NULL) {
+ 		struct net_device *dev;
+ 		netif_tx_request_t *txp;
+@@ -1646,9 +1676,8 @@ irqreturn_t netif_be_int(int irq, void *
+ 	return IRQ_HANDLED;
+ }
+ 
+-static void make_tx_response(netif_t *netif, 
+-			     netif_tx_request_t *txp,
+-			     s8       st)
++static bool make_tx_response(netif_t *netif, const netif_tx_request_t *txp,
++			     s8 st, netif_t **tailp)
+ {
+ 	RING_IDX i = netif->tx.rsp_prod_pvt;
+ 	netif_tx_response_t *resp;
+@@ -1663,8 +1692,16 @@ static void make_tx_response(netif_t *ne
+ 
+ 	netif->tx.rsp_prod_pvt = ++i;
+ 	RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(&netif->tx, notify);
+-	if (notify)
+-		notify_remote_via_irq(netif->irq);
++	if (notify) {
++		if (!tailp)
++			notify_remote_via_irq(netif->irq);
++		else if (netif != *tailp && !netif->tx_notify_link) {
++			if (*tailp)
++				(*tailp)->tx_notify_link = netif;
++			*tailp = netif;
++		} else
++			notify = false;
++	}
+ 
+ #ifdef CONFIG_XEN_NETDEV_PIPELINED_TRANSMITTER
+ 	if (i == netif->tx.req_cons) {
+@@ -1674,6 +1711,8 @@ static void make_tx_response(netif_t *ne
+ 			add_to_net_schedule_list_tail(netif);
+ 	}
+ #endif
++
++	return notify;
+ }
+ 
+ static netif_rx_response_t *make_rx_response(netif_t *netif, 
+--- head.orig/include/xen/evtchn.h	2013-06-05 08:47:55.000000000 +0200
 +++ head/include/xen/evtchn.h	2012-02-10 13:35:11.000000000 +0100
 @@ -188,6 +188,18 @@ static inline void notify_remote_via_evt
  	VOID(HYPERVISOR_event_channel_op(EVTCHNOP_send, &send));
