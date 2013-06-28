@@ -38,7 +38,7 @@ usage() {
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
           [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
           [--patch-dir=PATH] [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]]
-          [--ctags] [--cscope] [--no-xen]
+          [--ctags] [--cscope] [--no-xen] [--skip-reverse]
 
   The --build-dir option supports internal shell aliases, like ~, and variable
   expansion when the variables are properly escaped.  Environment variables
@@ -91,6 +91,7 @@ apply_fast_patches() {
 
     PATCHES=( ${PATCHES_AFTER[@]} )
 }
+SKIPPED_PATCHES=
 
 # Patch kernel normally
 apply_patches() {
@@ -143,7 +144,28 @@ apply_patches() {
 
         if [ $STATUS -ne 0 ]; then
             restore_files $backup_dir $PATCH_DIR
+
+	    if $SKIP_REVERSE; then
+		case $PATCH in
+		*.gz)	exec < <(gzip -cd $PATCH) ;;
+		*.bz2)	exec < <(bzip2 -cd $PATCH) ;;
+		*)		exec < $PATCH ;;
+		esac
+		patch -R -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 \
+			-E $fuzz --no-backup-if-mismatch --force --dry-run \
+			> $LAST_LOG 2>&1
+		ST=$?
+		exec 0<&5  # restore stdin
+		if [ $ST -eq 0 ]; then
+			echo "[ skipped: can be reverse-applied ]"
+			echo "[ skipped: can be reverse-applied ]" >> $PATCH_LOG
+			STATUS=0
+			SKIPPED_PATCHES="$SKIPPED_PATCHES $PATCH"
+			PATCH="# $PATCH"
+		fi
+	    fi
         fi
+
         if ! $QUILT; then
             rm -rf $PATCH_DIR/.pc/
         fi
@@ -174,6 +196,15 @@ apply_patches() {
     done
 }
 
+show_skipped() {
+    if [ -n "$SKIPPED_PATCHES" ]; then
+	echo "The following patches were skipped and can be removed from series.conf:"
+	for p in $SKIPPED_PATCHES; do
+	    echo "$p"
+	done
+    fi
+}
+
 # Allow to pass in default arguments via SEQUENCE_PATCH_ARGS.
 set -- $SEQUENCE_PATCH_ARGS "$@"
 
@@ -182,7 +213,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,no-xen -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,no-xen,skip-reverse -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -204,6 +235,7 @@ KABI=false
 CTAGS=false
 CSCOPE=false
 SKIP_XEN=false
+SKIP_REVERSE=false
 
 while true; do
     case "$1" in
@@ -267,6 +299,9 @@ while true; do
 	    ;;
 	--no-xen)
 	    SKIP_XEN=true
+	    ;;
+	--skip-reverse)
+	    SKIP_REVERSE=true
 	    ;;
 	--)
 	    shift
@@ -536,6 +571,7 @@ fi
 # they can be fixed up with quilt (or similar).
 if [ -n "${PATCHES[*]}" ]; then
     ( IFS=$'\n' ; echo "${PATCHES[*]}" ) >> $PATCH_DIR/series
+    show_skipped
     exit $status
 fi
 
@@ -583,3 +619,4 @@ if $CSCOPE; then
     fi
 fi
 
+show_skipped
