@@ -133,8 +133,11 @@ referenced_files="$( {
 	$(dirname $0)/guards --prefix=config --list < config.conf
     } | sort -u )"
 
+SKIP_XEN=true
 for file in $referenced_files; do
 	case $file in
+	config/*/xen | config/*/ec3)
+		SKIP_XEN=false ;;
 	config/* | patches.*/*)
 		;;
 	*)
@@ -142,6 +145,12 @@ for file in $referenced_files; do
 		exit 1
 	esac
 done
+
+if $SKIP_XEN; then
+	echo "[ Xen configs are disabled. Disabling Xen patches. ]"
+	sed -ie 's#.*patches.xen/#+noxen  &#' $build_dir/series.conf
+fi
+
 inconsistent=false
 check_for_merge_conflicts $referenced_files kernel-source.changes{,.old} || \
 	inconsistent=true
