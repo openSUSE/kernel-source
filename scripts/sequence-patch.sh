@@ -332,6 +332,13 @@ if [ $# -ne 0 ]; then
     usage
 fi
 
+if ! scripts/guards --prefix=config --list < config.conf | \
+     egrep -q '/(xen|ec2)$'; then
+     echo "*** Xen configs are disabled; Skipping Xen patches." >&2
+
+     SKIP_XEN=true
+fi
+
 # Some patches require patch 2.5.4. Abort with older versions.
 PATCH_VERSION=$(patch -v | sed -e '/^patch/!d' -e 's/patch //')
 case $PATCH_VERSION in
