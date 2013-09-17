@@ -483,7 +483,7 @@ if [ -n "$LIMIT" ] || $SKIP_XEN; then
             ;;
 	esac
     done
-    if ((n == ${#PATCHES[@]})); then
+    if [ -n "$LIMIT" ] && ((n == ${#PATCHES[@]})); then
 	echo "No patch \`$LIMIT' found."
 	exit 1
     fi
