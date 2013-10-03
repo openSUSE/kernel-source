@@ -375,7 +375,7 @@ export TMPDIR
 ORIG_DIR=$SCRATCH_AREA/linux-$SRCVERSION.orig
 TAG=$(get_branch_name)
 TAG=${TAG//\//_}
-if [ "$VANILLA" = "true" ]; then
+if $VANILLA; then
 	TAG=${TAG}-vanilla
 fi
 PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION${TAG:+-$TAG}.log
@@ -464,9 +464,9 @@ if ! [ -d $ORIG_DIR ]; then
 fi
 
 if $VANILLA; then
-PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep '^patches\.(kernel\.org|rpmify)/') )
+	PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep '^patches\.(kernel\.org|rpmify)/') )
 else
-PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
+	PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
 fi
 
 # Check if patch $LIMIT exists
@@ -564,6 +564,9 @@ fi
 
 ln -s $PWD $PATCH_DIR/patches
 ln -s patches/scripts/{refresh_patch,run_oldconfig}.sh $PATCH_DIR/
+if $VANILLA; then
+	touch "$PATCH_DIR/.is_vanilla"
+fi
 if $QUILT; then
     [ -r $HOME/.quiltrc ] && . $HOME/.quiltrc
     [ ${QUILT_PATCHES-patches} != patches ] \
