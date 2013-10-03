@@ -136,7 +136,7 @@ referenced_files="$( {
 SKIP_XEN=true
 for file in $referenced_files; do
 	case $file in
-	config/*/xen | config/*/ec3)
+	config/*/xen | config/*/ec2)
 		SKIP_XEN=false ;;
 	config/* | patches.*/*)
 		;;
