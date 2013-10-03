@@ -191,7 +191,7 @@ fi
 if test -e "${prefix}rpm/config.sh"; then
 	source "$_"
 fi
-if test -z "$set_flavor" -a "$VANILLA_ONLY" = 1; then
+if test -z "$set_flavor" && test "$VANILLA_ONLY" = 1 -o -e .is_vanilla; then
 	set_flavor=vanilla
 fi
 
