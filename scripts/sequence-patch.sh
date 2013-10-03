@@ -579,7 +579,9 @@ fi
 if [ -n "${PATCHES[*]}" ]; then
     ( IFS=$'\n' ; echo "${PATCHES[*]}" ) >> $PATCH_DIR/series
     show_skipped
-    exit $status
+    if test "0$status" -ne 0; then
+	    exit $status
+    fi
 fi
 
 if test -e supported.conf; then
