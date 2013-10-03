@@ -318,14 +318,20 @@ if [ $# -ge 1 ]; then
     shift
 fi
 
-if test -n "$CONFIG"; then
-    CONFIG_ARCH=${CONFIG%%-*}
-    CONFIG_FLAVOR=${CONFIG##*-}
-    if [ "$CONFIG" = "$CONFIG_ARCH" -o "$CONFIG" = "$CONFIG_FLAVOR" -o \
-         -z "$CONFIG_ARCH" -o -z "$CONFIG_FLAVOR" ]; then
+if test -z "$CONFIG"; then
+	CONFIG=$(uname -m)-default
+	case "$CONFIG" in
+	i?86-*)
+		CONFIG=i386-pae
+	esac
+fi
+
+CONFIG_ARCH=${CONFIG%%-*}
+CONFIG_FLAVOR=${CONFIG##*-}
+if [ "$CONFIG" = "$CONFIG_ARCH" -o "$CONFIG" = "$CONFIG_FLAVOR" -o \
+		-z "$CONFIG_ARCH" -o -z "$CONFIG_FLAVOR" ]; then
 	echo "Invalid config spec: --config=ARCH-FLAVOR is expected."
 	usage
-    fi
 fi
 
 if [ $# -ne 0 ]; then
@@ -591,7 +597,7 @@ fi
 
 if test -n "$CONFIG"; then
     if test -e "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
-	echo "[ Copying config/$CONFIG_ARCH/$CONFIG ]"
+	echo "[ Copying config/$CONFIG_ARCH/$CONFIG_FLAVOR ]"
 	cp -a "config/$CONFIG_ARCH/$CONFIG_FLAVOR" "$SP_BUILD_DIR/.config"
     else
 	echo "[ Config $CONFIG does not exist. ]"
