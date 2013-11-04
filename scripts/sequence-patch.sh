@@ -318,14 +318,20 @@ if [ $# -ge 1 ]; then
     shift
 fi
 
-if test -n "$CONFIG"; then
-    CONFIG_ARCH=${CONFIG%%-*}
-    CONFIG_FLAVOR=${CONFIG##*-}
-    if [ "$CONFIG" = "$CONFIG_ARCH" -o "$CONFIG" = "$CONFIG_FLAVOR" -o \
-         -z "$CONFIG_ARCH" -o -z "$CONFIG_FLAVOR" ]; then
+if test -z "$CONFIG"; then
+	CONFIG=$(uname -m)-default
+	case "$CONFIG" in
+	i?86-*)
+		CONFIG=i386-pae
+	esac
+fi
+
+CONFIG_ARCH=${CONFIG%%-*}
+CONFIG_FLAVOR=${CONFIG##*-}
+if [ "$CONFIG" = "$CONFIG_ARCH" -o "$CONFIG" = "$CONFIG_FLAVOR" -o \
+		-z "$CONFIG_ARCH" -o -z "$CONFIG_FLAVOR" ]; then
 	echo "Invalid config spec: --config=ARCH-FLAVOR is expected."
 	usage
-    fi
 fi
 
 if [ $# -ne 0 ]; then
@@ -369,7 +375,7 @@ export TMPDIR
 ORIG_DIR=$SCRATCH_AREA/linux-$SRCVERSION.orig
 TAG=$(get_branch_name)
 TAG=${TAG//\//_}
-if [ "$VANILLA" = "true" ]; then
+if $VANILLA; then
 	TAG=${TAG}-vanilla
 fi
 PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION${TAG:+-$TAG}.log
@@ -458,9 +464,9 @@ if ! [ -d $ORIG_DIR ]; then
 fi
 
 if $VANILLA; then
-PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep '^patches\.(kernel\.org|rpmify)/') )
+	PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep '^patches\.(kernel\.org|rpmify)/') )
 else
-PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
+	PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
 fi
 
 # Check if patch $LIMIT exists
@@ -558,6 +564,9 @@ fi
 
 ln -s $PWD $PATCH_DIR/patches
 ln -s patches/scripts/{refresh_patch,run_oldconfig}.sh $PATCH_DIR/
+if $VANILLA; then
+	touch "$PATCH_DIR/.is_vanilla"
+fi
 if $QUILT; then
     [ -r $HOME/.quiltrc ] && . $HOME/.quiltrc
     [ ${QUILT_PATCHES-patches} != patches ] \
@@ -579,7 +588,9 @@ fi
 if [ -n "${PATCHES[*]}" ]; then
     ( IFS=$'\n' ; echo "${PATCHES[*]}" ) >> $PATCH_DIR/series
     show_skipped
-    exit $status
+    if test "0$status" -ne 0; then
+	    exit $status
+    fi
 fi
 
 if test -e supported.conf; then
@@ -589,7 +600,7 @@ fi
 
 if test -n "$CONFIG"; then
     if test -e "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
-	echo "[ Copying config/$CONFIG_ARCH/$CONFIG ]"
+	echo "[ Copying config/$CONFIG_ARCH/$CONFIG_FLAVOR ]"
 	cp -a "config/$CONFIG_ARCH/$CONFIG_FLAVOR" "$SP_BUILD_DIR/.config"
     else
 	echo "[ Config $CONFIG does not exist. ]"
