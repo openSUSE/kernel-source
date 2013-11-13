@@ -139,8 +139,7 @@ apply_patches() {
             restore_files $backup_dir $PATCH_DIR
 
 	    if $SKIP_REVERSE; then
-		patch -R -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 \
-			-E $fuzz --no-backup-if-mismatch --force --dry-run \
+		patch -R -d $PATCH_DIR -p1 -E $fuzz --force --dry-run \
 			< $PATCH > $LAST_LOG 2>&1
 		ST=$?
 		if [ $ST -eq 0 ]; then
