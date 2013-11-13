@@ -496,7 +496,7 @@ fi
 # Helper function to restore files backed up by patch. This is
 # faster than doing a --dry-run first.
 restore_files() {
-    local backup_dir=$1 patch_dir=$2 file wd=$PWD
+    local backup_dir=$1 patch_dir=$2 file
     local -a remove restore
  
     if [ -d $backup_dir ]; then
