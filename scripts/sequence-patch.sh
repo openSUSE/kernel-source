@@ -131,31 +131,18 @@ apply_patches() {
         echo "[ $PATCH ]" >> $PATCH_LOG
         backup_dir=$PATCH_DIR/.pc/$PATCH
 
-        exec 5<&1  # duplicate stdin
-        case $PATCH in
-        *.gz)	exec < <(gzip -cd $PATCH) ;;
-        *.bz2)	exec < <(bzip2 -cd $PATCH) ;;
-        *)		exec < $PATCH ;;
-        esac
         patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
-                --no-backup-if-mismatch --force > $LAST_LOG 2>&1
+                --no-backup-if-mismatch --force < $PATCH > $LAST_LOG 2>&1
         STATUS=$?
-        exec 0<&5  # restore stdin
 
         if [ $STATUS -ne 0 ]; then
             restore_files $backup_dir $PATCH_DIR
 
 	    if $SKIP_REVERSE; then
-		case $PATCH in
-		*.gz)	exec < <(gzip -cd $PATCH) ;;
-		*.bz2)	exec < <(bzip2 -cd $PATCH) ;;
-		*)		exec < $PATCH ;;
-		esac
 		patch -R -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 \
 			-E $fuzz --no-backup-if-mismatch --force --dry-run \
-			> $LAST_LOG 2>&1
+			< $PATCH > $LAST_LOG 2>&1
 		ST=$?
-		exec 0<&5  # restore stdin
 		if [ $ST -eq 0 ]; then
 			echo "[ skipped: can be reverse-applied ]"
 			echo "[ skipped: can be reverse-applied ]" >> $PATCH_LOG
