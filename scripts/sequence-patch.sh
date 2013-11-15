@@ -148,8 +148,12 @@ apply_patches() {
 			STATUS=0
 			SKIPPED_PATCHES="$SKIPPED_PATCHES $PATCH"
 			PATCH="# $PATCH"
+			remove_rejects $backup_dir $PATCH_DIR
 		fi
 	    fi
+
+	    # Backup directory is no longer needed
+	    rm -rf $backup_dir
         fi
 
         if ! $QUILT; then
@@ -513,6 +517,26 @@ restore_files() {
 		| xargs cp -f --parents --target $patch_dir
 	cd $patch_dir
 	#echo "Remove: ${remove[@]}"
+	[ ${#remove[@]} -ne 0 ] \
+	    && printf "%s\n" "${remove[@]}" | xargs rm -f
+	popd > /dev/null
+    fi
+}
+
+# Helper function to remove stray .rej files.
+remove_rejects() {
+    local backup_dir=$1 patch_dir=$2 file
+    local -a remove
+
+    if [ -d $backup_dir ]; then
+	pushd $backup_dir > /dev/null
+	for file in $(find . -type f) ; do
+	    if [ -f "$patch_dir/$file.rej" ]; then
+		remove[${#remove[@]}]="$file.rej"
+	    fi
+	done
+	cd $patch_dir
+	#echo "Remove rejects: ${remove[@]}"
 	[ ${#remove[@]} -ne 0 ] \
 	    && printf "%s\n" "${remove[@]}" | xargs rm -f
 	popd > /dev/null
