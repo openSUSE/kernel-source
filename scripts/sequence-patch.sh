@@ -437,15 +437,8 @@ echo "Creating tree in $PATCH_DIR"
 # Clean up from previous run
 rm -f "$PATCH_LOG" "$LAST_LOG"
 if [ -e $PATCH_DIR ]; then
-    tmpdir=$(mktemp -d ${PATCH_DIR%/*}/${0##*/}.XXXXXX)
-    if [ -n "$tmpdir" ]; then
-	echo "Cleaning up from previous run (background)"
-	mv $PATCH_DIR $tmpdir
-	rm -rf $tmpdir &
-    else
-	echo "Cleaning up from previous run"
-	rm -rf $PATCH_DIR
-    fi
+    echo "Cleaning up from previous run"
+    rm -rf $PATCH_DIR
 fi
 
 # Create fresh $SCRATCH_AREA/linux-$SRCVERSION.
