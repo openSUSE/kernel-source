@@ -154,6 +154,10 @@ apply_patches() {
 
 	    # Backup directory is no longer needed
 	    rm -rf $backup_dir
+	else
+	    if $QUILT; then
+		echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
+	    fi
         fi
 
         if ! $QUILT; then
@@ -169,9 +173,6 @@ apply_patches() {
             break
         else
             echo "$SERIES_PFX$PATCH" >> $PATCH_DIR/series
-            if $QUILT; then
-                echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
-            fi
             rm -f $LAST_LOG
         fi
 
