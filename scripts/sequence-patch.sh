@@ -310,11 +310,15 @@ if [ $# -ge 1 ]; then
 fi
 
 if test -z "$CONFIG"; then
-	CONFIG=$(uname -m)-default
-	case "$CONFIG" in
-	i?86-*)
-		CONFIG=i386-pae
-	esac
+	if test "$VANILLA_ONLY" = 1; then
+		CONFIG=$(uname -m)-vanilla
+	else
+		CONFIG=$(uname -m)-default
+		case "$CONFIG" in
+		i?86-*)
+			CONFIG=i386-pae
+		esac
+	fi
 fi
 
 CONFIG_ARCH=${CONFIG%%-*}
