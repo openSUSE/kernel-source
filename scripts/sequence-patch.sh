@@ -38,7 +38,7 @@ usage() {
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
           [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
           [--patch-dir=PATH] [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]]
-          [--ctags] [--cscope] [--no-xen]
+          [--ctags] [--cscope] [--no-xen] [--skip-reverse]
 
   The --build-dir option supports internal shell aliases, like ~, and variable
   expansion when the variables are properly escaped.  Environment variables
@@ -91,6 +91,7 @@ apply_fast_patches() {
 
     PATCHES=( ${PATCHES_AFTER[@]} )
 }
+SKIPPED_PATCHES=
 
 # Patch kernel normally
 apply_patches() {
@@ -130,20 +131,35 @@ apply_patches() {
         echo "[ $PATCH ]" >> $PATCH_LOG
         backup_dir=$PATCH_DIR/.pc/$PATCH
 
-        exec 5<&1  # duplicate stdin
-        case $PATCH in
-        *.gz)	exec < <(gzip -cd $PATCH) ;;
-        *.bz2)	exec < <(bzip2 -cd $PATCH) ;;
-        *)		exec < $PATCH ;;
-        esac
         patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
-                --no-backup-if-mismatch --force > $LAST_LOG 2>&1
+                --no-backup-if-mismatch --force < $PATCH > $LAST_LOG 2>&1
         STATUS=$?
-        exec 0<&5  # restore stdin
 
         if [ $STATUS -ne 0 ]; then
             restore_files $backup_dir $PATCH_DIR
+
+	    if $SKIP_REVERSE; then
+		patch -R -d $PATCH_DIR -p1 -E $fuzz --force --dry-run \
+			< $PATCH > $LAST_LOG 2>&1
+		ST=$?
+		if [ $ST -eq 0 ]; then
+			echo "[ skipped: can be reverse-applied ]"
+			echo "[ skipped: can be reverse-applied ]" >> $PATCH_LOG
+			STATUS=0
+			SKIPPED_PATCHES="$SKIPPED_PATCHES $PATCH"
+			PATCH="# $PATCH"
+			remove_rejects $backup_dir $PATCH_DIR
+		fi
+	    fi
+
+	    # Backup directory is no longer needed
+	    rm -rf $backup_dir
+	else
+	    if $QUILT; then
+		echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
+	    fi
         fi
+
         if ! $QUILT; then
             rm -rf $PATCH_DIR/.pc/
         fi
@@ -157,9 +173,6 @@ apply_patches() {
             break
         else
             echo "$SERIES_PFX$PATCH" >> $PATCH_DIR/series
-            if $QUILT; then
-                echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
-            fi
             rm -f $LAST_LOG
         fi
 
@@ -174,6 +187,15 @@ apply_patches() {
     done
 }
 
+show_skipped() {
+    if [ -n "$SKIPPED_PATCHES" ]; then
+	echo "The following patches were skipped and can be removed from series.conf:"
+	for p in $SKIPPED_PATCHES; do
+	    echo "$p"
+	done
+    fi
+}
+
 # Allow to pass in default arguments via SEQUENCE_PATCH_ARGS.
 set -- $SEQUENCE_PATCH_ARGS "$@"
 
@@ -182,7 +204,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,no-xen -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,no-xen,skip-reverse -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -204,6 +226,7 @@ KABI=false
 CTAGS=false
 CSCOPE=false
 SKIP_XEN=false
+SKIP_REVERSE=false
 
 while true; do
     case "$1" in
@@ -268,6 +291,9 @@ while true; do
 	--no-xen)
 	    SKIP_XEN=true
 	    ;;
+	--skip-reverse)
+	    SKIP_REVERSE=true
+	    ;;
 	--)
 	    shift
 	    break ;;
@@ -283,18 +309,35 @@ if [ $# -ge 1 ]; then
     shift
 fi
 
-if test -n "$CONFIG"; then
-    CONFIG_ARCH=${CONFIG%%-*}
-    CONFIG_FLAVOR=${CONFIG##*-}
-    if [ "$CONFIG" = "$CONFIG_ARCH" -o "$CONFIG" = "$CONFIG_FLAVOR" -o \
-         -z "$CONFIG_ARCH" -o -z "$CONFIG_FLAVOR" ]; then
+if test -z "$CONFIG"; then
+	if test "$VANILLA_ONLY" = 1; then
+		CONFIG=$(uname -m)-vanilla
+	else
+		CONFIG=$(uname -m)-default
+		case "$CONFIG" in
+		i?86-*)
+			CONFIG=i386-pae
+		esac
+	fi
+fi
+
+CONFIG_ARCH=${CONFIG%%-*}
+CONFIG_FLAVOR=${CONFIG##*-}
+if [ "$CONFIG" = "$CONFIG_ARCH" -o "$CONFIG" = "$CONFIG_FLAVOR" -o \
+		-z "$CONFIG_ARCH" -o -z "$CONFIG_FLAVOR" ]; then
 	echo "Invalid config spec: --config=ARCH-FLAVOR is expected."
 	usage
-    fi
 fi
 
 if [ $# -ne 0 ]; then
     usage
+fi
+
+if ! scripts/guards --prefix=config --list < config.conf | \
+     egrep -q '/(xen|ec2)$'; then
+     echo "*** Xen configs are disabled; Skipping Xen patches." >&2
+
+     SKIP_XEN=true
 fi
 
 # Some patches require patch 2.5.4. Abort with older versions.
@@ -327,7 +370,7 @@ export TMPDIR
 ORIG_DIR=$SCRATCH_AREA/linux-$SRCVERSION.orig
 TAG=$(get_branch_name)
 TAG=${TAG//\//_}
-if [ "$VANILLA" = "true" ]; then
+if $VANILLA; then
 	TAG=${TAG}-vanilla
 fi
 PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION${TAG:+-$TAG}.log
@@ -398,15 +441,8 @@ echo "Creating tree in $PATCH_DIR"
 # Clean up from previous run
 rm -f "$PATCH_LOG" "$LAST_LOG"
 if [ -e $PATCH_DIR ]; then
-    tmpdir=$(mktemp -d ${PATCH_DIR%/*}/${0##*/}.XXXXXX)
-    if [ -n "$tmpdir" ]; then
-	echo "Cleaning up from previous run (background)"
-	mv $PATCH_DIR $tmpdir
-	rm -rf $tmpdir &
-    else
-	echo "Cleaning up from previous run"
-	rm -rf $PATCH_DIR
-    fi
+    echo "Cleaning up from previous run"
+    rm -rf $PATCH_DIR
 fi
 
 # Create fresh $SCRATCH_AREA/linux-$SRCVERSION.
@@ -416,9 +452,9 @@ if ! [ -d $ORIG_DIR ]; then
 fi
 
 if $VANILLA; then
-PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep '^patches\.(kernel\.org|rpmify)/') )
+	PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep '^patches\.(kernel\.org|rpmify)/') )
 else
-PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
+	PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
 fi
 
 # Check if patch $LIMIT exists
@@ -441,7 +477,7 @@ if [ -n "$LIMIT" ] || $SKIP_XEN; then
             ;;
 	esac
     done
-    if ((n == ${#PATCHES[@]})); then
+    if [ -n "$LIMIT" ] && ((n == ${#PATCHES[@]})); then
 	echo "No patch \`$LIMIT' found."
 	exit 1
     fi
@@ -461,7 +497,7 @@ fi
 # Helper function to restore files backed up by patch. This is
 # faster than doing a --dry-run first.
 restore_files() {
-    local backup_dir=$1 patch_dir=$2 file wd=$PWD
+    local backup_dir=$1 patch_dir=$2 file
     local -a remove restore
  
     if [ -d $backup_dir ]; then
@@ -479,6 +515,26 @@ restore_files() {
 		| xargs cp -f --parents --target $patch_dir
 	cd $patch_dir
 	#echo "Remove: ${remove[@]}"
+	[ ${#remove[@]} -ne 0 ] \
+	    && printf "%s\n" "${remove[@]}" | xargs rm -f
+	popd > /dev/null
+    fi
+}
+
+# Helper function to remove stray .rej files.
+remove_rejects() {
+    local backup_dir=$1 patch_dir=$2 file
+    local -a remove
+
+    if [ -d $backup_dir ]; then
+	pushd $backup_dir > /dev/null
+	for file in $(find . -type f) ; do
+	    if [ -f "$patch_dir/$file.rej" ]; then
+		remove[${#remove[@]}]="$file.rej"
+	    fi
+	done
+	cd $patch_dir
+	#echo "Remove rejects: ${remove[@]}"
 	[ ${#remove[@]} -ne 0 ] \
 	    && printf "%s\n" "${remove[@]}" | xargs rm -f
 	popd > /dev/null
@@ -516,6 +572,9 @@ fi
 
 ln -s $PWD $PATCH_DIR/patches
 ln -s patches/scripts/{refresh_patch,run_oldconfig}.sh $PATCH_DIR/
+if $VANILLA; then
+	touch "$PATCH_DIR/.is_vanilla"
+fi
 if $QUILT; then
     [ -r $HOME/.quiltrc ] && . $HOME/.quiltrc
     [ ${QUILT_PATCHES-patches} != patches ] \
@@ -536,7 +595,10 @@ fi
 # they can be fixed up with quilt (or similar).
 if [ -n "${PATCHES[*]}" ]; then
     ( IFS=$'\n' ; echo "${PATCHES[*]}" ) >> $PATCH_DIR/series
-    exit $status
+    show_skipped
+    if test "0$status" -ne 0; then
+	    exit $status
+    fi
 fi
 
 if test -e supported.conf; then
@@ -546,7 +608,7 @@ fi
 
 if test -n "$CONFIG"; then
     if test -e "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
-	echo "[ Copying config/$CONFIG_ARCH/$CONFIG ]"
+	echo "[ Copying config/$CONFIG_ARCH/$CONFIG_FLAVOR ]"
 	cp -a "config/$CONFIG_ARCH/$CONFIG_FLAVOR" "$SP_BUILD_DIR/.config"
     else
 	echo "[ Config $CONFIG does not exist. ]"
@@ -583,3 +645,4 @@ if $CSCOPE; then
     fi
 fi
 
+show_skipped

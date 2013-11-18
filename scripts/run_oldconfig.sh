@@ -191,7 +191,7 @@ fi
 if test -e "${prefix}rpm/config.sh"; then
 	source "$_"
 fi
-if test -z "$set_flavor" -a "$VANILLA_ONLY" = 1; then
+if test -z "$set_flavor" && test "$VANILLA_ONLY" = 1 -o -e .is_vanilla; then
 	set_flavor=vanilla
 fi
 
@@ -323,7 +323,10 @@ for config in $config_files; do
     s390x/*)
         MAKE_ARGS="ARCH=s390"
         ;;
-   arm*/*)
+    arm64/*)
+        MAKE_ARGS="ARCH=arm64"
+        ;;
+    armv*/*)
         MAKE_ARGS="ARCH=arm"
         ;;
     */um)

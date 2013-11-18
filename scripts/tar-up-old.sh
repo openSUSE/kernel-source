@@ -279,8 +279,28 @@ for flavor in $flavors ; do
     # of i386.
     archs="$(echo $archs | sed -e 's,i386,%ix86,g')"
 
+    # Summary and description
+    if test -e rpm/package-descriptions; then
+	description=$(sed "1,/^=== kernel-$flavor ===/d; /^===/,\$ d" rpm/package-descriptions)
+	if test -z "$description"; then
+	    echo "warning: no description for kernel-$flavor found" >&2
+	    summary="The Linux Kernel"
+	    description="The Linux Kernel."
+	else
+	    summary=$(echo "$description"  | head -n 1)
+	    # escape newlines for the sed 's' command
+	    description=$(echo "$description" | tail -n +3 | \
+		sed 's/$/\\/; $ s/\\$//')
+	fi
+    else
+	summary="The Linux Kernel"
+	description="The Linux Kernel."
+    fi
+
     # Generate spec file
     sed -r -e "s,@NAME@,kernel-$flavor,g" \
+	-e "s,@SUMMARY@,$summary,g" \
+	-e "s~@DESCRIPTION@~$description~g" \
 	-e "s,@(FLAVOR|CFGNAME)@,$flavor,g" \
 	-e "s,@VARIANT@,$VARIANT,g" \
 	-e "s,@(SRC)?VERSION@,$SRCVERSION,g" \
@@ -440,7 +460,8 @@ cp -a                       \
     doc/README.SUSE         \
     $build_dir
 rm -f "$build_dir"/*spec.in "$build_dir"/get_release_number.sh.in \
-    "$build_dir"/old-packages.conf "$build_dir"/km.conf
+    "$build_dir"/old-packages.conf "$build_dir"/km.conf \
+    "$build_dir"/package-descriptions
 # Not all files are in all branches
 for f in misc/extract-modaliases scripts/kabi-checks; do
     if test -e "$f"; then
@@ -548,8 +569,10 @@ for archive in $all_archives; do
     fi
 done
 
-echo "kabi.tar.bz2"
-stable_tar $build_dir/kabi.tar.bz2 kabi
+if test -d kabi; then
+    echo "kabi.tar.bz2"
+    stable_tar $build_dir/kabi.tar.bz2 kabi
+fi
 
 for kmp in  novell-kmp hello; do
     if test ! -d "doc/$kmp"; then

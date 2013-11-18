@@ -133,8 +133,11 @@ referenced_files="$( {
 	$(dirname $0)/guards --prefix=config --list < config.conf
     } | sort -u )"
 
+SKIP_XEN=true
 for file in $referenced_files; do
 	case $file in
+	config/*/xen | config/*/ec2)
+		SKIP_XEN=false ;;
 	config/* | patches.*/*)
 		;;
 	*)
@@ -142,6 +145,12 @@ for file in $referenced_files; do
 		exit 1
 	esac
 done
+
+if $SKIP_XEN; then
+	echo "[ Xen configs are disabled. Disabling Xen patches. ]"
+	sed -ie 's#.*patches.xen/#+noxen  &#' $build_dir/series.conf
+fi
+
 inconsistent=false
 check_for_merge_conflicts $referenced_files kernel-source.changes{,.old} || \
 	inconsistent=true
@@ -297,8 +306,10 @@ for archive in $all_archives; do
     fi
 done
 
-echo "kabi.tar.bz2"
-stable_tar $build_dir/kabi.tar.bz2 kabi
+if test -d kabi; then
+    echo "kabi.tar.bz2"
+    stable_tar $build_dir/kabi.tar.bz2 kabi
+fi
 
 if test -d sysctl && \
 	grep -q '^Source.*\<sysctl\.tar\.bz2' "$build_dir/kernel-source.spec.in"
