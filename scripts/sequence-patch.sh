@@ -79,12 +79,10 @@ apply_fast_patches() {
     STATUS=$?
 
     if [ $STATUS -ne 0 ]; then
-        if [ $STATUS -ne 0 ]; then
-            [ -n "$QUIET" ] && cat $LAST_LOG
-            echo "All-in-one patch failed (not rolled back)."
-            echo "Logfile: $LAST_LOG"
-            status=1
-        fi
+        [ -n "$QUIET" ] && cat $LAST_LOG
+        echo "All-in-one patch failed (not rolled back)."
+        echo "Logfile: $LAST_LOG"
+        status=1
     else
         rm -f $LAST_LOG
     fi
