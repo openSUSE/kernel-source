@@ -70,9 +70,7 @@ END
 }
 
 apply_fast_patches() {
-    before=$(echo ${PATCHES_BEFORE[@]}|wc -w)
-    after=$(echo ${PATCHES_AFTER[@]}|wc -w)
-    echo "[ Fast-applying $before patches. $after remain. ]"
+    echo "[ Fast-applying ${#PATCHES_BEFORE[@]} patches. ${#PATCHES_AFTER[@]} remain. ]"
     LAST_LOG=$(cat "${PATCHES_BEFORE[@]}" | \
         patch -d $PATCH_DIR -p1 -E $fuzz --force --no-backup-if-mismatch \
 		-s 2>&1)
