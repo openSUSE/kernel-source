@@ -136,12 +136,12 @@ apply_patches() {
             restore_files $backup_dir $PATCH_DIR
 
 	    if $SKIP_REVERSE; then
-		LAST_LOG=$(patch -R -d $PATCH_DIR -p1 -E $fuzz --force --dry-run \
-			< $PATCH 2>&1)
+		patch -R -d $PATCH_DIR -p1 -E $fuzz --force --dry-run \
+			< $PATCH > /dev/null 2>&1
 		ST=$?
 		if [ $ST -eq 0 ]; then
-			echo "[ skipped: can be reverse-applied ]"
-			echo "[ skipped: can be reverse-applied ]" >> $PATCH_LOG
+			LAST_LOG="[ skipped: can be reverse-applied ]"
+			[ -n "$QUIET" ] && echo "$LAST_LOG"
 			STATUS=0
 			SKIPPED_PATCHES="$SKIPPED_PATCHES $PATCH"
 			PATCH="# $PATCH"
