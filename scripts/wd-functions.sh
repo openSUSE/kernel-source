@@ -41,7 +41,7 @@ get_branch_name()
 
 _find_tarball()
 {
-    local version=$1 dir subdir major
+    local version=$1 xz_ok=$2 dir subdir major
 
     set -- ${version//[.-]/ }
     major=$1.$2
@@ -51,6 +51,10 @@ _find_tarball()
     esac
     for dir in . $MIRROR {/mounts,/labs,}/mirror/kernel; do
         for subdir in "" "/v$major" "/testing" "/v$major/testing"; do
+            if test -n "$xz_ok" -a -r "$dir$subdir/linux-$version.tar.xz"; then
+                echo "$dir$subdir/linux-$version.tar.xz"
+                return
+            fi
             if test -r "$dir$subdir/linux-$version.tar.bz2"; then
                 echo "$dir$subdir/linux-$version.tar.bz2"
                 return
@@ -120,14 +124,18 @@ unpack_tarball()
 {
     local version=$1 dest=$2 tarball
 
-    tarball=$(_find_tarball "$version")
+    tarball=$(_find_tarball "$version" zx_ok)
     mkdir -p "$dest"
     if test -n "$tarball"; then
         echo "Extracting $tarball"
-        tar -xjf "$tarball" -C "$dest" --strip-components=1
+        case "$tarball" in
+        *.bz2) tar -xjf "$tarball" -C "$dest" --strip-components=1 ;;
+        *.xz) tar -xJf "$tarball" -C "$dest" --strip-components=1 ;;
+        *) tar -xf "$tarball" -C "$dest" --strip-components=1 ;;
+        esac
         return
     fi
-    echo "Warning: could not find linux-$version.tar.bz2, trying to create it from git" >&2
+    echo "Warning: could not find linux-$version.tar.(bz2|xz), trying to create it from git" >&2
     echo "alternatively you can put an unpatched kernel tree to $dest" >&2
     set -o pipefail
     _get_tarball_from_git "$version" | tar -xf - -C "$dest" --strip-components=1

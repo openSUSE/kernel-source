@@ -70,23 +70,18 @@ END
 }
 
 apply_fast_patches() {
-    before=$(echo ${PATCHES_BEFORE[@]}|wc -w)
-    after=$(echo ${PATCHES_AFTER[@]}|wc -w)
-    echo "[ Fast-applying $before patches. $after remain. ]"
-    cat "${PATCHES_BEFORE[@]}" | \
+    echo "[ Fast-applying ${#PATCHES_BEFORE[@]} patches. ${#PATCHES_AFTER[@]} remain. ]"
+    LAST_LOG=$(cat "${PATCHES_BEFORE[@]}" | \
         patch -d $PATCH_DIR -p1 -E $fuzz --force --no-backup-if-mismatch \
-		-s > $LAST_LOG 2>&1
+		-s 2>&1)
     STATUS=$?
 
     if [ $STATUS -ne 0 ]; then
-        if [ $STATUS -ne 0 ]; then
-            [ -n "$QUIET" ] && cat $LAST_LOG
-            echo "All-in-one patch failed (not rolled back)."
-            echo "Logfile: $LAST_LOG"
-            status=1
-        fi
-    else
-        rm -f $LAST_LOG
+        echo "$LAST_LOG" >> $PATCH_LOG
+        [ -n "$QUIET" ] && echo "$LAST_LOG"
+        echo "All-in-one patch failed (not rolled back)."
+        echo "Logfile: $PATCH_LOG"
+        status=1
     fi
 
     PATCHES=( ${PATCHES_AFTER[@]} )
@@ -131,58 +126,48 @@ apply_patches() {
         echo "[ $PATCH ]" >> $PATCH_LOG
         backup_dir=$PATCH_DIR/.pc/$PATCH
 
-        exec 5<&1  # duplicate stdin
-        case $PATCH in
-        *.gz)	exec < <(gzip -cd $PATCH) ;;
-        *.bz2)	exec < <(bzip2 -cd $PATCH) ;;
-        *)		exec < $PATCH ;;
-        esac
-        patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
-                --no-backup-if-mismatch --force > $LAST_LOG 2>&1
+        LAST_LOG=$(patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
+                --no-backup-if-mismatch --force < $PATCH 2>&1)
         STATUS=$?
-        exec 0<&5  # restore stdin
 
         if [ $STATUS -ne 0 ]; then
             restore_files $backup_dir $PATCH_DIR
 
 	    if $SKIP_REVERSE; then
-		case $PATCH in
-		*.gz)	exec < <(gzip -cd $PATCH) ;;
-		*.bz2)	exec < <(bzip2 -cd $PATCH) ;;
-		*)		exec < $PATCH ;;
-		esac
-		patch -R -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 \
-			-E $fuzz --no-backup-if-mismatch --force --dry-run \
-			> $LAST_LOG 2>&1
+		patch -R -d $PATCH_DIR -p1 -E $fuzz --force --dry-run \
+			< $PATCH > /dev/null 2>&1
 		ST=$?
-		exec 0<&5  # restore stdin
 		if [ $ST -eq 0 ]; then
-			echo "[ skipped: can be reverse-applied ]"
-			echo "[ skipped: can be reverse-applied ]" >> $PATCH_LOG
+			LAST_LOG="[ skipped: can be reverse-applied ]"
+			[ -n "$QUIET" ] && echo "$LAST_LOG"
 			STATUS=0
 			SKIPPED_PATCHES="$SKIPPED_PATCHES $PATCH"
 			PATCH="# $PATCH"
+			remove_rejects $backup_dir $PATCH_DIR
 		fi
+	    fi
+
+	    # Backup directory is no longer needed
+	    rm -rf $backup_dir
+	else
+	    if $QUILT; then
+		echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
 	    fi
         fi
 
         if ! $QUILT; then
             rm -rf $PATCH_DIR/.pc/
         fi
-        cat $LAST_LOG >> $PATCH_LOG
-        [ -z "$QUIET" ] && cat $LAST_LOG
+        echo "$LAST_LOG" >> $PATCH_LOG
+        [ -z "$QUIET" ] && echo "$LAST_LOG"
         if [ $STATUS -ne 0 ]; then
-            [ -n "$QUIET" ] && cat $LAST_LOG
+            [ -n "$QUIET" ] && echo "$LAST_LOG"
             echo "Patch $PATCH failed (rolled back)."
             echo "Logfile: $PATCH_LOG"
             status=1
             break
         else
             echo "$SERIES_PFX$PATCH" >> $PATCH_DIR/series
-            if $QUILT; then
-                echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
-            fi
-            rm -f $LAST_LOG
         fi
 
         shift
@@ -319,11 +304,15 @@ if [ $# -ge 1 ]; then
 fi
 
 if test -z "$CONFIG"; then
-	CONFIG=$(uname -m)-default
-	case "$CONFIG" in
-	i?86-*)
-		CONFIG=i386-pae
-	esac
+	if test "$VANILLA_ONLY" = 1; then
+		CONFIG=$(uname -m)-vanilla
+	else
+		CONFIG=$(uname -m)-default
+		case "$CONFIG" in
+		i?86-*)
+			CONFIG=i386-pae
+		esac
+	fi
 fi
 
 CONFIG_ARCH=${CONFIG%%-*}
@@ -379,7 +368,6 @@ if $VANILLA; then
 	TAG=${TAG}-vanilla
 fi
 PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION${TAG:+-$TAG}.log
-LAST_LOG=$SCRATCH_AREA/last-$SRCVERSION${TAG:+-$TAG}.log
 
 # Check series.conf.
 if [ ! -r series.conf ]; then
@@ -444,17 +432,10 @@ fi
 echo "Creating tree in $PATCH_DIR"
 
 # Clean up from previous run
-rm -f "$PATCH_LOG" "$LAST_LOG"
+rm -f "$PATCH_LOG"
 if [ -e $PATCH_DIR ]; then
-    tmpdir=$(mktemp -d ${PATCH_DIR%/*}/${0##*/}.XXXXXX)
-    if [ -n "$tmpdir" ]; then
-	echo "Cleaning up from previous run (background)"
-	mv $PATCH_DIR $tmpdir
-	rm -rf $tmpdir &
-    else
-	echo "Cleaning up from previous run"
-	rm -rf $PATCH_DIR
-    fi
+    echo "Cleaning up from previous run"
+    rm -rf $PATCH_DIR
 fi
 
 # Create fresh $SCRATCH_AREA/linux-$SRCVERSION.
@@ -509,7 +490,7 @@ fi
 # Helper function to restore files backed up by patch. This is
 # faster than doing a --dry-run first.
 restore_files() {
-    local backup_dir=$1 patch_dir=$2 file wd=$PWD
+    local backup_dir=$1 patch_dir=$2 file
     local -a remove restore
  
     if [ -d $backup_dir ]; then
@@ -527,6 +508,26 @@ restore_files() {
 		| xargs cp -f --parents --target $patch_dir
 	cd $patch_dir
 	#echo "Remove: ${remove[@]}"
+	[ ${#remove[@]} -ne 0 ] \
+	    && printf "%s\n" "${remove[@]}" | xargs rm -f
+	popd > /dev/null
+    fi
+}
+
+# Helper function to remove stray .rej files.
+remove_rejects() {
+    local backup_dir=$1 patch_dir=$2 file
+    local -a remove
+
+    if [ -d $backup_dir ]; then
+	pushd $backup_dir > /dev/null
+	for file in $(find . -type f) ; do
+	    if [ -f "$patch_dir/$file.rej" ]; then
+		remove[${#remove[@]}]="$file.rej"
+	    fi
+	done
+	cd $patch_dir
+	#echo "Remove rejects: ${remove[@]}"
 	[ ${#remove[@]} -ne 0 ] \
 	    && printf "%s\n" "${remove[@]}" | xargs rm -f
 	popd > /dev/null
