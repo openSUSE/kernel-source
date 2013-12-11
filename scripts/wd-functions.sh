@@ -50,7 +50,11 @@ _find_tarball()
         major=3.x
     esac
     if test -z "$suffixes"; then
-        suffixes="tar.xz tar.bz2"
+        if test -n "$(type -p xz)"; then
+            suffixes="tar.xz tar.bz2"
+        else
+            suffixes="tar.bz2"
+        fi
     fi
     for dir in . $MIRROR {/mounts,/labs,}/mirror/kernel; do
         for subdir in "" "/v$major" "/testing" "/v$major/testing"; do
@@ -142,7 +146,7 @@ unpack_tarball()
         echo "Extracting $tarball"
         case "$tarball" in
         *.bz2) tar -xjf "$tarball" -C "$dest" --strip-components=1 ;;
-        *.xz) tar -xJf "$tarball" -C "$dest" --strip-components=1 ;;
+        *.xz) xz -d <"$tarball" | tar -xf - -C "$dest" --strip-components=1 ;;
         *) tar -xf "$tarball" -C "$dest" --strip-components=1 ;;
         esac
         return
