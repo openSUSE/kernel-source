@@ -588,8 +588,8 @@ fi
 # they can be fixed up with quilt (or similar).
 if [ -n "${PATCHES[*]}" ]; then
     ( IFS=$'\n' ; echo "${PATCHES[*]}" ) >> $PATCH_DIR/series
-    show_skipped
 fi
+show_skipped
 if test "0$status" -ne 0; then
     exit $status
 fi
@@ -637,5 +637,3 @@ if $CSCOPE; then
 	echo "[ Could not generate cscope db: cscope not found ]"
     fi
 fi
-
-show_skipped
