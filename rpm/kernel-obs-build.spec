@@ -53,14 +53,15 @@ loaded during build when installing the kernel package.
 export KERNEL_MODULES="loop dm-mod dm-snapshot binfmt-misc fuse kqemu squashfs ext2 ext3 ext4 reiserfs nf_conntrack_ipv6 binfmt_misc virtio_pci virtio_blk fat vfat nls_cp437 nls_iso8859-1"
 mkdir -p /sys
 mount /sys /sys -t sysfs
-ROOT="/dev/vda"
-[ -e /dev/hda1 ] && ROOT="/dev/hda1" # for xen builds
-/sbin/mkinitrd -d $ROOT \
+ROOT=""
+[ -e "/dev/vda" ] && ROOT="-d /dev/vda"
+[ -e /dev/hda1 ] && ROOT="-d /dev/hda1" # for xen builds
+/sbin/mkinitrd $ROOT \
                -m "$KERNEL_MODULES" \
                -k /boot/vmlinu?-*-default -M /boot/System.map-*-default -i /tmp/initrd.kvm
 
 %ifarch %ix86 x86_64
-/sbin/mkinitrd -d $ROOT \
+/sbin/mkinitrd $ROOT \
                -m "$KERNEL_MODULES" \
                -k /boot/vmlinuz-xen -M /boot/System.map-*-xen -i /tmp/initrd.xen
 %endif
