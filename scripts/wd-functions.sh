@@ -41,7 +41,7 @@ get_branch_name()
 
 _find_tarball()
 {
-    local version=$1 dir subdir major
+    local version=$1 suffixes=$2 dir subdir major suffix
 
     set -- ${version//[.-]/ }
     major=$1.$2
@@ -49,12 +49,21 @@ _find_tarball()
     3.*)
         major=3.x
     esac
+    if test -z "$suffixes"; then
+        if test -n "$(type -p xz)"; then
+            suffixes="tar.xz tar.bz2"
+        else
+            suffixes="tar.bz2"
+        fi
+    fi
     for dir in . $MIRROR {/mounts,/labs,}/mirror/kernel; do
         for subdir in "" "/v$major" "/testing" "/v$major/testing"; do
-            if test -r "$dir$subdir/linux-$version.tar.bz2"; then
-                echo "$dir$subdir/linux-$version.tar.bz2"
-                return
-            fi
+            for suffix in $suffixes; do
+                if test -r "$dir$subdir/linux-$version.$suffix"; then
+                    echo "$_"
+                    return
+                fi
+            done
         done
     done
 }
@@ -97,22 +106,33 @@ _get_tarball_from_git()
 
 get_tarball()
 {
-    local version=$1 dest=$2 tarball
+    local version=$1 suffix=$2 dest=$3 tarball compress
 
-    tarball=$(_find_tarball "$version")
+    tarball=$(_find_tarball "$version" "$suffix")
     if test -n "$tarball"; then
-        cp "$tarball" "$dest/linux-$version.tar.bz2.part" || exit
-        mv "$dest/linux-$version.tar.bz2.part" "$dest/linux-$version.tar.bz2"
+        cp "$tarball" "$dest/linux-$version.$suffix.part" || exit
+        mv "$dest/linux-$version.$suffix.part" "$dest/linux-$version.$suffix"
         return
     fi
-    echo "Warning: could not find linux-$version.tar.bz2, trying to create it from git" >&2
+    echo "Warning: could not find linux-$version.$suffix, trying to create it from git" >&2
+    case "$suffix" in
+    tar.bz2)
+        compress="bzip2 -9"
+        ;;
+    tar.xz)
+        compress="xz"
+        ;;
+    *)
+        echo "Unknown compression format: $suffix" >&2
+        exit 1
+    esac
     set -o pipefail
-    _get_tarball_from_git "$version" | bzip2 -9 \
-        >"$dest/linux-$version.tar.bz2.part"
+    _get_tarball_from_git "$version" | $compress \
+        >"$dest/linux-$version.$suffix.part"
     if test $? -ne 0; then
         exit 1
     fi
-    mv "$dest/linux-$version.tar.bz2.part" "$dest/linux-$version.tar.bz2"
+    mv "$dest/linux-$version.$suffix.part" "$dest/linux-$version.$suffix"
     set +o pipefail
 }
 
@@ -124,10 +144,14 @@ unpack_tarball()
     mkdir -p "$dest"
     if test -n "$tarball"; then
         echo "Extracting $tarball"
-        tar -xjf "$tarball" -C "$dest" --strip-components=1
+        case "$tarball" in
+        *.bz2) tar -xjf "$tarball" -C "$dest" --strip-components=1 ;;
+        *.xz) xz -d <"$tarball" | tar -xf - -C "$dest" --strip-components=1 ;;
+        *) tar -xf "$tarball" -C "$dest" --strip-components=1 ;;
+        esac
         return
     fi
-    echo "Warning: could not find linux-$version.tar.bz2, trying to create it from git" >&2
+    echo "Warning: could not find linux-$version.tar.(bz2|xz), trying to create it from git" >&2
     echo "alternatively you can put an unpatched kernel tree to $dest" >&2
     set -o pipefail
     _get_tarball_from_git "$version" | tar -xf - -C "$dest" --strip-components=1

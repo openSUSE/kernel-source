@@ -154,7 +154,7 @@ done
 mkdir -p "$build_dir"
 if test ! -e "$build_dir/linux-$SRCVERSION.tar.bz2"; then
 	echo "linux-$SRCVERSION.tar.bz2"
-	get_tarball "$SRCVERSION" "$build_dir"
+	get_tarball "$SRCVERSION" "tar.bz2" "$build_dir"
 fi
 
 # list of patches to include.
