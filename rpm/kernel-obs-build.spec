@@ -1,7 +1,7 @@
 #
 # spec file for package kernel-obs-build
 #
-# Copyright (c) 2013 SUSE LINUX Products GmbH, Nuernberg, Germany.
+# Copyright (c) 2014 SUSE LINUX Products GmbH, Nuernberg, Germany.
 #
 # All modifications and additions to the file contributed by third parties
 # remain the property of their copyright owners, unless otherwise agreed
@@ -14,30 +14,31 @@
 
 # Please submit bugfixes or comments via http://bugs.opensuse.org/
 #
-
 # needsrootforbuild
+
 
 #!BuildIgnore: post-build-checks
 
-Name:         kernel-obs-build
-BuildRequires: mkinitrd
-BuildRequires: device-mapper
-BuildRequires: coreutils util-linux
+Name:           kernel-obs-build
+BuildRequires:  coreutils
+BuildRequires:  device-mapper
+BuildRequires:  mkinitrd
+BuildRequires:  util-linux
 
-BuildRequires: kernel-default
+BuildRequires:  kernel-default
 %ifarch %ix86 x86_64
-BuildRequires: kernel-xen
+BuildRequires:  kernel-xen
 %endif
 %if 0%{?suse_version} < 1200
 # For SLE 11
-BuildRequires: yast2-bootloader
+BuildRequires:  yast2-bootloader
 BuildRoot:      %{_tmppath}/%{name}-%{version}-build
-Group:        SLES
 %endif
-License:      GPL
-Summary:      package kernel and initrd for OBS VM builds
-Version:      1
-Release:      0
+Summary:        package kernel and initrd for OBS VM builds
+License:        GPL-2.0
+Group:          SLES
+Version:        1
+Release:        0
 
 %description
 This package is repackaging already compiled kernels to make them usable
@@ -80,3 +81,4 @@ cp -v /tmp/initrd.xen $RPM_BUILD_ROOT/.build.initrd.xen
 /.build.kernel.*
 /.build.initrd.*
 
+%changelog
