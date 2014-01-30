@@ -1,7 +1,7 @@
 #
-# spec file for package kernel-obs-build
+# spec file for package kernel-obs-qa
 #
-# Copyright (c) 2013 SUSE LINUX Products GmbH, Nuernberg, Germany.
+# Copyright (c) 2014 SUSE LINUX Products GmbH, Nuernberg, Germany.
 #
 # All modifications and additions to the file contributed by third parties
 # remain the property of their copyright owners, unless otherwise agreed
@@ -14,24 +14,24 @@
 
 # Please submit bugfixes or comments via http://bugs.opensuse.org/
 #
-
 # needsrootforbuild
 
-Name:         kernel-obs-qa
-BuildRequires: module-init-tools
-BuildRequires: kernel-default
+
+Name:           kernel-obs-qa
+BuildRequires:  kernel-default
+BuildRequires:  module-init-tools
 %ifarch %ix86 x86_64
-BuildRequires: kernel-xen
+BuildRequires:  kernel-xen
 %endif
 %if 0%{?suse_version} < 1200
 # for SLE 11
 BuildRoot:      %{_tmppath}/%{name}-%{version}-build
-Group:        SLES
 %endif
-License:      GPL
-Summary:      Basic QA tests for the kernel
-Version:      1
-Release:      0
+Summary:        Basic QA tests for the kernel
+License:        GPL-2.0
+Group:          SLES
+Version:        1
+Release:        0
 
 %description
 This package is using the kernel compiled within Open Build Service(OBS)
@@ -59,3 +59,4 @@ touch %{buildroot}/usr/share/kernel-qa/logfile
 %defattr(-,root,root)
 /usr/share/kernel-qa
 
+%changelog
