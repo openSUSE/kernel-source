@@ -19,7 +19,7 @@
 
 Name:           kernel-obs-qa
 BuildRequires:  kernel-default
-BuildRequires:  module-init-tools
+BuildRequires:  modutils
 %ifarch %ix86 x86_64
 BuildRequires:  kernel-xen
 %endif
