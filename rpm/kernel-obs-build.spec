@@ -53,8 +53,6 @@ loaded during build when installing the kernel package.
 # a longer list to have them also available for qemu cross builds where x86_64 kernel runs in eg. arm env.
 # this list of modules where available on build workers of build.opensuse.org, so we stay compatible.
 export KERNEL_MODULES="loop dm-mod dm-snapshot binfmt-misc fuse kqemu squashfs ext2 ext3 ext4 reiserfs nf_conntrack_ipv6 binfmt_misc virtio_pci virtio_blk fat vfat nls_cp437 nls_iso8859-1 ibmvscsi"
-mkdir -p /sys
-mount /sys /sys -t sysfs
 ROOT=""
 [ -e "/dev/vda" ] && ROOT="-d /dev/vda"
 [ -e /dev/hda1 ] && ROOT="-d /dev/hda1" # for xen builds
