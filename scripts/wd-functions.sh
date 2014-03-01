@@ -110,8 +110,12 @@ get_tarball()
 
     tarball=$(_find_tarball "$version" "$suffix")
     if test -n "$tarball"; then
-        cp "$tarball" "$dest/linux-$version.$suffix.part" || exit
+        cp -p "$tarball" "$dest/linux-$version.$suffix.part" || exit
         mv "$dest/linux-$version.$suffix.part" "$dest/linux-$version.$suffix"
+        return
+    fi
+    # Reuse the locally generated tarball if already there
+    if test -e "$dest/linux-$version.$suffix"; then
         return
     fi
     echo "Warning: could not find linux-$version.$suffix, trying to create it from git" >&2

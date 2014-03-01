@@ -120,10 +120,8 @@ for f in "$build_dir"/*; do
 	rm -f "$f"
 done
 mkdir -p "$build_dir"
-if test ! -e "$build_dir/linux-$SRCVERSION.$suffix"; then
-	echo "linux-$SRCVERSION.$suffix"
-	get_tarball "$SRCVERSION" "$suffix" "$build_dir"
-fi
+echo "linux-$SRCVERSION.$suffix"
+get_tarball "$SRCVERSION" "$suffix" "$build_dir"
 
 # list of patches to include.
 install -m 644 series.conf $build_dir/
