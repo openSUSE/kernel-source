@@ -39,7 +39,6 @@ License:        GPL-2.0
 Group:          SLES
 Version:        1
 Release:        0
-ExclusiveArch:  %ix86 x86_64 s390x ppc64le
 
 %description
 This package is repackaging already compiled kernels to make them usable
