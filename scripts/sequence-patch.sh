@@ -304,7 +304,7 @@ if [ $# -ge 1 ]; then
 fi
 
 if test -z "$CONFIG"; then
-	if test "$VANILLA_ONLY" = 1; then
+	if test "$VANILLA_ONLY" = 1 || $VANILLA; then
 		CONFIG=$(uname -m)-vanilla
 	else
 		CONFIG=$(uname -m)-default
