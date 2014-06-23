@@ -62,7 +62,8 @@ run_bootloader () {
 	    [ -f /boot/grub/menu.lst -o \
 	      -f /etc/lilo.conf      -o \
 	      -f /etc/elilo.conf     -o \
-	      -f /etc/zipl.conf ]
+	      -f /etc/zipl.conf      -o \
+	      -f /etc/default/grub    ]
     then
 	return 0
     else
