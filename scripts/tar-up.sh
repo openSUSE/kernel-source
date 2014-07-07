@@ -109,20 +109,19 @@ check_for_merge_conflicts() {
     fi
 }
 
+suffix=$(sed -rn 's/^Source0:.*\.(tar\.[a-z0-9]*)$/\1/p' rpm/kernel-source.spec.in)
 # Dot files are skipped by intention, in order not to break osc working
 # copies. The linux tarball is not deleted if it is already there
 for f in "$build_dir"/*; do
 	case "$f" in
-	*/"linux-$SRCVERSION.tar.bz2")
+	*/"linux-$SRCVERSION.$suffix")
 		continue
 	esac
 	rm -f "$f"
 done
 mkdir -p "$build_dir"
-if test ! -e "$build_dir/linux-$SRCVERSION.tar.bz2"; then
-	echo "linux-$SRCVERSION.tar.bz2"
-	get_tarball "$SRCVERSION" "$build_dir"
-fi
+echo "linux-$SRCVERSION.$suffix"
+get_tarball "$SRCVERSION" "$suffix" "$build_dir"
 
 # list of patches to include.
 install -m 644 series.conf $build_dir/

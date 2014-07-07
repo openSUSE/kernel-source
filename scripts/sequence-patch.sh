@@ -70,23 +70,18 @@ END
 }
 
 apply_fast_patches() {
-    before=$(echo ${PATCHES_BEFORE[@]}|wc -w)
-    after=$(echo ${PATCHES_AFTER[@]}|wc -w)
-    echo "[ Fast-applying $before patches. $after remain. ]"
-    cat "${PATCHES_BEFORE[@]}" | \
+    echo "[ Fast-applying ${#PATCHES_BEFORE[@]} patches. ${#PATCHES_AFTER[@]} remain. ]"
+    LAST_LOG=$(cat "${PATCHES_BEFORE[@]}" | \
         patch -d $PATCH_DIR -p1 -E $fuzz --force --no-backup-if-mismatch \
-		-s > $LAST_LOG 2>&1
+		-s 2>&1)
     STATUS=$?
 
     if [ $STATUS -ne 0 ]; then
-        if [ $STATUS -ne 0 ]; then
-            [ -n "$QUIET" ] && cat $LAST_LOG
-            echo "All-in-one patch failed (not rolled back)."
-            echo "Logfile: $LAST_LOG"
-            status=1
-        fi
-    else
-        rm -f $LAST_LOG
+        echo "$LAST_LOG" >> $PATCH_LOG
+        [ -n "$QUIET" ] && echo "$LAST_LOG"
+        echo "All-in-one patch failed (not rolled back)."
+        echo "Logfile: $PATCH_LOG"
+        status=1
     fi
 
     PATCHES=( ${PATCHES_AFTER[@]} )
@@ -131,8 +126,8 @@ apply_patches() {
         echo "[ $PATCH ]" >> $PATCH_LOG
         backup_dir=$PATCH_DIR/.pc/$PATCH
 
-        patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
-                --no-backup-if-mismatch --force < $PATCH > $LAST_LOG 2>&1
+        LAST_LOG=$(patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
+                --no-backup-if-mismatch --force < $PATCH 2>&1)
         STATUS=$?
 
         if [ $STATUS -ne 0 ]; then
@@ -140,11 +135,11 @@ apply_patches() {
 
 	    if $SKIP_REVERSE; then
 		patch -R -d $PATCH_DIR -p1 -E $fuzz --force --dry-run \
-			< $PATCH > $LAST_LOG 2>&1
+			< $PATCH > /dev/null 2>&1
 		ST=$?
 		if [ $ST -eq 0 ]; then
-			echo "[ skipped: can be reverse-applied ]"
-			echo "[ skipped: can be reverse-applied ]" >> $PATCH_LOG
+			LAST_LOG="[ skipped: can be reverse-applied ]"
+			[ -n "$QUIET" ] && echo "$LAST_LOG"
 			STATUS=0
 			SKIPPED_PATCHES="$SKIPPED_PATCHES $PATCH"
 			PATCH="# $PATCH"
@@ -163,17 +158,16 @@ apply_patches() {
         if ! $QUILT; then
             rm -rf $PATCH_DIR/.pc/
         fi
-        cat $LAST_LOG >> $PATCH_LOG
-        [ -z "$QUIET" ] && cat $LAST_LOG
+        echo "$LAST_LOG" >> $PATCH_LOG
+        [ -z "$QUIET" ] && echo "$LAST_LOG"
         if [ $STATUS -ne 0 ]; then
-            [ -n "$QUIET" ] && cat $LAST_LOG
+            [ -n "$QUIET" ] && echo "$LAST_LOG"
             echo "Patch $PATCH failed (rolled back)."
             echo "Logfile: $PATCH_LOG"
             status=1
             break
         else
             echo "$SERIES_PFX$PATCH" >> $PATCH_DIR/series
-            rm -f $LAST_LOG
         fi
 
         shift
@@ -310,7 +304,7 @@ if [ $# -ge 1 ]; then
 fi
 
 if test -z "$CONFIG"; then
-	if test "$VANILLA_ONLY" = 1; then
+	if test "$VANILLA_ONLY" = 1 || $VANILLA; then
 		CONFIG=$(uname -m)-vanilla
 	else
 		CONFIG=$(uname -m)-default
@@ -374,7 +368,6 @@ if $VANILLA; then
 	TAG=${TAG}-vanilla
 fi
 PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION${TAG:+-$TAG}.log
-LAST_LOG=$SCRATCH_AREA/last-$SRCVERSION${TAG:+-$TAG}.log
 
 # Check series.conf.
 if [ ! -r series.conf ]; then
@@ -439,7 +432,7 @@ fi
 echo "Creating tree in $PATCH_DIR"
 
 # Clean up from previous run
-rm -f "$PATCH_LOG" "$LAST_LOG"
+rm -f "$PATCH_LOG"
 if [ -e $PATCH_DIR ]; then
     echo "Cleaning up from previous run"
     rm -rf $PATCH_DIR
@@ -595,10 +588,10 @@ fi
 # they can be fixed up with quilt (or similar).
 if [ -n "${PATCHES[*]}" ]; then
     ( IFS=$'\n' ; echo "${PATCHES[*]}" ) >> $PATCH_DIR/series
-    show_skipped
-    if test "0$status" -ne 0; then
-	    exit $status
-    fi
+fi
+show_skipped
+if test "0$status" -ne 0; then
+    exit $status
 fi
 
 if test -e supported.conf; then
@@ -644,5 +637,3 @@ if $CSCOPE; then
 	echo "[ Could not generate cscope db: cscope not found ]"
     fi
 fi
-
-show_skipped

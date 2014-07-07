@@ -152,10 +152,8 @@ for f in "$build_dir"/*; do
 	rm -f "$f"
 done
 mkdir -p "$build_dir"
-if test ! -e "$build_dir/linux-$SRCVERSION.tar.bz2"; then
-	echo "linux-$SRCVERSION.tar.bz2"
-	get_tarball "$SRCVERSION" "$build_dir"
-fi
+echo "linux-$SRCVERSION.tar.bz2"
+get_tarball "$SRCVERSION" "tar.bz2" "$build_dir"
 
 # list of patches to include.
 install -m 644 series.conf $build_dir/

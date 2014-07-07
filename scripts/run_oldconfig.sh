@@ -313,7 +313,7 @@ for config in $config_files; do
     fi
 
     case $config in
-    ppc/*|ppc64/*)
+    ppc*/*)
         if test -e arch/powerpc/Makefile; then
             MAKE_ARGS="ARCH=powerpc"
         else
