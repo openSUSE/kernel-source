@@ -1,35 +1,9 @@
 # Flag to trigger /etc/init.d/purge-kernels on next reboot (fate#312018)
 touch /boot/do_purge_kernels
 
-# It must be possible to install different kernel.rpm packages in parallel.
-# But in this post install script, the /boot/vmlinux symlink is replaced.
-# On powerpc, the different kernels are for different board/firmware types
-# They are not compatible.
-wrong_boardtype() {
-    echo "This kernel-@FLAVOR@.@RPM_TARGET_CPU@.rpm is for $1, it will not boot on this system."
-    echo "The /boot/vmlinux symlink will not be created or updated."
-    exit 0
-}
-if [ -f /proc/cpuinfo ]; then
-    case "@FLAVOR@-@RPM_TARGET_CPU@" in
-	vanilla-ppc64|default-ppc64le|default-ppc64|ps3-ppc64|ppc64-ppc64|kdump-ppc64|ps3-ppc|ppc64-ppc|kdump-ppc)
-		if [ -d /proc/iSeries -o ! -d /proc/ppc64 ]; then
-			wrong_boardtype "OpenFirmware based 64bit machines"
-		fi
-	;;
-	vanilla-ppc|default-ppc)
-		if [ -d /proc/ppc64 -o -d /proc/iSeries ]; then
-			wrong_boardtype "32bit systems"
-		fi
-	;;
-	*)
-	;;
-    esac
-fi
-
 suffix=
 case @FLAVOR@ in
-    kdump|ps3|xen*|ec2|vanilla)
+    xen*|ec2|vanilla)
 	suffix=-@FLAVOR@
 	;;
 esac
@@ -70,11 +44,6 @@ run_bootloader () {
 	return 1
     fi
 }
-
-# exit out early for Moblin as we don't want to touch the bootloader menu
-if [ -f /etc/SuSE-moblin-release ] ; then
-    exit 0
-fi
 
 if [ -f /etc/fstab -a ! -e /.buildenv ] ; then
     # only run the bootloader if the usual bootloader configuration
