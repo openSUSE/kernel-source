@@ -26,11 +26,6 @@ if [ -x $wm2 ]; then
     /bin/bash -${-/e/} $wm2 --remove-kernel @KERNELRELEASE@-@FLAVOR@
 fi
 
-# exit out early for Moblin as we don't want to touch the bootloader menu
-if [ -f /etc/SuSE-moblin-release ] ; then
-    exit 0
-fi
-
 # remove fstab check once perl-Bootloader can cope with it
 if [ -f /etc/fstab ]; then
 	if [ -x /usr/lib/bootloader/bootloader_entry ]; then
