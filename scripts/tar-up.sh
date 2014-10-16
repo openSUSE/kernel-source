@@ -147,7 +147,7 @@ done
 
 if $SKIP_XEN; then
 	echo "[ Xen configs are disabled. Disabling Xen patches. ]"
-	sed -ie 's#.*patches.xen/#+noxen  &#' $build_dir/series.conf
+	sed -i 's#.*patches.xen/#+noxen  &#' $build_dir/series.conf
 fi
 
 inconsistent=false
