@@ -448,6 +448,9 @@ sub upload_package {
 	my $progresscb = $options->{progresscb} || sub { };
 	my $remove_packages = $options->{remove_packages} || [];
 	my %remove_packages = map { $_ => 1 } @$remove_packages;
+	my $limit_packages = $options->{limit_packages} || [];
+	my %limit_packages = map { $_ => 1 } @$limit_packages;
+	my $do_limit_packages = (scalar(@$limit_packages) > 0);
 	my $revision;
 
 	if (!$self->project_exists($project)) {
@@ -507,6 +510,7 @@ sub upload_package {
 
 	for my $spec (keys(%specfiles)) {
 		next if $remove_packages{$spec};
+		next if $do_limit_packages && !$limit_packages{$spec};
 		$self->create_package($project, $spec);
 		$self->put("/source/$project/$spec/_link", $link_xml);
 		&$progresscb('LINK', "$project/$spec");
