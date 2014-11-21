@@ -213,14 +213,14 @@ sub get_repo_archs {
 		return if $element ne "repository";
 		if (defined($repository)) {
 			return if $attr{name} ne $repository;
-		} elsif ($attr{name} ne "standard" && $attr{name} ne "ports") {
-			return;
-		} elsif ($attr{name} eq "ports" && $project eq "openSUSE:Factory") {
-			return;
 		}
-		$self->{has_match} = 1;
-		$self->{repo_name} = $attr{name};
-		$self->{res}{$attr{name}} ||= [];
+		if ($attr{name} eq "standard" ||
+		    $attr{name} eq "ports" && $project ne "openSUSE:Factory" ||
+		    $attr{name} =~ /^SUSE_.*_Update$/ && $project =~ /^SUSE:Maintenance:/) {
+			$self->{has_match} = 1;
+			$self->{repo_name} = $attr{name};
+			$self->{res}{$attr{name}} ||= [];
+		}
 	};
 	my $handle_char = sub {
 		my ($self, $string) = @_;
