@@ -316,9 +316,11 @@ sub create_project {
 			%repo_archs = $self->get_repo_archs($base, "standard");
 		}
 		for my $r (sort(keys(%repo_archs))) {
-			$writer->startTag("repository",
-				name => $repo ? $repo : $r,
-				rebuild => "local", block => "local");
+			my @attrs = (name => $repo ? $repo : $r);
+			if (!$options->{rebuild}) {
+				push(@attrs, rebuild => "local", block => "local");
+			}
+			$writer->startTag("repository", @attrs);
 			$writer->emptyTag("path", repository => $r,
 				project => $base);
 			for my $arch (@{$repo_archs{$r}}) {
