@@ -275,8 +275,9 @@ stable_tar() {
     shift
 
     if test -z "$mtime" && $using_git; then
+	local dirs=$(printf '%s\n' "$@" | sed 's:/.*::' | sort -u)
         mtime="$(cd "$chdir"
-            echo "$@" | xargs git log -1 --pretty=tformat:%ct -- | sort -n | \
+            echo "${dirs[@]}" | xargs git log -1 --pretty=tformat:%ct -- | sort -n | \
             tail -n 1)"
     fi
     if test -n "$mtime"; then
