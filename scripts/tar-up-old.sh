@@ -558,11 +558,7 @@ all_archives="$(
 for archive in $all_archives; do
     echo "$archive.tar.bz2"
 
-    files="$( echo "$referenced_files" \
-	| sed -ne "\:^${archive//./\\.}/:p" \
-	| while read patch; do
-	    [ -e "$patch" ] && echo "$patch"
-	done)"
+    files="$(echo "$referenced_files" | sed -ne "\:^${archive//./\\.}/:p")"
     if [ -n "$files" ]; then
 	stable_tar $build_dir/$archive.tar.bz2 $files
     fi
