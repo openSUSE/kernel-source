@@ -366,12 +366,6 @@ sub create_project {
 	if ($options->{prjconf}) {
 		$prjconf .= $options->{prjconf};
 	}
-	# Do not use kernel-obs-build in the standard repository
-	$prjconf .= "\%if \"\%_repository\" == \"QA\"\n";
-	$prjconf .= "VMInstall: kernel-obs-build\n";
-	$prjconf .= "\%else\n";
-	$prjconf .= "VMInstall: !kernel-obs-build\n";
-	$prjconf .= "\%endif\n";
 	for my $package (@{$options->{remove_packages} || []}) {
 		# OBS idiom: substitute the package by an empty set
 		$prjconf .= "Substitute: $package\n";
@@ -397,7 +391,7 @@ sub create_package {
 	$writer->dataElement("title", $title);
 	$writer->dataElement("description", $description);
 	# XXX: HACK
-	if ($package =~ /^kernel-obs-qa/) {
+	if ($package =~ /^kernel-obs-(qa|build)/) {
 		$writer->startTag("build");
 		$writer->emptyTag("disable");
 		$writer->emptyTag("enable", repository => "QA");
