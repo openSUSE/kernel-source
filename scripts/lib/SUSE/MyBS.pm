@@ -292,6 +292,7 @@ sub create_project {
 		$writer->emptyTag($options->{$attr} ? "enable" : "disable");
 		if ($attr =~ /^(publish|build)/ && exists($options->{repos}{"QA"})) {
 			$writer->emptyTag("disable", repository => "QA");
+			$writer->emptyTag("disable", repository => "QA_ports");
 		}
 		$writer->endTag($attr);
 	}
@@ -339,24 +340,23 @@ sub create_project {
 		}
 	}
 	if (exists($options->{repos}{QA})) {
-		# The special QA repository builds against the "standard"
-		# and possibly "ports" repository of the project itself
-		$writer->startTag("repository", name => "QA");
+		# The special QA and QA_ports repositories build against
+		# the "standard" and "ports" repositories of the project itself
 		my %std_repos = $self->get_repo_archs($options->{repos}{""});
-		my %std_archs;
 		for my $repo (sort(keys(%std_repos))) {
+			$writer->startTag("repository", name =>
+				($repo eq "standard" ? "QA" : "QA_$repo"));
 			$writer->emptyTag("path", repository => $repo,
 				project => $project);
-			$std_archs{$_} = 1 for @{$std_repos{$repo}};
-		}
-		for my $arch (sort(keys(%std_archs))) {
-			if ($options->{limit_archs} &&
-				!$limit_archs{$arch}) {
-				next;
+			for my $arch (sort(@{$std_repos{$repo}})) {
+				if ($options->{limit_archs} &&
+					!$limit_archs{$arch}) {
+					next;
+				}
+				$writer->dataElement("arch", $arch);
 			}
-			$writer->dataElement("arch", $arch);
+			$writer->endTag("repository");
 		}
-		$writer->endTag("repository");
 	}
 	$writer->endTag("project");
 	$writer->end();
@@ -395,6 +395,7 @@ sub create_package {
 		$writer->startTag("build");
 		$writer->emptyTag("disable");
 		$writer->emptyTag("enable", repository => "QA");
+		$writer->emptyTag("enable", repository => "QA_ports");
 		$writer->endTag("build");
 	}
 	$writer->endTag("package");
