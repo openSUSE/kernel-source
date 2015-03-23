@@ -44,11 +44,11 @@ _find_tarball()
     local version=$1 suffixes=$2 dir subdir major suffix
 
     set -- ${version//[.-]/ }
-    major=$1.$2
-    case "$major" in
-    3.*)
-        major=3.x
-    esac
+    if test $1 -le 2; then
+        major=$1.$2
+    else
+        major=$1.x
+    fi
     if test -z "$suffixes"; then
         if test -n "$(type -p xz)"; then
             suffixes="tar.xz tar.bz2"
