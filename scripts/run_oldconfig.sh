@@ -217,8 +217,10 @@ menuconfig)
 *)
 	case "$TERM" in
 	linux* | xterm* | screen*)
-		use_region=true
-		_region_init_
+		if tty -s; then
+			use_region=true
+			_region_init_
+		fi
 	esac
 esac
 
