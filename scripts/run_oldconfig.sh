@@ -147,7 +147,7 @@ until [ "$#" = "0" ] ; do
 
 ${0##*/} does either:
  * run make oldconfig to clean up the .config files
- * modify kernel .config files in the CVS tree
+ * modify kernel .config files in the GIT tree
 
 run it with no options in your SCRATCH_AREA $SCRATCH_AREA, like
 	patches/scripts/${0##*/}
