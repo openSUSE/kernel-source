@@ -379,7 +379,6 @@ for config in $config_files; do
 	make $MAKE_ARGS oldconfig
     esac
     ask_reuse_config $config .config
-    if ! diff -U0 $config .config; then
-	sed '/^# Linux kernel version:/d' < .config > $config
-    fi
+    diff -U0 $config .config
+    cp .config $config
 done
