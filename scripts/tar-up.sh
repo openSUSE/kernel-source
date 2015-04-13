@@ -147,7 +147,7 @@ done
 
 if $SKIP_XEN; then
 	echo "[ Xen configs are disabled. Disabling Xen patches. ]"
-	sed -ie 's#.*patches.xen/#+noxen  &#' $build_dir/series.conf
+	sed -i 's#.*patches.xen/#+noxen  &#' $build_dir/series.conf
 fi
 
 inconsistent=false
@@ -275,8 +275,9 @@ stable_tar() {
     shift
 
     if test -z "$mtime" && $using_git; then
+	local dirs=$(printf '%s\n' "$@" | sed 's:/.*::' | sort -u)
         mtime="$(cd "$chdir"
-            echo "$@" | xargs git log -1 --pretty=tformat:%ct -- | sort -n | \
+            echo "${dirs[@]}" | xargs git log -1 --pretty=tformat:%ct -- | sort -n | \
             tail -n 1)"
     fi
     if test -n "$mtime"; then
@@ -295,11 +296,7 @@ all_archives="$(
 for archive in $all_archives; do
     echo "$archive.tar.bz2"
 
-    files="$( echo "$referenced_files" \
-	| sed -ne "\:^${archive//./\\.}/:p" \
-	| while read patch; do
-	    [ -e "$patch" ] && echo "$patch"
-	done)"
+    files="$(echo "$referenced_files" | sed -ne "\:^${archive//./\\.}/:p")"
     if [ -n "$files" ]; then
 	stable_tar $build_dir/$archive.tar.bz2 $files
     fi
