@@ -23,7 +23,7 @@
 #########################################################
 # dirty scroll region tricks ...
 
-use_region=0
+use_region=false
 
 function _region_init_ () {
     echo -ne '\x1b[H\033[J'	# clear screen
@@ -39,7 +39,7 @@ function _region_fini_ () {
 
 function _region_msg_ () {
     local msg="$*"
-    if test "$use_region" != "0"; then
+    if $use_region; then
 	echo -ne '\x1b7'	# save cursor
 	echo -ne '\x1b[0;0H'	# move cursor
 	echo -e "##\x1b[K"	# message
@@ -84,7 +84,9 @@ set_var()
 
 function _cleanup_() {
 	test -d "$TMPDIR" && rm -rf $TMPDIR
-	test "$use_region" != 0 && _region_fini_
+	if $use_region; then
+		_region_fini_
+	fi
 }
 TMPDIR=
 trap _cleanup_ EXIT
@@ -215,7 +217,7 @@ menuconfig)
 *)
 	case "$TERM" in
 	linux* | xterm* | screen*)
-		use_region=1
+		use_region=true
 		_region_init_
 	esac
 esac
