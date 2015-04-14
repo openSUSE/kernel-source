@@ -307,11 +307,18 @@ if test -z "$CONFIG"; then
 	if test "$VANILLA_ONLY" = 1 || $VANILLA; then
 		CONFIG=$(uname -m)-vanilla
 	else
-		CONFIG=$(uname -m)-default
-		case "$CONFIG" in
-		i?86-*)
-			CONFIG=i386-pae
+		machine=$(uname -m)
+		case "$machine" in
+		i?86)
+			machine=i386
 		esac
+		if test -e "config/$machine/smp"; then
+			CONFIG=$machine-smp
+		elif test -e "config/$machine/pae"; then
+			CONFIG=$machine-pae
+		else
+			CONFIG=$machine-default
+		fi
 	fi
 fi
 
