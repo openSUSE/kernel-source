@@ -620,10 +620,17 @@ if test -n "$CONFIG"; then
     fi
 fi
 
+# Some archs we use for the config do not exist or have a different name in the
+# kernl source tree
+case $CONFIG_ARCH in
+	s390x) TAGS_ARCH=s390 ;;
+	ppc64|ppc64le) TAGS_ARCH=powerpc ;;
+	*) TAGS_ARCH=$CONFIG_ARCH ;;
+esac
 if $CTAGS; then
     if ctags --version > /dev/null; then
 	echo "[ Generating ctags (this may take a while)]"
-	make -s --no-print-directory -C "$PATCH_DIR" O="$SP_BUILD_DIR" tags
+	ARCH=$TAGS_ARCH make -s --no-print-directory -C "$PATCH_DIR" O="$SP_BUILD_DIR" tags
     else
 	echo "[ Could not generate ctags: ctags not found ]"
     fi
@@ -632,7 +639,7 @@ fi
 if $CSCOPE; then
     if cscope -V 2> /dev/null; then
 	echo "[ Generating cscope db (this may take a while)]"
-	make -s --no-print-directory -C "$PATCH_DIR" O="$SP_BUILD_DIR" cscope
+	ARCH=$TAGS_ARCH make -s --no-print-directory -C "$PATCH_DIR" O="$SP_BUILD_DIR" cscope
     else
 	echo "[ Could not generate cscope db: cscope not found ]"
     fi

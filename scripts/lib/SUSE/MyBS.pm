@@ -213,14 +213,14 @@ sub get_repo_archs {
 		return if $element ne "repository";
 		if (defined($repository)) {
 			return if $attr{name} ne $repository;
-		} elsif ($attr{name} ne "standard" && $attr{name} ne "ports") {
-			return;
-		} elsif ($attr{name} eq "ports" && $project eq "openSUSE:Factory") {
-			return;
 		}
-		$self->{has_match} = 1;
-		$self->{repo_name} = $attr{name};
-		$self->{res}{$attr{name}} ||= [];
+		if ($attr{name} eq "standard" ||
+		    $attr{name} eq "ports" && $project ne "openSUSE:Factory" ||
+		    $attr{name} =~ /^SUSE_.*_Update$/ && $project =~ /^SUSE:Maintenance:/) {
+			$self->{has_match} = 1;
+			$self->{repo_name} = $attr{name};
+			$self->{res}{$attr{name}} ||= [];
+		}
 	};
 	my $handle_char = sub {
 		my ($self, $string) = @_;
@@ -292,6 +292,7 @@ sub create_project {
 		$writer->emptyTag($options->{$attr} ? "enable" : "disable");
 		if ($attr =~ /^(publish|build)/ && exists($options->{repos}{"QA"})) {
 			$writer->emptyTag("disable", repository => "QA");
+			$writer->emptyTag("disable", repository => "QA_ports");
 		}
 		$writer->endTag($attr);
 	}
@@ -316,9 +317,11 @@ sub create_project {
 			%repo_archs = $self->get_repo_archs($base, "standard");
 		}
 		for my $r (sort(keys(%repo_archs))) {
-			$writer->startTag("repository",
-				name => $repo ? $repo : $r,
-				rebuild => "local", block => "local");
+			my @attrs = (name => $repo ? $repo : $r);
+			if (!$options->{rebuild}) {
+				push(@attrs, rebuild => "local", block => "local");
+			}
+			$writer->startTag("repository", @attrs);
 			$writer->emptyTag("path", repository => $r,
 				project => $base);
 			for my $arch (@{$repo_archs{$r}}) {
@@ -337,24 +340,23 @@ sub create_project {
 		}
 	}
 	if (exists($options->{repos}{QA})) {
-		# The special QA repository builds against the "standard"
-		# and possibly "ports" repository of the project itself
-		$writer->startTag("repository", name => "QA");
+		# The special QA and QA_ports repositories build against
+		# the "standard" and "ports" repositories of the project itself
 		my %std_repos = $self->get_repo_archs($options->{repos}{""});
-		my %std_archs;
 		for my $repo (sort(keys(%std_repos))) {
+			$writer->startTag("repository", name =>
+				($repo eq "standard" ? "QA" : "QA_$repo"));
 			$writer->emptyTag("path", repository => $repo,
 				project => $project);
-			$std_archs{$_} = 1 for @{$std_repos{$repo}};
-		}
-		for my $arch (sort(keys(%std_archs))) {
-			if ($options->{limit_archs} &&
-				!$limit_archs{$arch}) {
-				next;
+			for my $arch (sort(@{$std_repos{$repo}})) {
+				if ($options->{limit_archs} &&
+					!$limit_archs{$arch}) {
+					next;
+				}
+				$writer->dataElement("arch", $arch);
 			}
-			$writer->dataElement("arch", $arch);
+			$writer->endTag("repository");
 		}
-		$writer->endTag("repository");
 	}
 	$writer->endTag("project");
 	$writer->end();
@@ -364,12 +366,6 @@ sub create_project {
 	if ($options->{prjconf}) {
 		$prjconf .= $options->{prjconf};
 	}
-	# Do not use kernel-obs-build in the standard repository
-	$prjconf .= "\%if \"\%_repository\" == \"QA\"\n";
-	$prjconf .= "VMInstall: kernel-obs-build\n";
-	$prjconf .= "\%else\n";
-	$prjconf .= "VMInstall: !kernel-obs-build\n";
-	$prjconf .= "\%endif\n";
 	for my $package (@{$options->{remove_packages} || []}) {
 		# OBS idiom: substitute the package by an empty set
 		$prjconf .= "Substitute: $package\n";
@@ -395,10 +391,11 @@ sub create_package {
 	$writer->dataElement("title", $title);
 	$writer->dataElement("description", $description);
 	# XXX: HACK
-	if ($package =~ /^kernel-obs-qa/) {
+	if ($package =~ /^kernel-obs-(qa|build)/) {
 		$writer->startTag("build");
 		$writer->emptyTag("disable");
 		$writer->emptyTag("enable", repository => "QA");
+		$writer->emptyTag("enable", repository => "QA_ports");
 		$writer->endTag("build");
 	}
 	$writer->endTag("package");
