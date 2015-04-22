@@ -23,7 +23,7 @@
 #########################################################
 # dirty scroll region tricks ...
 
-use_region=0
+use_region=false
 
 function _region_init_ () {
     echo -ne '\x1b[H\033[J'	# clear screen
@@ -39,7 +39,10 @@ function _region_fini_ () {
 
 function _region_msg_ () {
     local msg="$*"
-    if test "$use_region" != "0"; then
+    if $silent; then
+	    return
+    fi
+    if $use_region; then
 	echo -ne '\x1b7'	# save cursor
 	echo -ne '\x1b[0;0H'	# move cursor
 	echo -e "##\x1b[K"	# message
@@ -53,6 +56,14 @@ function _region_msg_ () {
     fi
 }
 
+info()
+{
+	if $silent; then
+		return
+	fi
+	echo "$@"
+}
+
 set_var()
 {
 	local name=$1 val=$2 config config_files
@@ -64,10 +75,10 @@ set_var()
 	esac
 	config_files=$(${prefix}scripts/guards $CONFIG_SYMBOLS < ${prefix}config.conf)
 	if [ -n "$set_flavor" ] ; then
-		echo "appending $name=$val to all -$set_flavor config files listed in config.conf"
+		info "appending $name=$val to all -$set_flavor config files listed in config.conf"
 		config_files=$(printf "%s\n" $config_files | grep "/$set_flavor\$")
 	else
-		echo "appending $name=$val to all config files listed in config.conf"
+		info "appending $name=$val to all config files listed in config.conf"
 	fi
 	for config in $config_files; do
 		if test -L "${prefix}config/$config"; then
@@ -84,7 +95,9 @@ set_var()
 
 function _cleanup_() {
 	test -d "$TMPDIR" && rm -rf $TMPDIR
-	test "$use_region" != 0 && _region_fini_
+	if $use_region; then
+		_region_fini_
+	fi
 }
 TMPDIR=
 trap _cleanup_ EXIT
@@ -96,6 +109,7 @@ cpu_arch=
 mode=oldconfig
 option=
 value=
+silent=false
 until [ "$#" = "0" ] ; do
 	case "$1" in
 	y|-y|--yes)
@@ -140,12 +154,16 @@ until [ "$#" = "0" ] ; do
 		set_flavor="vanilla"
 		shift
 		;;
+	-s|--silent)
+		silent=true
+		shift
+		;;
 	-h|--help)
 		cat <<EOF
 
 ${0##*/} does either:
  * run make oldconfig to clean up the .config files
- * modify kernel .config files in the CVS tree
+ * modify kernel .config files in the GIT tree
 
 run it with no options in your SCRATCH_AREA $SCRATCH_AREA, like
 	patches/scripts/${0##*/}
@@ -169,6 +187,8 @@ FOO
 FOO=X
 CONFIG_FOO
 CONFIG_FOO=X
+
+Run with -s|--silent in both modes to suppress most output
 EOF
 		exit 1
 		;;
@@ -215,8 +235,10 @@ menuconfig)
 *)
 	case "$TERM" in
 	linux* | xterm* | screen*)
-		use_region=1
-		_region_init_
+		if tty -s && ! $silent; then
+			use_region=true
+			_region_init_
+		fi
 	esac
 esac
 
@@ -336,6 +358,9 @@ for config in $config_files; do
         MAKE_ARGS="ARCH=$cpu_arch"
         ;;
     esac
+    if $silent; then
+	    MAKE_ARGS="$MAKE_ARGS -s"
+    fi
     config="${prefix}config/$config"
 
     cat $config | \
@@ -349,7 +374,7 @@ for config in $config_files; do
     > .config
     for f in $TMPDIR/reuse/{all,$cpu_arch-all,all-$flavor}; do
         if test -e "$f"; then
-            echo "Reusing choice for ${f##*/}"
+            info "Reusing choice for ${f##*/}"
             cat "$f" >>.config
         fi
     done
@@ -375,7 +400,8 @@ for config in $config_files; do
 	make $MAKE_ARGS oldconfig
     esac
     ask_reuse_config $config .config
-    if ! diff -U0 $config .config; then
-	sed '/^# Linux kernel version:/d' < .config > $config
+    if ! $silent; then
+        diff -U0 $config .config
     fi
+    cp .config $config
 done

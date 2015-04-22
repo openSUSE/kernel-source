@@ -307,11 +307,18 @@ if test -z "$CONFIG"; then
 	if test "$VANILLA_ONLY" = 1 || $VANILLA; then
 		CONFIG=$(uname -m)-vanilla
 	else
-		CONFIG=$(uname -m)-default
-		case "$CONFIG" in
-		i?86-*)
-			CONFIG=i386-pae
+		machine=$(uname -m)
+		case "$machine" in
+		i?86)
+			machine=i386
 		esac
+		if test -e "config/$machine/smp"; then
+			CONFIG=$machine-smp
+		elif test -e "config/$machine/pae"; then
+			CONFIG=$machine-pae
+		else
+			CONFIG=$machine-default
+		fi
 	fi
 fi
 
@@ -374,14 +381,6 @@ if [ ! -r series.conf ]; then
     echo "Configuration file \`series.conf' not found"
     exit 1
 fi
-if [ -e scripts/check-patches ]; then
-    scripts/check-patches || {
-	echo "Inconsistencies found."
-	echo "Please clean up series.conf and/or the patches directories!"
-	read
-    }
-fi
-
 if $have_arch_patches; then
     if [ -z "$ARCH_SYMBOLS" ]; then
         if [ -x ./arch-symbols ]; then
