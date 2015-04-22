@@ -381,14 +381,6 @@ if [ ! -r series.conf ]; then
     echo "Configuration file \`series.conf' not found"
     exit 1
 fi
-if [ -e scripts/check-patches ]; then
-    scripts/check-patches || {
-	echo "Inconsistencies found."
-	echo "Please clean up series.conf and/or the patches directories!"
-	read
-    }
-fi
-
 if $have_arch_patches; then
     if [ -z "$ARCH_SYMBOLS" ]; then
         if [ -x ./arch-symbols ]; then
