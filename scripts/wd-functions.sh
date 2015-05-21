@@ -171,16 +171,6 @@ if $using_git && test -z "$CHECKED_GIT_HOOKS"; then
     if ! "$scripts_dir"/install-git-hooks --check; then
         echo "WARNING: You should run $scripts_dir/install-git-hooks to enable pre-commit checks." >&2
     fi
-    suse_domains_re='(suse\.(de|com|cz)|novell\.com)'
-    kerncvs_re='(kerncvs(\.suse\.de)?|10\.10\.1\.75)'
-    if (echo $EMAIL; hostname -f) | grep -Eiq "aaa[@.]$suse_domains_re\\>" || \
-        git config remote.origin.url | grep -Eiq "\\<$kerncvs_re:"; then
-        # only warn when used in suse
-        if ! git var GIT_COMMITTER_IDENT | grep -Eiq "@$suse_domains_re>"; then
-            echo "WARNING: You should set your suse email address in git"  >&2
-            echo "WARNING: E.g. by running 'git config --global user.email <your login>@suse.de'" >&2
-        fi
-    fi
 fi
 
 # vim: sw=4:sts=4:et
