@@ -8,20 +8,22 @@
 # 
 export LC_ALL=C
 export LANG=C
+
 current=` quilt top `
 case "$current" in
-	*/patches.kernel.org/*)
+*/patches.kernel.org/*)
 	echo "Will not touch kernel.org patch '$current' because it will disappear soon."
 	exit 0
 	;;
-	*/patches.xen/*)
+*/patches.xen/*)
 	# Preserve file order in xen patches
 	;;
-	*)
+*)
 	# Sort files in other patches
 	opt_sort=--sort
 	;;
 esac
+
 quilt refresh \
 	-U 3 \
 	--no-timestamps \
