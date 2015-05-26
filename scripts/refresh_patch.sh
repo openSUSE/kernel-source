@@ -14,13 +14,19 @@ case "$current" in
 	echo "Will not touch kernel.org patch '$current' because it will disappear soon."
 	exit 0
 	;;
-	*);;
+	*/patches.xen/*)
+	# Preserve file order in xen patches
+	;;
+	*)
+	# Sort files in other patches
+	opt_sort=--sort
+	;;
 esac
 quilt refresh \
 	-U 3 \
 	--no-timestamps \
 	--no-index \
 	--diffstat \
-	--sort \
+	$opt_sort \
 	--backup \
 	-p ab
