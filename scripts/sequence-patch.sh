@@ -334,8 +334,8 @@ if [ $# -ne 0 ]; then
     usage
 fi
 
-if ! scripts/guards --prefix=config --list < config.conf | \
-     egrep -q '/(xen|ec2)$'; then
+if ! scripts/guards --prefix=config $(scripts/arch-symbols --list) < config.conf | \
+     egrep -q '/(xen|ec2|pv)$'; then
      echo "*** Xen configs are disabled; Skipping Xen patches." >&2
 
      SKIP_XEN=true
