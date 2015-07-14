@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 #
 # keep noise between two revisions of a patch small:
 # fixed sort order
