@@ -166,6 +166,31 @@ unpack_tarball()
     set +o pipefail
 }
 
+get_git_remote() {
+    local branch=$1
+    local remote
+
+    remote=$(git config --get branch.${branch}.remote)
+    remote=${remote:-"<repository>"}
+    echo "$remote"
+}
+
+get_git_user() {
+    local remote=$1
+    local user
+
+    if [ "$remote" ]; then
+        user=$(git remote -v show -n | awk '
+            /^'$remote'/ && /\(push\)$/ {
+                match($2, "^(ssh://)?(([^@]+)@)?", a)
+                print a[3]
+            }')
+    fi
+    user=${user:-$LOGNAME}
+    user=${user:-"<user>"}
+    echo "$user"
+}
+
 if $using_git && test -z "$CHECKED_GIT_HOOKS"; then
     export CHECKED_GIT_HOOKS=1
     if ! "$scripts_dir"/install-git-hooks --check; then
