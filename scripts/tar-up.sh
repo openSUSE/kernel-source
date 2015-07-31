@@ -132,16 +132,22 @@ referenced_files="$( {
 	$(dirname $0)/guards --prefix=config --list < config.conf
     } | sort -u )"
 
-SKIP_XEN=true
 for file in $referenced_files; do
 	case $file in
-	config/*/xen | config/*/ec2)
-		SKIP_XEN=false ;;
 	config/* | patches.*/*)
 		;;
 	*)
 		echo "Error: Patches must be placed in the patches.*/ subdirectories: $file" >&2
 		exit 1
+	esac
+done
+
+SKIP_XEN=true
+used_configs=$( $(dirname $0)/guards --prefix=config $( $(dirname $0)/arch-symbols --list) < config.conf )
+for file in $used_configs; do
+	case $file in
+	config/*/xen | config/*/ec2 | config/*/pv)
+		SKIP_XEN=false ;;
 	esac
 done
 
