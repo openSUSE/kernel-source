@@ -1,4 +1,4 @@
-#! /bin/sh
+#! /bin/bash
 
 # log.sh - Automate insertion of patches into a kernel rpm tree managed
 # with series.conf

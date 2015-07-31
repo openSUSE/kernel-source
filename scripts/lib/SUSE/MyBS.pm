@@ -448,6 +448,8 @@ sub upload_package {
 	my $limit_packages = $options->{limit_packages} || [];
 	my %limit_packages = map { $_ => 1 } @$limit_packages;
 	my $do_limit_packages = (scalar(@$limit_packages) > 0);
+	my $extra_links = $options->{extra_links} || [];
+	my %specfiles = map { $_ => 1 } @$extra_links;
 	my $revision;
 
 	if (!$self->project_exists($project)) {
@@ -461,7 +463,6 @@ sub upload_package {
 	my $filelist_writer = XML::Writer->new(OUTPUT => \$new_filelist);
 	$filelist_writer->startTag("directory");
 	my $changed = 0;
-	my %specfiles;
 	while ((my $name = CORE::readdir($dh))) {
 		my $local_path = "$dir/$name";
 		my $remote_path = "/source/$project/$package/$name?rev=repository";
