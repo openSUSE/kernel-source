@@ -1,0 +1,244 @@
+From: Filipe Manana <fdmanana@suse.com>
+Date: Wed, 22 Jul 2015 04:54:54 +0100
+Subject: Btrfs: fix stale directory entries after fsync log replay
+Patch-mainline: Submitted, http://www.spinics.net/lists/linux-btrfs/msg45480.html
+References: bsc#942925
+
+We have another case where after an fsync log replay we get an inode with
+a wrong link count (smaller than it should be) and a number of directory
+entries greater than its link count. This happens when we add a new link
+hard link to our inode A and then we fsync some other inode B that has
+the side effect of logging the parent directory inode too. In this case
+at log replay time we add the new hard link to our inode (the item with
+key BTRFS_INODE_REF_KEY) when processing the parent directory but we
+never adjust the link count of our inode A. As a result we get stale dir
+entries for our inode A that can never be deleted and therefore it makes
+it impossible to remove the parent directory (as its i_size can never
+decrease back to 0).
+
+A simple reproducer for fstests that triggers this issue:
+
+  seq=`basename $0`
+  seqres=$RESULT_DIR/$seq
+  echo "QA output created by $seq"
+  tmp=/tmp/$$
+  status=1	# failure is the default!
+  trap "_cleanup; exit \$status" 0 1 2 3 15
+
+  _cleanup()
+  {
+      _cleanup_flakey
+      rm -f $tmp.*
+  }
+
+  # get standard environment, filters and checks
+  . ./common/rc
+  . ./common/filter
+  . ./common/dmflakey
+
+  # real QA test starts here
+  _need_to_be_root
+  _supported_fs generic
+  _supported_os Linux
+  _require_scratch
+  _require_dm_flakey
+  _require_metadata_journaling $SCRATCH_DEV
+
+  rm -f $seqres.full
+
+  _scratch_mkfs >>$seqres.full 2>&1
+  _init_flakey
+  _mount_flakey
+
+  # Create our test directory and files.
+  mkdir $SCRATCH_MNT/testdir
+  touch $SCRATCH_MNT/testdir/foo
+  touch $SCRATCH_MNT/testdir/bar
+
+  # Make sure everything done so far is durably persisted.
+  sync
+
+  # Create one hard link for file foo and another one for file bar. After
+  # that fsync only the file bar.
+  ln $SCRATCH_MNT/testdir/bar $SCRATCH_MNT/testdir/bar_link
+  ln $SCRATCH_MNT/testdir/foo $SCRATCH_MNT/testdir/foo_link
+  $XFS_IO_PROG -c "fsync" $SCRATCH_MNT/testdir/bar
+
+  # Silently drop all writes on scratch device to simulate power failure.
+  _load_flakey_table $FLAKEY_DROP_WRITES
+  _unmount_flakey
+
+  # Allow writes again and mount the fs to trigger log/journal replay.
+  _load_flakey_table $FLAKEY_ALLOW_WRITES
+  _mount_flakey
+
+  # Now verify both our files have a link count of 2.
+  echo "Link count for file foo: $(stat --format=%h $SCRATCH_MNT/testdir/foo)"
+  echo "Link count for file bar: $(stat --format=%h $SCRATCH_MNT/testdir/bar)"
+
+  # We should be able to remove all the links of our files in testdir, and
+  # after that the parent directory should become empty and therefore
+  # possible to remove it.
+  rm -f $SCRATCH_MNT/testdir/*
+  rmdir $SCRATCH_MNT/testdir
+
+  _unmount_flakey
+
+  # The fstests framework will call fsck against our filesystem which will verify
+  # that all metadata is in a consistent state.
+
+  status=0
+  exit
+
+The test fails with:
+
+ -Link count for file foo: 2
+ +Link count for file foo: 1
+  Link count for file bar: 2
+ +rm: cannot remove '/home/fdmanana/btrfs-tests/scratch_1/testdir/foo_link': Stale file handle
+ +rmdir: failed to remove '/home/fdmanana/btrfs-tests/scratch_1/testdir': Directory not empty
+ (...)
+ _check_btrfs_filesystem: filesystem on /dev/sdc is inconsistent
+
+And fsck's output:
+
+  (...)
+  checking fs roots
+  root 5 inode 258 errors 2001, no inode item, link count wrong
+      unresolved ref dir 257 index 5 namelen 8 name foo_link filetype 1 errors 4, no inode ref
+  Checking filesystem on /dev/sdc
+  (...)
+
+So fix this by marking inodes for link count fixup at log replay time
+whenever a directory entry is replayed if the entry was created in the
+transaction where the fsync was made and if it points to a non-directory
+inode.
+
+This isn't a new problem/regression, the issue exists for a long time,
+possibly since the log tree feature was added (2008).
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Acked-by: Jeff Mahoney <jeffm@suse.com>
+---
+ fs/btrfs/tree-log.c | 64 +++++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 60 insertions(+), 4 deletions(-)
+
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index 9c45431..cb5666e 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -1613,6 +1613,9 @@ static bool name_in_log_ref(struct btrfs_root *log_root,
+  * not exist in the FS, it is skipped.  fsyncs on directories
+  * do not force down inodes inside that directory, just changes to the
+  * names or unlinks in a directory.
++ *
++ * Returns < 0 on error, 0 if the name wasn't replayed (dentry points to a
++ * non-existing inode) and 1 if the name was replayed.
+  */
+ static noinline int replay_one_name(struct btrfs_trans_handle *trans,
+ 				    struct btrfs_root *root,
+@@ -1631,6 +1634,7 @@ static noinline int replay_one_name(struct btrfs_trans_handle *trans,
+ 	int exists;
+ 	int ret = 0;
+ 	bool update_size = (key->type == BTRFS_DIR_INDEX_KEY);
++	bool name_added = false;
+ 
+ 	dir = read_one_inode(root, key->objectid);
+ 	if (!dir)
+@@ -1708,6 +1712,8 @@ out:
+ 	}
+ 	kfree(name);
+ 	iput(dir);
++	if (!ret && name_added)
++		ret = 1;
+ 	return ret;
+ 
+ insert:
+@@ -1723,6 +1729,8 @@ insert:
+ 			      name, name_len, log_type, &log_key);
+ 	if (ret && ret != -ENOENT && ret != -EEXIST)
+ 		goto out;
++	if (!ret)
++		name_added = true;
+ 	update_size = false;
+ 	ret = 0;
+ 	goto out;
+@@ -1740,12 +1748,13 @@ static noinline int replay_one_dir_item(struct btrfs_trans_handle *trans,
+ 					struct extent_buffer *eb, int slot,
+ 					struct btrfs_key *key)
+ {
+-	int ret;
++	int ret = 0;
+ 	u32 item_size = btrfs_item_size_nr(eb, slot);
+ 	struct btrfs_dir_item *di;
+ 	int name_len;
+ 	unsigned long ptr;
+ 	unsigned long ptr_end;
++	struct btrfs_path *fixup_path = NULL;
+ 
+ 	ptr = btrfs_item_ptr_offset(eb, slot);
+ 	ptr_end = ptr + item_size;
+@@ -1755,12 +1764,59 @@ static noinline int replay_one_dir_item(struct btrfs_trans_handle *trans,
+ 			return -EIO;
+ 		name_len = btrfs_dir_name_len(eb, di);
+ 		ret = replay_one_name(trans, root, path, eb, di, key);
+-		if (ret)
+-			return ret;
++		if (ret < 0)
++			break;
+ 		ptr = (unsigned long)(di + 1);
+ 		ptr += name_len;
++
++		/*
++		 * If this entry refers to a non-directory (directories can not
++		 * have a link count > 1) and it was added in the transaction
++		 * that was not committed, make sure we fixup the link count of
++		 * the inode it the entry points to. Otherwise something like
++		 * the following would result in a directory pointing to an
++		 * inode with a wrong link that does not account for this dir
++		 * entry:
++		 *
++		 * mkdir testdir
++		 * touch testdir/foo
++		 * touch testdir/bar
++		 * sync
++		 *
++		 * ln testdir/bar testdir/bar_link
++		 * ln testdir/foo testdir/foo_link
++		 * xfs_io -c "fsync" testdir/bar
++		 *
++		 * <power failure>
++		 *
++		 * mount fs, log replay happens
++		 *
++		 * File foo would remain with a link count of 1 when it has two
++		 * entries pointing to it in the directory testdir. This would
++		 * make it impossible to ever delete the parent directory has
++		 * it would result in stale dentries that can never be deleted.
++		 */
++		if (ret == 1 && btrfs_dir_type(eb, di) != BTRFS_FT_DIR) {
++			struct btrfs_key di_key;
++
++			if (!fixup_path) {
++				fixup_path = btrfs_alloc_path();
++				if (!fixup_path) {
++					ret = -ENOMEM;
++					break;
++				}
++			}
++
++			btrfs_dir_item_key_to_cpu(eb, di, &di_key);
++			ret = link_to_fixup_dir(trans, root, fixup_path,
++						di_key.objectid);
++			if (ret)
++				break;
++		}
++		ret = 0;
+ 	}
+-	return 0;
++	btrfs_free_path(fixup_path);
++	return ret;
+ }
+ 
+ /*
+
