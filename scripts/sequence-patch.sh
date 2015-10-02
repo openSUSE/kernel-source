@@ -318,10 +318,8 @@ if test -z "$CONFIG"; then
 			CONFIG=$machine-pae
 		elif test -e "config/$machine/default"; then
 			CONFIG=$machine-default
-		elif test -e "config/$machine/rt"; then
-			CONFIG=$machine-rt
-		elif test -e "config/$machine/xen"; then
-			CONFIG=$machine-xen
+		elif test -n "$VARIANT" -a -e "config/$machine/${VARIANT#-}"; then
+			CONFIG=$machine$VARIANT
 		else
 			echo "Cannot determine default config for arch $machine"
 		fi
