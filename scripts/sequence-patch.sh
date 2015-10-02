@@ -320,6 +320,8 @@ if test -z "$CONFIG"; then
 			CONFIG=$machine-default
 		elif test -e "config/$machine/rt"; then
 			CONFIG=$machine-rt
+		elif test -e "config/$machine/xen"; then
+			CONFIG=$machine-xen
 		else
 			echo "Cannot determine default config for arch $machine"
 		fi
