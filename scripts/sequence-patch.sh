@@ -71,7 +71,7 @@ END
 
 apply_fast_patches() {
     echo "[ Fast-applying ${#PATCHES_BEFORE[@]} patches. ${#PATCHES_AFTER[@]} remain. ]"
-    LAST_LOG=$(cat "${PATCHES_BEFORE[@]}" | \
+    LAST_LOG=$(echo "${PATCHES_BEFORE[@]}" | xargs cat | \
         patch -d $PATCH_DIR -p1 -E $fuzz --force --no-backup-if-mismatch \
 		-s 2>&1)
     STATUS=$?
