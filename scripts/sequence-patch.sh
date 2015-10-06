@@ -308,9 +308,15 @@ if test -z "$CONFIG"; then
 		CONFIG=$(uname -m)-vanilla
 	else
 		machine=$(uname -m)
+		# XXX: We could use scripts/arch-symbols here, but it is
+		# not unified among branches and has weird behavior in some
 		case "$machine" in
 		i?86)
 			machine=i386
+			;;
+		aarch64)
+			machine=arm64
+			;;
 		esac
 		if test -e "config/$machine/smp"; then
 			CONFIG=$machine-smp
