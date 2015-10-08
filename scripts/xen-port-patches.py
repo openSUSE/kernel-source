@@ -114,6 +114,8 @@ def mayCreatePatch(fname, repls):
 	patchheader = ""; pheaderactive = 1
 	endmarker = re.compile(r"^(Index|diff|CVS|RCS|\-\-\-|\+\+\+|===)")
 	subj = re.compile(r"^Subject:\s")
+	commit = re.compile(r"^Git-[Cc]ommit:\s")
+	mainline = re.compile(r"^Patch-[Mm]ainline:\s")
 	for line in pfile:
 		hmark = endmarker.search(line)
 		if pheaderactive:
@@ -123,6 +125,10 @@ def mayCreatePatch(fname, repls):
 				if subj and subj.search(line):
 					subj = None
 					line = decorateSubject(line)
+				elif commit.search(line):
+					continue
+				elif mainline.search(line):
+					line = "Patch-mainline: Never, SUSE-Xen specific\n"
 				patchheader += line
 				continue
 		# If we get here, we're past the patch file header
