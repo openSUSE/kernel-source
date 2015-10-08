@@ -5,7 +5,6 @@ Create custom patches for xen from custom patches that affect x86.
 Turned out to be a little functional programming exercise for the author.
 (c) 2005-04-06, Kurt Garloff <garloff@suse.de>
 """
-__revision__ = '$Id'
 
 import re, glob, sys, os, filecmp
 
