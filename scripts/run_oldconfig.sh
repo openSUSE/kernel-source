@@ -111,6 +111,7 @@ option=
 value=
 silent=false
 check=false
+current=false
 until [ "$#" = "0" ] ; do
 	case "$1" in
 	y|-y|--yes)
@@ -159,6 +160,10 @@ until [ "$#" = "0" ] ; do
 		check=true
 		shift
 		;;
+	-c|--current)
+		current=true
+		shift
+		;;
 	-s|--silent)
 		silent=true
 		shift
@@ -181,6 +186,7 @@ possible options in this mode:
 	--flavor <flavor>  to run only for configs of specified flavor
 	--vanilla          an alias for "--flavor vanilla"
 	--check            just check if configs are up to date
+	-c|--current       uset tmp/current for checks
 
 run it with one of the following options to modify all .config files listed
 in config.conf:
@@ -327,6 +333,11 @@ filter_config()
 {
     sed -e '/^# .* is not set$/p' -e '/^$\|^#/d' "$@" | sort
 }
+
+if $current; then
+	prefix=../../$prefix
+	cd tmp/current
+fi
 
 err=0
 for config in $config_files; do

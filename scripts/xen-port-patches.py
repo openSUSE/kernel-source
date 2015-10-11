@@ -5,7 +5,6 @@ Create custom patches for xen from custom patches that affect x86.
 Turned out to be a little functional programming exercise for the author.
 (c) 2005-04-06, Kurt Garloff <garloff@suse.de>
 """
-__revision__ = '$Id'
 
 import re, glob, sys, os, filecmp
 
@@ -79,6 +78,18 @@ def writePatch(fname, hdr, body):
 		ser.write("\t\t%s\n" % xenfname)
 		ser.close()
 
+def decorateSubject(subject):
+	m = re.search(r"^(Subject:\s*(?:\[.*\])?\s*)(.*)", subject);
+	if not m:
+		return subject
+	if re.search(r"^[^\s]*:[^:]*$", m.group(2)):
+		# subsystem: text -> xen/subsystem: text
+		tag = "xen/"
+	else:
+		# text -> xen: text
+		tag = "xen: "
+	return m.group(1) + tag + m.group(2) + "\n"
+
 def mayCreatePatch(fname, repls):
 	"Try to apply the replacement rules to fname"
 	if fname.endswith(".gz"):
@@ -101,12 +112,22 @@ def mayCreatePatch(fname, repls):
 	patch = ""; rule = ()
 	patchheader = ""; pheaderactive = 1
 	endmarker = re.compile(r"^(Index|diff|CVS|RCS|\-\-\-|\+\+\+|===)")
+	subj = re.compile(r"^Subject:\s")
+	commit = re.compile(r"^Git-[Cc]ommit:\s")
+	mainline = re.compile(r"^Patch-[Mm]ainline:\s")
 	for line in pfile:
 		hmark = endmarker.search(line)
 		if pheaderactive:
 			if hmark:
 				pheaderactive = 0
 			else:
+				if subj and subj.search(line):
+					subj = None
+					line = decorateSubject(line)
+				elif commit.search(line):
+					continue
+				elif mainline.search(line):
+					line = "Patch-mainline: Never, SUSE-Xen specific\n"
 				patchheader += line
 				continue
 		# If we get here, we're past the patch file header
