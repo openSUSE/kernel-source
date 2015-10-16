@@ -201,8 +201,7 @@ if test -e "$build_dir"/config-options.changes; then
 	mv "$build_dir"/config-options.changes \
 		"$build_dir"/config-options.changes.txt
 fi
-# FIXME: move config-subst out of rpm/
-rm "$build_dir/config-subst"
+rm -f "$build_dir/config-subst"
 
 changelog=$build_dir/kernel-source$VARIANT.changes
 if test -e kernel-source.changes; then
