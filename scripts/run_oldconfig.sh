@@ -386,9 +386,12 @@ for config in $config_files; do
     fi
     config="${prefix}config/$config"
 
-    <"$config" bash ${prefix}rpm/config-subst CONFIG_LOCALVERSION \"-$flavor\" \
-    | bash ${prefix}rpm/config-subst CONFIG_SUSE_KERNEL y \
-    > .config
+    cp "$config" .config
+    for cfg in "CONFIG_LOCALVERSION=\"-$flavor\"" "CONFIG_SUSE_KERNEL=y"; do
+	    if ! grep -q "^$cfg\$" .config; then
+		    echo "$cfg" >>.config
+	    fi
+    done
     for f in $TMPDIR/reuse/{all,$cpu_arch-all,all-$flavor}; do
         if test -e "$f"; then
             info "Reusing choice for ${f##*/}"
