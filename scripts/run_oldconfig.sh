@@ -292,7 +292,7 @@ ask_reuse_config()
         /> .*CONFIG_/ { x[substr($0, 3)]++; }
         END {
             for (l in x)
-                if (x[l] > 0)
+                if (x[l] > 0 && l !~ /^CONFIG_LOCALVERSION\>/)
                     print l;
         }'
 
