@@ -292,7 +292,7 @@ ask_reuse_config()
         /> .*CONFIG_/ { x[substr($0, 3)]++; }
         END {
             for (l in x)
-                if (x[l] > 0)
+                if (x[l] > 0 && l !~ /^CONFIG_LOCALVERSION\>/)
                     print l;
         }'
 
@@ -386,15 +386,12 @@ for config in $config_files; do
     fi
     config="${prefix}config/$config"
 
-    cat $config | \
-    if grep -qw CONFIG_CFGNAME "$config"; then
-        # SLES9
-        cat
-    else
-        bash ${prefix}rpm/config-subst CONFIG_LOCALVERSION \"-$flavor\"
-    fi \
-    | bash ${prefix}rpm/config-subst CONFIG_SUSE_KERNEL y \
-    > .config
+    cp "$config" .config
+    for cfg in "CONFIG_LOCALVERSION=\"-$flavor\"" "CONFIG_SUSE_KERNEL=y"; do
+	    if ! grep -q "^$cfg\$" .config; then
+		    echo "$cfg" >>.config
+	    fi
+    done
     for f in $TMPDIR/reuse/{all,$cpu_arch-all,all-$flavor}; do
         if test -e "$f"; then
             info "Reusing choice for ${f##*/}"
