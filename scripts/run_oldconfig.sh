@@ -386,13 +386,7 @@ for config in $config_files; do
     fi
     config="${prefix}config/$config"
 
-    cat $config | \
-    if grep -qw CONFIG_CFGNAME "$config"; then
-        # SLES9
-        cat
-    else
-        bash ${prefix}rpm/config-subst CONFIG_LOCALVERSION \"-$flavor\"
-    fi \
+    <"$config" bash ${prefix}rpm/config-subst CONFIG_LOCALVERSION \"-$flavor\" \
     | bash ${prefix}rpm/config-subst CONFIG_SUSE_KERNEL y \
     > .config
     for f in $TMPDIR/reuse/{all,$cpu_arch-all,all-$flavor}; do
