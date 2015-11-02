@@ -327,6 +327,16 @@ if test -z "$CONFIG"; then
 		elif test -n "$VARIANT" -a -e "config/$machine/${VARIANT#-}"; then
 			CONFIG=$machine$VARIANT
 		else
+			# Try other architectures and assume the user is able
+			# to cross-compile
+			for machine in x86_64 ppc64 ppc64le arm64 s390x; do
+				if test -e "config/$machine/default"; then
+					CONFIG=$machine-default
+					break
+				fi
+			done
+		fi
+		if test -z "$CONFIG"; then
 			echo "Cannot determine default config for arch $machine"
 		fi
 	fi

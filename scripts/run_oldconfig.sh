@@ -387,7 +387,8 @@ for config in $config_files; do
     config="${prefix}config/$config"
 
     cp "$config" .config
-    for cfg in "CONFIG_LOCALVERSION=\"-$flavor\"" "CONFIG_SUSE_KERNEL=y"; do
+    for cfg in "CONFIG_LOCALVERSION=\"-$flavor\"" "CONFIG_SUSE_KERNEL=y" \
+		    "CONFIG_DEBUG_INFO=y"; do
 	    if ! grep -q "^$cfg\$" .config; then
 		    echo "$cfg" >>.config
 	    fi
