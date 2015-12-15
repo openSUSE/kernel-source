@@ -114,8 +114,11 @@ suffix=$(sed -rn 's/^Source0:.*\.(tar\.[a-z0-9]*)$/\1/p' rpm/kernel-source.spec.
 # copies. The linux tarball is not deleted if it is already there
 for f in "$build_dir"/*; do
 	case "$f" in
-	*/"linux-$SRCVERSION.$suffix")
+	"$build_dir/linux-$SRCVERSION.$suffix")
 		continue
+		;;
+	"$build_dir"/patches.*)
+		rm -rf "$f"
 	esac
 	rm -f "$f"
 done
