@@ -36,6 +36,7 @@ sub scan
 			m{^\Q$loc\E.*/Makefile} ||
 			m{^\Q$loc\E/arch/[^/]+/boot/dts/include/dt-bindings\b} ||
 			m{^\Q$loc\E/arch/[^/]+/include\b} ||
+			m{^\Q$loc\E/arch/.*/module\.lds\b} ||
 			m{^\Q$loc\E/arch/arm/[^/]+/include/mach\b} ||
 			m{^\Q$loc\E/arch/arm/[^/]+/include/plat\b} ||
 			m{^\Q$loc\E/include/[^/]+\b} ||
