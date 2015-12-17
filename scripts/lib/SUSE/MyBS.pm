@@ -215,7 +215,7 @@ sub get_repo_archs {
 			return if $attr{name} ne $repository;
 		}
 		if ($attr{name} eq "standard" ||
-		    $attr{name} eq "ports" && $project ne "openSUSE:Factory" ||
+		    $attr{name} eq "ports" && $project !~ /\bopenSUSE:Factory\b/ ||
 		    $attr{name} =~ /^SUSE_.*_Update$/ && $project =~ /^SUSE:Maintenance:/) {
 			$self->{has_match} = 1;
 			$self->{repo_name} = $attr{name};
@@ -287,16 +287,6 @@ sub create_project {
 		}
 	}
 
-	for my $attr (qw(build publish debuginfo)) {
-		$writer->startTag($attr);
-		$writer->emptyTag($options->{$attr} ? "enable" : "disable");
-		if ($attr =~ /^(publish|build)/ && exists($options->{repos}{"QA"})) {
-			$writer->emptyTag("disable", repository => "QA");
-			$writer->emptyTag("disable", repository => "QA_ports");
-		}
-		$writer->endTag($attr);
-	}
-
 	if (!exists($options->{repos})) {
 		if (!exists($options->{base})) {
 			croak "Either 'base' or 'repos' must be specified";
@@ -305,10 +295,10 @@ sub create_project {
 		$options->{repos} = { $options->{repository} => $options->{base} };
 	}
 	my %seen_archs;
+	my @qa_repos;
 	for my $repo (sort(keys(%{$options->{repos}}))) {
 		my $base = $options->{repos}{$repo};
 		my %repo_archs;
-		next if $repo eq "QA";
 		if ($repo eq "") {
 			# get all "default" repositories of a given project
 			%repo_archs = $self->get_repo_archs($base);
@@ -317,13 +307,12 @@ sub create_project {
 			%repo_archs = $self->get_repo_archs($base, "standard");
 		}
 		for my $r (sort(keys(%repo_archs))) {
-			my @attrs = (name => $repo ? $repo : $r);
+			my $name = $repo ? $repo : $r;
+			my @attrs = (name => $name);
 			if (!$options->{rebuild}) {
 				push(@attrs, rebuild => "local", block => "local");
 			}
-			$writer->startTag("repository", @attrs);
-			$writer->emptyTag("path", repository => $r,
-				project => $base);
+			my @archs;
 			for my $arch (@{$repo_archs{$r}}) {
 				if ($options->{limit_archs} &&
 					!$limit_archs{$arch}) {
@@ -334,30 +323,43 @@ sub create_project {
 					next;
 				}
 				$seen_archs{$arch} = 1;
+				push(@archs, $arch);
+			}
+			$writer->startTag("repository", @attrs);
+			$writer->emptyTag("path", repository => $r,
+				project => $base);
+			for my $arch (@archs) {
 				$writer->dataElement("arch", $arch);
 			}
 			$writer->endTag("repository");
-		}
-	}
-	if (exists($options->{repos}{QA})) {
-		# The special QA and QA_ports repositories build against
-		# the "standard" and "ports" repositories of the project itself
-		my %std_repos = $self->get_repo_archs($options->{repos}{""});
-		for my $repo (sort(keys(%std_repos))) {
-			$writer->startTag("repository", name =>
-				($repo eq "standard" ? "QA" : "QA_$repo"));
-			$writer->emptyTag("path", repository => $repo,
+			if (!exists($options->{qa})) {
+				next;
+			}
+			# For each regular repository foo, there is a
+			# repository named QA_foo, building against foo
+			my $qa_name = ($name eq "standard") ? "QA"
+					: "QA_$name";
+			$writer->startTag("repository", name => $qa_name);
+			$writer->emptyTag("path", repository => $name,
 				project => $project);
-			for my $arch (sort(@{$std_repos{$repo}})) {
-				if ($options->{limit_archs} &&
-					!$limit_archs{$arch}) {
-					next;
-				}
+			for my $arch (@archs) {
 				$writer->dataElement("arch", $arch);
 			}
 			$writer->endTag("repository");
+			push(@qa_repos, $qa_name);
 		}
 	}
+	for my $attr (qw(build publish debuginfo)) {
+		$writer->startTag($attr);
+		$writer->emptyTag($options->{$attr} ? "enable" : "disable");
+		if ($attr =~ /^(publish|build)/) {
+			for my $repo (@qa_repos) {
+				$writer->emptyTag("disable", repository => $repo);
+			}
+		}
+		$writer->endTag($attr);
+	}
+
 	$writer->endTag("project");
 	$writer->end();
 
@@ -378,30 +380,32 @@ sub create_project {
 		$prjconf .= "$macro\n";
 	}
 	$self->put("/source/$project/_config", $prjconf);
+	return { name => $project, qa_repos => \@qa_repos };
 }
 
 sub create_package {
-	my ($self, $project, $package, $title, $description) = @_;
+	my ($self, $prj, $package, $title, $description) = @_;
 	$title ||= $package;
 	$description ||= "";
 
 	my $meta;
 	my $writer = XML::Writer->new(OUTPUT => \$meta);
-	$writer->startTag("package", project => $project, name => $package);
+	$writer->startTag("package", project => $prj->{name}, name => $package);
 	$writer->dataElement("title", $title);
 	$writer->dataElement("description", $description);
 	# XXX: HACK
 	if ($package =~ /^kernel-obs-(qa|build)/) {
 		$writer->startTag("build");
 		$writer->emptyTag("disable");
-		$writer->emptyTag("enable", repository => "QA");
-		$writer->emptyTag("enable", repository => "QA_ports");
+		for my $repo (@{$prj->{qa_repos} || []}) {
+			$writer->emptyTag("enable", repository => $repo);
+		}
 		$writer->endTag("build");
 	}
 	$writer->endTag("package");
 	$writer->end();
 
-	$self->put("/source/$project/$package/_meta", $meta);
+	$self->put("/source/$prj->{name}/$package/_meta", $meta);
 }
 
 # Get a list of links to this package within the same project
@@ -440,7 +444,7 @@ sub get_directory_revision {
 }
 
 sub upload_package {
-	my ($self, $dir, $project, $package, $commit, $options) = @_;
+	my ($self, $dir, $prj, $package, $commit, $options) = @_;
 	$options ||= {};
 	my $progresscb = $options->{progresscb} || sub { };
 	my $remove_packages = $options->{remove_packages} || [];
@@ -451,11 +455,15 @@ sub upload_package {
 	my $extra_links = $options->{extra_links} || [];
 	my %specfiles = map { $_ => 1 } @$extra_links;
 	my $revision;
+	if (!ref($prj)) {
+		$prj = { name => $prj };
+	}
+	my $project = $prj->{name};
 
 	if (!$self->project_exists($project)) {
 		die "Project $project does not exist\n";
 	}
-	$self->create_package($project, $package);
+	$self->create_package($prj, $package);
 	&$progresscb('CREATE', "$project/$package");
 	opendir(my $dh, $dir) or die "$dir: $!\n";
 	my $remote = $self->readdir("/source/$project/$package");
@@ -509,7 +517,7 @@ sub upload_package {
 	for my $spec (keys(%specfiles)) {
 		next if $remove_packages{$spec};
 		next if $do_limit_packages && !$limit_packages{$spec};
-		$self->create_package($project, $spec);
+		$self->create_package($prj, $spec);
 		$self->put("/source/$project/$spec/_link", $link_xml);
 		&$progresscb('LINK', "$project/$spec");
 		delete($links{$spec});
