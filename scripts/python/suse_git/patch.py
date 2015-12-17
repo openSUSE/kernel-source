@@ -45,17 +45,3 @@ class PatchChecker:
 
     def do_patch(self):
         pass
-
-    def print_errors(self, errors, fn="stdin"):
-        ret = 0
-        if errors:
-            print >>sys.stderr, "ERROR: Problems encountered in",
-            if fn:
-                print >>sys.stderr, "`%s'" % fn
-            else:
-                print >>sys.stderr, "input"
-        for error in errors:
-            print >>sys.stderr, "** %s" % error
-            ret = 1
-
-        return ret

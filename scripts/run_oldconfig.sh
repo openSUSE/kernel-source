@@ -111,6 +111,7 @@ option=
 value=
 silent=false
 check=false
+current=false
 until [ "$#" = "0" ] ; do
 	case "$1" in
 	y|-y|--yes)
@@ -159,6 +160,10 @@ until [ "$#" = "0" ] ; do
 		check=true
 		shift
 		;;
+	-c|--current)
+		current=true
+		shift
+		;;
 	-s|--silent)
 		silent=true
 		shift
@@ -181,6 +186,7 @@ possible options in this mode:
 	--flavor <flavor>  to run only for configs of specified flavor
 	--vanilla          an alias for "--flavor vanilla"
 	--check            just check if configs are up to date
+	-c|--current       uset tmp/current for checks
 
 run it with one of the following options to modify all .config files listed
 in config.conf:
@@ -286,7 +292,7 @@ ask_reuse_config()
         /> .*CONFIG_/ { x[substr($0, 3)]++; }
         END {
             for (l in x)
-                if (x[l] > 0)
+                if (x[l] > 0 && l !~ /^CONFIG_LOCALVERSION\>/)
                     print l;
         }'
 
@@ -327,6 +333,11 @@ filter_config()
 {
     sed -e '/^# .* is not set$/p' -e '/^$\|^#/d' "$@" | sort
 }
+
+if $current; then
+	prefix=../../$prefix
+	cd tmp/current
+fi
 
 err=0
 for config in $config_files; do
@@ -375,15 +386,13 @@ for config in $config_files; do
     fi
     config="${prefix}config/$config"
 
-    cat $config | \
-    if grep -qw CONFIG_CFGNAME "$config"; then
-        # SLES9
-        cat
-    else
-        bash ${prefix}rpm/config-subst CONFIG_LOCALVERSION \"-$flavor\"
-    fi \
-    | bash ${prefix}rpm/config-subst CONFIG_SUSE_KERNEL y \
-    > .config
+    cp "$config" .config
+    for cfg in "CONFIG_LOCALVERSION=\"-$flavor\"" "CONFIG_SUSE_KERNEL=y" \
+		    "CONFIG_DEBUG_INFO=y"; do
+	    if ! grep -q "^$cfg\$" .config; then
+		    echo "$cfg" >>.config
+	    fi
+    done
     for f in $TMPDIR/reuse/{all,$cpu_arch-all,all-$flavor}; do
         if test -e "$f"; then
             info "Reusing choice for ${f##*/}"
