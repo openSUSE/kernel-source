@@ -199,4 +199,13 @@ if $using_git && test -z "$CHECKED_GIT_HOOKS"; then
     fi
 fi
 
+get_localversion() {
+    local version=$1
+
+    if [[ "$version" =~ .*-[1-9][0-9]*-g[a-f0-9]+$ ]] # 4.4-rc6-1310-gec0382c
+    then
+	echo "$version" | sed -e "s/.*\(-[1-9][0-9]*-g[a-f0-9]\+\)$/\1/";
+    fi
+}
+
 # vim: sw=4:sts=4:et

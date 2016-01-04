@@ -176,6 +176,9 @@ if ! scripts/cvs-wd-timestamp > $build_dir/$tsfile; then
     exit 1
 fi
 
+localversion=$(get_localversion $SRCVERSION)
+[ -n "$localversion" ] && echo -n "$localversion" > $build_dir/localversion
+
 if $using_git; then
     # Always include the git revision
     echo "GIT Revision: $(git rev-parse HEAD)" >> $build_dir/$tsfile
