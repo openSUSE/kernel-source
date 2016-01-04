@@ -70,7 +70,7 @@ _find_tarball()
 
 _get_tarball_from_git()
 {
-    local version=$1 tag url
+    local version=$1 tag url=$2 default_url
 
     git=${LINUX_GIT:-$HOME/linux-2.6}
     if test ! -d "$git/.git"; then
@@ -80,16 +80,17 @@ _get_tarball_from_git()
     case "$version" in
     *next-*)
         tag=refs/tags/next-${version##*next-}
-        url=git://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git
+        default_url=git://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git
         ;;
     [0-9]*-g???????)
         tag="v$version"
-        url=git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
+        default_url=git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
         ;;
     *)
         tag=refs/tags/"v$version"
-        url=git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
+        default_url=git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
     esac
+    [ -z "$url" ] && url=$default_url
     if ! git --git-dir="$git/.git" cat-file -e "$tag" 2>/dev/null; then
         case "$tag" in
         refs/tags/*)
@@ -106,7 +107,7 @@ _get_tarball_from_git()
 
 get_tarball()
 {
-    local version=$1 suffix=$2 dest=$3 tarball compress
+    local version=$1 suffix=$2 dest=$3 url=$4 tarball compress
 
     tarball=$(_find_tarball "$version" "$suffix")
     if test -n "$tarball"; then
@@ -131,7 +132,7 @@ get_tarball()
         exit 1
     esac
     set -o pipefail
-    _get_tarball_from_git "$version" | $compress \
+    _get_tarball_from_git "$version" "$url" | $compress \
         >"$dest/linux-$version.$suffix.part"
     if test $? -ne 0; then
         exit 1
@@ -142,7 +143,7 @@ get_tarball()
 
 unpack_tarball()
 {
-    local version=$1 dest=$2 tarball
+    local version=$1 dest=$2 url=$3 tarball
 
     tarball=$(_find_tarball "$version")
     mkdir -p "$dest"
@@ -158,7 +159,7 @@ unpack_tarball()
     echo "Warning: could not find linux-$version.tar.(bz2|xz), trying to create it from git" >&2
     echo "alternatively you can put an unpatched kernel tree to $dest" >&2
     set -o pipefail
-    _get_tarball_from_git "$version" | tar -xf - -C "$dest" --strip-components=1
+    _get_tarball_from_git "$version" "$url" | tar -xf - -C "$dest" --strip-components=1
     if test $? -ne 0; then
         rm -rf "$dest"
         exit 1

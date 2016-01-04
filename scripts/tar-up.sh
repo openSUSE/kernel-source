@@ -124,7 +124,7 @@ for f in "$build_dir"/*; do
 done
 mkdir -p "$build_dir"
 echo "linux-$SRCVERSION.$suffix"
-get_tarball "$SRCVERSION" "$suffix" "$build_dir"
+get_tarball "$SRCVERSION" "$suffix" "$build_dir" "$URL"
 
 # list of patches to include.
 install -m 644 series.conf $build_dir/
