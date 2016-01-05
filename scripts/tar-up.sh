@@ -114,14 +114,17 @@ suffix=$(sed -rn 's/^Source0:.*\.(tar\.[a-z0-9]*)$/\1/p' rpm/kernel-source.spec.
 # copies. The linux tarball is not deleted if it is already there
 for f in "$build_dir"/*; do
 	case "$f" in
-	*/"linux-$SRCVERSION.$suffix")
+	"$build_dir/linux-$SRCVERSION.$suffix")
 		continue
+		;;
+	"$build_dir"/patches.*)
+		rm -rf "$f"
 	esac
 	rm -f "$f"
 done
 mkdir -p "$build_dir"
 echo "linux-$SRCVERSION.$suffix"
-get_tarball "$SRCVERSION" "$suffix" "$build_dir"
+get_tarball "$SRCVERSION" "$suffix" "$build_dir" "$URL"
 
 # list of patches to include.
 install -m 644 series.conf $build_dir/
@@ -172,6 +175,9 @@ tsfile=source-timestamp
 if ! scripts/cvs-wd-timestamp > $build_dir/$tsfile; then
     exit 1
 fi
+
+localversion=$(get_localversion $SRCVERSION)
+[ -n "$localversion" ] && echo -n "$localversion" > $build_dir/localversion
 
 if $using_git; then
     # Always include the git revision
