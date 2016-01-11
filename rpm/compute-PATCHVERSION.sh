@@ -40,7 +40,7 @@ warned=false
 while read patch; do
 	dir=${patch%/*}
 	for p in "${path[@]}"; do
-		if test -d "$p/$dir"; then
+		if test -e "$p/$patch"; then
 			echo "$p/$patch"
 			continue 2
 		fi
