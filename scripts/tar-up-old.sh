@@ -146,8 +146,11 @@ check_for_merge_conflicts() {
 # copies. The linux tarball is not deleted if it is already there
 for f in "$build_dir"/*; do
 	case "$f" in
-	*/"linux-$SRCVERSION.tar.bz2")
+	"$build_dir/linux-$SRCVERSION.tar.bz2")
 		continue
+		;;
+	"$build_dir"/patches.*)
+		rm -rf "$f"
 	esac
 	rm -f "$f"
 done

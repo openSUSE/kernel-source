@@ -114,7 +114,7 @@ check=false
 current=false
 until [ "$#" = "0" ] ; do
 	case "$1" in
-	y|-y|--yes)
+	y|-y|--yes|o|-o|--olddefconfig)
 		mode=yes
 		shift
 		;;
@@ -179,7 +179,9 @@ run it with no options in your SCRATCH_AREA $SCRATCH_AREA, like
 	patches/scripts/${0##*/}
 possible options in this mode:
 	called with no option will run just make oldconfig interactive
-	y|-y|--yes         to run 'yes "" | make oldconfig'
+	y|-y|--yes         to run 'yes "" | make oldconfig' - equivalent to
+                           'make olddefconfig' on newer kernels
+	o|-o|--olddefconfig  same as '--yes'
 	--mod              to set all new options to 'm' (booleans to 'y')
 	a|-a|--arch        to run make oldconfig only for the given arch
 	m|-m|--menuconfig  to run make menuconfig instead of oldconfig
