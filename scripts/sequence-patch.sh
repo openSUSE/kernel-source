@@ -641,6 +641,11 @@ if test -n "$CONFIG"; then
     fi
 fi
 
+for cert in rpm/*.crt; do
+	echo "[ Copying $cert ]"
+	cp "$cert" "$SP_BUILD_DIR/"
+done
+
 # Some archs we use for the config do not exist or have a different name in the
 # kernl source tree
 case $CONFIG_ARCH in
