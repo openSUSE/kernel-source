@@ -37,6 +37,8 @@ sort()
 tolerate_unknown_new_config_options=
 ignore_kabi=
 mkspec_args=()
+arch=
+flavor=
 source rpm/config.sh
 until [ "$#" = "0" ] ; do
   case "$1" in
@@ -73,6 +75,11 @@ until [ "$#" = "0" ] ; do
       mkspec_args=("${mkspec_args[@]}" --release "$2")
       shift 2
       ;;
+    -a|--arch)
+      arch=$2; shift 2 ;;
+    -f|--flavor|--flavour)
+      flavor=$2; shift 2 ;;
+    --vanilla) flavor="vanilla"; shift ;;
     -h|--help|-v|--version)
 	cat <<EOF
 
@@ -83,6 +90,9 @@ these options are recognized:
     -u		       update generated files in an existing kernel-source dir
     -i                 ignore kabi failures
     -d, --dir=DIR      create package in DIR instead of default kernel-source$VARIANT
+    -a, --arch=ARCH    create package for architecture ARCH only
+    -f, --flavor=FLAVOR create package for FLAVOR only
+    --vanilla	       like --flavor=vanilla
 
 EOF
 	exit 1
@@ -158,6 +168,9 @@ if $SKIP_XEN; then
 	echo "[ Xen configs are disabled. Disabling Xen patches. ]"
 	sed -i 's#.*patches.xen/#+noxen  &#' $build_dir/series.conf
 fi
+[ "$flavor" == "vanilla" ] &&  \
+    sed -i '/^$\|\s*#\|patches\.\(kernel\.org\|rpmify\)/b; s/\(.*\)/#### \1/' \
+    $build_dir/series.conf
 
 inconsistent=false
 check_for_merge_conflicts $referenced_files kernel-source.changes{,.old} || \
@@ -194,6 +207,9 @@ tmpdir=$(mktemp -dt ${0##*/}.XXXXXX)
 CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
 cp -p rpm/* config.conf supported.conf doc/* $build_dir
+match="${flavor:+\\/$flavor$}"
+match="${arch:+^+${arch}${match:+.*}}${match}"
+[ -n "$match" ] && sed -i "/^$\|\s*#\|${match}/b; s/\(.*\)/#### \1/" $build_dir/config.conf
 if test -e misc/extract-modaliases; then
 	cp misc/extract-modaliases $build_dir
 fi
