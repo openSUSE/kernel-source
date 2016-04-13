@@ -121,13 +121,15 @@ check_for_merge_conflicts() {
 
 suffix=$(sed -rn 's/^Source0:.*\.(tar\.[a-z0-9]*)$/\1/p' rpm/kernel-source.spec.in)
 # Dot files are skipped by intention, in order not to break osc working
-# copies. The linux tarball is not deleted if it is already there
+# copies.  The linux tarball is not deleted if it is already there. Do
+# not delete the get_release_number.sh file, since it may be produced
+# externally by PTF utils.
 for f in "$build_dir"/*; do
-	case "$f" in
-	"$build_dir/linux-$SRCVERSION.$suffix")
+	case "${f##*/}" in
+	"linux-$SRCVERSION.$suffix" | get_release_number.sh)
 		continue
 		;;
-	"$build_dir"/patches.*)
+	patches.*)
 		rm -rf "$f"
 	esac
 	rm -f "$f"
