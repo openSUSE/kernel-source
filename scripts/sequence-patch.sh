@@ -586,6 +586,12 @@ if test "$SP_BUILD_DIR" != "$PATCH_DIR"; then
     rm -f "$SP_BUILD_DIR/patches"
     ln -sf "$PATCH_DIR" "$SP_BUILD_DIR/source"
     ln -sf "source/patches" "$SP_BUILD_DIR/patches"
+    cat > $PATCH_DIR/GNUmakefile <<EOF
+ifndef KBUILD_OUTPUT
+KBUILD_OUTPUT=$SP_BUILD_DIR
+endif
+include Makefile
+EOF
 fi
 
 # If there are any remaining patches, add them to the series so
