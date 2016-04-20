@@ -634,6 +634,8 @@ if test -n "$CONFIG"; then
 	    echo "[ No kABI references for $CONFIG ]"
 	fi
     fi
+    test "$SP_BUILD_DIR" != "$PATCH_DIR" && \
+	make -C $PATCH_DIR O=$SP_BUILD_DIR -s silentoldconfig
 fi
 
 for cert in rpm/*.crt; do
