@@ -73,7 +73,7 @@ set_var()
 		CONFIG_*) ;;
 		*) name="CONFIG_$name" ;;
 	esac
-	config_files=$(${prefix}scripts/guards $CONFIG_SYMBOLS < ${prefix}config.conf)
+	config_files=$(${scripts}/guards $CONFIG_SYMBOLS < ${prefix}config.conf)
 	if [ -n "$set_flavor" ] ; then
 		info "appending $name=$val to all -$set_flavor config files listed in config.conf"
 		config_files=$(printf "%s\n" $config_files | grep "/$set_flavor\$")
@@ -221,6 +221,7 @@ else
 	echo "no arch-symbols found"
 	exit 1
 fi
+scripts="${prefix}scripts"
 
 if test -e "${prefix}rpm/config.sh"; then
 	source "$_"
@@ -231,12 +232,12 @@ fi
 
 if [ -z "$cpu_arch" ]; then
     CONFIG_SYMBOLS=$(
-        for arch in $(${prefix}scripts/arch-symbols --list); do
-            ${prefix}scripts/arch-symbols $arch
+        for arch in $(${scripts}/arch-symbols --list); do
+            ${scripts}/arch-symbols $arch
         done
     )
 else
-    CONFIG_SYMBOLS=$(${prefix}scripts/arch-symbols $cpu_arch)
+    CONFIG_SYMBOLS=$(${scripts}/arch-symbols $cpu_arch)
 fi
 
 case "$mode" in
@@ -256,7 +257,7 @@ menuconfig)
 	esac
 esac
 
-config_files=$(${prefix}scripts/guards $CONFIG_SYMBOLS < ${prefix}config.conf)
+config_files=$(${scripts}/guards $CONFIG_SYMBOLS < ${prefix}config.conf)
 
 if [ -z "$set_flavor" ] ; then
     config_files=$(printf "%s\n" $config_files | grep -v vanilla)
@@ -271,7 +272,7 @@ if [ -s extra-symbols ]; then
     EXTRA_SYMBOLS="$(cat extra-symbols)"
 fi
 
-${prefix}scripts/guards $EXTRA_SYMBOLS < ${prefix}series.conf \
+${scripts}/guards $EXTRA_SYMBOLS < ${prefix}series.conf \
     > $TMPDIR/applied-patches
 
 EXTRA_SYMBOLS="$(echo $EXTRA_SYMBOLS | sed -e 's# *[Rr][Tt] *##g')"
@@ -350,7 +351,7 @@ for config in $config_files; do
         continue
     fi
     set -- kernel-$flavor $flavor $(case $flavor in (rt|rt_*) echo RT ;; esac)
-    ${prefix}scripts/guards $* $EXTRA_SYMBOLS \
+    ${scripts}/guards $* $EXTRA_SYMBOLS \
 	< ${prefix}series.conf > $TMPDIR/patches
 
     if ! diff -q $TMPDIR/applied-patches $TMPDIR/patches > /dev/null; then
