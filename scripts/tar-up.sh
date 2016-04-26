@@ -157,19 +157,6 @@ for file in $referenced_files; do
 	esac
 done
 
-SKIP_XEN=true
-used_configs=$( $(dirname $0)/guards --prefix=config $( $(dirname $0)/arch-symbols --list) < config.conf )
-for file in $used_configs; do
-	case $file in
-	config/*/xen | config/*/ec2 | config/*/pv)
-		SKIP_XEN=false ;;
-	esac
-done
-
-if $SKIP_XEN; then
-	echo "[ Xen configs are disabled. Disabling Xen patches. ]"
-	sed -i 's#.*patches.xen/#+noxen  &#' $build_dir/series.conf
-fi
 [ "$flavor" == "vanilla" ] &&  \
     sed -i '/^$\|\s*#\|patches\.\(kernel\.org\|rpmify\)/b; s/\(.*\)/#### \1/' \
     $build_dir/series.conf
