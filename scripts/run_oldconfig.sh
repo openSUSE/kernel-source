@@ -388,8 +388,22 @@ for config in $config_files; do
 	    MAKE_ARGS="$MAKE_ARGS -s"
     fi
     config="${prefix}config/$config"
+    config_orig="config-orig"
 
-    cp "$config" .config
+    vanilla_base=
+    if [ "$flavor" = "vanilla" ] && ! grep -q CONFIG_MMU= "$config"; then
+	if [ "$cpu_arch" = "i386" ]; then
+	    vanilla_base="$(dirname "$config")/pae"
+	else
+	    vanilla_base="$(dirname "$config")/default"
+	fi
+	${scripts}/config-merge "$vanilla_base" "$config" >$config_orig
+    else
+	cp "$config" $config_orig
+    fi
+
+    cp $config_orig .config
+
     for cfg in "CONFIG_LOCALVERSION=\"-$flavor\"" "CONFIG_SUSE_KERNEL=y" \
 		    "CONFIG_DEBUG_INFO=y"; do
 	    if ! grep -q "^$cfg\$" .config; then
@@ -425,6 +439,7 @@ for config in $config_files; do
             if ! make $MAKE_ARGS silentoldconfig </dev/null; then
                 echo "${config#$prefix} is out of date"
                 err=1
+                rm $config_orig
                 continue
             fi
         else
@@ -432,15 +447,30 @@ for config in $config_files; do
         fi
     esac
     if ! $check; then
-        ask_reuse_config $config .config
-        if ! $silent; then
-            diff -U0 $config .config
-        fi
-        cp .config $config
+        ask_reuse_config $config_orig .config
+	if [ -n "$vanilla_base" ]; then
+	    # We need to diff and re-merge to compare to the original,
+	    # otherwise we'll see the differences between default
+	    # and vanilla in addition to the changes made during this run.
+	    ${scripts}/config-diff "$vanilla_base" .config > config-new.diff
+	    ${scripts}/config-merge "$vanilla_base" config-new.diff > config-new
+	    if ! $silent; then
+		diff -U0 $config_orig config-new|grep -v ^@@
+	    fi
+	    mv config-new.diff "$config"
+	    rm -f config-new
+
+	else
+	    if ! $silent; then
+		diff -U0 $config_orig .config|grep -v ^@@
+	    fi
+	    cp .config "$config"
+	fi
+	rm -f $config_orig
         continue
     fi
     differences="$(
-        diff -bU0 <(filter_config "$config") <(filter_config .config) | \
+        diff -bU0 <(filter_config $config_orig) <(filter_config .config) | \
         grep '^[-+][^-+]'
     )"
     if echo "$differences" | grep -q '^+' ; then
@@ -448,6 +478,7 @@ for config in $config_files; do
         echo "$differences"
         err=1
     fi
+    rm $config_orig
 done
 
 exit $err
