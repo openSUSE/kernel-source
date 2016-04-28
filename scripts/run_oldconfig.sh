@@ -84,6 +84,11 @@ set_var()
 		if test -L "${prefix}config/$config"; then
 			continue
 		fi
+		# do not change trimmed vanilla configs unless requested
+		if test "$set_flavor" != "vanilla" && ! \
+			grep -q '^CONFIG_MMU=' "${prefix}config/$config"; then
+			continue
+		fi
 		sed -i "/\\<$name[ =]/d" "${prefix}config/$config"
 		case "$val" in
 		y | m) echo "$name=$val" ;;
