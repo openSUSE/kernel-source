@@ -358,6 +358,10 @@ if $current; then
 	cd tmp/current
 fi
 
+# Keep these in the -vanilla fragment even if -default has the same values.
+# This allows the spec file to read them from the fragment without calling
+# kconfig
+precious_options=($(sed -n 's/^%define config_vars //p' "${prefix}rpm/kernel-binary.spec.in"))
 err=0
 for config in $config_files; do
     cpu_arch=${config%/*}
@@ -469,6 +473,11 @@ for config in $config_files; do
 	    # otherwise we'll see the differences between default
 	    # and vanilla in addition to the changes made during this run.
 	    ${scripts}/config-diff "$vanilla_base" .config > config-new.diff
+	    for opt in "${precious_options[@]}"; do
+		    if ! grep -q -w "$opt" config-new.diff; then
+			    grep -w "$opt" .config >>config-new.diff
+		    fi
+	    done
 	    ${scripts}/config-merge "$vanilla_base" config-new.diff > config-new
 	    if ! $silent; then
 		diff -U0 $config_orig config-new|grep -v ^@@
