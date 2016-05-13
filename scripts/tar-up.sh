@@ -37,6 +37,8 @@ sort()
 tolerate_unknown_new_config_options=
 ignore_kabi=
 mkspec_args=()
+arch=
+flavor=
 source rpm/config.sh
 until [ "$#" = "0" ] ; do
   case "$1" in
@@ -73,6 +75,11 @@ until [ "$#" = "0" ] ; do
       mkspec_args=("${mkspec_args[@]}" --release "$2")
       shift 2
       ;;
+    -a|--arch)
+      arch=$2; shift 2 ;;
+    -f|--flavor|--flavour)
+      flavor=$2; shift 2 ;;
+    --vanilla) flavor="vanilla"; shift ;;
     -h|--help|-v|--version)
 	cat <<EOF
 
@@ -83,6 +90,9 @@ these options are recognized:
     -u		       update generated files in an existing kernel-source dir
     -i                 ignore kabi failures
     -d, --dir=DIR      create package in DIR instead of default kernel-source$VARIANT
+    -a, --arch=ARCH    create package for architecture ARCH only
+    -f, --flavor=FLAVOR create package for FLAVOR only
+    --vanilla	       like --flavor=vanilla
 
 EOF
 	exit 1
@@ -111,13 +121,15 @@ check_for_merge_conflicts() {
 
 suffix=$(sed -rn 's/^Source0:.*\.(tar\.[a-z0-9]*)$/\1/p' rpm/kernel-source.spec.in)
 # Dot files are skipped by intention, in order not to break osc working
-# copies. The linux tarball is not deleted if it is already there
+# copies.  The linux tarball is not deleted if it is already there. Do
+# not delete the get_release_number.sh file, since it may be produced
+# externally by PTF utils.
 for f in "$build_dir"/*; do
-	case "$f" in
-	"$build_dir/linux-$SRCVERSION.$suffix")
+	case "${f##*/}" in
+	"linux-$SRCVERSION.$suffix" | get_release_number.sh)
 		continue
 		;;
-	"$build_dir"/patches.*)
+	patches.*)
 		rm -rf "$f"
 	esac
 	rm -f "$f"
@@ -145,19 +157,9 @@ for file in $referenced_files; do
 	esac
 done
 
-SKIP_XEN=true
-used_configs=$( $(dirname $0)/guards --prefix=config $( $(dirname $0)/arch-symbols --list) < config.conf )
-for file in $used_configs; do
-	case $file in
-	config/*/xen | config/*/ec2 | config/*/pv)
-		SKIP_XEN=false ;;
-	esac
-done
-
-if $SKIP_XEN; then
-	echo "[ Xen configs are disabled. Disabling Xen patches. ]"
-	sed -i 's#.*patches.xen/#+noxen  &#' $build_dir/series.conf
-fi
+[ "$flavor" == "vanilla" ] &&  \
+    sed -i '/^$\|\s*#\|patches\.\(kernel\.org\|rpmify\)/b; s/\(.*\)/#### \1/' \
+    $build_dir/series.conf
 
 inconsistent=false
 check_for_merge_conflicts $referenced_files kernel-source.changes{,.old} || \
@@ -194,6 +196,9 @@ tmpdir=$(mktemp -dt ${0##*/}.XXXXXX)
 CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
 cp -p rpm/* config.conf supported.conf doc/* $build_dir
+match="${flavor:+\\/$flavor$}"
+match="${arch:+^+${arch}${match:+.*}}${match}"
+[ -n "$match" ] && sed -i "/^$\|\s*#\|${match}/b; s/\(.*\)/#### \1/" $build_dir/config.conf
 if test -e misc/extract-modaliases; then
 	cp misc/extract-modaliases $build_dir
 fi
@@ -347,10 +352,6 @@ for archive in $archives; do
     stable_tar -C $tmpdir2 -t 1234567890 $build_dir/$archive.tar.bz2 $archive
 done
 
-# Force mbuild to choose build hosts with enough memory available:
-echo $((1024*1024)) > $build_dir/minmem
-# Force mbuild to choose build hosts with enough disk space available:
-echo $((6*1024)) > $build_dir/needed_space_in_mb
 if [ -n "$ignore_kabi" ]; then
     echo > $build_dir/IGNORE-KABI-BADNESS
 fi
