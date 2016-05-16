@@ -38,7 +38,7 @@ usage() {
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
           [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
           [--patch-dir=PATH] [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]]
-          [--ctags] [--cscope] [--no-xen] [--skip-reverse]
+          [--ctags] [--cscope] [--skip-reverse]
 
   The --build-dir option supports internal shell aliases, like ~, and variable
   expansion when the variables are properly escaped.  Environment variables
@@ -63,7 +63,7 @@ SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
   of the component patches fail to apply the tree will not be rolled
   back.
 
-  When used with last-patch-name or --no-xen, both --fast and --no-quilt
+  When used with last-patch-name, both --fast and --no-quilt
   will set up a quilt environment for the remaining patches.
 END
     exit 1
@@ -198,7 +198,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,no-xen,skip-reverse -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,skip-reverse -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -219,7 +219,6 @@ CONFIG_FLAVOR=
 KABI=false
 CTAGS=false
 CSCOPE=false
-SKIP_XEN=false
 SKIP_REVERSE=false
 
 while true; do
@@ -281,9 +280,6 @@ while true; do
 	    ;;
 	--cscope)
 	    CSCOPE=true
-	    ;;
-	--no-xen)
-	    SKIP_XEN=true
 	    ;;
 	--skip-reverse)
 	    SKIP_REVERSE=true
@@ -354,13 +350,6 @@ fi
 
 if [ $# -ne 0 ]; then
     usage
-fi
-
-if ! scripts/guards --prefix=config $(scripts/arch-symbols --list) < config.conf | \
-     egrep -q '/(xen|ec2|pv)$'; then
-     echo "*** Xen configs are disabled; Skipping Xen patches." >&2
-
-     SKIP_XEN=true
 fi
 
 # Some patches require patch 2.5.4. Abort with older versions.
@@ -472,7 +461,7 @@ else
 fi
 
 # Check if patch $LIMIT exists
-if [ -n "$LIMIT" ] || $SKIP_XEN; then
+if [ -n "$LIMIT" ]; then
     for ((n=0; n<${#PATCHES[@]}; n++)); do
 	if [ "$LIMIT" = - ]; then
 	    LIMIT=${PATCHES[n]}
@@ -483,12 +472,6 @@ if [ -n "$LIMIT" ] || $SKIP_XEN; then
 	    LIMIT=${PATCHES[n]}
 	    break
 	    ;;
-	patches.xen/*)
-            if $SKIP_XEN; then
-                LIMIT=${PATCHES[n-1]}
-                break
-            fi
-            ;;
 	esac
     done
     if [ -n "$LIMIT" ] && ((n == ${#PATCHES[@]})); then
@@ -623,7 +606,19 @@ fi
 if test -n "$CONFIG"; then
     if test -e "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
 	echo "[ Copying config/$CONFIG_ARCH/$CONFIG_FLAVOR ]"
-	cp -a "config/$CONFIG_ARCH/$CONFIG_FLAVOR" "$SP_BUILD_DIR/.config"
+	if [ "$CONFIG_FLAVOR" = "vanilla" ] && \
+	   grep -q CONFIG_MMU= "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
+	    if [ "$CONFIG_ARCH" = "i386" ]; then
+		vanilla_base="config/$CONFIG_ARCH/pae"
+	    else
+		vanilla_base="config/$CONFIG_ARCH/default"
+	    fi
+	    scripts/config-merge "$vanilla_base" \
+				 "config/$CONFIG_ARCH/$CONFIG_FLAVOR" \
+				 > "$SP_BUILD_DIR/.config"
+	else
+	    cp -a "config/$CONFIG_ARCH/$CONFIG_FLAVOR" "$SP_BUILD_DIR/.config"
+	fi
     else
 	echo "[ Config $CONFIG does not exist. ]"
     fi
@@ -640,6 +635,11 @@ if test -n "$CONFIG"; then
 	fi
     fi
 fi
+
+for cert in rpm/*.crt; do
+	echo "[ Copying $cert ]"
+	cp "$cert" "$SP_BUILD_DIR/"
+done
 
 # Some archs we use for the config do not exist or have a different name in the
 # kernl source tree
