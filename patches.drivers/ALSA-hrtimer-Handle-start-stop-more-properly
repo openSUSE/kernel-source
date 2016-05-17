@@ -1,0 +1,160 @@
+From d2c5cf88d5282de258f4eb6ab40040b80a075cd8 Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Sun, 24 Apr 2016 22:52:18 +0200
+Subject: [PATCH] ALSA: hrtimer: Handle start/stop more properly
+Patch-mainline: Queued in subsystem maintainer repository
+Git-commit: d2c5cf88d5282de258f4eb6ab40040b80a075cd8
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/tiwai/sound.git
+References: bsc#973378
+
+This patch tries to address the still remaining issues in ALSA hrtimer
+Driver: 
+- Spurious use-after-free was detected in hrtimer callback
+- Incorrect rescheduling due to delayed start
+- WARN_ON() is triggered in hrtimer_forward() invoked in hrtimer
+  callback
+
+The first issue happens only when the new timer is scheduled even
+while hrtimer is being closed.  It's related with the second and third
+items; since ALSA timer core invokes hw.start callback during hrtimer
+interrupt, this may result in the explicit call of hrtimer_start().
+
+Also, the similar problem is seen for the stop; ALSA timer core
+invokes hw.stop callback even in the hrtimer handler, too.  Since we
+must not call the synced hrtimer_cancel() in such a context, it's just
+a hrtimer_try_to_cancel() call that doesn't properly work.
+
+Another culprit of the second and third items is the call of
+hrtimer_forward_now() before snd_timer_interrupt().  The timer->stick
+value may change during snd_timer_interrupt() call, but this
+possibility is ignored completely.
+
+For covering these subtle and messy issues, the following changes have
+been done in this patch:
+- A new flag, in_callback, is introduced in the private data to
+  indicate that the hrtimer handler is being processed.
+- Both start and stop callbacks skip when called from (during)
+  in_callback flag.
+- The hrtimer handler returns properly HRTIMER_RESTART and NORESTART
+  depending on the running state now.
+- The hrtimer handler reprograms the expiry properly after
+  snd_timer_interrupt() call, instead of before.
+- The close callback clears running flag and sets in_callback flag
+  to block any further start/stop calls.
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ sound/core/hrtimer.c | 56 ++++++++++++++++++++++++++++++++++++----------------
+ 1 file changed, 39 insertions(+), 17 deletions(-)
+
+diff --git a/sound/core/hrtimer.c b/sound/core/hrtimer.c
+index 656d9a9032dc..e2f27022b363 100644
+--- a/sound/core/hrtimer.c
++++ b/sound/core/hrtimer.c
+@@ -38,37 +38,53 @@ static unsigned int resolution;
+ struct snd_hrtimer {
+ 	struct snd_timer *timer;
+ 	struct hrtimer hrt;
+-	atomic_t running;
++	bool in_callback;
+ };
+ 
+ static enum hrtimer_restart snd_hrtimer_callback(struct hrtimer *hrt)
+ {
+ 	struct snd_hrtimer *stime = container_of(hrt, struct snd_hrtimer, hrt);
+ 	struct snd_timer *t = stime->timer;
+-	unsigned long oruns;
+-
+-	if (!atomic_read(&stime->running))
+-		return HRTIMER_NORESTART;
+-
+-	oruns = hrtimer_forward_now(hrt, ns_to_ktime(t->sticks * resolution));
+-	snd_timer_interrupt(stime->timer, t->sticks * oruns);
++	ktime_t delta;
++	unsigned long ticks;
++	enum hrtimer_restart ret = HRTIMER_NORESTART;
++
++	spin_lock(&t->lock);
++	if (!t->running)
++		goto out; /* fast path */
++	stime->in_callback = true;
++	ticks = t->sticks;
++	spin_unlock(&t->lock);
++
++	/* calculate the drift */
++	delta = ktime_sub(hrt->base->get_time(), hrtimer_get_expires(hrt));
++	if (delta.tv64 > 0)
++		ticks += ktime_divns(delta, ticks * resolution);
++
++	snd_timer_interrupt(stime->timer, ticks);
++
++	spin_lock(&t->lock);
++	if (t->running) {
++		hrtimer_add_expires_ns(hrt, t->sticks * resolution);
++		ret = HRTIMER_RESTART;
++	}
+ 
+-	if (!atomic_read(&stime->running))
+-		return HRTIMER_NORESTART;
+-	return HRTIMER_RESTART;
++	stime->in_callback = false;
++ out:
++	spin_unlock(&t->lock);
++	return ret;
+ }
+ 
+ static int snd_hrtimer_open(struct snd_timer *t)
+ {
+ 	struct snd_hrtimer *stime;
+ 
+-	stime = kmalloc(sizeof(*stime), GFP_KERNEL);
++	stime = kzalloc(sizeof(*stime), GFP_KERNEL);
+ 	if (!stime)
+ 		return -ENOMEM;
+ 	hrtimer_init(&stime->hrt, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	stime->timer = t;
+ 	stime->hrt.function = snd_hrtimer_callback;
+-	atomic_set(&stime->running, 0);
+ 	t->private_data = stime;
+ 	return 0;
+ }
+@@ -78,6 +94,11 @@ static int snd_hrtimer_close(struct snd_timer *t)
+ 	struct snd_hrtimer *stime = t->private_data;
+ 
+ 	if (stime) {
++		spin_lock_irq(&t->lock);
++		t->running = 0; /* just to be sure */
++		stime->in_callback = 1; /* skip start/stop */
++		spin_unlock_irq(&t->lock);
++
+ 		hrtimer_cancel(&stime->hrt);
+ 		kfree(stime);
+ 		t->private_data = NULL;
+@@ -89,18 +110,19 @@ static int snd_hrtimer_start(struct snd_timer *t)
+ {
+ 	struct snd_hrtimer *stime = t->private_data;
+ 
+-	atomic_set(&stime->running, 0);
+-	hrtimer_try_to_cancel(&stime->hrt);
++	if (stime->in_callback)
++		return 0;
+ 	hrtimer_start(&stime->hrt, ns_to_ktime(t->sticks * resolution),
+ 		      HRTIMER_MODE_REL);
+-	atomic_set(&stime->running, 1);
+ 	return 0;
+ }
+ 
+ static int snd_hrtimer_stop(struct snd_timer *t)
+ {
+ 	struct snd_hrtimer *stime = t->private_data;
+-	atomic_set(&stime->running, 0);
++
++	if (stime->in_callback)
++		return 0;
+ 	hrtimer_try_to_cancel(&stime->hrt);
+ 	return 0;
+ }
+-- 
+2.8.2
+
