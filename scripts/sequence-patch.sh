@@ -587,8 +587,10 @@ if test "$SP_BUILD_DIR" != "$PATCH_DIR"; then
     ln -sf "$PATCH_DIR" "$SP_BUILD_DIR/source"
     ln -sf "source/patches" "$SP_BUILD_DIR/patches"
     cat > $PATCH_DIR/GNUmakefile <<EOF
+ifeq ($(filter tags TAGS cscope gtags, $(MAKECMDGOALS)),)
 ifndef KBUILD_OUTPUT
 KBUILD_OUTPUT=$SP_BUILD_DIR
+endif
 endif
 include Makefile
 EOF
