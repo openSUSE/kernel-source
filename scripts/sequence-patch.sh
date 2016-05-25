@@ -586,6 +586,14 @@ if test "$SP_BUILD_DIR" != "$PATCH_DIR"; then
     rm -f "$SP_BUILD_DIR/patches"
     ln -sf "$PATCH_DIR" "$SP_BUILD_DIR/source"
     ln -sf "source/patches" "$SP_BUILD_DIR/patches"
+    cat > $PATCH_DIR/GNUmakefile <<EOF
+ifeq ($(filter tags TAGS cscope gtags, $(MAKECMDGOALS)),)
+ifndef KBUILD_OUTPUT
+KBUILD_OUTPUT=$SP_BUILD_DIR
+endif
+endif
+include Makefile
+EOF
 fi
 
 # If there are any remaining patches, add them to the series so
@@ -634,12 +642,17 @@ if test -n "$CONFIG"; then
 	    echo "[ No kABI references for $CONFIG ]"
 	fi
     fi
+    test "$SP_BUILD_DIR" != "$PATCH_DIR" && \
+	make -C $PATCH_DIR O=$SP_BUILD_DIR -s silentoldconfig
 fi
 
-for cert in rpm/*.crt; do
+if [ "rpm/*.crt" != 'rpm/*.crt' ]
+then
+    for cert in rpm/*.crt; do
 	echo "[ Copying $cert ]"
 	cp "$cert" "$SP_BUILD_DIR/"
-done
+    done
+fi
 
 # Some archs we use for the config do not exist or have a different name in the
 # kernl source tree
