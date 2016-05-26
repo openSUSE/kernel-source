@@ -549,8 +549,11 @@ stable_tar() {
         tar_opts=("${tar_opts[@]}" --no-paxheaders)
     esac
     printf '%s\n' "$@" | \
-	    scripts/stable-tar.pl "${tar_opts[@]}" -T - >"${tarball%.bz2}" || exit
-    bzip2 -9 "${tarball%.bz2}" || exit
+	    scripts/stable-tar.pl "${tar_opts[@]}" -T - | bzip2 -9 >"$tarball"
+    case "${PIPESTATUS[*]}" in
+    *[1-9]*)
+        exit 1
+    esac
 }
 
 # create the *.tar.bz2 files in parallel: Spawn a job for each cpu
