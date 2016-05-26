@@ -304,6 +304,39 @@ stable_tar() {
     bzip2 -9 "${tarball%.bz2}" || exit
 }
 
+# create the *.tar.bz2 files in parallel: Spawn a job for each cpu
+# present; wait for all of them to finish; submit a new set of jobs.
+# This is not a very efficient algorithm and it can result in anomalies
+# where adding a cpu slows the script down, so improvements are welcome.
+slots=$(getconf _NPROCESSORS_ONLN)
+if test 0$slots -lt 1; then
+	slots=1
+fi
+used=0
+wait_archives()
+{
+	if test $used -gt 0; then
+		wait
+		if grep -q '[^0]' "$tmpdir"/result-*; then
+			exit 1
+		fi
+		used=0
+		rm -f "$tmpdir"/result-*
+	fi
+}
+do_archive()
+{
+	if test $slots -eq 1; then
+		stable_tar "$@"
+		return
+	fi
+	if test $used -eq $slots; then
+		wait_archives
+	fi
+	(stable_tar "$@"; echo $? >"$tmpdir/result-$used") &
+	let used++
+}
+
 # The first directory level determines the archive name
 all_archives="$(
     echo "$referenced_files" \
@@ -314,21 +347,22 @@ for archive in $all_archives; do
 
     files="$(echo "$referenced_files" | sed -ne "\:^${archive//./\\.}/:p")"
     if [ -n "$files" ]; then
-	stable_tar $build_dir/$archive.tar.bz2 $files
+	do_archive $build_dir/$archive.tar.bz2 $files
     fi
 done
 
 if test -d kabi; then
     echo "kabi.tar.bz2"
-    stable_tar $build_dir/kabi.tar.bz2 kabi
+    do_archive $build_dir/kabi.tar.bz2 kabi
 fi
 
 if test -d sysctl && \
 	grep -q '^Source.*\<sysctl\.tar\.bz2' "$build_dir/kernel-source.spec.in"
 then
 	echo "sysctl.tar.bz2"
-	stable_tar $build_dir/sysctl.tar.bz2 sysctl
+	do_archive $build_dir/sysctl.tar.bz2 sysctl
 fi
+wait_archives
 
 
 # Create empty dummys for any *.tar.bz2 archive mentioned in the spec file
