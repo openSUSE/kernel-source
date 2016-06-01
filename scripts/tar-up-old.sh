@@ -35,6 +35,7 @@ source_timestamp=
 tolerate_unknown_new_config_options=0
 ignore_kabi=
 ignore_unsupported_deps=
+ptf_source=
 source rpm/config.sh
 until [ "$#" = "0" ] ; do
   case "$1" in
@@ -60,6 +61,10 @@ until [ "$#" = "0" ] ; do
       ;;
     -iu|--ignore-unsupported-deps)
       ignore_unsupported_deps=1
+      shift
+      ;;
+    --ptf)
+      ptf_source=1
       shift
       ;;
     -rs|--release-string)
@@ -497,11 +502,14 @@ if [ -n "$source_timestamp" ]; then
 	rpm_release_string=${branch:-HEAD}_$(date --utc '+%Y%m%d%H%M%S' -d "$ts")
 fi
 
-sed -e "s:@RELEASE_PREFIX@:$RELEASE_PREFIX:"		\
-    -e "s:@RELEASE_SUFFIX@:$rpm_release_string:"	\
-    rpm/get_release_number.sh.in			\
-    > $build_dir/get_release_number.sh
-chmod 755 $build_dir/get_release_number.sh
+if [ -z "$ptf_source" ]
+then
+	sed -e "s:@RELEASE_PREFIX@:$RELEASE_PREFIX:"		\
+	    -e "s:@RELEASE_SUFFIX@:$rpm_release_string:"	\
+	    rpm/get_release_number.sh.in			\
+	    > $build_dir/get_release_number.sh
+	chmod 755 $build_dir/get_release_number.sh
+fi
 
 # Usage:
 # stable_tar [-t <timestamp>] [-C <dir>] [--exclude=...] <tarball> <files> ...
