@@ -39,6 +39,7 @@ ignore_kabi=
 mkspec_args=()
 arch=
 flavor=
+ptf_source=
 source rpm/config.sh
 until [ "$#" = "0" ] ; do
   case "$1" in
@@ -64,6 +65,10 @@ until [ "$#" = "0" ] ; do
       ;;
     -iu|--ignore-unsupported-deps)
       # ignored, set %supported_modules_check in the spec instead
+      shift
+      ;;
+    --ptf)
+      ptf_source=1;
       shift
       ;;
     -rs|--release-string)
@@ -195,7 +200,9 @@ trap 'if test -n "$CLEANFILES"; then rm -rf "${CLEANFILES[@]}"; fi' EXIT
 tmpdir=$(mktemp -dt ${0##*/}.XXXXXX)
 CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
-cp -p rpm/* config.conf supported.conf doc/* $build_dir
+RSYNC_EXCLUDE=""
+[ -n "$ptf_source" ] && RSYNC_EXCLUDE="--exclude get_release_number.sh"
+rsync $RSYNC_EXCLUDE rpm/* config.conf supported.conf doc/* $build_dir
 match="${flavor:+\\/$flavor$}"
 match="${arch:+^+${arch}${match:+.*}}${match}"
 [ -n "$match" ] && sed -i "/^$\|\s*#\|${match}/b; s/\(.*\)/#### \1/" $build_dir/config.conf
