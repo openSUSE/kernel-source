@@ -383,11 +383,7 @@ for config in $config_files; do
 
     case $config in
     ppc*/*)
-        if test -e arch/powerpc/Makefile; then
-            MAKE_ARGS="ARCH=powerpc"
-        else
-            MAKE_ARGS="ARCH=$cpu_arch"
-        fi
+	MAKE_ARGS="ARCH=powerpc"
         ;;
     s390x/*)
         MAKE_ARGS="ARCH=s390"
