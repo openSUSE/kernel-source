@@ -141,6 +141,7 @@ tag_map = {
     },
     'From' : {
         'multi' : True,
+        'required' : True,
         'accepted' : [
             {
                 'name' : 'SUSE',
@@ -149,6 +150,14 @@ tag_map = {
             {
                 'match' : '.*',
             }
+        ],
+    },
+    'Subject' : {
+        'required' : True,
+        'accepted' :  [
+            {
+                'match' : '.*',
+            },
         ],
     },
 #    'References' : {

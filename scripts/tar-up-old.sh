@@ -35,6 +35,7 @@ source_timestamp=
 tolerate_unknown_new_config_options=0
 ignore_kabi=
 ignore_unsupported_deps=
+ptf_source=
 source rpm/config.sh
 until [ "$#" = "0" ] ; do
   case "$1" in
@@ -60,6 +61,10 @@ until [ "$#" = "0" ] ; do
       ;;
     -iu|--ignore-unsupported-deps)
       ignore_unsupported_deps=1
+      shift
+      ;;
+    --ptf)
+      ptf_source=1
       shift
       ;;
     -rs|--release-string)
@@ -497,11 +502,14 @@ if [ -n "$source_timestamp" ]; then
 	rpm_release_string=${branch:-HEAD}_$(date --utc '+%Y%m%d%H%M%S' -d "$ts")
 fi
 
-sed -e "s:@RELEASE_PREFIX@:$RELEASE_PREFIX:"		\
-    -e "s:@RELEASE_SUFFIX@:$rpm_release_string:"	\
-    rpm/get_release_number.sh.in			\
-    > $build_dir/get_release_number.sh
-chmod 755 $build_dir/get_release_number.sh
+if [ -z "$ptf_source" ]
+then
+	sed -e "s:@RELEASE_PREFIX@:$RELEASE_PREFIX:"		\
+	    -e "s:@RELEASE_SUFFIX@:$rpm_release_string:"	\
+	    rpm/get_release_number.sh.in			\
+	    > $build_dir/get_release_number.sh
+	chmod 755 $build_dir/get_release_number.sh
+fi
 
 # Usage:
 # stable_tar [-t <timestamp>] [-C <dir>] [--exclude=...] <tarball> <files> ...
@@ -549,8 +557,44 @@ stable_tar() {
         tar_opts=("${tar_opts[@]}" --no-paxheaders)
     esac
     printf '%s\n' "$@" | \
-	    scripts/stable-tar.pl "${tar_opts[@]}" -T - >"${tarball%.bz2}" || exit
-    bzip2 -9 "${tarball%.bz2}" || exit
+	    scripts/stable-tar.pl "${tar_opts[@]}" -T - | bzip2 -9 >"$tarball"
+    case "${PIPESTATUS[*]}" in
+    *[1-9]*)
+        exit 1
+    esac
+}
+
+# create the *.tar.bz2 files in parallel: Spawn a job for each cpu
+# present; wait for all of them to finish; submit a new set of jobs.
+# This is not a very efficient algorithm and it can result in anomalies
+# where adding a cpu slows the script down, so improvements are welcome.
+slots=$(getconf _NPROCESSORS_ONLN)
+if test 0$slots -lt 1; then
+	slots=1
+fi
+used=0
+wait_archives()
+{
+	if test $used -gt 0; then
+		wait
+		if grep -q '[^0]' "$tmpdir"/result-*; then
+			exit 1
+		fi
+		used=0
+		rm -f "$tmpdir"/result-*
+	fi
+}
+do_archive()
+{
+	if test $slots -eq 1; then
+		stable_tar "$@"
+		return
+	fi
+	if test $used -eq $slots; then
+		wait_archives
+	fi
+	(stable_tar "$@"; echo $? >"$tmpdir/result-$used") &
+	let used++
 }
 
 # The first directory level determines the archive name
@@ -563,13 +607,13 @@ for archive in $all_archives; do
 
     files="$(echo "$referenced_files" | sed -ne "\:^${archive//./\\.}/:p")"
     if [ -n "$files" ]; then
-	stable_tar $build_dir/$archive.tar.bz2 $files
+	do_archive $build_dir/$archive.tar.bz2 $files
     fi
 done
 
 if test -d kabi; then
     echo "kabi.tar.bz2"
-    stable_tar $build_dir/kabi.tar.bz2 kabi
+    do_archive $build_dir/kabi.tar.bz2 kabi
 fi
 
 for kmp in  novell-kmp hello; do
@@ -577,9 +621,10 @@ for kmp in  novell-kmp hello; do
         continue
     fi
     echo "$kmp.tar.bz2"
-    stable_tar -C doc --exclude='*.o' --exclude='*.ko' --exclude='*.*.cmd' \
+    do_archive -C doc --exclude='*.o' --exclude='*.ko' --exclude='*.*.cmd' \
         "$build_dir/$kmp.tar.bz2" "$kmp"
 done
+wait_archives
 
 # Create empty dummys for any *.tar.bz2 archive mentioned in the spec file
 # not already created: patches.addon is empty by intention; others currently

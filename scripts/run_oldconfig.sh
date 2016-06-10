@@ -226,6 +226,12 @@ else
 	echo "no arch-symbols found"
 	exit 1
 fi
+
+if $current; then
+	prefix=../../$prefix
+	cd tmp/current
+fi
+
 scripts="${prefix}scripts"
 
 if test -e "${prefix}rpm/config.sh"; then
@@ -353,11 +359,6 @@ filter_config()
     sed -e '/^# .* is not set$/p' -e '/^$\|^#/d' "$@" | sort
 }
 
-if $current; then
-	prefix=../../$prefix
-	cd tmp/current
-fi
-
 # Keep these in the -vanilla fragment even if -default has the same values.
 # This allows the spec file to read them from the fragment without calling
 # kconfig
@@ -382,11 +383,7 @@ for config in $config_files; do
 
     case $config in
     ppc*/*)
-        if test -e arch/powerpc/Makefile; then
-            MAKE_ARGS="ARCH=powerpc"
-        else
-            MAKE_ARGS="ARCH=$cpu_arch"
-        fi
+	MAKE_ARGS="ARCH=powerpc"
         ;;
     s390x/*)
         MAKE_ARGS="ARCH=s390"
