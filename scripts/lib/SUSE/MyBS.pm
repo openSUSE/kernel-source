@@ -12,7 +12,6 @@ use HTTP::Request;
 use File::Temp qw(tempfile);
 use Config::IniFiles;
 use Digest::MD5;
-use Data::Dumper;
 
 use SUSE::MyBS::Buildresults;
 
