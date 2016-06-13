@@ -615,7 +615,7 @@ if test -n "$CONFIG"; then
     if test -e "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
 	echo "[ Copying config/$CONFIG_ARCH/$CONFIG_FLAVOR ]"
 	if [ "$CONFIG_FLAVOR" = "vanilla" ] && \
-	   grep -q CONFIG_MMU= "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
+	   ! grep -q CONFIG_MMU= "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
 	    if [ "$CONFIG_ARCH" = "i386" ]; then
 		vanilla_base="config/$CONFIG_ARCH/pae"
 	    else
