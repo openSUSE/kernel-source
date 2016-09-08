@@ -108,14 +108,15 @@ sub api {
 	my ($self, $method, $path, $data) = @_;
 	my $url = $self->{url} . $path;
 
-	#print STDERR "$method => $url\n";
 	my $req = HTTP::Request->new($method => $url);
 	if ($data) {
 		$req->add_content($data);
 	}
+	#$self->{ua}->prepare_request($req);
+	#print STDERR "req: " . $req->as_string() . "\n";
 	my $res = $self->{ua}->request($req);
 	if ($res->code != 200) {
-		#print STDERR $res->content();
+		#print STDERR $res->as_string();
 		die "$path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
 	}
 	return $res->content();
