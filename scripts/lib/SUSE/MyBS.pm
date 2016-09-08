@@ -111,6 +111,7 @@ sub api {
 	my $req = HTTP::Request->new($method => $url);
 	if ($data) {
 		$req->add_content($data);
+		$req->header("Content-type" => "application/octet-stream");
 	}
 	#$self->{ua}->prepare_request($req);
 	#print STDERR "req: " . $req->as_string() . "\n";
