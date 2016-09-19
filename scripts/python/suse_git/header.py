@@ -156,7 +156,7 @@ tag_map = {
         'required' : True,
         'accepted' :  [
             {
-                'match' : '.*',
+                'match' : '\S+',
             },
         ],
     },
