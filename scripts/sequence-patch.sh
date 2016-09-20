@@ -618,14 +618,13 @@ fi
 if test -n "$CONFIG"; then
     if test -e "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
 	echo "[ Copying config/$CONFIG_ARCH/$CONFIG_FLAVOR ]"
-	if [ "$CONFIG_FLAVOR" = "vanilla" ] && \
-	   ! grep -q CONFIG_MMU= "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
+	if ! grep -q CONFIG_MMU= "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
 	    if [ "$CONFIG_ARCH" = "i386" ]; then
-		vanilla_base="config/$CONFIG_ARCH/pae"
+		config_base="config/$CONFIG_ARCH/pae"
 	    else
-		vanilla_base="config/$CONFIG_ARCH/default"
+		config_base="config/$CONFIG_ARCH/default"
 	    fi
-	    scripts/config-merge "$vanilla_base" \
+	    scripts/config-merge "$config_base" \
 				 "config/$CONFIG_ARCH/$CONFIG_FLAVOR" \
 				 > "$SP_BUILD_DIR/.config"
 	else

@@ -84,8 +84,8 @@ set_var()
 		if test -L "${prefix}config/$config"; then
 			continue
 		fi
-		# do not change trimmed vanilla configs unless requested
-		if test "$set_flavor" != "vanilla" && ! \
+		# do not change trimmed configs unless requested
+		if test -z "$set_flavor" && ! \
 			grep -q '^CONFIG_MMU=' "${prefix}config/$config"; then
 			continue
 		fi
@@ -407,14 +407,14 @@ for config in $config_files; do
     config="${prefix}config/$config"
     config_orig="config-orig"
 
-    vanilla_base=
-    if [ "$flavor" = "vanilla" ] && ! grep -q CONFIG_MMU= "$config"; then
+    config_base=
+    if ! grep -q CONFIG_MMU= "$config"; then
 	if [ "$cpu_arch" = "i386" ]; then
-	    vanilla_base="$(dirname "$config")/pae"
+	    config_base="$(dirname "$config")/pae"
 	else
-	    vanilla_base="$(dirname "$config")/default"
+	    config_base="$(dirname "$config")/default"
 	fi
-	${scripts}/config-merge "$vanilla_base" "$config" >$config_orig
+	${scripts}/config-merge "$config_base" "$config" >$config_orig
     else
 	cp "$config" $config_orig
     fi
@@ -465,17 +465,17 @@ for config in $config_files; do
     esac
     if ! $check; then
         ask_reuse_config $config_orig .config
-	if [ -n "$vanilla_base" ]; then
+	if [ -n "$config_base" ]; then
 	    # We need to diff and re-merge to compare to the original,
 	    # otherwise we'll see the differences between default
 	    # and vanilla in addition to the changes made during this run.
-	    ${scripts}/config-diff "$vanilla_base" .config > config-new.diff
+	    ${scripts}/config-diff "$config_base" .config > config-new.diff
 	    for opt in "${precious_options[@]}"; do
 		    if ! grep -q -w "$opt" config-new.diff; then
 			    grep -w "$opt" .config >>config-new.diff
 		    fi
 	    done
-	    ${scripts}/config-merge "$vanilla_base" config-new.diff > config-new
+	    ${scripts}/config-merge "$config_base" config-new.diff > config-new
 	    if ! $silent; then
 		diff -U0 $config_orig config-new|grep -v ^@@
 	    fi
