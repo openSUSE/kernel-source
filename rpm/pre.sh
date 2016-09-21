@@ -19,3 +19,44 @@ if [ @BASE_PACKAGE@ = 1 -a "$YAST_IS_RUNNING" != "" ]; then
 		fi
 	fi
 fi
+
+
+# On AArch64 we switched from 64k PAGE_SIZE to 4k PAGE_SIZE. Unfortunately
+# btrfs can only use file systems created with the same PAGE_SIZE. So we
+# check if the user has any btrfs file systems mounted and refuse to install
+# in that case.
+if [ $( uname -m ) = aarch64 -a \
+     "$( zgrep CONFIG_ARM64_64K_PAGES=y /proc/config.gz )" -a \
+     @FLAVOR@ = default ]; then
+	if [ "$FORCE_4K" = 1 ]; then
+		# The user knows what he's doing, let him be.
+		exit 0
+	fi
+
+	if [ "$YAST_IS_RUNNING" = "instsys" ]; then
+		# We're probably test installing the kernel, that should succeed
+		exit 0
+	fi
+
+	cat >&2 <<-EOF
+
+		You are running on a 64kb PAGE_SIZE kernel. The default kernel
+		switched to 4kb PAGE_SIZE which will prevent it from mounting btrfs
+		or the swap partition.
+		
+		To ensure that your system still works, I am refusing to install
+		this kernel. If you want to force installation regardlesss, reinstall
+		with the environment variable FORCE_4K set to 1.
+
+		To stay with a 64kb PAGE_SIZE kernel, please follow these steps:
+
+		        $ zypper in kernel-64kb
+		        [ reboot into the new kernel ]
+		        $ zypper rm kernel-default
+
+		You will then be on the 64kb PAGE_SIZE kernel and can update your
+		system normally.
+	EOF
+
+	exit 1
+fi
