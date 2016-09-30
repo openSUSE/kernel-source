@@ -38,7 +38,7 @@ usage() {
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
           [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
           [--patch-dir=PATH] [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]]
-          [--ctags] [--cscope] [--skip-reverse]
+          [--ctags] [--cscope] [--etags] [--skip-reverse]
 
   The --build-dir option supports internal shell aliases, like ~, and variable
   expansion when the variables are properly escaped.  Environment variables
@@ -198,7 +198,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,skip-reverse -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,etags,skip-reverse -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -219,6 +219,7 @@ CONFIG_FLAVOR=
 KABI=false
 CTAGS=false
 CSCOPE=false
+ETAGS=false
 SKIP_REVERSE=false
 
 while true; do
@@ -280,6 +281,9 @@ while true; do
 	    ;;
 	--cscope)
 	    CSCOPE=true
+	    ;;
+	--etags)
+	    ETAGS=true
 	    ;;
 	--skip-reverse)
 	    SKIP_REVERSE=true
@@ -614,14 +618,13 @@ fi
 if test -n "$CONFIG"; then
     if test -e "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
 	echo "[ Copying config/$CONFIG_ARCH/$CONFIG_FLAVOR ]"
-	if [ "$CONFIG_FLAVOR" = "vanilla" ] && \
-	   ! grep -q CONFIG_MMU= "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
+	if ! grep -q CONFIG_MMU= "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
 	    if [ "$CONFIG_ARCH" = "i386" ]; then
-		vanilla_base="config/$CONFIG_ARCH/pae"
+		config_base="config/$CONFIG_ARCH/pae"
 	    else
-		vanilla_base="config/$CONFIG_ARCH/default"
+		config_base="config/$CONFIG_ARCH/default"
 	    fi
-	    scripts/config-merge "$vanilla_base" \
+	    scripts/config-merge "$config_base" \
 				 "config/$CONFIG_ARCH/$CONFIG_FLAVOR" \
 				 > "$SP_BUILD_DIR/.config"
 	else
@@ -676,5 +679,14 @@ if $CSCOPE; then
 	ARCH=$TAGS_ARCH make -s --no-print-directory -C "$PATCH_DIR" O="$SP_BUILD_DIR" cscope
     else
 	echo "[ Could not generate cscope db: cscope not found ]"
+    fi
+fi
+
+if $ETAGS; then
+    if etags --version > /dev/null; then
+	echo "[ Generating etags (this may take a while)]"
+	ARCH=$TAGS_ARCH make -s --no-print-directory -C "$PATCH_DIR" O="$SP_BUILD_DIR" TAGS
+    else
+	echo "[ Could not generate etags: etags not found ]"
     fi
 fi
