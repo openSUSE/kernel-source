@@ -38,7 +38,7 @@ usage() {
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
           [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
           [--patch-dir=PATH] [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]]
-          [--ctags] [--cscope] [--no-xen]
+          [--ctags] [--cscope] [--etags] [--skip-reverse]
 
   The --build-dir option supports internal shell aliases, like ~, and variable
   expansion when the variables are properly escaped.  Environment variables
@@ -63,34 +63,30 @@ SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
   of the component patches fail to apply the tree will not be rolled
   back.
 
-  When used with last-patch-name or --no-xen, both --fast and --no-quilt
+  When used with last-patch-name, both --fast and --no-quilt
   will set up a quilt environment for the remaining patches.
 END
     exit 1
 }
 
 apply_fast_patches() {
-    before=$(echo ${PATCHES_BEFORE[@]}|wc -w)
-    after=$(echo ${PATCHES_AFTER[@]}|wc -w)
-    echo "[ Fast-applying $before patches. $after remain. ]"
-    cat "${PATCHES_BEFORE[@]}" | \
+    echo "[ Fast-applying ${#PATCHES_BEFORE[@]} patches. ${#PATCHES_AFTER[@]} remain. ]"
+    LAST_LOG=$(echo "${PATCHES_BEFORE[@]}" | xargs cat | \
         patch -d $PATCH_DIR -p1 -E $fuzz --force --no-backup-if-mismatch \
-		-s > $LAST_LOG 2>&1
+		-s 2>&1)
     STATUS=$?
 
     if [ $STATUS -ne 0 ]; then
-        if [ $STATUS -ne 0 ]; then
-            [ -n "$QUIET" ] && cat $LAST_LOG
-            echo "All-in-one patch failed (not rolled back)."
-            echo "Logfile: $LAST_LOG"
-            status=1
-        fi
-    else
-        rm -f $LAST_LOG
+        echo "$LAST_LOG" >> $PATCH_LOG
+        [ -n "$QUIET" ] && echo "$LAST_LOG"
+        echo "All-in-one patch failed (not rolled back)."
+        echo "Logfile: $PATCH_LOG"
+        status=1
     fi
 
     PATCHES=( ${PATCHES_AFTER[@]} )
 }
+SKIPPED_PATCHES=
 
 # Patch kernel normally
 apply_patches() {
@@ -130,37 +126,48 @@ apply_patches() {
         echo "[ $PATCH ]" >> $PATCH_LOG
         backup_dir=$PATCH_DIR/.pc/$PATCH
 
-        exec 5<&1  # duplicate stdin
-        case $PATCH in
-        *.gz)	exec < <(gzip -cd $PATCH) ;;
-        *.bz2)	exec < <(bzip2 -cd $PATCH) ;;
-        *)		exec < $PATCH ;;
-        esac
-        patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
-                --no-backup-if-mismatch --force > $LAST_LOG 2>&1
+        LAST_LOG=$(patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
+                --no-backup-if-mismatch --force < $PATCH 2>&1)
         STATUS=$?
-        exec 0<&5  # restore stdin
 
         if [ $STATUS -ne 0 ]; then
             restore_files $backup_dir $PATCH_DIR
+
+	    if $SKIP_REVERSE; then
+		patch -R -d $PATCH_DIR -p1 -E $fuzz --force --dry-run \
+			< $PATCH > /dev/null 2>&1
+		ST=$?
+		if [ $ST -eq 0 ]; then
+			LAST_LOG="[ skipped: can be reverse-applied ]"
+			[ -n "$QUIET" ] && echo "$LAST_LOG"
+			STATUS=0
+			SKIPPED_PATCHES="$SKIPPED_PATCHES $PATCH"
+			PATCH="# $PATCH"
+			remove_rejects $backup_dir $PATCH_DIR
+		fi
+	    fi
+
+	    # Backup directory is no longer needed
+	    rm -rf $backup_dir
+	else
+	    if $QUILT; then
+		echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
+	    fi
         fi
+
         if ! $QUILT; then
             rm -rf $PATCH_DIR/.pc/
         fi
-        cat $LAST_LOG >> $PATCH_LOG
-        [ -z "$QUIET" ] && cat $LAST_LOG
+        echo "$LAST_LOG" >> $PATCH_LOG
+        [ -z "$QUIET" ] && echo "$LAST_LOG"
         if [ $STATUS -ne 0 ]; then
-            [ -n "$QUIET" ] && cat $LAST_LOG
+            [ -n "$QUIET" ] && echo "$LAST_LOG"
             echo "Patch $PATCH failed (rolled back)."
             echo "Logfile: $PATCH_LOG"
             status=1
             break
         else
             echo "$SERIES_PFX$PATCH" >> $PATCH_DIR/series
-            if $QUILT; then
-                echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
-            fi
-            rm -f $LAST_LOG
         fi
 
         shift
@@ -174,6 +181,15 @@ apply_patches() {
     done
 }
 
+show_skipped() {
+    if [ -n "$SKIPPED_PATCHES" ]; then
+	echo "The following patches were skipped and can be removed from series.conf:"
+	for p in $SKIPPED_PATCHES; do
+	    echo "$p"
+	done
+    fi
+}
+
 # Allow to pass in default arguments via SEQUENCE_PATCH_ARGS.
 set -- $SEQUENCE_PATCH_ARGS "$@"
 
@@ -182,7 +198,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,no-xen -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,etags,skip-reverse -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -203,7 +219,8 @@ CONFIG_FLAVOR=
 KABI=false
 CTAGS=false
 CSCOPE=false
-SKIP_XEN=false
+ETAGS=false
+SKIP_REVERSE=false
 
 while true; do
     case "$1" in
@@ -265,8 +282,11 @@ while true; do
 	--cscope)
 	    CSCOPE=true
 	    ;;
-	--no-xen)
-	    SKIP_XEN=true
+	--etags)
+	    ETAGS=true
+	    ;;
+	--skip-reverse)
+	    SKIP_REVERSE=true
 	    ;;
 	--)
 	    shift
@@ -283,14 +303,53 @@ if [ $# -ge 1 ]; then
     shift
 fi
 
+if test -z "$CONFIG"; then
+	if test "$VANILLA_ONLY" = 1 || $VANILLA; then
+		CONFIG=$(uname -m)-vanilla
+	else
+		machine=$(uname -m)
+		# XXX: We could use scripts/arch-symbols here, but it is
+		# not unified among branches and has weird behavior in some
+		case "$machine" in
+		i?86)
+			machine=i386
+			;;
+		aarch64)
+			machine=arm64
+			;;
+		esac
+		if test -e "config/$machine/smp"; then
+			CONFIG=$machine-smp
+		elif test -e "config/$machine/pae"; then
+			CONFIG=$machine-pae
+		elif test -e "config/$machine/default"; then
+			CONFIG=$machine-default
+		elif test -n "$VARIANT" -a -e "config/$machine/${VARIANT#-}"; then
+			CONFIG=$machine$VARIANT
+		else
+			# Try other architectures and assume the user is able
+			# to cross-compile
+			for machine in x86_64 ppc64 ppc64le arm64 s390x; do
+				if test -e "config/$machine/default"; then
+					CONFIG=$machine-default
+					break
+				fi
+			done
+		fi
+		if test -z "$CONFIG"; then
+			echo "Cannot determine default config for arch $machine"
+		fi
+	fi
+fi
+
 if test -n "$CONFIG"; then
-    CONFIG_ARCH=${CONFIG%%-*}
-    CONFIG_FLAVOR=${CONFIG##*-}
-    if [ "$CONFIG" = "$CONFIG_ARCH" -o "$CONFIG" = "$CONFIG_FLAVOR" -o \
-         -z "$CONFIG_ARCH" -o -z "$CONFIG_FLAVOR" ]; then
-	echo "Invalid config spec: --config=ARCH-FLAVOR is expected."
-	usage
-    fi
+	CONFIG_ARCH=${CONFIG%%-*}
+	CONFIG_FLAVOR=${CONFIG##*-}
+	if [ "$CONFIG" = "$CONFIG_ARCH" -o "$CONFIG" = "$CONFIG_FLAVOR" -o \
+			-z "$CONFIG_ARCH" -o -z "$CONFIG_FLAVOR" ]; then
+		echo "Invalid config spec: --config=ARCH-FLAVOR is expected."
+		usage
+	fi
 fi
 
 if [ $# -ne 0 ]; then
@@ -327,25 +386,16 @@ export TMPDIR
 ORIG_DIR=$SCRATCH_AREA/linux-$SRCVERSION.orig
 TAG=$(get_branch_name)
 TAG=${TAG//\//_}
-if [ "$VANILLA" = "true" ]; then
+if $VANILLA; then
 	TAG=${TAG}-vanilla
 fi
 PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION${TAG:+-$TAG}.log
-LAST_LOG=$SCRATCH_AREA/last-$SRCVERSION${TAG:+-$TAG}.log
 
 # Check series.conf.
 if [ ! -r series.conf ]; then
     echo "Configuration file \`series.conf' not found"
     exit 1
 fi
-if [ -e scripts/check-patches ]; then
-    scripts/check-patches || {
-	echo "Inconsistencies found."
-	echo "Please clean up series.conf and/or the patches directories!"
-	read
-    }
-fi
-
 if $have_arch_patches; then
     if [ -z "$ARCH_SYMBOLS" ]; then
         if [ -x ./arch-symbols ]; then
@@ -396,33 +446,26 @@ fi
 echo "Creating tree in $PATCH_DIR"
 
 # Clean up from previous run
-rm -f "$PATCH_LOG" "$LAST_LOG"
+rm -f "$PATCH_LOG"
 if [ -e $PATCH_DIR ]; then
-    tmpdir=$(mktemp -d ${PATCH_DIR%/*}/${0##*/}.XXXXXX)
-    if [ -n "$tmpdir" ]; then
-	echo "Cleaning up from previous run (background)"
-	mv $PATCH_DIR $tmpdir
-	rm -rf $tmpdir &
-    else
-	echo "Cleaning up from previous run"
-	rm -rf $PATCH_DIR
-    fi
+    echo "Cleaning up from previous run"
+    rm -rf $PATCH_DIR
 fi
 
 # Create fresh $SCRATCH_AREA/linux-$SRCVERSION.
 if ! [ -d $ORIG_DIR ]; then
-    unpack_tarball "$SRCVERSION" "$ORIG_DIR"
+    unpack_tarball "$SRCVERSION" "$ORIG_DIR" "$URL"
     find $ORIG_DIR -type f | xargs chmod a-w,a+r
 fi
 
 if $VANILLA; then
-PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep '^patches\.(kernel\.org|rpmify)/') )
+	PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep '^patches\.(kernel\.org|rpmify)/') )
 else
-PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
+	PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
 fi
 
 # Check if patch $LIMIT exists
-if [ -n "$LIMIT" ] || $SKIP_XEN; then
+if [ -n "$LIMIT" ]; then
     for ((n=0; n<${#PATCHES[@]}; n++)); do
 	if [ "$LIMIT" = - ]; then
 	    LIMIT=${PATCHES[n]}
@@ -433,15 +476,9 @@ if [ -n "$LIMIT" ] || $SKIP_XEN; then
 	    LIMIT=${PATCHES[n]}
 	    break
 	    ;;
-	patches.xen/*)
-            if $SKIP_XEN; then
-                LIMIT=${PATCHES[n-1]}
-                break
-            fi
-            ;;
 	esac
     done
-    if ((n == ${#PATCHES[@]})); then
+    if [ -n "$LIMIT" ] && ((n == ${#PATCHES[@]})); then
 	echo "No patch \`$LIMIT' found."
 	exit 1
     fi
@@ -461,7 +498,7 @@ fi
 # Helper function to restore files backed up by patch. This is
 # faster than doing a --dry-run first.
 restore_files() {
-    local backup_dir=$1 patch_dir=$2 file wd=$PWD
+    local backup_dir=$1 patch_dir=$2 file
     local -a remove restore
  
     if [ -d $backup_dir ]; then
@@ -479,6 +516,26 @@ restore_files() {
 		| xargs cp -f --parents --target $patch_dir
 	cd $patch_dir
 	#echo "Remove: ${remove[@]}"
+	[ ${#remove[@]} -ne 0 ] \
+	    && printf "%s\n" "${remove[@]}" | xargs rm -f
+	popd > /dev/null
+    fi
+}
+
+# Helper function to remove stray .rej files.
+remove_rejects() {
+    local backup_dir=$1 patch_dir=$2 file
+    local -a remove
+
+    if [ -d $backup_dir ]; then
+	pushd $backup_dir > /dev/null
+	for file in $(find . -type f) ; do
+	    if [ -f "$patch_dir/$file.rej" ]; then
+		remove[${#remove[@]}]="$file.rej"
+	    fi
+	done
+	cd $patch_dir
+	#echo "Remove rejects: ${remove[@]}"
 	[ ${#remove[@]} -ne 0 ] \
 	    && printf "%s\n" "${remove[@]}" | xargs rm -f
 	popd > /dev/null
@@ -516,6 +573,9 @@ fi
 
 ln -s $PWD $PATCH_DIR/patches
 ln -s patches/scripts/{refresh_patch,run_oldconfig}.sh $PATCH_DIR/
+if $VANILLA; then
+	touch "$PATCH_DIR/.is_vanilla"
+fi
 if $QUILT; then
     [ -r $HOME/.quiltrc ] && . $HOME/.quiltrc
     [ ${QUILT_PATCHES-patches} != patches ] \
@@ -530,12 +590,23 @@ if test "$SP_BUILD_DIR" != "$PATCH_DIR"; then
     rm -f "$SP_BUILD_DIR/patches"
     ln -sf "$PATCH_DIR" "$SP_BUILD_DIR/source"
     ln -sf "source/patches" "$SP_BUILD_DIR/patches"
+    cat > $PATCH_DIR/GNUmakefile <<EOF
+ifeq (\$(filter tags TAGS cscope gtags, \$(MAKECMDGOALS)),)
+ifndef KBUILD_OUTPUT
+KBUILD_OUTPUT=$SP_BUILD_DIR
+endif
+endif
+include Makefile
+EOF
 fi
 
 # If there are any remaining patches, add them to the series so
 # they can be fixed up with quilt (or similar).
 if [ -n "${PATCHES[*]}" ]; then
     ( IFS=$'\n' ; echo "${PATCHES[*]}" ) >> $PATCH_DIR/series
+fi
+show_skipped
+if test "0$status" -ne 0; then
     exit $status
 fi
 
@@ -546,8 +617,19 @@ fi
 
 if test -n "$CONFIG"; then
     if test -e "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
-	echo "[ Copying config/$CONFIG_ARCH/$CONFIG ]"
-	cp -a "config/$CONFIG_ARCH/$CONFIG_FLAVOR" "$SP_BUILD_DIR/.config"
+	echo "[ Copying config/$CONFIG_ARCH/$CONFIG_FLAVOR ]"
+	if ! grep -q CONFIG_MMU= "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
+	    if [ "$CONFIG_ARCH" = "i386" ]; then
+		config_base="config/$CONFIG_ARCH/pae"
+	    else
+		config_base="config/$CONFIG_ARCH/default"
+	    fi
+	    scripts/config-merge "$config_base" \
+				 "config/$CONFIG_ARCH/$CONFIG_FLAVOR" \
+				 > "$SP_BUILD_DIR/.config"
+	else
+	    cp -a "config/$CONFIG_ARCH/$CONFIG_FLAVOR" "$SP_BUILD_DIR/.config"
+	fi
     else
 	echo "[ Config $CONFIG does not exist. ]"
     fi
@@ -563,12 +645,29 @@ if test -n "$CONFIG"; then
 	    echo "[ No kABI references for $CONFIG ]"
 	fi
     fi
+    test "$SP_BUILD_DIR" != "$PATCH_DIR" && \
+	make -C $PATCH_DIR O=$SP_BUILD_DIR -s silentoldconfig
 fi
 
+if [ "rpm/*.crt" != 'rpm/*.crt' ]
+then
+    for cert in rpm/*.crt; do
+	echo "[ Copying $cert ]"
+	cp "$cert" "$SP_BUILD_DIR/"
+    done
+fi
+
+# Some archs we use for the config do not exist or have a different name in the
+# kernl source tree
+case $CONFIG_ARCH in
+	s390x) TAGS_ARCH=s390 ;;
+	ppc64|ppc64le) TAGS_ARCH=powerpc ;;
+	*) TAGS_ARCH=$CONFIG_ARCH ;;
+esac
 if $CTAGS; then
     if ctags --version > /dev/null; then
 	echo "[ Generating ctags (this may take a while)]"
-	make -s --no-print-directory -C "$PATCH_DIR" O="$SP_BUILD_DIR" tags
+	ARCH=$TAGS_ARCH make -s --no-print-directory -C "$PATCH_DIR" O="$SP_BUILD_DIR" tags
     else
 	echo "[ Could not generate ctags: ctags not found ]"
     fi
@@ -577,9 +676,17 @@ fi
 if $CSCOPE; then
     if cscope -V 2> /dev/null; then
 	echo "[ Generating cscope db (this may take a while)]"
-	make -s --no-print-directory -C "$PATCH_DIR" O="$SP_BUILD_DIR" cscope
+	ARCH=$TAGS_ARCH make -s --no-print-directory -C "$PATCH_DIR" O="$SP_BUILD_DIR" cscope
     else
 	echo "[ Could not generate cscope db: cscope not found ]"
     fi
 fi
 
+if $ETAGS; then
+    if etags --version > /dev/null; then
+	echo "[ Generating etags (this may take a while)]"
+	ARCH=$TAGS_ARCH make -s --no-print-directory -C "$PATCH_DIR" O="$SP_BUILD_DIR" TAGS
+    else
+	echo "[ Could not generate etags: etags not found ]"
+    fi
+fi

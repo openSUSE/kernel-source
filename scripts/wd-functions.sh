@@ -41,27 +41,36 @@ get_branch_name()
 
 _find_tarball()
 {
-    local version=$1 dir subdir major
+    local version=$1 suffixes=$2 dir subdir major suffix
 
     set -- ${version//[.-]/ }
-    major=$1.$2
-    case "$major" in
-    3.*)
-        major=3.x
-    esac
+    if test $1 -le 2; then
+        major=$1.$2
+    else
+        major=$1.x
+    fi
+    if test -z "$suffixes"; then
+        if test -n "$(type -p xz)"; then
+            suffixes="tar.xz tar.bz2"
+        else
+            suffixes="tar.bz2"
+        fi
+    fi
     for dir in . $MIRROR {/mounts,/labs,}/mirror/kernel; do
         for subdir in "" "/v$major" "/testing" "/v$major/testing"; do
-            if test -r "$dir$subdir/linux-$version.tar.bz2"; then
-                echo "$dir$subdir/linux-$version.tar.bz2"
-                return
-            fi
+            for suffix in $suffixes; do
+                if test -r "$dir$subdir/linux-$version.$suffix"; then
+                    echo "$_"
+                    return
+                fi
+            done
         done
     done
 }
 
 _get_tarball_from_git()
 {
-    local version=$1 tag url
+    local version=$1 tag url=$2 default_url
 
     git=${LINUX_GIT:-$HOME/linux-2.6}
     if test ! -d "$git/.git"; then
@@ -71,16 +80,17 @@ _get_tarball_from_git()
     case "$version" in
     *next-*)
         tag=refs/tags/next-${version##*next-}
-        url=git://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git
+        default_url=git://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git
         ;;
     [0-9]*-g???????)
         tag="v$version"
-        url=git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
+        default_url=git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
         ;;
     *)
         tag=refs/tags/"v$version"
-        url=git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
+        default_url=git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
     esac
+    [ -z "$url" ] && url=$default_url
     if ! git --git-dir="$git/.git" cat-file -e "$tag" 2>/dev/null; then
         case "$tag" in
         refs/tags/*)
@@ -97,40 +107,59 @@ _get_tarball_from_git()
 
 get_tarball()
 {
-    local version=$1 dest=$2 tarball
+    local version=$1 suffix=$2 dest=$3 url=$4 tarball compress
 
-    tarball=$(_find_tarball "$version")
+    tarball=$(_find_tarball "$version" "$suffix")
     if test -n "$tarball"; then
-        cp "$tarball" "$dest/linux-$version.tar.bz2.part" || exit
-        mv "$dest/linux-$version.tar.bz2.part" "$dest/linux-$version.tar.bz2"
+        cp -p "$tarball" "$dest/linux-$version.$suffix.part" || exit
+        mv "$dest/linux-$version.$suffix.part" "$dest/linux-$version.$suffix"
         return
     fi
-    echo "Warning: could not find linux-$version.tar.bz2, trying to create it from git" >&2
+    # Reuse the locally generated tarball if already there
+    if test -e "$dest/linux-$version.$suffix"; then
+        return
+    fi
+    echo "Warning: could not find linux-$version.$suffix, trying to create it from git" >&2
+    case "$suffix" in
+    tar.bz2)
+        compress="bzip2 -9"
+        ;;
+    tar.xz)
+        compress="xz"
+        ;;
+    *)
+        echo "Unknown compression format: $suffix" >&2
+        exit 1
+    esac
     set -o pipefail
-    _get_tarball_from_git "$version" | bzip2 -9 \
-        >"$dest/linux-$version.tar.bz2.part"
+    _get_tarball_from_git "$version" "$url" | $compress \
+        >"$dest/linux-$version.$suffix.part"
     if test $? -ne 0; then
         exit 1
     fi
-    mv "$dest/linux-$version.tar.bz2.part" "$dest/linux-$version.tar.bz2"
+    mv "$dest/linux-$version.$suffix.part" "$dest/linux-$version.$suffix"
     set +o pipefail
 }
 
 unpack_tarball()
 {
-    local version=$1 dest=$2 tarball
+    local version=$1 dest=$2 url=$3 tarball
 
     tarball=$(_find_tarball "$version")
     mkdir -p "$dest"
     if test -n "$tarball"; then
         echo "Extracting $tarball"
-        tar -xjf "$tarball" -C "$dest" --strip-components=1
+        case "$tarball" in
+        *.bz2) tar -xjf "$tarball" -C "$dest" --strip-components=1 ;;
+        *.xz) xz -d <"$tarball" | tar -xf - -C "$dest" --strip-components=1 ;;
+        *) tar -xf "$tarball" -C "$dest" --strip-components=1 ;;
+        esac
         return
     fi
-    echo "Warning: could not find linux-$version.tar.bz2, trying to create it from git" >&2
+    echo "Warning: could not find linux-$version.tar.(bz2|xz), trying to create it from git" >&2
     echo "alternatively you can put an unpatched kernel tree to $dest" >&2
     set -o pipefail
-    _get_tarball_from_git "$version" | tar -xf - -C "$dest" --strip-components=1
+    _get_tarball_from_git "$version" "$url" | tar -xf - -C "$dest" --strip-components=1
     if test $? -ne 0; then
         rm -rf "$dest"
         exit 1
@@ -138,21 +167,45 @@ unpack_tarball()
     set +o pipefail
 }
 
+get_git_remote() {
+    local branch=$1
+    local remote
+
+    remote=$(git config --get branch.${branch}.remote)
+    remote=${remote:-"<repository>"}
+    echo "$remote"
+}
+
+get_git_user() {
+    local remote=$1
+    local user
+
+    if [ "$remote" ]; then
+        user=$(git remote -v show -n | awk '
+            /^'$remote'/ && /\(push\)$/ {
+                match($2, "^(ssh://)?(([^@]+)@)?", a)
+                print a[3]
+            }')
+    fi
+    user=${user:-$LOGNAME}
+    user=${user:-"<user>"}
+    echo "$user"
+}
+
 if $using_git && test -z "$CHECKED_GIT_HOOKS"; then
     export CHECKED_GIT_HOOKS=1
     if ! "$scripts_dir"/install-git-hooks --check; then
         echo "WARNING: You should run $scripts_dir/install-git-hooks to enable pre-commit checks." >&2
     fi
-    suse_domains_re='(suse\.(de|com|cz)|novell\.com)'
-    kerncvs_re='(kerncvs(\.suse\.de)?|10\.10\.1\.75)'
-    if (echo $EMAIL; hostname -f) | grep -Eiq "aaa[@.]$suse_domains_re\\>" || \
-        git config remote.origin.url | grep -Eiq "\\<$kerncvs_re:"; then
-        # only warn when used in suse
-        if ! git var GIT_COMMITTER_IDENT | grep -Eiq "@$suse_domains_re>"; then
-            echo "WARNING: You should set your suse email address in git"  >&2
-            echo "WARNING: E.g. by running 'git config --global user.email <your login>@suse.de'" >&2
-        fi
-    fi
 fi
+
+get_localversion() {
+    local version=$1
+
+    if [[ "$version" =~ .*-[1-9][0-9]*-g[a-f0-9]+$ ]] # 4.4-rc6-1310-gec0382c
+    then
+	echo "$version" | sed -e "s/.*\(-[1-9][0-9]*-g[a-f0-9]\+\)$/\1/";
+    fi
+}
 
 # vim: sw=4:sts=4:et

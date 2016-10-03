@@ -37,6 +37,9 @@ sort()
 tolerate_unknown_new_config_options=
 ignore_kabi=
 mkspec_args=()
+arch=
+flavor=
+ptf_source=
 source rpm/config.sh
 until [ "$#" = "0" ] ; do
   case "$1" in
@@ -64,6 +67,10 @@ until [ "$#" = "0" ] ; do
       # ignored, set %supported_modules_check in the spec instead
       shift
       ;;
+    --ptf)
+      ptf_source=1;
+      shift
+      ;;
     -rs|--release-string)
       case "$2" in
       *' '*)
@@ -73,6 +80,11 @@ until [ "$#" = "0" ] ; do
       mkspec_args=("${mkspec_args[@]}" --release "$2")
       shift 2
       ;;
+    -a|--arch)
+      arch=$2; shift 2 ;;
+    -f|--flavor|--flavour)
+      flavor=$2; shift 2 ;;
+    --vanilla) flavor="vanilla"; shift ;;
     -h|--help|-v|--version)
 	cat <<EOF
 
@@ -83,6 +95,9 @@ these options are recognized:
     -u		       update generated files in an existing kernel-source dir
     -i                 ignore kabi failures
     -d, --dir=DIR      create package in DIR instead of default kernel-source$VARIANT
+    -a, --arch=ARCH    create package for architecture ARCH only
+    -f, --flavor=FLAVOR create package for FLAVOR only
+    --vanilla	       like --flavor=vanilla
 
 EOF
 	exit 1
@@ -109,20 +124,24 @@ check_for_merge_conflicts() {
     fi
 }
 
+suffix=$(sed -rn 's/^Source0:.*\.(tar\.[a-z0-9]*)$/\1/p' rpm/kernel-source.spec.in)
 # Dot files are skipped by intention, in order not to break osc working
-# copies. The linux tarball is not deleted if it is already there
+# copies.  The linux tarball is not deleted if it is already there. Do
+# not delete the get_release_number.sh file, since it may be produced
+# externally by PTF utils.
 for f in "$build_dir"/*; do
-	case "$f" in
-	*/"linux-$SRCVERSION.tar.bz2")
+	case "${f##*/}" in
+	"linux-$SRCVERSION.$suffix" | get_release_number.sh)
 		continue
+		;;
+	patches.*)
+		rm -rf "$f"
 	esac
 	rm -f "$f"
 done
 mkdir -p "$build_dir"
-if test ! -e "$build_dir/linux-$SRCVERSION.tar.bz2"; then
-	echo "linux-$SRCVERSION.tar.bz2"
-	get_tarball "$SRCVERSION" "$build_dir"
-fi
+echo "linux-$SRCVERSION.$suffix"
+get_tarball "$SRCVERSION" "$suffix" "$build_dir" "$URL"
 
 # list of patches to include.
 install -m 644 series.conf $build_dir/
@@ -142,6 +161,11 @@ for file in $referenced_files; do
 		exit 1
 	esac
 done
+
+[ "$flavor" == "vanilla" ] &&  \
+    sed -i '/^$\|\s*#\|patches\.\(kernel\.org\|rpmify\)/b; s/\(.*\)/#### \1/' \
+    $build_dir/series.conf
+
 inconsistent=false
 check_for_merge_conflicts $referenced_files kernel-source.changes{,.old} || \
 	inconsistent=true
@@ -159,6 +183,9 @@ if ! scripts/cvs-wd-timestamp > $build_dir/$tsfile; then
     exit 1
 fi
 
+localversion=$(get_localversion $SRCVERSION)
+[ -n "$localversion" ] && echo -n "$localversion" > $build_dir/localversion
+
 if $using_git; then
     # Always include the git revision
     echo "GIT Revision: $(git rev-parse HEAD)" >> $build_dir/$tsfile
@@ -173,7 +200,12 @@ trap 'if test -n "$CLEANFILES"; then rm -rf "${CLEANFILES[@]}"; fi' EXIT
 tmpdir=$(mktemp -dt ${0##*/}.XXXXXX)
 CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
-cp -p rpm/* config.conf supported.conf doc/* $build_dir
+RSYNC_EXCLUDE=""
+[ -n "$ptf_source" ] && RSYNC_EXCLUDE="--exclude get_release_number.sh"
+rsync $RSYNC_EXCLUDE rpm/* config.conf supported.conf doc/* $build_dir
+match="${flavor:+\\/$flavor$}"
+match="${arch:+^+${arch}${match:+.*}}${match}"
+[ -n "$match" ] && sed -i "/^$\|\s*#\|${match}/b; s/\(.*\)/#### \1/" $build_dir/config.conf
 if test -e misc/extract-modaliases; then
 	cp misc/extract-modaliases $build_dir
 fi
@@ -187,8 +219,7 @@ if test -e "$build_dir"/config-options.changes; then
 	mv "$build_dir"/config-options.changes \
 		"$build_dir"/config-options.changes.txt
 fi
-# FIXME: move config-subst out of rpm/
-rm "$build_dir/config-subst"
+rm -f "$build_dir/config-subst"
 
 changelog=$build_dir/kernel-source$VARIANT.changes
 if test -e kernel-source.changes; then
@@ -267,16 +298,53 @@ stable_tar() {
     shift
 
     if test -z "$mtime" && $using_git; then
+	local dirs=$(printf '%s\n' "$@" | sed 's:/.*::' | sort -u)
         mtime="$(cd "$chdir"
-            echo "$@" | xargs git log -1 --pretty=tformat:%ct -- | sort -n | \
+            echo "${dirs[@]}" | xargs git log -1 --pretty=tformat:%ct -- | sort -n | \
             tail -n 1)"
     fi
     if test -n "$mtime"; then
         tar_opts=("${tar_opts[@]}" --mtime "$mtime")
     fi
     printf '%s\n' "$@" | \
-	    scripts/stable-tar.pl "${tar_opts[@]}" -T - >"${tarball%.bz2}" || exit
-    bzip2 -9 "${tarball%.bz2}" || exit
+	    scripts/stable-tar.pl "${tar_opts[@]}" -T - | bzip2 -9 >"$tarball"
+    case "${PIPESTATUS[*]}" in
+    *[1-9]*)
+        exit 1
+    esac
+}
+
+# create the *.tar.bz2 files in parallel: Spawn a job for each cpu
+# present; wait for all of them to finish; submit a new set of jobs.
+# This is not a very efficient algorithm and it can result in anomalies
+# where adding a cpu slows the script down, so improvements are welcome.
+slots=$(getconf _NPROCESSORS_ONLN)
+if test 0$slots -lt 1; then
+	slots=1
+fi
+used=0
+wait_archives()
+{
+	if test $used -gt 0; then
+		wait
+		if grep -q '[^0]' "$tmpdir"/result-*; then
+			exit 1
+		fi
+		used=0
+		rm -f "$tmpdir"/result-*
+	fi
+}
+do_archive()
+{
+	if test $slots -eq 1; then
+		stable_tar "$@"
+		return
+	fi
+	if test $used -eq $slots; then
+		wait_archives
+	fi
+	(stable_tar "$@"; echo $? >"$tmpdir/result-$used") &
+	let used++
 }
 
 # The first directory level determines the archive name
@@ -287,25 +355,24 @@ all_archives="$(
 for archive in $all_archives; do
     echo "$archive.tar.bz2"
 
-    files="$( echo "$referenced_files" \
-	| sed -ne "\:^${archive//./\\.}/:p" \
-	| while read patch; do
-	    [ -e "$patch" ] && echo "$patch"
-	done)"
+    files="$(echo "$referenced_files" | sed -ne "\:^${archive//./\\.}/:p")"
     if [ -n "$files" ]; then
-	stable_tar $build_dir/$archive.tar.bz2 $files
+	do_archive $build_dir/$archive.tar.bz2 $files
     fi
 done
 
-echo "kabi.tar.bz2"
-stable_tar $build_dir/kabi.tar.bz2 kabi
+if test -d kabi; then
+    echo "kabi.tar.bz2"
+    do_archive $build_dir/kabi.tar.bz2 kabi
+fi
 
 if test -d sysctl && \
 	grep -q '^Source.*\<sysctl\.tar\.bz2' "$build_dir/kernel-source.spec.in"
 then
 	echo "sysctl.tar.bz2"
-	stable_tar $build_dir/sysctl.tar.bz2 sysctl
+	do_archive $build_dir/sysctl.tar.bz2 sysctl
 fi
+wait_archives
 
 
 # Create empty dummys for any *.tar.bz2 archive mentioned in the spec file
@@ -329,10 +396,6 @@ for archive in $archives; do
     stable_tar -C $tmpdir2 -t 1234567890 $build_dir/$archive.tar.bz2 $archive
 done
 
-# Force mbuild to choose build hosts with enough memory available:
-echo $((1024*1024)) > $build_dir/minmem
-# Force mbuild to choose build hosts with enough disk space available:
-echo $((6*1024)) > $build_dir/needed_space_in_mb
 if [ -n "$ignore_kabi" ]; then
     echo > $build_dir/IGNORE-KABI-BADNESS
 fi
