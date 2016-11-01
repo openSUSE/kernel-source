@@ -197,8 +197,8 @@ class MissingTagError(ValidationError):
             tag = Tag("Policy", None)
         msg = "%s%s requires %s%s." % (tag.name, \
                     " (%s)" % tag.tagtype if tag.tagtype else "", \
-                    requires[0], \
-                    " (%s)" % requires[1] if requires[1] else "")
+                    requires['name'], \
+                    " (%s)" % requires['type'] if 'type' in requires else "")
         self.target = [requires]
         super(MissingTagError, self).__init__(tag.name, msg)
 
@@ -208,8 +208,8 @@ class MissingMultiTagError(MissingTagError):
             tag = Tag("Policy", None)
         msg = "%s%s requires %s." % (tag.name, \
                 " (%s)" % tag.tagtype if tag.tagtype else "", \
-                " or ".join(["%s%s" % (req[0], \
-                    " (%s)" % req[1] if req[1] else "") for req in requires]))
+                " or ".join(["%s%s" % (req['name'], \
+                    " (%s)" % req['type'] if 'type' in req else "") for req in requires]))
         self.target = requires
         super(MissingTagError, self).__init__(tag.name, msg)
 
@@ -217,8 +217,8 @@ class ExcludedTagError(ValidationError):
     def __init__(self, tag, excludes):
         msg = "%s%s excludes %s%s." % (tag.name,
                 " (%s)" % tag.tagtype if tag.tagtype else "", \
-                excludes[0], \
-                " (%s)" % excludes[1] if excludes[1] else "")
+                excludes['name'], \
+                " (%s)" % excludes['type'] if 'type' in excludes else "")
         super(ExcludedTagError, self).__init__(tag.name, msg)
 
 class DuplicateTagError(ValidationError):
@@ -240,7 +240,7 @@ class HeaderException(patch.PatchException):
             for err in self._errors:
                 if isinstance(err, MissingTagError):
                     for tag in err.target:
-                        if tag[0].lower() == name.lower():
+                        if tag['name'].lower() == name.lower():
                             return True
         except KeyError, e:
             pass
@@ -268,12 +268,10 @@ class Tag:
                 (self.name, self.value, type, valid)
 
     def match_req(self, req):
-        if self.name == req[0]:
-            if req[1] is None:
+        if self.name == req['name']:
+            if 'type' not in req or self.tagtype == req['type']:
                 if self.valid:
                     return True
-            elif self.tagtype == req[1] and self.valid:
-                return True
         return False
 
 def handle_requires(tag, rules, target):
@@ -281,11 +279,11 @@ def handle_requires(tag, rules, target):
         tag = Tag(tag, None)
     for req in rules:
         s = req.split(':')
+        new_req = {
+            'name' : s[0]
+        }
         if len(s) > 1:
-            new_req = (s[0], s[1])
-        else:
-            new_req = (s[0], None)
-
+            new_req['type'] = s[1]
         if not tag in target:
             target[tag] = []
         target[tag].append(new_req)
@@ -355,6 +353,7 @@ class HeaderChecker(patch.PatchChecker):
 
                     tag.valid = True
 
+                    # Handle rule-level dependencies
                     if 'requires' in rule:
                         handle_requires(tag, rule['requires'], requires)
                     if 'requires_any' in rule:
@@ -363,17 +362,17 @@ class HeaderChecker(patch.PatchChecker):
                         handle_requires(tag, rule['excludes'], excludes)
                     break
 
-                tags.append(tag)
-
+                # Handle tag-level dependencies
                 if tag.valid:
                     if 'requires' in mapping:
-                        handle_requires(tag.name, mapping['requires'], requires)
+                        handle_requires(tag, mapping['requires'], requires)
                     if 'requires_any' in mapping:
-                        handle_requires(tag.name, mapping['requires_any'],
+                        handle_requires(tag, mapping['requires_any'],
                                         requires_any)
                     if 'excludes' in mapping:
-                        handle_requires(tag.name, mapping['excludes'], excludes)
+                        handle_requires(tag, mapping['excludes'], excludes)
 
+                tags.append(tag)
 
                 if error:
                     continue
@@ -428,7 +427,7 @@ class HeaderChecker(patch.PatchChecker):
                     if entry == tag.name:
                         found = True
                 if not found:
-                    errors.append(MissingTagError(None, (entry, None)))
+                    errors.append(MissingTagError(None, { 'name' : entry }))
 
         if errors:
             raise HeaderException(errors)
