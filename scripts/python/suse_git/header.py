@@ -384,41 +384,38 @@ class HeaderChecker(patch.PatchChecker):
                     errors.append(FormatError(tag.name, tag.value, errmsg))
                     continue
 
-        if requires:
-            for reqtag in requires:
-                for req in requires[reqtag]:
-                    found = False
-                    for tag in tags:
-                        found = tag.match_req(req)
-                        if found:
-                            break
-                    if not found:
-                        errors.append(MissingTagError(reqtag, req))
-
-        if requires_any:
-            for reqtag in requires_any:
+        for reqtag in requires:
+            for req in requires[reqtag]:
                 found = False
-                for req in requires_any[reqtag]:
-                    for tag in tags:
-                        found = tag.match_req(req)
-                        if found:
-                            break
+                for tag in tags:
+                    found = tag.match_req(req)
                     if found:
                         break
                 if not found:
-                    errors.append(MissingMultiTagError(reqtag,
+                    errors.append(MissingTagError(reqtag, req))
+
+        for reqtag in requires_any:
+            found = False
+            for req in requires_any[reqtag]:
+                for tag in tags:
+                    found = tag.match_req(req)
+                    if found:
+                        break
+                if found:
+                    break
+            if not found:
+                errors.append(MissingMultiTagError(reqtag,
                                                        requires_any[reqtag]))
 
-        if excludes:
-            for reqtag in excludes:
-                for req in excludes[reqtag]:
-                    found = False
-                    for tag in tags:
-                        found = tag.match_req(req)
-                        if found:
-                            break
+        for reqtag in excludes:
+            for req in excludes[reqtag]:
+                found = False
+                for tag in tags:
+                    found = tag.match_req(req)
                     if found:
-                        errors.append(ExcludedTagError(reqtag, req))
+                        break
+                if found:
+                    errors.append(ExcludedTagError(reqtag, req))
 
         for entry in tag_map:
             if 'required' in tag_map[entry]:
