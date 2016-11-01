@@ -162,6 +162,7 @@ tag_map = {
     },
     'References' : {
         'required' : True,
+        'required_on_update' : False,
         'multi' : True,
         'accepted' : [
             {
@@ -274,35 +275,54 @@ class Tag:
                     return True
         return False
 
-def handle_requires(tag, rules, target):
-    if isinstance(tag, str):
-        tag = Tag(tag, None)
-    for req in rules:
-        s = req.split(':')
-        new_req = {
-            'name' : s[0]
-        }
-        if len(s) > 1:
-            new_req['type'] = s[1]
-        if not tag in target:
-            target[tag] = []
-        target[tag].append(new_req)
-
 class HeaderChecker(patch.PatchChecker):
-    def __init__(self):
+    def __init__(self, stream, updating=False):
         patch.PatchChecker.__init__(self)
-
-    def do_patch(self, stream):
-        requires = {}
-        requires_any = {}
-        excludes = {}
-        tags = []
-        errors = []
-
+        self.updating = updating
         if isinstance(stream, str):
             stream = StringIO(stream)
+        self.stream = stream
 
-        for line in stream.readlines():
+        self.requires = {}
+        self.requires_any = {}
+        self.excludes = {}
+        self.tags = []
+        self.errors = []
+
+        self.do_patch()
+
+    def get_rulename(self, ruleset, rulename):
+        if rulename in ruleset:
+            if self.updating:
+                 updating_rule = "{}_on_update".format(rulename)
+                 if updating_rule in ruleset:
+                     return updating_rule
+            return rulename
+        return None
+
+    def handle_requires(self, tag, ruleset, rulename):
+        target = getattr(self, rulename)
+
+        rulename = self.get_rulename(ruleset, rulename)
+        if not rulename:
+            return
+
+        if isinstance(tag, str):
+            tag = Tag(tag, None)
+
+        for req in ruleset[rulename]:
+            s = req.split(':')
+            new_req = {
+                'name' : s[0]
+            }
+            if len(s) > 1:
+                new_req['type'] = s[1]
+            if not tag in target:
+                target[tag] = []
+            target[tag].append(new_req)
+
+    def do_patch(self):
+        for line in self.stream.readlines():
             if diffstart.match(line):
                 break
 
@@ -314,7 +334,7 @@ class HeaderChecker(patch.PatchChecker):
                     continue;
 
                 if re.match("\s*$", tag.value):
-                    errors.append(EmptyTagError(tag.name))
+                    self.errors.append(EmptyTagError(tag.name))
                     continue
 
                 mapping = tag_map[tag.name]
@@ -324,14 +344,14 @@ class HeaderChecker(patch.PatchChecker):
                 except KeyError, e:
                     multi = False
 
-                for t in tags:
+                for t in self.tags:
                     if tag.name == t.name and not multi:
-                        errors.append(DuplicateTagError(tag.name))
+                        self.errors.append(DuplicateTagError(tag.name))
                         continue
 
                 # No rules to process
                 if 'accepted' not in mapping:
-                    tags.append(tag)
+                    self.tags.append(tag)
                     continue
 
                 match = False
@@ -347,32 +367,25 @@ class HeaderChecker(patch.PatchChecker):
 
                     if 'error' in rule:
                         error = True
-                        errors.append(FormatError(tag.name, tag.value,
+                        self.errors.append(FormatError(tag.name, tag.value,
                                                   rule['error']))
                         break
 
                     tag.valid = True
 
                     # Handle rule-level dependencies
-                    if 'requires' in rule:
-                        handle_requires(tag, rule['requires'], requires)
-                    if 'requires_any' in rule:
-                        handle_requires(tag, rule['requires_any'], requires_any)
-                    if 'excludes' in rule:
-                        handle_requires(tag, rule['excludes'], excludes)
+                    self.handle_requires(tag, rule, 'requires')
+                    self.handle_requires(tag, rule, 'requires_any')
+                    self.handle_requires(tag, rule, 'excludes')
                     break
 
                 # Handle tag-level dependencies
                 if tag.valid:
-                    if 'requires' in mapping:
-                        handle_requires(tag, mapping['requires'], requires)
-                    if 'requires_any' in mapping:
-                        handle_requires(tag, mapping['requires_any'],
-                                        requires_any)
-                    if 'excludes' in mapping:
-                        handle_requires(tag, mapping['excludes'], excludes)
+                    self.handle_requires(tag, mapping, 'requires')
+                    self.handle_requires(tag, mapping, 'requires_any')
+                    self.handle_requires(tag, mapping, 'excludes')
 
-                tags.append(tag)
+                self.tags.append(tag)
 
                 if error:
                     continue
@@ -381,52 +394,58 @@ class HeaderChecker(patch.PatchChecker):
                     errmsg = None
                     if 'error' in mapping:
                         errmsg = mapping['error']
-                    errors.append(FormatError(tag.name, tag.value, errmsg))
+                    self.errors.append(FormatError(tag.name, tag.value, errmsg))
                     continue
 
-        for reqtag in requires:
-            for req in requires[reqtag]:
+        for reqtag in self.requires:
+            for req in self.requires[reqtag]:
                 found = False
-                for tag in tags:
+                for tag in self.tags:
                     found = tag.match_req(req)
                     if found:
                         break
                 if not found:
-                    errors.append(MissingTagError(reqtag, req))
+                    self.errors.append(MissingTagError(reqtag, req))
 
-        for reqtag in requires_any:
+        for reqtag in self.requires_any:
             found = False
-            for req in requires_any[reqtag]:
-                for tag in tags:
+            for req in self.requires_any[reqtag]:
+                for tag in self.tags:
                     found = tag.match_req(req)
                     if found:
                         break
                 if found:
                     break
             if not found:
-                errors.append(MissingMultiTagError(reqtag,
-                                                       requires_any[reqtag]))
+                self.errors.append(
+                        MissingMultiTagError(reqtag, self.requires_any[reqtag]))
 
-        for reqtag in excludes:
-            for req in excludes[reqtag]:
+        for reqtag in self.excludes:
+            for req in self.excludes[reqtag]:
                 found = False
-                for tag in tags:
+                for tag in self.tags:
                     found = tag.match_req(req)
                     if found:
                         break
                 if found:
-                    errors.append(ExcludedTagError(reqtag, req))
+                    self.errors.append(ExcludedTagError(reqtag, req))
 
         for entry in tag_map:
             if 'required' in tag_map[entry]:
                 found = False
-                for tag in tags:
+                for tag in self.tags:
                     if entry == tag.name:
                         found = True
                 if not found:
-                    errors.append(MissingTagError(None, { 'name' : entry }))
+                    required = True
+                    if self.updating and 'required_on_update' in tag_map[entry]:
+                        if not tag_map[entry]['required_on_update']:
+                            required = False
+                    if required:
+                        self.errors.append(MissingTagError(None,
+                                                           { 'name' : entry }))
 
-        if errors:
-            raise HeaderException(errors)
+        if self.errors:
+            raise HeaderException(self.errors)
 
 Checker = HeaderChecker
