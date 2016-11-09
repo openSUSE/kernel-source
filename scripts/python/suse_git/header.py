@@ -294,7 +294,7 @@ class HeaderChecker(patch.PatchChecker):
     def get_rulename(self, ruleset, rulename):
         if rulename in ruleset:
             if self.updating:
-                 updating_rule = "{}_on_update".format(rulename)
+                 updating_rule = "%s_on_update" % rulename
                  if updating_rule in ruleset:
                      return updating_rule
             return rulename
