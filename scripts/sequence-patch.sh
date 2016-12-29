@@ -329,7 +329,9 @@ if test -z "$CONFIG"; then
 		else
 			# Try other architectures and assume the user is able
 			# to cross-compile
-			for machine in x86_64 ppc64 ppc64le arm64 s390x; do
+			for machine in ${machine/ppc64le/ppc64} \
+				${machine/ppc64/ppc64le} x86_64 \
+				ppc64 ppc64le arm64 s390x; do
 				if test -e "config/$machine/default"; then
 					CONFIG=$machine-default
 					break
