@@ -118,7 +118,7 @@ sub api {
 	my $res = $self->{ua}->request($req);
 	if ($res->code != 200) {
 		#print STDERR $res->as_string();
-		die "$path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
+		die "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
 	}
 	return $res->content();
 }
