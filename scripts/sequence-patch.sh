@@ -329,7 +329,9 @@ if test -z "$CONFIG"; then
 		else
 			# Try other architectures and assume the user is able
 			# to cross-compile
-			for machine in x86_64 ppc64 ppc64le arm64 s390x; do
+			for machine in ${machine/ppc64le/ppc64} \
+				${machine/ppc64/ppc64le} x86_64 \
+				ppc64 ppc64le arm64 s390x; do
 				if test -e "config/$machine/default"; then
 					CONFIG=$machine-default
 					break
@@ -647,14 +649,6 @@ if test -n "$CONFIG"; then
     fi
     test "$SP_BUILD_DIR" != "$PATCH_DIR" && \
 	make -C $PATCH_DIR O=$SP_BUILD_DIR -s silentoldconfig
-fi
-
-if [ "rpm/*.crt" != 'rpm/*.crt' ]
-then
-    for cert in rpm/*.crt; do
-	echo "[ Copying $cert ]"
-	cp "$cert" "$SP_BUILD_DIR/"
-    done
 fi
 
 # Some archs we use for the config do not exist or have a different name in the

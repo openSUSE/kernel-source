@@ -118,7 +118,7 @@ sub api {
 	my $res = $self->{ua}->request($req);
 	if ($res->code != 200) {
 		#print STDERR $res->as_string();
-		die "$path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
+		die "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
 	}
 	return $res->content();
 }
@@ -448,6 +448,7 @@ sub upload_package {
 	my ($self, $dir, $prj, $package, $commit, $options) = @_;
 	$options ||= {};
 	my $progresscb = $options->{progresscb} || sub { };
+	my $no_init = $options->{no_init};
 	my $remove_packages = $options->{remove_packages} || [];
 	my %remove_packages = map { $_ => 1 } @$remove_packages;
 	my $limit_packages = $options->{limit_packages} || [];
@@ -464,8 +465,10 @@ sub upload_package {
 	if (!$self->project_exists($project)) {
 		die "Project $project does not exist\n";
 	}
-	$self->create_package($prj, $package);
-	&$progresscb('CREATE', "$project/$package");
+	if (!$no_init) {
+		$self->create_package($prj, $package);
+		&$progresscb('CREATE', "$project/$package");
+	}
 	opendir(my $dh, $dir) or die "$dir: $!\n";
 	my $remote = $self->readdir("/source/$project/$package");
 	my $new_filelist = "";
@@ -505,6 +508,9 @@ sub upload_package {
 	if ($changed) {
 		my $xml = $self->post("/source/$project/$package?comment=$commit&cmd=commitfilelist", $new_filelist);
 		$revision = $self->get_directory_revision($xml);
+	}
+	if ($no_init) {
+		return $revision;
 	}
 
 	# Create links for all specfiles in this package

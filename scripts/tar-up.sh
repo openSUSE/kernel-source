@@ -110,11 +110,14 @@ EOF
 done
 export LANG=POSIX
 
-[ -z "$build_dir" ] && build_dir=kernel-source$VARIANT
-if [ -z "$build_dir" ]; then
-    echo "Please define the build directory with the --dir option" >&2
-    exit 1
-fi
+case "$build_dir" in
+"")
+	build_dir=kernel-source$VARIANT
+	;;
+/* | ./*) ;;
+*)
+	build_dir=./$build_dir
+esac
 
 check_for_merge_conflicts() {
     set -- $(grep -lP '^<{7}(?!<)|^>{7}(?!>)' "$@" 2> /dev/null)
