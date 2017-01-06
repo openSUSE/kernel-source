@@ -651,14 +651,6 @@ if test -n "$CONFIG"; then
 	make -C $PATCH_DIR O=$SP_BUILD_DIR -s silentoldconfig
 fi
 
-if [ "rpm/*.crt" != 'rpm/*.crt' ]
-then
-    for cert in rpm/*.crt; do
-	echo "[ Copying $cert ]"
-	cp "$cert" "$SP_BUILD_DIR/"
-    done
-fi
-
 # Some archs we use for the config do not exist or have a different name in the
 # kernl source tree
 case $CONFIG_ARCH in
