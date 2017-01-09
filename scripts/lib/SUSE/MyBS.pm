@@ -564,6 +564,14 @@ sub get_logfile {
 	return $self->get("/build/$project/$repository/$arch/$package/_log?nostream=1");
 }
 
+sub get_make_stderr {
+	my ($self, $project, $package, $repository, $arch) = @_;
+
+	$repository ||= "standard";
+	return $self->get("/build/$project/$repository/$arch/$package/make-stderr.log");
+}
+
+
 sub get_kernel_commit {
 	my ($self, $project, $package, $revision) = @_;
 
