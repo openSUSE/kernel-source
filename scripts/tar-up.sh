@@ -39,7 +39,6 @@ ignore_kabi=
 mkspec_args=()
 arch=
 flavor=
-ptf_source=
 source rpm/config.sh
 until [ "$#" = "0" ] ; do
   case "$1" in
@@ -65,10 +64,6 @@ until [ "$#" = "0" ] ; do
       ;;
     -iu|--ignore-unsupported-deps)
       # ignored, set %supported_modules_check in the spec instead
-      shift
-      ;;
-    --ptf)
-      ptf_source=1;
       shift
       ;;
     -rs|--release-string)
@@ -129,12 +124,10 @@ check_for_merge_conflicts() {
 
 suffix=$(sed -rn 's/^Source0:.*\.(tar\.[a-z0-9]*)$/\1/p' rpm/kernel-source.spec.in)
 # Dot files are skipped by intention, in order not to break osc working
-# copies.  The linux tarball is not deleted if it is already there. Do
-# not delete the get_release_number.sh file, since it may be produced
-# externally by PTF utils.
+# copies. The linux tarball is not deleted if it is already there.
 for f in "$build_dir"/*; do
 	case "${f##*/}" in
-	"linux-$SRCVERSION.$suffix" | get_release_number.sh)
+	"linux-$SRCVERSION.$suffix")
 		continue
 		;;
 	patches.*)
@@ -203,9 +196,7 @@ trap 'if test -n "$CLEANFILES"; then rm -rf "${CLEANFILES[@]}"; fi' EXIT
 tmpdir=$(mktemp -dt ${0##*/}.XXXXXX)
 CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
-RSYNC_EXCLUDE=""
-[ -n "$ptf_source" ] && RSYNC_EXCLUDE="--exclude get_release_number.sh"
-rsync $RSYNC_EXCLUDE rpm/* config.conf supported.conf doc/* $build_dir
+cp -p rpm/* config.conf supported.conf doc/* $build_dir
 match="${flavor:+\\/$flavor$}"
 match="${arch:+^+${arch}${match:+.*}}${match}"
 [ -n "$match" ] && sed -i "/^$\|\s*#\|${match}/b; s/\(.*\)/#### \1/" $build_dir/config.conf
