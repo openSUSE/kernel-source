@@ -60,7 +60,7 @@ sub load_symvers {
 			$errors++;
 			next;
 		}
-		my $new = { crc => $l[0], mod => $l[2] };
+		my $new = { crc => $l[0], mod => $l[2], type => $l[3] };
 		$res{$l[1]} = $new;
 	}
 	if (!%res) {
@@ -71,9 +71,35 @@ sub load_symvers {
 	return %res;
 }
 
+# Each bit represents a restriction of the export and adding a restriction
+# fails the check
+my $type_GPL    = 0x1;
+my $type_NOW    = 0x2;
+my $type_UNUSED = 0x4;
+my %types = (
+	EXPORT_SYMBOL            => 0x0,
+	EXPORT_SYMBOL_GPL        => $type_GPL | $type_NOW,
+	EXPORT_SYMBOL_GPL_FUTURE => $type_GPL,
+	EXPORT_UNUSED_SYMBOL     => $type_UNUSED,
+	EXPORT_UNUSED_SYMBOL_GPL => $type_UNUSED | $type_GPL | $type_NOW
+);
+
+sub type_compatible {
+	my ($old, $new) = @_;
+
+	for my $type ($old, $new) {
+		if (!exists($types{$type})) {
+			print STDERR "error: unrecognized export type $type.\n";
+			exit 1;
+		}
+	}
+	# if $new has a bit set that $old does not -> fail
+	return !(~$types{$old} & $types{$new});
+}
+
 my $kabi_errors = 0;
 sub kabi_change {
-	my ($sym, $mod, $oldcrc, $newcrc) = @_;
+	my ($sym, $mod, $message) = @_;
 	my $fail = 1;
 
 	for my $rule (@rules) {
@@ -84,12 +110,7 @@ sub kabi_change {
 		}
 	}
 	return unless $fail or $opt_verbose;
-	print STDERR "KABI: symbol $sym($mod) ";
-	if ($newcrc) {
-		print STDERR "changed crc from $oldcrc to $newcrc"
-	} else {
-		print STDERR "lost";
-	}
+	print STDERR "KABI: symbol $sym($mod) $message";
 	if ($fail) {
 		$kabi_errors++;
 		print STDERR "\n";
@@ -118,10 +139,13 @@ my %new = load_symvers($ARGV[1]);
 
 for my $sym (sort keys(%old)) {
 	if (!$new{$sym}) {
-		kabi_change($sym, $old{$sym}->{mod}, $old{$sym}->{crc}, 0);
+		kabi_change($sym, $old{$sym}->{mod}, "lost");
 	} elsif ($old{$sym}->{crc} ne $new{$sym}->{crc}) {
-		kabi_change($sym, $new{$sym}->{mod}, $old{$sym}->{crc},
-			$new{$sym}->{crc});
+		kabi_change($sym, $old{$sym}->{mod}, "changed crc from " .
+			"$old{$sym}->{crc} to $new{$sym}->{crc}");
+	} elsif (!type_compatible($old{$sym}->{type}, $new{$sym}->{type})) {
+		kabi_change($sym, $old{$sym}->{mod}, "changed type from " .
+			"$old{$sym}->{type} to $new{$sym}->{type}");
 	}
 }
 if ($kabi_errors) {
