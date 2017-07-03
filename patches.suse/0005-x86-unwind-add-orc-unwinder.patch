@@ -1,0 +1,1257 @@
+From: Josh Poimboeuf <jpoimboe@redhat.com>
+Date: Wed, 31 May 2017 20:05:20 -0500
+Subject: x86/unwind: add orc unwinder
+Patch-mainline: submitted Jun 28th 2017
+References: bnc#1018348
+
+Add a new orc unwinder which is enabled by CONFIG_ORC_UNWINDER.  It
+plugs into the existing x86 unwinder framework.
+
+It relies on objtool to generate the needed .orc and .orc_ip sections.
+
+For more details on why orc is used instead of DWARF, see
+Documentation/x86/orc-unwinder.txt.
+
+Thanks to Andy Lutomirski for the performance improvement ideas:
+splitting the orc unwind table into two parallel arrays and creating a
+fast lookup table to search a subset of the orc unwind table.
+
+Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ Documentation/x86/orc-unwinder.txt |  178 +++++++++++
+ arch/um/include/asm/unwind.h       |    8 
+ arch/x86/Kconfig                   |    1 
+ arch/x86/Kconfig.debug             |   25 +
+ arch/x86/include/asm/module.h      |    9 
+ arch/x86/include/asm/unwind.h      |   76 ++--
+ arch/x86/kernel/Makefile           |    8 
+ arch/x86/kernel/module.c           |   11 
+ arch/x86/kernel/setup.c            |    3 
+ arch/x86/kernel/unwind_frame.c     |   39 +-
+ arch/x86/kernel/unwind_guess.c     |    5 
+ arch/x86/kernel/unwind_orc.c       |  582 +++++++++++++++++++++++++++++++++++++
+ arch/x86/kernel/vmlinux.lds.S      |    2 
+ include/asm-generic/vmlinux.lds.h  |   20 +
+ lib/Kconfig.debug                  |    3 
+ scripts/Makefile.build             |   14 
+ 16 files changed, 921 insertions(+), 63 deletions(-)
+ create mode 100644 Documentation/x86/orc-unwinder.txt
+ create mode 100644 arch/um/include/asm/unwind.h
+ create mode 100644 arch/x86/kernel/unwind_orc.c
+
+--- /dev/null
++++ b/Documentation/x86/orc-unwinder.txt
+@@ -0,0 +1,178 @@
++Orc unwinder debuginfo generation
++=====================================
++
++Overview
++--------
++
++The kernel CONFIG_ORC_UNWINDER option enables objtool generation of orc
++debuginfo, which is out-of-band data which is used by the in-kernel orc
++unwinder.  It's similar in concept to DWARF CFI debuginfo which would be
++used by a DWARF unwinder.  The difference is that the format of the orc
++data is simpler than DWARF, which in turn allows the unwinder to be
++simpler and faster.
++
++Objtool generates the orc data by first doing compile-time stack
++metadata validation (CONFIG_STACK_VALIDATION).  After analyzing all the
++code paths of a .o file, it determines information about the stack state
++at each instruction address in the file and outputs that information to
++the .orc_unwind and .orc_unwind_ip sections.
++
++The orc sections are combined at link time and are sorted at boot time.
++The unwinder uses the resulting data to correlate instruction addresses
++with their stack states at run time.
++
++
++Orc vs frame pointers
++-------------------------
++
++With frame pointers enabled, GCC adds instrumentation code to every
++function in the kernel.  The kernel's .text size increases by about
++3.2%, resulting in a broad kernel-wide slowdown.  Measurements by Mel
++Gorman [1] have shown a slowdown of 5-10% for some workloads.
++
++In contrast, the orc unwinder has no effect on text size or runtime
++performance, because the debuginfo is out of band.  So if you disable
++frame pointers and enable the orc unwinder, you get a nice performance
++improvement across the board, and still have reliable stack traces.
++
++Ingo Molnar says:
++
++  "Note that it's not just a performance improvement, but also an
++  instruction cache locality improvement: 3.2% .text savings almost
++  directly transform into a similarly sized reduction in cache
++  footprint. That can transform to even higher speedups for workloads
++  whose cache locality is borderline."
++
++Another benefit of orc compared to frame pointers is that it can
++reliably unwind across interrupts and exceptions.  Frame pointer based
++unwinds can skip the caller of the interrupted function if it was a leaf
++function or if the interrupt hit before the frame pointer was saved.
++
++The main disadvantage of the orc unwinder compared to frame pointers is
++that it needs more memory to store the orc unwind tables: roughly 2-4MB
++depending on the kernel config.
++
++
++Orc vs DWARF
++------------
++
++Orc debuginfo's advantage over DWARF itself is that it's much simpler.
++It gets rid of the complex DWARF CFI state machine and also gets rid of
++the tracking of unnecessary registers.  This allows the unwinder to be
++much simpler, meaning fewer bugs, which is especially important for
++mission critical oops code.
++
++The simpler debuginfo format also enables the unwinder to be much faster
++than DWARF, which is important for perf and lockdep.  In a basic
++performance test by Jiri Slaby [2], the orc unwinder was about 20x
++faster than an out-of-tree DWARF unwinder.  (Note: that measurement was
++taken before some performance tweaks were implemented which doubled
++performance, so the speedup over DWARF may be closer to 40x.)
++
++The orc data format does have a few downsides compared to DWARF.  The
++orc unwind tables take up ~2MB more memory than an DWARF .eh_frame
++table.
++
++Another potential downside is that, as GCC evolves, it's conceivable
++that the orc data may end up being *too* simple to describe the state of
++the stack for certain optimizations.  But IMO this is unlikely because
++GCC saves the frame pointer for any unusual stack adjustments it does,
++so I suspect we'll really only ever need to keep track of the stack
++pointer and the frame pointer between call frames.  But even if we do
++end up having to track all the registers DWARF tracks, at least we will
++still be able to control the format, e.g.  no complex state machines.
++
++
++Orc debuginfo generation
++------------------------
++
++The orc data is generated by objtool.  With the existing compile-time
++stack metadata validation feature, objtool already follows all code
++paths, and so it already has all the information it needs to be able to
++generate orc data from scratch.  So it's an easy step to go from stack
++validation to orc data generation.
++
++It should be possible to instead generate the orc data with a simple
++tool which converts DWARF to orc data.  However, such a solution would
++be incomplete due to the kernel's extensive use of asm, inline asm, and
++special sections like exception tables.
++
++That could be rectified by manually annotating those special code paths
++using GNU assembler .cfi annotations in .S files, and homegrown
++annotations for inline asm in .c files.  But asm annotations were tried
++in the past and were found to be unmaintainable.  They were often
++incorrect/incomplete and made the code harder to read and keep updated.
++And based on looking at glibc code, annotating inline asm in .c files
++might be even worse.
++
++Objtool still needs a few annotations, but only in code which does
++unusual things to the stack like entry code.  And even then, far fewer
++annotations are needed than what DWARF would need, so they're much more
++maintainable than DWARF CFI annotations.
++
++So the advantages of using objtool to generate orc data are that it
++gives more accurate debuginfo, with very few annotations.  It also
++insulates the kernel from toolchain bugs which can be very painful to
++deal with in the kernel since we often have to workaround issues in
++older versions of the toolchain for years.
++
++The downside is that the unwinder now becomes dependent on objtool's
++ability to reverse engineer GCC code paths.  If GCC optimizations become
++too complicated for objtool to follow, the orc data generation might
++stop working or become incomplete.  (It's worth noting that livepatch
++already has such a dependency on objtool's ability to follow GCC code
++paths.)
++
++If newer versions of GCC come up with some optimizations which break
++objtool, we may need to revisit the current implementation.  Some
++possible solutions would be asking GCC to make the optimizations more
++palatable, or having objtool use DWARF as an additional input, or
++creating a GCC plugin to assist objtool with its analysis.  But for now,
++objtool follows GCC code quite well.
++
++
++Unwinder implementation details
++-------------------------------
++
++Objtool generates the orc data by integrating with the compile-time
++stack metadata validation feature, which is described in detail in
++tools/objtool/Documentation/stack-validation.txt.  After analyzing all
++the code paths of a .o file, it creates an array of orc structs, and a
++parallel array of instruction addresses associated with those structs,
++and writes them to the .orc_unwind and .orc_unwind_ip sections
++respectively.
++
++The orc data is split into the two arrays for performance reasons, to
++make the searchable part of the data (.orc_unwind_ip) more compact.  The
++arrays are sorted in parallel at boot time.
++
++Performance is further improved by the use of a fast lookup table which
++is created at runtime.  The fast lookup table associates a given address
++with a range of orc unwind table indices, so that only a small subset of
++the orc unwind table needs to be searched.
++
++
++Etymology
++---------
++
++Orcs, fearsome creatures of medieval folklore, are natural enemies of
++the Dwarves.  Similarly, the orc unwinder has been created in opposition
++to DWARF.  Unlike the esoteric DWARF unwinder, the veracious orc
++unwinder wastes no time or siloconic effort decoding variable-length
++zero-extended unsigned-integer byte-coded state-machine-based debug
++information entries.
++
++The Orcs are not only opposed to Dwarves: they're adversarial toward
++*all* beings -- sometimes even themselves.  This is not dissimilar to
++the fact that the insular orc debuginfo format is exclusive to the Linux
++kernel -- and may even have some bugs lurking which could harm the
++kernel itself.  The orc debuginfo format is loathsomely feared by all
++other software projects.
++
++Similar to how Orcs frequently unravel the well-intentioned plans of
++their adversaries, the orc unwinder frequently unravels stacks with
++brutal, unyielding efficiency.
++
++
++[1] https://lkml.kernel.org/r/20170602104048.jkkzssljsompjdwy@suse.de
++[2] https://lkml.kernel.org/r/d2ca5435-6386-29b8-db87-7f227c2b713a@suse.cz
+--- /dev/null
++++ b/arch/um/include/asm/unwind.h
+@@ -0,0 +1,8 @@
++#ifndef _ASM_UML_UNWIND_H
++#define _ASM_UML_UNWIND_H
++
++static inline void
++unwind_module_init(struct module *mod, void *orc_ip, size_t orc_ip_size,
++		   void *orc, size_t orc_size) {}
++
++#endif /* _ASM_UML_UNWIND_H */
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -151,6 +151,7 @@ config X86
+ 	select HAVE_MEMBLOCK
+ 	select HAVE_MEMBLOCK_NODE_MAP
+ 	select HAVE_MIXED_BREAKPOINTS_REGS
++	select HAVE_MOD_ARCH_SPECIFIC
+ 	select HAVE_NMI
+ 	select HAVE_OPROFILE
+ 	select HAVE_OPTPROBES
+--- a/arch/x86/Kconfig.debug
++++ b/arch/x86/Kconfig.debug
+@@ -357,4 +357,29 @@ config PUNIT_ATOM_DEBUG
+ 	  The current power state can be read from
+ 	  /sys/kernel/debug/punit_atom/dev_power_state
+ 
++config ORC_UNWINDER
++	bool "Orc unwinder"
++	depends on X86_64
++	select STACK_VALIDATION
++	---help---
++	  This option enables the "orc" unwinder for unwinding kernel stack
++	  traces.  It uses a custom data format which is a simplified version
++	  of the DWARF Call Frame Information standard.
++
++	  This unwinder is more accurate across interrupt entry frames than the
++	  frame pointer unwinder.  This also can enable a small performance
++	  improvement across the entire kernel if CONFIG_FRAME_POINTER is
++	  disabled.
++
++	  Enabling this option will increase the kernel's runtime memory usage
++	  by roughly 2-4MB, depending on your kernel config.
++
++config FRAME_POINTER_UNWINDER
++	def_bool y
++	depends on !ORC_UNWINDER && FRAME_POINTER
++
++config GUESS_UNWINDER
++	def_bool y
++	depends on !ORC_UNWINDER && !FRAME_POINTER
++
+ endmenu
+--- a/arch/x86/include/asm/module.h
++++ b/arch/x86/include/asm/module.h
+@@ -2,6 +2,15 @@
+ #define _ASM_X86_MODULE_H
+ 
+ #include <asm-generic/module.h>
++#include <asm/orc_types.h>
++
++struct mod_arch_specific {
++#ifdef CONFIG_ORC_UNWINDER
++	unsigned int num_undwarves;
++	int *orc_unwind_ip;
++	struct orc_entry *orc_unwind;
++#endif
++};
+ 
+ #ifdef CONFIG_X86_64
+ /* X86_64 does not define MODULE_PROC_FAMILY */
+--- a/arch/x86/include/asm/unwind.h
++++ b/arch/x86/include/asm/unwind.h
+@@ -12,11 +12,14 @@ struct unwind_state {
+ 	struct task_struct *task;
+ 	int graph_idx;
+ 	bool error;
+-#ifdef CONFIG_FRAME_POINTER
++#if defined(CONFIG_ORC_UNWINDER)
++	bool signal, full_regs;
++	unsigned long sp, bp, ip;
++	struct pt_regs *regs;
++#elif defined(CONFIG_FRAME_POINTER)
+ 	bool got_irq;
+-	unsigned long *bp, *orig_sp;
++	unsigned long *bp, *orig_sp, ip;
+ 	struct pt_regs *regs;
+-	unsigned long ip;
+ #else
+ 	unsigned long *sp;
+ #endif
+@@ -24,41 +27,30 @@ struct unwind_state {
+ 
+ void __unwind_start(struct unwind_state *state, struct task_struct *task,
+ 		    struct pt_regs *regs, unsigned long *first_frame);
+-
+ bool unwind_next_frame(struct unwind_state *state);
+-
+ unsigned long unwind_get_return_address(struct unwind_state *state);
++unsigned long *unwind_get_return_address_ptr(struct unwind_state *state);
+ 
+ static inline bool unwind_done(struct unwind_state *state)
+ {
+ 	return state->stack_info.type == STACK_TYPE_UNKNOWN;
+ }
+ 
+-static inline
+-void unwind_start(struct unwind_state *state, struct task_struct *task,
+-		  struct pt_regs *regs, unsigned long *first_frame)
+-{
+-	first_frame = first_frame ? : get_stack_pointer(task, regs);
+-
+-	__unwind_start(state, task, regs, first_frame);
+-}
+-
+ static inline bool unwind_error(struct unwind_state *state)
+ {
+ 	return state->error;
+ }
+ 
+-#ifdef CONFIG_FRAME_POINTER
+-
+ static inline
+-unsigned long *unwind_get_return_address_ptr(struct unwind_state *state)
++void unwind_start(struct unwind_state *state, struct task_struct *task,
++		  struct pt_regs *regs, unsigned long *first_frame)
+ {
+-	if (unwind_done(state))
+-		return NULL;
++	first_frame = first_frame ? : get_stack_pointer(task, regs);
+ 
+-	return state->regs ? &state->regs->ip : state->bp + 1;
++	__unwind_start(state, task, regs, first_frame);
+ }
+ 
++#if defined(CONFIG_ORC_UNWINDER) || defined(CONFIG_FRAME_POINTER)
+ static inline struct pt_regs *unwind_get_entry_regs(struct unwind_state *state)
+ {
+ 	if (unwind_done(state))
+@@ -66,20 +58,46 @@ static inline struct pt_regs *unwind_get
+ 
+ 	return state->regs;
+ }
+-
+-#else /* !CONFIG_FRAME_POINTER */
+-
+-static inline
+-unsigned long *unwind_get_return_address_ptr(struct unwind_state *state)
++#else
++static inline struct pt_regs *unwind_get_entry_regs(struct unwind_state *state)
+ {
+ 	return NULL;
+ }
++#endif
+ 
+-static inline struct pt_regs *unwind_get_entry_regs(struct unwind_state *state)
++#ifdef CONFIG_ORC_UNWINDER
++void unwind_init(void);
++void unwind_module_init(struct module *mod, void *orc_ip, size_t orc_ip_size,
++			void *orc, size_t orc_size);
++#else
++static inline void unwind_init(void) {}
++static inline
++void unwind_module_init(struct module *mod, void *orc_ip, size_t orc_ip_size,
++			void *orc, size_t orc_size) {}
++#endif
++
++/*
++ * This disables KASAN checking when reading a value from another task's stack,
++ * since the other task could be running on another CPU and could have poisoned
++ * the stack in the meantime.
++ */
++#define READ_ONCE_TASK_STACK(task, x)			\
++({							\
++	unsigned long val;				\
++	if (task == current)				\
++		val = READ_ONCE(x);			\
++	else						\
++		val = READ_ONCE_NOCHECK(x);		\
++	val;						\
++})
++
++static inline bool task_on_another_cpu(struct task_struct *task)
+ {
+-	return NULL;
++#ifdef CONFIG_SMP
++	return task != current && task->on_cpu;
++#else
++	return false;
++#endif
+ }
+ 
+-#endif /* CONFIG_FRAME_POINTER */
+-
+ #endif /* _ASM_X86_UNWIND_H */
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -125,11 +125,9 @@ obj-$(CONFIG_PERF_EVENTS)		+= perf_regs.
+ obj-$(CONFIG_TRACING)			+= tracepoint.o
+ obj-$(CONFIG_SCHED_MC_PRIO)		+= itmt.o
+ 
+-ifdef CONFIG_FRAME_POINTER
+-obj-y					+= unwind_frame.o
+-else
+-obj-y					+= unwind_guess.o
+-endif
++obj-$(CONFIG_ORC_UNWINDER)		+= unwind_orc.o
++obj-$(CONFIG_FRAME_POINTER_UNWINDER)	+= unwind_frame.o
++obj-$(CONFIG_GUESS_UNWINDER)		+= unwind_guess.o
+ 
+ ###
+ # 64 bit specific files
+--- a/arch/x86/kernel/module.c
++++ b/arch/x86/kernel/module.c
+@@ -35,6 +35,7 @@
+ #include <asm/page.h>
+ #include <asm/pgtable.h>
+ #include <asm/setup.h>
++#include <asm/unwind.h>
+ 
+ #if 0
+ #define DEBUGP(fmt, ...)				\
+@@ -213,7 +214,7 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 		    struct module *me)
+ {
+ 	const Elf_Shdr *s, *text = NULL, *alt = NULL, *locks = NULL,
+-		*para = NULL;
++		*para = NULL, *orc = NULL, *orc_ip = NULL;
+ 	char *secstrings = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
+ 
+ 	for (s = sechdrs; s < sechdrs + hdr->e_shnum; s++) {
+@@ -225,6 +226,10 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 			locks = s;
+ 		if (!strcmp(".parainstructions", secstrings + s->sh_name))
+ 			para = s;
++		if (!strcmp(".orc_unwind", secstrings + s->sh_name))
++			orc = s;
++		if (!strcmp(".orc_unwind_ip", secstrings + s->sh_name))
++			orc_ip = s;
+ 	}
+ 
+ 	if (alt) {
+@@ -248,6 +253,10 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 	/* make jump label nops */
+ 	jump_label_apply_nops(me);
+ 
++	if (orc && orc_ip)
++		unwind_module_init(me, (void *)orc_ip->sh_addr, orc_ip->sh_size,
++				   (void *)orc->sh_addr, orc->sh_size);
++
+ 	return 0;
+ }
+ 
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@ -115,6 +115,7 @@
+ #include <asm/microcode.h>
+ #include <asm/mmu_context.h>
+ #include <asm/kaslr.h>
++#include <asm/unwind.h>
+ 
+ /*
+  * max_low_pfn_mapped: highest direct mapped pfn under 4GB
+@@ -1303,6 +1304,8 @@ void __init setup_arch(char **cmdline_p)
+ 	if (efi_enabled(EFI_BOOT))
+ 		efi_apply_memmap_quirks();
+ #endif
++
++	unwind_init();
+ }
+ 
+ #ifdef CONFIG_X86_32
+--- a/arch/x86/kernel/unwind_frame.c
++++ b/arch/x86/kernel/unwind_frame.c
+@@ -10,20 +10,22 @@
+ 
+ #define FRAME_HEADER_SIZE (sizeof(long) * 2)
+ 
+-/*
+- * This disables KASAN checking when reading a value from another task's stack,
+- * since the other task could be running on another CPU and could have poisoned
+- * the stack in the meantime.
+- */
+-#define READ_ONCE_TASK_STACK(task, x)			\
+-({							\
+-	unsigned long val;				\
+-	if (task == current)				\
+-		val = READ_ONCE(x);			\
+-	else						\
+-		val = READ_ONCE_NOCHECK(x);		\
+-	val;						\
+-})
++unsigned long unwind_get_return_address(struct unwind_state *state)
++{
++	if (unwind_done(state))
++		return 0;
++
++	return __kernel_text_address(state->ip) ? state->ip : 0;
++}
++EXPORT_SYMBOL_GPL(unwind_get_return_address);
++
++unsigned long *unwind_get_return_address_ptr(struct unwind_state *state)
++{
++	if (unwind_done(state))
++		return NULL;
++
++	return state->regs ? &state->regs->ip : state->bp + 1;
++}
+ 
+ static void unwind_dump(struct unwind_state *state)
+ {
+@@ -66,15 +68,6 @@ static void unwind_dump(struct unwind_st
+ 	}
+ }
+ 
+-unsigned long unwind_get_return_address(struct unwind_state *state)
+-{
+-	if (unwind_done(state))
+-		return 0;
+-
+-	return __kernel_text_address(state->ip) ? state->ip : 0;
+-}
+-EXPORT_SYMBOL_GPL(unwind_get_return_address);
+-
+ static size_t regs_size(struct pt_regs *regs)
+ {
+ 	/* x86_32 regs from kernel mode are two words shorter: */
+--- a/arch/x86/kernel/unwind_guess.c
++++ b/arch/x86/kernel/unwind_guess.c
+@@ -19,6 +19,11 @@ unsigned long unwind_get_return_address(
+ }
+ EXPORT_SYMBOL_GPL(unwind_get_return_address);
+ 
++unsigned long *unwind_get_return_address_ptr(struct unwind_state *state)
++{
++	return NULL;
++}
++
+ bool unwind_next_frame(struct unwind_state *state)
+ {
+ 	struct stack_info *info = &state->stack_info;
+--- /dev/null
++++ b/arch/x86/kernel/unwind_orc.c
+@@ -0,0 +1,582 @@
++#include <linux/module.h>
++#include <linux/sort.h>
++#include <asm/ptrace.h>
++#include <asm/stacktrace.h>
++#include <asm/unwind.h>
++#include <asm/orc_types.h>
++#include <asm/sections.h>
++
++#define orc_warn(fmt, ...) \
++	printk_deferred_once(KERN_WARNING pr_fmt("WARNING: " fmt), ##__VA_ARGS__)
++
++extern int __start_orc_unwind_ip[];
++extern int __stop_orc_ip[];
++extern struct orc_entry __start_orc_unwind[];
++extern struct orc_entry __stop_orc[];
++
++bool orc_init;
++static DEFINE_MUTEX(sort_mutex);
++
++int *cur_orc_ip_table = __start_orc_unwind_ip;
++struct orc_entry *cur_orc_table = __start_orc_unwind;
++
++/*
++ * This is a lookup table for speeding up access to the orc unwind table.
++ * Given an input address offset, the corresponding lookup table entry
++ * specifies a subset of the orc unwind table to search.
++ *
++ * Each block represents the end of the previous range and the start of the
++ * next range.  An extra block is added to give the last range an end.
++ *
++ * Some measured performance results for different values of LOOKUP_NUM_BLOCKS:
++ *
++ *  num blocks       array size	   lookup speedup   total speedup
++ *     2k		8k		1.5x		1.5x
++ *     4k		16k		1.6x		1.6x
++ *     8k		32k		1.8x		1.7x
++ *     16k		64k		2.0x		1.8x
++ *     32k		128k		2.5x		2.0x
++ *     64k		256k		2.9x		2.2x
++ *     128k		512k		3.3x		2.4x
++ *
++ * Go with 32k blocks because it doubles unwinder performance while only adding
++ * 3.5% to the orc data footprint.
++ */
++#define LOOKUP_NUM_BLOCKS		(32 * 1024)
++static unsigned int orc_fast_lookup[LOOKUP_NUM_BLOCKS + 1] __ro_after_init;
++
++#define LOOKUP_START_IP			(unsigned long)_stext
++#define LOOKUP_STOP_IP			(unsigned long)_etext
++#define LOOKUP_BLOCK_SIZE \
++	(DIV_ROUND_UP(LOOKUP_STOP_IP - LOOKUP_START_IP,	 LOOKUP_NUM_BLOCKS))
++
++
++static inline unsigned long orc_ip(const int *ip)
++{
++	return (unsigned long)ip + *ip;
++}
++
++static struct orc_entry *__orc_find(int *ip_table, struct orc_entry *u_table,
++				    unsigned int num_entries, unsigned long ip)
++{
++	int *first = ip_table;
++	int *last = ip_table + num_entries - 1;
++	int *mid = first, *found = first;
++
++	if (!num_entries)
++		return NULL;
++
++	/*
++	 * Do a binary range search to find the rightmost duplicate of a given
++	 * starting address.  Some entries are section terminators which are
++	 * "weak" entries for ensuring there are no gaps.  They should be
++	 * ignored when they conflict with a real entry.
++	 */
++	while (first <= last) {
++		mid = first + ((last - first) / 2);
++
++		if (orc_ip(mid) <= ip) {
++			found = mid;
++			first = mid + 1;
++		} else
++			last = mid - 1;
++	}
++
++	return u_table + (found - ip_table);
++}
++
++static struct orc_entry *orc_find(unsigned long ip)
++{
++	struct module *mod;
++
++	if (!orc_init)
++		return NULL;
++
++	/* For non-init vmlinux addresses, use the fast lookup table: */
++	if (ip >= LOOKUP_START_IP && ip < LOOKUP_STOP_IP) {
++		unsigned int idx, start, stop;
++
++		idx = (ip - LOOKUP_START_IP) / LOOKUP_BLOCK_SIZE;
++
++		if (WARN_ON_ONCE(idx >= LOOKUP_NUM_BLOCKS))
++			return NULL;
++
++		start = orc_fast_lookup[idx];
++		stop = orc_fast_lookup[idx + 1] + 1;
++
++		if (WARN_ON_ONCE(__start_orc_unwind + start >= __stop_orc) ||
++				 __start_orc_unwind + stop > __stop_orc)
++			return NULL;
++
++		return __orc_find(__start_orc_unwind_ip + start,
++				  __start_orc_unwind + start, stop - start, ip);
++	}
++
++	/* vmlinux .init slow lookup: */
++	if (ip >= (unsigned long)_sinittext && ip < (unsigned long)_einittext)
++		return __orc_find(__start_orc_unwind_ip, __start_orc_unwind,
++				  __stop_orc - __start_orc_unwind, ip);
++
++	/* Module lookup: */
++	mod = __module_address(ip);
++	if (!mod || !mod->arch.orc_unwind || !mod->arch.orc_unwind_ip)
++		return NULL;
++	return __orc_find(mod->arch.orc_unwind_ip, mod->arch.orc_unwind,
++			  mod->arch.num_undwarves, ip);
++}
++
++static void orc_sort_swap(void *_a, void *_b, int size)
++{
++	struct orc_entry *orc_a, *orc_b;
++	struct orc_entry orc_tmp;
++	int *a = _a, *b = _b, tmp;
++	int delta = _b - _a;
++
++	/* Swap the .orc_unwind_ip entries: */
++	tmp = *a;
++	*a = *b + delta;
++	*b = tmp - delta;
++
++	/* Swap the corresponding .orc_unwind entries: */
++	orc_a = cur_orc_table + (a - cur_orc_ip_table);
++	orc_b = cur_orc_table + (b - cur_orc_ip_table);
++	orc_tmp = *orc_a;
++	*orc_a = *orc_b;
++	*orc_b = orc_tmp;
++}
++
++static int orc_sort_cmp(const void *_a, const void *_b)
++{
++	struct orc_entry *orc_a;
++	const int *a = _a, *b = _b;
++	unsigned long a_val = orc_ip(a);
++	unsigned long b_val = orc_ip(b);
++
++	if (a_val > b_val)
++		return 1;
++	if (a_val < b_val)
++		return -1;
++
++	/*
++	 * The "weak" section terminator entries need to always be on the left
++	 * to ensure the lookup code skips them in favor of real entries.
++	 * These terminator entries exist to handle any gaps created by
++	 * whitelisted .o files which didn't get objtool generation.
++	 */
++	orc_a = cur_orc_table + (a - cur_orc_ip_table);
++	return orc_a->sp_reg == ORC_REG_UNDEFINED ? -1 : 1;
++}
++
++void unwind_module_init(struct module *mod, void *_orc_ip, size_t orc_ip_size,
++			void *_orc, size_t orc_size)
++{
++	int *orc_ip = _orc_ip;
++	struct orc_entry *orc = _orc;
++	unsigned int num_entries = orc_ip_size / sizeof(int);
++
++	WARN_ON_ONCE(orc_ip_size % sizeof(int) != 0 ||
++		     orc_size % sizeof(*orc) != 0 ||
++		     num_entries != orc_size / sizeof(*orc));
++
++	/*
++	 * The 'cur_orc_*' globals allow the orc_sort_swap() callback
++	 * to associate an orc_ip table entry with its corresponding
++	 * orc entry so they can both be swapped.
++	 */
++	mutex_lock(&sort_mutex);
++	cur_orc_ip_table = orc_ip;
++	cur_orc_table = orc;
++	sort(orc_ip, num_entries, sizeof(int), orc_sort_cmp, orc_sort_swap);
++	mutex_unlock(&sort_mutex);
++
++	mod->arch.orc_unwind_ip = orc_ip;
++	mod->arch.orc_unwind = orc;
++	mod->arch.num_undwarves = num_entries;
++}
++
++void __init unwind_init(void)
++{
++	size_t orc_ip_size = (void *)__stop_orc_ip - (void *)__start_orc_unwind_ip;
++	size_t orc_size = (void *)__stop_orc - (void *)__start_orc_unwind;
++	size_t num_entries = orc_ip_size / sizeof(int);
++	struct orc_entry *orc;
++	int i;
++
++	if (!num_entries || orc_ip_size % sizeof(int) != 0 ||
++	    orc_size % sizeof(struct orc_entry) != 0 ||
++	    num_entries != orc_size / sizeof(struct orc_entry)) {
++		pr_warn("WARNING: Bad or missing orc unwind table.  Disabling unwinder.\n");
++		return;
++	}
++
++	/* Sort the .orc_unwind and .orc_unwind_ip tables: */
++	sort(__start_orc_unwind_ip, num_entries, sizeof(int), orc_sort_cmp,
++	     orc_sort_swap);
++
++	/* Initialize the fast lookup table: */
++	for (i = 0; i < LOOKUP_NUM_BLOCKS; i++) {
++		orc = __orc_find(__start_orc_unwind_ip, __start_orc_unwind,
++				 num_entries,
++				 LOOKUP_START_IP + (LOOKUP_BLOCK_SIZE * i));
++		if (!orc) {
++			pr_warn("WARNING: Corrupt orc unwind table.  Disabling unwinder.\n");
++			return;
++		}
++
++		orc_fast_lookup[i] = orc - __start_orc_unwind;
++	}
++
++	/* Initialize the last 'end' block: */
++	orc = __orc_find(__start_orc_unwind_ip, __start_orc_unwind, num_entries,
++			 LOOKUP_STOP_IP);
++	if (!orc) {
++		pr_warn("WARNING: Corrupt orc unwind table.  Disabling unwinder.\n");
++		return;
++	}
++	orc_fast_lookup[LOOKUP_NUM_BLOCKS] = orc - __start_orc_unwind;
++
++	orc_init = true;
++}
++
++unsigned long unwind_get_return_address(struct unwind_state *state)
++{
++	if (unwind_done(state))
++		return 0;
++
++	return __kernel_text_address(state->ip) ? state->ip : 0;
++}
++EXPORT_SYMBOL_GPL(unwind_get_return_address);
++
++unsigned long *unwind_get_return_address_ptr(struct unwind_state *state)
++{
++	if (unwind_done(state))
++		return NULL;
++
++	if (state->regs)
++		return &state->regs->ip;
++
++	if (state->sp)
++		return (unsigned long *)state->sp - 1;
++
++	return NULL;
++}
++
++static bool stack_access_ok(struct unwind_state *state, unsigned long addr,
++			    size_t len)
++{
++	struct stack_info *info = &state->stack_info;
++
++	/*
++	 * If the address isn't on the current stack, switch to the next one.
++	 *
++	 * We may have to traverse multiple stacks to deal with the possibility
++	 * that info->next_sp could point to an empty stack and the address
++	 * could be on a subsequent stack.
++	 */
++	while (!on_stack(info, (void *)addr, len))
++		if (get_stack_info(info->next_sp, state->task, info,
++				   &state->stack_mask))
++			return false;
++
++	return true;
++}
++
++static bool deref_stack_reg(struct unwind_state *state, unsigned long addr,
++			    unsigned long *val)
++{
++	if (!stack_access_ok(state, addr, sizeof(long)))
++		return false;
++
++	*val = READ_ONCE_TASK_STACK(state->task, *(unsigned long *)addr);
++	return true;
++}
++
++#define REGS_SIZE (sizeof(struct pt_regs))
++#define SP_OFFSET (offsetof(struct pt_regs, sp))
++#define IRET_REGS_SIZE (REGS_SIZE - offsetof(struct pt_regs, ip))
++#define IRET_SP_OFFSET (SP_OFFSET - offsetof(struct pt_regs, ip))
++
++static bool deref_stack_regs(struct unwind_state *state, unsigned long addr,
++			     unsigned long *ip, unsigned long *sp, bool full)
++{
++	size_t regs_size = full ? REGS_SIZE : IRET_REGS_SIZE;
++	size_t sp_offset = full ? SP_OFFSET : IRET_SP_OFFSET;
++	struct pt_regs *regs = (struct pt_regs *)(addr + regs_size - REGS_SIZE);
++
++	if (IS_ENABLED(CONFIG_X86_64)) {
++		if (!stack_access_ok(state, addr, regs_size))
++			return false;
++
++		*ip = regs->ip;
++		*sp = regs->sp;
++
++		return true;
++	}
++
++	if (!stack_access_ok(state, addr, sp_offset))
++		return false;
++
++	*ip = regs->ip;
++
++	if (user_mode(regs)) {
++		if (!stack_access_ok(state, addr + sp_offset,
++				     REGS_SIZE - SP_OFFSET))
++			return false;
++
++		*sp = regs->sp;
++	} else
++		*sp = (unsigned long)&regs->sp;
++
++	return true;
++}
++
++bool unwind_next_frame(struct unwind_state *state)
++{
++	unsigned long ip_p, sp, orig_ip, prev_sp = state->sp;
++	enum stack_type prev_type = state->stack_info.type;
++	struct orc_entry *orc;
++	struct pt_regs *ptregs;
++	bool indirect = false;
++
++	if (unwind_done(state))
++		return false;
++
++	/* Don't let modules unload while we're reading their orc data. */
++	preempt_disable();
++
++	/* Have we reached the end? */
++	if (state->regs && user_mode(state->regs))
++		goto done;
++
++	/*
++	 * Find the orc entry associated with the text address.
++	 *
++	 * Decrement call return addresses by one so they work for sibling
++	 * calls and calls to noreturn functions.
++	 */
++	orc = orc_find(state->signal ? state->ip : state->ip - 1);
++	if (!orc || orc->sp_reg == ORC_REG_UNDEFINED)
++		goto done;
++	orig_ip = state->ip;
++
++	/* Find the previous frame's stack: */
++	switch (orc->sp_reg) {
++	case ORC_REG_SP:
++		sp = state->sp + orc->sp_offset;
++		break;
++
++	case ORC_REG_BP:
++		sp = state->bp + orc->sp_offset;
++		break;
++
++	case ORC_REG_SP_INDIRECT:
++		sp = state->sp + orc->sp_offset;
++		indirect = true;
++		break;
++
++	case ORC_REG_BP_INDIRECT:
++		sp = state->bp + orc->sp_offset;
++		indirect = true;
++		break;
++
++	case ORC_REG_R10:
++		if (!state->regs || !state->full_regs) {
++			orc_warn("missing regs for base reg R10 at ip %p\n",
++				 (void *)state->ip);
++			goto done;
++		}
++		sp = state->regs->r10;
++		break;
++
++	case ORC_REG_R13:
++		if (!state->regs || !state->full_regs) {
++			orc_warn("missing regs for base reg R13 at ip %p\n",
++				 (void *)state->ip);
++			goto done;
++		}
++		sp = state->regs->r13;
++		break;
++
++	case ORC_REG_DI:
++		if (!state->regs || !state->full_regs) {
++			orc_warn("missing regs for base reg DI at ip %p\n",
++				 (void *)state->ip);
++			goto done;
++		}
++		sp = state->regs->di;
++		break;
++
++	case ORC_REG_DX:
++		if (!state->regs || !state->full_regs) {
++			orc_warn("missing regs for base reg DX at ip %p\n",
++				 (void *)state->ip);
++			goto done;
++		}
++		sp = state->regs->dx;
++		break;
++
++	default:
++		orc_warn("unknown SP base reg %d for ip %p\n",
++			 orc->sp_reg, (void *)state->ip);
++		goto done;
++	}
++
++	if (indirect) {
++		if (!deref_stack_reg(state, sp, &sp))
++			goto done;
++	}
++
++	/* Find IP, SP and possibly regs: */
++	switch (orc->type) {
++	case ORC_TYPE_CALL:
++		ip_p = sp - sizeof(long);
++
++		if (!deref_stack_reg(state, ip_p, &state->ip))
++			goto done;
++
++		state->ip = ftrace_graph_ret_addr(state->task, &state->graph_idx,
++						  state->ip, (void *)ip_p);
++
++		state->sp = sp;
++		state->regs = NULL;
++		state->signal = false;
++		break;
++
++	case ORC_TYPE_REGS:
++		if (!deref_stack_regs(state, sp, &state->ip, &state->sp, true)) {
++			orc_warn("can't dereference registers at %p for ip %p\n",
++				 (void *)sp, (void *)orig_ip);
++			goto done;
++		}
++
++		state->regs = (struct pt_regs *)sp;
++		state->full_regs = true;
++		state->signal = true;
++		break;
++
++	case ORC_TYPE_REGS_IRET:
++		if (!deref_stack_regs(state, sp, &state->ip, &state->sp, false)) {
++			orc_warn("can't dereference iret registers at %p for ip %p\n",
++				 (void *)sp, (void *)orig_ip);
++			goto done;
++		}
++
++		ptregs = container_of((void *)sp, struct pt_regs, ip);
++		if ((unsigned long)ptregs >= prev_sp &&
++		    on_stack(&state->stack_info, ptregs, REGS_SIZE)) {
++			state->regs = ptregs;
++			state->full_regs = false;
++		} else
++			state->regs = NULL;
++
++		state->signal = true;
++		break;
++
++	default:
++		orc_warn("unknown orc entry type %d\n", orc->type);
++		break;
++	}
++
++	/* Find BP: */
++	switch (orc->bp_reg) {
++	case ORC_REG_UNDEFINED:
++		if (state->regs && state->full_regs)
++			state->bp = state->regs->bp;
++		break;
++
++	case ORC_REG_PREV_SP:
++		if (!deref_stack_reg(state, sp + orc->bp_offset, &state->bp))
++			goto done;
++		break;
++
++	case ORC_REG_BP:
++		if (!deref_stack_reg(state, state->bp + orc->bp_offset, &state->bp))
++			goto done;
++		break;
++
++	default:
++		orc_warn("unknown BP base reg %d for ip %p\n",
++			 orc->bp_reg, (void *)orig_ip);
++		goto done;
++	}
++
++	/* Prevent a recursive loop due to bad orc data: */
++	if (state->stack_info.type == prev_type &&
++	    on_stack(&state->stack_info, (void *)state->sp, sizeof(long)) &&
++	    state->sp <= prev_sp) {
++		orc_warn("stack going in the wrong direction? ip=%p\n",
++			 (void *)orig_ip);
++		goto done;
++	}
++
++	preempt_enable();
++	return true;
++
++done:
++	preempt_enable();
++	state->stack_info.type = STACK_TYPE_UNKNOWN;
++	return false;
++}
++EXPORT_SYMBOL_GPL(unwind_next_frame);
++
++void __unwind_start(struct unwind_state *state, struct task_struct *task,
++		    struct pt_regs *regs, unsigned long *first_frame)
++{
++	memset(state, 0, sizeof(*state));
++	state->task = task;
++
++	/*
++	 * Refuse to unwind the stack of a task while it's executing on another
++	 * CPU.  This check is racy, but that's ok: the unwinder has other
++	 * checks to prevent it from going off the rails.
++	 */
++	if (task_on_another_cpu(task))
++		goto done;
++
++	if (regs) {
++		if (user_mode(regs))
++			goto done;
++
++		state->ip = regs->ip;
++		state->sp = kernel_stack_pointer(regs);
++		state->bp = regs->bp;
++		state->regs = regs;
++		state->full_regs = true;
++		state->signal = true;
++
++	} else if (task == current) {
++		asm volatile("lea (%%rip), %0\n\t"
++			     "mov %%rsp, %1\n\t"
++			     "mov %%rbp, %2\n\t"
++			     : "=r" (state->ip), "=r" (state->sp),
++			       "=r" (state->bp));
++
++	} else {
++		struct inactive_task_frame *frame = (void *)task->thread.sp;
++
++		state->ip = frame->ret_addr;
++		state->sp = task->thread.sp;
++		state->bp = frame->bp;
++	}
++
++	if (get_stack_info((unsigned long *)state->sp, state->task,
++			   &state->stack_info, &state->stack_mask))
++		return;
++
++	/*
++	 * The caller can provide the address of the first frame directly
++	 * (first_frame) or indirectly (regs->sp) to indicate which stack frame
++	 * to start unwinding at.  Skip ahead until we reach it.
++	 */
++	while (!unwind_done(state) &&
++	       (!on_stack(&state->stack_info, first_frame, sizeof(long)) ||
++			state->sp <= (unsigned long)first_frame))
++		unwind_next_frame(state);
++
++	return;
++
++done:
++	state->stack_info.type = STACK_TYPE_UNKNOWN;
++	return;
++}
++EXPORT_SYMBOL_GPL(__unwind_start);
+--- a/arch/x86/kernel/vmlinux.lds.S
++++ b/arch/x86/kernel/vmlinux.lds.S
+@@ -148,6 +148,8 @@ SECTIONS
+ 
+ 	BUG_TABLE
+ 
++	ORC_UNWIND_TABLE
++
+ 	. = ALIGN(PAGE_SIZE);
+ 	__vvar_page = .;
+ 
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -669,6 +669,24 @@
+ #define BUG_TABLE
+ #endif
+ 
++#ifdef CONFIG_ORC_UNWINDER
++#define ORC_UNWIND_TABLE						\
++	. = ALIGN(4);							\
++	.orc_unwind_ip : AT(ADDR(.orc_unwind_ip) - LOAD_OFFSET) {	\
++		VMLINUX_SYMBOL(__start_orc_unwind_ip) = .;		\
++		KEEP(*(.orc_unwind_ip))					\
++		VMLINUX_SYMBOL(__stop_orc_ip) = .;			\
++	}								\
++	. = ALIGN(6);							\
++	.orc_unwind : AT(ADDR(.orc_unwind) - LOAD_OFFSET) {		\
++		VMLINUX_SYMBOL(__start_orc_unwind) = .;			\
++		KEEP(*(.orc_unwind))					\
++		VMLINUX_SYMBOL(__stop_orc) = .;				\
++	}
++#else
++#define ORC_UNWIND_TABLE
++#endif
++
+ #ifdef CONFIG_PM_TRACE
+ #define TRACEDATA							\
+ 	. = ALIGN(4);							\
+@@ -855,7 +873,7 @@
+ 		DATA_DATA						\
+ 		CONSTRUCTORS						\
+ 	}								\
+-	BUG_TABLE
++	BUG_TABLE							\
+ 
+ #define INIT_TEXT_SECTION(inittext_align)				\
+ 	. = ALIGN(inittext_align);					\
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -384,6 +384,9 @@ config STACK_VALIDATION
+ 	  pointers (if CONFIG_FRAME_POINTER is enabled).  This helps ensure
+ 	  that runtime stack traces are more reliable.
+ 
++	  This is also a prerequisite for generation of orc debuginfo, which is
++	  needed for CONFIG_ORC_UNWINDER.
++
+ 	  For more information, see
+ 	  tools/objtool/Documentation/stack-validation.txt.
+ 
+--- a/scripts/Makefile.build
++++ b/scripts/Makefile.build
+@@ -259,7 +259,8 @@ ifneq ($(SKIP_STACK_VALIDATION),1)
+ 
+ __objtool_obj := $(objtree)/tools/objtool/objtool
+ 
+-objtool_args = check
++objtool_args = $(if $(CONFIG_ORC_UNWINDER),orc generate,check)
++
+ ifndef CONFIG_FRAME_POINTER
+ objtool_args += --no-fp
+ endif
+@@ -277,6 +278,11 @@ objtool_obj = $(if $(patsubst y%,, \
+ endif # SKIP_STACK_VALIDATION
+ endif # CONFIG_STACK_VALIDATION
+ 
++# Rebuild all objects when objtool changes, or is enabled/disabled.
++objtool_dep = $(objtool_obj)					\
++	      $(wildcard include/config/orc/unwinder.h		\
++			 include/config/stack/validation.h)
++
+ define rule_cc_o_c
+ 	$(call echo-cmd,checksrc) $(cmd_checksrc)			  \
+ 	$(call cmd_and_fixdep,cc_o_c)					  \
+@@ -299,13 +305,13 @@ cmd_undef_syms = echo
+ endif
+ 
+ # Built-in and composite module parts
+-$(obj)/%.o: $(src)/%.c $(recordmcount_source) $(objtool_obj) FORCE
++$(obj)/%.o: $(src)/%.c $(recordmcount_source) $(objtool_dep) FORCE
+ 	$(call cmd,force_checksrc)
+ 	$(call if_changed_rule,cc_o_c)
+ 
+ # Single-part modules are special since we need to mark them in $(MODVERDIR)
+ 
+-$(single-used-m): $(obj)/%.o: $(src)/%.c $(recordmcount_source) $(objtool_obj) FORCE
++$(single-used-m): $(obj)/%.o: $(src)/%.c $(recordmcount_source) $(objtool_dep) FORCE
+ 	$(call cmd,force_checksrc)
+ 	$(call if_changed_rule,cc_o_c)
+ 	@{ echo $(@:.o=.ko); echo $@; \
+@@ -400,7 +406,7 @@ cmd_modversions_S =								\
+ endif
+ endif
+ 
+-$(obj)/%.o: $(src)/%.S $(objtool_obj) FORCE
++$(obj)/%.o: $(src)/%.S $(objtool_dep) FORCE
+ 	$(call if_changed_rule,as_o_S)
+ 
+ targets += $(real-objs-y) $(real-objs-m) $(lib-y)
