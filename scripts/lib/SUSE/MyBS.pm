@@ -326,6 +326,10 @@ sub create_project {
 				$seen_archs{$arch} = 1;
 				push(@archs, $arch);
 			}
+			if (!@archs) {
+				# this repository is not needed
+				next;
+			}
 			$writer->startTag("repository", @attrs);
 			$writer->emptyTag("path", repository => $r,
 				project => $base);
