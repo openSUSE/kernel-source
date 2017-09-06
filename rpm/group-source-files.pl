@@ -40,6 +40,7 @@ sub scan
 			m{^\Q$loc\E/arch/arm/[^/]+/include/mach\b} ||
 			m{^\Q$loc\E/arch/arm/[^/]+/include/plat\b} ||
 			m{^\Q$loc\E/arch/[^/]+/scripts\b} ||
+			m{^\Q$loc\E/arch/[^/]+/tools\b} ||
 			m{^\Q$loc\E/include/[^/]+\b} ||
 			m{^\Q$loc\E/scripts\b};
 		if (substr($_, 0, 1) ne "/") {
