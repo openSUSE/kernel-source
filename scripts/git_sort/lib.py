@@ -11,7 +11,7 @@ import sys
 
 import lib_tag
 
-from git_helpers import git_sort
+import git_sort
 
 
 class KSException(BaseException):

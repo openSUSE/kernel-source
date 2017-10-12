@@ -1,21 +1,5 @@
 Installing
 ==========
-Some scripts in the current repository require utilities available in the
-git-helpers repository (https://github.com/benthaman/git-helpers).
-That repository is configured as a submodule of ksapply.git. After cloning the
-current repository, run:
-```
-git submodule init
-git submodule update
-```
-
-The functions in quilt-mode.sh are meant to be used with a modified `quilt`
-that can use kernel-source.git's series.conf directly instead of a shadow
-copy.
-
-Install it from  
-https://gitlab.suse.de/benjamin_poirier/quilt
-
 The LINUX_GIT environment variable must be set to the path of a fresh Linux
 kernel git clone; it will be used as a reference for upstream commit
 information. Specifically, this must be a clone of
@@ -35,8 +19,12 @@ origin # git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
 stable # git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git
 ```
 
-Please note that linux-next is not a subsystem maintainer tree. If a commit is
-in linux-next, it comes from some other tree.
+The functions in quilt-mode.sh can assist in backporting a series of commits.
+They are meant to be used with a modified `quilt` that can use
+kernel-source.git's series.conf directly instead of a shadow copy.
+
+Install it from  
+https://gitlab.suse.de/benjamin_poirier/quilt
 
 Example workflow to backport a single commit
 ============================================
@@ -44,10 +32,10 @@ For example, we want to backport f5a952c08e84 which is a fix for another
 commit which was already backported:
 ```
 # adjust the path to `sequence-insert.py` according to your environment
-ben@f1:~/local/src/kernel-source$ ./scripts/sequence-patch.sh $(~/programming/suse/ksapply/sequence-insert.py f5a952c08e84)
+ben@f1:~/local/src/kernel-source$ ./scripts/sequence-patch.sh $(./scripts/git_sort/sequence-insert.py f5a952c08e84)
 [...]
 ben@f1:~/local/src/kernel-source$ cd tmp/current
-ben@f1:~/local/src/kernel-source/tmp/current$ . ~/programming/suse/ksapply/quilt-mode.sh
+ben@f1:~/local/src/kernel-source/tmp/current$ . ../../scripts/git_sort/quilt-mode.sh
 # Note that we are using the "-f" option of qcp since f5a952c08e84 is a
 # followup to another commit; its log contains a "Fixes" tag. If that was not
 # the case, we would use the "-d" and "-r" options of qcp.
@@ -104,7 +92,7 @@ Generate the work tree with patches applied up to the first patch in the
 list of commits to backport:
 ```
 # adjust the path to `sequence-insert.py` according to your environment
-kernel-source$ ./scripts/sequence-patch.sh $(~/programming/suse/ksapply/sequence-insert.py $(head -n1 /tmp/list | awk '{print $1}'))
+kernel-source$ ./scripts/sequence-patch.sh $(./scripts/git_sort/sequence-insert.py $(head -n1 /tmp/list | awk '{print $1}'))
 ```
 
 It is preferable to check that the driver builds before getting started:
@@ -114,7 +102,7 @@ kernel-source/tmp/current$ make -j4 drivers/net/ethernet/intel/e1000/
 
 Import the quilt-mode functions:
 ```
-kernel-source/tmp/current$ . ~/programming/suse/ksapply/quilt-mode.sh
+kernel-source/tmp/current$ . ../../scripts/git_sort/quilt-mode.sh
 ```
 
 Set the list of commits to backport:
@@ -209,7 +197,7 @@ section (from the start of "sorted patches" to the end of "out-of-tree
 patches") which will reposition the new entry. This last step is done using
 the "series_sort.py" script:
 ```
-kernel-source$ ~/programming/suse/ksapply/series_sort.py series.conf
+kernel-source$ ./scripts/series_sort.py series.conf
 ```
 
 Example of a merge conflict resolution involving sorted patches in series.conf
@@ -347,7 +335,7 @@ kernel-source$ cat /tmp/list | refs_in_series.sh "drivers/net/ethernet/emulex/be
 
 #### Cherry-pick each desired commit to kernel.git
 ```
-kernel$ . ~/programming/suse/ksapply/backport-mode.sh
+kernel$ . ../kernel-source/scripts/git_sort/backport-mode.sh
 # note that the pattern is quoted
 kernel$ bpset -s -p ../kernel-source/ -a /tmp/list_series -c /tmp/list2 "drivers/net/ethernet/emulex/benet/*"
 ```
