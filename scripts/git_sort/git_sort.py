@@ -40,6 +40,10 @@ remotes = (
      "master",),
     ("git://git.kernel.org/pub/scm/linux/kernel/git/powerpc/linux.git",
      "next",),
+    ("git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git",
+     "master",),
+    ("git://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git",
+     "master",),
 )
 
 
