@@ -73,7 +73,7 @@ def split_series(series):
 
             if current == before and l.lower() == "# sorted patches":
                 current = inside
-            elif current == inside and l in ("# Wireless Networking",):
+            elif current == inside and l.lower() == "# end of sorted patches":
                 current = after
         else:
             if comments:
