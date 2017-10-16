@@ -47,6 +47,14 @@ remotes = (
 )
 
 
+class GSException(BaseException):
+    pass
+
+
+class GSError(GSException):
+    pass
+
+
 k_org_canon_prefix = "git://git.kernel.org/pub/scm/linux/kernel/git/"
 
 def cmp_url(canonical_url, remote_url):
@@ -95,7 +103,7 @@ def _get_heads(repo):
                 try:
                     commit = repo.revparse_single(rev)
                 except KeyError:
-                    raise Exception(
+                    raise GSError(
                         "Could not read revision \"%s\". Perhaps you need to "
                         "fetch from remote \"%s\", ie. `git fetch %s`." % (
                             rev, remote_name, remote_name,))
@@ -120,15 +128,15 @@ def _rebuild_history(heads):
                               stderr=subprocess.STDOUT)
 
         if head_name in history:
-            raise Exception("head name \"%s\" is not unique." %
-                            (head_name,))
+            raise GSException("head name \"%s\" is not unique." %
+                              (head_name,))
 
         history[head_name] = [l.strip() for l in sp.stdout.readlines()]
 
         sp.communicate()
         if sp.returncode != 0:
-            raise Exception("git log exited with an error:\n" +
-                            "\n".join(history[head_name]))
+            raise GSError("git log exited with an error:\n" +
+                          "\n".join(history[head_name]))
 
         processed.append("^%s" % (rev,))
 
@@ -173,8 +181,12 @@ class SortedEntry(object):
 
 
 def git_sort(repo, mapping):
-    heads = _get_heads(repo)
-    history = _get_history(heads)
+    try:
+        heads = _get_heads(repo)
+        history = _get_history(heads)
+    except GSError as err:
+        print("Error: %s" % (err,), file=sys.stderr)
+        sys.exit(1)
     for head_name, rev in heads:
         for commit in history[head_name]:
             try:
@@ -210,7 +222,11 @@ if __name__ == "__main__":
             c_heads = None
         pprint.pprint(c_heads)
         print("Current heads:")
-        heads = _get_heads(repo)
+        try:
+            heads = _get_heads(repo)
+        except GSError as err:
+            print("Error: %s" % (err,), file=sys.stderr)
+            sys.exit(1)
         pprint.pprint(heads)
         if c_heads == heads:
             action = "Will not"
