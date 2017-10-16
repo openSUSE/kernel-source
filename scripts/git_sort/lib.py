@@ -340,7 +340,7 @@ def get_url_map():
     for canon_url, branch_name in git_sort.remotes:
         if canon_url in result:
             raise KSException("URL mapping is ambiguous, \"%s\" may map to "
-                              "multiple head names")
+                              "multiple head names" % (canon_url,))
         result[canon_url] = git_sort.head_name(canon_url, branch_name)
     return result
 
