@@ -95,8 +95,10 @@ def _get_heads(repo):
                 try:
                     commit = repo.revparse_single(rev)
                 except KeyError:
-                    raise Exception("Could not read revision \"%s\"." %
-                                    (rev,))
+                    raise Exception(
+                        "Could not read revision \"%s\". Perhaps you need to "
+                        "fetch from remote \"%s\", ie. `git fetch %s`." % (
+                            rev, remote_name, remote_name,))
                 heads.append((head_name(canon_url, branch_name),
                               str(commit.id),))
                 continue
