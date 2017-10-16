@@ -95,6 +95,9 @@ class SortedEntry(object):
 
 
 class SortIndex(object):
+    cache_version = 1
+
+
     def __init__(self, repo, skip_rebuild=False):
         self.repo = repo
         try:
@@ -179,18 +182,22 @@ class SortIndex(object):
         rebuild = False
         cache = self.get_cache()
         try:
-            c_heads = cache["heads"]
+            if cache["version"] != self.cache_version:
+                rebuild = True
         except KeyError:
             rebuild = True
 
-        if not rebuild and c_heads != self.heads:
-            rebuild = True
+        if not rebuild:
+            c_heads = cache["heads"]
+            if c_heads != self.heads:
+                rebuild = True
 
         if rebuild:
             if skip_rebuild:
                 history = None
             else:
                 history = self.rebuild_history()
+                cache["version"] = self.cache_version
                 cache["heads"] = self.heads
                 cache["history"] = history
         else:
@@ -229,20 +236,16 @@ if __name__ == "__main__":
     index = SortIndex(repo, skip_rebuild=args.dump_heads)
 
     if args.dump_heads:
-        print("Cached heads:")
         cache = index.get_cache()
         try:
-            c_heads = cache["heads"]
+            version = cache["version"]
         except KeyError:
-            c_heads = None
-        pprint.pprint(c_heads)
-        print("Current heads:")
-        try:
-            heads = index.heads
-        except GSError as err:
-            print("Error: %s" % (err,), file=sys.stderr)
-            sys.exit(1)
-        pprint.pprint(heads)
+            print("No usable cache")
+        else:
+            print("Cached heads (version %d):" % version)
+            pprint.pprint(cache["heads"])
+        print("Current heads (version %d):" % index.cache_version)
+        pprint.pprint(index.heads)
         if index.history:
             action = "Will not"
         else:
