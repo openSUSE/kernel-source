@@ -330,8 +330,6 @@ def series_sort(repo, entries):
         result.append(("unknown/local patches", [
             value for value_list in tagged.values() for value in value_list],))
 
-    result.extend([(r_tag, subsys[r_tag],) for r_tag in sorted(subsys)])
-
     result.append(("out-of-tree patches", [e.value for e in entries if e.oot],))
 
     return result
