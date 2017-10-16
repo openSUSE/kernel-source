@@ -299,7 +299,8 @@ def series_sort(repo, entries):
             tagged[input_entry.commit].append(input_entry.value)
 
     subsys = collections.defaultdict(list)
-    for sorted_entry in git_sort.git_sort(repo, tagged):
+    index = git_sort.SortIndex(repo)
+    for sorted_entry in index.sort(tagged):
         subsys[sorted_entry.head_name].extend(sorted_entry.value)
 
     url_map = get_url_map()

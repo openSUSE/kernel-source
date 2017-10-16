@@ -84,117 +84,131 @@ def head_name(canonical_url, branch_name):
         return "%s %s" % (repo_name, branch_name,)
 
 
-def _get_heads(repo):
-    """
-    Returns (head name, sha1)[]
-    """
-    heads = []
-    repo_remotes = {}
-    args = ("git", "config", "--get-regexp", "^remote\..+\.url$",)
-    for line in subprocess.check_output(args).splitlines():
-        name, url = line.split(None, 1)
-        name = name.split(".")[1]
-        repo_remotes[url] = name
-
-    for canon_url, branch_name in remotes:
-        for remote_url, remote_name in repo_remotes.items():
-            if cmp_url(canon_url, remote_url) == 0:
-                rev = "%s/%s" % (remote_name, branch_name,)
-                try:
-                    commit = repo.revparse_single(rev)
-                except KeyError:
-                    raise GSError(
-                        "Could not read revision \"%s\". Perhaps you need to "
-                        "fetch from remote \"%s\", ie. `git fetch %s`." % (
-                            rev, remote_name, remote_name,))
-                heads.append((head_name(canon_url, branch_name),
-                              str(commit.id),))
-                continue
-
-    # According to the urls in remotes, this is not a clone of linux.git
-    # Sort according to commits reachable from the current head
-    if not heads or heads[0][0] != head_name(*remotes[0]):
-        heads = [("HEAD", str(repo.revparse_single("HEAD").id),)]
-
-    return heads
-
-
-def _rebuild_history(heads):
-    processed = []
-    history = {}
-    args = ["git", "log", "--topo-order", "--reverse", "--pretty=tformat:%H"]
-    for head_name, rev in heads:
-        sp = subprocess.Popen(args + processed + [rev], stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT)
-
-        if head_name in history:
-            raise GSException("head name \"%s\" is not unique." %
-                              (head_name,))
-
-        history[head_name] = [l.strip() for l in sp.stdout.readlines()]
-
-        sp.communicate()
-        if sp.returncode != 0:
-            raise GSError("git log exited with an error:\n" +
-                          "\n".join(history[head_name]))
-
-        processed.append("^%s" % (rev,))
-
-    return history
-
-
-def _get_cache():
-    return shelve.open(os.path.expanduser("~/.cache/git-sort"))
-
-
-def _get_history(heads):
-    """
-    cache
-        heads[]
-            (head name, sha1)
-        history[head name][]
-            git hash represented as string of 40 characters
-    """
-    cache = _get_cache()
-    try:
-        c_heads = cache["heads"]
-    except KeyError:
-        c_heads = None
-
-    if c_heads != heads:
-        history = _rebuild_history(heads)
-        cache["heads"] = heads
-        cache["history"] = history
-    else:
-        history = cache["history"]
-    cache.close()
-
-    return history
-
-
 class SortedEntry(object):
     def __init__(self, head_name, value):
         self.head_name = head_name
         self.value = value
+
+
     def __repr__(self):
         return "%s = %s" % (self.head_name, pprint.pformat(self.value),)
 
 
-def git_sort(repo, mapping):
-    try:
-        heads = _get_heads(repo)
-        history = _get_history(heads)
-    except GSError as err:
-        print("Error: %s" % (err,), file=sys.stderr)
-        sys.exit(1)
-    for head_name, rev in heads:
-        for commit in history[head_name]:
-            try:
-                yield SortedEntry(head_name, mapping.pop(commit),)
-            except KeyError:
-                pass
+class SortIndex(object):
+    def __init__(self, repo, skip_rebuild=False):
+        self.repo = repo
+        try:
+            self.heads = self.get_heads()
+            self.history = self.get_history(skip_rebuild)
+        except GSError as err:
+            print("Error: %s" % (err,), file=sys.stderr)
+            sys.exit(1)
 
-    return
+
+    def get_heads(self):
+        """
+        Returns (head name, sha1)[]
+        """
+        heads = []
+        repo_remotes = {}
+        args = ("git", "config", "--get-regexp", "^remote\..+\.url$",)
+        for line in subprocess.check_output(args).splitlines():
+            name, url = line.split(None, 1)
+            name = name.split(".")[1]
+            repo_remotes[url] = name
+
+        for canon_url, branch_name in remotes:
+            for remote_url, remote_name in repo_remotes.items():
+                if cmp_url(canon_url, remote_url) == 0:
+                    rev = "%s/%s" % (remote_name, branch_name,)
+                    try:
+                        commit = self.repo.revparse_single(rev)
+                    except KeyError:
+                        raise GSError(
+                            "Could not read revision \"%s\". Perhaps you need to "
+                            "fetch from remote \"%s\", ie. `git fetch %s`." % (
+                                rev, remote_name, remote_name,))
+                    heads.append((head_name(canon_url, branch_name),
+                                  str(commit.id),))
+                    continue
+
+        # According to the urls in remotes, this is not a clone of linux.git
+        # Sort according to commits reachable from the current head
+        if not heads or heads[0][0] != head_name(*remotes[0]):
+            heads = [("HEAD", str(self.repo.revparse_single("HEAD").id),)]
+
+        return heads
+
+
+    def rebuild_history(self):
+        processed = []
+        history = {}
+        args = ["git", "log", "--topo-order", "--reverse", "--pretty=tformat:%H"]
+        for head_name, rev in self.heads:
+            sp = subprocess.Popen(args + processed + [rev], stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT)
+
+            if head_name in history:
+                raise GSException("head name \"%s\" is not unique." %
+                                  (head_name,))
+
+            history[head_name] = [l.strip() for l in sp.stdout.readlines()]
+
+            sp.communicate()
+            if sp.returncode != 0:
+                raise GSError("git log exited with an error:\n" +
+                              "\n".join(history[head_name]))
+
+            processed.append("^%s" % (rev,))
+
+        return history
+
+
+    def get_cache(self):
+        return shelve.open(os.path.expanduser("~/.cache/git-sort"))
+
+
+    def get_history(self, skip_rebuild):
+        """
+        cache
+            heads[]
+                (head name, sha1)
+            history[head name][]
+                git hash represented as string of 40 characters
+        """
+        rebuild = False
+        cache = self.get_cache()
+        try:
+            c_heads = cache["heads"]
+        except KeyError:
+            rebuild = True
+
+        if not rebuild and c_heads != self.heads:
+            rebuild = True
+
+        if rebuild:
+            if skip_rebuild:
+                history = None
+            else:
+                history = self.rebuild_history()
+                cache["heads"] = self.heads
+                cache["history"] = history
+        else:
+            history = cache["history"]
+        cache.close()
+
+        return history
+
+
+    def sort(self, mapping):
+        for head_name, rev in self.heads:
+            for commit in self.history[head_name]:
+                try:
+                    yield SortedEntry(head_name, mapping.pop(commit),)
+                except KeyError:
+                    pass
+
+        return
 
 
 if __name__ == "__main__":
@@ -212,10 +226,11 @@ if __name__ == "__main__":
     except KeyError:
         path = pygit2.discover_repository(os.getcwd())
     repo = pygit2.Repository(path)
+    index = SortIndex(repo, skip_rebuild=args.dump_heads)
 
     if args.dump_heads:
         print("Cached heads:")
-        cache = _get_cache()
+        cache = index.get_cache()
         try:
             c_heads = cache["heads"]
         except KeyError:
@@ -223,12 +238,12 @@ if __name__ == "__main__":
         pprint.pprint(c_heads)
         print("Current heads:")
         try:
-            heads = _get_heads(repo)
+            heads = index.heads
         except GSError as err:
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
         pprint.pprint(heads)
-        if c_heads == heads:
+        if index.history:
             action = "Will not"
         else:
             action = "Will"
@@ -255,7 +270,7 @@ if __name__ == "__main__":
         else:
             lines[h] = [line]
 
-    print("".join([line for entry in git_sort(repo, lines) for line in
+    print("".join([line for entry in index.sort(lines) for line in
                    entry.value]), end="")
 
     if len(lines) != 0:
