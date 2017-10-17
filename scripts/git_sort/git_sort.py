@@ -115,6 +115,7 @@ remotes = (
     Head(RepoURL("tiwai/sound.git")),
     Head(RepoURL("powerpc/linux.git"), "next"),
     Head(RepoURL("tip/tip.git")),
+    Head(RepoURL("shli/md.git")),
     Head(RepoURL("next/linux-next.git")),
 )
 
