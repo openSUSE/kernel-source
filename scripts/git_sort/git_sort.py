@@ -116,6 +116,7 @@ remotes = (
     Head(RepoURL("powerpc/linux.git"), "next"),
     Head(RepoURL("tip/tip.git")),
     Head(RepoURL("shli/md.git")),
+    Head(RepoURL("mkp/scsi.git")),
     Head(RepoURL("next/linux-next.git")),
 )
 
