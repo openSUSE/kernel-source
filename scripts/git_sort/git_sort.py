@@ -5,6 +5,7 @@ from __future__ import print_function
 
 import argparse
 import collections
+import operator
 import os
 import os.path
 import pprint
@@ -126,14 +127,8 @@ remotes = (
 )
 
 
-class SortedEntry(object):
-    def __init__(self, head, value):
-        self.head = head
-        self.value = value
-
-
 class SortIndex(object):
-    cache_version = 2
+    cache_version = 3
 
 
     def __init__(self, repo, skip_rebuild=False):
@@ -188,12 +183,13 @@ class SortIndex(object):
     def rebuild_history(self):
         """
         Returns
-        history[Head][]
-            git hash represented as string of 40 characters
+        history[Head][commit hash represented as string of 40 characters]
+                index, an ordinal number such that
+                commit a is an ancestor of commit b -> index(a) < index(b)
         """
         processed = []
         history = collections.OrderedDict()
-        args = ["git", "log", "--topo-order", "--reverse", "--pretty=tformat:%H"]
+        args = ["git", "log", "--topo-order", "--pretty=tformat:%H"]
         for head, rev in self.repo_heads.items():
             if head in history:
                 raise GSException("head \"%s\" is not unique." % (head,))
@@ -202,7 +198,12 @@ class SortIndex(object):
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT)
 
-            history[head] = [l.strip() for l in sp.stdout.readlines()]
+            result = {}
+            for l in sp.stdout:
+                result[l.strip()] = len(result)
+            # reverse indexes
+            history[head] = {commit : len(result) - val for commit, val in
+                             result.items()}
 
             sp.communicate()
             if sp.returncode != 0:
@@ -218,8 +219,10 @@ class SortIndex(object):
         """
         cache
             history[]
-                (url, rev, sha1, []
-                    git hash represented as string of 40 characters,)
+                (url, rev, sha1,
+                 history[commit hash represented as string of 40 characters]
+                    index (as described in get_history())
+                 ,)
 
         The cache is stored using basic types.
         """
@@ -276,14 +279,26 @@ class SortIndex(object):
 
 
     def sort(self, mapping):
-        for head in self.repo_heads:
-            for commit in self.history[head]:
+        """
+        Returns an OrderedDict
+        result[Head][]
+            sorted values from the mapping which are found in Head
+        """
+        result = collections.OrderedDict([(head, [],) for head in self.history])
+        for commit in mapping.keys():
+            for head, log in self.history.items():
                 try:
-                    yield SortedEntry(head, mapping.pop(commit),)
+                    index = log[commit]
                 except KeyError:
-                    pass
+                    continue
+                else:
+                    result[head].append((index, mapping.pop(commit),))
 
-        return
+        for head, entries in result.items():
+            entries.sort(key=operator.itemgetter(0))
+            result[head] = [e[1] for e in entries]
+
+        return result
 
 
 if __name__ == "__main__":
@@ -345,8 +360,11 @@ if __name__ == "__main__":
         else:
             lines[h] = [line]
 
-    print("".join([line for entry in index.sort(lines) for line in
-                   entry.value]), end="")
+    print("".join([line
+                   for entries in index.sort(lines).values()
+                       for entry in entries
+                           for line in entry
+                  ]), end="")
 
     if len(lines) != 0:
         print("Error: the following entries were not found in the indexed heads:",

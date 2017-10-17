@@ -232,7 +232,7 @@ def sequence_insert(series, rev, top):
     input_entries.append(entry)
 
     sorted_entries = series_sort(repo, input_entries)
-    for head, patches in sorted_entries:
+    for head, patches in sorted_entries.items():
         if head.rev == "unknown/local patches":
             if patches[0] == marker:
                 msg = "New commit %s" % commit
@@ -247,9 +247,7 @@ def sequence_insert(series, rev, top):
                           "and submit a patch.")
     sorted_patches = flatten([
         before,
-        [patch
-         for head, patches in sorted_entries
-         for patch in patches],
+        flatten(sorted_entries.values()),
         after])
     commit_pos = sorted_patches.index("# new commit")
     if commit_pos == 0:
@@ -310,20 +308,22 @@ def series_sort(repo, entries):
     """
     entries is a list of InputEntry objects
 
-    Returns a list of
-        (Head, [series.conf line with a patch name],)
+    Returns an OrderedDict
+        result[Head][]
+            series.conf line with a patch name
 
-    head name may be a "virtual head" like "out-of-tree patches".
+    Note that Head may be a "virtual head" like "out-of-tree patches".
     """
     tagged = collections.defaultdict(list)
     for input_entry in entries:
         if input_entry.commit:
             tagged[input_entry.commit].append(input_entry.value)
 
-    subsys = collections.defaultdict(list)
+    result = collections.OrderedDict([(head, [],) for head in git_sort.remotes])
     index = git_sort.SortIndex(repo)
-    for sorted_entry in index.sort(tagged):
-        subsys[sorted_entry.head].extend(sorted_entry.value)
+    sorted_tagged = index.sort(tagged)
+    for head, e in sorted_tagged.items():
+        result[head] = flatten(e)
 
     url_map = get_url_map()
     for e in entries:
@@ -340,22 +340,24 @@ def series_sort(repo, entries):
                     "a repository which is not indexed. Please edit "
                     "\"remotes\" in git_sort.py and submit a patch." % (
                         rev, patch,))
-            subsys[head].append(e.value)
-
-    result = []
-    for head in git_sort.remotes:
-        if head in subsys:
-            result.append((head, subsys[head],))
-            del subsys[head]
+            result[head].append(e.value)
 
     if tagged:
-        result.append((
-            git_sort.Head(git_sort.RepoURL(str(None)), "unknown/local patches"),
-            [value for value_list in tagged.values() for value in value_list],))
+        result[git_sort.Head(git_sort.RepoURL(str(None)),
+                             "unknown/local patches")] = [
+                                 value
+                                 for value_list in tagged.values()
+                                     for value in value_list
+                             ]
 
-    result.append((
-        git_sort.Head(git_sort.RepoURL(str(None)), "out-of-tree patches"),
-        [e.value for e in entries if e.oot],))
+    result[git_sort.Head(git_sort.RepoURL(str(None)),
+                         "out-of-tree patches")] = [
+                             e.value for e in entries if e.oot
+                         ]
+
+    for head, lines in result.items():
+        if not lines:
+            del result[head]
 
     return result
 
@@ -372,12 +374,13 @@ def get_url_map():
 
 def series_format(entries):
     """
-    entries is a list of
-        (Head, [series.conf line with a patch name],)
+    entries is an OrderedDict
+        entries[Head][]
+            series.conf line with a patch name
     """
     result = []
 
-    for head, lines in entries:
+    for head, lines in entries.items():
         if head != git_sort.remotes[0]:
             result.extend(["\n", "\t# %s\n" % (str(head),)])
         result.extend(lines)
