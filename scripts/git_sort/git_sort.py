@@ -264,7 +264,8 @@ class SortIndex(object):
                 if "heads" in cache:
                     del cache["heads"]
         else:
-            history = {key[0] : log for key, log in c_history.items()}
+            history = collections.OrderedDict(
+                [(key[0], log,) for key, log in c_history.items()])
         cache.close()
 
         return history
