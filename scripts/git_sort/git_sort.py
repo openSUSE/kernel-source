@@ -30,6 +30,7 @@ class RepoURL(object):
 
     def __init__(self, url):
         k_org_prefixes = [
+            "http://git.kernel.org/pub/scm/linux/kernel/git/",
             "https://git.kernel.org/pub/scm/linux/kernel/git/",
             "https://kernel.googlesource.com/pub/scm/linux/kernel/git/",
         ]
