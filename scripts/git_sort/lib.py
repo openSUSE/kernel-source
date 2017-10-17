@@ -239,7 +239,8 @@ def sequence_insert(series, rev, top):
     del sorted_patches[commit_pos]
 
     if sorted_patches != current_patches:
-        raise KSError("Subseries is not sorted.")
+        raise KSError("Subseries is not sorted. "
+                      "Please run scripts/series_sort.py.")
 
     return (name, commit_pos - top_index,)
 
@@ -276,9 +277,9 @@ class InputEntry(object):
                     "Either the repository at \"%s\" is outdated or patch \"%s\" is tagged improperly." % (
                         rev, repo.path, patch,))
             elif len(repo_tags) > 1:
-                raise KSError("Multiple Git-repo tags found."
-                                  "Patch \"%s\" is tagged improperly." %
-                                  (patch,))
+                raise KSError("Multiple Git-repo tags found. "
+                              "Patch \"%s\" is tagged improperly." %
+                              (patch,))
             self.subsys = git_sort.RepoURL(repo_tags[0])
         else:
             self.commit = str(commit.id)
