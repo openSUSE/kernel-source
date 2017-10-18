@@ -211,8 +211,8 @@ def sequence_insert(series, rev, top):
     input_entries.append(entry)
 
     sorted_entries = series_sort(repo, input_entries)
-    for head_name, patches in sorted_entries:
-        if head_name == "unknown/local patches":
+    for head, patches in sorted_entries:
+        if head.rev == "unknown/local patches":
             if patches[0] == marker:
                 msg = "New commit %s" % commit
             else:
@@ -227,7 +227,7 @@ def sequence_insert(series, rev, top):
     sorted_patches = flatten([
         before,
         [patch
-         for head_name, patches in sorted_entries
+         for head, patches in sorted_entries
          for patch in patches],
         after])
     commit_pos = sorted_patches.index("# new commit")
@@ -239,7 +239,8 @@ def sequence_insert(series, rev, top):
     del sorted_patches[commit_pos]
 
     if sorted_patches != current_patches:
-        raise KSError("Subseries is not sorted.")
+        raise KSError("Subseries is not sorted. "
+                      "Please run scripts/series_sort.py.")
 
     return (name, commit_pos - top_index,)
 
@@ -276,10 +277,10 @@ class InputEntry(object):
                     "Either the repository at \"%s\" is outdated or patch \"%s\" is tagged improperly." % (
                         rev, repo.path, patch,))
             elif len(repo_tags) > 1:
-                raise KSError("Multiple Git-repo tags found."
-                                  "Patch \"%s\" is tagged improperly." %
-                                  (patch,))
-            self.subsys = repo_tags[0]
+                raise KSError("Multiple Git-repo tags found. "
+                              "Patch \"%s\" is tagged improperly." %
+                              (patch,))
+            self.subsys = git_sort.RepoURL(repo_tags[0])
         else:
             self.commit = str(commit.id)
 
@@ -289,7 +290,7 @@ def series_sort(repo, entries):
     entries is a list of InputEntry objects
 
     Returns a list of
-        (head name, [series.conf line with a patch name],)
+        (Head, [series.conf line with a patch name],)
 
     head name may be a "virtual head" like "out-of-tree patches".
     """
@@ -299,14 +300,15 @@ def series_sort(repo, entries):
             tagged[input_entry.commit].append(input_entry.value)
 
     subsys = collections.defaultdict(list)
-    for sorted_entry in git_sort.git_sort(repo, tagged):
-        subsys[sorted_entry.head_name].extend(sorted_entry.value)
+    index = git_sort.SortIndex(repo)
+    for sorted_entry in index.sort(tagged):
+        subsys[sorted_entry.head].extend(sorted_entry.value)
 
     url_map = get_url_map()
     for e in entries:
         if e.subsys:
             try:
-                name = url_map[e.subsys]
+                head = url_map[e.subsys]
             except KeyError:
                 patch = firstword(e.value)
                 f = open(patch)
@@ -317,46 +319,46 @@ def series_sort(repo, entries):
                     "a repository which is not indexed. Please edit "
                     "\"remotes\" in git_sort.py and submit a patch." % (
                         rev, patch,))
-            subsys[name].append(e.value)
+            subsys[head].append(e.value)
 
     result = []
-    for remote in git_sort.remotes:
-        head_name = git_sort.head_name(*remote)
-        if head_name in subsys:
-            result.append((head_name, subsys[head_name],))
-            del subsys[head_name]
+    for head in git_sort.remotes:
+        if head in subsys:
+            result.append((head, subsys[head],))
+            del subsys[head]
 
     if tagged:
-        result.append(("unknown/local patches", [
-            value for value_list in tagged.values() for value in value_list],))
+        result.append((
+            git_sort.Head(git_sort.RepoURL(str(None)), "unknown/local patches"),
+            [value for value_list in tagged.values() for value in value_list],))
 
-    result.extend([(r_tag, subsys[r_tag],) for r_tag in sorted(subsys)])
-
-    result.append(("out-of-tree patches", [e.value for e in entries if e.oot],))
+    result.append((
+        git_sort.Head(git_sort.RepoURL(str(None)), "out-of-tree patches"),
+        [e.value for e in entries if e.oot],))
 
     return result
 
 
 def get_url_map():
     result = {}
-    for canon_url, branch_name in git_sort.remotes:
-        if canon_url in result:
+    for head in git_sort.remotes:
+        if head.repo_url in result:
             raise KSException("URL mapping is ambiguous, \"%s\" may map to "
-                              "multiple head names")
-        result[canon_url] = git_sort.head_name(canon_url, branch_name)
+                              "multiple head names" % (str(head.repo_url),))
+        result[head.repo_url] = head
     return result
 
 
 def series_format(entries):
     """
     entries is a list of
-        (group name, [series.conf line with a patch name],)
+        (Head, [series.conf line with a patch name],)
     """
     result = []
 
-    for head_name, lines in entries:
-        if head_name != git_sort.head_name(*git_sort.remotes[0]):
-            result.extend(["\n", "\t# %s\n" % (head_name,)])
+    for head, lines in entries:
+        if head != git_sort.remotes[0]:
+            result.extend(["\n", "\t# %s\n" % (str(head),)])
         result.extend(lines)
 
     return result
