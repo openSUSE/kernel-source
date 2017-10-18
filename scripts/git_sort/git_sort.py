@@ -95,6 +95,24 @@ class Head(object):
     def __hash__(self):
         return hash((self.repo_url, self.rev,))
 
+    
+    def __cmp__(self, other):
+        """
+        Head a is upstream of Head b -> a < b
+        """
+        def get_index(head):
+            """
+            A head with no url is considered out of tree. Any other head with a
+            url is upstream of it.
+            """
+            if head.repo_url == RepoURL(None):
+                return len(remotes)
+            else:
+                return remote_index[head]
+        a = get_index(self)
+        b = get_index(other)
+        return cmp(a, b)
+
 
     def __repr__(self):
         return "%s %s" % (repr(self.repo_url), self.rev,)
@@ -135,6 +153,9 @@ remotes = (
     Head(RepoURL("mkp/scsi.git")),
     Head(RepoURL("next/linux-next.git")),
 )
+
+
+remote_index = dict(zip(remotes, range(len(remotes))))
 
 
 class SortIndex(object):
