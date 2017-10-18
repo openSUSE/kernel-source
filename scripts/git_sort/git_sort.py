@@ -24,6 +24,10 @@ class GSError(GSException):
     pass
 
 
+class GSKeyError(GSException):
+    pass
+
+
 class RepoURL(object):
     k_org_canon_prefix = "git://git.kernel.org/pub/scm/linux/kernel/git/"
     proto_match = re.compile("(git|https?)://")
@@ -278,6 +282,18 @@ class SortIndex(object):
         return history
 
 
+    def lookup(self, commit):
+        for head, log in self.history.items():
+            try:
+                index = log[commit]
+            except KeyError:
+                continue
+            else:
+                return (head, index,)
+
+        raise GSKeyError
+
+
     def sort(self, mapping):
         """
         Returns an OrderedDict
@@ -286,13 +302,12 @@ class SortIndex(object):
         """
         result = collections.OrderedDict([(head, [],) for head in self.history])
         for commit in mapping.keys():
-            for head, log in self.history.items():
-                try:
-                    index = log[commit]
-                except KeyError:
-                    continue
-                else:
-                    result[head].append((index, mapping.pop(commit),))
+            try:
+                head, index = self.lookup(commit)
+            except GSKeyError:
+                continue
+            else:
+                result[head].append((index, mapping.pop(commit),))
 
         for head, entries in result.items():
             entries.sort(key=operator.itemgetter(0))
