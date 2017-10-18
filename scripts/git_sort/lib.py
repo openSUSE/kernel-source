@@ -343,14 +343,14 @@ def series_sort(repo, entries):
             result[head].append(e.value)
 
     if tagged:
-        result[git_sort.Head(git_sort.RepoURL(str(None)),
+        result[git_sort.Head(git_sort.RepoURL(None),
                              "unknown/local patches")] = [
                                  value
                                  for value_list in tagged.values()
                                      for value in value_list
                              ]
 
-    result[git_sort.Head(git_sort.RepoURL(str(None)),
+    result[git_sort.Head(git_sort.RepoURL(None),
                          "out-of-tree patches")] = [
                              e.value for e in entries if e.oot
                          ]

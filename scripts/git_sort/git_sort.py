@@ -34,6 +34,10 @@ class RepoURL(object):
     ext = ".git"
 
     def __init__(self, url):
+        if url is None or url == repr(None):
+            self.url = None
+            return
+
         k_org_prefixes = [
             "http://git.kernel.org/pub/scm/linux/kernel/git/",
             "https://git.kernel.org/pub/scm/linux/kernel/git/",
@@ -68,10 +72,10 @@ class RepoURL(object):
 
     def __str__(self):
         url = self.url
-        if url.startswith(self.k_org_canon_prefix) and url.endswith(self.ext):
-            url = url[len(self.k_org_canon_prefix):-1 * len(self.ext)]
-        elif url == str(None):
+        if url is None:
             url = ""
+        elif url.startswith(self.k_org_canon_prefix) and url.endswith(self.ext):
+            url = url[len(self.k_org_canon_prefix):-1 * len(self.ext)]
 
         return url
 
@@ -178,7 +182,7 @@ class SortIndex(object):
             # According to the urls in remotes, this is not a clone of linux.git
             # Sort according to commits reachable from the current head
             result = collections.OrderedDict(
-                [(Head(RepoURL(str(None)), "HEAD"),
+                [(Head(RepoURL(None), "HEAD"),
                   str(self.repo.revparse_single("HEAD").id),)])
 
         return result
