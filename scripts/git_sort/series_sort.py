@@ -33,6 +33,9 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--prefix", metavar="DIR",
                         help="Search for patches in this directory. Default: "
                         "current directory.")
+    parser.add_argument("-c", "--check", action="store_true",
+                        help="Report via exit status 2 if the series is not "
+                        "sorted.")
     parser.add_argument("series", nargs="?", metavar="series.conf",
                         help="series.conf file which will be modified in "
                         "place. Default: read input from stdin.")
@@ -77,15 +80,26 @@ if __name__ == "__main__":
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
 
-    output = lib.flatten([
-        before,
+    new_inside = lib.flatten([
         lib.series_header(inside),
         lib.series_format(sorted_entries),
         lib.series_footer(inside),
-        after])
+    ])
 
-    if args.series is not None:
-        f = open(args.series, mode="w")
+    if args.check:
+        if inside != new_inside:
+            sys.exit(2)
+        else:
+            sys.exit(0)
     else:
-        f = sys.stdout
-    f.writelines(output)
+        output = lib.flatten([
+            before,
+            new_inside,
+            after,
+        ])
+
+        if args.series is not None:
+            f = open(args.series, mode="w")
+        else:
+            f = sys.stdout
+        f.writelines(output)
