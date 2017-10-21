@@ -156,6 +156,7 @@ remotes = (
 
 
 remote_index = dict(zip(remotes, range(len(remotes))))
+oot = Head(RepoURL(None), "out-of-tree patches")
 
 
 class SortIndex(object):

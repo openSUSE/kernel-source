@@ -4,9 +4,11 @@
 from __future__ import print_function
 
 import collections
+import operator
 import os
 import os.path
 import pygit2
+import re
 import signal
 import subprocess
 import sys
@@ -70,6 +72,7 @@ class KSNotFound(KSException):
 
 start_text = "sorted patches"
 end_text = "end of sorted patches"
+oot_text = git_sort.oot.rev
 
 
 def split_series(series):
@@ -125,6 +128,36 @@ def filter_patches(line):
         return False
     else:
         return True
+
+
+def parse_section_header(line):
+    line = line.strip()
+
+    if not line.startswith("# "):
+        raise KSNotFound()
+    line = line[2:]
+    if line == oot_text:
+        return git_sort.oot
+    elif line.lower() == start_text:
+        raise KSNotFound()
+
+    words = line.split(None, 3)
+    if len(words) > 2:
+        raise KSError(
+            "Section comment \"%s\" in series.conf could not be parsed. "
+            "series.conf is invalid." % (line,))
+    args = [git_sort.RepoURL(words[0])]
+    if len(words) == 2:
+        args.append(words[1])
+
+    head = git_sort.Head(*args)
+
+    if head not in git_sort.remotes:
+        raise KSError(
+            "Section comment \"%s\" in series.conf does not match any Head in "
+            "variable \"remotes\". series.conf is invalid." % (line,))
+    
+    return head
 
 
 def series_header(series):
@@ -193,6 +226,27 @@ def find_commit_in_series(commit, series):
 flatten = lambda l: [item for sublist in l for item in sublist]
 
 
+def parse_inside(index, inside):
+    result = []
+    current_head = git_sort.remotes[0]
+    for line in inside:
+        try:
+            current_head = parse_section_header(line)
+        except KSNotFound:
+            pass
+        else:
+            continue
+
+        if not filter_patches(line):
+            continue
+
+        patch = firstword(line)
+        entry = InputEntry("\t%s\n" % (patch,))
+        entry.from_patch(index, patch, current_head)
+        result.append(entry)
+    return result
+
+
 def sequence_insert(series, rev, top):
     """
     top is the top applied patch, None if none are applied.
@@ -201,11 +255,15 @@ def sequence_insert(series, rev, top):
 
     Returns the name of the new top patch and how many must be applied/popped.
     """
+    filter_series = lambda lines : [firstword(line) for line in lines
+                                    if filter_patches(line)]
     git_dir = repo_path()
     if "GIT_DIR" not in os.environ:
         # this is for the `git log` call in git_sort.py
         os.environ["GIT_DIR"] = git_dir
     repo = pygit2.Repository(git_dir)
+    index = git_sort.SortIndex(repo)
+
     try:
         commit = str(repo.revparse_single(rev).id)
     except ValueError:
@@ -214,54 +272,46 @@ def sequence_insert(series, rev, top):
         raise KSError("Revision \"%s\" not found in \"%s\"." % (
             rev, git_dir,))
 
-    before, inside, after = [
-        [firstword(line) for line in lines if filter_patches(line)]
-        for lines in split_series(series)]
-    current_patches = flatten([before, inside, after])
+    marker = "# new commit"
+    new_entry = InputEntry(marker)
+    try:
+        new_entry.dest_head, new_entry.cindex = index.lookup(commit)
+    except git_sort.GSKeyError:
+        raise KSError(
+            "Commit %s not found in git-sort index. If it is from a "
+            "repository and branch pair which is not listed in \"remotes\", "
+            "please add it and submit a patch." % (commit,))
+
+    try:
+        before, inside, after = split_series(series)
+    except KSNotFound as err:
+        raise KSError(err)
+    before, after = map(filter_series, (before, after,))
+    current_patches = flatten([before, filter_series(inside), after])
 
     if top is None:
         top_index = 0
     else:
         top_index = current_patches.index(top) + 1
 
-    input_entries = []
-    for patch in inside:
-        entry = InputEntry(patch)
-        entry.from_patch(repo, patch)
-        input_entries.append(entry)
+    input_entries = parse_inside(index, inside)
+    input_entries.append(new_entry)
 
-    marker = "# new commit"
-    entry = InputEntry(marker)
-    entry.commit = commit
-    input_entries.append(entry)
-
-    sorted_entries = series_sort(repo, input_entries)
-    for head, patches in sorted_entries.items():
-        if head.rev == "unknown/local patches":
-            if patches[0] == marker:
-                msg = "New commit %s" % commit
-            else:
-                f = open(patches[0])
-                commit_tags = lib_tag.tag_get(f, "Git-commit")
-                rev = firstword(commit_tags[0])
-                msg = "Commit %s first found in patch \"%s\"" % (rev,
-                    patches[0],)
-            raise KSError(msg + " appears to be from a repository which is "
-                          "not indexed. Please edit \"remotes\" in git_sort.py "
-                          "and submit a patch.")
-    sorted_patches = flatten([
+    sorted_entries = series_sort(index, input_entries)
+    new_patches = flatten([
         before,
-        flatten(sorted_entries.values()),
-        after])
-    commit_pos = sorted_patches.index("# new commit")
+        [line.strip() for lines in sorted_entries.values() for line in lines],
+        after,
+    ])
+    commit_pos = new_patches.index(marker)
     if commit_pos == 0:
         # should be inserted first in series
         name = ""
     else:
-        name = sorted_patches[commit_pos - 1]
-    del sorted_patches[commit_pos]
+        name = new_patches[commit_pos - 1]
+    del new_patches[commit_pos]
 
-    if sorted_patches != current_patches:
+    if new_patches != current_patches:
         raise KSError("Subseries is not sorted. "
                       "Please run scripts/series_sort.py.")
 
@@ -269,46 +319,70 @@ def sequence_insert(series, rev, top):
 
 
 class InputEntry(object):
-    def __init__(self, value):
-        self.commit = None
-        self.subsys = None
-        self.oot = False
+    commit_match = re.compile("[0-9a-f]{40}")
 
+
+    def __init__(self, value):
         self.value = value
 
-    def from_patch(self, repo, patch):
+
+    def from_patch(self, index, patch, current_head):
         if not os.path.exists(patch):
             raise KSError("Could not find patch \"%s\"" % (patch,))
 
         f = open(patch)
         commit_tags = lib_tag.tag_get(f, "Git-commit")
         if not commit_tags:
-            self.oot = True
+            self.dest_head = git_sort.oot
             return
 
         rev = firstword(commit_tags[0])
+        if not self.commit_match.match(rev):
+            raise KSError("Git-commit tag \"%s\" in patch \"%s\" is not a "
+                          "valid revision." % (rev, patch,))
+
+        # this is where we decide a patch line's fate in the sorted series.conf
         try:
-            commit = repo.revparse_single(rev)
-        except ValueError:
-            raise KSError("Git-commit tag \"%s\" in patch \"%s\" is not a valid revision." %
-                              (rev, patch,))
-        except KeyError:
-            repo_tags = lib_tag.tag_get(f, "Git-repo")
-            if not repo_tags:
+            head, self.cindex = index.lookup(rev)
+        except git_sort.GSKeyError: # commit not found
+            if current_head not in index.repo_heads: # repo not indexed
+                self.dest_head = current_head
+            else: # repo is indexed
                 raise KSError(
-                    "Commit \"%s\" not found and no Git-repo specified. "
-                    "Either the repository at \"%s\" is outdated or patch \"%s\" is tagged improperly." % (
-                        rev, repo.path, patch,))
-            elif len(repo_tags) > 1:
-                raise KSError("Multiple Git-repo tags found. "
-                              "Patch \"%s\" is tagged improperly." %
-                              (patch,))
-            self.subsys = git_sort.RepoURL(repo_tags[0])
-        else:
-            self.commit = str(commit.id)
+                    "There is a problem with patch \"%s\". "
+                    "Commit \"%s\" not found in git-sort index. "
+                    "The remote fetching from \"%s\" needs to be fetched or "
+                    "the Git-commit tag is incorrect or the patch is in the "
+                    "wrong section of series.conf. Manual intervention is "
+                    "required." % (patch, rev, current_head.repo_url,))
+        else: # commit found
+            if current_head not in index.repo_heads: # repo not indexed
+                if head > current_head: # patch moved downstream
+                    self.dest_head = current_head
+                elif head == current_head: # patch didn't move
+                    raise KSException(
+                        "Head \"%s\" is not available locally but commit "
+                        "\"%s\" found in patch \"%s\" was found in that head." %
+                        (head, rev, patch,))
+                elif head < current_head: # patch moved upstream
+                    self.dest_head = head
+            else: # repo is indexed
+                if head > current_head: # patch moved downstream
+                    raise KSError(
+                        "There is a problem with patch \"%s\". "
+                        "The patch is in the wrong section of series.conf or "
+                        "the remote fetching from \"%s\" needs to be fetched "
+                        "or the relative order of \"%s\" and \"%s\" in "
+                        "\"remotes\" is incorrect. Manual intervention is "
+                        "required." % (
+                            patch, current_head.repo_url, head, current_head,))
+                elif head == current_head: # patch didn't move
+                    self.dest_head = head
+                elif head < current_head: # patch moved upstream
+                    self.dest_head = head
 
 
-def series_sort(repo, entries):
+def series_sort(index, entries):
     """
     entries is a list of InputEntry objects
 
@@ -318,61 +392,32 @@ def series_sort(repo, entries):
 
     Note that Head may be a "virtual head" like "out-of-tree patches".
     """
-    tagged = collections.defaultdict(list)
-    for input_entry in entries:
-        if input_entry.commit:
-            tagged[input_entry.commit].append(input_entry.value)
+    def container(head):
+        if head in index.repo_heads:
+            return collections.defaultdict(list)
+        else:
+            return []
 
-    result = collections.OrderedDict([(head, [],) for head in git_sort.remotes])
-    index = git_sort.SortIndex(repo)
-    sorted_tagged = index.sort(tagged)
-    for head, e in sorted_tagged.items():
-        result[head] = flatten(e)
+    result = collections.OrderedDict([
+        (head, container(head),)
+        for head in flatten((git_sort.remotes, (git_sort.oot,),))])
 
-    url_map = get_url_map()
-    for e in entries:
-        if e.subsys:
-            try:
-                head = url_map[e.subsys]
-            except KeyError:
-                patch = firstword(e.value)
-                f = open(patch)
-                commit_tags = lib_tag.tag_get(f, "Git-commit")
-                rev = firstword(commit_tags[0])
-                raise KSError(
-                    "Commit %s first found in patch \"%s\" appears to be from "
-                    "a repository which is not indexed. Please edit "
-                    "\"remotes\" in git_sort.py and submit a patch." % (
-                        rev, patch,))
-            result[head].append(e.value)
+    for entry in entries:
+        try:
+            result[entry.dest_head][entry.cindex].append(entry.value)
+        except AttributeError:
+            # no entry.cindex
+            result[entry.dest_head].append(entry.value)
 
-    if tagged:
-        result[git_sort.Head(git_sort.RepoURL(None),
-                             "unknown/local patches")] = [
-                                 value
-                                 for value_list in tagged.values()
-                                     for value in value_list
-                             ]
-
-    result[git_sort.Head(git_sort.RepoURL(None),
-                         "out-of-tree patches")] = [
-                             e.value for e in entries if e.oot
-                         ]
+    for head in index.repo_heads:
+        result[head] = flatten([
+            e[1]
+            for e in sorted(result[head].items(), key=operator.itemgetter(0))])
 
     for head, lines in result.items():
         if not lines:
             del result[head]
 
-    return result
-
-
-def get_url_map():
-    result = {}
-    for head in git_sort.remotes:
-        if head.repo_url in result:
-            raise KSException("URL mapping is ambiguous, \"%s\" may map to "
-                              "multiple head names" % (str(head.repo_url),))
-        result[head.repo_url] = head
     return result
 
 
