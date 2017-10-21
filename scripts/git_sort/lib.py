@@ -68,6 +68,10 @@ class KSNotFound(KSException):
     pass
 
 
+start_text = "sorted patches"
+end_text = "end of sorted patches"
+
+
 def split_series(series):
     before = []
     inside = []
@@ -92,9 +96,9 @@ def split_series(series):
                 whitespace = []
             comments.append(line)
 
-            if current == before and l.lower() == "# sorted patches":
+            if current == before and l.lower() == "# %s" % (start_text,):
                 current = inside
-            elif current == inside and l.lower() == "# end of sorted patches":
+            elif current == inside and l.lower() == "# %s" % (end_text,):
                 current = after
         else:
             if comments:
