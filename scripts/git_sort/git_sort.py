@@ -151,12 +151,11 @@ remotes = (
     Head(RepoURL("dledford/rdma.git"), "k.o/for-next"),
     Head(RepoURL("jejb/scsi.git"), "for-next"),
     Head(RepoURL("bp/bp.git"), "for-next"),
-    Head(RepoURL("jj/linux-apparmor.git"), "v4.8-aa2.8-out-of-tree",),
     Head(RepoURL("tiwai/sound.git")),
     Head(RepoURL("powerpc/linux.git"), "next"),
     Head(RepoURL("tip/tip.git")),
-    Head(RepoURL("shli/md.git")),
-    Head(RepoURL("mkp/scsi.git")),
+    Head(RepoURL("shli/md.git"), "for-next"),
+    Head(RepoURL("dhowells/linux-fs.git"), "keys-uefi"),
     Head(RepoURL("next/linux-next.git")),
 )
 
