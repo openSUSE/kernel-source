@@ -50,8 +50,9 @@ class RepoURL(object):
 
         if not self.proto_match.match(url):
             url = self.k_org_canon_prefix + url
-            if not url.endswith(self.ext):
-                url = url + self.ext
+
+        if not url.endswith(self.ext):
+            url = url + self.ext
 
         self.url = url
 
