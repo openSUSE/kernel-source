@@ -177,25 +177,6 @@ def series_footer(series):
     return series_header(reversed(series))
 
 
-def filter_sorted(series):
-    """
-    Return upstream patch names from the sorted section
-    """
-    result = []
-
-    for line in series:
-        line = line.strip()
-        if line == "# out-of-tree patches":
-            break
-
-        if line == "" or line.startswith(("#", "-", "+",)):
-            continue
-
-        result.append(line)
-
-    return result
-
-
 def repo_path():
     try:
         search_path = subprocess.check_output(
