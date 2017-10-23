@@ -26,12 +26,34 @@ class KSError(KSException):
     pass
 
 
+class KSNotFound(KSException):
+    pass
+
+
+# https://stackoverflow.com/a/952952
+flatten = lambda l: [item for sublist in l for item in sublist]
+
+
+# http://stackoverflow.com/questions/1158076/implement-touch-using-python
+def touch(fname, times=None):
+    with open(fname, 'a'):
+        os.utime(fname, times)
+
+
 # http://stackoverflow.com/questions/22077881/yes-reporting-error-with-subprocess-communicate
 def restore_signals(): # from http://hg.python.org/cpython/rev/768722b2ae0a/
     signals = ('SIGPIPE', 'SIGXFZ', 'SIGXFSZ')
     for sig in signals:
         if hasattr(signal, sig):
             signal.signal(getattr(signal, sig), signal.SIG_DFL)
+
+
+def firstword(value):
+    return value.split(None, 1)[0]
+
+
+def libdir():
+    return os.path.dirname(os.path.realpath(__file__))
 
 
 def check_series():
@@ -58,21 +80,38 @@ def check_series():
         return False
 
 
-def firstword(value):
-    return value.split(None, 1)[0]
-
-
-def libdir():
-    return os.path.dirname(os.path.realpath(__file__))
-
-
-class KSNotFound(KSException):
-    pass
+def repo_path():
+    try:
+        search_path = subprocess.check_output(
+            os.path.join(libdir(), "..", "linux_git.sh"),
+            preexec_fn=restore_signals).strip()
+    except subprocess.CalledProcessError:
+        print("Error: Could not determine mainline linux git repository path.",
+              file=sys.stderr)
+        sys.exit(1)
+    return pygit2.discover_repository(search_path)
 
 
 start_text = "sorted patches"
 end_text = "end of sorted patches"
 oot_text = git_sort.oot.rev
+
+
+def filter_patches(line):
+    line = line.strip()
+
+    if line == "" or line.startswith(("#", "-", "+",)):
+        return False
+    else:
+        return True
+
+
+def find_commit_in_series(commit, series):
+    for patch in [firstword(l) for l in series if filter_patches(l)]:
+        path = os.path.join("patches", patch)
+        f = open(path)
+        if commit in [firstword(t) for t in lib_tag.tag_get(f, "Git-commit")]:
+            return f
 
 
 def split_series(series):
@@ -121,13 +160,21 @@ def split_series(series):
     return (before, inside, after,)
 
 
-def filter_patches(line):
-    line = line.strip()
+def series_header(series):
+    header = []
 
-    if line == "" or line.startswith(("#", "-", "+",)):
-        return False
-    else:
-        return True
+    for line in series:
+        if not filter_patches(line):
+            header.append(line)
+            continue
+        else:
+            break
+
+    return header
+
+
+def series_footer(series):
+    return series_header(reversed(series))
 
 
 def parse_section_header(line):
@@ -160,53 +207,6 @@ def parse_section_header(line):
     return head
 
 
-def series_header(series):
-    header = []
-
-    for line in series:
-        if not filter_patches(line):
-            header.append(line)
-            continue
-        else:
-            break
-
-    return header
-
-
-def series_footer(series):
-    return series_header(reversed(series))
-
-
-def repo_path():
-    try:
-        search_path = subprocess.check_output(
-            os.path.join(libdir(), "..", "linux_git.sh"),
-            preexec_fn=restore_signals).strip()
-    except subprocess.CalledProcessError:
-        print("Error: Could not determine mainline linux git repository path.",
-              file=sys.stderr)
-        sys.exit(1)
-    return pygit2.discover_repository(search_path)
-
-
-# http://stackoverflow.com/questions/1158076/implement-touch-using-python
-def touch(fname, times=None):
-    with open(fname, 'a'):
-        os.utime(fname, times)
-
-
-def find_commit_in_series(commit, series):
-    for patch in [firstword(l) for l in series if filter_patches(l)]:
-        path = os.path.join("patches", patch)
-        f = open(path)
-        if commit in [firstword(t) for t in lib_tag.tag_get(f, "Git-commit")]:
-            return f
-
-
-# https://stackoverflow.com/a/952952
-flatten = lambda l: [item for sublist in l for item in sublist]
-
-
 def parse_inside(index, inside):
     result = []
     current_head = git_sort.remotes[0]
@@ -226,77 +226,6 @@ def parse_inside(index, inside):
         entry.from_patch(index, patch, current_head)
         result.append(entry)
     return result
-
-
-def sequence_insert(series, rev, top):
-    """
-    top is the top applied patch, None if none are applied.
-
-    Caller must chdir to where the entries in series can be found.
-
-    Returns the name of the new top patch and how many must be applied/popped.
-    """
-    filter_series = lambda lines : [firstword(line) for line in lines
-                                    if filter_patches(line)]
-    git_dir = repo_path()
-    if "GIT_DIR" not in os.environ:
-        # this is for the `git log` call in git_sort.py
-        os.environ["GIT_DIR"] = git_dir
-    repo = pygit2.Repository(git_dir)
-    index = git_sort.SortIndex(repo)
-
-    try:
-        commit = str(repo.revparse_single(rev).id)
-    except ValueError:
-        raise KSError("\"%s\" is not a valid revision." % (rev,))
-    except KeyError:
-        raise KSError("Revision \"%s\" not found in \"%s\"." % (
-            rev, git_dir,))
-
-    marker = "# new commit"
-    new_entry = InputEntry(marker)
-    try:
-        new_entry.dest_head, new_entry.cindex = index.lookup(commit)
-    except git_sort.GSKeyError:
-        raise KSError(
-            "Commit %s not found in git-sort index. If it is from a "
-            "repository and branch pair which is not listed in \"remotes\", "
-            "please add it and submit a patch." % (commit,))
-
-    try:
-        before, inside, after = split_series(series)
-    except KSNotFound as err:
-        raise KSError(err)
-    before, after = map(filter_series, (before, after,))
-    current_patches = flatten([before, filter_series(inside), after])
-
-    if top is None:
-        top_index = 0
-    else:
-        top_index = current_patches.index(top) + 1
-
-    input_entries = parse_inside(index, inside)
-    input_entries.append(new_entry)
-
-    sorted_entries = series_sort(index, input_entries)
-    new_patches = flatten([
-        before,
-        [line.strip() for lines in sorted_entries.values() for line in lines],
-        after,
-    ])
-    commit_pos = new_patches.index(marker)
-    if commit_pos == 0:
-        # should be inserted first in series
-        name = ""
-    else:
-        name = new_patches[commit_pos - 1]
-    del new_patches[commit_pos]
-
-    if new_patches != current_patches:
-        raise KSError("Subseries is not sorted. "
-                      "Please run scripts/series_sort.py.")
-
-    return (name, commit_pos - top_index,)
 
 
 class InputEntry(object):
@@ -416,3 +345,74 @@ def series_format(entries):
         result.extend(lines)
 
     return result
+
+
+def sequence_insert(series, rev, top):
+    """
+    top is the top applied patch, None if none are applied.
+
+    Caller must chdir to where the entries in series can be found.
+
+    Returns the name of the new top patch and how many must be applied/popped.
+    """
+    filter_series = lambda lines : [firstword(line) for line in lines
+                                    if filter_patches(line)]
+    git_dir = repo_path()
+    if "GIT_DIR" not in os.environ:
+        # this is for the `git log` call in git_sort.py
+        os.environ["GIT_DIR"] = git_dir
+    repo = pygit2.Repository(git_dir)
+    index = git_sort.SortIndex(repo)
+
+    try:
+        commit = str(repo.revparse_single(rev).id)
+    except ValueError:
+        raise KSError("\"%s\" is not a valid revision." % (rev,))
+    except KeyError:
+        raise KSError("Revision \"%s\" not found in \"%s\"." % (
+            rev, git_dir,))
+
+    marker = "# new commit"
+    new_entry = InputEntry(marker)
+    try:
+        new_entry.dest_head, new_entry.cindex = index.lookup(commit)
+    except git_sort.GSKeyError:
+        raise KSError(
+            "Commit %s not found in git-sort index. If it is from a "
+            "repository and branch pair which is not listed in \"remotes\", "
+            "please add it and submit a patch." % (commit,))
+
+    try:
+        before, inside, after = split_series(series)
+    except KSNotFound as err:
+        raise KSError(err)
+    before, after = map(filter_series, (before, after,))
+    current_patches = flatten([before, filter_series(inside), after])
+
+    if top is None:
+        top_index = 0
+    else:
+        top_index = current_patches.index(top) + 1
+
+    input_entries = parse_inside(index, inside)
+    input_entries.append(new_entry)
+
+    sorted_entries = series_sort(index, input_entries)
+    new_patches = flatten([
+        before,
+        [line.strip() for lines in sorted_entries.values() for line in lines],
+        after,
+    ])
+    commit_pos = new_patches.index(marker)
+    if commit_pos == 0:
+        # should be inserted first in series
+        name = ""
+    else:
+        name = new_patches[commit_pos - 1]
+    del new_patches[commit_pos]
+
+    if new_patches != current_patches:
+        raise KSError("Subseries is not sorted. "
+                      "Please run scripts/series_sort.py.")
+
+    return (name, commit_pos - top_index,)
