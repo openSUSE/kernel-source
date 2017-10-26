@@ -79,9 +79,9 @@ if __name__ == "__main__":
     except lib.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
-    for patch in added - local[3]:
-        entry = lib.InputEntry("\t%s\n" % (patch,))
-        entry.from_patch(index, patch, lib.git_sort.oot)
+    for name in added - local[3]:
+        entry = lib.InputEntry("\t%s\n" % (name,))
+        entry.from_patch(index, name, lib.git_sort.oot)
         input_entries.append(entry)
 
     try:

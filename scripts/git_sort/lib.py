@@ -4,6 +4,7 @@
 from __future__ import print_function
 
 import collections
+import contextlib
 import operator
 import os
 import os.path
@@ -13,9 +14,8 @@ import signal
 import subprocess
 import sys
 
-import lib_tag
-
 import git_sort
+import tag
 
 
 class KSException(BaseException):
@@ -106,12 +106,21 @@ def filter_patches(line):
         return True
 
 
+@contextlib.contextmanager
 def find_commit_in_series(commit, series):
-    for patch in [firstword(l) for l in series if filter_patches(l)]:
-        path = os.path.join("patches", patch)
-        f = open(path)
-        if commit in [firstword(t) for t in lib_tag.tag_get(f, "Git-commit")]:
-            return f
+    """
+    Caller must chdir to where the entries in series can be found.
+    """
+    for name in [firstword(l) for l in series if filter_patches(l)]:
+        patch = tag.Patch(name)
+        found = False
+        if commit in [firstword(value) for value in patch.get("Git-commit")]:
+            found = True
+            yield patch
+        patch.close()
+        if found:
+            return
+    raise KSNotFound()
 
 
 def split_series(series):
@@ -215,15 +224,13 @@ def parse_inside(index, inside):
             current_head = parse_section_header(line)
         except KSNotFound:
             pass
-        else:
-            continue
 
         if not filter_patches(line):
             continue
 
-        patch = firstword(line)
-        entry = InputEntry("\t%s\n" % (patch,))
-        entry.from_patch(index, patch, current_head)
+        name = firstword(line)
+        entry = InputEntry("\t%s\n" % (name,))
+        entry.from_patch(index, name, current_head)
         result.append(entry)
     return result
 
@@ -236,12 +243,12 @@ class InputEntry(object):
         self.value = value
 
 
-    def from_patch(self, index, patch, current_head):
-        if not os.path.exists(patch):
-            raise KSError("Could not find patch \"%s\"" % (patch,))
+    def from_patch(self, index, name, current_head):
+        if not os.path.exists(name):
+            raise KSError("Could not find patch \"%s\"" % (name,))
 
-        f = open(patch)
-        commit_tags = lib_tag.tag_get(f, "Git-commit")
+        with tag.Patch(name) as patch:
+            commit_tags = patch.get("Git-commit")
         if not commit_tags:
             self.dest_head = git_sort.oot
             return
@@ -249,7 +256,7 @@ class InputEntry(object):
         rev = firstword(commit_tags[0])
         if not self.commit_match.match(rev):
             raise KSError("Git-commit tag \"%s\" in patch \"%s\" is not a "
-                          "valid revision." % (rev, patch,))
+                          "valid revision." % (rev, name,))
 
         # this is where we decide a patch line's fate in the sorted series.conf
         try:
@@ -264,7 +271,7 @@ class InputEntry(object):
                     "The remote fetching from \"%s\" needs to be fetched or "
                     "the Git-commit tag is incorrect or the patch is in the "
                     "wrong section of series.conf. Manual intervention is "
-                    "required." % (patch, rev, current_head.repo_url,))
+                    "required." % (name, rev, current_head.repo_url,))
         else: # commit found
             if current_head not in index.repo_heads: # repo not indexed
                 if head > current_head: # patch moved downstream
@@ -273,7 +280,7 @@ class InputEntry(object):
                     raise KSException(
                         "Head \"%s\" is not available locally but commit "
                         "\"%s\" found in patch \"%s\" was found in that head." %
-                        (head, rev, patch,))
+                        (head, rev, name,))
                 elif head < current_head: # patch moved upstream
                     self.dest_head = head
             else: # repo is indexed
@@ -285,7 +292,7 @@ class InputEntry(object):
                         "or the relative order of \"%s\" and \"%s\" in "
                         "\"remotes\" is incorrect. Manual intervention is "
                         "required." % (
-                            patch, current_head.repo_url, head, current_head,))
+                            name, current_head.repo_url, head, current_head,))
                 elif head == current_head: # patch didn't move
                     self.dest_head = head
                 elif head < current_head: # patch moved upstream

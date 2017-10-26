@@ -11,7 +11,6 @@ import subprocess
 import sys
 
 import lib
-import lib_tag
 
 
 if __name__ == "__main__":
@@ -24,20 +23,30 @@ if __name__ == "__main__":
     if not lib.check_series():
         sys.exit(1)
 
-    repo = pygit2.Repository(lib.repo_path())
-    commit = str(repo.revparse_single(args.rev).id)
-
-    f = lib.find_commit_in_series(commit, open("series"))
-    if f is not None:
-        # remove "patches/" prefix
-        print("Commit %s already present in patch\n\t%s" % (
-            commit[:12], f.name[8:],))
-        references = " ".join(lib_tag.tag_get(f, "References"))
-        if references:
-            print("for\n\t%s" % (references,))
-
-        top = subprocess.check_output(
-            ("quilt", "top",), preexec_fn=lib.restore_signals).strip()
-        if top == f.name:
-            print("This is the top patch.")
+    repo_path = lib.repo_path()
+    repo = pygit2.Repository(repo_path)
+    try:
+        commit = str(repo.revparse_single(args.rev).id)
+    except KeyError:
+        print("Error: revision \"%s\" not found in \"%s\"." %
+              (args.rev, repo_path), file=sys.stderr)
         sys.exit(1)
+
+    series = open("series")
+    cwd = os.getcwd()
+    os.chdir("patches")
+    try:
+        with lib.find_commit_in_series(commit, series) as patch:
+            print("Commit %s already present in patch\n\t%s" % (
+                commit[:12], patch.name,))
+            references = " ".join(patch.get("References"))
+            if references:
+                print("for\n\t%s" % (references,))
+
+            top = subprocess.check_output(("quilt", "top",), cwd=cwd,
+                                          preexec_fn=lib.restore_signals).strip()
+            if top == patch.name:
+                print("This is the top patch.")
+            sys.exit(1)
+    except lib.KSNotFound:
+        pass
