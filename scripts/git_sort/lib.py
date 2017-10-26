@@ -365,9 +365,6 @@ def sequence_insert(series, rev, top):
     filter_series = lambda lines : [firstword(line) for line in lines
                                     if filter_patches(line)]
     git_dir = repo_path()
-    if "GIT_DIR" not in os.environ:
-        # this is for the `git log` call in git_sort.py
-        os.environ["GIT_DIR"] = git_dir
     repo = pygit2.Repository(git_dir)
     index = git_sort.SortIndex(repo)
 

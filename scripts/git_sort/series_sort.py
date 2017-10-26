@@ -42,9 +42,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     repo_path = lib.repo_path()
-    if "GIT_DIR" not in os.environ:
-        # this is for the `git log` call in git_sort.py
-        os.environ["GIT_DIR"] = repo_path
     repo = pygit2.Repository(repo_path)
     index = lib.git_sort.SortIndex(repo)
 

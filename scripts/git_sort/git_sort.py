@@ -183,7 +183,8 @@ class SortIndex(object):
         result = collections.OrderedDict()
         repo_remotes = []
         args = ("git", "config", "--get-regexp", "^remote\..+\.url$",)
-        for line in subprocess.check_output(args).splitlines():
+        for line in subprocess.check_output(args,
+                                            cwd=self.repo.path).splitlines():
             name, url = line.split(None, 1)
             name = name.split(".")[1]
             url = RepoURL(url)
@@ -228,6 +229,7 @@ class SortIndex(object):
                 raise GSException("head \"%s\" is not unique." % (head,))
 
             sp = subprocess.Popen(args + processed + [rev],
+                                  cwd=self.repo.path,
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT)
 

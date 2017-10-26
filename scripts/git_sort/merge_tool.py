@@ -40,9 +40,6 @@ if __name__ == "__main__":
     local_path, base_path, remote_path, merged_path = sys.argv[1:5]
 
     repo_path = lib.repo_path()
-    if "GIT_DIR" not in os.environ:
-        # this is for the `git log` call in git_sort.py
-        os.environ["GIT_DIR"] = repo_path
     repo = pygit2.Repository(repo_path)
     index = lib.git_sort.SortIndex(repo)
 
