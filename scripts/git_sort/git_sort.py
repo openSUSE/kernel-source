@@ -4,6 +4,7 @@
 from __future__ import print_function
 
 import argparse
+import bisect
 import collections
 import operator
 import os
@@ -25,6 +26,10 @@ class GSError(GSException):
 
 
 class GSKeyError(GSException):
+    pass
+
+
+class GSNotFound(GSException):
     pass
 
 
@@ -162,6 +167,7 @@ oot = Head(RepoURL(None), "out-of-tree patches")
 
 class SortIndex(object):
     cache_version = 3
+    version_match = re.compile("refs/tags/v(2\.6\.\d+|\d\.\d+)(-rc\d+)?$")
 
 
     def __init__(self, repo, skip_rebuild=False):
@@ -172,6 +178,7 @@ class SortIndex(object):
         except GSError as err:
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
+        self.version_indexes = None
 
 
     def get_heads(self):
@@ -345,6 +352,31 @@ class SortIndex(object):
             result[head] = [e[1] for e in entries]
 
         return result
+
+
+    def describe(self, index):
+        """
+        index must come from the mainline head (remotes[0]).
+        """
+        if self.version_indexes is None:
+            history = self.history[remotes[0]]
+            # remove "refs/tags/"
+            objects = [(self.repo.revparse_single(tag).get_object(), tag[10:],)
+                       for tag in self.repo.listall_references()
+                       if self.version_match.match(tag)]
+            revs = [(history[str(obj.id)], tag,)
+                    for obj, tag in objects
+                    if obj.type == pygit2.GIT_OBJ_COMMIT]
+            revs.sort(key=operator.itemgetter(0))
+            self.version_indexes = zip(*revs)
+
+        indexes, tags = self.version_indexes
+        i = bisect.bisect_left(indexes, index)
+        if i == len(tags):
+            # not yet part of a tagged release
+            return "%s+" % (tags[-1],)
+        else:
+            return tags[i]
 
 
 if __name__ == "__main__":
