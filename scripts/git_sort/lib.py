@@ -173,11 +173,17 @@ def series_header(series):
     header = []
 
     for line in series:
-        if not filter_patches(line):
-            header.append(line)
-            continue
+        if filter_patches(line):
+            break
+
+        try:
+            parse_section_header(line)
+        except KSNotFound:
+            pass
         else:
             break
+
+        header.append(line)
 
     return header
 
