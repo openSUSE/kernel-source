@@ -246,15 +246,21 @@ class InputEntry(object):
 
 
     def __init__(self, value):
+        """
+        value is typically a series.conf line but can be anything.
+        """
         self.value = value
 
 
     def from_patch(self, index, name, current_head):
+        self.name = name
         if not os.path.exists(name):
             raise KSError("Could not find patch \"%s\"" % (name,))
 
         with tag.Patch(name) as patch:
             commit_tags = patch.get("Git-commit")
+            repo_tags = patch.get("Git-repo")
+
         if not commit_tags:
             self.dest_head = git_sort.oot
             return
@@ -264,24 +270,60 @@ class InputEntry(object):
             raise KSError("Git-commit tag \"%s\" in patch \"%s\" is not a "
                           "valid revision." % (rev, name,))
 
+        if len(repo_tags) > 1:
+            raise KSError("Multiple Git-repo tags found. Patch \"%s\" is "
+                          "tagged improperly." % (name,))
+        elif repo_tags:
+            repo = git_sort.RepoURL(repo_tags[0])
+        elif commit_tags:
+            repo = git_sort.remotes[0].repo_url
+        self.new_url = None
+
         # this is where we decide a patch line's fate in the sorted series.conf
         try:
             head, self.cindex = index.lookup(rev)
         except git_sort.GSKeyError: # commit not found
             if current_head not in index.repo_heads: # repo not indexed
-                self.dest_head = current_head
+                if repo == current_head.repo_url: # good tag
+                    self.dest_head = current_head
+                else: # bad tag
+                    raise KSError(
+                        "There is a problem with patch \"%s\". "
+                        "The Git-repo tag is incorrect or the patch is in the "
+                        "wrong section of series.conf and (the Git-commit tag "
+                        "is incorrect or the relevant remote is outdated or "
+                        "not available locally) or an entry for this "
+                        "repository is missing from \"remotes\". In the last "
+                        "case, please edit \"remotes\" in "
+                        "\"scripts/git_sort/git_sort.py\" and commit the "
+                        "result. Manual intervention is required." % (name,))
             else: # repo is indexed
-                raise KSError(
-                    "There is a problem with patch \"%s\". "
-                    "Commit \"%s\" not found in git-sort index. "
-                    "The remote fetching from \"%s\" needs to be fetched or "
-                    "the Git-commit tag is incorrect or the patch is in the "
-                    "wrong section of series.conf. Manual intervention is "
-                    "required." % (name, rev, current_head.repo_url,))
+                if repo == current_head.repo_url: # good tag
+                    raise KSError(
+                        "There is a problem with patch \"%s\". "
+                        "Commit \"%s\" not found in git-sort index. "
+                        "The remote fetching from \"%s\" needs to be fetched "
+                        "or the Git-commit tag is incorrect or the patch is "
+                        "in the wrong section of series.conf. Manual "
+                        "intervention is required." % (
+                            name, rev, current_head.repo_url,))
+                else: # bad tag
+                    raise KSError(
+                        "There is a problem with patch \"%s\". "
+                        "The Git-repo tag is incorrect or the patch is in the "
+                        "wrong section of series.conf. Manual intervention is "
+                        "required." % (name,))
         else: # commit found
             if current_head not in index.repo_heads: # repo not indexed
                 if head > current_head: # patch moved downstream
-                    self.dest_head = current_head
+                    if repo == current_head.repo_url: # good tag
+                        self.dest_head = current_head
+                    else: # bad tag
+                        raise KSError(
+                            "There is a problem with patch \"%s\". "
+                            "The Git-repo tag is incorrect or the patch is in "
+                            "the wrong section of series.conf. Manual "
+                            "intervention is required." % (name,))
                 elif head == current_head: # patch didn't move
                     raise KSException(
                         "Head \"%s\" is not available locally but commit "
@@ -289,20 +331,34 @@ class InputEntry(object):
                         (head, rev, name,))
                 elif head < current_head: # patch moved upstream
                     self.dest_head = head
+                    self.new_url = head.repo_url
             else: # repo is indexed
                 if head > current_head: # patch moved downstream
-                    raise KSError(
-                        "There is a problem with patch \"%s\". "
-                        "The patch is in the wrong section of series.conf or "
-                        "the remote fetching from \"%s\" needs to be fetched "
-                        "or the relative order of \"%s\" and \"%s\" in "
-                        "\"remotes\" is incorrect. Manual intervention is "
-                        "required." % (
-                            name, current_head.repo_url, head, current_head,))
+                    if repo == current_head.repo_url: # good tag
+                        raise KSError(
+                            "There is a problem with patch \"%s\". "
+                            "The patch is in the wrong section of series.conf "
+                            "or the remote fetching from \"%s\" needs to be "
+                            "fetched or the relative order of \"%s\" and "
+                            "\"%s\" in \"remotes\" is incorrect. Manual "
+                            "intervention is required." % (
+                                name, current_head.repo_url, head,
+                                current_head,))
+                    else: # bad tag
+                        raise KSError(
+                            "There is a problem with patch \"%s\". "
+                            "The patch is in the wrong section of series.conf "
+                            "or the remote fetching from \"%s\" needs to be "
+                            "fetched. Manual intervention is required." % (
+                                name, current_head.repo_url,))
                 elif head == current_head: # patch didn't move
                     self.dest_head = head
+                    if repo != current_head.repo_url: # bad tag
+                        self.new_url = head.repo_url
                 elif head < current_head: # patch moved upstream
                     self.dest_head = head
+                    if repo != current_head.repo_url: # bad tag
+                        self.new_url = head.repo_url
 
 
 def series_sort(index, entries):
