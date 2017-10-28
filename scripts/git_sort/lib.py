@@ -7,6 +7,7 @@ import collections
 import os
 import pygit2
 import signal
+import subprocess
 import sys
 
 import lib_tag
@@ -31,12 +32,27 @@ def restore_signals(): # from http://hg.python.org/cpython/rev/768722b2ae0a/
 
 
 def check_series():
-    if open("series").readline().strip() != "# Kernel patches configuration file":
-        print("Error: series file does not look like series.conf",
-              file=sys.stderr)
+    def check():
+        return (open("series").readline().strip() ==
+                "# Kernel patches configuration file")
+
+    try:
+        retval = check()
+    except IOError as err:
+        print("Error: could not read series file: %s" % (err,), file=sys.stderr)
         return False
-    else:
+
+    if retval:
         return True
+    
+    subprocess.call(["quilt", "top"], preexec_fn=restore_signals)
+    if check():
+        return True
+    else:
+        print("Error: series file does not look like series.conf. "
+              "Make sure you are using the modified `quilt`; see "
+              "scripts/git_sort/README.md.", file=sys.stderr)
+        return False
 
 
 def firstword(value):
