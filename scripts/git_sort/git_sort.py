@@ -49,6 +49,10 @@ class RepoURL(object):
         return self.url == other.url
 
 
+    def __cmp__(self, other):
+        return cmp(self.url, other.url)
+
+
     def __hash__(self):
         return hash(self.url)
 
