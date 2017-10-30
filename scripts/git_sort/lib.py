@@ -158,19 +158,16 @@ def filter_sorted(series):
 
     return result
 
-import os
 
 def repo_path():
-    if "GIT_DIR" in os.environ:
-        search_path = os.environ["GIT_DIR"]
-    elif "LINUX_GIT" in os.environ:
-        search_path = os.environ["LINUX_GIT"]
-    else:
-        search_path = os.environ["HOME"] + "/linux-2.6"
-        if not os.path.isdir(search_path + "/.git"):
-                print("Error: No repository in %(search_path)s. Consider setting \"LINUX_GIT\" environment variable."
-                    % locals(), file=sys.stderr)
-                sys.exit(1)
+    try:
+        search_path = subprocess.check_output(
+            os.path.join(libdir(), "..", "linux_git.sh"),
+            preexec_fn=restore_signals).strip()
+    except subprocess.CalledProcessError:
+        print("Error: Could not determine mainline linux git repository path.",
+              file=sys.stderr)
+        sys.exit(1)
     return pygit2.discover_repository(search_path)
 
 

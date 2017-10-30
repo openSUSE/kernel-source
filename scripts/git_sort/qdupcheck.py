@@ -24,16 +24,7 @@ if __name__ == "__main__":
     if not lib.check_series():
         sys.exit(1)
 
-    if "GIT_DIR" in os.environ:
-        search_path = os.environ["GIT_DIR"]
-    elif "LINUX_GIT" in os.environ:
-        search_path = os.environ["LINUX_GIT"]
-    else:
-        print("Error: \"LINUX_GIT\" environment variable not set.",
-              file=sys.stderr)
-        sys.exit(1)
-    repo_path = pygit2.discover_repository(search_path)
-    repo = pygit2.Repository(repo_path)
+    repo = pygit2.Repository(lib.repo_path())
     commit = str(repo.revparse_single(args.rev).id)
 
     f = lib.find_commit_in_series(commit, open("series"))

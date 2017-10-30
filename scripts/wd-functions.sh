@@ -71,12 +71,9 @@ _find_tarball()
 _get_tarball_from_git()
 {
     local version=$1 tag url=$2 default_url
+    local libdir=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 
-    git=${LINUX_GIT:-$HOME/linux-2.6}
-    if test ! -d "$git/.git"; then
-        echo "No linux-2.6 git tree found (try setting the LINUX_GIT variable)" >&2
-        exit 1
-    fi
+    git=$("$libdir"/linux_git.sh) || exit 1
     case "$version" in
     *next-*)
         tag=refs/tags/next-${version##*next-}
