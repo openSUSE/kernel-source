@@ -5,6 +5,7 @@ from __future__ import print_function
 
 import collections
 import os
+import os.path
 import pygit2
 import signal
 import subprocess
@@ -57,6 +58,10 @@ def check_series():
 
 def firstword(value):
     return value.split(None, 1)[0]
+
+
+def libdir():
+    return os.path.dirname(os.path.realpath(__file__))
 
 
 class KSNotFound(KSException):
