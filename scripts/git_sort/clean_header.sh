@@ -6,8 +6,9 @@
 
 progname=$(basename "$0")
 libdir=$(dirname "$(readlink -f "$0")")
+git_dir=$("$libdir"/../linux_git.sh) || exit 1
 
-export GIT_DIR=$LINUX_GIT/.git
+export GIT_DIR="$git_dir"/.git
 : ${EDITOR:=${VISUAL:=vi}}
 
 . "$libdir"/lib_from.sh
@@ -84,11 +85,6 @@ fi
 if [ -n "$1" ]; then
 	echo "Error: too many arguments" > /dev/stderr
 	usage > /dev/stderr
-	exit 1
-fi
-
-if [ ! -d "$LINUX_GIT" ] || ! git log -n1 > /dev/null; then
-	echo "Warning: kernel git tree not found at \"$LINUX_GIT\" (check the LINUX_GIT environment variable)" > /dev/stderr
 	exit 1
 fi
 
@@ -332,7 +328,7 @@ email=$(git config --get user.email)
 if [ -z "$name" -o -z "$email" ]; then
 	name_str=${name:-(empty name)}
 	email_str=${email:-(empty email)}
-	echo "Warning: user signature incomplete ($name_str <$email_str>), you will have to edit the patch header manually. Check the LINUX_GIT environment variable and the git configuration." > /dev/stderr
+	echo "Warning: user signature incomplete ($name_str <$email_str>), you will have to edit the patch header manually. Check the git config of the repository in $git_dir." > /dev/stderr
 	name=${name:-Name}
 	email=${email:-user@example.com}
 	edit=1

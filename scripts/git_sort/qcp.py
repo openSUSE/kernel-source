@@ -29,8 +29,7 @@ def format_import(references, tmpdir, dstdir, rev, poi=[]):
         name = "%s-%s.patch" % (name[:-6], rev[:8],)
         dst = os.path.join(dstdir, name)
 
-    libdir = os.path.dirname(sys.argv[0])
-    subprocess.check_call((os.path.join(libdir, "clean_header.sh"),
+    subprocess.check_call((os.path.join(lib.libdir(), "clean_header.sh"),
                            "--commit=%s" % rev, "--reference=%s" % references,
                            src,), preexec_fn=lib.restore_signals)
     subprocess.check_call(("quilt", "import", "-P", dst, src,),
