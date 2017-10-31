@@ -5,8 +5,10 @@ from __future__ import print_function
 
 import collections
 import os
+import os.path
 import pygit2
 import signal
+import subprocess
 import sys
 
 import lib_tag
@@ -31,16 +33,35 @@ def restore_signals(): # from http://hg.python.org/cpython/rev/768722b2ae0a/
 
 
 def check_series():
-    if open("series").readline().strip() != "# Kernel patches configuration file":
-        print("Error: series file does not look like series.conf",
-              file=sys.stderr)
+    def check():
+        return (open("series").readline().strip() ==
+                "# Kernel patches configuration file")
+
+    try:
+        retval = check()
+    except IOError as err:
+        print("Error: could not read series file: %s" % (err,), file=sys.stderr)
         return False
-    else:
+
+    if retval:
         return True
+    
+    subprocess.call(["quilt", "top"], preexec_fn=restore_signals)
+    if check():
+        return True
+    else:
+        print("Error: series file does not look like series.conf. "
+              "Make sure you are using the modified `quilt`; see "
+              "scripts/git_sort/README.md.", file=sys.stderr)
+        return False
 
 
 def firstword(value):
     return value.split(None, 1)[0]
+
+
+def libdir():
+    return os.path.dirname(os.path.realpath(__file__))
 
 
 class KSNotFound(KSException):
@@ -139,12 +160,12 @@ def filter_sorted(series):
 
 
 def repo_path():
-    if "GIT_DIR" in os.environ:
-        search_path = os.environ["GIT_DIR"]
-    elif "LINUX_GIT" in os.environ:
-        search_path = os.environ["LINUX_GIT"]
-    else:
-        print("Error: \"LINUX_GIT\" environment variable not set.",
+    try:
+        search_path = subprocess.check_output(
+            os.path.join(libdir(), "..", "linux_git.sh"),
+            preexec_fn=restore_signals).strip()
+    except subprocess.CalledProcessError:
+        print("Error: Could not determine mainline linux git repository path.",
               file=sys.stderr)
         sys.exit(1)
     return pygit2.discover_repository(search_path)

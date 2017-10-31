@@ -176,7 +176,7 @@ class SortIndex(object):
             # Sort according to commits reachable from the current head
             result = collections.OrderedDict(
                 [(Head(RepoURL(str(None)), "HEAD"),
-                  str(repo.revparse_single("HEAD").id),)])
+                  str(self.repo.revparse_single("HEAD").id),)])
 
         return result
 
