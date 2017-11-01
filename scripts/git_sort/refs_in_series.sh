@@ -5,6 +5,8 @@
 
 
 progname=$(basename "$0")
+libdir=$(dirname "$(readlink -f "$0")")
+git_dir=$("$libdir"/../linux_git.sh) || exit 1
 
 usage () {
 	echo "Usage: $progname [paths of interest...]"
@@ -47,11 +49,6 @@ if [ ! -r "series.conf" ]; then
 	exit 1
 fi
 
-if [ ! -d "$LINUX_GIT" ] || ! GIT_DIR=$LINUX_GIT/.git git log -n1 > /dev/null; then
-	echo "Error: kernel git tree not found at \"$LINUX_GIT\" (check the LINUX_GIT environment variable)" > /dev/stderr
-	exit 1
-fi
-
 for arg in "$@"; do
 	includeargs+="--include=\"$arg\" "
 done
@@ -67,7 +64,7 @@ series=$(
 while read line; do
 	set $line
 	ref=$1
-	orig_stat_nb=$(GIT_DIR=$LINUX_GIT/.git git format-patch --stdout -n1 $ref | eval git apply --numstat "$includeargs" | wc -l)
+	orig_stat_nb=$(GIT_DIR="$git_dir"/.git git format-patch --stdout -n1 $ref | eval git apply --numstat "$includeargs" | wc -l)
 	found=
 	while read patch; do
 		if [ ! "$patch" ]; then

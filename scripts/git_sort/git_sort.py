@@ -4,7 +4,9 @@
 from __future__ import print_function
 
 import argparse
+import bisect
 import collections
+import operator
 import os
 import os.path
 import pprint
@@ -23,13 +25,26 @@ class GSError(GSException):
     pass
 
 
+class GSKeyError(GSException):
+    pass
+
+
+class GSNotFound(GSException):
+    pass
+
+
 class RepoURL(object):
     k_org_canon_prefix = "git://git.kernel.org/pub/scm/linux/kernel/git/"
     proto_match = re.compile("(git|https?)://")
     ext = ".git"
 
     def __init__(self, url):
+        if url is None or url == repr(None):
+            self.url = None
+            return
+
         k_org_prefixes = [
+            "http://git.kernel.org/pub/scm/linux/kernel/git/",
             "https://git.kernel.org/pub/scm/linux/kernel/git/",
             "https://kernel.googlesource.com/pub/scm/linux/kernel/git/",
         ]
@@ -38,14 +53,21 @@ class RepoURL(object):
                 url = url.replace(prefix, self.k_org_canon_prefix)
                 break
 
-        if url.endswith(self.ext) and not self.proto_match.match(url):
+        if not self.proto_match.match(url):
             url = self.k_org_canon_prefix + url
+
+        if not url.endswith(self.ext):
+            url = url + self.ext
 
         self.url = url
 
 
     def __eq__(self, other):
         return self.url == other.url
+
+
+    def __cmp__(self, other):
+        return cmp(self.url, other.url)
 
 
     def __hash__(self):
@@ -58,10 +80,10 @@ class RepoURL(object):
 
     def __str__(self):
         url = self.url
-        if url.startswith(self.k_org_canon_prefix) and url.endswith(self.ext):
-            url = url[len(self.k_org_canon_prefix):-1 * len(self.ext)]
-        elif url == str(None):
+        if url is None:
             url = ""
+        elif url.startswith(self.k_org_canon_prefix) and url.endswith(self.ext):
+            url = url[len(self.k_org_canon_prefix):-1 * len(self.ext)]
 
         return url
 
@@ -78,6 +100,24 @@ class Head(object):
 
     def __hash__(self):
         return hash((self.repo_url, self.rev,))
+
+    
+    def __cmp__(self, other):
+        """
+        Head a is upstream of Head b -> a < b
+        """
+        def get_index(head):
+            """
+            A head with no url is considered out of tree. Any other head with a
+            url is upstream of it.
+            """
+            if head.repo_url == RepoURL(None):
+                return len(remotes)
+            else:
+                return remote_index[head]
+        a = get_index(self)
+        b = get_index(other)
+        return cmp(a, b)
 
 
     def __repr__(self):
@@ -111,24 +151,22 @@ remotes = (
     Head(RepoURL("dledford/rdma.git"), "k.o/for-next"),
     Head(RepoURL("jejb/scsi.git"), "for-next"),
     Head(RepoURL("bp/bp.git"), "for-next"),
-    Head(RepoURL("jj/linux-apparmor.git"), "v4.8-aa2.8-out-of-tree",),
     Head(RepoURL("tiwai/sound.git")),
     Head(RepoURL("powerpc/linux.git"), "next"),
     Head(RepoURL("tip/tip.git")),
-    Head(RepoURL("shli/md.git")),
-    Head(RepoURL("mkp/scsi.git")),
+    Head(RepoURL("shli/md.git"), "for-next"),
+    Head(RepoURL("dhowells/linux-fs.git"), "keys-uefi"),
     Head(RepoURL("next/linux-next.git")),
 )
 
 
-class SortedEntry(object):
-    def __init__(self, head, value):
-        self.head = head
-        self.value = value
+remote_index = dict(zip(remotes, range(len(remotes))))
+oot = Head(RepoURL(None), "out-of-tree patches")
 
 
 class SortIndex(object):
-    cache_version = 2
+    cache_version = 3
+    version_match = re.compile("refs/tags/v(2\.6\.\d+|\d\.\d+)(-rc\d+)?$")
 
 
     def __init__(self, repo, skip_rebuild=False):
@@ -139,6 +177,7 @@ class SortIndex(object):
         except GSError as err:
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
+        self.version_indexes = None
 
 
     def get_heads(self):
@@ -150,7 +189,8 @@ class SortIndex(object):
         result = collections.OrderedDict()
         repo_remotes = []
         args = ("git", "config", "--get-regexp", "^remote\..+\.url$",)
-        for line in subprocess.check_output(args).splitlines():
+        for line in subprocess.check_output(args,
+                                            cwd=self.repo.path).splitlines():
             name, url = line.split(None, 1)
             name = name.split(".")[1]
             url = RepoURL(url)
@@ -159,7 +199,7 @@ class SortIndex(object):
         for head in remotes:
             for remote_name, remote_url in repo_remotes:
                 if head.repo_url == remote_url:
-                    rev = "%s/%s" % (remote_name, head.rev,)
+                    rev = "remotes/%s/%s" % (remote_name, head.rev,)
                     try:
                         commit = self.repo.revparse_single(rev)
                     except KeyError:
@@ -174,8 +214,8 @@ class SortIndex(object):
             # According to the urls in remotes, this is not a clone of linux.git
             # Sort according to commits reachable from the current head
             result = collections.OrderedDict(
-                [(Head(RepoURL(str(None)), "HEAD"),
-                  str(repo.revparse_single("HEAD").id),)])
+                [(Head(RepoURL(None), "HEAD"),
+                  str(self.repo.revparse_single("HEAD").id),)])
 
         return result
 
@@ -183,21 +223,28 @@ class SortIndex(object):
     def rebuild_history(self):
         """
         Returns
-        history[Head][]
-            git hash represented as string of 40 characters
+        history[Head][commit hash represented as string of 40 characters]
+                index, an ordinal number such that
+                commit a is an ancestor of commit b -> index(a) < index(b)
         """
         processed = []
         history = collections.OrderedDict()
-        args = ["git", "log", "--topo-order", "--reverse", "--pretty=tformat:%H"]
+        args = ["git", "log", "--topo-order", "--pretty=tformat:%H"]
         for head, rev in self.repo_heads.items():
             if head in history:
                 raise GSException("head \"%s\" is not unique." % (head,))
 
             sp = subprocess.Popen(args + processed + [rev],
+                                  cwd=self.repo.path,
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT)
 
-            history[head] = [l.strip() for l in sp.stdout.readlines()]
+            result = {}
+            for l in sp.stdout:
+                result[l.strip()] = len(result)
+            # reverse indexes
+            history[head] = {commit : len(result) - val for commit, val in
+                             result.items()}
 
             sp.communicate()
             if sp.returncode != 0:
@@ -213,8 +260,10 @@ class SortIndex(object):
         """
         cache
             history[]
-                (url, rev, sha1, []
-                    git hash represented as string of 40 characters,)
+                (url, rev, sha1,
+                 history[commit hash represented as string of 40 characters]
+                    index (as described in get_history())
+                 ,)
 
         The cache is stored using basic types.
         """
@@ -263,21 +312,70 @@ class SortIndex(object):
                 if "heads" in cache:
                     del cache["heads"]
         else:
-            history = {key[0] : log for key, log in c_history.items()}
+            history = collections.OrderedDict(
+                [(key[0], log,) for key, log in c_history.items()])
         cache.close()
 
         return history
 
 
-    def sort(self, mapping):
-        for head in self.repo_heads:
-            for commit in self.history[head]:
-                try:
-                    yield SortedEntry(head, mapping.pop(commit),)
-                except KeyError:
-                    pass
+    def lookup(self, commit):
+        for head, log in self.history.items():
+            try:
+                index = log[commit]
+            except KeyError:
+                continue
+            else:
+                return (head, index,)
 
-        return
+        raise GSKeyError
+
+
+    def sort(self, mapping):
+        """
+        Returns an OrderedDict
+        result[Head][]
+            sorted values from the mapping which are found in Head
+        """
+        result = collections.OrderedDict([(head, [],) for head in self.history])
+        for commit in mapping.keys():
+            try:
+                head, index = self.lookup(commit)
+            except GSKeyError:
+                continue
+            else:
+                result[head].append((index, mapping.pop(commit),))
+
+        for head, entries in result.items():
+            entries.sort(key=operator.itemgetter(0))
+            result[head] = [e[1] for e in entries]
+
+        return result
+
+
+    def describe(self, index):
+        """
+        index must come from the mainline head (remotes[0]).
+        """
+        if self.version_indexes is None:
+            history = self.history[remotes[0]]
+            # remove "refs/tags/"
+            objects = [(self.repo.revparse_single(tag).get_object(), tag[10:],)
+                       for tag in self.repo.listall_references()
+                       if self.version_match.match(tag)]
+            revs = [(history[str(obj.id)], tag,)
+                    for obj, tag in objects
+                    if obj.type == pygit2.GIT_OBJ_COMMIT]
+            revs.sort(key=operator.itemgetter(0))
+            self.version_indexes = zip(*revs)
+
+        indexes, tags = self.version_indexes
+        i = bisect.bisect_left(indexes, index)
+        if i == len(tags):
+            # not yet part of a tagged release
+            return "%s+" % (tags[-1],)
+        else:
+            return tags[i]
 
 
 if __name__ == "__main__":
@@ -339,8 +437,11 @@ if __name__ == "__main__":
         else:
             lines[h] = [line]
 
-    print("".join([line for entry in index.sort(lines) for line in
-                   entry.value]), end="")
+    print("".join([line
+                   for entries in index.sort(lines).values()
+                       for entry in entries
+                           for line in entry
+                  ]), end="")
 
     if len(lines) != 0:
         print("Error: the following entries were not found in the indexed heads:",

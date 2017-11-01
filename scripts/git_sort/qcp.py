@@ -8,13 +8,12 @@ import os
 import os.path
 import pygit2
 import shutil
-import StringIO
 import subprocess
 import sys
 import tempfile
 
 import lib
-import lib_tag
+import tag
 
 
 def format_import(references, tmpdir, dstdir, rev, poi=[]):
@@ -29,8 +28,7 @@ def format_import(references, tmpdir, dstdir, rev, poi=[]):
         name = "%s-%s.patch" % (name[:-6], rev[:8],)
         dst = os.path.join(dstdir, name)
 
-    libdir = os.path.dirname(sys.argv[0])
-    subprocess.check_call((os.path.join(libdir, "clean_header.sh"),
+    subprocess.check_call((os.path.join(lib.libdir(), "clean_header.sh"),
                            "--commit=%s" % rev, "--reference=%s" % references,
                            src,), preexec_fn=lib.restore_signals)
     subprocess.check_call(("quilt", "import", "-P", dst, src,),
@@ -86,19 +84,28 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if args.followup:
-        try:
-            fixes = lib.firstword(lib_tag.tag_get(
-                StringIO.StringIO(commit.message), "Fixes")[0])
-        except IndexError:
-            print("Error: no \"Fixes\" tag found in commit \"%s\"." %
-                  (str(commit.id)[:12]), file=sys.stderr)
-            sys.exit(1)
+        with tag.Patch(content=commit.message) as patch:
+            try:
+                fixes = lib.firstword(patch.get("Fixes")[0])
+            except IndexError:
+                print("Error: no \"Fixes\" tag found in commit \"%s\"." %
+                      (str(commit.id)[:12]), file=sys.stderr)
+                sys.exit(1)
         fixes = str(repo.revparse_single(fixes).id)
-        f = lib.find_commit_in_series(fixes, open("series"))
-        # remove "patches/" prefix
-        patch = f.name[8:]
-        destination = os.path.dirname(patch)
-        references = " ".join(lib_tag.tag_get(f, "References"))
+
+        series = open("series")
+        cwd = os.getcwd()
+        os.chdir("patches")
+        try:
+            with lib.find_commit_in_series(fixes, series) as patch:
+                destination = os.path.dirname(patch.name)
+                references = " ".join(patch.get(f, "References"))
+        except lib.KSNotFound:
+            print("Error: no patch found which contains commit %s." %
+                  (fixes[:12],), file=sys.stderr)
+            sys.exit(1)
+        os.chdir(cwd)
+
         print("Info: using references \"%s\" from patch \"%s\" which contains "
               "commit %s." % (references, patch, fixes[:12]), file=sys.stderr)
     else:
