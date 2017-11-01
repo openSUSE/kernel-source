@@ -24,6 +24,18 @@ import pygit2
 import sys
 
 import lib
+import tag
+import git_sort
+
+
+def update_tags(index, entries):
+    for entry in entries:
+        with tag.Patch(entry.name) as patch:
+            if entry.dest_head == git_sort.remotes[0]:
+                patch.change("Patch-mainline", index.describe(entry.cindex))
+                patch.remove("Git-repo")
+            else:
+                patch.change("Git-repo", repr(entry.new_url))
 
 
 if __name__ == "__main__":
@@ -42,10 +54,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     repo_path = lib.repo_path()
-    if "GIT_DIR" not in os.environ:
-        # this is for the `git log` call in git_sort.py
-        os.environ["GIT_DIR"] = repo_path
     repo = pygit2.Repository(repo_path)
+    index = lib.git_sort.SortIndex(repo)
 
     if args.series is not None:
         args.series = os.path.abspath(args.series)
@@ -64,19 +74,15 @@ if __name__ == "__main__":
         inside = lines
         after = []
 
-    input_entries = []
-    for patch in [lib.firstword(line) for line in inside if
-                  lib.filter_patches(line)]:
-        entry = lib.InputEntry("\t%s\n" % (patch,))
-        try:
-            entry.from_patch(repo, patch)
-        except lib.KSError as err:
-            print("Error: %s" % (err,), file=sys.stderr)
-            sys.exit(1)
-        input_entries.append(entry)
     try:
-        sorted_entries = lib.series_sort(repo, input_entries)
-    except lib.KSException as err:
+        input_entries = lib.parse_inside(index, inside)
+    except lib.KSError as err:
+        print("Error: %s" % (err,), file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        sorted_entries = lib.series_sort(index, input_entries)
+    except lib.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
 
@@ -86,11 +92,18 @@ if __name__ == "__main__":
         lib.series_footer(inside),
     ])
 
+    to_update = [entry for entry in input_entries
+                 if (entry.dest_head != git_sort.oot
+                     and entry.new_url is not None)]
     if args.check:
+        result = 0
         if inside != new_inside:
-            sys.exit(2)
-        else:
-            sys.exit(0)
+            print("Input is not sorted.")
+            result = 2
+        if len(to_update):
+            print("Git-repo tags are outdated.")
+            result = 2
+        sys.exit(result)
     else:
         output = lib.flatten([
             before,
@@ -103,3 +116,4 @@ if __name__ == "__main__":
         else:
             f = sys.stdout
         f.writelines(output)
+        update_tags(index, to_update)
