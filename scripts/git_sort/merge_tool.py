@@ -2,9 +2,6 @@
 # -*- coding: utf-8 -*-
 
 """
-Depends on orderedset, may be installed via pip/pip2
-    pip install orderedset
-
 Depends on `merge` from rcs
 
 Add a section like this to git config:
@@ -20,7 +17,6 @@ git mergetool --tool=git-sort series.conf
 
 from __future__ import print_function
 
-from orderedset import OrderedSet
 import os.path
 import pygit2
 import shutil
@@ -44,14 +40,13 @@ if __name__ == "__main__":
     local_path, base_path, remote_path, merged_path = sys.argv[1:5]
 
     repo_path = lib.repo_path()
-    if "GIT_DIR" not in os.environ:
-        # this is for the `git log` call in git_sort.py
-        os.environ["GIT_DIR"] = repo_path
     repo = pygit2.Repository(repo_path)
+    index = lib.git_sort.SortIndex(repo)
 
+    # (before, inside, after, set(inside),)
     local, base, remote = (
-        (s[0], s[1], s[2], OrderedSet([lib.firstword(l) for l in s[1] if
-                                       lib.filter_patches(l)]),)
+        (s[0], s[1], s[2], set([lib.firstword(l) for l in s[1] if
+                                lib.filter_patches(l)]),)
         for s in [
             lib.split_series(open(s_path)) for s_path in (
                 local_path, base_path, remote_path,)
@@ -75,14 +70,20 @@ if __name__ == "__main__":
         print("Warning: %d commits removed in remote but not present in local, "
               "ignoring." % (dup_rem_nb,))
 
-    input_entries = []
-    for patch in local[3] - removed | added:
-        entry = lib.InputEntry("\t%s\n" % (patch,))
-        entry.from_patch(repo, patch)
-        input_entries.append(entry)
+    inside = [line for line in local[1] if not line.strip() in removed]
     try:
-        sorted_entries = lib.series_sort(repo, input_entries)
-    except lib.KSException as err:
+        input_entries = lib.parse_inside(index, inside)
+    except lib.KSError as err:
+        print("Error: %s" % (err,), file=sys.stderr)
+        sys.exit(1)
+    for name in added - local[3]:
+        entry = lib.InputEntry("\t%s\n" % (name,))
+        entry.from_patch(index, name, lib.git_sort.oot)
+        input_entries.append(entry)
+
+    try:
+        sorted_entries = lib.series_sort(index, input_entries)
+    except lib.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
     output = lib.series_format(sorted_entries)
