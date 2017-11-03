@@ -60,9 +60,16 @@ if __name__ == "__main__":
     try:
         before, inside, after = lib.split_series(lines)
     except lib.KSNotFound:
-        before = []
-        inside = lines
-        after = []
+        if args.series is None:
+            before = []
+            inside = lines
+            after = []
+        elif args.check:
+            # no sorted section
+            sys.exit(0)
+        else:
+            print("Error: %s" % (err,), file=sys.stderr)
+            sys.exit(1)
 
     try:
         input_entries = lib.parse_inside(index, inside)
