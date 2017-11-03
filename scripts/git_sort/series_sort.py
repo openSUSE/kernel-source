@@ -23,19 +23,9 @@ import os
 import pygit2
 import sys
 
+import git_sort
 import lib
 import tag
-import git_sort
-
-
-def update_tags(index, entries):
-    for entry in entries:
-        with tag.Patch(entry.name) as patch:
-            if entry.dest_head == git_sort.remotes[0]:
-                patch.change("Patch-mainline", index.describe(entry.cindex))
-                patch.remove("Git-repo")
-            else:
-                patch.change("Git-repo", repr(entry.new_url))
 
 
 if __name__ == "__main__":
@@ -92,9 +82,7 @@ if __name__ == "__main__":
         lib.series_footer(inside),
     ])
 
-    to_update = [entry for entry in input_entries
-                 if (entry.dest_head != git_sort.oot
-                     and entry.new_url is not None)]
+    to_update = filter(lib.tag_needs_update, input_entries)
     if args.check:
         result = 0
         if inside != new_inside:
@@ -116,4 +104,4 @@ if __name__ == "__main__":
         else:
             f = sys.stdout
         f.writelines(output)
-        update_tags(index, to_update)
+        lib.update_tags(index, to_update)

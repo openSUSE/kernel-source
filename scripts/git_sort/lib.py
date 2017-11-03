@@ -26,7 +26,7 @@ class KSError(KSException):
     pass
 
 
-class KSNotFound(KSException):
+class KSNotFound(KSError):
     pass
 
 
@@ -265,10 +265,12 @@ class InputEntry(object):
             self.dest_head = git_sort.oot
             return
 
-        rev = firstword(commit_tags[0])
-        if not self.commit_match.match(rev):
-            raise KSError("Git-commit tag \"%s\" in patch \"%s\" is not a "
-                          "valid revision." % (rev, name,))
+        self.revs = [firstword(ct) for ct in commit_tags]
+        for rev in self.revs:
+            if not self.commit_match.match(rev):
+                raise KSError("Git-commit tag \"%s\" in patch \"%s\" is not a "
+                              "valid revision." % (rev, name,))
+        rev = self.revs[0]
 
         if len(repo_tags) > 1:
             raise KSError("Multiple Git-repo tags found. Patch \"%s\" is "
@@ -415,6 +417,23 @@ def series_format(entries):
         result.extend(lines)
 
     return result
+
+
+def tag_needs_update(entry):
+    if entry.dest_head != git_sort.oot and entry.new_url is not None:
+        return True
+    else:
+        return False
+
+
+def update_tags(index, entries):
+    for entry in entries:
+        with tag.Patch(entry.name) as patch:
+            if entry.dest_head == git_sort.remotes[0]:
+                patch.change("Patch-mainline", index.describe(entry.cindex))
+                patch.remove("Git-repo")
+            else:
+                patch.change("Git-repo", repr(entry.new_url))
 
 
 def sequence_insert(series, rev, top):
