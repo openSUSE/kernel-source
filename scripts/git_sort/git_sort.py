@@ -192,7 +192,8 @@ class SortIndex(object):
         repo_remotes = []
         args = ("git", "config", "--get-regexp", "^remote\..+\.url$",)
         for line in subprocess.check_output(args,
-                                            cwd=self.repo.path).splitlines():
+                                            cwd=self.repo.path,
+                                            env={}).splitlines():
             name, url = line.split(None, 1)
             name = name.split(".")[1]
             url = RepoURL(url)
@@ -238,6 +239,7 @@ class SortIndex(object):
 
             sp = subprocess.Popen(args + processed + [rev],
                                   cwd=self.repo.path,
+                                  env={},
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT)
 
