@@ -19,9 +19,48 @@ origin # git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
 stable # git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git
 ```
 
-The functions in quilt-mode.sh can assist in backporting a series of commits.
-They are meant to be used with a modified `quilt` that can use
-kernel-source.git's series.conf directly instead of a shadow copy.
+Inserting a new patch in the "sorted patches" section of series.conf
+====================================================================
+For a patch file, `<patch>` which is a backport of an upstream commit:
+1) add the file into one of the `patches.*` directories
+2) make sure that it contains the correct "Git-commit" tag
+3) make sure that this commit can be found in your local LINUX_GIT clone
+
+Then run:
+```
+kernel-source$ ./scripts/git_sort/series_insert.py <patch>
+```
+
+This script can also be called with multiple patches at once.
+
+Patches which are out-of-tree (not backports of upstream commits) can be added
+directly at a location of your choosing in the "# out-of-tree" section of the
+"sorted patches" section. In doubt, simply add them at the end of that section.
+
+After the patch has been inserted in series.conf, make sure to check that the
+series applies and to fix any potential conflicts. Then commit and push your
+result.
+
+Refreshing the order of patches in series.conf
+==============================================
+As upstream maintainers pull from each other, the order of patches in
+series.conf needs to be refreshed. In that case, run:
+```
+kernel-source$ ./scripts/series_sort.py series.conf
+```
+
+In case of unexpected trouble, you can also move patch entries to the
+"# out-of-tree" section and run the above script to reset a patch's position.
+
+Backporting commits using kernel-source.git and the quilt-mode.sh functions
+===========================================================================
+The sections "Example workflow to backport a single commit" and "Example
+workflow to backport a series of commits using kernel-source.git" demonstrate
+how to use the functions in quilt-mode.sh, which can assist in backporting a
+single commit or a series of commits directly to kernel-source.git.
+
+The functions in quilt-mode.sh are meant to be used with a modified `quilt`
+that can use kernel-source.git's series.conf directly instead of a shadow copy.
 
 Install it from  
 https://gitlab.suse.de/benjamin_poirier/quilt
@@ -185,19 +224,6 @@ fixing conflicts:
 ```
 quilt annotate <file>
 git gui blame --line=<line> <commit> <file>
-```
-
-Using your own workflow and then inserting a new patch at the right position in series.conf
-===========================================================================================
-It is not mandatory to use the quilt-mode helpers to add patches to the sorted
-section of series.conf. You can also import a patch into kernel-source.git
-using whatever means you prefer, add a new line for this patch anywhere in the
-"sorted patches" section of series.conf and perform a sort of the entire
-section (from the start of "sorted patches" to the end of "out-of-tree
-patches") which will reposition the new entry. This last step is done using
-the "series_sort.py" script:
-```
-kernel-source$ ./scripts/series_sort.py series.conf
 ```
 
 Example of a merge conflict resolution involving sorted patches in series.conf
