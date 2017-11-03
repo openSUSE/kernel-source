@@ -331,7 +331,8 @@ class InputEntry(object):
                         (head, rev, name,))
                 elif head < current_head: # patch moved upstream
                     self.dest_head = head
-                    self.new_url = head.repo_url
+                    if repo != head.repo_url: # bad tag
+                        self.new_url = head.repo_url
             else: # repo is indexed
                 if head > current_head: # patch moved downstream
                     if repo == current_head.repo_url: # good tag
