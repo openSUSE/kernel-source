@@ -354,11 +354,11 @@ class InputEntry(object):
                                 name, current_head.repo_url,))
                 elif head == current_head: # patch didn't move
                     self.dest_head = head
-                    if repo != current_head.repo_url: # bad tag
+                    if repo != head.repo_url: # bad tag
                         self.new_url = head.repo_url
                 elif head < current_head: # patch moved upstream
                     self.dest_head = head
-                    if repo != current_head.repo_url: # bad tag
+                    if repo != head.repo_url: # bad tag
                         self.new_url = head.repo_url
 
 
