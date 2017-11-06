@@ -156,9 +156,12 @@ remotes = (
     Head(RepoURL("tip/tip.git")),
     Head(RepoURL("shli/md.git"), "for-next"),
     Head(RepoURL("dhowells/linux-fs.git"), "keys-uefi"),
-    Head(RepoURL("next/linux-next.git")),
     Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.15"),
     Head(RepoURL("tytso/ext4.git"), "dev"),
+    # linux-next is not a good reference because it gets rebased. However, it is
+    # needed because the patches from akpm don't have their own git tree.
+    # Therefore, include linux-next in this list but keep it at the end.
+    Head(RepoURL("next/linux-next.git"), "akpm"),
 )
 
 
