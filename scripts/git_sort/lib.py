@@ -283,7 +283,7 @@ class InputEntry(object):
 
         # this is where we decide a patch line's fate in the sorted series.conf
         try:
-            head, self.cindex = index.lookup(rev)
+            head, cindex = index.lookup(rev)
         except git_sort.GSKeyError: # commit not found
             if current_head not in index.repo_heads: # repo not indexed
                 if repo == current_head.repo_url: # good tag
@@ -333,6 +333,7 @@ class InputEntry(object):
                         (head, rev, name,))
                 elif head < current_head: # patch moved upstream
                     self.dest_head = head
+                    self.cindex = cindex
                     if repo != head.repo_url: # bad tag
                         self.new_url = head.repo_url
             else: # repo is indexed
@@ -356,10 +357,12 @@ class InputEntry(object):
                                 name, current_head.repo_url,))
                 elif head == current_head: # patch didn't move
                     self.dest_head = head
+                    self.cindex = cindex
                     if repo != head.repo_url: # bad tag
                         self.new_url = head.repo_url
                 elif head < current_head: # patch moved upstream
                     self.dest_head = head
+                    self.cindex = cindex
                     if repo != head.repo_url: # bad tag
                         self.new_url = head.repo_url
 
