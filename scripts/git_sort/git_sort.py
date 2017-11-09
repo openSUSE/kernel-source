@@ -155,6 +155,7 @@ remotes = (
     Head(RepoURL("jejb/scsi.git"), "for-next"),
     Head(RepoURL("bp/bp.git"), "for-next"),
     Head(RepoURL("tiwai/sound.git")),
+    Head(RepoURL("git://linuxtv.org/media_tree.git")),
     Head(RepoURL("powerpc/linux.git"), "next"),
     Head(RepoURL("tip/tip.git")),
     Head(RepoURL("shli/md.git"), "for-next"),
@@ -163,8 +164,10 @@ remotes = (
     Head(RepoURL("tytso/ext4.git"), "dev"),
     Head(RepoURL("s390/linux.git"), "for-linus"),
     Head(RepoURL("tj/libata.git"), "for-next"),
+    Head(RepoURL("https://github.com/kdave/btrfs-devel.git"), "misc-next"),
     Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
     Head(RepoURL("gregkh/tty.git"), "tty-next"),
+    Head(RepoURL("jj/linux-apparmor.git"), "v4.8-aa2.8-out-of-tree"),
 )
 
 
