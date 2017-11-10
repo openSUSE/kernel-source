@@ -141,6 +141,9 @@ class Head(object):
 # up from repositories at the end of the list to repositories higher up. For
 # example, network commits usually follow "net-next" -> "net" -> "linux.git".
 #
+# linux-next is not a good reference because it gets rebased. If a commit is in
+# linux-next, it comes from some other tree. Please tag the patch accordingly.
+#
 # Head(RepoURL(remote url), remote branch name)[]
 # Note that "remote url" can be abbreviated if it starts with one of the usual
 # kernel.org prefixes and "remote branch name" can be omitted if it is "master".
@@ -152,6 +155,7 @@ remotes = (
     Head(RepoURL("jejb/scsi.git"), "for-next"),
     Head(RepoURL("bp/bp.git"), "for-next"),
     Head(RepoURL("tiwai/sound.git")),
+    Head(RepoURL("git://linuxtv.org/media_tree.git")),
     Head(RepoURL("powerpc/linux.git"), "next"),
     Head(RepoURL("tip/tip.git")),
     Head(RepoURL("shli/md.git"), "for-next"),
@@ -160,12 +164,10 @@ remotes = (
     Head(RepoURL("tytso/ext4.git"), "dev"),
     Head(RepoURL("s390/linux.git"), "for-linus"),
     Head(RepoURL("tj/libata.git"), "for-next"),
+    Head(RepoURL("https://github.com/kdave/btrfs-devel.git"), "misc-next"),
     Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
     Head(RepoURL("gregkh/tty.git"), "tty-next"),
-    # linux-next is not a good reference because it gets rebased. However, it is
-    # needed because the patches from akpm don't have their own git tree.
-    # Therefore, include linux-next in this list but keep it at the end.
-    Head(RepoURL("next/linux-next.git"), "akpm"),
+    Head(RepoURL("jj/linux-apparmor.git"), "v4.8-aa2.8-out-of-tree"),
 )
 
 
