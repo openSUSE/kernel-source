@@ -141,6 +141,9 @@ class Head(object):
 # up from repositories at the end of the list to repositories higher up. For
 # example, network commits usually follow "net-next" -> "net" -> "linux.git".
 #
+# linux-next is not a good reference because it gets rebased. If a commit is in
+# linux-next, it comes from some other tree. Please tag the patch accordingly.
+#
 # Head(RepoURL(remote url), remote branch name)[]
 # Note that "remote url" can be abbreviated if it starts with one of the usual
 # kernel.org prefixes and "remote branch name" can be omitted if it is "master".
@@ -152,11 +155,19 @@ remotes = (
     Head(RepoURL("jejb/scsi.git"), "for-next"),
     Head(RepoURL("bp/bp.git"), "for-next"),
     Head(RepoURL("tiwai/sound.git")),
+    Head(RepoURL("git://linuxtv.org/media_tree.git")),
     Head(RepoURL("powerpc/linux.git"), "next"),
     Head(RepoURL("tip/tip.git")),
     Head(RepoURL("shli/md.git"), "for-next"),
     Head(RepoURL("dhowells/linux-fs.git"), "keys-uefi"),
-    Head(RepoURL("next/linux-next.git")),
+    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.15"),
+    Head(RepoURL("tytso/ext4.git"), "dev"),
+    Head(RepoURL("s390/linux.git"), "for-linus"),
+    Head(RepoURL("tj/libata.git"), "for-next"),
+    Head(RepoURL("https://github.com/kdave/btrfs-devel.git"), "misc-next"),
+    Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
+    Head(RepoURL("gregkh/tty.git"), "tty-next"),
+    Head(RepoURL("jj/linux-apparmor.git"), "v4.8-aa2.8-out-of-tree"),
 )
 
 
@@ -190,7 +201,8 @@ class SortIndex(object):
         repo_remotes = []
         args = ("git", "config", "--get-regexp", "^remote\..+\.url$",)
         for line in subprocess.check_output(args,
-                                            cwd=self.repo.path).splitlines():
+                                            cwd=self.repo.path,
+                                            env={}).splitlines():
             name, url = line.split(None, 1)
             name = name.split(".")[1]
             url = RepoURL(url)
@@ -236,6 +248,7 @@ class SortIndex(object):
 
             sp = subprocess.Popen(args + processed + [rev],
                                   cwd=self.repo.path,
+                                  env={},
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT)
 

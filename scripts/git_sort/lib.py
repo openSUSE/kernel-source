@@ -26,7 +26,7 @@ class KSError(KSException):
     pass
 
 
-class KSNotFound(KSException):
+class KSNotFound(KSError):
     pass
 
 
@@ -265,10 +265,12 @@ class InputEntry(object):
             self.dest_head = git_sort.oot
             return
 
-        rev = firstword(commit_tags[0])
-        if not self.commit_match.match(rev):
-            raise KSError("Git-commit tag \"%s\" in patch \"%s\" is not a "
-                          "valid revision." % (rev, name,))
+        self.revs = [firstword(ct) for ct in commit_tags]
+        for rev in self.revs:
+            if not self.commit_match.match(rev):
+                raise KSError("Git-commit tag \"%s\" in patch \"%s\" is not a "
+                              "valid revision." % (rev, name,))
+        rev = self.revs[0]
 
         if len(repo_tags) > 1:
             raise KSError("Multiple Git-repo tags found. Patch \"%s\" is "
@@ -281,7 +283,7 @@ class InputEntry(object):
 
         # this is where we decide a patch line's fate in the sorted series.conf
         try:
-            head, self.cindex = index.lookup(rev)
+            head, cindex = index.lookup(rev)
         except git_sort.GSKeyError: # commit not found
             if current_head not in index.repo_heads: # repo not indexed
                 if repo == current_head.repo_url: # good tag
@@ -331,7 +333,9 @@ class InputEntry(object):
                         (head, rev, name,))
                 elif head < current_head: # patch moved upstream
                     self.dest_head = head
-                    self.new_url = head.repo_url
+                    self.cindex = cindex
+                    if repo != head.repo_url: # bad tag
+                        self.new_url = head.repo_url
             else: # repo is indexed
                 if head > current_head: # patch moved downstream
                     if repo == current_head.repo_url: # good tag
@@ -353,11 +357,13 @@ class InputEntry(object):
                                 name, current_head.repo_url,))
                 elif head == current_head: # patch didn't move
                     self.dest_head = head
-                    if repo != current_head.repo_url: # bad tag
+                    self.cindex = cindex
+                    if repo != head.repo_url: # bad tag
                         self.new_url = head.repo_url
                 elif head < current_head: # patch moved upstream
                     self.dest_head = head
-                    if repo != current_head.repo_url: # bad tag
+                    self.cindex = cindex
+                    if repo != head.repo_url: # bad tag
                         self.new_url = head.repo_url
 
 
@@ -414,6 +420,23 @@ def series_format(entries):
         result.extend(lines)
 
     return result
+
+
+def tag_needs_update(entry):
+    if entry.dest_head != git_sort.oot and entry.new_url is not None:
+        return True
+    else:
+        return False
+
+
+def update_tags(index, entries):
+    for entry in entries:
+        with tag.Patch(entry.name) as patch:
+            if entry.dest_head == git_sort.remotes[0]:
+                patch.change("Patch-mainline", index.describe(entry.cindex))
+                patch.remove("Git-repo")
+            else:
+                patch.change("Git-repo", repr(entry.new_url))
 
 
 def sequence_insert(series, rev, top):
