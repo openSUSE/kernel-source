@@ -386,7 +386,16 @@ class SortIndex(object):
         i = bisect.bisect_left(indexes, index)
         if i == len(tags):
             # not yet part of a tagged release
-            return "%s+" % (tags[-1],)
+            m = re.search("v([0-9]+)\.([0-9]+)(|-rc([0-9]+))$", tags[-1])
+            if m:
+                # Post-release commit with no rc, it'll be rc1
+                if m.group(3) == "":
+                    nexttag = "v%s.%d-rc1" % (m.group(1), int(m.group(2)) + 1)
+                else:
+                    nexttag = "v%s.%d or v%s.%s-rc%d (next release)" % \
+                              (m.group(1), int(m.group(2)) + 1, m.group(1),
+                               m.group(2), int(m.group(4)) + 1)
+            return nexttag
         else:
             return tags[i]
 
