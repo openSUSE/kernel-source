@@ -64,7 +64,11 @@ if __name__ == "__main__":
             sys.exit(1)
         entry = lib.InputEntry("\t%s\n" % (name,))
         new_lines.add(entry.value)
-        entry.from_patch(index, name, git_sort.oot)
+        try:
+            entry.from_patch(index, name, git_sort.oot)
+        except lib.KSError as err:
+            print("Error: %s" % (err,), file=sys.stderr)
+            sys.exit(1)
         if entry.dest_head != git_sort.oot:
             for rev in entry.revs:
                 try:
