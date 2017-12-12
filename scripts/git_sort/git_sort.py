@@ -168,6 +168,12 @@ remotes = (
     Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
     Head(RepoURL("gregkh/tty.git"), "tty-next"),
     Head(RepoURL("jj/linux-apparmor.git"), "v4.8-aa2.8-out-of-tree"),
+    Head(RepoURL("pablo/nf.git")),
+    Head(RepoURL("pablo/nf-next.git")),
+    Head(RepoURL("horms/ipvs.git")),
+    Head(RepoURL("horms/ipvs-next.git")),
+    Head(RepoURL("klassert/ipsec.git")),
+    Head(RepoURL("klassert/ipsec-next.git")),
 )
 
 
