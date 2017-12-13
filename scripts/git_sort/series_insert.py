@@ -120,4 +120,8 @@ if __name__ == "__main__":
     with open("series.conf", mode="w") as f:
         f.writelines(output)
 
-    lib.update_tags(index, filter(lib.tag_needs_update, new_entries))
+    try:
+        lib.update_tags(index, filter(lib.tag_needs_update, new_entries))
+    except lib.KSError as err:
+        print("Error: %s" % (err,), file=sys.stderr)
+        sys.exit(1)

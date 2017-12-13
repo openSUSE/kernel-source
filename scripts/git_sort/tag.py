@@ -108,3 +108,5 @@ class Patch(object):
                     return line
 
             self.head = map(change_value, self.head)
+        else:
+            raise KeyError("Tag \"%s\" not found" % (tag,))

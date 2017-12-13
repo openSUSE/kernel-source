@@ -432,11 +432,21 @@ def tag_needs_update(entry):
 def update_tags(index, entries):
     for entry in entries:
         with tag.Patch(entry.name) as patch:
+            message = "Failed to update tag \"%s\" in patch \"%s\". This " \
+                    "tag is not found."
             if entry.dest_head == git_sort.remotes[0]:
-                patch.change("Patch-mainline", index.describe(entry.cindex))
+                tag_name = "Patch-mainline"
+                try:
+                    patch.change(tag_name, index.describe(entry.cindex))
+                except KeyError:
+                    raise KSNotFound(message % (tag_name, entry.name,))
                 patch.remove("Git-repo")
             else:
-                patch.change("Git-repo", repr(entry.new_url))
+                tag_name = "Git-repo"
+                try:
+                    patch.change(tag_name, repr(entry.new_url))
+                except KeyError:
+                    raise KSNotFound(message % (tag_name, entry.name,))
 
 
 def sequence_insert(series, rev, top):
