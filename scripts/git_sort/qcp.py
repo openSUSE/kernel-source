@@ -99,7 +99,7 @@ if __name__ == "__main__":
         try:
             with lib.find_commit_in_series(fixes, series) as patch:
                 destination = os.path.dirname(patch.name)
-                references = " ".join(patch.get(f, "References"))
+                references = " ".join(patch.get("References"))
         except lib.KSNotFound:
             print("Error: no patch found which contains commit %s." %
                   (fixes[:12],), file=sys.stderr)

@@ -64,7 +64,11 @@ if __name__ == "__main__":
             sys.exit(1)
         entry = lib.InputEntry("\t%s\n" % (name,))
         new_lines.add(entry.value)
-        entry.from_patch(index, name, git_sort.oot)
+        try:
+            entry.from_patch(index, name, git_sort.oot)
+        except lib.KSError as err:
+            print("Error: %s" % (err,), file=sys.stderr)
+            sys.exit(1)
         if entry.dest_head != git_sort.oot:
             for rev in entry.revs:
                 try:
@@ -116,4 +120,8 @@ if __name__ == "__main__":
     with open("series.conf", mode="w") as f:
         f.writelines(output)
 
-    lib.update_tags(index, filter(lib.tag_needs_update, new_entries))
+    try:
+        lib.update_tags(index, filter(lib.tag_needs_update, new_entries))
+    except lib.KSError as err:
+        print("Error: %s" % (err,), file=sys.stderr)
+        sys.exit(1)
