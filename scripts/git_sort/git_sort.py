@@ -151,6 +151,8 @@ remotes = (
     Head(RepoURL("torvalds/linux.git")),
     Head(RepoURL("davem/net.git")),
     Head(RepoURL("davem/net-next.git")),
+    Head(RepoURL("rdma/rdma.git"), "for-rc"),
+    Head(RepoURL("rdma/rdma.git"), "for-next"),
     Head(RepoURL("dledford/rdma.git"), "k.o/for-next"),
     Head(RepoURL("jejb/scsi.git"), "for-next"),
     Head(RepoURL("bp/bp.git"), "for-next"),
