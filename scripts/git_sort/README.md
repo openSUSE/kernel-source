@@ -76,7 +76,9 @@ single commit or a series of commits directly to kernel-source.git.
 The functions in quilt-mode.sh are meant to be used with a modified `quilt`
 that can use kernel-source.git's series.conf directly instead of a shadow copy.
 
-Install it from  
+Packages are available in the following OBS project
+https://build.opensuse.org/package/show/home:benjamin_poirier:series_sort/quilt-ks
+Source is avaible from
 https://gitlab.suse.de/benjamin_poirier/quilt
 
 Example workflow to backport a single commit
