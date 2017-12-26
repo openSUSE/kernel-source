@@ -288,7 +288,16 @@ class SortIndex(object):
 
         The cache is stored using basic types.
         """
-        return shelve.open(os.path.expanduser("~/.cache/git-sort"))
+        try:
+            cache_dir = os.environ["XDG_CACHE_HOME"]
+        except KeyError:
+            cache_dir = os.path.expanduser("~/.cache")
+        if not os.path.isdir(cache_dir):
+            try:
+                os.makedirs(cache_dir)
+            except OSError as err:
+                raise GSError("Could not create cache directory:\n" + str(err))
+        return shelve.open(os.path.join(cache_dir, "git-sort"))
 
 
     def parse_cache_history(self, cache_history):
