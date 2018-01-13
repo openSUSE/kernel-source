@@ -401,7 +401,7 @@ class SortIndex(object):
                     nexttag = "v%s.%d-rc1" % (m.group(1), int(m.group(2)) + 1)
                 else:
                     nexttag = "v%s.%d or v%s.%s-rc%d (next release)" % \
-                              (m.group(1), int(m.group(2)) + 1, m.group(1),
+                              (m.group(1), int(m.group(2)), m.group(1),
                                m.group(2), int(m.group(4)) + 1)
             return nexttag
         else:
