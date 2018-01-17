@@ -151,6 +151,8 @@ remotes = (
     Head(RepoURL("torvalds/linux.git")),
     Head(RepoURL("davem/net.git")),
     Head(RepoURL("davem/net-next.git")),
+    Head(RepoURL("rdma/rdma.git"), "for-rc"),
+    Head(RepoURL("rdma/rdma.git"), "for-next"),
     Head(RepoURL("dledford/rdma.git"), "k.o/for-next"),
     Head(RepoURL("jejb/scsi.git"), "for-next"),
     Head(RepoURL("bp/bp.git"), "for-next"),
@@ -168,6 +170,12 @@ remotes = (
     Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
     Head(RepoURL("gregkh/tty.git"), "tty-next"),
     Head(RepoURL("jj/linux-apparmor.git"), "v4.8-aa2.8-out-of-tree"),
+    Head(RepoURL("pablo/nf.git")),
+    Head(RepoURL("pablo/nf-next.git")),
+    Head(RepoURL("horms/ipvs.git")),
+    Head(RepoURL("horms/ipvs-next.git")),
+    Head(RepoURL("klassert/ipsec.git")),
+    Head(RepoURL("klassert/ipsec-next.git")),
 )
 
 
@@ -393,7 +401,7 @@ class SortIndex(object):
                     nexttag = "v%s.%d-rc1" % (m.group(1), int(m.group(2)) + 1)
                 else:
                     nexttag = "v%s.%d or v%s.%s-rc%d (next release)" % \
-                              (m.group(1), int(m.group(2)) + 1, m.group(1),
+                              (m.group(1), int(m.group(2)), m.group(1),
                                m.group(2), int(m.group(4)) + 1)
             return nexttag
         else:

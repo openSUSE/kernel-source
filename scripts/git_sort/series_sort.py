@@ -111,4 +111,8 @@ if __name__ == "__main__":
         else:
             f = sys.stdout
         f.writelines(output)
-        lib.update_tags(index, to_update)
+        try:
+            lib.update_tags(index, to_update)
+        except lib.KSError as err:
+            print("Error: %s" % (err,), file=sys.stderr)
+            sys.exit(1)
