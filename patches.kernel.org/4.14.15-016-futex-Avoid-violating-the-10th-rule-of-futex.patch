@@ -1,0 +1,302 @@
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Fri, 8 Dec 2017 13:49:39 +0100
+Subject: [PATCH] futex: Avoid violating the 10th rule of futex
+References: bnc#1012628
+Patch-mainline: 4.14.15
+Git-commit: c1e2f0eaf015fb7076d51a339011f2383e6dd389
+
+commit c1e2f0eaf015fb7076d51a339011f2383e6dd389 upstream.
+
+Julia reported futex state corruption in the following scenario:
+
+   waiter                                  waker                                            stealer (prio > waiter)
+
+   futex(WAIT_REQUEUE_PI, uaddr, uaddr2,
+         timeout=[N ms])
+      futex_wait_requeue_pi()
+         futex_wait_queue_me()
+            freezable_schedule()
+            <scheduled out>
+                                           futex(LOCK_PI, uaddr2)
+                                           futex(CMP_REQUEUE_PI, uaddr,
+                                                 uaddr2, 1, 0)
+                                              /* requeues waiter to uaddr2 */
+                                           futex(UNLOCK_PI, uaddr2)
+                                                 wake_futex_pi()
+                                                    cmp_futex_value_locked(uaddr2, waiter)
+                                                    wake_up_q()
+           <woken by waker>
+           <hrtimer_wakeup() fires,
+            clears sleeper->task>
+                                                                                           futex(LOCK_PI, uaddr2)
+                                                                                              __rt_mutex_start_proxy_lock()
+                                                                                                 try_to_take_rt_mutex() /* steals lock */
+                                                                                                    rt_mutex_set_owner(lock, stealer)
+                                                                                              <preempted>
+         <scheduled in>
+         rt_mutex_wait_proxy_lock()
+            __rt_mutex_slowlock()
+               try_to_take_rt_mutex() /* fails, lock held by stealer */
+               if (timeout && !timeout->task)
+                  return -ETIMEDOUT;
+            fixup_owner()
+               /* lock wasn't acquired, so,
+                  fixup_pi_state_owner skipped */
+
+   return -ETIMEDOUT;
+
+   /* At this point, we've returned -ETIMEDOUT to userspace, but the
+    * futex word shows waiter to be the owner, and the pi_mutex has
+    * stealer as the owner */
+
+   futex_lock(LOCK_PI, uaddr2)
+     -> bails with EDEADLK, futex word says we're owner.
+
+And suggested that what commit:
+
+  73d786bd043e ("futex: Rework inconsistent rt_mutex/futex_q state")
+
+removes from fixup_owner() looks to be just what is needed. And indeed
+it is -- I completely missed that requeue_pi could also result in this
+case. So we need to restore that, except that subsequent patches, like
+commit:
+
+  16ffa12d7425 ("futex: Pull rt_mutex_futex_unlock() out from under hb->lock")
+
+changed all the locking rules. Even without that, the sequence:
+
+-               if (rt_mutex_futex_trylock(&q->pi_state->pi_mutex)) {
+-                       locked = 1;
+-                       goto out;
+-               }
+
+-               raw_spin_lock_irq(&q->pi_state->pi_mutex.wait_lock);
+-               owner = rt_mutex_owner(&q->pi_state->pi_mutex);
+-               if (!owner)
+-                       owner = rt_mutex_next_owner(&q->pi_state->pi_mutex);
+-               raw_spin_unlock_irq(&q->pi_state->pi_mutex.wait_lock);
+-               ret = fixup_pi_state_owner(uaddr, q, owner);
+
+already suggests there were races; otherwise we'd never have to look
+at next_owner.
+
+So instead of doing 3 consecutive wait_lock sections with who knows
+what races, we do it all in a single section. Additionally, the usage
+of pi_state->owner in fixup_owner() was only safe because only the
+rt_mutex owner would modify it, which this additional case wrecks.
+
+Luckily the values can only change away and not to the value we're
+testing, this means we can do a speculative test and double check once
+we have the wait_lock.
+
+Fixes: 73d786bd043e ("futex: Rework inconsistent rt_mutex/futex_q state")
+Reported-by: Julia Cartwright <julia@ni.com>
+Reported-by: Gratian Crisan <gratian.crisan@ni.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Tested-by: Julia Cartwright <julia@ni.com>
+Tested-by: Gratian Crisan <gratian.crisan@ni.com>
+Cc: Darren Hart <dvhart@infradead.org>
+Link: https://lkml.kernel.org/r/20171208124939.7livp7no2ov65rrc@hirez.programming.kicks-ass.net
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ kernel/futex.c                  | 83 +++++++++++++++++++++++++++++++++--------
+ kernel/locking/rtmutex.c        | 26 +++++++++----
+ kernel/locking/rtmutex_common.h |  1 +
+ 3 files changed, 87 insertions(+), 23 deletions(-)
+
+diff --git a/kernel/futex.c b/kernel/futex.c
+index 76ed5921117a..29ac5b64e7c7 100644
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -2294,21 +2294,17 @@ static void unqueue_me_pi(struct futex_q *q)
+ 	spin_unlock(q->lock_ptr);
+ }
+ 
+-/*
+- * Fixup the pi_state owner with the new owner.
+- *
+- * Must be called with hash bucket lock held and mm->sem held for non
+- * private futexes.
+- */
+ static int fixup_pi_state_owner(u32 __user *uaddr, struct futex_q *q,
+-				struct task_struct *newowner)
++				struct task_struct *argowner)
+ {
+-	u32 newtid = task_pid_vnr(newowner) | FUTEX_WAITERS;
+ 	struct futex_pi_state *pi_state = q->pi_state;
+ 	u32 uval, uninitialized_var(curval), newval;
+-	struct task_struct *oldowner;
++	struct task_struct *oldowner, *newowner;
++	u32 newtid;
+ 	int ret;
+ 
++	lockdep_assert_held(q->lock_ptr);
++
+ 	raw_spin_lock_irq(&pi_state->pi_mutex.wait_lock);
+ 
+ 	oldowner = pi_state->owner;
+@@ -2317,11 +2313,17 @@ static int fixup_pi_state_owner(u32 __user *uaddr, struct futex_q *q,
+ 		newtid |= FUTEX_OWNER_DIED;
+ 
+ 	/*
+-	 * We are here either because we stole the rtmutex from the
+-	 * previous highest priority waiter or we are the highest priority
+-	 * waiter but have failed to get the rtmutex the first time.
++	 * We are here because either:
++	 *
++	 *  - we stole the lock and pi_state->owner needs updating to reflect
++	 *    that (@argowner == current),
+ 	 *
+-	 * We have to replace the newowner TID in the user space variable.
++	 * or:
++	 *
++	 *  - someone stole our lock and we need to fix things to point to the
++	 *    new owner (@argowner == NULL).
++	 *
++	 * Either way, we have to replace the TID in the user space variable.
+ 	 * This must be atomic as we have to preserve the owner died bit here.
+ 	 *
+ 	 * Note: We write the user space value _before_ changing the pi_state
+@@ -2334,6 +2336,42 @@ static int fixup_pi_state_owner(u32 __user *uaddr, struct futex_q *q,
+ 	 * in the PID check in lookup_pi_state.
+ 	 */
+ retry:
++	if (!argowner) {
++		if (oldowner != current) {
++			/*
++			 * We raced against a concurrent self; things are
++			 * already fixed up. Nothing to do.
++			 */
++			ret = 0;
++			goto out_unlock;
++		}
++
++		if (__rt_mutex_futex_trylock(&pi_state->pi_mutex)) {
++			/* We got the lock after all, nothing to fix. */
++			ret = 0;
++			goto out_unlock;
++		}
++
++		/*
++		 * Since we just failed the trylock; there must be an owner.
++		 */
++		newowner = rt_mutex_owner(&pi_state->pi_mutex);
++		BUG_ON(!newowner);
++	} else {
++		WARN_ON_ONCE(argowner != current);
++		if (oldowner == current) {
++			/*
++			 * We raced against a concurrent self; things are
++			 * already fixed up. Nothing to do.
++			 */
++			ret = 0;
++			goto out_unlock;
++		}
++		newowner = argowner;
++	}
++
++	newtid = task_pid_vnr(newowner) | FUTEX_WAITERS;
++
+ 	if (get_futex_value_locked(&uval, uaddr))
+ 		goto handle_fault;
+ 
+@@ -2434,15 +2472,28 @@ static int fixup_owner(u32 __user *uaddr, struct futex_q *q, int locked)
+ 		 * Got the lock. We might not be the anticipated owner if we
+ 		 * did a lock-steal - fix up the PI-state in that case:
+ 		 *
+-		 * We can safely read pi_state->owner without holding wait_lock
+-		 * because we now own the rt_mutex, only the owner will attempt
+-		 * to change it.
++		 * Speculative pi_state->owner read (we don't hold wait_lock);
++		 * since we own the lock pi_state->owner == current is the
++		 * stable state, anything else needs more attention.
+ 		 */
+ 		if (q->pi_state->owner != current)
+ 			ret = fixup_pi_state_owner(uaddr, q, current);
+ 		goto out;
+ 	}
+ 
++	/*
++	 * If we didn't get the lock; check if anybody stole it from us. In
++	 * that case, we need to fix up the uval to point to them instead of
++	 * us, otherwise bad things happen. [10]
++	 *
++	 * Another speculative read; pi_state->owner == current is unstable
++	 * but needs our attention.
++	 */
++	if (q->pi_state->owner == current) {
++		ret = fixup_pi_state_owner(uaddr, q, NULL);
++		goto out;
++	}
++
+ 	/*
+ 	 * Paranoia check. If we did not take the lock, then we should not be
+ 	 * the owner of the rt_mutex.
+diff --git a/kernel/locking/rtmutex.c b/kernel/locking/rtmutex.c
+index 6f3dba6e4e9e..65cc0cb984e6 100644
+--- a/kernel/locking/rtmutex.c
++++ b/kernel/locking/rtmutex.c
+@@ -1290,6 +1290,19 @@ rt_mutex_slowlock(struct rt_mutex *lock, int state,
+ 	return ret;
+ }
+ 
++static inline int __rt_mutex_slowtrylock(struct rt_mutex *lock)
++{
++	int ret = try_to_take_rt_mutex(lock, current, NULL);
++
++	/*
++	 * try_to_take_rt_mutex() sets the lock waiters bit
++	 * unconditionally. Clean this up.
++	 */
++	fixup_rt_mutex_waiters(lock);
++
++	return ret;
++}
++
+ /*
+  * Slow path try-lock function:
+  */
+@@ -1312,13 +1325,7 @@ static inline int rt_mutex_slowtrylock(struct rt_mutex *lock)
+ 	 */
+ 	raw_spin_lock_irqsave(&lock->wait_lock, flags);
+ 
+-	ret = try_to_take_rt_mutex(lock, current, NULL);
+-
+-	/*
+-	 * try_to_take_rt_mutex() sets the lock waiters bit
+-	 * unconditionally. Clean this up.
+-	 */
+-	fixup_rt_mutex_waiters(lock);
++	ret = __rt_mutex_slowtrylock(lock);
+ 
+ 	raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
+ 
+@@ -1505,6 +1512,11 @@ int __sched rt_mutex_futex_trylock(struct rt_mutex *lock)
+ 	return rt_mutex_slowtrylock(lock);
+ }
+ 
++int __sched __rt_mutex_futex_trylock(struct rt_mutex *lock)
++{
++	return __rt_mutex_slowtrylock(lock);
++}
++
+ /**
+  * rt_mutex_timed_lock - lock a rt_mutex interruptible
+  *			the timeout structure is provided
+diff --git a/kernel/locking/rtmutex_common.h b/kernel/locking/rtmutex_common.h
+index 124e98ca0b17..68686b3ec3c1 100644
+--- a/kernel/locking/rtmutex_common.h
++++ b/kernel/locking/rtmutex_common.h
+@@ -148,6 +148,7 @@ extern bool rt_mutex_cleanup_proxy_lock(struct rt_mutex *lock,
+ 				 struct rt_mutex_waiter *waiter);
+ 
+ extern int rt_mutex_futex_trylock(struct rt_mutex *l);
++extern int __rt_mutex_futex_trylock(struct rt_mutex *l);
+ 
+ extern void rt_mutex_futex_unlock(struct rt_mutex *lock);
+ extern bool __rt_mutex_futex_unlock(struct rt_mutex *lock,
+-- 
+2.16.0
+
