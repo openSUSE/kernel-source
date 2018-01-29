@@ -21,9 +21,8 @@ if __name__ == "__main__":
     if not lib.check_series():
         sys.exit(1)
 
-    # remove "patches/" prefix
-    top = subprocess.check_output(("quilt", "top",),
-                                  preexec_fn=lib.restore_signals).strip()[8:]
+    top = subprocess.check_output(("quilt", "--quiltrc", "-", "top",),
+                                  preexec_fn=lib.restore_signals).strip()
 
     series = open("series")
     os.chdir("patches")

@@ -70,7 +70,7 @@ def check_series():
     if retval:
         return True
     
-    subprocess.call(["quilt", "top"], preexec_fn=restore_signals)
+    subprocess.check_call(["quilt", "top"], preexec_fn=restore_signals)
     if check():
         return True
     else:

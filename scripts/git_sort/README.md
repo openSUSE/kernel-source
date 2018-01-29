@@ -1,5 +1,19 @@
-Installing
-==========
+Requirements
+============
+The `pygit2` python module must be available. It may be installed from the
+package `python2-pygit2` on SLE/openSUSE releases. If that package is not
+available in the standard repositories for your installation, have a look at
+the Kernel:tools OBS project:
+```
+https://build.opensuse.org/package/show/Kernel:tools/python-pygit2
+```
+As a last resort, you can try to compile your own module:
+```
+pip2 install pygit2
+```
+but beware that this has extra dependencies (`python2-pip`, `python-devel`,
+`libgit2-devel`).
+
 The LINUX_GIT environment variable must be set to the path of a fresh Linux
 kernel git clone; it will be used as a reference for upstream commit
 information. Specifically, this must be a clone of
@@ -62,7 +76,9 @@ single commit or a series of commits directly to kernel-source.git.
 The functions in quilt-mode.sh are meant to be used with a modified `quilt`
 that can use kernel-source.git's series.conf directly instead of a shadow copy.
 
-Install it from  
+Packages are available in the following OBS project
+https://build.opensuse.org/package/show/home:benjamin_poirier:series_sort/quilt-ks
+Source is avaible from
 https://gitlab.suse.de/benjamin_poirier/quilt
 
 Example workflow to backport a single commit

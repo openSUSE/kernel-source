@@ -43,8 +43,9 @@ if __name__ == "__main__":
             if references:
                 print("for\n\t%s" % (references,))
 
-            top = subprocess.check_output(("quilt", "top",), cwd=cwd,
-                                          preexec_fn=lib.restore_signals).strip()
+            top = subprocess.check_output(
+                ("quilt", "--quiltrc", "-", "top",), cwd=cwd,
+                preexec_fn=lib.restore_signals).strip()
             if top == patch.name:
                 print("This is the top patch.")
             sys.exit(1)

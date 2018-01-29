@@ -185,6 +185,7 @@ oot = Head(RepoURL(None), "out-of-tree patches")
 
 class SortIndex(object):
     cache_version = 3
+    remote_match = re.compile("remote\..+\.url")
     version_match = re.compile("refs/tags/v(2\.6\.\d+|\d\.\d+)(-rc\d+)?$")
 
 
@@ -206,29 +207,26 @@ class SortIndex(object):
             sha1
         """
         result = collections.OrderedDict()
-        repo_remotes = []
-        args = ("git", "config", "--get-regexp", "^remote\..+\.url$",)
-        for line in subprocess.check_output(args,
-                                            cwd=self.repo.path,
-                                            env={}).splitlines():
-            name, url = line.split(None, 1)
-            name = name.split(".")[1]
-            url = RepoURL(url)
-            repo_remotes.append((name, url,))
+        repo_remotes = collections.OrderedDict([
+            (RepoURL(self.repo.config[name]), ".".join(name.split(".")[1:-1]))
+            for name in self.repo.config
+            if self.remote_match.match(name)])
 
         for head in remotes:
-            for remote_name, remote_url in repo_remotes:
-                if head.repo_url == remote_url:
-                    rev = "remotes/%s/%s" % (remote_name, head.rev,)
-                    try:
-                        commit = self.repo.revparse_single(rev)
-                    except KeyError:
-                        raise GSError(
-                            "Could not read revision \"%s\". Perhaps you need to "
-                            "fetch from remote \"%s\", ie. `git fetch %s`." % (
-                                rev, remote_name, remote_name,))
-                    result[head] = str(commit.id)
-                    break
+            try:
+                remote_name = repo_remotes[head.repo_url]
+            except KeyError:
+                continue
+
+            rev = "remotes/%s/%s" % (remote_name, head.rev,)
+            try:
+                commit = self.repo.revparse_single(rev)
+            except KeyError:
+                raise GSError(
+                    "Could not read revision \"%s\". Perhaps you need to "
+                    "fetch from remote \"%s\", ie. `git fetch %s`." % (
+                        rev, remote_name, remote_name,))
+            result[head] = str(commit.id)
 
         if remotes[0] not in result:
             # According to the urls in remotes, this is not a clone of linux.git
@@ -288,7 +286,16 @@ class SortIndex(object):
 
         The cache is stored using basic types.
         """
-        return shelve.open(os.path.expanduser("~/.cache/git-sort"))
+        try:
+            cache_dir = os.environ["XDG_CACHE_HOME"]
+        except KeyError:
+            cache_dir = os.path.expanduser("~/.cache")
+        if not os.path.isdir(cache_dir):
+            try:
+                os.makedirs(cache_dir)
+            except OSError as err:
+                raise GSError("Could not create cache directory:\n" + str(err))
+        return shelve.open(os.path.join(cache_dir, "git-sort"))
 
 
     def parse_cache_history(self, cache_history):
