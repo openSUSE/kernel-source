@@ -75,7 +75,7 @@ qfmake () {
 	fi
 
 	local targets new_target
-	for new_target in "$@" $(quilt files | sed -n -e 's/.c$/.o/p'); do
+	for new_target in "$@" $(quilt --quiltrc - files | sed -n -e 's/.c$/.o/p'); do
 		local exclude
 		local add=1
 		for exclude in "${qfm_excludes[@]}"; do
@@ -115,7 +115,7 @@ qfmake () {
 
 
 qf1 () {
-	cat $(quilt top)
+	cat $(quilt --quiltrc "$_libdir"/quiltrc.qf1 top)
 }
 
 
