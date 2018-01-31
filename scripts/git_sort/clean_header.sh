@@ -177,7 +177,10 @@ else
 				echo "Error: cannot use stash to describe patch. Stopping to avoid possibly erroneous results." > /dev/stderr
 				exit 1
 			else
-				remote=$(git config --get branch.$branch.remote)
+				if ! remote=$(git config --get branch.$branch.remote); then
+					echo "Error: \"$branch\" does not look like a remote tracking branch. Failed to get information about repository URL." > /dev/stderr
+					exit 1
+				fi
 			fi
 		fi
 		describe_url=$(git config --get remote.$remote.url)

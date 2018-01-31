@@ -65,7 +65,7 @@ class Patch(object):
         """
         tag does not contain the terminal ": ". It is case insensitive.
 
-        returns a list a list with the value for each instance of the tag
+        Returns a list with the value for each instance of the tag.
         """
         start = "%s: " % (tag.lower(),)
         return [line[len(start):-1].strip() for line in self.head
@@ -108,3 +108,5 @@ class Patch(object):
                     return line
 
             self.head = map(change_value, self.head)
+        else:
+            raise KeyError("Tag \"%s\" not found" % (tag,))
