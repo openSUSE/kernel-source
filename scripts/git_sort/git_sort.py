@@ -261,92 +261,197 @@ def get_history(repo, repo_heads):
     return history
 
 
-class SortIndex(object):
-    cache_version = 3
-    version_match = re.compile("refs/tags/v(2\.6\.\d+|\d\.\d+)(-rc\d+)?$")
+class CException(BaseException):
+    pass
 
 
-    def __init__(self, repo, skip_rebuild=False):
-        self.repo = repo
-        try:
-            self.repo_heads = get_heads(repo)
-            self.history = self.load_history(skip_rebuild)
-        except GSError as err:
-            print("Error: %s" % (err,), file=sys.stderr)
-            sys.exit(1)
-        self.version_indexes = None
+class CError(CException):
+    pass
 
 
-    def get_cache(self):
-        """
-        cache
-            history[]
-                (url, rev, sha1,
-                 history[commit hash represented as string of 40 characters]
-                    index (as described in get_history())
-                 ,)
+class CNeedsRebuild(CException):
+    pass
 
-        The cache is stored using basic types.
-        """
+
+class CAbsent(CNeedsRebuild):
+    pass
+
+
+class CKeyError(CNeedsRebuild):
+    pass
+
+
+class CUnsupported(CNeedsRebuild):
+    pass
+
+
+class CInconsistent(CNeedsRebuild):
+    pass
+
+
+class Cache(object):
+    """
+    cache
+        version
+        history[]
+            (url, rev, sha1,
+             history[commit hash represented as string of 40 characters]
+                index (as described in get_history())
+             ,)
+
+    The cache is stored using basic types.
+    """
+    version = 3
+
+
+    def __init__(self, write_enable=False):
+        self.write_enable = write_enable
+        self.closed = True
         try:
             cache_dir = os.environ["XDG_CACHE_HOME"]
         except KeyError:
             cache_dir = os.path.expanduser("~/.cache")
-        if not os.path.isdir(cache_dir):
-            try:
-                os.makedirs(cache_dir)
-            except OSError as err:
-                raise GSError("Could not create cache directory:\n" + str(err))
-        return shelve.open(os.path.join(cache_dir, "git-sort"))
-
-
-    def parse_cache_history(self, cache_history):
-        """
-        Note that the cache history and self.history have different keys.
-        """
-        return collections.OrderedDict([
-            (
-                (Head(RepoURL(e[0]), e[1]), e[2],),
-                e[3],
-            ) for e in cache_history])
-
-
-    def gen_cache_history(self, history):
-        return [(
-            repr(head.repo_url), head.rev, self.repo_heads[head], log,
-        ) for head, log in history.items()]
-
-
-    def load_history(self, skip_rebuild):
-        rebuild = False
-        cache = self.get_cache()
+        cache_path = os.path.join(cache_dir, "git-sort")
         try:
-            if cache["version"] != self.cache_version:
-                rebuild = True
-        except KeyError:
-            rebuild = True
-
-        if not rebuild:
-            c_history = self.parse_cache_history(cache["history"])
-            if c_history.keys() != self.repo_heads.items():
-                rebuild = True
-
-        if rebuild:
-            if skip_rebuild:
-                history = None
+            os.stat(cache_path)
+        except OSError as e:
+            if e.errno == 2:
+                if write_enable:
+                    if not os.path.isdir(cache_dir):
+                        try:
+                            os.makedirs(cache_dir)
+                        except OSError as err:
+                            raise CError("Could not create cache directory:\n" +
+                                         str(err))
+                else:
+                    raise CAbsent
             else:
-                history = get_history(self.repo, self.repo_heads)
-                cache["version"] = self.cache_version
-                cache["history"] = self.gen_cache_history(history)
-                # clean older cache format
-                if "heads" in cache:
-                    del cache["heads"]
-        else:
-            history = collections.OrderedDict(
-                [(key[0], log,) for key, log in c_history.items()])
-        cache.close()
+                raise
 
-        return history
+        flag_map = {False : "r", True : "n"}
+        self.cache = shelve.open(cache_path, flag=flag_map[write_enable])
+        self.closed = False
+        if write_enable:
+            self.cache["version"] = Cache.version
+
+
+    def __del__(self):
+        self.close()
+
+
+    def __enter__(self):
+        return self
+
+
+    def __exit__(self, *args):
+        self.close()
+
+
+    def close(self):
+        if not self.closed:
+            self.cache.close()
+        self.closed = True
+
+
+    def __getitem__(self, key):
+        """
+        Supported keys:
+            "version"
+                int
+            "history"
+                OrderedDict((Head, sha1) : history)
+        """
+        if self.closed:
+            raise ValueError
+
+        if key == "version":
+            try:
+                return self.cache["version"]
+            except KeyError:
+                raise CKeyError
+        elif key == "history":
+            try:
+                if self.cache["version"] != Cache.version:
+                    raise CUnsupported
+            except KeyError:
+                raise CUnsupported
+
+            try:
+                cache_history = self.cache["history"]
+            except KeyError:
+                raise CInconsistent
+
+            return collections.OrderedDict([
+                (
+                    (Head(RepoURL(e[0]), e[1]), e[2],),
+                    e[3],
+                ) for e in cache_history])
+        else:
+            raise KeyError
+
+
+    def __setitem__(self, key, value):
+        """
+        Supported keys:
+            "history"
+                OrderedDict((Head, sha1) : history)
+        """
+        if self.closed or not self.write_enable:
+            raise ValueError
+
+        if key == "history":
+            self.cache["history"] = [(
+                repr(desc[0].repo_url), desc[0].rev, desc[1], log,
+            ) for desc, log in value.items()]
+        else:
+            raise KeyError
+
+
+class SortIndex(object):
+    version_match = re.compile("refs/tags/v(2\.6\.\d+|\d\.\d+)(-rc\d+)?$")
+
+
+    def __init__(self, repo):
+        self.repo = repo
+        needs_rebuild = False
+        try:
+            with Cache() as cache:
+                try:
+                    history = cache["history"]
+                except CNeedsRebuild:
+                    needs_rebuild = True
+        except CAbsent:
+            needs_rebuild = True
+        except CError as err:
+            print("Error: %s" % (err,), file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            repo_heads = get_heads(repo)
+        except GSError as err:
+            print("Error: %s" % (err,), file=sys.stderr)
+            sys.exit(1)
+
+        if needs_rebuild or history.keys() != repo_heads:
+            try:
+                history = get_history(repo, repo_heads)
+            except GSError as err:
+                print("Error: %s" % (err,), file=sys.stderr)
+                sys.exit(1)
+            try:
+                with Cache(write_enable=True) as cache:
+                    cache["history"] = collections.OrderedDict(
+                        [((head, repo_heads[head],), log,)
+                         for head, log in history.items()])
+            except CError as err:
+                print("Error: %s" % (err,), file=sys.stderr)
+                sys.exit(1)
+            self.history = history
+        else:
+            # no more need for the head sha1
+            self.history = collections.OrderedDict(
+                    [(key[0], log,) for key, log in history.items()])
+        self.version_indexes = None
 
 
     def lookup(self, commit):
@@ -432,30 +537,51 @@ if __name__ == "__main__":
     except KeyError:
         path = pygit2.discover_repository(os.getcwd())
     repo = pygit2.Repository(path)
-    index = SortIndex(repo, skip_rebuild=args.dump_heads)
 
     if args.dump_heads:
-        cache = index.get_cache()
+        needs_rebuild = False
         try:
-            version = cache["version"]
-        except KeyError:
+            with Cache() as cache:
+                try:
+                    print("Cached heads (version %d):" % cache["version"])
+                except CKeyError:
+                    print("No usable cache")
+                    needs_rebuild = True
+                else:
+                    try:
+                        history = cache["history"]
+                    except CUnsupported:
+                        print("Unsupported cache version")
+                        needs_rebuild = True
+                    except CInconsistent:
+                        print("Inconsistent cache content")
+                        needs_rebuild = True
+                    else:
+                        pprint.pprint(history.keys())
+        except CAbsent:
             print("No usable cache")
-        else:
-            print("Cached heads (version %d):" % version)
-            if version == index.cache_version:
-                c_history = index.parse_cache_history(cache["history"])
-                pprint.pprint(c_history.keys())
-            else:
-                print("(omitted)")
-        print("Current heads (version %d):" % index.cache_version)
-        pprint.pprint(index.repo_heads.items())
-        if index.history:
-            action = "Will not"
-        else:
+            needs_rebuild = True
+        except CError as err:
+            print("Error: %s" % (err,), file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            repo_heads = get_heads(repo)
+        except GSError as err:
+            print("Error: %s" % (err,), file=sys.stderr)
+            sys.exit(1)
+        if not needs_rebuild and history.keys() != repo_heads.items():
+            needs_rebuild = True
+        print("Current heads (version %d):" % Cache.version)
+        pprint.pprint(repo_heads.items())
+        if needs_rebuild:
             action = "Will"
+        else:
+            action = "Will not"
         print("%s rebuild history" % (action,))
         sys.exit(0)
 
+    index = SortIndex(repo)
     lines = {}
     num = 0
     for line in sys.stdin.readlines():

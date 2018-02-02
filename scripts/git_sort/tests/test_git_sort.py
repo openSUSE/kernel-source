@@ -338,7 +338,7 @@ class TestCache(unittest.TestCase):
         # test version number change
         shelve.open(cache_path)["version"] = 1
         output = subprocess.check_output([gs_path, "-d"]).splitlines()
-        self.assertEqual(output[1], "(omitted)")
+        self.assertEqual(output[1], "Unsupported cache version")
         self.assertEqual(output[-1], "Will rebuild history")
 
         sp = subprocess.Popen(gs_path,
@@ -358,7 +358,7 @@ class TestCache(unittest.TestCase):
             "net-next" : ["abc", "abc", "abc"],
         }
         output = subprocess.check_output([gs_path, "-d"]).splitlines()
-        self.assertEqual(output[1], "(omitted)")
+        self.assertEqual(output[1], "Inconsistent cache content")
         self.assertEqual(output[-1], "Will rebuild history")
 
         sp = subprocess.Popen(gs_path,
