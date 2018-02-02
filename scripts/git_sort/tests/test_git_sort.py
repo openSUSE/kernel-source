@@ -145,9 +145,9 @@ class TestIndex(unittest.TestCase):
         shutil.rmtree(self.repo_dir)
 
 
-    def test_index(self):
+    def test_heads(self):
         self.assertEqual(
-            self.index.repo_heads,
+            git_sort.get_heads(self.repo),
             collections.OrderedDict([
                 (git_sort.Head(git_sort.RepoURL(None), "HEAD"),
                  str(self.commits[-1][0]),)])
@@ -238,9 +238,9 @@ class TestIndexLinux(unittest.TestCase):
         shutil.rmtree(self.repo_dir)
 
 
-    def test_index(self):
+    def test_heads(self):
         self.assertEqual(
-            self.index.repo_heads,
+            git_sort.get_heads(self.repo),
             collections.OrderedDict([
                 (git_sort.Head(git_sort.RepoURL("torvalds/linux.git")),
                  self.heads["mainline"]),

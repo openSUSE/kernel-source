@@ -15,6 +15,7 @@ import re
 import shelve
 import subprocess
 import sys
+import types
 
 
 class GSException(BaseException):
@@ -182,97 +183,98 @@ remotes = (
 remote_index = dict(zip(remotes, range(len(remotes))))
 oot = Head(RepoURL(None), "out-of-tree patches")
 
+remote_match = re.compile("remote\..+\.url")
+
+
+def get_heads(repo):
+    """
+    Returns
+    repo_heads[Head]
+        sha1
+    """
+    result = collections.OrderedDict()
+    repo_remotes = collections.OrderedDict([
+        (RepoURL(repo.config[name]), ".".join(name.split(".")[1:-1]))
+        for name in repo.config
+        if remote_match.match(name)])
+
+    for head in remotes:
+        try:
+            remote_name = repo_remotes[head.repo_url]
+        except KeyError:
+            continue
+
+        rev = "remotes/%s/%s" % (remote_name, head.rev,)
+        try:
+            commit = repo.revparse_single(rev)
+        except KeyError:
+            raise GSError(
+                "Could not read revision \"%s\". Perhaps you need to "
+                "fetch from remote \"%s\", ie. `git fetch %s`." % (
+                    rev, remote_name, remote_name,))
+        result[head] = str(commit.id)
+
+    if len(result) == 0 or result.keys()[0] != remotes[0]:
+        # According to the urls in remotes, this is not a clone of linux.git
+        # Sort according to commits reachable from the current head
+        result = collections.OrderedDict(
+            [(Head(RepoURL(None), "HEAD"),
+              str(repo.revparse_single("HEAD").id),)])
+
+    return result
+
+
+def get_history(repo, repo_heads):
+    """
+    Returns
+    history[Head][commit hash represented as string of 40 characters]
+            index, an ordinal number such that
+            commit a is an ancestor of commit b -> index(a) < index(b)
+    """
+    processed = []
+    history = collections.OrderedDict()
+    args = ["git", "log", "--topo-order", "--pretty=tformat:%H"]
+    for head, rev in repo_heads.items():
+        if head in history:
+            raise GSException("head \"%s\" is not unique." % (head,))
+
+        sp = subprocess.Popen(args + processed + [rev],
+                              cwd=repo.path,
+                              env={},
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+
+        result = {}
+        for l in sp.stdout:
+            result[l.strip()] = len(result)
+        # reverse indexes
+        history[head] = {commit : len(result) - val for commit, val in
+                         result.items()}
+
+        sp.communicate()
+        if sp.returncode != 0:
+            raise GSError("git log exited with an error:\n" +
+                          "\n".join(history[head]))
+
+        processed.append("^%s" % (rev,))
+
+    return history
+
 
 class SortIndex(object):
     cache_version = 3
-    remote_match = re.compile("remote\..+\.url")
     version_match = re.compile("refs/tags/v(2\.6\.\d+|\d\.\d+)(-rc\d+)?$")
 
 
     def __init__(self, repo, skip_rebuild=False):
         self.repo = repo
         try:
-            self.repo_heads = self.get_heads()
-            self.history = self.get_history(skip_rebuild)
+            self.repo_heads = get_heads(repo)
+            self.history = self.load_history(skip_rebuild)
         except GSError as err:
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
         self.version_indexes = None
-
-
-    def get_heads(self):
-        """
-        Returns
-        repo_heads[Head]
-            sha1
-        """
-        result = collections.OrderedDict()
-        repo_remotes = collections.OrderedDict([
-            (RepoURL(self.repo.config[name]), ".".join(name.split(".")[1:-1]))
-            for name in self.repo.config
-            if self.remote_match.match(name)])
-
-        for head in remotes:
-            try:
-                remote_name = repo_remotes[head.repo_url]
-            except KeyError:
-                continue
-
-            rev = "remotes/%s/%s" % (remote_name, head.rev,)
-            try:
-                commit = self.repo.revparse_single(rev)
-            except KeyError:
-                raise GSError(
-                    "Could not read revision \"%s\". Perhaps you need to "
-                    "fetch from remote \"%s\", ie. `git fetch %s`." % (
-                        rev, remote_name, remote_name,))
-            result[head] = str(commit.id)
-
-        if remotes[0] not in result:
-            # According to the urls in remotes, this is not a clone of linux.git
-            # Sort according to commits reachable from the current head
-            result = collections.OrderedDict(
-                [(Head(RepoURL(None), "HEAD"),
-                  str(self.repo.revparse_single("HEAD").id),)])
-
-        return result
-
-
-    def rebuild_history(self):
-        """
-        Returns
-        history[Head][commit hash represented as string of 40 characters]
-                index, an ordinal number such that
-                commit a is an ancestor of commit b -> index(a) < index(b)
-        """
-        processed = []
-        history = collections.OrderedDict()
-        args = ["git", "log", "--topo-order", "--pretty=tformat:%H"]
-        for head, rev in self.repo_heads.items():
-            if head in history:
-                raise GSException("head \"%s\" is not unique." % (head,))
-
-            sp = subprocess.Popen(args + processed + [rev],
-                                  cwd=self.repo.path,
-                                  env={},
-                                  stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT)
-
-            result = {}
-            for l in sp.stdout:
-                result[l.strip()] = len(result)
-            # reverse indexes
-            history[head] = {commit : len(result) - val for commit, val in
-                             result.items()}
-
-            sp.communicate()
-            if sp.returncode != 0:
-                raise GSError("git log exited with an error:\n" +
-                              "\n".join(history[head]))
-
-            processed.append("^%s" % (rev,))
-
-        return history
 
 
     def get_cache(self):
@@ -315,7 +317,7 @@ class SortIndex(object):
         ) for head, log in history.items()]
 
 
-    def get_history(self, skip_rebuild):
+    def load_history(self, skip_rebuild):
         rebuild = False
         cache = self.get_cache()
         try:
@@ -333,7 +335,7 @@ class SortIndex(object):
             if skip_rebuild:
                 history = None
             else:
-                history = self.rebuild_history()
+                history = get_history(self.repo, self.repo_heads)
                 cache["version"] = self.cache_version
                 cache["history"] = self.gen_cache_history(history)
                 # clean older cache format
