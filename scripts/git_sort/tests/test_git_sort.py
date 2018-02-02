@@ -135,8 +135,6 @@ class TestIndex(unittest.TestCase):
 
         self.index = git_sort.SortIndex(self.repo)
 
-        #sys.stdin.readline()
-
 
     def tearDown(self):
         shutil.rmtree(os.environ["XDG_CACHE_HOME"])
@@ -155,6 +153,10 @@ class TestIndex(unittest.TestCase):
     def test_sort(self):
         mapping = {commit : subject for commit, subject in self.commits}
         r = self.index.sort(mapping)
+        self.assertEqual(
+            len(mapping),
+            0
+        )
         self.assertEqual(
             len(r),
             1
@@ -180,6 +182,7 @@ class TestIndexLinux(unittest.TestCase):
         committer = pygit2.Signature('Cecil Committer', 'cecil@committers.tld')
         tree = self.repo.TreeBuilder().write()
 
+        self.commits = []
         m0 = self.repo.create_commit(
             "refs/heads/mainline",
             author,
@@ -188,6 +191,7 @@ class TestIndexLinux(unittest.TestCase):
             tree,
             []
         )
+        self.commits.append(self.repo.get(m0))
 
         n0 = self.repo.create_commit(
             "refs/heads/net",
@@ -197,11 +201,12 @@ class TestIndexLinux(unittest.TestCase):
             tree,
             [m0]
         )
+        self.commits.append(self.repo.get(n0))
 
-        self.repo.checkout("ref/heads/mainline")
+        self.repo.checkout("refs/heads/mainline")
 
         m1 = self.repo.create_commit(
-            "refs/heads/net",
+            "refs/heads/mainline",
             author,
             committer,
             "mainline 1, merge net\n\nlog",
@@ -209,9 +214,19 @@ class TestIndexLinux(unittest.TestCase):
             [m0, n0]
         )
 
+        self.repo.remotes.create("origin",
+                                 "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git")
+        self.repo.references.create("refs/remotes/origin/master", m1)
+
+        self.repo.remotes.create("net",
+                                 "git://git.kernel.org/pub/scm/linux/kernel/git/davem/net.git")
+        self.repo.references.create("refs/remotes/net/master", n0)
+
+        self.heads = {"mainline" : str(m1),
+                      "net" : str(n0)}
         self.index = git_sort.SortIndex(self.repo)
 
-        sys.stdin.readline()
+        #sys.stdin.readline()
 
 
     def tearDown(self):
@@ -220,4 +235,34 @@ class TestIndexLinux(unittest.TestCase):
 
 
     def test_index(self):
-        self.assertTrue(True)
+        self.assertEqual(
+            self.index.repo_heads,
+            collections.OrderedDict([
+                (git_sort.Head(git_sort.RepoURL("torvalds/linux.git")),
+                 self.heads["mainline"]),
+                (git_sort.Head(git_sort.RepoURL("davem/net.git")),
+                 self.heads["net"]),
+            ])
+        )
+
+
+    def test_sort(self):
+        mapping = {str(commit.id) : commit.message for commit in self.commits}
+        r = self.index.sort(mapping)
+        self.assertEqual(
+            len(mapping),
+            0
+        )
+        self.assertEqual(
+            len(r),
+            2
+        )
+        r2 = r.items()[0]
+        self.assertEqual(
+            r2[0],
+            git_sort.Head(git_sort.RepoURL("torvalds/linux.git"))
+        )
+        self.assertEqual(
+            r2[1],
+            [commit.message for commit in self.commits]
+        )
