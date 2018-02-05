@@ -6,14 +6,18 @@ from __future__ import print_function
 import collections
 import itertools
 import os
+import os.path
 import pygit2
+import shelve
 import shutil
+import StringIO
 import subprocess
 import sys
 import tempfile
 import unittest
 
 import git_sort
+import lib
 
 
 class TestRepoURL(unittest.TestCase):
@@ -135,17 +139,15 @@ class TestIndex(unittest.TestCase):
 
         self.index = git_sort.SortIndex(self.repo)
 
-        #sys.stdin.readline()
-
 
     def tearDown(self):
         shutil.rmtree(os.environ["XDG_CACHE_HOME"])
         shutil.rmtree(self.repo_dir)
 
 
-    def test_index(self):
+    def test_heads(self):
         self.assertEqual(
-            self.index.repo_heads,
+            git_sort.get_heads(self.repo),
             collections.OrderedDict([
                 (git_sort.Head(git_sort.RepoURL(None), "HEAD"),
                  str(self.commits[-1][0]),)])
@@ -155,6 +157,10 @@ class TestIndex(unittest.TestCase):
     def test_sort(self):
         mapping = {commit : subject for commit, subject in self.commits}
         r = self.index.sort(mapping)
+        self.assertEqual(
+            len(mapping),
+            0
+        )
         self.assertEqual(
             len(r),
             1
@@ -180,6 +186,7 @@ class TestIndexLinux(unittest.TestCase):
         committer = pygit2.Signature('Cecil Committer', 'cecil@committers.tld')
         tree = self.repo.TreeBuilder().write()
 
+        self.commits = []
         m0 = self.repo.create_commit(
             "refs/heads/mainline",
             author,
@@ -188,6 +195,7 @@ class TestIndexLinux(unittest.TestCase):
             tree,
             []
         )
+        self.commits.append(self.repo.get(m0))
 
         n0 = self.repo.create_commit(
             "refs/heads/net",
@@ -197,11 +205,12 @@ class TestIndexLinux(unittest.TestCase):
             tree,
             [m0]
         )
+        self.commits.append(self.repo.get(n0))
 
-        self.repo.checkout("ref/heads/mainline")
+        self.repo.checkout("refs/heads/mainline")
 
         m1 = self.repo.create_commit(
-            "refs/heads/net",
+            "refs/heads/mainline",
             author,
             committer,
             "mainline 1, merge net\n\nlog",
@@ -209,9 +218,19 @@ class TestIndexLinux(unittest.TestCase):
             [m0, n0]
         )
 
+        self.repo.remotes.create("origin",
+                                 "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git")
+        self.repo.references.create("refs/remotes/origin/master", m1)
+
+        self.repo.remotes.create("net",
+                                 "git://git.kernel.org/pub/scm/linux/kernel/git/davem/net.git")
+        self.repo.references.create("refs/remotes/net/master", n0)
+
+        self.heads = {"mainline" : str(m1),
+                      "net" : str(n0)}
         self.index = git_sort.SortIndex(self.repo)
 
-        sys.stdin.readline()
+        #sys.stdin.readline()
 
 
     def tearDown(self):
@@ -219,5 +238,141 @@ class TestIndexLinux(unittest.TestCase):
         shutil.rmtree(self.repo_dir)
 
 
-    def test_index(self):
-        self.assertTrue(True)
+    def test_heads(self):
+        self.assertEqual(
+            git_sort.get_heads(self.repo),
+            collections.OrderedDict([
+                (git_sort.Head(git_sort.RepoURL("torvalds/linux.git")),
+                 self.heads["mainline"]),
+                (git_sort.Head(git_sort.RepoURL("davem/net.git")),
+                 self.heads["net"]),
+            ])
+        )
+
+
+    def test_sort(self):
+        mapping = {str(commit.id) : commit.message for commit in self.commits}
+        r = self.index.sort(mapping)
+        self.assertEqual(
+            len(mapping),
+            0
+        )
+        self.assertEqual(
+            len(r),
+            2
+        )
+        r2 = r.items()[0]
+        self.assertEqual(
+            r2[0],
+            git_sort.Head(git_sort.RepoURL("torvalds/linux.git"))
+        )
+        self.assertEqual(
+            r2[1],
+            [commit.message for commit in self.commits]
+        )
+
+
+class TestCache(unittest.TestCase):
+    def setUp(self):
+        os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
+        self.repo_dir = tempfile.mkdtemp(prefix="gs_repo")
+        self.repo = pygit2.init_repository(self.repo_dir)
+
+        author = pygit2.Signature('Alice Author', 'alice@authors.tld')
+        committer = pygit2.Signature('Cecil Committer', 'cecil@committers.tld')
+        tree = self.repo.TreeBuilder().write()
+
+        parent = []
+        commits = []
+        for i in range(3):
+            subject = "commit %d" % (i,)
+            cid = self.repo.create_commit(
+                "refs/heads/master",
+                author,
+                committer,
+                "%s\n\nlog" % (subject,),
+                tree,
+                parent
+            )
+            parent = [cid]
+            commits.append("%s %s" % (str(cid), subject,))
+        self.commits = commits
+
+
+    def tearDown(self):
+        shutil.rmtree(os.environ["XDG_CACHE_HOME"])
+        shutil.rmtree(self.repo_dir)
+
+
+    def test_cache(self):
+        gs_path = os.path.join(lib.libdir(), "git_sort.py")
+        cache_path = os.path.join(os.environ["XDG_CACHE_HOME"], "git-sort")
+
+        input_text = "\n".join(self.commits)
+
+        os.chdir(self.repo_dir)
+        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        self.assertEqual(output[-1], "Will rebuild history")
+
+        # "-d" should not create a cache
+        retval = 0
+        try:
+            os.stat(cache_path)
+        except OSError as e:
+            retval = e.errno
+        self.assertEqual(retval, 2)
+
+        sp = subprocess.Popen(gs_path,
+                              stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+        output_ref, err = sp.communicate(input_text)
+        time1 = os.stat(cache_path).st_mtime
+
+        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        self.assertEqual(output[-1], "Will not rebuild history")
+
+        # "-d" should not modify a cache
+        self.assertEqual(os.stat(cache_path).st_mtime, time1)
+
+        # test version number change
+        shelve.open(cache_path)["version"] = 1
+        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        self.assertEqual(output[1], "Unsupported cache version")
+        self.assertEqual(output[-1], "Will rebuild history")
+
+        sp = subprocess.Popen(gs_path,
+                              stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+        output, err = sp.communicate(input_text)
+        self.assertEqual(output, output_ref)
+
+        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        self.assertEqual(output[-1], "Will not rebuild history")
+
+        # corrupt the cache structure
+        shelve.open(cache_path)["history"] = {
+            "linux.git" : ["abc", "abc", "abc"],
+            "net" : ["abc", "abc", "abc"],
+            "net-next" : ["abc", "abc", "abc"],
+        }
+        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        self.assertEqual(output[1], "Inconsistent cache content")
+        self.assertEqual(output[-1], "Will rebuild history")
+
+        sp = subprocess.Popen(gs_path,
+                              stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+        output, err = sp.communicate(input_text)
+        self.assertEqual(output, output_ref)
+
+        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        self.assertEqual(output[-1], "Will not rebuild history")
+
+
+if __name__ == '__main__':
+    # Run a single testcase
+    suite = unittest.TestLoader().loadTestsFromTestCase(TestCache)
+    unittest.TextTestRunner(verbosity=2).run(suite)
