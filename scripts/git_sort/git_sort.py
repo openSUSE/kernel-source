@@ -381,6 +381,14 @@ class Cache(object):
             except KeyError:
                 raise CInconsistent
 
+            # This detailed check may be needed if an older git-sort (which
+            # didn't set a cache version) modified the cache.
+            if (not isinstance(cache_history, types.ListType) or
+                len(cache_history) < 1 or 
+                len(cache_history[0]) != 4 or
+                not isinstance(cache_history[0][3], types.DictType)):
+                raise CInconsistent
+
             return collections.OrderedDict([
                 (
                     (Head(RepoURL(e[0]), e[1]), e[2],),
