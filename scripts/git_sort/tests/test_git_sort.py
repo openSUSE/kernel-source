@@ -6,14 +6,18 @@ from __future__ import print_function
 import collections
 import itertools
 import os
+import os.path
 import pygit2
+import shelve
 import shutil
+import StringIO
 import subprocess
 import sys
 import tempfile
 import unittest
 
 import git_sort
+import lib
 
 
 class TestRepoURL(unittest.TestCase):
@@ -266,3 +270,109 @@ class TestIndexLinux(unittest.TestCase):
             r2[1],
             [commit.message for commit in self.commits]
         )
+
+
+class TestCache(unittest.TestCase):
+    def setUp(self):
+        os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
+        self.repo_dir = tempfile.mkdtemp(prefix="gs_repo")
+        self.repo = pygit2.init_repository(self.repo_dir)
+
+        author = pygit2.Signature('Alice Author', 'alice@authors.tld')
+        committer = pygit2.Signature('Cecil Committer', 'cecil@committers.tld')
+        tree = self.repo.TreeBuilder().write()
+
+        parent = []
+        commits = []
+        for i in range(3):
+            subject = "commit %d" % (i,)
+            cid = self.repo.create_commit(
+                "refs/heads/master",
+                author,
+                committer,
+                "%s\n\nlog" % (subject,),
+                tree,
+                parent
+            )
+            parent = [cid]
+            commits.append("%s %s" % (str(cid), subject,))
+        self.commits = commits
+
+
+    def tearDown(self):
+        shutil.rmtree(os.environ["XDG_CACHE_HOME"])
+        shutil.rmtree(self.repo_dir)
+
+
+    def test_cache(self):
+        gs_path = os.path.join(lib.libdir(), "git_sort.py")
+        cache_path = os.path.join(os.environ["XDG_CACHE_HOME"], "git-sort")
+
+        input_text = "\n".join(self.commits)
+
+        os.chdir(self.repo_dir)
+        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        self.assertEqual(output[-1], "Will rebuild history")
+
+        # "-d" should not create a cache
+        retval = 0
+        try:
+            os.stat(cache_path)
+        except OSError as e:
+            retval = e.errno
+        self.assertEqual(retval, 2)
+
+        sp = subprocess.Popen(gs_path,
+                              stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+        output_ref, err = sp.communicate(input_text)
+        time1 = os.stat(cache_path).st_mtime
+
+        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        self.assertEqual(output[-1], "Will not rebuild history")
+
+        # "-d" should not modify a cache
+        self.assertEqual(os.stat(cache_path).st_mtime, time1)
+
+        # test version number change
+        shelve.open(cache_path)["version"] = 1
+        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        self.assertEqual(output[1], "(omitted)")
+        self.assertEqual(output[-1], "Will rebuild history")
+
+        sp = subprocess.Popen(gs_path,
+                              stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+        output, err = sp.communicate(input_text)
+        self.assertEqual(output, output_ref)
+
+        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        self.assertEqual(output[-1], "Will not rebuild history")
+
+        # corrupt the cache structure
+        shelve.open(cache_path)["history"] = {
+            "linux.git" : ["abc", "abc", "abc"],
+            "net" : ["abc", "abc", "abc"],
+            "net-next" : ["abc", "abc", "abc"],
+        }
+        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        self.assertEqual(output[1], "(omitted)")
+        self.assertEqual(output[-1], "Will rebuild history")
+
+        sp = subprocess.Popen(gs_path,
+                              stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+        output, err = sp.communicate(input_text)
+        self.assertEqual(output, output_ref)
+
+        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        self.assertEqual(output[-1], "Will not rebuild history")
+
+
+if __name__ == '__main__':
+    # Run a single testcase
+    suite = unittest.TestLoader().loadTestsFromTestCase(TestCache)
+    unittest.TextTestRunner(verbosity=2).run(suite)
