@@ -460,6 +460,7 @@ class SortIndex(object):
             self.history = collections.OrderedDict(
                     [(key[0], log,) for key, log in history.items()])
         self.version_indexes = None
+        self.repo_heads = repo_heads
 
 
     def lookup(self, commit):

@@ -4,13 +4,11 @@
 from __future__ import print_function
 
 import collections
-import itertools
 import os
 import os.path
 import pygit2
 import shelve
 import shutil
-import StringIO
 import subprocess
 import sys
 import tempfile
