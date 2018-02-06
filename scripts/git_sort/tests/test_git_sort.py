@@ -335,6 +335,16 @@ class TestCache(unittest.TestCase):
         # "-d" should not modify a cache
         self.assertEqual(os.stat(cache_path).st_mtime, time1)
 
+        # test that git-sort action is the same as "-d" states (no cache
+        # rebuild)
+        sp = subprocess.Popen(gs_path,
+                              stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+        output, err = sp.communicate(input_text)
+        self.assertEqual(output, output_ref)
+        self.assertEqual(os.stat(cache_path).st_mtime, time1)
+
         # test version number change
         shelve.open(cache_path)["version"] = 1
         output = subprocess.check_output([gs_path, "-d"]).splitlines()
