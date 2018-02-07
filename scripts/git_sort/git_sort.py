@@ -440,7 +440,7 @@ class SortIndex(object):
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
 
-        if needs_rebuild or history.keys() != repo_heads:
+        if needs_rebuild or history.keys() != repo_heads.items():
             try:
                 history = get_history(repo, repo_heads)
             except GSError as err:
@@ -460,6 +460,7 @@ class SortIndex(object):
             self.history = collections.OrderedDict(
                     [(key[0], log,) for key, log in history.items()])
         self.version_indexes = None
+        self.repo_heads = repo_heads
 
 
     def lookup(self, commit):
