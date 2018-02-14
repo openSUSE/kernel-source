@@ -53,7 +53,7 @@ if __name__ == "__main__":
 
     repo_path = lib.repo_path()
     repo = pygit2.Repository(repo_path)
-    index = lib.git_sort.SortIndex(repo)
+    index = git_sort.SortIndex(repo)
 
     if args.series is not None:
         args.series = os.path.abspath(args.series)
@@ -67,7 +67,7 @@ if __name__ == "__main__":
 
     try:
         before, inside, after = lib.split_series(lines)
-    except lib.KSNotFound:
+    except lib.KSNotFound as err:
         if args.series is None:
             before = []
             inside = lines
