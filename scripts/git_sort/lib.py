@@ -159,8 +159,14 @@ def split_series(series):
                 current.extend(whitespace)
                 whitespace = []
             current.append(line)
+    if comments:
+        current.extend(comments)
+        comments = []
+    if whitespace:
+        current.extend(whitespace)
+        whitespace = []
 
-    if current == before:
+    if current is before:
         raise KSNotFound("Sorted subseries not found.")
 
     current.extend(comments)
