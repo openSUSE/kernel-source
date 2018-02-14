@@ -138,6 +138,7 @@ class TestQuiltMode(unittest.TestCase):
             tree.write(),
             [m0]
         )
+        self.m1 = m1
         self.repo.create_tag("v4.10-rc5", m1, pygit2.GIT_REF_OID, committer,
                              "Linux 4.10-rc5")
 
@@ -234,7 +235,19 @@ Signed-off-by: Christoffer Dall <cdall@linaro.org>
         qm_path = os.path.join(lib.libdir(), "quilt-mode.sh")
 
         subprocess.check_output(". %s; qgoto %s" % (qm_path, str(self.m2)),
-                                shell=True, executable="/bin/bash")
+                              shell=True, executable="/bin/bash")
+
+        try:
+            result = subprocess.check_output(
+                ". %s; qdupcheck %s" % (qm_path, str(self.m1)), shell=True,
+                executable="/bin/bash")
+        except subprocess.CalledProcessError as err:
+            self.assertEqual(err.returncode, 1)
+            self.assertEqual(err.output.splitlines()[1].strip(),
+                             "patches.suse/Linux-4.10-rc5.patch")
+        else:
+            self.assertTrue(False)
+
 
 if __name__ == '__main__':
     # Run a single testcase
