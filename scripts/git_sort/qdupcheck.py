@@ -43,9 +43,16 @@ if __name__ == "__main__":
             if references:
                 print("for\n\t%s" % (references,))
 
-            top = subprocess.check_output(
-                ("quilt", "--quiltrc", "-", "top",), cwd=cwd,
-                preexec_fn=lib.restore_signals).strip()
+            try:
+                top = subprocess.check_output(
+                    ("quilt", "--quiltrc", "-", "top",), cwd=cwd,
+                    preexec_fn=lib.restore_signals,
+                    stderr=subprocess.STDOUT).strip()
+            except subprocess.CalledProcessError as err:
+                if err.output == "No patches applied\n":
+                    top = None
+                else:
+                    raise
             if top == patch.name:
                 print("This is the top patch.")
             sys.exit(1)

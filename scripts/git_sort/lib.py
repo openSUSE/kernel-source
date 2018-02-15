@@ -70,7 +70,15 @@ def check_series():
     if retval:
         return True
     
-    subprocess.check_call(["quilt", "top"], preexec_fn=restore_signals)
+    try:
+        subprocess.check_output(("quilt", "--quiltrc", "-", "top",),
+                                preexec_fn=restore_signals,
+                                stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as err:
+        if err.output == "No patches applied\n":
+            pass
+        else:
+            raise
     if check():
         return True
     else:
@@ -159,8 +167,14 @@ def split_series(series):
                 current.extend(whitespace)
                 whitespace = []
             current.append(line)
+    if comments:
+        current.extend(comments)
+        comments = []
+    if whitespace:
+        current.extend(whitespace)
+        whitespace = []
 
-    if current == before:
+    if current is before:
         raise KSNotFound("Sorted subseries not found.")
 
     current.extend(comments)

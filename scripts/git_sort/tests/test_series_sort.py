@@ -112,7 +112,78 @@ class TestSeriesSort(unittest.TestCase):
 
         # setup stub kernel-source content
         self.ks_dir = tempfile.mkdtemp(prefix="gs_ks")
-        open(os.path.join(self.ks_dir, "series.conf"), mode="w").write(
+        k_org_canon_prefix = "git://git.kernel.org/pub/scm/linux/kernel/git/"
+        patch_dir = os.path.join(self.ks_dir, "patches.suse")
+        os.mkdir(patch_dir)
+        os.chdir(patch_dir)
+        write_patch("mainline0.patch", mainline="v3.45-rc6", commit=str(m0))
+        write_patch("net0.patch", mainline="v3.45-rc6", commit=str(n0))
+        write_patch("net1.patch", repo=k_org_canon_prefix + "davem/net.git",
+                    commit=str(n1))
+        write_patch("net2.patch", repo=k_org_canon_prefix + "davem/net.git",
+                    commit=str(n2))
+        write_patch("net2.patch", repo=k_org_canon_prefix + "davem/net.git",
+                    commit=str(n2))
+        write_patch("oot0.patch", mainline="no")
+        write_patch("oot1.patch", mainline="no")
+
+    def tearDown(self):
+        shutil.rmtree(os.environ["XDG_CACHE_HOME"])
+        shutil.rmtree(os.environ["LINUX_GIT"])
+        shutil.rmtree(self.ks_dir)
+
+
+    def test_absent(self):
+        ss_path = os.path.join(lib.libdir(), "series_sort.py")
+        os.chdir(self.ks_dir)
+
+        (tmp, series,) = tempfile.mkstemp(dir=self.ks_dir)
+        open(series, mode="w").write(
+"""
+	patches.suse/unsorted-before.patch
+""")
+
+        try:
+            output = subprocess.check_output([ss_path, series],
+                                             stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as err:
+            self.assertEqual(err.output, "Error: Sorted subseries not found.\n")
+        else:
+            self.assertTrue(False)
+
+        os.unlink(series)
+
+
+    def test_sort_small(self):
+        ss_path = os.path.join(lib.libdir(), "series_sort.py")
+        os.chdir(self.ks_dir)
+
+        (tmp, series,) = tempfile.mkstemp(dir=self.ks_dir)
+        open(series, mode="w").write(
+"""########################################################
+	# sorted patches
+	########################################################
+	patches.suse/mainline0.patch
+	patches.suse/net0.patch
+	########################################################
+	# end of sorted patches
+	########################################################
+""")
+
+        subprocess.check_call([ss_path, "-c", series])
+        content = open(series).read()
+        output = subprocess.check_call([ss_path, series])
+        self.assertEqual(open(series).read(), content)
+
+        os.unlink(series)
+
+
+    def test_sort(self):
+        ss_path = os.path.join(lib.libdir(), "series_sort.py")
+        os.chdir(self.ks_dir)
+
+        (tmp, series,) = tempfile.mkstemp(dir=self.ks_dir)
+        open(series, mode="w").write(
 """
 	patches.suse/unsorted-before.patch
 
@@ -136,35 +207,13 @@ class TestSeriesSort(unittest.TestCase):
 
 	patches.suse/unsorted-after.patch
 """)
-        k_org_canon_prefix = "git://git.kernel.org/pub/scm/linux/kernel/git/"
-        patch_dir = os.path.join(self.ks_dir, "patches.suse")
-        os.mkdir(patch_dir)
-        os.chdir(patch_dir)
-        write_patch("mainline0.patch", mainline="v3.45-rc6", commit=str(m0))
-        write_patch("net0.patch", mainline="v3.45-rc6", commit=str(n0))
-        write_patch("net1.patch", repo=k_org_canon_prefix + "davem/net.git",
-                    commit=str(n1))
-        write_patch("net2.patch", repo=k_org_canon_prefix + "davem/net.git",
-                    commit=str(n2))
-        write_patch("net2.patch", repo=k_org_canon_prefix + "davem/net.git",
-                    commit=str(n2))
-        write_patch("oot0.patch", mainline="no")
-        write_patch("oot1.patch", mainline="no")
 
-    def tearDown(self):
-        shutil.rmtree(os.environ["XDG_CACHE_HOME"])
-        shutil.rmtree(os.environ["LINUX_GIT"])
-        shutil.rmtree(self.ks_dir)
+        subprocess.check_call([ss_path, "-c", series])
+        content = open(series).read()
+        output = subprocess.check_call([ss_path, series])
+        self.assertEqual(open(series).read(), content)
 
-
-    def test_sort(self):
-        ss_path = os.path.join(lib.libdir(), "series_sort.py")
-        os.chdir(self.ks_dir)
-
-        subprocess.check_call([ss_path, "-c", "series.conf"])
-        content = open("series.conf").read()
-        output = subprocess.check_call([ss_path, "series.conf"])
-        self.assertEqual(open("series.conf").read(), content)
+        os.unlink(series)
 
 
 if __name__ == '__main__':
