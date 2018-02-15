@@ -107,6 +107,8 @@ class TestQuiltMode(unittest.TestCase):
         # setup stub linux repository
         os.environ["LINUX_GIT"] = tempfile.mkdtemp(prefix="gs_repo")
         self.repo = pygit2.init_repository(os.environ["LINUX_GIT"])
+        self.repo.config["user.email"] = "agraf@suse.de"
+        self.repo.config["user.name"] = "Alexander Graf"
         readme_path = os.path.join(os.environ["LINUX_GIT"], "README")
 
         author = pygit2.Signature("Alice Author", "alice@authors.tld")
@@ -249,14 +251,59 @@ Signed-off-by: Christoffer Dall <cdall@linaro.org>
         subprocess.check_output(". %s; qgoto %s" % (qm_path, str(self.m0)),
                               shell=True, executable="/bin/bash")
 
+        # test qdupcheck
         try:
             result = subprocess.check_output(
                 ". %s; qdupcheck %s" % (qm_path, str(self.m1)), shell=True,
                 executable="/bin/bash")
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
-            self.assertEqual(err.output.splitlines()[1].strip(),
+            self.assertEqual(err.output.splitlines()[-1].strip(),
                              "patches.suse/Linux-4.10-rc5.patch")
+        else:
+            self.assertTrue(False)
+        
+        subprocess.check_output(". %s; qgoto %s" % (qm_path, str(self.m1)),
+                              shell=True, executable="/bin/bash")
+
+        try:
+            result = subprocess.check_output(
+                ". %s; qdupcheck %s" % (qm_path, str(self.m1)), shell=True,
+                executable="/bin/bash")
+        except subprocess.CalledProcessError as err:
+            self.assertEqual(err.returncode, 1)
+            self.assertEqual(err.output.splitlines()[-1].strip(),
+                             "This is the top patch.")
+        else:
+            self.assertTrue(False)
+
+        # import m2
+        subprocess.check_output(". %s; qgoto %s" % (qm_path, str(self.m2)),
+                              shell=True, executable="/bin/bash")
+        subprocess.check_output(
+            """. %s; qcp -r "bsc#1077761" -d patches.suse %s""" % (
+                qm_path, str(self.m2)), shell=True, executable="/bin/bash")
+
+        retval = subprocess.check_output(("quilt", "--quiltrc", "-", "next",))
+        name = "patches.suse/KVM-arm-arm64-vgic-v3-Add-accessors-for-the-ICH_APxR.patch"
+        self.assertEqual(retval.strip(), name)
+
+        try:
+            retval = open(os.path.join(self.ks_dir, name)).readlines().index(
+                "Acked-by: Alexander Graf <agraf@suse.de>\n")
+        except ValueError:
+            retval = -1
+        self.assertNotEqual(retval, -1)
+
+        retval = subprocess.check_output(("quilt", "--quiltrc", "-", "push",))
+
+        try:
+            result = subprocess.check_output(("quilt", "--quiltrc", "-",
+                                              "pop",), stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as err:
+            self.assertEqual(err.returncode, 1)
+            self.assertTrue(err.output.endswith(
+                "needs to be refreshed first.\n"))
         else:
             self.assertTrue(False)
 
