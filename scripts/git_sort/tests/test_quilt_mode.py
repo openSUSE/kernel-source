@@ -124,6 +124,7 @@ class TestQuiltMode(unittest.TestCase):
             tree.write(),
             []
         )
+        self.m0 = m0
         self.repo.create_tag("v4.9", m0, pygit2.GIT_REF_OID, committer,
                              "Linux 4.9")
 
@@ -234,7 +235,18 @@ Signed-off-by: Christoffer Dall <cdall@linaro.org>
     def test_quilt_mode(self):
         qm_path = os.path.join(lib.libdir(), "quilt-mode.sh")
 
-        subprocess.check_output(". %s; qgoto %s" % (qm_path, str(self.m2)),
+        # test series file replacement
+        entries = ["%s\n" % (l,) for l in map(lambda line : line.strip(),
+                                  open("series").readlines()) if l and not
+                   l.startswith("#")]
+        # remove the symlink
+        os.unlink("series")
+        open("series", mode="w").writelines(entries)
+        subprocess.check_output(
+            [os.path.join(lib.libdir(), "qgoto.py"), str(self.m0)])
+
+        # test qgoto
+        subprocess.check_output(". %s; qgoto %s" % (qm_path, str(self.m0)),
                               shell=True, executable="/bin/bash")
 
         try:

@@ -70,7 +70,15 @@ def check_series():
     if retval:
         return True
     
-    subprocess.check_call(["quilt", "top"], preexec_fn=restore_signals)
+    try:
+        subprocess.check_output(("quilt", "--quiltrc", "-", "top",),
+                                preexec_fn=restore_signals,
+                                stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as err:
+        if err.output == "No patches applied\n":
+            pass
+        else:
+            raise
     if check():
         return True
     else:
