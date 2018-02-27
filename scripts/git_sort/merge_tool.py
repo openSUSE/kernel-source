@@ -7,7 +7,7 @@ Depends on `merge` from rcs
 Add a section like this to git config:
 
 [mergetool "git-sort"]
-	cmd = /<path>/merge_tool.py $LOCAL $BASE $REMOTE $MERGED
+	cmd = scripts/git_sort/merge_tool.py $LOCAL $BASE $REMOTE $MERGED
 	trustExitCode = true
 
 Then call
