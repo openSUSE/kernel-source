@@ -15,6 +15,7 @@ import re
 import shelve
 import subprocess
 import sys
+import types
 
 
 class GSException(BaseException):
@@ -182,162 +183,284 @@ remotes = (
 remote_index = dict(zip(remotes, range(len(remotes))))
 oot = Head(RepoURL(None), "out-of-tree patches")
 
+remote_match = re.compile("remote\..+\.url")
+
+
+def get_heads(repo):
+    """
+    Returns
+    repo_heads[Head]
+        sha1
+    """
+    result = collections.OrderedDict()
+    repo_remotes = collections.OrderedDict([
+        (RepoURL(repo.config[name]), ".".join(name.split(".")[1:-1]))
+        for name in repo.config
+        if remote_match.match(name)])
+
+    for head in remotes:
+        try:
+            remote_name = repo_remotes[head.repo_url]
+        except KeyError:
+            continue
+
+        rev = "remotes/%s/%s" % (remote_name, head.rev,)
+        try:
+            commit = repo.revparse_single(rev)
+        except KeyError:
+            raise GSError(
+                "Could not read revision \"%s\". Perhaps you need to "
+                "fetch from remote \"%s\", ie. `git fetch %s`." % (
+                    rev, remote_name, remote_name,))
+        result[head] = str(commit.id)
+
+    if len(result) == 0 or result.keys()[0] != remotes[0]:
+        # According to the urls in remotes, this is not a clone of linux.git
+        # Sort according to commits reachable from the current head
+        result = collections.OrderedDict(
+            [(Head(RepoURL(None), "HEAD"),
+              str(repo.revparse_single("HEAD").id),)])
+
+    return result
+
+
+def get_history(repo, repo_heads):
+    """
+    Returns
+    history[Head][commit hash represented as string of 40 characters]
+            index, an ordinal number such that
+            commit a is an ancestor of commit b -> index(a) < index(b)
+    """
+    processed = []
+    history = collections.OrderedDict()
+    args = ["git", "log", "--topo-order", "--pretty=tformat:%H"]
+    for head, rev in repo_heads.items():
+        if head in history:
+            raise GSException("head \"%s\" is not unique." % (head,))
+
+        sp = subprocess.Popen(args + processed + [rev],
+                              cwd=repo.path,
+                              env={},
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+
+        result = {}
+        for l in sp.stdout:
+            result[l.strip()] = len(result)
+        # reverse indexes
+        history[head] = {commit : len(result) - val for commit, val in
+                         result.items()}
+
+        sp.communicate()
+        if sp.returncode != 0:
+            raise GSError("git log exited with an error:\n" +
+                          "\n".join(history[head]))
+
+        processed.append("^%s" % (rev,))
+
+    return history
+
+
+class CException(BaseException):
+    pass
+
+
+class CError(CException):
+    pass
+
+
+class CNeedsRebuild(CException):
+    pass
+
+
+class CAbsent(CNeedsRebuild):
+    pass
+
+
+class CKeyError(CNeedsRebuild):
+    pass
+
+
+class CUnsupported(CNeedsRebuild):
+    pass
+
+
+class CInconsistent(CNeedsRebuild):
+    pass
+
+
+class Cache(object):
+    """
+    cache
+        version
+        history[]
+            (url, rev, sha1,
+             history[commit hash represented as string of 40 characters]
+                index (as described in get_history())
+             ,)
+
+    The cache is stored using basic types.
+    """
+    version = 3
+
+
+    def __init__(self, write_enable=False):
+        self.write_enable = write_enable
+        self.closed = True
+        try:
+            cache_dir = os.environ["XDG_CACHE_HOME"]
+        except KeyError:
+            cache_dir = os.path.expanduser("~/.cache")
+        cache_path = os.path.join(cache_dir, "git-sort")
+        try:
+            os.stat(cache_path)
+        except OSError as e:
+            if e.errno == 2:
+                if write_enable:
+                    if not os.path.isdir(cache_dir):
+                        try:
+                            os.makedirs(cache_dir)
+                        except OSError as err:
+                            raise CError("Could not create cache directory:\n" +
+                                         str(err))
+                else:
+                    raise CAbsent
+            else:
+                raise
+
+        flag_map = {False : "r", True : "n"}
+        self.cache = shelve.open(cache_path, flag=flag_map[write_enable])
+        self.closed = False
+        if write_enable:
+            self.cache["version"] = Cache.version
+
+
+    def __del__(self):
+        self.close()
+
+
+    def __enter__(self):
+        return self
+
+
+    def __exit__(self, *args):
+        self.close()
+
+
+    def close(self):
+        if not self.closed:
+            self.cache.close()
+        self.closed = True
+
+
+    def __getitem__(self, key):
+        """
+        Supported keys:
+            "version"
+                int
+            "history"
+                OrderedDict((Head, sha1) : history)
+        """
+        if self.closed:
+            raise ValueError
+
+        if key == "version":
+            try:
+                return self.cache["version"]
+            except KeyError:
+                raise CKeyError
+        elif key == "history":
+            try:
+                if self.cache["version"] != Cache.version:
+                    raise CUnsupported
+            except KeyError:
+                raise CUnsupported
+
+            try:
+                cache_history = self.cache["history"]
+            except KeyError:
+                raise CInconsistent
+
+            # This detailed check may be needed if an older git-sort (which
+            # didn't set a cache version) modified the cache.
+            if (not isinstance(cache_history, types.ListType) or
+                len(cache_history) < 1 or 
+                len(cache_history[0]) != 4 or
+                not isinstance(cache_history[0][3], types.DictType)):
+                raise CInconsistent
+
+            return collections.OrderedDict([
+                (
+                    (Head(RepoURL(e[0]), e[1]), e[2],),
+                    e[3],
+                ) for e in cache_history])
+        else:
+            raise KeyError
+
+
+    def __setitem__(self, key, value):
+        """
+        Supported keys:
+            "history"
+                OrderedDict((Head, sha1) : history)
+        """
+        if self.closed or not self.write_enable:
+            raise ValueError
+
+        if key == "history":
+            self.cache["history"] = [(
+                repr(desc[0].repo_url), desc[0].rev, desc[1], log,
+            ) for desc, log in value.items()]
+        else:
+            raise KeyError
+
 
 class SortIndex(object):
-    cache_version = 3
     version_match = re.compile("refs/tags/v(2\.6\.\d+|\d\.\d+)(-rc\d+)?$")
 
 
-    def __init__(self, repo, skip_rebuild=False):
+    def __init__(self, repo):
         self.repo = repo
+        needs_rebuild = False
         try:
-            self.repo_heads = self.get_heads()
-            self.history = self.get_history(skip_rebuild)
+            with Cache() as cache:
+                try:
+                    history = cache["history"]
+                except CNeedsRebuild:
+                    needs_rebuild = True
+        except CAbsent:
+            needs_rebuild = True
+        except CError as err:
+            print("Error: %s" % (err,), file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            repo_heads = get_heads(repo)
         except GSError as err:
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
-        self.version_indexes = None
 
-
-    def get_heads(self):
-        """
-        Returns
-        repo_heads[Head]
-            sha1
-        """
-        result = collections.OrderedDict()
-        repo_remotes = []
-        args = ("git", "config", "--get-regexp", "^remote\..+\.url$",)
-        for line in subprocess.check_output(args,
-                                            cwd=self.repo.path,
-                                            env={}).splitlines():
-            name, url = line.split(None, 1)
-            name = name.split(".")[1]
-            url = RepoURL(url)
-            repo_remotes.append((name, url,))
-
-        for head in remotes:
-            for remote_name, remote_url in repo_remotes:
-                if head.repo_url == remote_url:
-                    rev = "remotes/%s/%s" % (remote_name, head.rev,)
-                    try:
-                        commit = self.repo.revparse_single(rev)
-                    except KeyError:
-                        raise GSError(
-                            "Could not read revision \"%s\". Perhaps you need to "
-                            "fetch from remote \"%s\", ie. `git fetch %s`." % (
-                                rev, remote_name, remote_name,))
-                    result[head] = str(commit.id)
-                    break
-
-        if remotes[0] not in result:
-            # According to the urls in remotes, this is not a clone of linux.git
-            # Sort according to commits reachable from the current head
-            result = collections.OrderedDict(
-                [(Head(RepoURL(None), "HEAD"),
-                  str(self.repo.revparse_single("HEAD").id),)])
-
-        return result
-
-
-    def rebuild_history(self):
-        """
-        Returns
-        history[Head][commit hash represented as string of 40 characters]
-                index, an ordinal number such that
-                commit a is an ancestor of commit b -> index(a) < index(b)
-        """
-        processed = []
-        history = collections.OrderedDict()
-        args = ["git", "log", "--topo-order", "--pretty=tformat:%H"]
-        for head, rev in self.repo_heads.items():
-            if head in history:
-                raise GSException("head \"%s\" is not unique." % (head,))
-
-            sp = subprocess.Popen(args + processed + [rev],
-                                  cwd=self.repo.path,
-                                  env={},
-                                  stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT)
-
-            result = {}
-            for l in sp.stdout:
-                result[l.strip()] = len(result)
-            # reverse indexes
-            history[head] = {commit : len(result) - val for commit, val in
-                             result.items()}
-
-            sp.communicate()
-            if sp.returncode != 0:
-                raise GSError("git log exited with an error:\n" +
-                              "\n".join(history[head]))
-
-            processed.append("^%s" % (rev,))
-
-        return history
-
-
-    def get_cache(self):
-        """
-        cache
-            history[]
-                (url, rev, sha1,
-                 history[commit hash represented as string of 40 characters]
-                    index (as described in get_history())
-                 ,)
-
-        The cache is stored using basic types.
-        """
-        return shelve.open(os.path.expanduser("~/.cache/git-sort"))
-
-
-    def parse_cache_history(self, cache_history):
-        """
-        Note that the cache history and self.history have different keys.
-        """
-        return collections.OrderedDict([
-            (
-                (Head(RepoURL(e[0]), e[1]), e[2],),
-                e[3],
-            ) for e in cache_history])
-
-
-    def gen_cache_history(self, history):
-        return [(
-            repr(head.repo_url), head.rev, self.repo_heads[head], log,
-        ) for head, log in history.items()]
-
-
-    def get_history(self, skip_rebuild):
-        rebuild = False
-        cache = self.get_cache()
-        try:
-            if cache["version"] != self.cache_version:
-                rebuild = True
-        except KeyError:
-            rebuild = True
-
-        if not rebuild:
-            c_history = self.parse_cache_history(cache["history"])
-            if c_history.keys() != self.repo_heads.items():
-                rebuild = True
-
-        if rebuild:
-            if skip_rebuild:
-                history = None
-            else:
-                history = self.rebuild_history()
-                cache["version"] = self.cache_version
-                cache["history"] = self.gen_cache_history(history)
-                # clean older cache format
-                if "heads" in cache:
-                    del cache["heads"]
+        if needs_rebuild or history.keys() != repo_heads.items():
+            try:
+                history = get_history(repo, repo_heads)
+            except GSError as err:
+                print("Error: %s" % (err,), file=sys.stderr)
+                sys.exit(1)
+            try:
+                with Cache(write_enable=True) as cache:
+                    cache["history"] = collections.OrderedDict(
+                        [((head, repo_heads[head],), log,)
+                         for head, log in history.items()])
+            except CError as err:
+                print("Error: %s" % (err,), file=sys.stderr)
+                sys.exit(1)
+            self.history = history
         else:
-            history = collections.OrderedDict(
-                [(key[0], log,) for key, log in c_history.items()])
-        cache.close()
-
-        return history
+            # no more need for the head sha1
+            self.history = collections.OrderedDict(
+                    [(key[0], log,) for key, log in history.items()])
+        self.version_indexes = None
+        self.repo_heads = repo_heads
 
 
     def lookup(self, commit):
@@ -423,30 +546,51 @@ if __name__ == "__main__":
     except KeyError:
         path = pygit2.discover_repository(os.getcwd())
     repo = pygit2.Repository(path)
-    index = SortIndex(repo, skip_rebuild=args.dump_heads)
 
     if args.dump_heads:
-        cache = index.get_cache()
+        needs_rebuild = False
         try:
-            version = cache["version"]
-        except KeyError:
+            with Cache() as cache:
+                try:
+                    print("Cached heads (version %d):" % cache["version"])
+                except CKeyError:
+                    print("No usable cache")
+                    needs_rebuild = True
+                else:
+                    try:
+                        history = cache["history"]
+                    except CUnsupported:
+                        print("Unsupported cache version")
+                        needs_rebuild = True
+                    except CInconsistent:
+                        print("Inconsistent cache content")
+                        needs_rebuild = True
+                    else:
+                        pprint.pprint(history.keys())
+        except CAbsent:
             print("No usable cache")
-        else:
-            print("Cached heads (version %d):" % version)
-            if version == index.cache_version:
-                c_history = index.parse_cache_history(cache["history"])
-                pprint.pprint(c_history.keys())
-            else:
-                print("(omitted)")
-        print("Current heads (version %d):" % index.cache_version)
-        pprint.pprint(index.repo_heads.items())
-        if index.history:
-            action = "Will not"
-        else:
+            needs_rebuild = True
+        except CError as err:
+            print("Error: %s" % (err,), file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            repo_heads = get_heads(repo)
+        except GSError as err:
+            print("Error: %s" % (err,), file=sys.stderr)
+            sys.exit(1)
+        if not needs_rebuild and history.keys() != repo_heads.items():
+            needs_rebuild = True
+        print("Current heads (version %d):" % Cache.version)
+        pprint.pprint(repo_heads.items())
+        if needs_rebuild:
             action = "Will"
+        else:
+            action = "Will not"
         print("%s rebuild history" % (action,))
         sys.exit(0)
 
+    index = SortIndex(repo)
     lines = {}
     num = 0
     for line in sys.stdin.readlines():

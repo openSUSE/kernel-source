@@ -13,7 +13,7 @@ class Patch(object):
             self.modified = False
             self.closed = False
         elif content:
-            self.head = ["%s\n" % (l,) for l in content.split("\n")]
+            self.head = ["%s\n" % (l,) for l in content.splitlines()]
             self.closed = True
         else:
             self.head = sys.stdin.readlines()
