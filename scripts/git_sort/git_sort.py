@@ -159,11 +159,13 @@ remotes = (
     Head(RepoURL("bp/bp.git"), "for-next"),
     Head(RepoURL("tiwai/sound.git")),
     Head(RepoURL("git://linuxtv.org/media_tree.git")),
+    Head(RepoURL("powerpc/linux.git"), "fixes"),
     Head(RepoURL("powerpc/linux.git"), "next"),
     Head(RepoURL("tip/tip.git")),
     Head(RepoURL("shli/md.git"), "for-next"),
     Head(RepoURL("dhowells/linux-fs.git"), "keys-uefi"),
     Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.15"),
+    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.16"),
     Head(RepoURL("tytso/ext4.git"), "dev"),
     Head(RepoURL("s390/linux.git"), "for-linus"),
     Head(RepoURL("tj/libata.git"), "for-next"),
@@ -177,6 +179,14 @@ remotes = (
     Head(RepoURL("horms/ipvs-next.git")),
     Head(RepoURL("klassert/ipsec.git")),
     Head(RepoURL("klassert/ipsec-next.git")),
+    Head(RepoURL("mkp/scsi.git"), "4.15/scsi-fixes"),
+    Head(RepoURL("mkp/scsi.git"), "4.16/scsi-fixes"),
+    Head(RepoURL("mkp/scsi.git"), "4.17/scsi-queue"),
+    Head(RepoURL("git://git.kernel.dk/linux-block.git"), "for-next"),
+    Head(RepoURL("git://git.kernel.org/pub/scm/virt/kvm/kvm.git"), "queue"),
+    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.16-rc"),
+    Head(RepoURL("powerpc/linux.git"), 'fixes'),
+    Head(RepoURL("dhowells/linux-fs.git")),
 )
 
 
