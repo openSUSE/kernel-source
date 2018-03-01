@@ -26,6 +26,11 @@ class TestRepoURL(unittest.TestCase):
         )
 
         self.assertEqual(
+            git_sort.RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git"),
+            git_sort.RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git")
+        )
+
+        self.assertEqual(
             git_sort.RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"),
             git_sort.RepoURL("http://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git")
         )
@@ -194,6 +199,9 @@ class TestIndexLinux(unittest.TestCase):
             []
         )
         self.commits.append(self.repo.get(m0))
+        self.repo.create_reference_direct("refs/tags/v4.8", m0, False)
+        self.repo.create_tag("v4.9", m0, pygit2.GIT_REF_OID, committer,
+                             "Linux 4.9")
 
         n0 = self.repo.create_commit(
             "refs/heads/net",
@@ -215,6 +223,8 @@ class TestIndexLinux(unittest.TestCase):
             tree,
             [m0, n0]
         )
+        self.repo.create_tag("v4.10", m1, pygit2.GIT_REF_OID, committer,
+                             "Linux 4.10")
 
         self.repo.remotes.create("origin",
                                  "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git")
@@ -268,6 +278,12 @@ class TestIndexLinux(unittest.TestCase):
             r2[1],
             [commit.message for commit in self.commits]
         )
+
+
+    def test_describe(self):
+        self.assertEqual(
+            self.index.describe(self.index.lookup(str(self.commits[1].id))[1]),
+            "v4.10")
 
 
 class TestCache(unittest.TestCase):
@@ -382,5 +398,5 @@ class TestCache(unittest.TestCase):
 
 if __name__ == '__main__':
     # Run a single testcase
-    suite = unittest.TestLoader().loadTestsFromTestCase(TestCache)
+    suite = unittest.TestLoader().loadTestsFromTestCase(TestIndexLinux)
     unittest.TextTestRunner(verbosity=2).run(suite)
