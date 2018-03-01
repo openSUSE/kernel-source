@@ -326,6 +326,10 @@ sub create_project {
 				$seen_archs{$arch} = 1;
 				push(@archs, $arch);
 			}
+			if (!@archs) {
+				# this repository is not needed
+				next;
+			}
 			$writer->startTag("repository", @attrs);
 			$writer->emptyTag("path", repository => $r,
 				project => $base);
@@ -563,6 +567,14 @@ sub get_logfile {
 	$repository ||= "standard";
 	return $self->get("/build/$project/$repository/$arch/$package/_log?nostream=1");
 }
+
+sub get_make_stderr {
+	my ($self, $project, $package, $repository, $arch) = @_;
+
+	$repository ||= "standard";
+	return $self->get("/build/$project/$repository/$arch/$package/make-stderr.log");
+}
+
 
 sub get_kernel_commit {
 	my ($self, $project, $package, $revision) = @_;
