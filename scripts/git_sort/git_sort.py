@@ -517,10 +517,15 @@ class SortIndex(object):
         """
         if self.version_indexes is None:
             history = self.history[remotes[0]]
-            # remove "refs/tags/"
-            objects = [(self.repo.revparse_single(tag).get_object(), tag[10:],)
-                       for tag in self.repo.listall_references()
-                       if self.version_match.match(tag)]
+            # Remove "refs/tags/"
+            # Mainline release tags are annotated tag objects attached to a
+            # commit object; do not consider other kinds of tags.
+            objects = [(obj_tag.get_object(), tag,)
+                       for obj_tag, tag in [
+                           (self.repo.revparse_single(tag), tag[10:],)
+                           for tag in self.repo.listall_references()
+                           if self.version_match.match(tag)
+                       ] if obj_tag.type == pygit2.GIT_OBJ_TAG]
             revs = [(history[str(obj.id)], tag,)
                     for obj, tag in objects
                     if obj.type == pygit2.GIT_OBJ_COMMIT]
