@@ -7,7 +7,7 @@ Depends on `merge` from rcs
 Add a section like this to git config:
 
 [mergetool "git-sort"]
-	cmd = /<path>/merge_tool.py $LOCAL $BASE $REMOTE $MERGED
+	cmd = scripts/git_sort/merge_tool.py $LOCAL $BASE $REMOTE $MERGED
 	trustExitCode = true
 
 Then call
@@ -97,7 +97,17 @@ if __name__ == "__main__":
     splice(base, output, base_path)
     splice(remote, output, remote_path)
 
-    retval = subprocess.call(["merge", merged_path, base_path, remote_path])
+    try:
+        cmd = "merge"
+        retval = subprocess.call([cmd, merged_path, base_path, remote_path])
+    except OSError as e:
+        if e.errno == 2:
+            print("Error: could not run `%s`. Please make sure it is "
+                  "installed (from the \"rcs\" package)." % (cmd,),
+                  file=sys.stderr)
+            sys.exit(1)
+        else:
+            raise
     if retval != 0:
         name = "%s.merged%d" % (merged_path, os.getpid(),)
         print("Warning: conflicts outside of sorted section, leaving merged "

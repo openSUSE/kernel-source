@@ -378,7 +378,7 @@ tag_add () {
 # get_attributions
 get_attributions () {
 	awk '
-		tolower($1) ~ /^[^ ]+-by:$/ {
+		tolower($1) ~ /^(acked|reviewed|signed-off)-by:$/ {
 			print
 		}
 	'

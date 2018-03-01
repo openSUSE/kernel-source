@@ -358,15 +358,17 @@ if [ $# -ne 0 ]; then
     usage
 fi
 
-# Some patches require patch 2.5.4. Abort with older versions.
-PATCH_VERSION=$(patch -v | sed -e '/^patch/!d' -e 's/patch //')
-case $PATCH_VERSION in
-    ([01].*|2.[1-4].*|2.5.[1-3])  # (check if < 2.5.4)
-	echo "patch version $PATCH_VERSION found; " \
-	     "a version >= 2.5.4 required." >&2
+# We need at least 2.7 now due to kselftests-kmp-default requiring
+# selftests with the need to ensure scripts are execuable.
+PATCH_VERSION_REQ="2.7"
+PATCH_VERSION_REQ_LD_VERSION=$(echo $PATCH_VERSION_REQ | scripts/ld-version.sh)
+PATCH_VERSION=$(patch --version | head -1 | awk '{print $3}')
+PATCH_VERSION_LD=$(echo $PATCH_VERSION | scripts/ld-version.sh)
+
+if [ $PATCH_VERSION_LD -lt $PATCH_VERSION_REQ_LD_VERSION ]; then
+	echo "$0 requires at least patch version $PATCH_VERSION_REQ"
 	exit 1
-    ;;
-esac
+fi
 
 # Check SCRATCH_AREA.
 if [ -z "$SCRATCH_AREA" ]; then
