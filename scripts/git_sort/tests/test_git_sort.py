@@ -26,6 +26,11 @@ class TestRepoURL(unittest.TestCase):
         )
 
         self.assertEqual(
+            git_sort.RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git"),
+            git_sort.RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git")
+        )
+
+        self.assertEqual(
             git_sort.RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"),
             git_sort.RepoURL("http://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git")
         )

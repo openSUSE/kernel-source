@@ -60,6 +60,10 @@ class RepoURL(object):
         if not url.endswith(self.ext):
             url = url + self.ext
 
+        # an undocumented alias
+        if url == "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git":
+            url = "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+
         self.url = url
 
 
