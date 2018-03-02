@@ -6,6 +6,7 @@ from __future__ import print_function
 import argparse
 import bisect
 import collections
+import functools
 import operator
 import os
 import os.path
@@ -67,12 +68,20 @@ class RepoURL(object):
         self.url = url
 
 
+    def _is_valid_operand(self, other):
+        return hasattr(other, "url")
+
+
     def __eq__(self, other):
+        if not self._is_valid_operand(other):
+            return NotImplemented
         return self.url == other.url
 
 
-    def __cmp__(self, other):
-        return cmp(self.url, other.url)
+    def __ne__(self, other):
+        if not self._is_valid_operand(other):
+            return NotImplemented
+        return self.url != other.url
 
 
     def __hash__(self):
@@ -93,36 +102,42 @@ class RepoURL(object):
         return url
 
 
+@functools.total_ordering
 class Head(object):
     def __init__(self, repo_url, rev="master"):
         self.repo_url = repo_url
         self.rev = rev
 
 
+    def _is_valid_operand(self, other):
+        return hasattr(other, "repo_url") and hasattr(other, "rev")
+
+
+    def _get_index(self):
+        """
+        A head with no url is considered out of tree. Any other head with a
+        url is upstream of it.
+        """
+        if self.repo_url == RepoURL(None):
+            return len(remotes)
+        else:
+            return remote_index[self]
+
+
     def __eq__(self, other):
+        if not self._is_valid_operand(other):
+            return NotImplemented
         return (self.repo_url == other.repo_url and self.rev == other.rev)
+
+
+    def __lt__(self, other):
+        if not self._is_valid_operand(other):
+            return NotImplemented
+        return self._get_index() < other._get_index()
 
 
     def __hash__(self):
         return hash((self.repo_url, self.rev,))
-
-    
-    def __cmp__(self, other):
-        """
-        Head a is upstream of Head b -> a < b
-        """
-        def get_index(head):
-            """
-            A head with no url is considered out of tree. Any other head with a
-            url is upstream of it.
-            """
-            if head.repo_url == RepoURL(None):
-                return len(remotes)
-            else:
-                return remote_index[head]
-        a = get_index(self)
-        b = get_index(other)
-        return cmp(a, b)
 
 
     def __repr__(self):
