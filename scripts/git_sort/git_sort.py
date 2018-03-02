@@ -60,6 +60,10 @@ class RepoURL(object):
         if not url.endswith(self.ext):
             url = url + self.ext
 
+        # an undocumented alias
+        if url == "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git":
+            url = "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+
         self.url = url
 
 
@@ -159,11 +163,13 @@ remotes = (
     Head(RepoURL("bp/bp.git"), "for-next"),
     Head(RepoURL("tiwai/sound.git")),
     Head(RepoURL("git://linuxtv.org/media_tree.git")),
+    Head(RepoURL("powerpc/linux.git"), "fixes"),
     Head(RepoURL("powerpc/linux.git"), "next"),
     Head(RepoURL("tip/tip.git")),
     Head(RepoURL("shli/md.git"), "for-next"),
     Head(RepoURL("dhowells/linux-fs.git"), "keys-uefi"),
     Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.15"),
+    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.16"),
     Head(RepoURL("tytso/ext4.git"), "dev"),
     Head(RepoURL("s390/linux.git"), "for-linus"),
     Head(RepoURL("tj/libata.git"), "for-next"),
@@ -177,6 +183,14 @@ remotes = (
     Head(RepoURL("horms/ipvs-next.git")),
     Head(RepoURL("klassert/ipsec.git")),
     Head(RepoURL("klassert/ipsec-next.git")),
+    Head(RepoURL("mkp/scsi.git"), "4.15/scsi-fixes"),
+    Head(RepoURL("mkp/scsi.git"), "4.16/scsi-fixes"),
+    Head(RepoURL("mkp/scsi.git"), "4.17/scsi-queue"),
+    Head(RepoURL("git://git.kernel.dk/linux-block.git"), "for-next"),
+    Head(RepoURL("git://git.kernel.org/pub/scm/virt/kvm/kvm.git"), "queue"),
+    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.16-rc"),
+    Head(RepoURL("powerpc/linux.git"), 'fixes'),
+    Head(RepoURL("dhowells/linux-fs.git")),
 )
 
 
@@ -503,10 +517,15 @@ class SortIndex(object):
         """
         if self.version_indexes is None:
             history = self.history[remotes[0]]
-            # remove "refs/tags/"
-            objects = [(self.repo.revparse_single(tag).get_object(), tag[10:],)
-                       for tag in self.repo.listall_references()
-                       if self.version_match.match(tag)]
+            # Remove "refs/tags/"
+            # Mainline release tags are annotated tag objects attached to a
+            # commit object; do not consider other kinds of tags.
+            objects = [(obj_tag.get_object(), tag,)
+                       for obj_tag, tag in [
+                           (self.repo.revparse_single(tag), tag[10:],)
+                           for tag in self.repo.listall_references()
+                           if self.version_match.match(tag)
+                       ] if obj_tag.type == pygit2.GIT_OBJ_TAG]
             revs = [(history[str(obj.id)], tag,)
                     for obj, tag in objects
                     if obj.type == pygit2.GIT_OBJ_COMMIT]
