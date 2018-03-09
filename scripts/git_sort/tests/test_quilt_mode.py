@@ -1,7 +1,5 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
-
-from __future__ import print_function
 
 import os
 import os.path
@@ -114,7 +112,8 @@ Signed-off-by: Christoffer Dall <cdall@linaro.org>
         m0_name = tests.support.format_patch(self.repo.get(m0), mainline="v4.9")
         m1_name = tests.support.format_patch(self.repo.get(m1),
                                              mainline="v4.10-rc5")
-        open(os.path.join(self.ks_dir, "series.conf"), mode="w").write(
+        with open(os.path.join(self.ks_dir, "series.conf"), mode="w") as f:
+            f.write(
 """# Kernel patches configuration file
 
 	########################################################
@@ -134,9 +133,12 @@ Signed-off-by: Christoffer Dall <cdall@linaro.org>
         # This overlaps what is tested by test_series_sort, hence, not put in a
         # test of its own.
         subprocess.check_call([ss_path, "-c", "series.conf"])
-        content = open("series.conf").read()
-        output = subprocess.check_call([ss_path, "series.conf"])
-        self.assertEqual(open("series.conf").read(), content)
+        with open("series.conf") as f:
+            content1 = f.read()
+        subprocess.check_call([ss_path, "series.conf"])
+        with open("series.conf") as f:
+            content2 = f.read()
+        self.assertEqual(content2, content1)
 
         os.makedirs("tmp/current")
         os.chdir("tmp/current")
@@ -156,71 +158,79 @@ Signed-off-by: Christoffer Dall <cdall@linaro.org>
         qm_path = os.path.join(lib.libdir(), "quilt-mode.sh")
 
         # test series file replacement
-        entries = ["%s\n" % (l,) for l in map(lambda line : line.strip(),
-                                  open("series").readlines()) if l and not
-                   l.startswith("#")]
+        with open("series") as f:
+            entries = ["%s\n" % (l,) for l in
+                       [line.strip() for line in f.readlines()]
+                       if l and not l.startswith("#")]
         # remove the symlink
         os.unlink("series")
-        open("series", mode="w").writelines(entries)
-        subprocess.check_output(
-            [os.path.join(lib.libdir(), "qgoto.py"), str(self.m0)])
+        with open("series", mode="w") as f:
+            f.writelines(entries)
+        subprocess.check_call(
+            [os.path.join(lib.libdir(), "qgoto.py"), str(self.m0)],
+            stdout=subprocess.DEVNULL)
 
         # test qgoto
-        subprocess.check_output(". %s; qgoto %s" % (qm_path, str(self.m0)),
-                              shell=True, executable="/bin/bash")
+        subprocess.check_call(". %s; qgoto %s" % (qm_path, str(self.m0)),
+                              shell=True, stdout=subprocess.DEVNULL,
+                              executable="/bin/bash")
 
         # test qdupcheck
         try:
-            result = subprocess.check_output(
+            subprocess.check_output(
                 ". %s; qdupcheck %s" % (qm_path, str(self.m1)), shell=True,
                 executable="/bin/bash")
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
-            self.assertEqual(err.output.splitlines()[-1].strip(),
+            self.assertEqual(err.output.decode().splitlines()[-1].strip(),
                              "patches.suse/Linux-4.10-rc5.patch")
         else:
             self.assertTrue(False)
         
-        subprocess.check_output(". %s; qgoto %s" % (qm_path, str(self.m1)),
-                              shell=True, executable="/bin/bash")
+        subprocess.check_call(". %s; qgoto %s" % (qm_path, str(self.m1)),
+                              shell=True, stdout=subprocess.DEVNULL,
+                              executable="/bin/bash")
 
         try:
-            result = subprocess.check_output(
+            subprocess.check_output(
                 ". %s; qdupcheck %s" % (qm_path, str(self.m1)), shell=True,
                 executable="/bin/bash")
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
-            self.assertEqual(err.output.splitlines()[-1].strip(),
+            self.assertEqual(err.output.decode().splitlines()[-1].strip(),
                              "This is the top patch.")
         else:
             self.assertTrue(False)
 
         # import m2
-        subprocess.check_output(". %s; qgoto %s" % (qm_path, str(self.m2)),
+        subprocess.check_call(". %s; qgoto %s" % (qm_path, str(self.m2)),
                               shell=True, executable="/bin/bash")
-        subprocess.check_output(
+        subprocess.check_call(
             """. %s; qcp -r "bsc#1077761" -d patches.suse %s""" % (
-                qm_path, str(self.m2)), shell=True, executable="/bin/bash")
+                qm_path, str(self.m2)),
+            shell=True, stdout=subprocess.DEVNULL, executable="/bin/bash")
 
         retval = subprocess.check_output(("quilt", "--quiltrc", "-", "next",))
         name = "patches.suse/KVM-arm-arm64-vgic-v3-Add-accessors-for-the-ICH_APxR.patch"
-        self.assertEqual(retval.strip(), name)
+        self.assertEqual(retval.decode().strip(), name)
 
         try:
-            retval = open(os.path.join(self.ks_dir, name)).readlines().index(
-                "Acked-by: Alexander Graf <agraf@suse.de>\n")
+            with open(os.path.join(self.ks_dir, name)) as f:
+                retval = f.readlines().index(
+                    "Acked-by: Alexander Graf <agraf@suse.de>\n")
         except ValueError:
             retval = -1
         self.assertNotEqual(retval, -1)
 
-        retval = subprocess.check_output(("quilt", "--quiltrc", "-", "push",))
+        subprocess.check_call(("quilt", "--quiltrc", "-", "push",),
+                              stdout=subprocess.DEVNULL)
 
         try:
-            result = subprocess.check_output(("quilt", "--quiltrc", "-",
-                                              "pop",), stderr=subprocess.STDOUT)
+            subprocess.check_output(("quilt", "--quiltrc", "-", "pop",),
+                                    stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
-            self.assertTrue(err.output.endswith(
+            self.assertTrue(err.output.decode().endswith(
                 "needs to be refreshed first.\n"))
         else:
             self.assertTrue(False)

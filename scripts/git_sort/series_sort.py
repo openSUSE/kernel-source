@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 """
@@ -16,8 +16,6 @@ select the lines and filter them through the script:
     :'<,'>! ~/<path>/series_sort.py
 """
 
-from __future__ import print_function
-
 import argparse
 import os
 import sys
@@ -26,8 +24,8 @@ try:
     import pygit2
 except ImportError as err:
     print("Error: %s" % (err,), file=sys.stderr)
-    print("Please install the \"pygit2\" python module. For more details, "
-          "please refer to the \"Requirements\" section of "
+    print("Please install the \"pygit2\" python3 module. For more details, "
+          "please refer to the \"Installation Requirements\" section of "
           "\"scripts/git_sort/README.md\".", file=sys.stderr)
     sys.exit(1)
 
@@ -99,7 +97,7 @@ if __name__ == "__main__":
         lib.series_footer(inside),
     ])
 
-    to_update = filter(lib.tag_needs_update, input_entries)
+    to_update = list(filter(lib.tag_needs_update, input_entries))
     if args.check:
         result = 0
         if inside != new_inside:

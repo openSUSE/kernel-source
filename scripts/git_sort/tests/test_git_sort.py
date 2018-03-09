@@ -1,7 +1,5 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
-
-from __future__ import print_function
 
 import collections
 import os
@@ -168,7 +166,7 @@ class TestIndex(unittest.TestCase):
             len(r),
             1
         )
-        r2 = r.items()[0]
+        r2 = list(r.items())[0]
         self.assertEqual(
             r2[0],
             git_sort.Head(git_sort.RepoURL(None), "HEAD")
@@ -269,7 +267,7 @@ class TestIndexLinux(unittest.TestCase):
             len(r),
             2
         )
-        r2 = r.items()[0]
+        r2 = list(r.items())[0]
         self.assertEqual(
             r2[0],
             git_sort.Head(git_sort.RepoURL("torvalds/linux.git"))
@@ -325,7 +323,7 @@ class TestCache(unittest.TestCase):
         input_text = "\n".join(self.commits)
 
         os.chdir(self.repo_dir)
-        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        output = subprocess.check_output([gs_path, "-d"]).decode().splitlines()
         self.assertEqual(output[-1], "Will rebuild history")
 
         # "-d" should not create a cache
@@ -336,14 +334,11 @@ class TestCache(unittest.TestCase):
             retval = e.errno
         self.assertEqual(retval, 2)
 
-        sp = subprocess.Popen(gs_path,
-                              stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE)
-        output_ref, err = sp.communicate(input_text)
+        output_ref = subprocess.check_output(
+            gs_path, input=input_text.encode()).decode()
         time1 = os.stat(cache_path).st_mtime
 
-        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        output = subprocess.check_output([gs_path, "-d"]).decode().splitlines()
         self.assertEqual(output[-1], "Will not rebuild history")
 
         # "-d" should not modify a cache
@@ -351,28 +346,22 @@ class TestCache(unittest.TestCase):
 
         # test that git-sort action is the same as "-d" states (no cache
         # rebuild)
-        sp = subprocess.Popen(gs_path,
-                              stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE)
-        output, err = sp.communicate(input_text)
+        output = subprocess.check_output(
+            gs_path, input=input_text.encode()).decode()
         self.assertEqual(output, output_ref)
         self.assertEqual(os.stat(cache_path).st_mtime, time1)
 
         # test version number change
         shelve.open(cache_path)["version"] = 1
-        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        output = subprocess.check_output([gs_path, "-d"]).decode().splitlines()
         self.assertEqual(output[1], "Unsupported cache version")
         self.assertEqual(output[-1], "Will rebuild history")
 
-        sp = subprocess.Popen(gs_path,
-                              stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE)
-        output, err = sp.communicate(input_text)
+        output = subprocess.check_output(
+            gs_path, input=input_text.encode()).decode()
         self.assertEqual(output, output_ref)
 
-        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        output = subprocess.check_output([gs_path, "-d"]).decode().splitlines()
         self.assertEqual(output[-1], "Will not rebuild history")
 
         # corrupt the cache structure
@@ -381,18 +370,15 @@ class TestCache(unittest.TestCase):
             "net" : ["abc", "abc", "abc"],
             "net-next" : ["abc", "abc", "abc"],
         }
-        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        output = subprocess.check_output([gs_path, "-d"]).decode().splitlines()
         self.assertEqual(output[1], "Inconsistent cache content")
         self.assertEqual(output[-1], "Will rebuild history")
 
-        sp = subprocess.Popen(gs_path,
-                              stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE)
-        output, err = sp.communicate(input_text)
+        output = subprocess.check_output(
+            gs_path, input=input_text.encode()).decode()
         self.assertEqual(output, output_ref)
 
-        output = subprocess.check_output([gs_path, "-d"]).splitlines()
+        output = subprocess.check_output([gs_path, "-d"]).decode().splitlines()
         self.assertEqual(output[-1], "Will not rebuild history")
 
 

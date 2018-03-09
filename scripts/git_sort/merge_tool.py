@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 """
@@ -14,8 +14,6 @@ Then call
 git mergetool --tool=git-sort series.conf
 
 """
-
-from __future__ import print_function
 
 import os.path
 import pygit2

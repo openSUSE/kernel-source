@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 import sys
@@ -107,6 +107,6 @@ class Patch(object):
                 else:
                     return line
 
-            self.head = map(change_value, self.head)
+            self.head = list(map(change_value, self.head))
         else:
             raise KeyError("Tag \"%s\" not found" % (tag,))

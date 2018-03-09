@@ -1,11 +1,10 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
-
-from __future__ import print_function
 
 import argparse
 import bisect
 import collections
+import dbm
 import functools
 import operator
 import os
@@ -209,7 +208,7 @@ remotes = (
 )
 
 
-remote_index = dict(zip(remotes, range(len(remotes))))
+remote_index = dict(zip(remotes, list(range(len(remotes)))))
 oot = Head(RepoURL(None), "out-of-tree patches")
 
 remote_match = re.compile("remote\..+\.url")
@@ -243,7 +242,7 @@ def get_heads(repo):
                     rev, remote_name, remote_name,))
         result[head] = str(commit.id)
 
-    if len(result) == 0 or result.keys()[0] != remotes[0]:
+    if len(result) == 0 or list(result.keys())[0] != remotes[0]:
         # According to the urls in remotes, this is not a clone of linux.git
         # Sort according to commits reachable from the current head
         result = collections.OrderedDict(
@@ -275,7 +274,7 @@ def get_history(repo, repo_heads):
 
         result = {}
         for l in sp.stdout:
-            result[l.strip()] = len(result)
+            result[l.decode().strip()] = len(result)
         # reverse indexes
         history[head] = {commit : len(result) - val for commit, val in
                          result.items()}
@@ -370,10 +369,8 @@ class Cache(object):
         flag_map = {False : "r", True : "n"}
         try:
             self.cache = shelve.open(cache_path, flag=flag_map[write_enable])
-        except ImportError as err:
-            raise CUnsupported("Unsupported cache database format:\n" +
-                               str(err))
-
+        except dbm.error:
+            raise CUnsupported
         self.closed = False
         if write_enable:
             self.cache["version"] = Cache.version
@@ -433,10 +430,10 @@ class Cache(object):
 
             # This detailed check may be needed if an older git-sort (which
             # didn't set a cache version) modified the cache.
-            if (not isinstance(cache_history, types.ListType) or
+            if (not isinstance(cache_history, list) or
                 len(cache_history) < 1 or 
                 len(cache_history[0]) != 4 or
-                not isinstance(cache_history[0][3], types.DictType)):
+                not isinstance(cache_history[0][3], dict)):
                 raise CInconsistent
 
             return collections.OrderedDict([
@@ -490,7 +487,7 @@ class SortIndex(object):
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
 
-        if needs_rebuild or history.keys() != repo_heads.items():
+        if needs_rebuild or list(history.keys()) != list(repo_heads.items()):
             try:
                 history = get_history(repo, repo_heads)
             except GSError as err:
@@ -532,7 +529,7 @@ class SortIndex(object):
             sorted values from the mapping which are found in Head
         """
         result = collections.OrderedDict([(head, [],) for head in self.history])
-        for commit in mapping.keys():
+        for commit in list(mapping.keys()):
             try:
                 head, index = self.lookup(commit)
             except GSKeyError:
@@ -566,7 +563,7 @@ class SortIndex(object):
                     for obj, tag in objects
                     if obj.type == pygit2.GIT_OBJ_COMMIT]
             revs.sort(key=operator.itemgetter(0))
-            self.version_indexes = zip(*revs)
+            self.version_indexes = list(zip(*revs))
 
         indexes, tags = self.version_indexes
         i = bisect.bisect_left(indexes, index)
@@ -621,9 +618,11 @@ if __name__ == "__main__":
                         print("Inconsistent cache content")
                         needs_rebuild = True
                     else:
-                        pprint.pprint(history.keys())
-        except CNeedsRebuild:
+                        pprint.pprint(list(history.keys()))
+        except CAbsent:
             print("No usable cache")
+            needs_rebuild = True
+        except CNeedsRebuild:
             needs_rebuild = True
         except CError as err:
             print("Error: %s" % (err,), file=sys.stderr)
@@ -634,10 +633,10 @@ if __name__ == "__main__":
         except GSError as err:
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
-        if not needs_rebuild and history.keys() != repo_heads.items():
+        if not needs_rebuild and list(history.keys()) != list(repo_heads.items()):
             needs_rebuild = True
         print("Current heads (version %d):" % Cache.version)
-        pprint.pprint(repo_heads.items())
+        pprint.pprint(list(repo_heads.items()))
         if needs_rebuild:
             action = "Will"
         else:

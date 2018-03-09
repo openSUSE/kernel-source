@@ -1,7 +1,5 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
-
-from __future__ import print_function
 
 import collections
 import operator
@@ -29,14 +27,6 @@ def touch(fname, times=None):
         os.utime(fname, times)
 
 
-# http://stackoverflow.com/questions/22077881/yes-reporting-error-with-subprocess-communicate
-def restore_signals(): # from http://hg.python.org/cpython/rev/768722b2ae0a/
-    signals = ('SIGPIPE', 'SIGXFZ', 'SIGXFSZ')
-    for sig in signals:
-        if hasattr(signal, sig):
-            signal.signal(getattr(signal, sig), signal.SIG_DFL)
-
-
 def libdir():
     return os.path.dirname(os.path.realpath(__file__))
 
@@ -57,10 +47,9 @@ def check_series():
     
     try:
         subprocess.check_output(("quilt", "--quiltrc", "-", "top",),
-                                preexec_fn=restore_signals,
                                 stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError as err:
-        if err.output == "No patches applied\n":
+        if err.output.decode() == "No patches applied\n":
             pass
         else:
             raise
@@ -76,8 +65,8 @@ def check_series():
 def repo_path():
     try:
         search_path = subprocess.check_output(
-            os.path.join(libdir(), "..", "linux_git.sh"),
-            preexec_fn=restore_signals).strip()
+            os.path.join(libdir(), "..",
+                         "linux_git.sh")).decode().strip()
     except subprocess.CalledProcessError:
         print("Error: Could not determine mainline linux git repository path.",
               file=sys.stderr)
@@ -316,7 +305,7 @@ def series_sort(index, entries):
             e[1]
             for e in sorted(result[head].items(), key=operator.itemgetter(0))])
 
-    for head, lines in result.items():
+    for head, lines in list(result.items()):
         if not lines:
             del result[head]
 

@@ -1,7 +1,5 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
-
-from __future__ import print_function
 
 import argparse
 import os
@@ -22,7 +20,7 @@ def format_import(references, tmpdir, dstdir, rev, poi=[]):
     assert len(poi) == 0 # todo
     args = ("git", "format-patch", "--output-directory", tmpdir, "--notes",
             "--max-count=1", "--subject-prefix=", "--no-numbered", rev,)
-    src = subprocess.check_output(args).strip()
+    src = subprocess.check_output(args).decode().strip()
     # remove number prefix
     name = os.path.basename(src)[5:]
     dst = os.path.join(dstdir, name)
@@ -32,9 +30,8 @@ def format_import(references, tmpdir, dstdir, rev, poi=[]):
 
     subprocess.check_call((os.path.join(lib.libdir(), "clean_header.sh"),
                            "--commit=%s" % rev, "--reference=%s" % references,
-                           src,), preexec_fn=lib.restore_signals)
-    subprocess.check_call(("quilt", "import", "-P", dst, src,),
-                          preexec_fn=lib.restore_signals)
+                           src,))
+    subprocess.check_call(("quilt", "import", "-P", dst, src,))
     # This will remind the user to run refresh_patch.sh
     lib.touch(".pc/%s~refresh" % (dst,))
 
