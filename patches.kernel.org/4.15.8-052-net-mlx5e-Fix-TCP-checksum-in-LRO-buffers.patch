@@ -1,0 +1,131 @@
+From: Gal Pressman <galp@mellanox.com>
+Date: Wed, 20 Dec 2017 08:48:24 +0200
+Subject: [PATCH] net/mlx5e: Fix TCP checksum in LRO buffers
+References: bnc#1012628
+Patch-mainline: 4.15.8
+Git-commit: 8babd44d2079079f9d5a4aca7005aed80236efe0
+
+[ Upstream commit 8babd44d2079079f9d5a4aca7005aed80236efe0 ]
+
+When receiving an LRO packet, the checksum field is set by the hardware
+to the checksum of the first coalesced packet. Obviously, this checksum
+is not valid for the merged LRO packet and should be fixed.  We can use
+the CQE checksum which covers the checksum of the entire merged packet
+TCP payload to help us calculate the checksum incrementally.
+
+Tested by sending IPv4/6 traffic with LRO enabled, RX checksum disabled
+and watching nstat checksum error counters (in addition to the obvious
+bandwidth drop caused by checksum errors).
+
+This bug is usually "hidden" since LRO packets would go through the
+CHECKSUM_UNNECESSARY flow which does not validate the packet checksum.
+
+It's important to note that previous to this patch, LRO packets provided
+with CHECKSUM_UNNECESSARY are indeed packets with a correct validated
+checksum (even though the checksum inside the TCP header is incorrect),
+since the hardware LRO aggregation is terminated upon receiving a packet
+with bad checksum.
+
+Fixes: e586b3b0baee ("net/mlx5: Ethernet Datapath files")
+Signed-off-by: Gal Pressman <galp@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_rx.c | 49 ++++++++++++++++++-------
+ 1 file changed, 35 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 5b499c7a698f..36611b64a91c 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -36,6 +36,7 @@
+ #include <linux/tcp.h>
+ #include <linux/bpf_trace.h>
+ #include <net/busy_poll.h>
++#include <net/ip6_checksum.h>
+ #include "en.h"
+ #include "en_tc.h"
+ #include "eswitch.h"
+@@ -547,20 +548,33 @@ bool mlx5e_post_rx_mpwqes(struct mlx5e_rq *rq)
+ 	return true;
+ }
+ 
++static void mlx5e_lro_update_tcp_hdr(struct mlx5_cqe64 *cqe, struct tcphdr *tcp)
++{
++	u8 l4_hdr_type = get_cqe_l4_hdr_type(cqe);
++	u8 tcp_ack     = (l4_hdr_type == CQE_L4_HDR_TYPE_TCP_ACK_NO_DATA) ||
++			 (l4_hdr_type == CQE_L4_HDR_TYPE_TCP_ACK_AND_DATA);
++
++	tcp->check                      = 0;
++	tcp->psh                        = get_cqe_lro_tcppsh(cqe);
++
++	if (tcp_ack) {
++		tcp->ack                = 1;
++		tcp->ack_seq            = cqe->lro_ack_seq_num;
++		tcp->window             = cqe->lro_tcp_win;
++	}
++}
++
+ static void mlx5e_lro_update_hdr(struct sk_buff *skb, struct mlx5_cqe64 *cqe,
+ 				 u32 cqe_bcnt)
+ {
+ 	struct ethhdr	*eth = (struct ethhdr *)(skb->data);
+ 	struct tcphdr	*tcp;
+ 	int network_depth = 0;
++	__wsum check;
+ 	__be16 proto;
+ 	u16 tot_len;
+ 	void *ip_p;
+ 
+-	u8 l4_hdr_type = get_cqe_l4_hdr_type(cqe);
+-	u8 tcp_ack = (l4_hdr_type == CQE_L4_HDR_TYPE_TCP_ACK_NO_DATA) ||
+-		(l4_hdr_type == CQE_L4_HDR_TYPE_TCP_ACK_AND_DATA);
+-
+ 	proto = __vlan_get_protocol(skb, eth->h_proto, &network_depth);
+ 
+ 	tot_len = cqe_bcnt - network_depth;
+@@ -577,23 +591,30 @@ static void mlx5e_lro_update_hdr(struct sk_buff *skb, struct mlx5_cqe64 *cqe,
+ 		ipv4->check             = 0;
+ 		ipv4->check             = ip_fast_csum((unsigned char *)ipv4,
+ 						       ipv4->ihl);
++
++		mlx5e_lro_update_tcp_hdr(cqe, tcp);
++		check = csum_partial(tcp, tcp->doff * 4,
++				     csum_unfold((__force __sum16)cqe->check_sum));
++		/* Almost done, don't forget the pseudo header */
++		tcp->check = csum_tcpudp_magic(ipv4->saddr, ipv4->daddr,
++					       tot_len - sizeof(struct iphdr),
++					       IPPROTO_TCP, check);
+ 	} else {
++		u16 payload_len = tot_len - sizeof(struct ipv6hdr);
+ 		struct ipv6hdr *ipv6 = ip_p;
+ 
+ 		tcp = ip_p + sizeof(struct ipv6hdr);
+ 		skb_shinfo(skb)->gso_type = SKB_GSO_TCPV6;
+ 
+ 		ipv6->hop_limit         = cqe->lro_min_ttl;
+-		ipv6->payload_len       = cpu_to_be16(tot_len -
+-						      sizeof(struct ipv6hdr));
+-	}
+-
+-	tcp->psh = get_cqe_lro_tcppsh(cqe);
+-
+-	if (tcp_ack) {
+-		tcp->ack                = 1;
+-		tcp->ack_seq            = cqe->lro_ack_seq_num;
+-		tcp->window             = cqe->lro_tcp_win;
++		ipv6->payload_len       = cpu_to_be16(payload_len);
++
++		mlx5e_lro_update_tcp_hdr(cqe, tcp);
++		check = csum_partial(tcp, tcp->doff * 4,
++				     csum_unfold((__force __sum16)cqe->check_sum));
++		/* Almost done, don't forget the pseudo header */
++		tcp->check = csum_ipv6_magic(&ipv6->saddr, &ipv6->daddr, payload_len,
++					     IPPROTO_TCP, check);
+ 	}
+ }
+ 
+-- 
+2.16.2
+
