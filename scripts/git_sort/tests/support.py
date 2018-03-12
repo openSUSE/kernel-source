@@ -24,38 +24,40 @@ class FixedOffset(datetime.tzinfo):
         return datetime.timedelta(0) # we don't know about DST
 
 
-def format_patch(commit, mainline=None, repo=None):
-    def format_sanitized_subject(message):
-        """
-        Reimplemented from the similarly named function in the git source.
-        """
-        def is_title_char(c):
-            if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
-                (c >= '0' and c <= '9') or c == '.' or c == '_'):
-                return True
-            else:
-                return False
+def format_sanitized_subject(message):
+    """
+    Reimplemented from the similarly named function in the git source.
+    """
+    def is_title_char(c):
+        if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '.' or c == '_'):
+            return True
+        else:
+            return False
 
-        result = []
-        space = False
-        i = 0
-        end = message.find("\n")
-        if end == -1:
-            end = len(message)
-        while i < end:
-            c = message[i]
-            if is_title_char(c):
-                if space and result:
-                    result.append("-")
-                result.append(c)
-                space = False
-                if c == ".":
-                    while i + 1 < end and message[i + 1] == ".":
-                        i = i + 1
-            else:
-                space = True
-            i = i + 1
-        return "".join(result[:52])
+    result = []
+    space = False
+    i = 0
+    end = message.find("\n")
+    if end == -1:
+        end = len(message)
+    while i < end:
+        c = message[i]
+        if is_title_char(c):
+            if space and result:
+                result.append("-")
+            result.append(c)
+            space = False
+            if c == ".":
+                while i + 1 < end and message[i + 1] == ".":
+                    i = i + 1
+        else:
+            space = True
+        i = i + 1
+    return "".join(result[:52])
+
+
+def format_patch(commit, mainline=None, repo=None):
     name = format_sanitized_subject(commit.message) + ".patch"
 
     with open(name, mode="w") as f:
