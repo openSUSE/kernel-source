@@ -321,14 +321,14 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
                  os.path.join(lib.libdir(), "merge_tool.py"),),))
         subprocess.check_call(("git", "config", "--add",
                                "mergetool.git-sort.trustexitcode", "true",))
-        result = subprocess.call(("git", "merge", "other",),
+        retval = subprocess.call(("git", "merge", "other",),
                                        stdout=subprocess.DEVNULL,
                                        stderr=subprocess.DEVNULL)
-        self.assertEqual(result, 1)
-        result = subprocess.check_output(("git", "mergetool", "--tool=git-sort",
-                                          "series.conf",))
+        self.assertEqual(retval, 1)
+        retval = subprocess.check_output(
+            ("git", "mergetool", "--tool=git-sort", "series.conf",))
         self.assertEqual(
-            result.decode().splitlines()[-1].strip(),
+            retval.decode().splitlines()[-1].strip(),
             "1 commits added, 0 commits removed from base to remote.")
         with open("series.conf") as f:
             entries = series_conf.filter_series(f.readlines())
@@ -337,9 +337,9 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
                           (tests.support.format_sanitized_subject(
                               self.repo.get(commit).message),)
                           for commit in self.commits[:4]])
-        result = subprocess.check_output(("git", "status", "--porcelain",
+        retval = subprocess.check_output(("git", "status", "--porcelain",
                                           "series.conf",))
-        self.assertEqual(result.decode().strip(), "M  series.conf")
+        self.assertEqual(retval.decode().strip(), "M  series.conf")
 
 if __name__ == '__main__':
     # Run a single testcase
