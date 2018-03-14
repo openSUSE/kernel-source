@@ -190,7 +190,7 @@ remotes = (
     Head(RepoURL("https://github.com/kdave/btrfs-devel.git"), "misc-next"),
     Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
     Head(RepoURL("gregkh/tty.git"), "tty-next"),
-    Head(RepoURL("jj/linux-apparmor.git"), "v4.8-aa2.8-out-of-tree"),
+    Head(RepoURL("jj/linux-apparmor.git"), "apparmor-next"),
     Head(RepoURL("pablo/nf.git")),
     Head(RepoURL("pablo/nf-next.git")),
     Head(RepoURL("horms/ipvs.git")),
