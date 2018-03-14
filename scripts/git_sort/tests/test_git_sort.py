@@ -382,6 +382,38 @@ class TestCache(unittest.TestCase):
         self.assertEqual(output[-1], "Will not rebuild history")
 
 
+class TestErrors(unittest.TestCase):
+    def setUp(self):
+        self.repo_dir = tempfile.mkdtemp(prefix="gs_repo")
+
+
+    def tearDown(self):
+        shutil.rmtree(self.repo_dir)
+
+
+    def test_errors(self):
+        gs_path = os.path.join(lib.libdir(), "git_sort.py")
+        os.chdir(self.repo_dir)
+
+        try:
+            subprocess.check_output([gs_path, "-d"], stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as err:
+            self.assertEqual(err.returncode, 1)
+            self.assertEqual(err.output.decode().strip(),
+                             "Error: Not a git repository")
+        else:
+            self.assertTrue(False)
+
+        try:
+            subprocess.check_output([gs_path], stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as err:
+            self.assertEqual(err.returncode, 1)
+            self.assertEqual(err.output.decode().strip(),
+                             "Error: Not a git repository")
+        else:
+            self.assertTrue(False)
+
+
 if __name__ == '__main__':
     # Run a single testcase
     suite = unittest.TestLoader().loadTestsFromTestCase(TestIndexLinux)

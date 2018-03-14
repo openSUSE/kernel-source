@@ -56,8 +56,12 @@ if __name__ == "__main__":
     index = git_sort.SortIndex(repo)
 
     if args.series is not None:
-        args.series = os.path.abspath(args.series)
-        f = open(args.series)
+        try:
+            f = open(args.series)
+        except FileNotFoundError as err:
+            print("Error: %s" % (err,), file=sys.stderr)
+            sys.exit(1)
+        series = os.path.abspath(args.series)
     else:
         f = sys.stdin
     lines = f.readlines()
@@ -115,7 +119,7 @@ if __name__ == "__main__":
         ])
 
         if args.series is not None:
-            f = open(args.series, mode="w")
+            f = open(series, mode="w")
         else:
             f = sys.stdout
         f.writelines(output)

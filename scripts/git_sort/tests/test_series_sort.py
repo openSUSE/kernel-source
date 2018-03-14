@@ -129,6 +129,21 @@ class TestSeriesSort(unittest.TestCase):
         shutil.rmtree(self.ks_dir)
 
 
+    def test_nofile(self):
+        ss_path = os.path.join(lib.libdir(), "series_sort.py")
+        os.chdir(self.ks_dir)
+
+        try:
+            subprocess.check_output([ss_path, "aaa"], stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as err:
+            self.assertEqual(err.returncode, 1)
+            self.assertEqual(
+                err.output.decode(),
+                "Error: [Errno 2] No such file or directory: 'aaa'\n")
+        else:
+            self.assertTrue(False)
+
+
     def test_absent(self):
         ss_path = os.path.join(lib.libdir(), "series_sort.py")
         os.chdir(self.ks_dir)

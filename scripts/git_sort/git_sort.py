@@ -596,7 +596,11 @@ if __name__ == "__main__":
     try:
         path = os.environ["GIT_DIR"]
     except KeyError:
-        path = pygit2.discover_repository(os.getcwd())
+        try:
+            path = pygit2.discover_repository(os.getcwd())
+        except KeyError:
+            print("Error: Not a git repository", file=sys.stderr)
+            sys.exit(1)
     repo = pygit2.Repository(path)
 
     if args.dump_heads:
