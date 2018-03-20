@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 
+import exc
 import lib
 
 
@@ -73,7 +74,7 @@ if __name__ == "__main__":
     inside = [line for line in local[1] if not line.strip() in removed]
     try:
         input_entries = lib.parse_inside(index, inside)
-    except lib.KSError as err:
+    except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
     for name in added - local[3]:
@@ -83,7 +84,7 @@ if __name__ == "__main__":
 
     try:
         sorted_entries = lib.series_sort(index, input_entries)
-    except lib.KSError as err:
+    except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
     output = lib.series_format(sorted_entries)
@@ -119,7 +120,7 @@ if __name__ == "__main__":
     to_update = filter(lib.tag_needs_update, input_entries)
     try:
         lib.update_tags(index, to_update)
-    except lib.KSError as err:
+    except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         result = 1
     else:
