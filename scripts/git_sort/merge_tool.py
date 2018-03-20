@@ -97,6 +97,7 @@ if __name__ == "__main__":
     splice(base, output, base_path)
     splice(remote, output, remote_path)
 
+    result = 0
     try:
         cmd = "merge"
         retval = subprocess.call([cmd, merged_path, base_path, remote_path])
@@ -113,5 +114,16 @@ if __name__ == "__main__":
         print("Warning: conflicts outside of sorted section, leaving merged "
               "result in %s" % (name,))
         shutil.copy(merged_path, name)
-        sys.exit(1)
+        result = 1
 
+    to_update = filter(lib.tag_needs_update, input_entries)
+    try:
+        lib.update_tags(index, to_update)
+    except lib.KSError as err:
+        print("Error: %s" % (err,), file=sys.stderr)
+        result = 1
+    else:
+        for entry in to_update:
+            subprocess.check_call(["git", "add", entry.name])
+
+    sys.exit(result)
