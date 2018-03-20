@@ -15,6 +15,7 @@ import sys
 
 import git_sort
 import lib
+import series_conf
 import tag
 
 
@@ -38,7 +39,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        before, inside, after = lib.split_series(lines)
+        before, inside, after = series_conf.split(lines)
         current_entries = lib.parse_inside(index, inside)
     except lib.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)

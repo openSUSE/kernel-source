@@ -25,6 +25,7 @@ import sys
 
 import exc
 import lib
+import series_conf
 
 
 def splice(series, inside, output_path):
@@ -49,7 +50,7 @@ if __name__ == "__main__":
         (s[0], s[1], s[2], set([lib.firstword(l) for l in s[1] if
                                 lib.filter_patches(l)]),)
         for s in [
-            lib.split_series(open(s_path)) for s_path in (
+            series_conf.split(open(s_path)) for s_path in (
                 local_path, base_path, remote_path,)
         ]
     )

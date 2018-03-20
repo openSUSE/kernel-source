@@ -34,6 +34,7 @@ except ImportError as err:
 import exc
 import git_sort
 import lib
+import series_conf
 import tag
 
 
@@ -67,7 +68,7 @@ if __name__ == "__main__":
         os.chdir(args.prefix)
 
     try:
-        before, inside, after = lib.split_series(lines)
+        before, inside, after = series_conf.split(lines)
     except exc.KSNotFound as err:
         if args.series is None:
             before = []

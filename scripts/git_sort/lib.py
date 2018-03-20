@@ -16,6 +16,7 @@ import sys
 
 import exc
 import git_sort
+import series_conf
 import tag
 
 
@@ -89,11 +90,6 @@ def repo_path():
     return pygit2.discover_repository(search_path)
 
 
-start_text = "sorted patches"
-end_text = "end of sorted patches"
-oot_text = git_sort.oot.rev
-
-
 def filter_patches(line):
     line = line.strip()
 
@@ -120,58 +116,6 @@ def find_commit_in_series(commit, series):
     raise exc.KSNotFound()
 
 
-def split_series(series):
-    before = []
-    inside = []
-    after = []
-
-    whitespace = []
-    comments = []
-
-    current = before
-    for line in series:
-        l = line.strip()
-
-        if l == "":
-            if comments:
-                current.extend(comments)
-                comments = []
-            whitespace.append(line)
-            continue
-        elif l.startswith("#"):
-            if whitespace:
-                current.extend(whitespace)
-                whitespace = []
-            comments.append(line)
-
-            if current == before and l.lower() == "# %s" % (start_text,):
-                current = inside
-            elif current == inside and l.lower() == "# %s" % (end_text,):
-                current = after
-        else:
-            if comments:
-                current.extend(comments)
-                comments = []
-            if whitespace:
-                current.extend(whitespace)
-                whitespace = []
-            current.append(line)
-    if comments:
-        current.extend(comments)
-        comments = []
-    if whitespace:
-        current.extend(whitespace)
-        whitespace = []
-
-    if current is before:
-        raise exc.KSNotFound("Sorted subseries not found.")
-
-    current.extend(comments)
-    current.extend(whitespace)
-
-    return (before, inside, after,)
-
-
 def series_header(series):
     header = []
 
@@ -196,6 +140,7 @@ def series_footer(series):
 
 
 def parse_section_header(line):
+    oot_text = git_sort.oot.rev
     line = line.strip()
 
     if not line.startswith("# "):
@@ -203,7 +148,7 @@ def parse_section_header(line):
     line = line[2:]
     if line == oot_text:
         return git_sort.oot
-    elif line.lower() == start_text:
+    elif line.lower() == series_conf.start_text:
         raise exc.KSNotFound()
 
     words = line.split(None, 3)
@@ -485,7 +430,7 @@ def sequence_insert(series, rev, top):
             "please add it and submit a patch." % (commit,))
 
     try:
-        before, inside, after = split_series(series)
+        before, inside, after = series_conf.split(series)
     except exc.KSNotFound as err:
         raise exc.KSError(err)
     before, after = map(filter_series, (before, after,))
