@@ -14,7 +14,9 @@ import pygit2
 import sys
 
 import git_sort
+import exc
 import lib
+import series_conf
 import tag
 
 
@@ -38,9 +40,9 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        before, inside, after = lib.split_series(lines)
+        before, inside, after = series_conf.split(lines)
         current_entries = lib.parse_inside(index, inside)
-    except lib.KSError as err:
+    except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
 
@@ -66,7 +68,7 @@ if __name__ == "__main__":
         new_lines.add(entry.value)
         try:
             entry.from_patch(index, name, git_sort.oot)
-        except lib.KSError as err:
+        except exc.KSError as err:
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
         if entry.dest_head != git_sort.oot:
@@ -83,7 +85,7 @@ if __name__ == "__main__":
 
     try:
         sorted_entries = lib.series_sort(index, current_entries + new_entries)
-    except lib.KSError as err:
+    except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
 
@@ -122,6 +124,6 @@ if __name__ == "__main__":
 
     try:
         lib.update_tags(index, filter(lib.tag_needs_update, new_entries))
-    except lib.KSError as err:
+    except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)

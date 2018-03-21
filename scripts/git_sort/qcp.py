@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 
+import exc
 import lib
 import tag
 
@@ -100,7 +101,7 @@ if __name__ == "__main__":
             with lib.find_commit_in_series(fixes, series) as patch:
                 destination = os.path.dirname(patch.name)
                 references = " ".join(patch.get("References"))
-        except lib.KSNotFound:
+        except exc.KSNotFound:
             print("Error: no patch found which contains commit %s." %
                   (fixes[:12],), file=sys.stderr)
             sys.exit(1)
