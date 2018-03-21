@@ -10,6 +10,7 @@ import pygit2
 import subprocess
 import sys
 
+import exc
 import lib
 
 
@@ -56,5 +57,5 @@ if __name__ == "__main__":
             if top == patch.name:
                 print("This is the top patch.")
             sys.exit(1)
-    except lib.KSNotFound:
+    except exc.KSNotFound:
         pass

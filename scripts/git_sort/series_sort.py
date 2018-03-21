@@ -31,8 +31,10 @@ except ImportError as err:
           "\"scripts/git_sort/README.md\".", file=sys.stderr)
     sys.exit(1)
 
+import exc
 import git_sort
 import lib
+import series_conf
 import tag
 
 
@@ -66,8 +68,8 @@ if __name__ == "__main__":
         os.chdir(args.prefix)
 
     try:
-        before, inside, after = lib.split_series(lines)
-    except lib.KSNotFound as err:
+        before, inside, after = series_conf.split(lines)
+    except exc.KSNotFound as err:
         if args.series is None:
             before = []
             inside = lines
@@ -81,13 +83,13 @@ if __name__ == "__main__":
 
     try:
         input_entries = lib.parse_inside(index, inside)
-    except lib.KSError as err:
+    except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
 
     try:
         sorted_entries = lib.series_sort(index, input_entries)
-    except lib.KSError as err:
+    except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
 
@@ -121,6 +123,6 @@ if __name__ == "__main__":
         f.writelines(output)
         try:
             lib.update_tags(index, to_update)
-        except lib.KSError as err:
+        except exc.KSError as err:
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
