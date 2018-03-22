@@ -3,11 +3,9 @@
 
 from __future__ import print_function
 
-import collections
 import os
 import os.path
 import pygit2
-import shelve
 import shutil
 import subprocess
 import sys
@@ -16,21 +14,7 @@ import unittest
 
 import git_sort
 import lib
-
-
-def write_patch(name, mainline=None, repo=None, commit=None):
-    f = open(name, mode="w")
-    if mainline and commit and repo is None:
-        f.write("Patch-mainline: %s\n" % (mainline,))
-        f.write("Git-commit: %s\n" % (commit,))
-    elif mainline is None and repo and commit:
-        f.write("Patch-mainline: Queued in subsystem maintainer repository\n")
-        f.write("Git-repo: %s\n" % (repo,))
-        f.write("Git-commit: %s\n" % (commit,))
-    elif mainline and repo is None and commit is None:
-        f.write("Patch-mainline: %s\n" % (mainline,))
-    else:
-        assert False
+import tests.support
 
 
 class TestSeriesSort(unittest.TestCase):
@@ -100,32 +84,46 @@ class TestSeriesSort(unittest.TestCase):
             [n1]
         )
 
-        self.repo.remotes.create("origin",
-                                 "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git")
+        oot0 = self.repo.create_commit(
+            "refs/heads/oot",
+            author,
+            committer,
+            "oot 0\n\nlog",
+            tree,
+            [m0]
+        )
+
+        oot1 = self.repo.create_commit(
+            "refs/heads/oot",
+            author,
+            committer,
+            "oot 1\n\nlog",
+            tree,
+            [oot0]
+        )
+
+        k_org_canon_prefix = "git://git.kernel.org/pub/scm/linux/kernel/git/"
+        origin_repo = k_org_canon_prefix + "torvalds/linux.git"
+        self.repo.remotes.create("origin", origin_repo)
         self.repo.references.create("refs/remotes/origin/master", m2)
 
-        self.repo.remotes.create("net",
-                                 "git://git.kernel.org/pub/scm/linux/kernel/git/davem/net.git")
+        net_repo = k_org_canon_prefix + "davem/net.git"
+        self.repo.remotes.create("net", net_repo)
         self.repo.references.create("refs/remotes/net/master", n2)
 
         self.index = git_sort.SortIndex(self.repo)
 
         # setup stub kernel-source content
         self.ks_dir = tempfile.mkdtemp(prefix="gs_ks")
-        k_org_canon_prefix = "git://git.kernel.org/pub/scm/linux/kernel/git/"
         patch_dir = os.path.join(self.ks_dir, "patches.suse")
         os.mkdir(patch_dir)
         os.chdir(patch_dir)
-        write_patch("mainline0.patch", mainline="v3.45-rc6", commit=str(m0))
-        write_patch("net0.patch", mainline="v3.45-rc6", commit=str(n0))
-        write_patch("net1.patch", repo=k_org_canon_prefix + "davem/net.git",
-                    commit=str(n1))
-        write_patch("net2.patch", repo=k_org_canon_prefix + "davem/net.git",
-                    commit=str(n2))
-        write_patch("net2.patch", repo=k_org_canon_prefix + "davem/net.git",
-                    commit=str(n2))
-        write_patch("oot0.patch", mainline="no")
-        write_patch("oot1.patch", mainline="no")
+        tests.support.format_patch(self.repo.get(m0), mainline="v3.45-rc6")
+        tests.support.format_patch(self.repo.get(n0), mainline="v3.45-rc6")
+        tests.support.format_patch(self.repo.get(n1), repo=net_repo)
+        tests.support.format_patch(self.repo.get(n2), repo=net_repo)
+        tests.support.format_patch(self.repo.get(oot0))
+        tests.support.format_patch(self.repo.get(oot1))
 
     def tearDown(self):
         shutil.rmtree(os.environ["XDG_CACHE_HOME"])
@@ -163,8 +161,8 @@ class TestSeriesSort(unittest.TestCase):
 """########################################################
 	# sorted patches
 	########################################################
-	patches.suse/mainline0.patch
-	patches.suse/net0.patch
+	patches.suse/mainline-0.patch
+	patches.suse/net-0.patch
 	########################################################
 	# end of sorted patches
 	########################################################
@@ -190,16 +188,16 @@ class TestSeriesSort(unittest.TestCase):
 	########################################################
 	# sorted patches
 	########################################################
-	patches.suse/mainline0.patch
-	patches.suse/net0.patch
+	patches.suse/mainline-0.patch
+	patches.suse/net-0.patch
 
 	# davem/net
-	patches.suse/net1.patch
-	patches.suse/net2.patch
+	patches.suse/net-1.patch
+	patches.suse/net-2.patch
 
 	# out-of-tree patches
-	patches.suse/oot0.patch
-	patches.suse/oot1.patch
+	patches.suse/oot-0.patch
+	patches.suse/oot-1.patch
 
 	########################################################
 	# end of sorted patches
