@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys
 
 import git_sort
 import lib
@@ -93,6 +94,38 @@ class TestSeriesInsert(unittest.TestCase):
 	# end of sorted patches
 	########################################################
 """)
+
+        content = []
+        with open("patches.suse/mainline-1.patch") as f:
+            for line in f:
+                if line.startswith("Git-commit: "):
+                    line = "Git-commit: invalid\n"
+                content.append(line)
+        open("patches.suse/mainline-1.patch", mode="w+").writelines(content)
+
+        open(series, mode="w").write(
+"""########################################################
+	# sorted patches
+	########################################################
+	patches.suse/mainline-0.patch
+	patches.suse/mainline-2.patch
+	########################################################
+	# end of sorted patches
+	########################################################
+""")
+
+        try:
+            subprocess.check_output([si_path, "patches.suse/mainline-1.patch"],
+                                   stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as err:
+            self.assertEqual(err.returncode, 1)
+            self.assertEqual(
+                err.output,
+                "Error: Git-commit tag \"invalid\" in patch "
+                "\"patches.suse/mainline-1.patch\" is not a valid revision.\n")
+        else:
+            self.assertTrue(False)
+
         os.unlink(series)
 
 
