@@ -12,6 +12,7 @@ import sys
 
 import exc
 import lib
+import series_conf
 
 
 if __name__ == "__main__":
@@ -37,7 +38,7 @@ if __name__ == "__main__":
     cwd = os.getcwd()
     os.chdir("patches")
     try:
-        with lib.find_commit_in_series(commit, series) as patch:
+        with series_conf.find_commit_in_series(commit, series) as patch:
             print("Commit %s already present in patch\n\t%s" % (
                 commit[:12], patch.name,))
             references = " ".join(patch.get("References"))

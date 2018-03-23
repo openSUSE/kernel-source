@@ -14,6 +14,7 @@ import tempfile
 
 import exc
 import lib
+import series_conf
 import tag
 
 
@@ -87,7 +88,7 @@ if __name__ == "__main__":
     if args.followup:
         with tag.Patch(content=commit.message) as patch:
             try:
-                fixes = lib.firstword(patch.get("Fixes")[0])
+                fixes = series_conf.firstword(patch.get("Fixes")[0])
             except IndexError:
                 print("Error: no \"Fixes\" tag found in commit \"%s\"." %
                       (str(commit.id)[:12]), file=sys.stderr)
@@ -98,7 +99,7 @@ if __name__ == "__main__":
         cwd = os.getcwd()
         os.chdir("patches")
         try:
-            with lib.find_commit_in_series(fixes, series) as patch:
+            with series_conf.find_commit_in_series(fixes, series) as patch:
                 destination = os.path.dirname(patch.name)
                 references = " ".join(patch.get("References"))
         except exc.KSNotFound:
