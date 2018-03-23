@@ -4,7 +4,7 @@ _libdir=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 
 sorted_section_changed () {
 	status=$(git diff-index --cached --name-status --diff-filter=AM HEAD \
-		-- "$_libdir"/../../series.conf | awk '{print $1}')
+		-- series.conf | awk '{print $1}')
 	case "$status" in
 		"")
 			return 1
