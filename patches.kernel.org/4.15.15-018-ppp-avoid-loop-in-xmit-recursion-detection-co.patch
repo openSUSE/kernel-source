@@ -1,0 +1,149 @@
+From: Guillaume Nault <g.nault@alphalink.fr>
+Date: Tue, 20 Mar 2018 16:49:26 +0100
+Subject: [PATCH] ppp: avoid loop in xmit recursion detection code
+References: bnc#1012628
+Patch-mainline: 4.15.15
+Git-commit: 6d066734e9f09cdea4a3b9cb76136db3f29cfb02
+
+[ Upstream commit 6d066734e9f09cdea4a3b9cb76136db3f29cfb02 ]
+
+We already detect situations where a PPP channel sends packets back to
+its upper PPP device. While this is enough to avoid deadlocking on xmit
+locks, this doesn't prevent packets from looping between the channel
+and the unit.
+
+The problem is that ppp_start_xmit() enqueues packets in ppp->file.xq
+before checking for xmit recursion. Therefore, __ppp_xmit_process()
+might dequeue a packet from ppp->file.xq and send it on the channel
+which, in turn, loops it back on the unit. Then ppp_start_xmit()
+queues the packet back to ppp->file.xq and __ppp_xmit_process() picks
+it up and sends it again through the channel. Therefore, the packet
+will loop between __ppp_xmit_process() and ppp_start_xmit() until some
+other part of the xmit path drops it.
+
+For L2TP, we rapidly fill the skb's headroom and pppol2tp_xmit() drops
+the packet after a few iterations. But PPTP reallocates the headroom
+if necessary, letting the loop run and exhaust the machine resources
+(as reported in https://bugzilla.kernel.org/show_bug.cgi?id=199109).
+
+Fix this by letting __ppp_xmit_process() enqueue the skb to
+ppp->file.xq, so that we can check for recursion before adding it to
+the queue. Now ppp_xmit_process() can drop the packet when recursion is
+detected.
+
+__ppp_channel_push() is a bit special. It calls __ppp_xmit_process()
+without having any actual packet to send. This is used by
+ppp_output_wakeup() to re-enable transmission on the parent unit (for
+implementations like ppp_async.c, where the .start_xmit() function
+might not consume the skb, leaving it in ppp->xmit_pending and
+disabling transmission).
+Therefore, __ppp_xmit_process() needs to handle the case where skb is
+NULL, dequeuing as many packets as possible from ppp->file.xq.
+
+Reported-by: xu heng <xuheng333@zoho.com>
+Fixes: 55454a565836 ("ppp: avoid dealock on recursive xmit")
+Signed-off-by: Guillaume Nault <g.nault@alphalink.fr>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/net/ppp/ppp_generic.c | 26 ++++++++++++++------------
+ 1 file changed, 14 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/ppp/ppp_generic.c b/drivers/net/ppp/ppp_generic.c
+index 9f79f9274c50..d37183aec313 100644
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -257,7 +257,7 @@ struct ppp_net {
+ /* Prototypes. */
+ static int ppp_unattached_ioctl(struct net *net, struct ppp_file *pf,
+ 			struct file *file, unsigned int cmd, unsigned long arg);
+-static void ppp_xmit_process(struct ppp *ppp);
++static void ppp_xmit_process(struct ppp *ppp, struct sk_buff *skb);
+ static void ppp_send_frame(struct ppp *ppp, struct sk_buff *skb);
+ static void ppp_push(struct ppp *ppp);
+ static void ppp_channel_push(struct channel *pch);
+@@ -513,13 +513,12 @@ static ssize_t ppp_write(struct file *file, const char __user *buf,
+ 		goto out;
+ 	}
+ 
+-	skb_queue_tail(&pf->xq, skb);
+-
+ 	switch (pf->kind) {
+ 	case INTERFACE:
+-		ppp_xmit_process(PF_TO_PPP(pf));
++		ppp_xmit_process(PF_TO_PPP(pf), skb);
+ 		break;
+ 	case CHANNEL:
++		skb_queue_tail(&pf->xq, skb);
+ 		ppp_channel_push(PF_TO_CHANNEL(pf));
+ 		break;
+ 	}
+@@ -1267,8 +1266,8 @@ ppp_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	put_unaligned_be16(proto, pp);
+ 
+ 	skb_scrub_packet(skb, !net_eq(ppp->ppp_net, dev_net(dev)));
+-	skb_queue_tail(&ppp->file.xq, skb);
+-	ppp_xmit_process(ppp);
++	ppp_xmit_process(ppp, skb);
++
+ 	return NETDEV_TX_OK;
+ 
+  outf:
+@@ -1420,13 +1419,14 @@ static void ppp_setup(struct net_device *dev)
+  */
+ 
+ /* Called to do any work queued up on the transmit side that can now be done */
+-static void __ppp_xmit_process(struct ppp *ppp)
++static void __ppp_xmit_process(struct ppp *ppp, struct sk_buff *skb)
+ {
+-	struct sk_buff *skb;
+-
+ 	ppp_xmit_lock(ppp);
+ 	if (!ppp->closing) {
+ 		ppp_push(ppp);
++
++		if (skb)
++			skb_queue_tail(&ppp->file.xq, skb);
+ 		while (!ppp->xmit_pending &&
+ 		       (skb = skb_dequeue(&ppp->file.xq)))
+ 			ppp_send_frame(ppp, skb);
+@@ -1440,7 +1440,7 @@ static void __ppp_xmit_process(struct ppp *ppp)
+ 	ppp_xmit_unlock(ppp);
+ }
+ 
+-static void ppp_xmit_process(struct ppp *ppp)
++static void ppp_xmit_process(struct ppp *ppp, struct sk_buff *skb)
+ {
+ 	local_bh_disable();
+ 
+@@ -1448,7 +1448,7 @@ static void ppp_xmit_process(struct ppp *ppp)
+ 		goto err;
+ 
+ 	(*this_cpu_ptr(ppp->xmit_recursion))++;
+-	__ppp_xmit_process(ppp);
++	__ppp_xmit_process(ppp, skb);
+ 	(*this_cpu_ptr(ppp->xmit_recursion))--;
+ 
+ 	local_bh_enable();
+@@ -1458,6 +1458,8 @@ static void ppp_xmit_process(struct ppp *ppp)
+ err:
+ 	local_bh_enable();
+ 
++	kfree_skb(skb);
++
+ 	if (net_ratelimit())
+ 		netdev_err(ppp->dev, "recursion detected\n");
+ }
+@@ -1942,7 +1944,7 @@ static void __ppp_channel_push(struct channel *pch)
+ 	if (skb_queue_empty(&pch->file.xq)) {
+ 		ppp = pch->ppp;
+ 		if (ppp)
+-			__ppp_xmit_process(ppp);
++			__ppp_xmit_process(ppp, NULL);
+ 	}
+ }
+ 
+-- 
+2.16.3
+
