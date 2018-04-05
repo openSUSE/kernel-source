@@ -205,6 +205,7 @@ remotes = (
     Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.16-rc"),
     Head(RepoURL("dhowells/linux-fs.git")),
     Head(RepoURL("herbert/cryptodev-2.6.git"), "master"),
+    Head(RepoURL("helgaas/pci.git"), "next"),
 )
 
 
