@@ -342,8 +342,23 @@ class Cache(object):
             else:
                 raise
 
+        if write_enable:
+            # In case there is already a database file of an unsupported format,
+            # one would hope that with flag="n" a new database would be created
+            # to overwrite the current one. Alas, that is not the case... :'(
+            try:
+                os.unlink(cache_path)
+            except OSError as e:
+                if e.errno != 2:
+                    raise
+
         flag_map = {False : "r", True : "n"}
-        self.cache = shelve.open(cache_path, flag=flag_map[write_enable])
+        try:
+            self.cache = shelve.open(cache_path, flag=flag_map[write_enable])
+        except ImportError as err:
+            raise CUnsupported("Unsupported cache database format:\n" +
+                               str(err))
+
         self.closed = False
         if write_enable:
             self.cache["version"] = Cache.version
@@ -378,16 +393,22 @@ class Cache(object):
         if self.closed:
             raise ValueError
 
+        try:
+            version = self.cache["version"]
+        except KeyError:
+            key_error = True
+        except ValueError as err:
+            raise CUnsupported(str(err))
+        else:
+            key_error = False
+
         if key == "version":
-            try:
-                return self.cache["version"]
-            except KeyError:
+            if key_error:
                 raise CKeyError
+            else:
+                return version
         elif key == "history":
-            try:
-                if self.cache["version"] != Cache.version:
-                    raise CUnsupported
-            except KeyError:
+            if key_error or version != Cache.version:
                 raise CUnsupported
 
             try:
@@ -442,7 +463,7 @@ class SortIndex(object):
                     history = cache["history"]
                 except CNeedsRebuild:
                     needs_rebuild = True
-        except CAbsent:
+        except CNeedsRebuild:
             needs_rebuild = True
         except CError as err:
             print("Error: %s" % (err,), file=sys.stderr)
@@ -586,7 +607,7 @@ if __name__ == "__main__":
                         needs_rebuild = True
                     else:
                         pprint.pprint(history.keys())
-        except CAbsent:
+        except CNeedsRebuild:
             print("No usable cache")
             needs_rebuild = True
         except CError as err:
