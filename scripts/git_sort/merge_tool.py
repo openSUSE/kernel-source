@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 """
@@ -14,8 +14,6 @@ Then call
 git mergetool --tool=git-sort series.conf
 
 """
-
-from __future__ import print_function
 
 import os.path
 import pygit2
@@ -47,8 +45,8 @@ if __name__ == "__main__":
 
     # (before, inside, after, set(inside),)
     local, base, remote = (
-        (s[0], s[1], s[2], set([lib.firstword(l) for l in s[1] if
-                                lib.filter_patches(l)]),)
+        (s[0], s[1], s[2], set([series_conf.firstword(l) for l in s[1] if
+                                series_conf.filter_patches(l)]),)
         for s in [
             series_conf.split(open(s_path)) for s_path in (
                 local_path, base_path, remote_path,)

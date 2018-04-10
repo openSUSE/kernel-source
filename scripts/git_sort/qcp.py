@@ -1,7 +1,5 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
-
-from __future__ import print_function
 
 import argparse
 import os
@@ -14,6 +12,7 @@ import tempfile
 
 import exc
 import lib
+import series_conf
 import tag
 
 
@@ -21,7 +20,7 @@ def format_import(references, tmpdir, dstdir, rev, poi=[]):
     assert len(poi) == 0 # todo
     args = ("git", "format-patch", "--output-directory", tmpdir, "--notes",
             "--max-count=1", "--subject-prefix=", "--no-numbered", rev,)
-    src = subprocess.check_output(args).strip()
+    src = subprocess.check_output(args).decode().strip()
     # remove number prefix
     name = os.path.basename(src)[5:]
     dst = os.path.join(dstdir, name)
@@ -31,9 +30,8 @@ def format_import(references, tmpdir, dstdir, rev, poi=[]):
 
     subprocess.check_call((os.path.join(lib.libdir(), "clean_header.sh"),
                            "--commit=%s" % rev, "--reference=%s" % references,
-                           src,), preexec_fn=lib.restore_signals)
-    subprocess.check_call(("quilt", "import", "-P", dst, src,),
-                          preexec_fn=lib.restore_signals)
+                           src,))
+    subprocess.check_call(("quilt", "import", "-P", dst, src,))
     # This will remind the user to run refresh_patch.sh
     lib.touch(".pc/%s~refresh" % (dst,))
 
@@ -87,7 +85,7 @@ if __name__ == "__main__":
     if args.followup:
         with tag.Patch(content=commit.message) as patch:
             try:
-                fixes = lib.firstword(patch.get("Fixes")[0])
+                fixes = series_conf.firstword(patch.get("Fixes")[0])
             except IndexError:
                 print("Error: no \"Fixes\" tag found in commit \"%s\"." %
                       (str(commit.id)[:12]), file=sys.stderr)
@@ -98,7 +96,7 @@ if __name__ == "__main__":
         cwd = os.getcwd()
         os.chdir("patches")
         try:
-            with lib.find_commit_in_series(fixes, series) as patch:
+            with series_conf.find_commit_in_series(fixes, series) as patch:
                 destination = os.path.dirname(patch.name)
                 references = " ".join(patch.get("References"))
         except exc.KSNotFound:

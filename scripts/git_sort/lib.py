@@ -1,10 +1,7 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-from __future__ import print_function
-
 import collections
-import contextlib
 import operator
 import os
 import os.path
@@ -30,18 +27,6 @@ def touch(fname, times=None):
         os.utime(fname, times)
 
 
-# http://stackoverflow.com/questions/22077881/yes-reporting-error-with-subprocess-communicate
-def restore_signals(): # from http://hg.python.org/cpython/rev/768722b2ae0a/
-    signals = ('SIGPIPE', 'SIGXFZ', 'SIGXFSZ')
-    for sig in signals:
-        if hasattr(signal, sig):
-            signal.signal(getattr(signal, sig), signal.SIG_DFL)
-
-
-def firstword(value):
-    return value.split(None, 1)[0]
-
-
 def libdir():
     return os.path.dirname(os.path.realpath(__file__))
 
@@ -62,10 +47,9 @@ def check_series():
     
     try:
         subprocess.check_output(("quilt", "--quiltrc", "-", "top",),
-                                preexec_fn=restore_signals,
                                 stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError as err:
-        if err.output == "No patches applied\n":
+        if err.output.decode() == "No patches applied\n":
             pass
         else:
             raise
@@ -81,8 +65,8 @@ def check_series():
 def repo_path():
     try:
         search_path = subprocess.check_output(
-            os.path.join(libdir(), "..", "linux_git.sh"),
-            preexec_fn=restore_signals).strip()
+            os.path.join(libdir(), "..",
+                         "linux_git.sh")).decode().strip()
     except subprocess.CalledProcessError:
         print("Error: Could not determine mainline linux git repository path.",
               file=sys.stderr)
@@ -90,37 +74,11 @@ def repo_path():
     return pygit2.discover_repository(search_path)
 
 
-def filter_patches(line):
-    line = line.strip()
-
-    if line == "" or line.startswith(("#", "-", "+",)):
-        return False
-    else:
-        return True
-
-
-@contextlib.contextmanager
-def find_commit_in_series(commit, series):
-    """
-    Caller must chdir to where the entries in series can be found.
-    """
-    for name in [firstword(l) for l in series if filter_patches(l)]:
-        patch = tag.Patch(name)
-        found = False
-        if commit in [firstword(value) for value in patch.get("Git-commit")]:
-            found = True
-            yield patch
-        patch.close()
-        if found:
-            return
-    raise exc.KSNotFound()
-
-
 def series_header(series):
     header = []
 
     for line in series:
-        if filter_patches(line):
+        if series_conf.filter_patches(line):
             break
 
         try:
@@ -179,10 +137,10 @@ def parse_inside(index, inside):
         except exc.KSNotFound:
             pass
 
-        if not filter_patches(line):
+        if not series_conf.filter_patches(line):
             continue
 
-        name = firstword(line)
+        name = series_conf.firstword(line)
         entry = InputEntry("\t%s\n" % (name,))
         entry.from_patch(index, name, current_head)
         result.append(entry)
@@ -213,7 +171,7 @@ class InputEntry(object):
             self.dest_head = git_sort.oot
             return
 
-        self.revs = [firstword(ct) for ct in commit_tags]
+        self.revs = [series_conf.firstword(ct) for ct in commit_tags]
         for rev in self.revs:
             if not self.commit_match.match(rev):
                 raise exc.KSError("Git-commit tag \"%s\" in patch \"%s\" is not a "
@@ -347,7 +305,7 @@ def series_sort(index, entries):
             e[1]
             for e in sorted(result[head].items(), key=operator.itemgetter(0))])
 
-    for head, lines in result.items():
+    for head, lines in list(result.items()):
         if not lines:
             del result[head]
 
@@ -405,8 +363,6 @@ def sequence_insert(series, rev, top):
 
     Returns the name of the new top patch and how many must be applied/popped.
     """
-    filter_series = lambda lines : [firstword(line) for line in lines
-                                    if filter_patches(line)]
     git_dir = repo_path()
     repo = pygit2.Repository(git_dir)
     index = git_sort.SortIndex(repo)
@@ -433,8 +389,8 @@ def sequence_insert(series, rev, top):
         before, inside, after = series_conf.split(series)
     except exc.KSNotFound as err:
         raise exc.KSError(err)
-    before, after = map(filter_series, (before, after,))
-    current_patches = flatten([before, filter_series(inside), after])
+    before, after = map(series_conf.filter_series, (before, after,))
+    current_patches = flatten([before, series_conf.filter_series(inside), after])
 
     if top is None:
         top_index = 0
