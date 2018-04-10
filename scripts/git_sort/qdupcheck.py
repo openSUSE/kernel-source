@@ -1,7 +1,5 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
-
-from __future__ import print_function
 
 import argparse
 import os
@@ -12,6 +10,7 @@ import sys
 
 import exc
 import lib
+import series_conf
 
 
 if __name__ == "__main__":
@@ -37,7 +36,7 @@ if __name__ == "__main__":
     cwd = os.getcwd()
     os.chdir("patches")
     try:
-        with lib.find_commit_in_series(commit, series) as patch:
+        with series_conf.find_commit_in_series(commit, series) as patch:
             print("Commit %s already present in patch\n\t%s" % (
                 commit[:12], patch.name,))
             references = " ".join(patch.get("References"))
@@ -46,11 +45,10 @@ if __name__ == "__main__":
 
             try:
                 top = subprocess.check_output(
-                    ("quilt", "--quiltrc", "-", "top",), cwd=cwd,
-                    preexec_fn=lib.restore_signals,
-                    stderr=subprocess.STDOUT).strip()
+                    ("quilt", "--quiltrc", "-", "top",),
+                    cwd=cwd, stderr=subprocess.STDOUT,).decode().strip()
             except subprocess.CalledProcessError as err:
-                if err.output == "No patches applied\n":
+                if err.output.decode() == "No patches applied\n":
                     top = None
                 else:
                     raise

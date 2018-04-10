@@ -1,7 +1,5 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
-
-from __future__ import print_function
 
 import os
 import os.path
@@ -131,21 +129,36 @@ class TestSeriesSort(unittest.TestCase):
         shutil.rmtree(self.ks_dir)
 
 
+    def test_nofile(self):
+        ss_path = os.path.join(lib.libdir(), "series_sort.py")
+        os.chdir(self.ks_dir)
+
+        try:
+            subprocess.check_output([ss_path, "aaa"], stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as err:
+            self.assertEqual(err.returncode, 1)
+            self.assertEqual(
+                err.output.decode(),
+                "Error: [Errno 2] No such file or directory: 'aaa'\n")
+        else:
+            self.assertTrue(False)
+
+
     def test_absent(self):
         ss_path = os.path.join(lib.libdir(), "series_sort.py")
         os.chdir(self.ks_dir)
 
         (tmp, series,) = tempfile.mkstemp(dir=self.ks_dir)
-        open(series, mode="w").write(
+        with open(series, mode="w") as f:
+            f.write(
 """
 	patches.suse/unsorted-before.patch
 """)
 
         try:
-            output = subprocess.check_output([ss_path, series],
-                                             stderr=subprocess.STDOUT)
+            subprocess.check_output([ss_path, series], stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
-            self.assertEqual(err.output, "Error: Sorted subseries not found.\n")
+            self.assertEqual(err.output.decode(), "Error: Sorted subseries not found.\n")
         else:
             self.assertTrue(False)
 
@@ -157,7 +170,8 @@ class TestSeriesSort(unittest.TestCase):
         os.chdir(self.ks_dir)
 
         (tmp, series,) = tempfile.mkstemp(dir=self.ks_dir)
-        open(series, mode="w").write(
+        with open(series, mode="w") as f:
+            f.write(
 """########################################################
 	# sorted patches
 	########################################################
@@ -169,9 +183,12 @@ class TestSeriesSort(unittest.TestCase):
 """)
 
         subprocess.check_call([ss_path, "-c", series])
-        content = open(series).read()
-        output = subprocess.check_call([ss_path, series])
-        self.assertEqual(open(series).read(), content)
+        with open(series) as f:
+            content1 = f.read()
+        subprocess.check_call([ss_path, series])
+        with open(series) as f:
+            content2 = f.read()
+        self.assertEqual(content2, content1)
 
         os.unlink(series)
 
@@ -181,7 +198,8 @@ class TestSeriesSort(unittest.TestCase):
         os.chdir(self.ks_dir)
 
         (tmp, series,) = tempfile.mkstemp(dir=self.ks_dir)
-        open(series, mode="w").write(
+        with open(series, mode="w") as f:
+            f.write(
 """
 	patches.suse/unsorted-before.patch
 
@@ -207,9 +225,12 @@ class TestSeriesSort(unittest.TestCase):
 """)
 
         subprocess.check_call([ss_path, "-c", series])
-        content = open(series).read()
-        output = subprocess.check_call([ss_path, series])
-        self.assertEqual(open(series).read(), content)
+        with open(series) as f:
+            content1 = f.read()
+        subprocess.check_call([ss_path, series])
+        with open(series) as f:
+            content2 = f.read()
+        self.assertEqual(content2, content1)
 
         os.unlink(series)
 

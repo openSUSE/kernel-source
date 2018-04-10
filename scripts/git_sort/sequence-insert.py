@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 """
@@ -8,8 +8,6 @@ to the patch just before where the new commit will be added. The current script
 prints out which patch that is. Use in conjunction with sequence-patch.sh:
     kernel-source$ ./scripts/sequence-patch.sh $(~/programming/suse/ksapply/sequence-insert.py 5c8227d0d3b1)
 """
-
-from __future__ import print_function
 
 import argparse
 import os

@@ -1,7 +1,5 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
-
-from __future__ import print_function
 
 import os
 import pygit2
@@ -71,7 +69,8 @@ class TestSeriesInsert(unittest.TestCase):
         os.chdir(self.ks_dir)
 
         series = "series.conf"
-        open(series, mode="w").write(
+        with open(series, mode="w") as f:
+            f.write(
 """########################################################
 	# sorted patches
 	########################################################
@@ -83,7 +82,9 @@ class TestSeriesInsert(unittest.TestCase):
 """)
 
         subprocess.check_call([si_path, "patches.suse/mainline-1.patch"])
-        self.assertEqual(open(series).read(),
+        with open(series) as f:
+            content = f.read()
+        self.assertEqual(content,
 """########################################################
 	# sorted patches
 	########################################################
@@ -101,9 +102,11 @@ class TestSeriesInsert(unittest.TestCase):
                 if line.startswith("Git-commit: "):
                     line = "Git-commit: invalid\n"
                 content.append(line)
-        open("patches.suse/mainline-1.patch", mode="w+").writelines(content)
+        with open("patches.suse/mainline-1.patch", mode="w+") as f:
+            f.writelines(content)
 
-        open(series, mode="w").write(
+        with open(series, mode="w") as f:
+            f.write(
 """########################################################
 	# sorted patches
 	########################################################
@@ -120,7 +123,7 @@ class TestSeriesInsert(unittest.TestCase):
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
             self.assertEqual(
-                err.output,
+                err.output.decode(),
                 "Error: Git-commit tag \"invalid\" in patch "
                 "\"patches.suse/mainline-1.patch\" is not a valid revision.\n")
         else:

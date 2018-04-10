@@ -1,19 +1,43 @@
-Requirements
-============
-The `pygit2` python module must be available. It may be installed from the
-package `python2-pygit2` on SLE/openSUSE releases. If that package is not
-available in the standard repositories for your installation, have a look at
-the Kernel:tools OBS project:
+Installation Requirements
+=========================
+`git-sort` and the related series.conf sorting scripts depend on the python3
+`dbm` and `pygit2` modules.
+
+For SLE12-SP2 and SLE12-SP3, the python3-dbm package is available in the
+SUSE:SLE-12:Update IBS project:
+```
+https://build.suse.de/project/show/SUSE:SLE-12:Update
+http://download.suse.de/ibs/SUSE:/SLE-12:/Update/standard/SUSE:SLE-12:Update.repo
+```
+
+For openSUSE 42.3 and Tumbleweed, the python3-dbm package is available in the
+normal OSS repository.
+
+The python3-pygit2 package is available from the Kernel:tools OBS project
+except for Tumbleweed where it's available from the normal OSS repository.
 ```
 https://build.opensuse.org/package/show/Kernel:tools/python-pygit2
 ```
-As a last resort, you can try to compile your own module:
-```
-pip2 install pygit2
-```
-but beware that this has extra dependencies (`python2-pip`, `python-devel`,
-`libgit2-devel`).
 
+merge_tool.py depends on `merge` from the rcs package, available in standard
+repositories.
+
+The functions in `quilt-mode.sh` are meant to be used with a modified `quilt`
+that can use kernel-source.git's series.conf directly instead of a shadow
+copy.
+
+Packages are available in the following OBS project
+https://build.opensuse.org/package/show/home:benjamin_poirier:series_sort/quilt-ks
+Source is avaible from
+https://gitlab.suse.de/benjamin_poirier/quilt
+
+quilt depends on diffstat from the package with the same name. For SLE12-SP2
+and SLE12-SP3, the diffstat package is available in the SDK module. For
+openSUSE 42.3 and Tumbleweed, the diffstat package is available in the normal
+OSS repository.
+
+Configuration Requirements
+==========================
 The LINUX_GIT environment variable must be set to the path of a fresh Linux
 kernel git clone; it will be used as a reference for upstream commit
 information. Specifically, this must be a clone of
@@ -72,14 +96,6 @@ The sections "Example workflow to backport a single commit" and "Example
 workflow to backport a series of commits using kernel-source.git" demonstrate
 how to use the functions in quilt-mode.sh, which can assist in backporting a
 single commit or a series of commits directly to kernel-source.git.
-
-The functions in quilt-mode.sh are meant to be used with a modified `quilt`
-that can use kernel-source.git's series.conf directly instead of a shadow copy.
-
-Packages are available in the following OBS project
-https://build.opensuse.org/package/show/home:benjamin_poirier:series_sort/quilt-ks
-Source is avaible from
-https://gitlab.suse.de/benjamin_poirier/quilt
 
 Example workflow to backport a single commit
 ============================================
