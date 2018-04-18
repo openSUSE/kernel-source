@@ -322,7 +322,9 @@ def series_format(entries):
 
     for head, lines in entries.items():
         if head != git_sort.remotes[0]:
-            result.extend(["\n", "\t# %s\n" % (str(head),)])
+            if result:
+                result.append("\n")
+            result.append("\t# %s\n" % (str(head),))
         result.extend(lines)
 
     return result
@@ -346,6 +348,10 @@ def update_tags(index, entries):
                     patch.change(tag_name, index.describe(entry.cindex))
                 except KeyError:
                     raise exc.KSNotFound(message % (tag_name, entry.name,))
+                except git_sort.GSError as err:
+                    raise exc.KSError("Failed to update tag \"%s\" in patch "
+                                      "\"%s\". %s" % (tag_name, entry.name,
+                                                      str(err),))
                 patch.remove("Git-repo")
             else:
                 tag_name = "Git-repo"

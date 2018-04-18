@@ -567,6 +567,10 @@ class SortIndex(object):
             revs.sort(key=operator.itemgetter(0))
             self.version_indexes = list(zip(*revs))
 
+        if not self.version_indexes:
+            raise GSError("Cannot describe commit, did not find any mainline "
+                          "release tags in repository.")
+
         indexes, tags = self.version_indexes
         i = bisect.bisect_left(indexes, index)
         if i == len(tags):

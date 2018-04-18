@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import datetime
+import os.path
 import pygit2
 
 
@@ -55,8 +56,9 @@ def format_sanitized_subject(message):
     return "".join(result[:52])
 
 
-def format_patch(commit, mainline=None, repo=None):
-    name = format_sanitized_subject(commit.message) + ".patch"
+def format_patch(commit, mainline=None, repo=None, directory=""):
+    name = os.path.join(directory, format_sanitized_subject(commit.message) +
+                        ".patch")
 
     with open(name, mode="w") as f:
         f.write("From: %s <%s>\n" % (commit.author.name, commit.author.email,))
@@ -94,3 +96,24 @@ def format_patch(commit, mainline=None, repo=None):
         f.write("--\ngs-tests\n")
 
     return name
+
+
+def format_series(content):
+    def format_section(section):
+        if section[0] is not None:
+            header = "\t# %s\n" % (section[0],)
+        else:
+            header = ""
+        return "%s%s" % (header,
+                         "\n".join(["\t%s" % (name,) for name in section[1]]),)
+    return \
+"""	########################################################
+	# sorted patches
+	########################################################
+%s
+	########################################################
+	# end of sorted patches
+	########################################################
+""" % (
+    "\n\n".join(map(format_section, content)))
+
