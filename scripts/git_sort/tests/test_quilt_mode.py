@@ -179,8 +179,6 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
         subprocess.check_call(
             ["quilt", "setup", "--sourcedir", "../../", "../../series.conf"])
 
-        #sys.stdin.readline()
-
 
     def tearDown(self):
         shutil.rmtree(os.environ["XDG_CACHE_HOME"])
@@ -277,7 +275,7 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
         subprocess.check_call(("quilt", "--quiltrc", "-", "push",),
                               stdout=subprocess.DEVNULL)
 
-        # test merge_tool.py
+        # prepare repository
         os.chdir(self.ks_dir)
         subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
                        stdout=subprocess.DEVNULL)
@@ -292,7 +290,8 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
         os.chdir("tmp/current")
         subprocess.check_call(("quilt", "setup", "--sourcedir", "../../",
                                "../../series.conf",),)
-        # ... import commits[3]
+
+        # import commits[3]
         subprocess.check_call(
             ". %s; qgoto %s" % (qm_path, str(self.commits[3])), shell=True,
             stdout=subprocess.DEVNULL, executable="/bin/bash")
@@ -305,14 +304,81 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
                               stdout=subprocess.DEVNULL)
         subprocess.check_call(("quilt", "--quiltrc", "-", "refresh",),
                               stdout=subprocess.DEVNULL)
+        name = subprocess.check_output(
+            ("quilt", "--quiltrc", "-", "top",)).decode().strip()
 
         os.chdir(self.ks_dir)
         subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
                               stdout=subprocess.DEVNULL)
+
+        # test pre-commit.sh
+        pc_path = os.path.join(lib.libdir(), "pre-commit.sh")
+
+        subprocess.check_call(pc_path, stdout=subprocess.DEVNULL)
+
+        with open("series.conf") as f:
+            content = f.readlines()
+
+        content2 = list(content)
+        middle = int(len(content2) / 2)
+        content2[middle], content2[middle + 1] = \
+            content2[middle + 1], content2[middle]
+
+        with open("series.conf", mode="w") as f:
+            f.writelines(content2)
+
+        # check should be done against index, not working tree
+        subprocess.check_call(pc_path, stdout=subprocess.DEVNULL)
+
+        subprocess.check_call(("git", "add", "series.conf",),
+                              stdout=subprocess.DEVNULL)
+
+        # ... test a bad sorted section
+        try:
+            subprocess.check_output(pc_path, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as err:
+            self.assertEqual(err.returncode, 1)
+            self.assertTrue(err.output.decode().startswith(
+                "Input is not sorted."))
+        else:
+            self.assertTrue(False)
+
+        with open("series.conf", mode="w") as f:
+            f.writelines(content)
+
+        subprocess.check_call(("git", "add", "series.conf",),
+                              stdout=subprocess.DEVNULL)
+
         subprocess.check_call(("git", "commit", "-m",
                                "sched/debug: Ignore TASK_IDLE for SysRq-W",),
                               stdout=subprocess.DEVNULL)
 
+        # ... test a bad sorted patch
+        with open(name) as f:
+            content = f.readlines()
+        content2 = list(content)
+        for i in range(len(content2)):
+            if content2[i].startswith("Git-commit: "):
+                content2[i] = "Git-commit: cb329c2e40cf6cfc7bcd7c36ce5547f95e972ea5\n"
+                break
+        with open(name, mode="w") as f:
+            f.writelines(content2)
+        subprocess.check_call(("git", "add", name,), stdout=subprocess.DEVNULL)
+
+        try:
+            subprocess.check_output(pc_path, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as err:
+            self.assertEqual(err.returncode, 1)
+            self.assertTrue(err.output.decode().startswith(
+                "Error: There is a problem with patch \"%s\"." % (name,)))
+        else:
+            self.assertTrue(False)
+
+        with open(name, mode="w") as f:
+            f.writelines(content)
+        subprocess.check_call(("git", "add", name,), stdout=subprocess.DEVNULL)
+
+        # test merge_tool.py
         subprocess.check_call(("git", "checkout", "-q", "master",))
         shutil.rmtree("tmp/current")
         subprocess.check_call(

@@ -34,12 +34,12 @@ sorted_section_changed () {
 }
 
 sorted_patches_changed () {
-	common=$(comm -123 --total <(
+	common=$(comm -12 <(
 		git diff-index --cached --name-only --diff-filter=AMD HEAD | sort
 		) <(
 		git cat-file blob :series.conf |
 			"$_libdir"/series_conf.py --name-only | sort
-		) | awk '{print $3}')
+		) | wc -l)
 	
 	if ! [ "$common" -eq "$common" ] 2>/dev/stderr; then
 		# not an integer
