@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 """
@@ -6,15 +6,15 @@ Script to insert new patches in series.conf according to the upstream order of
 commits that the patches backport.
 """
 
-from __future__ import print_function
-
 import argparse
 import collections
 import pygit2
 import sys
 
 import git_sort
+import exc
 import lib
+import series_conf
 import tag
 
 
@@ -38,13 +38,13 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        before, inside, after = lib.split_series(lines)
+        before, inside, after = series_conf.split(lines)
         current_entries = lib.parse_inside(index, inside)
-    except lib.KSError as err:
+    except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
 
-    if filter(lib.tag_needs_update, current_entries):
+    if list(filter(lib.tag_needs_update, current_entries)):
         print("Error: Some Git-repo tags for patches currently in series.conf "
               "are outdated. Please run series_sort.py first and commit the "
               "result before adding new patches.", file=sys.stderr)
@@ -66,7 +66,7 @@ if __name__ == "__main__":
         new_lines.add(entry.value)
         try:
             entry.from_patch(index, name, git_sort.oot)
-        except lib.KSError as err:
+        except exc.KSError as err:
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
         if entry.dest_head != git_sort.oot:
@@ -83,12 +83,12 @@ if __name__ == "__main__":
 
     try:
         sorted_entries = lib.series_sort(index, current_entries + new_entries)
-    except lib.KSError as err:
+    except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
 
     cur_sorted_entries = collections.OrderedDict()
-    for head, lines in sorted_entries.items():
+    for head, lines in list(sorted_entries.items()):
         current_lines = [line for line in lines if line not in new_lines]
         if current_lines:
             cur_sorted_entries[head] = current_lines
@@ -121,7 +121,7 @@ if __name__ == "__main__":
         f.writelines(output)
 
     try:
-        lib.update_tags(index, filter(lib.tag_needs_update, new_entries))
-    except lib.KSError as err:
+        lib.update_tags(index, list(filter(lib.tag_needs_update, new_entries)))
+    except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)

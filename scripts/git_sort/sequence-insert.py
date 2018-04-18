@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 """
@@ -9,12 +9,11 @@ prints out which patch that is. Use in conjunction with sequence-patch.sh:
     kernel-source$ ./scripts/sequence-patch.sh $(~/programming/suse/ksapply/sequence-insert.py 5c8227d0d3b1)
 """
 
-from __future__ import print_function
-
 import argparse
 import os
 import sys
 
+import exc
 import lib
 
 
@@ -28,7 +27,7 @@ if __name__ == "__main__":
     try:
         (name, delta,) = lib.sequence_insert(open("series.conf"), args.rev,
                                              None)
-    except lib.KSException as err:
+    except exc.KSException as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
 
