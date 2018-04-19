@@ -1,11 +1,11 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
-
-from __future__ import print_function
 
 import argparse
 import bisect
 import collections
+import dbm
+import functools
 import operator
 import os
 import os.path
@@ -67,12 +67,20 @@ class RepoURL(object):
         self.url = url
 
 
+    def _is_valid_operand(self, other):
+        return hasattr(other, "url")
+
+
     def __eq__(self, other):
+        if not self._is_valid_operand(other):
+            return NotImplemented
         return self.url == other.url
 
 
-    def __cmp__(self, other):
-        return cmp(self.url, other.url)
+    def __ne__(self, other):
+        if not self._is_valid_operand(other):
+            return NotImplemented
+        return self.url != other.url
 
 
     def __hash__(self):
@@ -93,36 +101,42 @@ class RepoURL(object):
         return url
 
 
+@functools.total_ordering
 class Head(object):
     def __init__(self, repo_url, rev="master"):
         self.repo_url = repo_url
         self.rev = rev
 
 
+    def _is_valid_operand(self, other):
+        return hasattr(other, "repo_url") and hasattr(other, "rev")
+
+
+    def _get_index(self):
+        """
+        A head with no url is considered out of tree. Any other head with a
+        url is upstream of it.
+        """
+        if self.repo_url == RepoURL(None):
+            return len(remotes)
+        else:
+            return remote_index[self]
+
+
     def __eq__(self, other):
+        if not self._is_valid_operand(other):
+            return NotImplemented
         return (self.repo_url == other.repo_url and self.rev == other.rev)
+
+
+    def __lt__(self, other):
+        if not self._is_valid_operand(other):
+            return NotImplemented
+        return self._get_index() < other._get_index()
 
 
     def __hash__(self):
         return hash((self.repo_url, self.rev,))
-
-    
-    def __cmp__(self, other):
-        """
-        Head a is upstream of Head b -> a < b
-        """
-        def get_index(head):
-            """
-            A head with no url is considered out of tree. Any other head with a
-            url is upstream of it.
-            """
-            if head.repo_url == RepoURL(None):
-                return len(remotes)
-            else:
-                return remote_index[head]
-        a = get_index(self)
-        b = get_index(other)
-        return cmp(a, b)
 
 
     def __repr__(self):
@@ -168,15 +182,15 @@ remotes = (
     Head(RepoURL("tip/tip.git")),
     Head(RepoURL("shli/md.git"), "for-next"),
     Head(RepoURL("dhowells/linux-fs.git"), "keys-uefi"),
-    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.15"),
     Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.16"),
+    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.17"),
     Head(RepoURL("tytso/ext4.git"), "dev"),
     Head(RepoURL("s390/linux.git"), "for-linus"),
     Head(RepoURL("tj/libata.git"), "for-next"),
     Head(RepoURL("https://github.com/kdave/btrfs-devel.git"), "misc-next"),
     Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
     Head(RepoURL("gregkh/tty.git"), "tty-next"),
-    Head(RepoURL("jj/linux-apparmor.git"), "v4.8-aa2.8-out-of-tree"),
+    Head(RepoURL("jj/linux-apparmor.git"), "apparmor-next"),
     Head(RepoURL("pablo/nf.git")),
     Head(RepoURL("pablo/nf-next.git")),
     Head(RepoURL("horms/ipvs.git")),
@@ -186,15 +200,17 @@ remotes = (
     Head(RepoURL("mkp/scsi.git"), "4.15/scsi-fixes"),
     Head(RepoURL("mkp/scsi.git"), "4.16/scsi-fixes"),
     Head(RepoURL("mkp/scsi.git"), "4.17/scsi-queue"),
+    Head(RepoURL("mkp/scsi.git"), "queue"),
     Head(RepoURL("git://git.kernel.dk/linux-block.git"), "for-next"),
     Head(RepoURL("git://git.kernel.org/pub/scm/virt/kvm/kvm.git"), "queue"),
     Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.16-rc"),
-    Head(RepoURL("powerpc/linux.git"), 'fixes'),
     Head(RepoURL("dhowells/linux-fs.git")),
+    Head(RepoURL("herbert/cryptodev-2.6.git"), "master"),
+    Head(RepoURL("helgaas/pci.git"), "next"),
 )
 
 
-remote_index = dict(zip(remotes, range(len(remotes))))
+remote_index = dict(zip(remotes, list(range(len(remotes)))))
 oot = Head(RepoURL(None), "out-of-tree patches")
 
 remote_match = re.compile("remote\..+\.url")
@@ -228,7 +244,7 @@ def get_heads(repo):
                     rev, remote_name, remote_name,))
         result[head] = str(commit.id)
 
-    if len(result) == 0 or result.keys()[0] != remotes[0]:
+    if len(result) == 0 or list(result.keys())[0] != remotes[0]:
         # According to the urls in remotes, this is not a clone of linux.git
         # Sort according to commits reachable from the current head
         result = collections.OrderedDict(
@@ -260,7 +276,7 @@ def get_history(repo, repo_heads):
 
         result = {}
         for l in sp.stdout:
-            result[l.strip()] = len(result)
+            result[l.decode().strip()] = len(result)
         # reverse indexes
         history[head] = {commit : len(result) - val for commit, val in
                          result.items()}
@@ -342,8 +358,21 @@ class Cache(object):
             else:
                 raise
 
+        if write_enable:
+            # In case there is already a database file of an unsupported format,
+            # one would hope that with flag="n" a new database would be created
+            # to overwrite the current one. Alas, that is not the case... :'(
+            try:
+                os.unlink(cache_path)
+            except OSError as e:
+                if e.errno != 2:
+                    raise
+
         flag_map = {False : "r", True : "n"}
-        self.cache = shelve.open(cache_path, flag=flag_map[write_enable])
+        try:
+            self.cache = shelve.open(cache_path, flag=flag_map[write_enable])
+        except dbm.error:
+            raise CUnsupported
         self.closed = False
         if write_enable:
             self.cache["version"] = Cache.version
@@ -378,16 +407,22 @@ class Cache(object):
         if self.closed:
             raise ValueError
 
+        try:
+            version = self.cache["version"]
+        except KeyError:
+            key_error = True
+        except ValueError as err:
+            raise CUnsupported(str(err))
+        else:
+            key_error = False
+
         if key == "version":
-            try:
-                return self.cache["version"]
-            except KeyError:
+            if key_error:
                 raise CKeyError
+            else:
+                return version
         elif key == "history":
-            try:
-                if self.cache["version"] != Cache.version:
-                    raise CUnsupported
-            except KeyError:
+            if key_error or version != Cache.version:
                 raise CUnsupported
 
             try:
@@ -397,10 +432,10 @@ class Cache(object):
 
             # This detailed check may be needed if an older git-sort (which
             # didn't set a cache version) modified the cache.
-            if (not isinstance(cache_history, types.ListType) or
+            if (not isinstance(cache_history, list) or
                 len(cache_history) < 1 or 
                 len(cache_history[0]) != 4 or
-                not isinstance(cache_history[0][3], types.DictType)):
+                not isinstance(cache_history[0][3], dict)):
                 raise CInconsistent
 
             return collections.OrderedDict([
@@ -442,7 +477,7 @@ class SortIndex(object):
                     history = cache["history"]
                 except CNeedsRebuild:
                     needs_rebuild = True
-        except CAbsent:
+        except CNeedsRebuild:
             needs_rebuild = True
         except CError as err:
             print("Error: %s" % (err,), file=sys.stderr)
@@ -454,7 +489,7 @@ class SortIndex(object):
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
 
-        if needs_rebuild or history.keys() != repo_heads.items():
+        if needs_rebuild or list(history.keys()) != list(repo_heads.items()):
             try:
                 history = get_history(repo, repo_heads)
             except GSError as err:
@@ -496,7 +531,7 @@ class SortIndex(object):
             sorted values from the mapping which are found in Head
         """
         result = collections.OrderedDict([(head, [],) for head in self.history])
-        for commit in mapping.keys():
+        for commit in list(mapping.keys()):
             try:
                 head, index = self.lookup(commit)
             except GSKeyError:
@@ -530,7 +565,7 @@ class SortIndex(object):
                     for obj, tag in objects
                     if obj.type == pygit2.GIT_OBJ_COMMIT]
             revs.sort(key=operator.itemgetter(0))
-            self.version_indexes = zip(*revs)
+            self.version_indexes = list(zip(*revs))
 
         indexes, tags = self.version_indexes
         i = bisect.bisect_left(indexes, index)
@@ -563,7 +598,11 @@ if __name__ == "__main__":
     try:
         path = os.environ["GIT_DIR"]
     except KeyError:
-        path = pygit2.discover_repository(os.getcwd())
+        try:
+            path = pygit2.discover_repository(os.getcwd())
+        except KeyError:
+            print("Error: Not a git repository", file=sys.stderr)
+            sys.exit(1)
     repo = pygit2.Repository(path)
 
     if args.dump_heads:
@@ -585,9 +624,11 @@ if __name__ == "__main__":
                         print("Inconsistent cache content")
                         needs_rebuild = True
                     else:
-                        pprint.pprint(history.keys())
+                        pprint.pprint(list(history.keys()))
         except CAbsent:
             print("No usable cache")
+            needs_rebuild = True
+        except CNeedsRebuild:
             needs_rebuild = True
         except CError as err:
             print("Error: %s" % (err,), file=sys.stderr)
@@ -598,10 +639,10 @@ if __name__ == "__main__":
         except GSError as err:
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
-        if not needs_rebuild and history.keys() != repo_heads.items():
+        if not needs_rebuild and list(history.keys()) != list(repo_heads.items()):
             needs_rebuild = True
         print("Current heads (version %d):" % Cache.version)
-        pprint.pprint(repo_heads.items())
+        pprint.pprint(list(repo_heads.items()))
         if needs_rebuild:
             action = "Will"
         else:

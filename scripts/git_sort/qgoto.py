@@ -1,13 +1,12 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
-
-from __future__ import print_function
 
 import argparse
 import os
 import subprocess
 import sys
 
+import exc
 import lib
 
 
@@ -22,11 +21,11 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        top = subprocess.check_output(("quilt", "--quiltrc", "-", "top",),
-                                      preexec_fn=lib.restore_signals,
-                                      stderr=subprocess.STDOUT).strip()
+        top = subprocess.check_output(
+            ("quilt", "--quiltrc", "-", "top",),
+            stderr=subprocess.STDOUT).decode().strip()
     except subprocess.CalledProcessError as err:
-        if err.output == "No patches applied\n":
+        if err.output.decode() == "No patches applied\n":
             top = None
         else:
             raise
@@ -36,7 +35,7 @@ if __name__ == "__main__":
 
     try:
         (name, delta,) = lib.sequence_insert(series, args.rev, top)
-    except lib.KSException as err:
+    except exc.KSException as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
 

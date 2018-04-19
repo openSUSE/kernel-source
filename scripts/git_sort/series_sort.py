@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 """
@@ -16,8 +16,6 @@ select the lines and filter them through the script:
     :'<,'>! ~/<path>/series_sort.py
 """
 
-from __future__ import print_function
-
 import argparse
 import os
 import sys
@@ -26,13 +24,15 @@ try:
     import pygit2
 except ImportError as err:
     print("Error: %s" % (err,), file=sys.stderr)
-    print("Please install the \"pygit2\" python module. For more details, "
-          "please refer to the \"Requirements\" section of "
+    print("Please install the \"pygit2\" python3 module. For more details, "
+          "please refer to the \"Installation Requirements\" section of "
           "\"scripts/git_sort/README.md\".", file=sys.stderr)
     sys.exit(1)
 
+import exc
 import git_sort
 import lib
+import series_conf
 import tag
 
 
@@ -56,8 +56,12 @@ if __name__ == "__main__":
     index = git_sort.SortIndex(repo)
 
     if args.series is not None:
-        args.series = os.path.abspath(args.series)
-        f = open(args.series)
+        try:
+            f = open(args.series)
+        except FileNotFoundError as err:
+            print("Error: %s" % (err,), file=sys.stderr)
+            sys.exit(1)
+        series = os.path.abspath(args.series)
     else:
         f = sys.stdin
     lines = f.readlines()
@@ -66,8 +70,8 @@ if __name__ == "__main__":
         os.chdir(args.prefix)
 
     try:
-        before, inside, after = lib.split_series(lines)
-    except lib.KSNotFound as err:
+        before, inside, after = series_conf.split(lines)
+    except exc.KSNotFound as err:
         if args.series is None:
             before = []
             inside = lines
@@ -81,13 +85,13 @@ if __name__ == "__main__":
 
     try:
         input_entries = lib.parse_inside(index, inside)
-    except lib.KSError as err:
+    except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
 
     try:
         sorted_entries = lib.series_sort(index, input_entries)
-    except lib.KSError as err:
+    except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
 
@@ -97,7 +101,7 @@ if __name__ == "__main__":
         lib.series_footer(inside),
     ])
 
-    to_update = filter(lib.tag_needs_update, input_entries)
+    to_update = list(filter(lib.tag_needs_update, input_entries))
     if args.check:
         result = 0
         if inside != new_inside:
@@ -115,12 +119,12 @@ if __name__ == "__main__":
         ])
 
         if args.series is not None:
-            f = open(args.series, mode="w")
+            f = open(series, mode="w")
         else:
             f = sys.stdout
         f.writelines(output)
         try:
             lib.update_tags(index, to_update)
-        except lib.KSError as err:
+        except exc.KSError as err:
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)

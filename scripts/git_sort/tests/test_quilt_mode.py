@@ -1,15 +1,9 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-from __future__ import print_function
-
-import collections
-import datetime
 import os
 import os.path
 import pygit2
-import re
-import shelve
 import shutil
 import subprocess
 import sys
@@ -18,86 +12,8 @@ import unittest
 
 import git_sort
 import lib
-
-
-# from http://www.pygit2.org/recipes/git-show.html
-class FixedOffset(datetime.tzinfo):
-    """Fixed offset in minutes east from UTC."""
-
-    def __init__(self, offset):
-        self.__offset = datetime.timedelta(minutes = offset)
-
-    def utcoffset(self, dt):
-        return self.__offset
-
-    def tzname(self, dt):
-        return None # we don't know the time zone's name
-
-    def dst(self, dt):
-        return datetime.timedelta(0) # we don't know about DST
-
-
-def format_patch(commit, tag):
-    def format_sanitized_subject(message):
-        """
-        Reimplemented from the similarly named function in the git source.
-        """
-        def is_title_char(c):
-            if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
-                (c >= '0' and c <= '9') or c == '.' or c == '_'):
-                return True
-            else:
-                return False
-
-        result = []
-        space = False
-        i = 0
-        end = message.find("\n")
-        if end == -1:
-            end = len(message)
-        while i < end:
-            c = message[i]
-            if is_title_char(c):
-                if space and result:
-                    result.append("-")
-                result.append(c)
-                space = False
-                if c == ".":
-                    while i + 1 < end and message[i + 1] == ".":
-                        i = i + 1
-            else:
-                space = True
-            i = i + 1
-        return "".join(result[:52])
-    name = format_sanitized_subject(commit.message) + ".patch"
-
-    with open(name, mode="w") as f:
-        f.write("From: %s <%s>\n" % (commit.author.name, commit.author.email,))
-        tzinfo = FixedOffset(commit.author.offset)
-        dt = datetime.datetime.fromtimestamp(float(commit.author.time), tzinfo)
-        f.write("Date: %s\n" % (dt.strftime("%c %z"),))
-        f.write("Patch-mainline: %s\n" % (tag,))
-        f.write("Git-commit: %s\n" % (str(commit.id),))
-        f.write("Subject: %s" % (commit.message,))
-        if not commit.message.endswith("\n"):
-            f.write("\n")
-            if commit.message.find("\n") == -1:
-                f.write("\n")
-        else:
-            if commit.message.count("\n") == 1:
-                # ends with a newline but consists only of a subject.
-                f.write("\n")
-        f.write("---\n")
-        args = []
-        if len(commit.parents):
-            args.append(commit.parents[0].tree)
-        diff = commit.tree.diff_to_tree(*args, swap=True)
-        f.write(diff.stats.format(pygit2.GIT_DIFF_STATS_FULL, width=79))
-        f.write("\n")
-        f.write(diff.patch)
-        f.write("--\ngs-tests\n")
-
-    return name
+import series_conf
+import tests.support
 
 
 class TestQuiltMode(unittest.TestCase):
@@ -118,42 +34,40 @@ class TestQuiltMode(unittest.TestCase):
         tree.insert("README", 
                     self.repo.create_blob("NAME = Roaring Lionus\n"),
                     pygit2.GIT_FILEMODE_BLOB)
-        m0 = self.repo.create_commit(
+        self.commits = []
+        self.commits.append(self.repo.create_commit(
             "refs/heads/mainline",
             author,
             committer,
             "Linux 4.9",
             tree.write(),
             []
-        )
-        self.m0 = m0
-        self.repo.create_tag("v4.9", m0, pygit2.GIT_REF_OID, committer,
-                             "Linux 4.9")
+        ))
+        self.repo.create_tag("v4.9", self.commits[-1], pygit2.GIT_REF_OID,
+                             committer, "Linux 4.9")
 
         tree.insert("README", 
                     self.repo.create_blob("NAME = Anniversary Edition\n"),
                     pygit2.GIT_FILEMODE_BLOB)
-        m1 = self.repo.create_commit(
+        self.commits.append(self.repo.create_commit(
             "refs/heads/mainline",
             author,
             committer,
             "Linux 4.10-rc5",
             tree.write(),
-            [m0]
-        )
-        self.m1 = m1
-        self.repo.create_tag("v4.10-rc5", m1, pygit2.GIT_REF_OID, committer,
-                             "Linux 4.10-rc5")
+            [self.commits[-1]]
+        ))
+        self.repo.create_tag("v4.10-rc5", self.commits[-1], pygit2.GIT_REF_OID,
+                             committer, "Linux 4.10-rc5")
 
-        author = pygit2.Signature('Alice Author', 'alice@authors.tld')
         tree.insert("driver.c", 
                     self.repo.create_blob("#include <linux/module.h>\n"),
                     pygit2.GIT_FILEMODE_BLOB)
-        marc = pygit2.Signature("Marc Zyngier", "marc.zyngier@arm.com")
-        m2 = self.repo.create_commit(
+        author2 = pygit2.Signature("Marc Zyngier", "marc.zyngier@arm.com")
+        self.commits.append(self.repo.create_commit(
             "refs/heads/mainline",
-            marc,
-            marc,
+            author2,
+            author2,
             """KVM: arm/arm64: vgic-v3: Add accessors for the ICH_APxRn_EL2 registers
 
 As we're about to access the Active Priority registers a lot more,
@@ -166,49 +80,80 @@ Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
 Signed-off-by: Christoffer Dall <cdall@linaro.org>
 """,
             tree.write(),
-            [m1]
-        )
-        self.m2 = m2
+            [self.commits[-1]]
+        ))
+
+        tree.insert("core.c", 
+                    self.repo.create_blob("#include <linux/kernel.h>\n"),
+                    pygit2.GIT_FILEMODE_BLOB)
+        author3 = pygit2.Signature("Peter Zijlstra", "peterz@infradead.org")
+        self.commits.append(self.repo.create_commit(
+            "refs/heads/mainline",
+            author3,
+            author3,
+            """sched/debug: Ignore TASK_IDLE for SysRq-W
+
+Markus reported that tasks in TASK_IDLE state are reported by SysRq-W,
+which results in undesirable clutter.
+
+Reported-by: Markus Trippelsdorf <markus@trippelsdorf.de>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: linux-kernel@vger.kernel.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+""",
+            tree.write(),
+            [self.commits[-1]]
+        ))
 
         tree.insert("README", 
                     self.repo.create_blob("NAME = Fearless Coyote\n"),
                     pygit2.GIT_FILEMODE_BLOB)
-        m3 = self.repo.create_commit(
+        self.commits.append(self.repo.create_commit(
             "refs/heads/mainline",
             author,
             committer,
             "Linux 4.10-rc6",
             tree.write(),
-            [m2]
-        )
-        self.repo.create_tag("v4.10-rc6", m3, pygit2.GIT_REF_OID, committer,
-                             "Linux 4.10-rc6")
+            [self.commits[-1]]
+        ))
+        self.repo.create_tag("v4.10-rc6", self.commits[-1], pygit2.GIT_REF_OID,
+                             committer, "Linux 4.10-rc6")
 
-        self.repo.remotes.create("origin",
-                            "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git")
-        self.repo.references.create("refs/remotes/origin/master", m3)
+        self.repo.remotes.create(
+            "origin",
+            "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git")
+        self.repo.references.create("refs/remotes/origin/master",
+                                    self.commits[-1])
 
         # setup stub kernel-source content
         self.ks_dir = tempfile.mkdtemp(prefix="gs_ks")
-        k_org_canon_prefix = "git://git.kernel.org/pub/scm/linux/kernel/git/"
         patch_dir = os.path.join(self.ks_dir, "patches.suse")
         os.mkdir(patch_dir)
         os.chdir(patch_dir)
-        m0_name = format_patch(self.repo.get(m0), "v4.9")
-        m1_name = format_patch(self.repo.get(m1), "v4.10-rc5")
-        open(os.path.join(self.ks_dir, "series.conf"), mode="w").write(
+        with open(os.path.join(self.ks_dir, "series.conf"), mode="w") as f:
+            f.write(
 """# Kernel patches configuration file
 
 	########################################################
 	# sorted patches
 	########################################################
-	patches.suse/%s
-	patches.suse/%s
-
+""")
+            for commit, tag in (
+                (self.commits[0], "v4.9",),
+                (self.commits[1], "v4.10-rc5",),
+            ):
+                f.write("\tpatches.suse/%s\n" % (
+                    tests.support.format_patch(self.repo.get(commit),
+                                               mainline=tag),))
+            f.write(
+"""
 	########################################################
 	# end of sorted patches
 	########################################################
-""" % (m0_name, m1_name,))
+""")
 
         ss_path = os.path.join(lib.libdir(), "series_sort.py")
         os.chdir(self.ks_dir)
@@ -216,16 +161,23 @@ Signed-off-by: Christoffer Dall <cdall@linaro.org>
         # This overlaps what is tested by test_series_sort, hence, not put in a
         # test of its own.
         subprocess.check_call([ss_path, "-c", "series.conf"])
-        content = open("series.conf").read()
-        output = subprocess.check_call([ss_path, "series.conf"])
-        self.assertEqual(open("series.conf").read(), content)
+        with open("series.conf") as f:
+            content1 = f.read()
+        subprocess.check_call([ss_path, "series.conf"])
+        with open("series.conf") as f:
+            content2 = f.read()
+        self.assertEqual(content2, content1)
+
+        subprocess.check_call(("git", "init", "./",), stdout=subprocess.DEVNULL)
+        subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
+                              stdout=subprocess.DEVNULL)
+        subprocess.check_call(("git", "commit", "-m", "import",),
+                              stdout=subprocess.DEVNULL)
 
         os.makedirs("tmp/current")
         os.chdir("tmp/current")
         subprocess.check_call(
             ["quilt", "setup", "--sourcedir", "../../", "../../series.conf"])
-
-        #sys.stdin.readline()
 
 
     def tearDown(self):
@@ -238,75 +190,222 @@ Signed-off-by: Christoffer Dall <cdall@linaro.org>
         qm_path = os.path.join(lib.libdir(), "quilt-mode.sh")
 
         # test series file replacement
-        entries = ["%s\n" % (l,) for l in map(lambda line : line.strip(),
-                                  open("series").readlines()) if l and not
-                   l.startswith("#")]
+        with open("series") as f:
+            entries = ["%s\n" % (l,) for l in
+                       [line.strip() for line in f.readlines()]
+                       if l and not l.startswith("#")]
         # remove the symlink
         os.unlink("series")
-        open("series", mode="w").writelines(entries)
-        subprocess.check_output(
-            [os.path.join(lib.libdir(), "qgoto.py"), str(self.m0)])
+        with open("series", mode="w") as f:
+            f.writelines(entries)
+        subprocess.check_call(
+            (os.path.join(lib.libdir(), "qgoto.py"), str(self.commits[0]),),
+            stdout=subprocess.DEVNULL)
 
         # test qgoto
-        subprocess.check_output(". %s; qgoto %s" % (qm_path, str(self.m0)),
-                              shell=True, executable="/bin/bash")
+        subprocess.check_call(
+            ". %s; qgoto %s" % (qm_path, str(self.commits[0])), shell=True,
+            stdout=subprocess.DEVNULL, executable="/bin/bash")
 
         # test qdupcheck
         try:
-            result = subprocess.check_output(
-                ". %s; qdupcheck %s" % (qm_path, str(self.m1)), shell=True,
-                executable="/bin/bash")
+            subprocess.check_output(
+                ". %s; qdupcheck %s" % (qm_path, str(self.commits[1])),
+                shell=True, executable="/bin/bash")
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
-            self.assertEqual(err.output.splitlines()[-1].strip(),
+            self.assertEqual(err.output.decode().splitlines()[-1].strip(),
                              "patches.suse/Linux-4.10-rc5.patch")
         else:
             self.assertTrue(False)
         
-        subprocess.check_output(". %s; qgoto %s" % (qm_path, str(self.m1)),
-                              shell=True, executable="/bin/bash")
+        subprocess.check_call(
+            ". %s; qgoto %s" % (qm_path, str(self.commits[1])), shell=True,
+            stdout=subprocess.DEVNULL, executable="/bin/bash")
 
         try:
-            result = subprocess.check_output(
-                ". %s; qdupcheck %s" % (qm_path, str(self.m1)), shell=True,
-                executable="/bin/bash")
+            subprocess.check_output(
+                ". %s; qdupcheck %s" % (qm_path, str(self.commits[1])),
+                shell=True, executable="/bin/bash")
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
-            self.assertEqual(err.output.splitlines()[-1].strip(),
+            self.assertEqual(err.output.decode().splitlines()[-1].strip(),
                              "This is the top patch.")
         else:
             self.assertTrue(False)
 
-        # import m2
-        subprocess.check_output(". %s; qgoto %s" % (qm_path, str(self.m2)),
-                              shell=True, executable="/bin/bash")
-        subprocess.check_output(
+        # import commits[2]
+        subprocess.check_call(
+            ". %s; qgoto %s" % (qm_path, str(self.commits[2])), shell=True,
+            executable="/bin/bash")
+        subprocess.check_call(
             """. %s; qcp -r "bsc#1077761" -d patches.suse %s""" % (
-                qm_path, str(self.m2)), shell=True, executable="/bin/bash")
+                qm_path, str(self.commits[2])),
+            shell=True, stdout=subprocess.DEVNULL, executable="/bin/bash")
 
         retval = subprocess.check_output(("quilt", "--quiltrc", "-", "next",))
         name = "patches.suse/KVM-arm-arm64-vgic-v3-Add-accessors-for-the-ICH_APxR.patch"
-        self.assertEqual(retval.strip(), name)
+        self.assertEqual(retval.decode().strip(), name)
 
         try:
-            retval = open(os.path.join(self.ks_dir, name)).readlines().index(
-                "Acked-by: Alexander Graf <agraf@suse.de>\n")
+            with open(os.path.join(self.ks_dir, name)) as f:
+                retval = f.readlines().index(
+                    "Acked-by: Alexander Graf <agraf@suse.de>\n")
         except ValueError:
             retval = -1
         self.assertNotEqual(retval, -1)
 
-        retval = subprocess.check_output(("quilt", "--quiltrc", "-", "push",))
+        subprocess.check_call(("quilt", "--quiltrc", "-", "push",),
+                              stdout=subprocess.DEVNULL)
 
         try:
-            result = subprocess.check_output(("quilt", "--quiltrc", "-",
-                                              "pop",), stderr=subprocess.STDOUT)
+            subprocess.check_output(("quilt", "--quiltrc", "-", "pop",),
+                                    stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
-            self.assertTrue(err.output.endswith(
+            self.assertTrue(err.output.decode().endswith(
                 "needs to be refreshed first.\n"))
         else:
             self.assertTrue(False)
 
+        subprocess.check_call(("quilt", "--quiltrc", "-", "refresh",),
+                              stdout=subprocess.DEVNULL)
+        subprocess.check_call(("quilt", "--quiltrc", "-", "pop",),
+                              stdout=subprocess.DEVNULL)
+        subprocess.check_call(("quilt", "--quiltrc", "-", "push",),
+                              stdout=subprocess.DEVNULL)
+
+        # prepare repository
+        os.chdir(self.ks_dir)
+        subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
+                       stdout=subprocess.DEVNULL)
+        subprocess.check_call(
+            ("git", "commit", "-m",
+             "KVM: arm/arm64: vgic-v3: Add accessors for the ICH_APxRn_EL2 registers",),
+            stdout=subprocess.DEVNULL)
+        subprocess.check_call(("git", "checkout", "-q", "-b", "other",
+                               "HEAD^",))
+        shutil.rmtree("tmp/current")
+        os.makedirs("tmp/current")
+        os.chdir("tmp/current")
+        subprocess.check_call(("quilt", "setup", "--sourcedir", "../../",
+                               "../../series.conf",),)
+
+        # import commits[3]
+        subprocess.check_call(
+            ". %s; qgoto %s" % (qm_path, str(self.commits[3])), shell=True,
+            stdout=subprocess.DEVNULL, executable="/bin/bash")
+        subprocess.check_call(
+            """. %s; qcp -r "bsc#123" -d patches.suse %s""" % (
+                qm_path, str(self.commits[3])),
+            shell=True, stdout=subprocess.DEVNULL, executable="/bin/bash")
+
+        subprocess.check_call(("quilt", "--quiltrc", "-", "push",),
+                              stdout=subprocess.DEVNULL)
+        subprocess.check_call(("quilt", "--quiltrc", "-", "refresh",),
+                              stdout=subprocess.DEVNULL)
+        name = subprocess.check_output(
+            ("quilt", "--quiltrc", "-", "top",)).decode().strip()
+
+        os.chdir(self.ks_dir)
+        subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
+                              stdout=subprocess.DEVNULL)
+
+        # test pre-commit.sh
+        pc_path = os.path.join(lib.libdir(), "pre-commit.sh")
+
+        subprocess.check_call(pc_path, stdout=subprocess.DEVNULL)
+
+        with open("series.conf") as f:
+            content = f.readlines()
+
+        content2 = list(content)
+        middle = int(len(content2) / 2)
+        content2[middle], content2[middle + 1] = \
+            content2[middle + 1], content2[middle]
+
+        with open("series.conf", mode="w") as f:
+            f.writelines(content2)
+
+        # check should be done against index, not working tree
+        subprocess.check_call(pc_path, stdout=subprocess.DEVNULL)
+
+        subprocess.check_call(("git", "add", "series.conf",),
+                              stdout=subprocess.DEVNULL)
+
+        # ... test a bad sorted section
+        try:
+            subprocess.check_output(pc_path, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as err:
+            self.assertEqual(err.returncode, 1)
+            self.assertTrue(err.output.decode().startswith(
+                "Input is not sorted."))
+        else:
+            self.assertTrue(False)
+
+        with open("series.conf", mode="w") as f:
+            f.writelines(content)
+
+        subprocess.check_call(("git", "add", "series.conf",),
+                              stdout=subprocess.DEVNULL)
+
+        subprocess.check_call(("git", "commit", "-m",
+                               "sched/debug: Ignore TASK_IDLE for SysRq-W",),
+                              stdout=subprocess.DEVNULL)
+
+        # ... test a bad sorted patch
+        with open(name) as f:
+            content = f.readlines()
+        content2 = list(content)
+        for i in range(len(content2)):
+            if content2[i].startswith("Git-commit: "):
+                content2[i] = "Git-commit: cb329c2e40cf6cfc7bcd7c36ce5547f95e972ea5\n"
+                break
+        with open(name, mode="w") as f:
+            f.writelines(content2)
+        subprocess.check_call(("git", "add", name,), stdout=subprocess.DEVNULL)
+
+        try:
+            subprocess.check_output(pc_path, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as err:
+            self.assertEqual(err.returncode, 1)
+            self.assertTrue(err.output.decode().startswith(
+                "Error: There is a problem with patch \"%s\"." % (name,)))
+        else:
+            self.assertTrue(False)
+
+        with open(name, mode="w") as f:
+            f.writelines(content)
+        subprocess.check_call(("git", "add", name,), stdout=subprocess.DEVNULL)
+
+        # test merge_tool.py
+        subprocess.check_call(("git", "checkout", "-q", "master",))
+        shutil.rmtree("tmp/current")
+        subprocess.check_call(
+            ("git", "config", "--add", "mergetool.git-sort.cmd",
+             "%s $LOCAL $BASE $REMOTE $MERGED" % (
+                 os.path.join(lib.libdir(), "merge_tool.py"),),))
+        subprocess.check_call(("git", "config", "--add",
+                               "mergetool.git-sort.trustexitcode", "true",))
+        retval = subprocess.call(("git", "merge", "other",),
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+        self.assertEqual(retval, 1)
+        retval = subprocess.check_output(
+            ("git", "mergetool", "--tool=git-sort", "series.conf",))
+        self.assertEqual(
+            retval.decode().splitlines()[-1].strip(),
+            "1 commits added, 0 commits removed from base to remote.")
+        with open("series.conf") as f:
+            entries = series_conf.filter_series(f.readlines())
+        self.assertEqual(entries,
+                         ["patches.suse/%s.patch" %
+                          (tests.support.format_sanitized_subject(
+                              self.repo.get(commit).message),)
+                          for commit in self.commits[:4]])
+        retval = subprocess.check_output(("git", "status", "--porcelain",
+                                          "series.conf",))
+        self.assertEqual(retval.decode().strip(), "M  series.conf")
 
 if __name__ == '__main__':
     # Run a single testcase
