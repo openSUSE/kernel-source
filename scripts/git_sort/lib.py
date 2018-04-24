@@ -1,10 +1,7 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-from __future__ import print_function
-
 import collections
-import contextlib
 import operator
 import os
 import os.path
@@ -14,20 +11,10 @@ import signal
 import subprocess
 import sys
 
+import exc
 import git_sort
+import series_conf
 import tag
-
-
-class KSException(BaseException):
-    pass
-
-
-class KSError(KSException):
-    pass
-
-
-class KSNotFound(KSError):
-    pass
 
 
 # https://stackoverflow.com/a/952952
@@ -38,18 +25,6 @@ flatten = lambda l: [item for sublist in l for item in sublist]
 def touch(fname, times=None):
     with open(fname, 'a'):
         os.utime(fname, times)
-
-
-# http://stackoverflow.com/questions/22077881/yes-reporting-error-with-subprocess-communicate
-def restore_signals(): # from http://hg.python.org/cpython/rev/768722b2ae0a/
-    signals = ('SIGPIPE', 'SIGXFZ', 'SIGXFSZ')
-    for sig in signals:
-        if hasattr(signal, sig):
-            signal.signal(getattr(signal, sig), signal.SIG_DFL)
-
-
-def firstword(value):
-    return value.split(None, 1)[0]
 
 
 def libdir():
@@ -72,10 +47,9 @@ def check_series():
     
     try:
         subprocess.check_output(("quilt", "--quiltrc", "-", "top",),
-                                preexec_fn=restore_signals,
                                 stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError as err:
-        if err.output == "No patches applied\n":
+        if err.output.decode() == "No patches applied\n":
             pass
         else:
             raise
@@ -91,8 +65,8 @@ def check_series():
 def repo_path():
     try:
         search_path = subprocess.check_output(
-            os.path.join(libdir(), "..", "linux_git.sh"),
-            preexec_fn=restore_signals).strip()
+            os.path.join(libdir(), "..",
+                         "linux_git.sh")).decode().strip()
     except subprocess.CalledProcessError:
         print("Error: Could not determine mainline linux git repository path.",
               file=sys.stderr)
@@ -100,99 +74,16 @@ def repo_path():
     return pygit2.discover_repository(search_path)
 
 
-start_text = "sorted patches"
-end_text = "end of sorted patches"
-oot_text = git_sort.oot.rev
-
-
-def filter_patches(line):
-    line = line.strip()
-
-    if line == "" or line.startswith(("#", "-", "+",)):
-        return False
-    else:
-        return True
-
-
-@contextlib.contextmanager
-def find_commit_in_series(commit, series):
-    """
-    Caller must chdir to where the entries in series can be found.
-    """
-    for name in [firstword(l) for l in series if filter_patches(l)]:
-        patch = tag.Patch(name)
-        found = False
-        if commit in [firstword(value) for value in patch.get("Git-commit")]:
-            found = True
-            yield patch
-        patch.close()
-        if found:
-            return
-    raise KSNotFound()
-
-
-def split_series(series):
-    before = []
-    inside = []
-    after = []
-
-    whitespace = []
-    comments = []
-
-    current = before
-    for line in series:
-        l = line.strip()
-
-        if l == "":
-            if comments:
-                current.extend(comments)
-                comments = []
-            whitespace.append(line)
-            continue
-        elif l.startswith("#"):
-            if whitespace:
-                current.extend(whitespace)
-                whitespace = []
-            comments.append(line)
-
-            if current == before and l.lower() == "# %s" % (start_text,):
-                current = inside
-            elif current == inside and l.lower() == "# %s" % (end_text,):
-                current = after
-        else:
-            if comments:
-                current.extend(comments)
-                comments = []
-            if whitespace:
-                current.extend(whitespace)
-                whitespace = []
-            current.append(line)
-    if comments:
-        current.extend(comments)
-        comments = []
-    if whitespace:
-        current.extend(whitespace)
-        whitespace = []
-
-    if current is before:
-        raise KSNotFound("Sorted subseries not found.")
-
-    current.extend(comments)
-    current.extend(whitespace)
-
-    return (before, inside, after,)
-
-
 def series_header(series):
     header = []
 
     for line in series:
-        if filter_patches(line):
+        if series_conf.filter_patches(line):
             break
 
         try:
             parse_section_header(line)
-        except KSNotFound:
+        except exc.KSNotFound:
             pass
         else:
             break
@@ -207,19 +98,20 @@ def series_footer(series):
 
 
 def parse_section_header(line):
+    oot_text = git_sort.oot.rev
     line = line.strip()
 
     if not line.startswith("# "):
-        raise KSNotFound()
+        raise exc.KSNotFound()
     line = line[2:]
     if line == oot_text:
         return git_sort.oot
-    elif line.lower() == start_text:
-        raise KSNotFound()
+    elif line.lower() == series_conf.start_text:
+        raise exc.KSNotFound()
 
     words = line.split(None, 3)
     if len(words) > 2:
-        raise KSError(
+        raise exc.KSError(
             "Section comment \"%s\" in series.conf could not be parsed. "
             "series.conf is invalid." % (line,))
     args = [git_sort.RepoURL(words[0])]
@@ -229,7 +121,7 @@ def parse_section_header(line):
     head = git_sort.Head(*args)
 
     if head not in git_sort.remotes:
-        raise KSError(
+        raise exc.KSError(
             "Section comment \"%s\" in series.conf does not match any Head in "
             "variable \"remotes\". series.conf is invalid." % (line,))
     
@@ -242,13 +134,13 @@ def parse_inside(index, inside):
     for line in inside:
         try:
             current_head = parse_section_header(line)
-        except KSNotFound:
+        except exc.KSNotFound:
             pass
 
-        if not filter_patches(line):
+        if not series_conf.filter_patches(line):
             continue
 
-        name = firstword(line)
+        name = series_conf.firstword(line)
         entry = InputEntry("\t%s\n" % (name,))
         entry.from_patch(index, name, current_head)
         result.append(entry)
@@ -269,7 +161,7 @@ class InputEntry(object):
     def from_patch(self, index, name, current_head):
         self.name = name
         if not os.path.exists(name):
-            raise KSError("Could not find patch \"%s\"" % (name,))
+            raise exc.KSError("Could not find patch \"%s\"" % (name,))
 
         with tag.Patch(name) as patch:
             commit_tags = patch.get("Git-commit")
@@ -279,15 +171,15 @@ class InputEntry(object):
             self.dest_head = git_sort.oot
             return
 
-        self.revs = [firstword(ct) for ct in commit_tags]
+        self.revs = [series_conf.firstword(ct) for ct in commit_tags]
         for rev in self.revs:
             if not self.commit_match.match(rev):
-                raise KSError("Git-commit tag \"%s\" in patch \"%s\" is not a "
+                raise exc.KSError("Git-commit tag \"%s\" in patch \"%s\" is not a "
                               "valid revision." % (rev, name,))
         rev = self.revs[0]
 
         if len(repo_tags) > 1:
-            raise KSError("Multiple Git-repo tags found. Patch \"%s\" is "
+            raise exc.KSError("Multiple Git-repo tags found. Patch \"%s\" is "
                           "tagged improperly." % (name,))
         elif repo_tags:
             repo = git_sort.RepoURL(repo_tags[0])
@@ -303,7 +195,7 @@ class InputEntry(object):
                 if repo == current_head.repo_url: # good tag
                     self.dest_head = current_head
                 else: # bad tag
-                    raise KSError(
+                    raise exc.KSError(
                         "There is a problem with patch \"%s\". "
                         "The Git-repo tag is incorrect or the patch is in the "
                         "wrong section of series.conf and (the Git-commit tag "
@@ -315,7 +207,7 @@ class InputEntry(object):
                         "result. Manual intervention is required." % (name,))
             else: # repo is indexed
                 if repo == current_head.repo_url: # good tag
-                    raise KSError(
+                    raise exc.KSError(
                         "There is a problem with patch \"%s\". "
                         "Commit \"%s\" not found in git-sort index. "
                         "The remote fetching from \"%s\" needs to be fetched "
@@ -324,7 +216,7 @@ class InputEntry(object):
                         "intervention is required." % (
                             name, rev, current_head.repo_url,))
                 else: # bad tag
-                    raise KSError(
+                    raise exc.KSError(
                         "There is a problem with patch \"%s\". "
                         "The Git-repo tag is incorrect or the patch is in the "
                         "wrong section of series.conf. Manual intervention is "
@@ -335,13 +227,13 @@ class InputEntry(object):
                     if repo == current_head.repo_url: # good tag
                         self.dest_head = current_head
                     else: # bad tag
-                        raise KSError(
+                        raise exc.KSError(
                             "There is a problem with patch \"%s\". "
                             "The Git-repo tag is incorrect or the patch is in "
                             "the wrong section of series.conf. Manual "
                             "intervention is required." % (name,))
                 elif head == current_head: # patch didn't move
-                    raise KSException(
+                    raise exc.KSException(
                         "Head \"%s\" is not available locally but commit "
                         "\"%s\" found in patch \"%s\" was found in that head." %
                         (head, rev, name,))
@@ -353,7 +245,7 @@ class InputEntry(object):
             else: # repo is indexed
                 if head > current_head: # patch moved downstream
                     if repo == current_head.repo_url: # good tag
-                        raise KSError(
+                        raise exc.KSError(
                             "There is a problem with patch \"%s\". "
                             "The patch is in the wrong section of series.conf "
                             "or the remote fetching from \"%s\" needs to be "
@@ -363,7 +255,7 @@ class InputEntry(object):
                                 name, current_head.repo_url, head,
                                 current_head,))
                     else: # bad tag
-                        raise KSError(
+                        raise exc.KSError(
                             "There is a problem with patch \"%s\". "
                             "The patch is in the wrong section of series.conf "
                             "or the remote fetching from \"%s\" needs to be "
@@ -413,7 +305,7 @@ def series_sort(index, entries):
             e[1]
             for e in sorted(result[head].items(), key=operator.itemgetter(0))])
 
-    for head, lines in result.items():
+    for head, lines in list(result.items()):
         if not lines:
             del result[head]
 
@@ -453,14 +345,14 @@ def update_tags(index, entries):
                 try:
                     patch.change(tag_name, index.describe(entry.cindex))
                 except KeyError:
-                    raise KSNotFound(message % (tag_name, entry.name,))
+                    raise exc.KSNotFound(message % (tag_name, entry.name,))
                 patch.remove("Git-repo")
             else:
                 tag_name = "Git-repo"
                 try:
                     patch.change(tag_name, repr(entry.new_url))
                 except KeyError:
-                    raise KSNotFound(message % (tag_name, entry.name,))
+                    raise exc.KSNotFound(message % (tag_name, entry.name,))
 
 
 def sequence_insert(series, rev, top):
@@ -471,8 +363,6 @@ def sequence_insert(series, rev, top):
 
     Returns the name of the new top patch and how many must be applied/popped.
     """
-    filter_series = lambda lines : [firstword(line) for line in lines
-                                    if filter_patches(line)]
     git_dir = repo_path()
     repo = pygit2.Repository(git_dir)
     index = git_sort.SortIndex(repo)
@@ -480,9 +370,9 @@ def sequence_insert(series, rev, top):
     try:
         commit = str(repo.revparse_single(rev).id)
     except ValueError:
-        raise KSError("\"%s\" is not a valid revision." % (rev,))
+        raise exc.KSError("\"%s\" is not a valid revision." % (rev,))
     except KeyError:
-        raise KSError("Revision \"%s\" not found in \"%s\"." % (
+        raise exc.KSError("Revision \"%s\" not found in \"%s\"." % (
             rev, git_dir,))
 
     marker = "# new commit"
@@ -490,17 +380,17 @@ def sequence_insert(series, rev, top):
     try:
         new_entry.dest_head, new_entry.cindex = index.lookup(commit)
     except git_sort.GSKeyError:
-        raise KSError(
+        raise exc.KSError(
             "Commit %s not found in git-sort index. If it is from a "
             "repository and branch pair which is not listed in \"remotes\", "
             "please add it and submit a patch." % (commit,))
 
     try:
-        before, inside, after = split_series(series)
-    except KSNotFound as err:
-        raise KSError(err)
-    before, after = map(filter_series, (before, after,))
-    current_patches = flatten([before, filter_series(inside), after])
+        before, inside, after = series_conf.split(series)
+    except exc.KSNotFound as err:
+        raise exc.KSError(err)
+    before, after = map(series_conf.filter_series, (before, after,))
+    current_patches = flatten([before, series_conf.filter_series(inside), after])
 
     if top is None:
         top_index = 0
@@ -525,7 +415,7 @@ def sequence_insert(series, rev, top):
     del new_patches[commit_pos]
 
     if new_patches != current_patches:
-        raise KSError("Subseries is not sorted. "
+        raise exc.KSError("Subseries is not sorted. "
                       "Please run scripts/series_sort.py.")
 
     return (name, commit_pos - top_index,)

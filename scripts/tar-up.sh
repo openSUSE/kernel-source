@@ -243,6 +243,9 @@ elif $using_git; then
         echo "expected \"last commit: <commit>\" in rpm/kernel-source.changes.old" >&2
         exit 1
     esac
+    if test -d rpm/gitlog-excludes; then
+	exclude=(--excludes "$_" "${exclude[@]}")
+    fi
     if test -e rpm/gitlog-fixups; then
 	    exclude=(--fixups "$_" "${exclude[@]}")
     fi

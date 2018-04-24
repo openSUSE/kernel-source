@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 """
@@ -15,15 +15,15 @@ git mergetool --tool=git-sort series.conf
 
 """
 
-from __future__ import print_function
-
 import os.path
 import pygit2
 import shutil
 import subprocess
 import sys
 
+import exc
 import lib
+import series_conf
 
 
 def splice(series, inside, output_path):
@@ -45,10 +45,10 @@ if __name__ == "__main__":
 
     # (before, inside, after, set(inside),)
     local, base, remote = (
-        (s[0], s[1], s[2], set([lib.firstword(l) for l in s[1] if
-                                lib.filter_patches(l)]),)
+        (s[0], s[1], s[2], set([series_conf.firstword(l) for l in s[1] if
+                                series_conf.filter_patches(l)]),)
         for s in [
-            lib.split_series(open(s_path)) for s_path in (
+            series_conf.split(open(s_path)) for s_path in (
                 local_path, base_path, remote_path,)
         ]
     )
@@ -73,7 +73,7 @@ if __name__ == "__main__":
     inside = [line for line in local[1] if not line.strip() in removed]
     try:
         input_entries = lib.parse_inside(index, inside)
-    except lib.KSError as err:
+    except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
     for name in added - local[3]:
@@ -83,7 +83,7 @@ if __name__ == "__main__":
 
     try:
         sorted_entries = lib.series_sort(index, input_entries)
-    except lib.KSError as err:
+    except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
     output = lib.series_format(sorted_entries)
@@ -97,6 +97,7 @@ if __name__ == "__main__":
     splice(base, output, base_path)
     splice(remote, output, remote_path)
 
+    result = 0
     try:
         cmd = "merge"
         retval = subprocess.call([cmd, merged_path, base_path, remote_path])
@@ -113,5 +114,16 @@ if __name__ == "__main__":
         print("Warning: conflicts outside of sorted section, leaving merged "
               "result in %s" % (name,))
         shutil.copy(merged_path, name)
-        sys.exit(1)
+        result = 1
 
+    to_update = filter(lib.tag_needs_update, input_entries)
+    try:
+        lib.update_tags(index, to_update)
+    except exc.KSError as err:
+        print("Error: %s" % (err,), file=sys.stderr)
+        result = 1
+    else:
+        for entry in to_update:
+            subprocess.check_call(["git", "add", entry.name])
+
+    sys.exit(result)
