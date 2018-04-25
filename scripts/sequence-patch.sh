@@ -20,6 +20,8 @@
 # you may find current contact information at www.novell.com
 #############################################################################
 
+[ -f $(dirname $0)/../rpm/config.sh ] || exit 0
+
 source $(dirname $0)/../rpm/config.sh
 source $(dirname $0)/wd-functions.sh
 
