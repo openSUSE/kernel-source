@@ -464,6 +464,40 @@ class Cache(object):
             raise KeyError
 
 
+@functools.total_ordering
+class IndexedCommit(object):
+    def __init__(self, head, index):
+        self.head = head
+        self.index = index
+
+
+    def _is_valid_operand(self, other):
+        return hasattr(other, "head") and hasattr(other, "index")
+
+
+    def __eq__(self, other):
+        if not self._is_valid_operand(other):
+            return NotImplemented
+        return (self.head == other.head and self.index == other.index)
+
+
+    def __lt__(self, other):
+        if not self._is_valid_operand(other):
+            return NotImplemented
+        if self.head == other.head:
+            return self.index < other.index
+        else:
+            return self.head < other.head
+
+
+    def __hash__(self):
+        return hash((self.head, self.index,))
+
+
+    def __repr__(self):
+        return "%s %d" % (repr(self.head), self.index,)
+
+
 class SortIndex(object):
     version_match = re.compile("refs/tags/v(2\.6\.\d+|\d\.\d+)(-rc\d+)?$")
 
@@ -519,7 +553,7 @@ class SortIndex(object):
             except KeyError:
                 continue
             else:
-                return (head, index,)
+                return IndexedCommit(head, index)
 
         raise GSKeyError
 
@@ -533,11 +567,11 @@ class SortIndex(object):
         result = collections.OrderedDict([(head, [],) for head in self.history])
         for commit in list(mapping.keys()):
             try:
-                head, index = self.lookup(commit)
+                ic = self.lookup(commit)
             except GSKeyError:
                 continue
             else:
-                result[head].append((index, mapping.pop(commit),))
+                result[ic.head].append((ic.index, mapping.pop(commit),))
 
         for head, entries in result.items():
             entries.sort(key=operator.itemgetter(0))
@@ -655,7 +689,8 @@ if __name__ == "__main__":
         sys.exit(0)
 
     index = SortIndex(repo)
-    lines = {}
+    dest = {}
+    oot = []
     num = 0
     for line in sys.stdin.readlines():
         num = num + 1
@@ -673,20 +708,24 @@ if __name__ == "__main__":
                   (num, line.strip(),), file=sys.stderr)
             sys.exit(1)
         h = str(commit.id)
-        if h in lines:
-            lines[h].append(line)
+        if h in dest:
+            dest[h][1].append(line)
         else:
-            lines[h] = [line]
+            try:
+                ic = index.lookup(h)
+            except GSKeyError:
+                oot.append(line)
+            else:
+                dest[h] = (ic, [line],)
 
     print("".join([line
-                   for entries in index.sort(lines).values()
-                       for entry in entries
-                           for line in entry
+                   for ic, lines in sorted(dest.values(),
+                                           key=operator.itemgetter(0))
+                       for line in lines
                   ]), end="")
 
-    if len(lines) != 0:
+    if oot:
         print("Error: the following entries were not found in the indexed heads:",
               file=sys.stderr)
-        print("".join([line for line_list in lines.values() for line in
-                       line_list]), end="")
+        print("".join(oot), end="")
         sys.exit(1)

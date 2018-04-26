@@ -189,7 +189,7 @@ class InputEntry(object):
 
         # this is where we decide a patch line's fate in the sorted series.conf
         try:
-            head, cindex = index.lookup(rev)
+            ic = index.lookup(rev)
         except git_sort.GSKeyError: # commit not found
             if current_head not in index.repo_heads: # repo not indexed
                 if repo == current_head.repo_url: # good tag
@@ -223,7 +223,7 @@ class InputEntry(object):
                         "required." % (name,))
         else: # commit found
             if current_head not in index.repo_heads: # repo not indexed
-                if head > current_head: # patch moved downstream
+                if ic.head > current_head: # patch moved downstream
                     if repo == current_head.repo_url: # good tag
                         self.dest_head = current_head
                     else: # bad tag
@@ -232,18 +232,18 @@ class InputEntry(object):
                             "The Git-repo tag is incorrect or the patch is in "
                             "the wrong section of series.conf. Manual "
                             "intervention is required." % (name,))
-                elif head == current_head: # patch didn't move
+                elif ic.head == current_head: # patch didn't move
                     raise exc.KSException(
                         "Head \"%s\" is not available locally but commit "
                         "\"%s\" found in patch \"%s\" was found in that head." %
-                        (head, rev, name,))
-                elif head < current_head: # patch moved upstream
-                    self.dest_head = head
-                    self.cindex = cindex
-                    if repo != head.repo_url: # bad tag
-                        self.new_url = head.repo_url
+                        (ic.head, rev, name,))
+                elif ic.head < current_head: # patch moved upstream
+                    self.dest_head = ic.head
+                    self.dest = ic
+                    if repo != ic.head.repo_url: # bad tag
+                        self.new_url = ic.head.repo_url
             else: # repo is indexed
-                if head > current_head: # patch moved downstream
+                if ic.head > current_head: # patch moved downstream
                     if repo == current_head.repo_url: # good tag
                         raise exc.KSError(
                             "There is a problem with patch \"%s\". "
@@ -252,7 +252,7 @@ class InputEntry(object):
                             "fetched or the relative order of \"%s\" and "
                             "\"%s\" in \"remotes\" is incorrect. Manual "
                             "intervention is required." % (
-                                name, current_head.repo_url, head,
+                                name, current_head.repo_url, ic.head,
                                 current_head,))
                     else: # bad tag
                         raise exc.KSError(
@@ -261,16 +261,16 @@ class InputEntry(object):
                             "or the remote fetching from \"%s\" needs to be "
                             "fetched. Manual intervention is required." % (
                                 name, current_head.repo_url,))
-                elif head == current_head: # patch didn't move
-                    self.dest_head = head
-                    self.cindex = cindex
-                    if repo != head.repo_url: # bad tag
-                        self.new_url = head.repo_url
-                elif head < current_head: # patch moved upstream
-                    self.dest_head = head
-                    self.cindex = cindex
-                    if repo != head.repo_url: # bad tag
-                        self.new_url = head.repo_url
+                elif ic.head == current_head: # patch didn't move
+                    self.dest_head = ic.head
+                    self.dest = ic
+                    if repo != ic.head.repo_url: # bad tag
+                        self.new_url = ic.head.repo_url
+                elif ic.head < current_head: # patch moved upstream
+                    self.dest_head = ic.head
+                    self.dest = ic
+                    if repo != ic.head.repo_url: # bad tag
+                        self.new_url = ic.head.repo_url
 
 
 def series_sort(index, entries):
@@ -295,9 +295,9 @@ def series_sort(index, entries):
 
     for entry in entries:
         try:
-            result[entry.dest_head][entry.cindex].append(entry.value)
+            result[entry.dest_head][entry.dest].append(entry.value)
         except AttributeError:
-            # no entry.cindex
+            # no entry.dest
             result[entry.dest_head].append(entry.value)
 
     for head in index.repo_heads:
@@ -345,7 +345,7 @@ def update_tags(index, entries):
             if entry.dest_head == git_sort.remotes[0]:
                 tag_name = "Patch-mainline"
                 try:
-                    patch.change(tag_name, index.describe(entry.cindex))
+                    patch.change(tag_name, index.describe(entry.dest.index))
                 except KeyError:
                     raise exc.KSNotFound(message % (tag_name, entry.name,))
                 except git_sort.GSError as err:
@@ -384,12 +384,13 @@ def sequence_insert(series, rev, top):
     marker = "# new commit"
     new_entry = InputEntry(marker)
     try:
-        new_entry.dest_head, new_entry.cindex = index.lookup(commit)
+        new_entry.dest = index.lookup(commit)
     except git_sort.GSKeyError:
         raise exc.KSError(
             "Commit %s not found in git-sort index. If it is from a "
             "repository and branch pair which is not listed in \"remotes\", "
             "please add it and submit a patch." % (commit,))
+    new_entry.dest_head = new_entry.dest.head
 
     try:
         before, inside, after = series_conf.split(series)
