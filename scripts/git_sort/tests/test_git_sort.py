@@ -177,6 +177,12 @@ class TestIndex(unittest.TestCase):
         )
 
 
+    def test_empty_input(self):
+        os.chdir(self.repo_dir)
+        gs_path = os.path.join(lib.libdir(), "git_sort.py")
+        subprocess.check_output(gs_path, input="\n".encode())
+
+
 class TestIndexLinux(unittest.TestCase):
     def setUp(self):
         os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")

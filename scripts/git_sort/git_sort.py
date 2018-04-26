@@ -659,8 +659,11 @@ if __name__ == "__main__":
     num = 0
     for line in sys.stdin.readlines():
         num = num + 1
+        tokens = line.strip().split(None, 1)
+        if not tokens:
+            continue
         try:
-            commit = repo.revparse_single(line.strip().split(None, 1)[0])
+            commit = repo.revparse_single(tokens[0])
         except ValueError:
             print("Error: did not find a commit hash on line %d:\n%s" %
                   (num, line.strip(),), file=sys.stderr)
