@@ -128,7 +128,7 @@ def parse_section_header(line):
     return head
 
 
-def parse_inside(index, inside):
+def parse_inside(index, inside, move_upstream):
     result = []
     current_head = git_sort.remotes[0]
     for line in inside:
@@ -142,7 +142,7 @@ def parse_inside(index, inside):
 
         name = series_conf.firstword(line)
         entry = InputEntry("\t%s\n" % (name,))
-        entry.from_patch(index, name, current_head)
+        entry.from_patch(index, name, current_head, move_upstream)
         result.append(entry)
     return result
 
@@ -158,7 +158,7 @@ class InputEntry(object):
         self.value = value
 
 
-    def from_patch(self, index, name, current_head):
+    def from_patch(self, index, name, current_head, move_upstream):
         self.name = name
         if not os.path.exists(name):
             raise exc.KSError("Could not find patch \"%s\"" % (name,))
@@ -222,26 +222,32 @@ class InputEntry(object):
                         "wrong section of series.conf. Manual intervention is "
                         "required." % (name,))
         else: # commit found
+            msg_bad_tag = "There is a problem with patch \"%s\". " \
+                    "The Git-repo tag is incorrect or the patch is in " \
+                    "the wrong section of series.conf. Manual " \
+                    "intervention is required." % (name,)
             if current_head not in index.repo_heads: # repo not indexed
                 if ic.head > current_head: # patch moved downstream
                     if repo == current_head.repo_url: # good tag
                         self.dest_head = current_head
                     else: # bad tag
-                        raise exc.KSError(
-                            "There is a problem with patch \"%s\". "
-                            "The Git-repo tag is incorrect or the patch is in "
-                            "the wrong section of series.conf. Manual "
-                            "intervention is required." % (name,))
+                        raise exc.KSError(msg_bad_tag)
                 elif ic.head == current_head: # patch didn't move
                     raise exc.KSException(
                         "Head \"%s\" is not available locally but commit "
                         "\"%s\" found in patch \"%s\" was found in that head." %
                         (ic.head, rev, name,))
                 elif ic.head < current_head: # patch moved upstream
-                    self.dest_head = ic.head
-                    self.dest = ic
-                    if repo != ic.head.repo_url: # bad tag
-                        self.new_url = ic.head.repo_url
+                    if move_upstream: # move patches between subsystem sections
+                        self.dest_head = ic.head
+                        self.dest = ic
+                        if repo != ic.head.repo_url: # bad tag
+                            self.new_url = ic.head.repo_url
+                    else: # do not move patches between subsystem sections
+                        if repo == current_head.repo_url: # good tag
+                            self.dest_head = current_head
+                        else: # bad tag
+                            raise exc.KSError(msg_bad_tag)
             else: # repo is indexed
                 if ic.head > current_head: # patch moved downstream
                     if repo == current_head.repo_url: # good tag
@@ -267,10 +273,17 @@ class InputEntry(object):
                     if repo != ic.head.repo_url: # bad tag
                         self.new_url = ic.head.repo_url
                 elif ic.head < current_head: # patch moved upstream
-                    self.dest_head = ic.head
-                    self.dest = ic
-                    if repo != ic.head.repo_url: # bad tag
-                        self.new_url = ic.head.repo_url
+                    if move_upstream: # move patches between subsystem sections
+                        self.dest_head = ic.head
+                        self.dest = ic
+                        if repo != ic.head.repo_url: # bad tag
+                            self.new_url = ic.head.repo_url
+                    else: # do not move patches between subsystem sections
+                        if repo == current_head.repo_url: # good tag
+                            self.dest_head = current_head
+                            self.dest = ic
+                        else: # bad tag
+                            raise exc.KSError(msg_bad_tag)
 
 
 def series_sort(index, entries):
@@ -404,7 +417,7 @@ def sequence_insert(series, rev, top):
     else:
         top_index = current_patches.index(top) + 1
 
-    input_entries = parse_inside(index, inside)
+    input_entries = parse_inside(index, inside, False)
     input_entries.append(new_entry)
 
     sorted_entries = series_sort(index, input_entries)

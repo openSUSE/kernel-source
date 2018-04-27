@@ -234,6 +234,7 @@ class TestFromPatch(unittest.TestCase):
           fetches from that remote)
         * patch appears to have moved downstream/didn't move/upstream
         * patch's tag is good ("Git-repo:" == current_head.url)
+        * patches may be moved upstream between subsystem sections
     """
 
     def setUp(self):
@@ -405,56 +406,81 @@ class TestFromPatch(unittest.TestCase):
                     self.assertEqual(line[len(tag):-1], value)
 
 
-    def check_failure(self, msg):
-        try:
-            subprocess.check_output([self.ss_path, "-c", "series.conf"],
-                                    stderr=subprocess.STDOUT)
-        except subprocess.CalledProcessError as err:
-            self.assertEqual(err.returncode, 1)
-            self.assertTrue(err.output.decode(), msg)
+    def _transform_arg(move_upstream):
+        if move_upstream is None:
+            return [[], ["-u"]]
+        elif move_upstream:
+            return [["-u"]]
         else:
-            self.assertTrue(False)
-
-        try:
-            subprocess.check_output([self.ss_path, "series.conf"],
-                                    stderr=subprocess.STDOUT)
-        except subprocess.CalledProcessError as err:
-            self.assertEqual(err.returncode, 1)
-            self.assertEqual(err.output.decode(), msg)
-        else:
-            self.assertTrue(False)
+            return [[]]
 
 
-    def check_constant(self, name):
-        subprocess.check_call([self.ss_path, "-c", "series.conf"])
+    def check_failure(self, msg, move_upstream=None):
+        for extra_arg in self.__class__._transform_arg(move_upstream):
+            try:
+                subprocess.check_output(
+                    [self.ss_path] + extra_arg + ["-c", "series.conf"],
+                    stderr=subprocess.STDOUT)
+            except subprocess.CalledProcessError as err:
+                self.assertEqual(err.returncode, 1)
+                self.assertTrue(err.output.decode(), msg)
+            else:
+                self.assertTrue(False)
 
-        with open("series.conf") as f:
-            series1 = f.read()
-        with open(name) as f:
-            patch1 = f.read()
-        subprocess.check_call([self.ss_path, "series.conf"])
-        with open("series.conf") as f:
-            series2 = f.read()
-        with open(name) as f:
-            patch2 = f.read()
-        self.assertEqual(series2, series1)
-        self.assertEqual(patch2, patch1)
+            try:
+                subprocess.check_output(
+                    [self.ss_path] + extra_arg + ["series.conf"],
+                    stderr=subprocess.STDOUT)
+            except subprocess.CalledProcessError as err:
+                self.assertEqual(err.returncode, 1)
+                self.assertEqual(err.output.decode(), msg)
+            else:
+                self.assertTrue(False)
 
 
-    def check_outdated(self, msg, series2):
-        try:
-            subprocess.check_output([self.ss_path, "-c", "series.conf"],
-                                    stderr=subprocess.STDOUT)
-        except subprocess.CalledProcessError as err:
-            self.assertEqual(err.returncode, 2)
-            self.assertEqual(err.output.decode(), msg)
-        else:
-            self.assertTrue(False)
+    def check_constant(self, name, move_upstream=None):
+        for extra_arg in self.__class__._transform_arg(move_upstream):
+            subprocess.check_call(
+                [self.ss_path] + extra_arg + ["-c", "series.conf"])
 
-        subprocess.check_call([self.ss_path, "series.conf"])
-        with open("series.conf") as f:
-            content2 = f.read()
-        self.assertEqual(content2, series2)
+            with open("series.conf") as f:
+                series1 = f.read()
+            with open(name) as f:
+                patch1 = f.read()
+            subprocess.check_call([self.ss_path] + extra_arg + ["series.conf"])
+            with open("series.conf") as f:
+                series2 = f.read()
+            with open(name) as f:
+                patch2 = f.read()
+            self.assertEqual(series2, series1)
+            self.assertEqual(patch2, patch1)
+
+
+    def check_outdated(self, name, msg, series2, move_upstream=None):
+        (tmp, series,) = tempfile.mkstemp(dir=self.ks_dir)
+        (tmp, patch,) = tempfile.mkstemp(dir=self.ks_dir)
+        shutil.copy(name, patch)
+
+        for extra_arg in self.__class__._transform_arg(move_upstream):
+            shutil.copy(patch, name)
+            try:
+                subprocess.check_output(
+                    [self.ss_path] + extra_arg + ["-c", "series.conf"],
+                    stderr=subprocess.STDOUT)
+            except subprocess.CalledProcessError as err:
+                self.assertEqual(err.returncode, 2)
+                self.assertEqual(err.output.decode(), msg)
+            else:
+                self.assertTrue(False)
+
+            shutil.copy("series.conf", series)
+            subprocess.check_call([self.ss_path] + extra_arg + [series])
+            with open(series) as f:
+                content2 = f.read()
+            self.assertEqual(content2, series2)
+
+        os.unlink(series)
+        os.unlink(patch)
 
 
     def test_found_indexed_downstream_good(self):
@@ -548,16 +574,11 @@ class TestFromPatch(unittest.TestCase):
         with open("series.conf", mode="w") as f:
             f.write(series1)
 
-        self.check_outdated("Git-repo tags are outdated.\n", series1)
+        self.check_outdated(name, "Git-repo tags are outdated.\n", series1)
         self.check_tag(name, "Git-repo: ", self.net_next_repo)
 
 
-    def test_found_indexed_upstream_good(self):
-        """
-        patch sorted in rdma for-next, commit found in mainline
-            moves to mainline
-            tag is updated
-        """
+    def prepare_found_indexed_upstream_good(self):
         name = tests.support.format_patch(
             self.repo.get(self.commits["rdma for-next 0"]), repo=self.rdma_repo,
             directory=self.patch_dir)
@@ -575,21 +596,34 @@ class TestFromPatch(unittest.TestCase):
             )),
         ))
 
-        self.check_outdated(
-            "Input is not sorted.\nGit-repo tags are outdated.\n", series2)
+        return name, series2
+
+
+    def test_found_indexed_upstream_good_moveupstream(self):
+        """
+        patch sorted in rdma for-next, commit found in mainline
+            moves to mainline
+            tag is updated
+        """
+        name, series2 = self.prepare_found_indexed_upstream_good()
+
+        self.check_outdated(name,
+            "Input is not sorted.\nGit-repo tags are outdated.\n", series2,
+            True)
         self.check_tag(name, "Git-repo: ", self.mainline_repo)
 
 
-    def test_found_indexed_upstream_bad2(self):
+    def test_found_indexed_upstream_good_nomoveupstream(self):
         """
-        patch sorted in dledford/rdma k.o/for-next, tagged with rdma, commit
-        found in rdma for-next
-            moves to for-rc
-            tag is NOT updated
+        patch sorted in rdma for-next, commit found in mainline
+            stays there
+        """
+        name, series2 = self.prepare_found_indexed_upstream_good()
 
-        This is a special case. See the log of commit 0ac6457e94e8
-        ("scripts/git_sort/lib.py: Rewrite Git-repo only if it differs.")
-        """
+        self.check_constant(name, False)
+
+
+    def prepare_found_indexed_upstream_bad2(self):
         alt_repo = self.rdma_repo.replace("git://", "https://")
 
         name = tests.support.format_patch(
@@ -609,8 +643,38 @@ class TestFromPatch(unittest.TestCase):
             )),
         ))
 
-        self.check_outdated("Input is not sorted.\n", series2)
+        return name, series2, alt_repo
+
+
+    def test_found_indexed_upstream_bad2_moveupstream(self):
+        """
+        patch sorted in dledford/rdma k.o/for-next, tagged with rdma/rdma,
+        commit found in rdma/rdma for-rc
+            moves to rdma/rdma for-rc
+            tag is NOT updated
+
+        This is a special case. See the log of commit 0ac6457e94e8
+        ("scripts/git_sort/lib.py: Rewrite Git-repo only if it differs.")
+        """
+        name, series2, alt_repo = self.prepare_found_indexed_upstream_bad2()
+
+        self.check_outdated(name, "Input is not sorted.\n", series2, True)
         self.check_tag(name, "Git-repo: ", alt_repo)
+
+
+    def test_found_indexed_upstream_bad2_nomoveupstream(self):
+        """
+        patch sorted in dledford/rdma k.o/for-next, tagged with rdma/rdma,
+        commit found in rdma/rdma for-rc
+            error, possible causes:
+                section is wrong or Git-repo is wrong
+                    because they differ and there is no way to know which head
+                    the user intended.
+        """
+        name, series2, alt_repo = self.prepare_found_indexed_upstream_bad2()
+
+        self.check_failure(
+"Error: There is a problem with patch \"%s\". The Git-repo tag is incorrect or the patch is in the wrong section of series.conf. Manual intervention is required.\n" % (name,), False)
 
 
     def test_found_notindexed_downstream_good(self):
@@ -660,12 +724,7 @@ class TestFromPatch(unittest.TestCase):
     # cannot be tested (without stubbing some code to return invalid data)
 
 
-    def test_found_notindexed_upstream_good(self):
-        """
-        patch sorted in net (not fetched), commit found in mainline
-            moves to mainline
-            tag is updated
-        """
+    def prepare_found_notindexed_upstream_good(self):
         name = tests.support.format_patch(
             self.repo.get(self.commits["net 0"]), repo=self.net_repo,
             directory=self.patch_dir)
@@ -683,21 +742,33 @@ class TestFromPatch(unittest.TestCase):
             )),
         ))
 
-        self.check_outdated(
-            "Input is not sorted.\nGit-repo tags are outdated.\n", series2)
+        return name, series2
+
+
+    def test_found_notindexed_upstream_good_moveupstream(self):
+        """
+        patch sorted in net (not fetched), commit found in mainline
+            moves to mainline
+            tag is updated
+        """
+        name, series2 = self.prepare_found_notindexed_upstream_good()
+
+        self.check_outdated(name,
+            "Input is not sorted.\nGit-repo tags are outdated.\n", series2,
+            True)
         self.check_tag(name, "Git-repo: ", self.mainline_repo)
 
 
-    def test_found_notindexed_upstream_bad2(self):
+    def test_found_notindexed_upstream_good_nomoveupstream(self):
         """
-        patch sorted in pablo nf-next (not fetched), commit found in pablo nf,
-        git-repo tag is bad
-            moves to pablo nf
-            tag is NOT updated
+        patch sorted in net (not fetched), commit found in mainline
+            stays there
+        """
+        name, series2 = self.prepare_found_notindexed_upstream_good()
 
-        This is a special case. See the log of commit 0ac6457e94e8
-        ("scripts/git_sort/lib.py: Rewrite Git-repo only if it differs.")
-        """
+        self.check_constant(name, False)
+
+    def prepare_found_notindexed_upstream_bad2(self):
         alt_repo = self.nf_repo.replace("git://", "https://")
 
         name = tests.support.format_patch(
@@ -717,8 +788,38 @@ class TestFromPatch(unittest.TestCase):
             )),
         ))
 
-        self.check_outdated("Input is not sorted.\n", series2)
+        return name, series2, alt_repo
+
+
+    def test_found_notindexed_upstream_bad2_moveupstream(self):
+        """
+        patch sorted in pablo nf-next (not fetched), commit found in pablo nf,
+        git-repo tag is bad
+            moves to pablo nf
+            tag is NOT updated
+
+        This is a special case. See the log of commit 0ac6457e94e8
+        ("scripts/git_sort/lib.py: Rewrite Git-repo only if it differs.")
+        """
+        name, series2, alt_repo = self.prepare_found_notindexed_upstream_bad2()
+
+        self.check_outdated(name, "Input is not sorted.\n", series2, True)
         self.check_tag(name, "Git-repo: ", alt_repo)
+
+
+    def test_found_notindexed_upstream_bad2_nomoveupstream(self):
+        """
+        patch sorted in pablo nf-next (not fetched), commit found in pablo nf,
+        git-repo tag is bad
+            error, possible causes:
+                section is wrong or Git-repo is wrong
+                    because they differ and there is no way to know which head
+                    the user intended.
+        """
+        name, series2, alt_repo = self.prepare_found_notindexed_upstream_bad2()
+
+        self.check_failure(
+"Error: There is a problem with patch \"%s\". The Git-repo tag is incorrect or the patch is in the wrong section of series.conf. Manual intervention is required.\n" % (name,), False)
 
 
     def test_notfound_indexed_NA_good(self):
