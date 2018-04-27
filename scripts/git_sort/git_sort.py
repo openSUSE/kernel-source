@@ -153,8 +153,9 @@ class Head(object):
 
 
 # a list of each remote head which is indexed by this script
-# If a commit does not appear in one of these remotes, it is considered "not
-# upstream" and cannot be sorted.
+# If the working repository is a clone of linux.git (it fetches from mainline,
+# the first remote) and a commit does not appear in one of these remotes, it is
+# considered "not upstream" and cannot be sorted.
 # Repositories that come first in the list should be pulling/merging from
 # repositories lower down in the list. Said differently, commits should trickle
 # up from repositories at the end of the list to repositories higher up. For
@@ -229,6 +230,9 @@ def get_heads(repo):
         if remote_match.match(name)])
 
     for head in remotes:
+        if head in result:
+            raise GSException("head \"%s\" is not unique." % (head,))
+
         try:
             remote_name = repo_remotes[head.repo_url]
         except KeyError:
@@ -265,9 +269,6 @@ def get_history(repo, repo_heads):
     history = collections.OrderedDict()
     args = ["git", "log", "--topo-order", "--pretty=tformat:%H"]
     for head, rev in repo_heads.items():
-        if head in history:
-            raise GSException("head \"%s\" is not unique." % (head,))
-
         sp = subprocess.Popen(args + processed + [rev],
                               cwd=repo.path,
                               env={},
