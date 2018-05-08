@@ -128,12 +128,9 @@ if __name__ == "__main__":
             sys.stdout.writelines(inside)
             # Avoid an unsightly error that may occur when not all output is
             # read:
-            # close failed in file object destructor:
-            # sys.excepthook is missing
-            # lost sys.stderr
+            # Exception ignored in: <_io.TextIOWrapper name='<stdout>' mode='w' encoding='UTF-8'>
+            # BrokenPipeError: [Errno 32] Broken pipe
             sys.stdout.flush()
-        except IOError as err:
-            if err.errno == errno.EPIPE:
-                pass
-            else:
-                raise
+        except BrokenPipeError:
+            sys.stderr.close()
+            sys.exit()
