@@ -69,32 +69,21 @@ class TestSeriesInsert(unittest.TestCase):
         os.chdir(self.ks_dir)
 
         series = "series.conf"
+        series1 = tests.support.format_series((
+            (None,
+             ("patches.suse/mainline-%d.patch" % (i,) for i in (0, 2,))),
+        ))
         with open(series, mode="w") as f:
-            f.write(
-"""########################################################
-	# sorted patches
-	########################################################
-	patches.suse/mainline-0.patch
-	patches.suse/mainline-2.patch
-	########################################################
-	# end of sorted patches
-	########################################################
-""")
+            f.write(series1)
 
         subprocess.check_call([si_path, "patches.suse/mainline-1.patch"])
         with open(series) as f:
             content = f.read()
         self.assertEqual(content,
-"""########################################################
-	# sorted patches
-	########################################################
-	patches.suse/mainline-0.patch
-	patches.suse/mainline-1.patch
-	patches.suse/mainline-2.patch
-	########################################################
-	# end of sorted patches
-	########################################################
-""")
+            tests.support.format_series((
+                (None,
+                 ("patches.suse/mainline-%d.patch" % (i,) for i in range(3))),
+            )))
 
         content = []
         with open("patches.suse/mainline-1.patch") as f:
@@ -106,16 +95,7 @@ class TestSeriesInsert(unittest.TestCase):
             f.writelines(content)
 
         with open(series, mode="w") as f:
-            f.write(
-"""########################################################
-	# sorted patches
-	########################################################
-	patches.suse/mainline-0.patch
-	patches.suse/mainline-2.patch
-	########################################################
-	# end of sorted patches
-	########################################################
-""")
+            f.write(series1)
 
         try:
             subprocess.check_output([si_path, "patches.suse/mainline-1.patch"],
