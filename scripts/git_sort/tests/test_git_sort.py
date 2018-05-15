@@ -123,7 +123,7 @@ class TestIndex(unittest.TestCase):
         tree = self.repo.TreeBuilder().write()
 
         parent = []
-        commits = []
+        self.commits = []
         for i in range(3):
             subject = "commit %d" % (i,)
             cid = self.repo.create_commit(
@@ -135,8 +135,7 @@ class TestIndex(unittest.TestCase):
                 parent
             )
             parent = [cid]
-            commits.append((str(cid), subject,))
-        self.commits = commits
+            self.commits.append(str(cid))
 
         self.index = git_sort.SortIndex(self.repo)
 
@@ -151,30 +150,22 @@ class TestIndex(unittest.TestCase):
             git_sort.get_heads(self.repo),
             collections.OrderedDict([
                 (git_sort.Head(git_sort.RepoURL(None), "HEAD"),
-                 str(self.commits[-1][0]),)])
+                 self.commits[-1],)])
         )
 
 
-    def test_sort(self):
-        mapping = {commit : subject for commit, subject in self.commits}
-        r = self.index.sort(mapping)
-        self.assertEqual(
-            len(mapping),
-            0
-        )
-        self.assertEqual(
-            len(r),
-            1
-        )
-        r2 = list(r.items())[0]
-        self.assertEqual(
-            r2[0],
-            git_sort.Head(git_sort.RepoURL(None), "HEAD")
-        )
-        self.assertEqual(
-            r2[1],
-            [subject for commit, subject in self.commits]
-        )
+    def test_lookup(self):
+        ci0 = self.index.lookup(self.commits[0])
+        ci1 = self.index.lookup(self.commits[1])
+
+        self.assertEqual(ci0, ci0)
+        self.assertTrue(ci0 < ci1)
+
+
+    def test_empty_input(self):
+        os.chdir(self.repo_dir)
+        gs_path = os.path.join(lib.libdir(), "git_sort.py")
+        subprocess.check_output(gs_path, input="\n".encode())
 
 
 class TestIndexLinux(unittest.TestCase):
@@ -256,32 +247,9 @@ class TestIndexLinux(unittest.TestCase):
         )
 
 
-    def test_sort(self):
-        mapping = {str(commit.id) : commit.message for commit in self.commits}
-        r = self.index.sort(mapping)
-        self.assertEqual(
-            len(mapping),
-            0
-        )
-        self.assertEqual(
-            len(r),
-            2
-        )
-        r2 = list(r.items())[0]
-        self.assertEqual(
-            r2[0],
-            git_sort.Head(git_sort.RepoURL("torvalds/linux.git"))
-        )
-        self.assertEqual(
-            r2[1],
-            [commit.message for commit in self.commits]
-        )
-
-
     def test_describe(self):
-        self.assertEqual(
-            self.index.describe(self.index.lookup(str(self.commits[1].id))[1]),
-            "v4.10")
+        ic = self.index.lookup(str(self.commits[1].id))
+        self.assertEqual(self.index.describe(ic.index), "v4.10")
 
 
 class TestCache(unittest.TestCase):

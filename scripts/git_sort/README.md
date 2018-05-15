@@ -84,7 +84,7 @@ Refreshing the order of patches in series.conf
 As upstream maintainers pull from each other, the order of patches in
 series.conf needs to be refreshed. In that case, run:
 ```
-kernel-source$ ./scripts/series_sort.py series.conf
+kernel-source$ ./scripts/series_sort.py --upstream series.conf
 ```
 
 In case of unexpected trouble, you can also move patch entries to the

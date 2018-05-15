@@ -72,13 +72,13 @@ if __name__ == "__main__":
 
     inside = [line for line in local[1] if not line.strip() in removed]
     try:
-        input_entries = lib.parse_inside(index, inside)
+        input_entries = lib.parse_inside(index, inside, False)
     except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
     for name in added - local[3]:
         entry = lib.InputEntry("\t%s\n" % (name,))
-        entry.from_patch(index, name, lib.git_sort.oot)
+        entry.from_patch(index, name, lib.git_sort.oot, True)
         input_entries.append(entry)
 
     try:
