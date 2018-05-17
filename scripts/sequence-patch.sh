@@ -618,7 +618,20 @@ fi
 
 if test -e supported.conf; then
     echo "[ Generating Module.supported ]"
-    scripts/guards base external < supported.conf > "$SP_BUILD_DIR/Module.supported"
+    scripts/guards --list --with-guards < supported.conf | \
+    awk '
+	    /\+external / {
+		    print $(NF) " external";
+		    next;
+	    }
+	    /^-/ {
+		    print $(NF) " no";
+		    next;
+	    }
+	    {
+		    print $(NF);
+	    }
+    ' > "$SP_BUILD_DIR/Module.supported"
 fi
 
 if test -n "$CONFIG"; then
