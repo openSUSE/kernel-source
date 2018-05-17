@@ -6,7 +6,7 @@ When we want to backport a specific commit at its right position in the sorted
 sub-series, it is most efficient to use sequence_patch.sh to expand the tree up
 to the patch just before where the new commit will be added. The current script
 prints out which patch that is. Use in conjunction with sequence-patch.sh:
-    kernel-source$ ./scripts/sequence-patch.sh $(~/programming/suse/ksapply/sequence-insert.py 5c8227d0d3b1)
+    kernel-source$ ./scripts/sequence-patch.sh $(./scripts/git_sort/sequence-insert.py 5c8227d0d3b1)
 """
 
 import argparse
