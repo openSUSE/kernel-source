@@ -128,10 +128,13 @@ def parse_section_header(line):
     return head
 
 
-def parse_inside(index, inside, move_upstream):
-    result = []
+def patches_per_section(inside_lines):
+    result = collections.OrderedDict([
+        (head, [],)
+        for head in flatten((git_sort.remotes, (git_sort.oot,),))])
+
     current_head = git_sort.remotes[0]
-    for line in inside:
+    for line in inside_lines:
         try:
             current_head = parse_section_header(line)
         except exc.KSNotFound:
@@ -141,9 +144,39 @@ def parse_inside(index, inside, move_upstream):
             continue
 
         name = series_conf.firstword(line)
-        entry = InputEntry("\t%s\n" % (name,))
-        entry.from_patch(index, name, current_head, move_upstream)
-        result.append(entry)
+        result[current_head].append(name)
+
+    for head, names in list(result.items()):
+        if not names:
+            del result[head]
+
+    return result
+
+
+def parse_inside(index, inside_lines, move_upstream):
+    result = []
+    for head, names in patches_per_section(inside_lines).items():
+        for name in names:
+            entry = InputEntry("\t%s\n" % (name,))
+            entry.from_patch(index, name, head, move_upstream)
+            result.append(entry)
+
+    return result
+
+
+def list_moved_patches(base_lines, remote_lines):
+    base = {}
+    result = []
+
+    for head, names in patches_per_section(base_lines).items():
+        for name in names:
+            base[name] = head
+
+    for head, names in patches_per_section(remote_lines).items():
+        for name in names:
+            if name in base and head != base[name]:
+                result.append(name)
+
     return result
 
 
