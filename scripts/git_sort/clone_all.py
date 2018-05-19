@@ -39,10 +39,7 @@ if __name__ == "__main__":
         repo_url = head.repo_url
         if repo_url not in repo_urls:
             repo_urls.append(repo_url)
-    print("\n".join(["git remote add %s %s" % (
+    print("\n".join(["git remote add --no-tags %s %s" % (
         transform(str(repo_url)), repr(repo_url),)
-        for repo_url in repo_urls]))
-    print("\n".join(["git config --add remote.%s.tagOpt --no-tags" % (
-        transform(str(repo_url)),)
         for repo_url in repo_urls]))
     print("git fetch --all")
