@@ -20,6 +20,8 @@
 # you may find current contact information at www.novell.com
 #############################################################################
 
+[ -f $(dirname $0)/../rpm/config.sh ] || exit 0
+
 source $(dirname $0)/../rpm/config.sh
 source $(dirname $0)/wd-functions.sh
 
@@ -616,7 +618,20 @@ fi
 
 if test -e supported.conf; then
     echo "[ Generating Module.supported ]"
-    scripts/guards base external < supported.conf > "$SP_BUILD_DIR/Module.supported"
+    scripts/guards --list --with-guards < supported.conf | \
+    awk '
+	    /\+external / {
+		    print $(NF) " external";
+		    next;
+	    }
+	    /^-/ {
+		    print $(NF) " no";
+		    next;
+	    }
+	    {
+		    print $(NF);
+	    }
+    ' > "$SP_BUILD_DIR/Module.supported"
 fi
 
 if test -n "$CONFIG"; then
