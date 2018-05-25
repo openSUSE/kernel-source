@@ -434,6 +434,111 @@ class TestSpliceSeries(unittest.TestCase):
 	patches.drivers/0
 	patches.drivers/1
 """,),
+            # two new sections
+            (
+"""	patches.fixes/0
+
+	# out-of-tree patches
+	patches.suse/0
+	patches.suse/1
+""",
+"""	patches.fixes/0
+
+	# davem/net
+	patches.drivers/1
+	patches.drivers/2
+
+	# davem/net-next
+	patches.drivers/3
+	patches.drivers/4
+
+	# out-of-tree patches
+	patches.suse/0
+	patches.suse/1
+""",
+                "patches.drivers/1",
+"""	patches.fixes/0
+
+	# davem/net
+	patches.drivers/1
+
+	# out-of-tree patches
+	patches.suse/0
+	patches.suse/1
+""",),
+            # eof in whitespace
+            (
+"""	patches.fixes/0
+""",
+"""	patches.fixes/0
+
+	# davem/net
+	patches.drivers/1
+	patches.drivers/2
+
+""",
+                "patches.drivers/1",
+"""	patches.fixes/0
+
+	# davem/net
+	patches.drivers/1
+
+""",),
+            # two new sections, multi-line whitespace
+            (
+"""	patches.fixes/0
+
+	# out-of-tree patches
+	patches.suse/0
+	patches.suse/1
+""",
+"""	patches.fixes/0
+
+	# davem/net
+	patches.drivers/1
+	patches.drivers/2
+
+
+	# davem/net-next
+	patches.drivers/3
+	patches.drivers/4
+
+	# out-of-tree patches
+	patches.suse/0
+	patches.suse/1
+""",
+                "patches.drivers/1",
+"""	patches.fixes/0
+
+	# davem/net
+	patches.drivers/1
+
+
+	# out-of-tree patches
+	patches.suse/0
+	patches.suse/1
+""",),
+            # two new sections, eof in new
+            (
+"""	patches.fixes/0
+""",
+"""	patches.fixes/0
+
+	# davem/net
+	patches.drivers/1
+	patches.drivers/2
+
+	# davem/net-next
+	patches.drivers/3
+	patches.drivers/4
+""",
+                "patches.drivers/1",
+"""	patches.fixes/0
+
+	# davem/net
+	patches.drivers/1
+
+""",),
             )
 
         for i in range(len(vectors)):
