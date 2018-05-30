@@ -215,29 +215,6 @@ remotes = (
 remote_index = dict(zip(remotes, list(range(len(remotes)))))
 oot = Head(RepoURL(None), "out-of-tree patches")
 
-remote_match = re.compile("remote\..+\.url")
-
-
-def config_keys(repo):
-    """
-    With libgit < 0.27, pygit2's Config.__iter__() elements are str.
-    With libgit 0.27, the same elements are ConfigEntry instances.
-
-    This function is an adaptation layer to support both interfaces.
-    """
-    try:
-        first = repo.config.__iter__().next()
-    except StopIteration:
-        return
-
-    if isinstance(first, pygit2.config.ConfigEntry):
-        transform = lambda config_entry: config_entry.name
-    else:
-        transform = lambda name: name
-
-    for entry in repo.config:
-        yield transform(entry)
-
 
 def get_heads(repo):
     """
@@ -247,9 +224,8 @@ def get_heads(repo):
     """
     result = collections.OrderedDict()
     repo_remotes = collections.OrderedDict([
-        (RepoURL(repo.config[name]), ".".join(name.split(".")[1:-1]))
-        for name in config_keys(repo)
-        if remote_match.match(name)])
+        (RepoURL(remote.url), remote.name,)
+        for remote in repo.remotes])
 
     for head in remotes:
         if head in result:
