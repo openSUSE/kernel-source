@@ -99,7 +99,8 @@ def find_commit_in_series(commit, series):
     for name in filter_series(series):
         patch = tag.Patch(name)
         found = False
-        if commit in [firstword(value) for value in patch.get("Git-commit")]:
+        if commit in [firstword(value) for value in patch.get("Git-commit") if
+                      value]:
             found = True
             yield patch
         patch.close()

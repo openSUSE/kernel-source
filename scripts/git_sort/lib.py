@@ -204,11 +204,22 @@ class InputEntry(object):
             self.dest_head = git_sort.oot
             return
 
-        self.revs = [series_conf.firstword(ct) for ct in commit_tags]
-        for rev in self.revs:
-            if not self.commit_match.match(rev):
-                raise exc.KSError("Git-commit tag \"%s\" in patch \"%s\" is not a "
-                              "valid revision." % (rev, name,))
+        class BadTag(Exception):
+            pass
+
+        def get_commit(value):
+            if not value:
+                raise BadTag(value)
+            tag = series_conf.firstword(value)
+            if not self.commit_match.match(tag):
+                raise BadTag(tag)
+            return tag
+
+        try:
+            self.revs = [get_commit(value) for value in commit_tags]
+        except BadTag as e:
+            raise exc.KSError("Git-commit tag \"%s\" in patch \"%s\" is not a "
+                              "valid revision." % (e.args[0], name,))
         rev = self.revs[0]
 
         if len(repo_tags) > 1:
