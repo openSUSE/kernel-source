@@ -1,11 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-,
-# vim:set shiftwidth=4 softtabstop=4 expandtab textwidth=79:
 
 import sys
 import os.path
 import unittest
-from StringIO import StringIO
+from io import StringIO
 
 from suse_git import header
 
@@ -28,7 +27,7 @@ class TestHeaderChecker(unittest.TestCase):
     def test_empty(self):
         try:
             self.header = header.Checker("")
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.MissingTagError) == 4)
             self.assertTrue(e.tag_is_missing('patch-mainline'))
             self.assertTrue(e.tag_is_missing('from'))
@@ -49,7 +48,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.DuplicateTagError) == 1)
             self.assertTrue(e.errors() == 1)
 
@@ -66,7 +65,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.DuplicateTagError) == 1)
             self.assertTrue(e.errors() == 1)
 
@@ -81,7 +80,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.EmptyTagError) == 1)
             self.assertTrue(e.errors(header.MissingTagError) == 1)
             self.assertTrue(e.tag_is_missing('patch-mainline'))
@@ -98,7 +97,7 @@ Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
         try:
             self.header = header.Checker(text)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.MissingTagError) == 1)
             self.assertTrue(e.tag_is_missing('acked-by'))
             self.assertTrue(e.tag_is_missing('signed-off-by'))
@@ -219,7 +218,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.FormatError) == 1)
             self.assertTrue(e.errors() == 1)
 
@@ -254,7 +253,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.FormatError) == 1)
             self.assertTrue(e.errors() == 1)
 
@@ -270,7 +269,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.ExcludedTagError) == 1)
             self.assertTrue(e.errors() == 1)
 
@@ -288,7 +287,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.MissingTagError) == 1)
             self.assertTrue(e.errors(header.ExcludedTagError) == 1)
             self.assertTrue(e.errors() == 2)
@@ -304,7 +303,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.FormatError) == 1)
             self.assertTrue(e.errors() == 1)
 
@@ -318,7 +317,7 @@ Acked-by: developer@suse.com
 """
         try:
             self.header = header.Checker(text)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.FormatError) == 1)
             self.assertTrue(e.errors() == 1)
 
@@ -333,7 +332,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.FormatError) == 1)
             self.assertTrue(e.errors() == 1)
 
@@ -348,7 +347,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.FormatError) == 1)
             self.assertTrue(e.errors() == 1)
 
@@ -363,7 +362,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.FormatError) == 1)
             self.assertTrue(e.errors() == 1)
 
@@ -407,7 +406,7 @@ Acked-by: developer@suse.com
 """
         try:
             self.header = header.Checker(text)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             # Both policy and Git-commit require Patch-mainline
             self.assertTrue(e.errors(header.MissingTagError) == 2)
             self.assertTrue(e.tag_is_missing('patch-mainline'))
@@ -436,7 +435,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.MissingTagError) == 2)
             self.assertTrue(e.tag_is_missing('git-commit'))
             self.assertTrue(e.tag_is_missing('git-repo'))
@@ -454,7 +453,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             # Required by both Patch-mainline (Queued) and
             # Git-repo
             self.assertTrue(e.errors(header.MissingTagError) == 2)
@@ -473,7 +472,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.MissingTagError) == 1)
             self.assertTrue(e.tag_is_missing('git-repo'))
             self.assertTrue(e.errors() == 1)
@@ -489,7 +488,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.FormatError) == 1)
             self.assertTrue(e.errors() == 1)
 
@@ -535,7 +534,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.EmptyTagError) == 1)
             self.assertTrue(e.errors(header.MissingTagError) == 1)
             self.assertTrue(e.tag_is_missing('references'))
@@ -552,7 +551,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.MissingTagError) == 1)
             self.assertTrue(e.tag_is_missing('references'))
             self.assertTrue(e.errors() == 1)
@@ -636,7 +635,7 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text, True)
             self.assertTrue(False)
-        except header.HeaderException, e:
+        except header.HeaderException as e:
             self.assertTrue(e.errors(header.EmptyTagError) == 1)
             self.assertTrue(e.errors() == 1)
 

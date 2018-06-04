@@ -1,11 +1,11 @@
-#!/usr/bin/env python
-# vim: sw=4 ts=4 et si:
+#!/usr/bin/python
+# -*- coding: utf-8 -*-,
 
 import sys
 import re
 from optparse import OptionParser
 from . import patch
-from StringIO import StringIO
+from io import StringIO
 
 diffstart = re.compile("^(---|\*\*\*|Index:|\+\+\+)[ \t][^ \t]\S+/|^diff -")
 tag_regex = re.compile("(\S+):[ \t]*(.*)")
@@ -243,7 +243,7 @@ class HeaderException(patch.PatchException):
                     for tag in err.target:
                         if tag['name'].lower() == name.lower():
                             return True
-        except KeyError, e:
+        except KeyError as e:
             pass
 
         return False
@@ -322,7 +322,7 @@ class HeaderChecker(patch.PatchChecker):
             target[tag].append(new_req)
 
     def do_patch(self):
-        for line in self.stream.readlines():
+        for line in self.stream:
             if diffstart.match(line):
                 break
 
@@ -341,7 +341,7 @@ class HeaderChecker(patch.PatchChecker):
 
                 try:
                     multi = mapping['multi']
-                except KeyError, e:
+                except KeyError as e:
                     multi = False
 
                 for t in self.tags:
