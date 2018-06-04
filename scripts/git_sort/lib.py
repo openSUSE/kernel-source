@@ -13,8 +13,8 @@ import sys
 
 import exc
 import git_sort
+from patch import Patch
 import series_conf
-import tag
 
 
 # https://stackoverflow.com/a/952952
@@ -196,7 +196,7 @@ class InputEntry(object):
         if not os.path.exists(name):
             raise exc.KSError("Could not find patch \"%s\"" % (name,))
 
-        with tag.Patch(name) as patch:
+        with Patch(open(name, mode="rb")) as patch:
             commit_tags = patch.get("Git-commit")
             repo_tags = patch.get("Git-repo")
 
@@ -396,7 +396,7 @@ def tag_needs_update(entry):
 
 def update_tags(index, entries):
     for entry in entries:
-        with tag.Patch(entry.name) as patch:
+        with Patch(open(entry.name, mode="r+b")) as patch:
             message = "Failed to update tag \"%s\" in patch \"%s\". This " \
                     "tag is not found."
             if entry.dest_head == git_sort.remotes[0]:

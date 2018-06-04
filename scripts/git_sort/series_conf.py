@@ -15,7 +15,7 @@ import errno
 import sys
 
 import exc
-import tag
+from patch import Patch
 
 
 start_text = "sorted patches"
@@ -92,18 +92,19 @@ filter_series = lambda lines : [firstword(line) for line in lines
 
 
 @contextlib.contextmanager
-def find_commit_in_series(commit, series):
+def find_commit(commit, series, mode="rb"):
     """
     Caller must chdir to where the entries in series can be found.
     """
     for name in filter_series(series):
-        patch = tag.Patch(name)
+        patch = Patch(open(name, mode="rb"))
         found = False
-        if commit in [firstword(value) for value in patch.get("Git-commit") if
-                      value]:
+        if commit in [firstword(value)
+                      for value in patch.get("Git-commit")
+                      if value]:
             found = True
-            yield patch
-        patch.close()
+            yield name, patch
+        patch.writeback()
         if found:
             return
     raise exc.KSNotFound()
