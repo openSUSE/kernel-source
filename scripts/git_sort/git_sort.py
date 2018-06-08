@@ -223,27 +223,38 @@ def get_heads(repo):
         sha1
     """
     result = collections.OrderedDict()
-    repo_remotes = collections.OrderedDict([
-        (RepoURL(remote.url), remote.name,)
-        for remote in repo.remotes])
+    repo_remotes = collections.OrderedDict(
+        ((RepoURL(remote.url), remote,) for remote in repo.remotes))
 
     for head in remotes:
         if head in result:
             raise GSException("head \"%s\" is not unique." % (head,))
 
         try:
-            remote_name = repo_remotes[head.repo_url]
+            remote = repo_remotes[head.repo_url]
         except KeyError:
             continue
 
-        rev = "remotes/%s/%s" % (remote_name, head.rev,)
+        lhs = "refs/heads/%s" % (head.rev,)
+        rhs = None
+        nb = len(remote.fetch_refspecs)
+        if nb == 0:
+            # `git clone --bare` case
+            rhs = lhs
+        else:
+            for i in range(nb):
+                r = remote.get_refspec(i)
+                if r.src_matches(lhs):
+                    rhs = r.transform(lhs)
+                    break
+        if rhs is None:
+            raise GSError("No matching fetch refspec for head \"%s\"." %
+                          (head,))
         try:
-            commit = repo.revparse_single(rev)
+            commit = repo.revparse_single(rhs)
         except KeyError:
-            raise GSError(
-                "Could not read revision \"%s\". Perhaps you need to "
-                "fetch from remote \"%s\", ie. `git fetch %s`." % (
-                    rev, remote_name, remote_name,))
+            raise GSError("Could not read revision \"%s\". Perhaps you need "
+                          "to fetch from remote \"%s\"" % (rhs, remote.name,))
         result[head] = str(commit.id)
 
     if len(result) == 0 or list(result.keys())[0] != remotes[0]:
