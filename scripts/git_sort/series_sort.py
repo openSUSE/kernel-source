@@ -45,7 +45,10 @@ if __name__ == "__main__":
                         "current directory.")
     parser.add_argument("-c", "--check", action="store_true",
                         help="Report via exit status 2 if the series is not "
-                        "sorted.")
+                        "sorted. Default: false.")
+    parser.add_argument("-u", "--upstream", action="store_true",
+                        help="Move patches upstream between subsystem sections "
+                        "as appropriate. Default: false.")
     parser.add_argument("series", nargs="?", metavar="series.conf",
                         help="series.conf file which will be modified in "
                         "place. Default: read input from stdin.")
@@ -84,7 +87,7 @@ if __name__ == "__main__":
             sys.exit(1)
 
     try:
-        input_entries = lib.parse_inside(index, inside)
+        input_entries = lib.parse_inside(index, inside, args.upstream)
     except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)

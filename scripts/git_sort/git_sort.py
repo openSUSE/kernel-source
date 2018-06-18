@@ -153,8 +153,9 @@ class Head(object):
 
 
 # a list of each remote head which is indexed by this script
-# If a commit does not appear in one of these remotes, it is considered "not
-# upstream" and cannot be sorted.
+# If the working repository is a clone of linux.git (it fetches from mainline,
+# the first remote) and a commit does not appear in one of these remotes, it is
+# considered "not upstream" and cannot be sorted.
 # Repositories that come first in the list should be pulling/merging from
 # repositories lower down in the list. Said differently, commits should trickle
 # up from repositories at the end of the list to repositories higher up. For
@@ -205,8 +206,9 @@ remotes = (
     Head(RepoURL("git://git.kernel.org/pub/scm/virt/kvm/kvm.git"), "queue"),
     Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.16-rc"),
     Head(RepoURL("dhowells/linux-fs.git")),
-    Head(RepoURL("herbert/cryptodev-2.6.git"), "master"),
+    Head(RepoURL("herbert/cryptodev-2.6.git")),
     Head(RepoURL("helgaas/pci.git"), "next"),
+    Head(RepoURL("viro/vfs.git"), "for-linus"),
 )
 
 
@@ -214,6 +216,27 @@ remote_index = dict(zip(remotes, list(range(len(remotes)))))
 oot = Head(RepoURL(None), "out-of-tree patches")
 
 remote_match = re.compile("remote\..+\.url")
+
+
+def config_keys(repo):
+    """
+    With libgit < 0.27, pygit2's Config.__iter__() elements are str.
+    With libgit 0.27, the same elements are ConfigEntry instances.
+
+    This function is an adaptation layer to support both interfaces.
+    """
+    try:
+        first = repo.config.__iter__().next()
+    except StopIteration:
+        return
+
+    if isinstance(first, pygit2.config.ConfigEntry):
+        transform = lambda config_entry: config_entry.name
+    else:
+        transform = lambda name: name
+
+    for entry in repo.config:
+        yield transform(entry)
 
 
 def get_heads(repo):
@@ -225,10 +248,13 @@ def get_heads(repo):
     result = collections.OrderedDict()
     repo_remotes = collections.OrderedDict([
         (RepoURL(repo.config[name]), ".".join(name.split(".")[1:-1]))
-        for name in repo.config
+        for name in config_keys(repo)
         if remote_match.match(name)])
 
     for head in remotes:
+        if head in result:
+            raise GSException("head \"%s\" is not unique." % (head,))
+
         try:
             remote_name = repo_remotes[head.repo_url]
         except KeyError:
@@ -265,9 +291,6 @@ def get_history(repo, repo_heads):
     history = collections.OrderedDict()
     args = ["git", "log", "--topo-order", "--pretty=tformat:%H"]
     for head, rev in repo_heads.items():
-        if head in history:
-            raise GSException("head \"%s\" is not unique." % (head,))
-
         sp = subprocess.Popen(args + processed + [rev],
                               cwd=repo.path,
                               env={},
@@ -464,6 +487,40 @@ class Cache(object):
             raise KeyError
 
 
+@functools.total_ordering
+class IndexedCommit(object):
+    def __init__(self, head, index):
+        self.head = head
+        self.index = index
+
+
+    def _is_valid_operand(self, other):
+        return hasattr(other, "head") and hasattr(other, "index")
+
+
+    def __eq__(self, other):
+        if not self._is_valid_operand(other):
+            return NotImplemented
+        return (self.head == other.head and self.index == other.index)
+
+
+    def __lt__(self, other):
+        if not self._is_valid_operand(other):
+            return NotImplemented
+        if self.head == other.head:
+            return self.index < other.index
+        else:
+            return self.head < other.head
+
+
+    def __hash__(self):
+        return hash((self.head, self.index,))
+
+
+    def __repr__(self):
+        return "%s %d" % (repr(self.head), self.index,)
+
+
 class SortIndex(object):
     version_match = re.compile("refs/tags/v(2\.6\.\d+|\d\.\d+)(-rc\d+)?$")
 
@@ -519,7 +576,7 @@ class SortIndex(object):
             except KeyError:
                 continue
             else:
-                return (head, index,)
+                return IndexedCommit(head, index)
 
         raise GSKeyError
 
@@ -533,11 +590,11 @@ class SortIndex(object):
         result = collections.OrderedDict([(head, [],) for head in self.history])
         for commit in list(mapping.keys()):
             try:
-                head, index = self.lookup(commit)
+                ic = self.lookup(commit)
             except GSKeyError:
                 continue
             else:
-                result[head].append((index, mapping.pop(commit),))
+                result[ic.head].append((ic.index, mapping.pop(commit),))
 
         for head, entries in result.items():
             entries.sort(key=operator.itemgetter(0))
@@ -566,6 +623,10 @@ class SortIndex(object):
                     if obj.type == pygit2.GIT_OBJ_COMMIT]
             revs.sort(key=operator.itemgetter(0))
             self.version_indexes = list(zip(*revs))
+
+        if not self.version_indexes:
+            raise GSError("Cannot describe commit, did not find any mainline "
+                          "release tags in repository.")
 
         indexes, tags = self.version_indexes
         i = bisect.bisect_left(indexes, index)
@@ -651,12 +712,16 @@ if __name__ == "__main__":
         sys.exit(0)
 
     index = SortIndex(repo)
-    lines = {}
+    dest = {}
+    oot = []
     num = 0
     for line in sys.stdin.readlines():
         num = num + 1
+        tokens = line.strip().split(None, 1)
+        if not tokens:
+            continue
         try:
-            commit = repo.revparse_single(line.strip().split(None, 1)[0])
+            commit = repo.revparse_single(tokens[0])
         except ValueError:
             print("Error: did not find a commit hash on line %d:\n%s" %
                   (num, line.strip(),), file=sys.stderr)
@@ -666,20 +731,24 @@ if __name__ == "__main__":
                   (num, line.strip(),), file=sys.stderr)
             sys.exit(1)
         h = str(commit.id)
-        if h in lines:
-            lines[h].append(line)
+        if h in dest:
+            dest[h][1].append(line)
         else:
-            lines[h] = [line]
+            try:
+                ic = index.lookup(h)
+            except GSKeyError:
+                oot.append(line)
+            else:
+                dest[h] = (ic, [line],)
 
     print("".join([line
-                   for entries in index.sort(lines).values()
-                       for entry in entries
-                           for line in entry
+                   for ic, lines in sorted(dest.values(),
+                                           key=operator.itemgetter(0))
+                       for line in lines
                   ]), end="")
 
-    if len(lines) != 0:
+    if oot:
         print("Error: the following entries were not found in the indexed heads:",
               file=sys.stderr)
-        print("".join([line for line_list in lines.values() for line in
-                       line_list]), end="")
+        print("".join(oot), end="")
         sys.exit(1)
