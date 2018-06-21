@@ -25,7 +25,6 @@ class TestQuiltMode(unittest.TestCase):
         self.repo = pygit2.init_repository(os.environ["LINUX_GIT"])
         self.repo.config["user.email"] = "agraf@suse.de"
         self.repo.config["user.name"] = "Alexander Graf"
-        readme_path = os.path.join(os.environ["LINUX_GIT"], "README")
 
         author = pygit2.Signature("Alice Author", "alice@authors.tld")
         committer = pygit2.Signature("Cecil Committer", "cecil@committers.tld")
@@ -572,7 +571,156 @@ class TestMergeTool(unittest.TestCase):
         self.assertEqual(retval.decode().strip(), "M  series.conf")
 
 
+class TestQCP(unittest.TestCase):
+    def setUp(self):
+        os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
+
+        # setup stub linux repository
+        os.environ["LINUX_GIT"] = tempfile.mkdtemp(prefix="gs_repo")
+        self.repo = pygit2.init_repository(os.environ["LINUX_GIT"])
+        self.repo.config["user.email"] = "author1@example.com"
+        self.repo.config["user.name"] = "Author One"
+
+        author = pygit2.Signature("Author One", "author1@example.com")
+        committer = pygit2.Signature("Maintainer One", "maintainer1@example.com")
+        tree = self.repo.TreeBuilder()
+
+        tree.insert("driver.c", 
+                    self.repo.create_blob("#include <bad.h>\n"),
+                    pygit2.GIT_FILEMODE_BLOB)
+        self.commits = []
+        self.commits.append(self.repo.create_commit(
+            "refs/heads/mainline",
+            author,
+            committer,
+            """Add a very small module
+
+... which was not tested.
+
+Signed-off-by: Author One <author1@example.com>
+Signed-off-by: Maintainer One <maintainer@example.com>
+""",
+            tree.write(),
+            []
+        ))
+
+        tree.insert("driver.c", 
+                    self.repo.create_blob("#include <linux/module.h>\n"),
+                    pygit2.GIT_FILEMODE_BLOB)
+        self.commits.append(self.repo.create_commit(
+            "refs/heads/mainline",
+            author,
+            committer,
+            """Fix the very small module
+
+syzbot is reporting deadlocks at __blkdev_get() [1].
+
+----------------------------------------
+[   92.493919] systemd-udevd   D12696   525      1 0x00000000
+[   92.495891] Call Trace:
+[   92.501560]  schedule+0x23/0x80
+[   92.502923]  schedule_preempt_disabled+0x5/0x10
+[   92.504645]  __mutex_lock+0x416/0x9e0
+[   92.510760]  __blkdev_get+0x73/0x4f0
+[   92.512220]  blkdev_get+0x12e/0x390
+[   92.518151]  do_dentry_open+0x1c3/0x2f0
+[   92.519815]  path_openat+0x5d9/0xdc0
+[   92.521437]  do_filp_open+0x7d/0xf0
+[   92.527365]  do_sys_open+0x1b8/0x250
+[   92.528831]  do_syscall_64+0x6e/0x270
+[   92.530341]  entry_SYSCALL_64_after_hwframe+0x42/0xb7
+
+[   92.931922] 1 lock held by systemd-udevd/525:
+[   92.933642]  #0: 00000000a2849e25 (&bdev->bd_mutex){+.+.}, at: __blkdev_get+0x73/0x4f0
+----------------------------------------
+
+The reason of deadlock turned out that wait_event_interruptible() in
+
+Reported-by: Markus Trippelsdorf <markus@trippelsdorf.de>
+Fixes: %s ("Add a very small module")
+Signed-off-by: Author One <author1@example.com>
+Signed-off-by: Maintainer One <maintainer@example.com>
+""" % (str(self.commits[-1],)),
+            tree.write(),
+            [self.commits[-1]]
+        ))
+
+        self.repo.create_tag("v4.10-rc6", self.commits[-1], pygit2.GIT_REF_OID,
+                             committer, "Linux 4.10-rc6")
+
+        self.repo.remotes.create(
+            "origin",
+            "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git")
+        self.repo.references.create("refs/remotes/origin/master",
+                                    self.commits[-1])
+
+        # setup stub kernel-source content
+        self.ks_dir = tempfile.mkdtemp(prefix="gs_ks")
+        patch_dir = os.path.join(self.ks_dir, "patches.suse")
+        os.mkdir(patch_dir)
+        os.chdir(patch_dir)
+        with open(os.path.join(self.ks_dir, "series.conf"), mode="w") as f:
+            f.write(
+"""# Kernel patches configuration file
+
+	########################################################
+	# sorted patches
+	########################################################
+""")
+            f.write("\tpatches.suse/%s\n" % (
+                tests.support.format_patch(self.repo.get(self.commits[0]),
+                                           mainline="v4.9",
+                                           references="bsc#123"),))
+            f.write(
+"""
+	########################################################
+	# end of sorted patches
+	########################################################
+""")
+
+        ss_path = os.path.join(lib.libdir(), "series_sort.py")
+        os.chdir(self.ks_dir)
+
+        # This overlaps what is tested by test_series_sort, hence, not put in a
+        # test of its own.
+        subprocess.check_call([ss_path, "-c", "series.conf"])
+        with open("series.conf") as f:
+            content1 = f.read()
+        subprocess.check_call([ss_path, "series.conf"])
+        with open("series.conf") as f:
+            content2 = f.read()
+        self.assertEqual(content2, content1)
+
+        os.makedirs("tmp/current")
+        os.chdir("tmp/current")
+        subprocess.check_call(
+            ["quilt", "setup", "--sourcedir", "../../", "../../series.conf"])
+
+
+    def tearDown(self):
+        shutil.rmtree(os.environ["XDG_CACHE_HOME"])
+        shutil.rmtree(os.environ["LINUX_GIT"])
+        shutil.rmtree(self.ks_dir)
+
+
+    def test_fixup(self):
+        qm_path = os.path.join(lib.libdir(), "quilt-mode.sh")
+
+        # import commits[1]
+        subprocess.check_call(
+            ". %s; qgoto %s" % (qm_path, str(self.commits[1])), shell=True,
+            stdout=subprocess.DEVNULL, executable="/bin/bash")
+        subprocess.check_call(
+            """. %s; qcp -f %s""" % (
+                qm_path, str(self.commits[1])),
+            shell=True, stdout=subprocess.DEVNULL, executable="/bin/bash")
+
+        retval = subprocess.check_output(("quilt", "--quiltrc", "-", "next",))
+        name = "patches.suse/Fix-the-very-small-module.patch"
+        self.assertEqual(retval.decode().strip(), name)
+
+
 if __name__ == '__main__':
     # Run a single testcase
-    suite = unittest.TestLoader().loadTestsFromTestCase(TestMergeTool)
+    suite = unittest.TestLoader().loadTestsFromTestCase(TestQCP)
     unittest.TextTestRunner(verbosity=2).run(suite)
