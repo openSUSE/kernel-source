@@ -36,9 +36,9 @@ if __name__ == "__main__":
     cwd = os.getcwd()
     os.chdir("patches")
     try:
-        with series_conf.find_commit_in_series(commit, series) as patch:
+        with series_conf.find_commit(commit, series) as (name, patch,):
             print("Commit %s already present in patch\n\t%s" % (
-                commit[:12], patch.name,))
+                commit[:12], name,))
             references = " ".join(patch.get("References"))
             if references:
                 print("for\n\t%s" % (references,))
@@ -52,7 +52,7 @@ if __name__ == "__main__":
                     top = None
                 else:
                     raise
-            if top == patch.name:
+            if top == name:
                 print("This is the top patch.")
             sys.exit(1)
     except exc.KSNotFound:

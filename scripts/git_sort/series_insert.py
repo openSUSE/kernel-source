@@ -11,11 +11,10 @@ import collections
 import pygit2
 import sys
 
-import git_sort
 import exc
+import git_sort
 import lib
 import series_conf
-import tag
 
 
 if __name__ == "__main__":
