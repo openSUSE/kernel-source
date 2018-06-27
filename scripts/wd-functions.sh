@@ -72,6 +72,7 @@ _get_tarball_from_git()
 {
     local version=$1 tag url=$2 default_url
     local libdir=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+    local git
 
     git=$("$libdir"/linux_git.sh) || exit 1
     case "$version" in
@@ -88,18 +89,18 @@ _get_tarball_from_git()
         default_url=git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
     esac
     [ -z "$url" ] && url=$default_url
-    if ! git --git-dir="$git/.git" cat-file -e "$tag" 2>/dev/null; then
+    if ! git --git-dir="$git" cat-file -e "$tag" 2>/dev/null; then
         case "$tag" in
         refs/tags/*)
-            git --git-dir="$git/.git" fetch "$url" "$tag:$tag"
+            git --git-dir="$git" fetch "$url" "$tag:$tag"
             ;;
         *)
             # v2.6.X.Y-rcZ-gabcdef1, not a real tag
-            git --git-dir="$git/.git" fetch --tags "$url" \
+            git --git-dir="$git" fetch --tags "$url" \
                 refs/heads/master:refs/tags/latest
         esac
     fi
-    git --git-dir="$git/.git" archive --prefix="linux-$version/" "$tag"
+    git --git-dir="$git" archive --prefix="linux-$version/" "$tag"
 }
 
 get_tarball()
