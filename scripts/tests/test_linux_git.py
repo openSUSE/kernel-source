@@ -20,7 +20,7 @@ class TestLinuxGit(unittest.TestCase):
         shutil.rmtree(self.tmpdir)
 
 
-    def run_one(self, bare, var, output):
+    def run_one(self, *, bare, var, output):
         args = ["git", "init", "--quiet"]
         if bare:
             args.append("--bare")
@@ -34,14 +34,17 @@ class TestLinuxGit(unittest.TestCase):
 
 
     def test_bare(self):
-        self.run_one(True, self.tmpdir, self.tmpdir + "\n")
+        self.run_one(bare=True, var=self.tmpdir, output=self.tmpdir + "\n")
 
 
     def test_nonbare(self):
-        "Test non --bare repo with and without .git component in env var"
-        self.run_one(False, self.tmpdir, os.path.join(self.tmpdir, ".git") + "\n")
-        self.run_one(False, os.path.join(self.tmpdir, ".git"),
-                     os.path.join(self.tmpdir, ".git") + "\n")
+        self.run_one(bare=False, var=self.tmpdir,
+                     output=os.path.join(self.tmpdir, ".git") + "\n")
+
+
+    def test_nonbare_git(self):
+        self.run_one(bare=False, var=os.path.join(self.tmpdir, ".git"),
+                     output=os.path.join(self.tmpdir, ".git") + "\n")
 
 
 if __name__ == '__main__':

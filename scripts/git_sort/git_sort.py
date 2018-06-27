@@ -215,29 +215,6 @@ remotes = (
 remote_index = dict(zip(remotes, list(range(len(remotes)))))
 oot = Head(RepoURL(None), "out-of-tree patches")
 
-remote_match = re.compile("remote\..+\.url")
-
-
-def config_keys(repo):
-    """
-    With libgit < 0.27, pygit2's Config.__iter__() elements are str.
-    With libgit 0.27, the same elements are ConfigEntry instances.
-
-    This function is an adaptation layer to support both interfaces.
-    """
-    try:
-        first = repo.config.__iter__().next()
-    except StopIteration:
-        return
-
-    if isinstance(first, pygit2.config.ConfigEntry):
-        transform = lambda config_entry: config_entry.name
-    else:
-        transform = lambda name: name
-
-    for entry in repo.config:
-        yield transform(entry)
-
 
 def get_heads(repo):
     """
@@ -246,28 +223,38 @@ def get_heads(repo):
         sha1
     """
     result = collections.OrderedDict()
-    repo_remotes = collections.OrderedDict([
-        (RepoURL(repo.config[name]), ".".join(name.split(".")[1:-1]))
-        for name in config_keys(repo)
-        if remote_match.match(name)])
+    repo_remotes = collections.OrderedDict(
+        ((RepoURL(remote.url), remote,) for remote in repo.remotes))
 
     for head in remotes:
         if head in result:
             raise GSException("head \"%s\" is not unique." % (head,))
 
         try:
-            remote_name = repo_remotes[head.repo_url]
+            remote = repo_remotes[head.repo_url]
         except KeyError:
             continue
 
-        rev = "remotes/%s/%s" % (remote_name, head.rev,)
+        lhs = "refs/heads/%s" % (head.rev,)
+        rhs = None
+        nb = len(remote.fetch_refspecs)
+        if nb == 0:
+            # `git clone --bare` case
+            rhs = lhs
+        else:
+            for i in range(nb):
+                r = remote.get_refspec(i)
+                if r.src_matches(lhs):
+                    rhs = r.transform(lhs)
+                    break
+        if rhs is None:
+            raise GSError("No matching fetch refspec for head \"%s\"." %
+                          (head,))
         try:
-            commit = repo.revparse_single(rev)
+            commit = repo.revparse_single(rhs)
         except KeyError:
-            raise GSError(
-                "Could not read revision \"%s\". Perhaps you need to "
-                "fetch from remote \"%s\", ie. `git fetch %s`." % (
-                    rev, remote_name, remote_name,))
+            raise GSError("Could not read revision \"%s\". Perhaps you need "
+                          "to fetch from remote \"%s\"" % (rhs, remote.name,))
         result[head] = str(commit.id)
 
     if len(result) == 0 or list(result.keys())[0] != remotes[0]:
