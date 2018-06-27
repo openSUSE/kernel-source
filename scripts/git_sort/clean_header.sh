@@ -8,7 +8,7 @@ progname=$(basename "$0")
 libdir=$(dirname "$(readlink -f "$0")")
 git_dir=$("$libdir"/../linux_git.sh) || exit 1
 
-export GIT_DIR="$git_dir"/.git
+export GIT_DIR=$git_dir
 : ${EDITOR:=${VISUAL:=vi}}
 
 . "$libdir"/lib_from.sh
