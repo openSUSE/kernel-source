@@ -45,6 +45,7 @@ class Patch(object):
         self.f.seek(0)
         self.f.writelines([line.encode() for line in self.head])
         self.f.write(self.body)
+        self.f.truncate()
 
         self.modified = False
 
