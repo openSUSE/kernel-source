@@ -745,6 +745,16 @@ class TestFromPatch(unittest.TestCase):
         return name, series2
 
 
+    @staticmethod
+    def filter_out_tags(name):
+        with open(name) as f:
+            result = [line
+                      for line in f
+                      if not line.startswith(("Git-repo", "Patch-mainline",))]
+
+        return result
+
+
     def test_found_notindexed_upstream_good_moveupstream(self):
         """
         patch sorted in net (not fetched), commit found in mainline
@@ -752,11 +762,16 @@ class TestFromPatch(unittest.TestCase):
             tag is updated
         """
         name, series2 = self.prepare_found_notindexed_upstream_good()
+        before = self.filter_out_tags(name)
 
         self.check_outdated(name,
             "Input is not sorted.\nGit-repo tags are outdated.\n", series2,
             True)
         self.check_tag(name, "Git-repo: ", self.mainline_repo)
+
+        # check that only the expected tags changed
+        after = self.filter_out_tags(name)
+        self.assertEqual(before, after)
 
 
     def test_found_notindexed_upstream_good_nomoveupstream(self):
