@@ -205,6 +205,7 @@ remotes = (
     Head(RepoURL("herbert/cryptodev-2.6.git")),
     Head(RepoURL("helgaas/pci.git"), "next"),
     Head(RepoURL("viro/vfs.git"), "for-linus"),
+    Head(RepoURL("jeyu/linux.git"), "modules-next"),
 )
 
 
