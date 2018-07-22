@@ -1,0 +1,152 @@
+From: Jan Kara <jack@suse.cz>
+Date: Mon, 18 Jun 2018 15:46:58 +0200
+Subject: [PATCH] bdi: Fix another oops in wb_workfn()
+References: bnc#1012628
+Patch-mainline: 4.17.9
+Git-commit: 3ee7e8697d5860b173132606d80a9cd35e7113ee
+
+commit 3ee7e8697d5860b173132606d80a9cd35e7113ee upstream.
+
+syzbot is reporting NULL pointer dereference at wb_workfn() [1] due to
+wb->bdi->dev being NULL. And Dmitry confirmed that wb->state was
+WB_shutting_down after wb->bdi->dev became NULL. This indicates that
+unregister_bdi() failed to call wb_shutdown() on one of wb objects.
+
+The problem is in cgwb_bdi_unregister() which does cgwb_kill() and thus
+drops bdi's reference to wb structures before going through the list of
+wbs again and calling wb_shutdown() on each of them. This way the loop
+iterating through all wbs can easily miss a wb if that wb has already
+passed through cgwb_remove_from_bdi_list() called from wb_shutdown()
+from cgwb_release_workfn() and as a result fully shutdown bdi although
+wb_workfn() for this wb structure is still running. In fact there are
+also other ways cgwb_bdi_unregister() can race with
+cgwb_release_workfn() leading e.g. to use-after-free issues:
+
+CPU1                            CPU2
+                                cgwb_bdi_unregister()
+                                  cgwb_kill(*slot);
+
+cgwb_release()
+  queue_work(cgwb_release_wq, &wb->release_work);
+cgwb_release_workfn()
+                                  wb = list_first_entry(&bdi->wb_list, ...)
+                                  spin_unlock_irq(&cgwb_lock);
+  wb_shutdown(wb);
+  ...
+  kfree_rcu(wb, rcu);
+                                  wb_shutdown(wb); -> oops use-after-free
+
+We solve these issues by synchronizing writeback structure shutdown from
+cgwb_bdi_unregister() with cgwb_release_workfn() using a new mutex. That
+way we also no longer need synchronization using WB_shutting_down as the
+mutex provides it for CONFIG_CGROUP_WRITEBACK case and without
+CONFIG_CGROUP_WRITEBACK wb_shutdown() can be called only once from
+bdi_unregister().
+
+Reported-by: syzbot <syzbot+4a7438e774b21ddd8eca@syzkaller.appspotmail.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ include/linux/backing-dev-defs.h |  2 +-
+ mm/backing-dev.c                 | 20 +++++++-------------
+ 2 files changed, 8 insertions(+), 14 deletions(-)
+
+diff --git a/include/linux/backing-dev-defs.h b/include/linux/backing-dev-defs.h
+index 0bd432a4d7bd..24251762c20c 100644
+--- a/include/linux/backing-dev-defs.h
++++ b/include/linux/backing-dev-defs.h
+@@ -22,7 +22,6 @@ struct dentry;
+  */
+ enum wb_state {
+ 	WB_registered,		/* bdi_register() was done */
+-	WB_shutting_down,	/* wb_shutdown() in progress */
+ 	WB_writeback_running,	/* Writeback is in progress */
+ 	WB_has_dirty_io,	/* Dirty inodes on ->b_{dirty|io|more_io} */
+ 	WB_start_all,		/* nr_pages == 0 (all) work pending */
+@@ -189,6 +188,7 @@ struct backing_dev_info {
+ #ifdef CONFIG_CGROUP_WRITEBACK
+ 	struct radix_tree_root cgwb_tree; /* radix tree of active cgroup wbs */
+ 	struct rb_root cgwb_congested_tree; /* their congested states */
++	struct mutex cgwb_release_mutex;  /* protect shutdown of wb structs */
+ #else
+ 	struct bdi_writeback_congested *wb_congested;
+ #endif
+diff --git a/mm/backing-dev.c b/mm/backing-dev.c
+index 8fe3ebd6ac00..048d0651aa98 100644
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@ -359,15 +359,8 @@ static void wb_shutdown(struct bdi_writeback *wb)
+ 	spin_lock_bh(&wb->work_lock);
+ 	if (!test_and_clear_bit(WB_registered, &wb->state)) {
+ 		spin_unlock_bh(&wb->work_lock);
+-		/*
+-		 * Wait for wb shutdown to finish if someone else is just
+-		 * running wb_shutdown(). Otherwise we could proceed to wb /
+-		 * bdi destruction before wb_shutdown() is finished.
+-		 */
+-		wait_on_bit(&wb->state, WB_shutting_down, TASK_UNINTERRUPTIBLE);
+ 		return;
+ 	}
+-	set_bit(WB_shutting_down, &wb->state);
+ 	spin_unlock_bh(&wb->work_lock);
+ 
+ 	cgwb_remove_from_bdi_list(wb);
+@@ -379,12 +372,6 @@ static void wb_shutdown(struct bdi_writeback *wb)
+ 	mod_delayed_work(bdi_wq, &wb->dwork, 0);
+ 	flush_delayed_work(&wb->dwork);
+ 	WARN_ON(!list_empty(&wb->work_list));
+-	/*
+-	 * Make sure bit gets cleared after shutdown is finished. Matches with
+-	 * the barrier provided by test_and_clear_bit() above.
+-	 */
+-	smp_wmb();
+-	clear_and_wake_up_bit(WB_shutting_down, &wb->state);
+ }
+ 
+ static void wb_exit(struct bdi_writeback *wb)
+@@ -508,10 +495,12 @@ static void cgwb_release_workfn(struct work_struct *work)
+ 	struct bdi_writeback *wb = container_of(work, struct bdi_writeback,
+ 						release_work);
+ 
++	mutex_lock(&wb->bdi->cgwb_release_mutex);
+ 	wb_shutdown(wb);
+ 
+ 	css_put(wb->memcg_css);
+ 	css_put(wb->blkcg_css);
++	mutex_unlock(&wb->bdi->cgwb_release_mutex);
+ 
+ 	fprop_local_destroy_percpu(&wb->memcg_completions);
+ 	percpu_ref_exit(&wb->refcnt);
+@@ -697,6 +686,7 @@ static int cgwb_bdi_init(struct backing_dev_info *bdi)
+ 
+ 	INIT_RADIX_TREE(&bdi->cgwb_tree, GFP_ATOMIC);
+ 	bdi->cgwb_congested_tree = RB_ROOT;
++	mutex_init(&bdi->cgwb_release_mutex);
+ 
+ 	ret = wb_init(&bdi->wb, bdi, 1, GFP_KERNEL);
+ 	if (!ret) {
+@@ -717,7 +707,10 @@ static void cgwb_bdi_unregister(struct backing_dev_info *bdi)
+ 	spin_lock_irq(&cgwb_lock);
+ 	radix_tree_for_each_slot(slot, &bdi->cgwb_tree, &iter, 0)
+ 		cgwb_kill(*slot);
++	spin_unlock_irq(&cgwb_lock);
+ 
++	mutex_lock(&bdi->cgwb_release_mutex);
++	spin_lock_irq(&cgwb_lock);
+ 	while (!list_empty(&bdi->wb_list)) {
+ 		wb = list_first_entry(&bdi->wb_list, struct bdi_writeback,
+ 				      bdi_node);
+@@ -726,6 +719,7 @@ static void cgwb_bdi_unregister(struct backing_dev_info *bdi)
+ 		spin_lock_irq(&cgwb_lock);
+ 	}
+ 	spin_unlock_irq(&cgwb_lock);
++	mutex_unlock(&bdi->cgwb_release_mutex);
+ }
+ 
+ /**
+-- 
+2.18.0
+
