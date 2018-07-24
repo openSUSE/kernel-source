@@ -64,7 +64,7 @@ series=$(
 while read line; do
 	set $line
 	ref=$1
-	orig_stat_nb=$(GIT_DIR="$git_dir"/.git git format-patch --stdout -n1 $ref | eval git apply --numstat "$includeargs" | wc -l)
+	orig_stat_nb=$(GIT_DIR=$git_dir git format-patch --stdout -n1 $ref | eval git apply --numstat "$includeargs" | wc -l)
 	found=
 	while read patch; do
 		if [ ! "$patch" ]; then
