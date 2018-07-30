@@ -31,6 +31,10 @@ https://build.opensuse.org/package/show/home:benjamin_poirier:series_sort/quilt-
 Source is avaible from
 https://gitlab.suse.de/benjamin_poirier/quilt
 
+The packages in home:benjamin_poirier:series_sort are signed with the key
+from home:benjamin_poirier which has the following fingerprint:
+6075 E129 2ACD 9732 A079  7B40 3F6E 17FC 4A3D 5625
+
 quilt depends on diffstat from the package with the same name. For SLE12-SP2
 and SLE12-SP3, the diffstat package is available in the SDK module. For
 openSUSE 42.3 and Tumbleweed, the diffstat package is available in the normal
