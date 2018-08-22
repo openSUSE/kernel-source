@@ -1,5 +1,5 @@
-# http://registry.suse.de/cgi-bin/overview.pl
-FROM registry.suse.de/home/benjamin_poirier/docker_images/sle-12-sp3/images/x86_64/suse/sles12sp3:2.0.3 AS base
+# http://registry.suse.de/
+FROM registry.suse.de/home/benjamin_poirier/docker_images/sle-12-sp3/images/suse/sles12sp3:2.0.3 AS base
 
 RUN zypper -n ref
 
