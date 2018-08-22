@@ -1,5 +1,5 @@
-# https://store.docker.com/images/opensuse
-FROM opensuse:42.3 AS base
+# https://hub.docker.com/r/opensuse/leap/
+FROM opensuse/leap:42.3 AS base
 
 RUN zypper -n ref
 
