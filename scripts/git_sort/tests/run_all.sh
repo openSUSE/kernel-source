@@ -13,6 +13,7 @@ fi
 for release in \
 	sle12-sp2 \
 	sle12-sp3 \
+	sle15 \
 	opensuse-42.3 \
 	opensuse-15.0 \
 	opensuse-tumbleweed \
