@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import io
 import os
 import os.path
 import pygit2
@@ -12,8 +13,8 @@ import tempfile
 
 import exc
 import lib
+from patch import Patch
 import series_conf
-import tag
 
 
 def format_import(references, tmpdir, dstdir, rev, poi=[]):
@@ -83,7 +84,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if args.followup:
-        with tag.Patch(content=commit.message) as patch:
+        with Patch(io.BytesIO(commit.message.encode())) as patch:
             try:
                 fixes = series_conf.firstword(patch.get("Fixes")[0])
             except IndexError:
@@ -96,8 +97,8 @@ if __name__ == "__main__":
         cwd = os.getcwd()
         os.chdir("patches")
         try:
-            with series_conf.find_commit_in_series(fixes, series) as patch:
-                destination = os.path.dirname(patch.name)
+            with series_conf.find_commit(fixes, series) as (name, patch,):
+                destination = os.path.dirname(name)
                 references = " ".join(patch.get("References"))
         except exc.KSNotFound:
             print("Error: no patch found which contains commit %s." %
@@ -106,7 +107,7 @@ if __name__ == "__main__":
         os.chdir(cwd)
 
         print("Info: using references \"%s\" from patch \"%s\" which contains "
-              "commit %s." % (references, patch, fixes[:12]), file=sys.stderr)
+              "commit %s." % (references, name, fixes[:12]))
     else:
         destination = args.destination
         references = args.references

@@ -13,8 +13,8 @@ import sys
 
 import exc
 import git_sort
+from patch import Patch
 import series_conf
-import tag
 
 
 # https://stackoverflow.com/a/952952
@@ -32,6 +32,12 @@ def libdir():
 
 
 def check_series():
+    """
+    Check that the "series" file used by quilt looks like a series.conf file and
+    not a simplified version. If using the modified quilt, it will be a symlink
+    to the actual "series.conf" file and doing things like `quilt import` will
+    automatically update series.conf.
+    """
     def check():
         return (open("series").readline().strip() ==
                 "# Kernel patches configuration file")
@@ -63,6 +69,10 @@ def check_series():
 
 
 def repo_path():
+    """
+    Get the path to the git_dir of the mainline linux git repository to use.
+    Typically obtained from the LINUX_GIT environment variable.
+    """
     try:
         search_path = subprocess.check_output(
             os.path.join(libdir(), "..",
@@ -75,6 +85,11 @@ def repo_path():
 
 
 def series_header(series):
+    """
+    Return the block of lines at the top of series that are not patch files
+    entries or automatically generated comments. These lines should be prepended
+    to the output.
+    """
     header = []
 
     for line in series:
@@ -98,6 +113,11 @@ def series_footer(series):
 
 
 def parse_section_header(line):
+    """
+    Parse a series.conf line to identify if it's a comment denoting the
+    beginning of a subsystem section. In that case, return the Head object it
+    corresponds to.
+    """
     oot_text = git_sort.oot.rev
     line = line.strip()
 
@@ -128,10 +148,18 @@ def parse_section_header(line):
     return head
 
 
-def parse_inside(index, inside):
-    result = []
+def patches_per_section(inside_lines):
+    """
+    Returns an OrderedDict
+    result[Head][]
+        patch file name
+    """
+    result = collections.OrderedDict([
+        (head, [],)
+        for head in flatten((git_sort.remotes, (git_sort.oot,),))])
+
     current_head = git_sort.remotes[0]
-    for line in inside:
+    for line in inside_lines:
         try:
             current_head = parse_section_header(line)
         except exc.KSNotFound:
@@ -141,13 +169,54 @@ def parse_inside(index, inside):
             continue
 
         name = series_conf.firstword(line)
-        entry = InputEntry("\t%s\n" % (name,))
-        entry.from_patch(index, name, current_head)
-        result.append(entry)
+        result[current_head].append(name)
+
+    for head, names in list(result.items()):
+        if not names:
+            del result[head]
+
+    return result
+
+
+def parse_inside(index, inside_lines, move_upstream):
+    """
+    Parse series.conf lines to generate InputEntry objects.
+    """
+    result = []
+    for head, names in patches_per_section(inside_lines).items():
+        for name in names:
+            entry = InputEntry("\t%s\n" % (name,))
+            entry.from_patch(index, name, head, move_upstream)
+            result.append(entry)
+
+    return result
+
+
+def list_moved_patches(base_lines, remote_lines):
+    """
+    Return a list of patch file names which are in different subsystem sections
+    between base and remote.
+    """
+    base = {}
+    result = []
+
+    for head, names in patches_per_section(base_lines).items():
+        for name in names:
+            base[name] = head
+
+    for head, names in patches_per_section(remote_lines).items():
+        for name in names:
+            if name in base and head != base[name]:
+                result.append(name)
+
     return result
 
 
 class InputEntry(object):
+    """
+    A patch line entry (usually from series.conf) and associated data about the
+    commit it backports.
+    """
     commit_match = re.compile("[0-9a-f]{40}")
 
 
@@ -158,12 +227,22 @@ class InputEntry(object):
         self.value = value
 
 
-    def from_patch(self, index, name, current_head):
+    def from_patch(self, index, name, current_head, move_upstream):
+        """
+        This is where we decide a patch line's fate in the sorted series.conf
+        The following factors determine how a patch is sorted:
+        * commit found in index
+        * patch's series.conf current_head is indexed (ie. the local repo
+          fetches from that remote)
+        * patch appears to have moved downstream/didn't move/upstream
+        * patch's tag is good ("Git-repo:" == current_head.url)
+        * patches may be moved upstream between subsystem sections
+        """
         self.name = name
         if not os.path.exists(name):
             raise exc.KSError("Could not find patch \"%s\"" % (name,))
 
-        with tag.Patch(name) as patch:
+        with Patch(open(name, mode="rb")) as patch:
             commit_tags = patch.get("Git-commit")
             repo_tags = patch.get("Git-repo")
 
@@ -171,11 +250,22 @@ class InputEntry(object):
             self.dest_head = git_sort.oot
             return
 
-        self.revs = [series_conf.firstword(ct) for ct in commit_tags]
-        for rev in self.revs:
-            if not self.commit_match.match(rev):
-                raise exc.KSError("Git-commit tag \"%s\" in patch \"%s\" is not a "
-                              "valid revision." % (rev, name,))
+        class BadTag(Exception):
+            pass
+
+        def get_commit(value):
+            if not value:
+                raise BadTag(value)
+            tag = series_conf.firstword(value)
+            if not self.commit_match.match(tag):
+                raise BadTag(tag)
+            return tag
+
+        try:
+            self.revs = [get_commit(value) for value in commit_tags]
+        except BadTag as e:
+            raise exc.KSError("Git-commit tag \"%s\" in patch \"%s\" is not a "
+                              "valid revision." % (e.args[0], name,))
         rev = self.revs[0]
 
         if len(repo_tags) > 1:
@@ -187,9 +277,8 @@ class InputEntry(object):
             repo = git_sort.remotes[0].repo_url
         self.new_url = None
 
-        # this is where we decide a patch line's fate in the sorted series.conf
         try:
-            head, cindex = index.lookup(rev)
+            ic = index.lookup(rev)
         except git_sort.GSKeyError: # commit not found
             if current_head not in index.repo_heads: # repo not indexed
                 if repo == current_head.repo_url: # good tag
@@ -222,28 +311,34 @@ class InputEntry(object):
                         "wrong section of series.conf. Manual intervention is "
                         "required." % (name,))
         else: # commit found
+            msg_bad_tag = "There is a problem with patch \"%s\". " \
+                    "The Git-repo tag is incorrect or the patch is in " \
+                    "the wrong section of series.conf. Manual " \
+                    "intervention is required." % (name,)
             if current_head not in index.repo_heads: # repo not indexed
-                if head > current_head: # patch moved downstream
+                if ic.head > current_head: # patch moved downstream
                     if repo == current_head.repo_url: # good tag
                         self.dest_head = current_head
                     else: # bad tag
-                        raise exc.KSError(
-                            "There is a problem with patch \"%s\". "
-                            "The Git-repo tag is incorrect or the patch is in "
-                            "the wrong section of series.conf. Manual "
-                            "intervention is required." % (name,))
-                elif head == current_head: # patch didn't move
+                        raise exc.KSError(msg_bad_tag)
+                elif ic.head == current_head: # patch didn't move
                     raise exc.KSException(
                         "Head \"%s\" is not available locally but commit "
                         "\"%s\" found in patch \"%s\" was found in that head." %
-                        (head, rev, name,))
-                elif head < current_head: # patch moved upstream
-                    self.dest_head = head
-                    self.cindex = cindex
-                    if repo != head.repo_url: # bad tag
-                        self.new_url = head.repo_url
+                        (ic.head, rev, name,))
+                elif ic.head < current_head: # patch moved upstream
+                    if move_upstream: # move patches between subsystem sections
+                        self.dest_head = ic.head
+                        self.dest = ic
+                        if repo != ic.head.repo_url: # bad tag
+                            self.new_url = ic.head.repo_url
+                    else: # do not move patches between subsystem sections
+                        if repo == current_head.repo_url: # good tag
+                            self.dest_head = current_head
+                        else: # bad tag
+                            raise exc.KSError(msg_bad_tag)
             else: # repo is indexed
-                if head > current_head: # patch moved downstream
+                if ic.head > current_head: # patch moved downstream
                     if repo == current_head.repo_url: # good tag
                         raise exc.KSError(
                             "There is a problem with patch \"%s\". "
@@ -252,7 +347,7 @@ class InputEntry(object):
                             "fetched or the relative order of \"%s\" and "
                             "\"%s\" in \"remotes\" is incorrect. Manual "
                             "intervention is required." % (
-                                name, current_head.repo_url, head,
+                                name, current_head.repo_url, ic.head,
                                 current_head,))
                     else: # bad tag
                         raise exc.KSError(
@@ -261,16 +356,23 @@ class InputEntry(object):
                             "or the remote fetching from \"%s\" needs to be "
                             "fetched. Manual intervention is required." % (
                                 name, current_head.repo_url,))
-                elif head == current_head: # patch didn't move
-                    self.dest_head = head
-                    self.cindex = cindex
-                    if repo != head.repo_url: # bad tag
-                        self.new_url = head.repo_url
-                elif head < current_head: # patch moved upstream
-                    self.dest_head = head
-                    self.cindex = cindex
-                    if repo != head.repo_url: # bad tag
-                        self.new_url = head.repo_url
+                elif ic.head == current_head: # patch didn't move
+                    self.dest_head = ic.head
+                    self.dest = ic
+                    if repo != ic.head.repo_url: # bad tag
+                        self.new_url = ic.head.repo_url
+                elif ic.head < current_head: # patch moved upstream
+                    if move_upstream: # move patches between subsystem sections
+                        self.dest_head = ic.head
+                        self.dest = ic
+                        if repo != ic.head.repo_url: # bad tag
+                            self.new_url = ic.head.repo_url
+                    else: # do not move patches between subsystem sections
+                        if repo == current_head.repo_url: # good tag
+                            self.dest_head = current_head
+                            self.dest = ic
+                        else: # bad tag
+                            raise exc.KSError(msg_bad_tag)
 
 
 def series_sort(index, entries):
@@ -278,8 +380,8 @@ def series_sort(index, entries):
     entries is a list of InputEntry objects
 
     Returns an OrderedDict
-        result[Head][]
-            series.conf line with a patch name
+    result[Head][]
+        patch file name
 
     Note that Head may be a "virtual head" like "out-of-tree patches".
     """
@@ -295,9 +397,9 @@ def series_sort(index, entries):
 
     for entry in entries:
         try:
-            result[entry.dest_head][entry.cindex].append(entry.value)
+            result[entry.dest_head][entry.dest].append(entry.value)
         except AttributeError:
-            # no entry.cindex
+            # no entry.dest
             result[entry.dest_head].append(entry.value)
 
     for head in index.repo_heads:
@@ -314,15 +416,17 @@ def series_sort(index, entries):
 
 def series_format(entries):
     """
-    entries is an OrderedDict
-        entries[Head][]
-            series.conf line with a patch name
+    entries is an OrderedDict, typically the output of series_sort()
+    result[Head][]
+        patch file name
     """
     result = []
 
     for head, lines in entries.items():
         if head != git_sort.remotes[0]:
-            result.extend(["\n", "\t# %s\n" % (str(head),)])
+            if result:
+                result.append("\n")
+            result.append("\t# %s\n" % (str(head),))
         result.extend(lines)
 
     return result
@@ -336,16 +440,23 @@ def tag_needs_update(entry):
 
 
 def update_tags(index, entries):
+    """
+    Update the Git-repo tag (possibly by removing it) of patches.
+    """
     for entry in entries:
-        with tag.Patch(entry.name) as patch:
+        with Patch(open(entry.name, mode="r+b")) as patch:
             message = "Failed to update tag \"%s\" in patch \"%s\". This " \
                     "tag is not found."
             if entry.dest_head == git_sort.remotes[0]:
                 tag_name = "Patch-mainline"
                 try:
-                    patch.change(tag_name, index.describe(entry.cindex))
+                    patch.change(tag_name, index.describe(entry.dest.index))
                 except KeyError:
                     raise exc.KSNotFound(message % (tag_name, entry.name,))
+                except git_sort.GSError as err:
+                    raise exc.KSError("Failed to update tag \"%s\" in patch "
+                                      "\"%s\". %s" % (tag_name, entry.name,
+                                                      str(err),))
                 patch.remove("Git-repo")
             else:
                 tag_name = "Git-repo"
@@ -378,12 +489,13 @@ def sequence_insert(series, rev, top):
     marker = "# new commit"
     new_entry = InputEntry(marker)
     try:
-        new_entry.dest_head, new_entry.cindex = index.lookup(commit)
+        new_entry.dest = index.lookup(commit)
     except git_sort.GSKeyError:
         raise exc.KSError(
             "Commit %s not found in git-sort index. If it is from a "
             "repository and branch pair which is not listed in \"remotes\", "
             "please add it and submit a patch." % (commit,))
+    new_entry.dest_head = new_entry.dest.head
 
     try:
         before, inside, after = series_conf.split(series)
@@ -397,7 +509,7 @@ def sequence_insert(series, rev, top):
     else:
         top_index = current_patches.index(top) + 1
 
-    input_entries = parse_inside(index, inside)
+    input_entries = parse_inside(index, inside, False)
     input_entries.append(new_entry)
 
     sorted_entries = series_sort(index, input_entries)

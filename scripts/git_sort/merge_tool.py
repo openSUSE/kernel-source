@@ -45,22 +45,24 @@ if __name__ == "__main__":
 
     # (before, inside, after, set(inside),)
     local, base, remote = (
-        (s[0], s[1], s[2], set([series_conf.firstword(l) for l in s[1] if
-                                series_conf.filter_patches(l)]),)
+        (s[0], s[1], s[2], set([series_conf.firstword(l)
+                                for l in s[1]
+                                if series_conf.filter_patches(l)]),)
         for s in [
-            series_conf.split(open(s_path)) for s_path in (
-                local_path, base_path, remote_path,)
+            series_conf.split(open(s_path))
+            for s_path in (local_path, base_path, remote_path,)
         ]
     )
 
     added = remote[3] - base[3]
     removed = base[3] - remote[3]
+    moved = set(lib.list_moved_patches(base[1], remote[1]))
 
-    added_nb = len(added)
-    removed_nb = len(removed)
-    if added_nb or removed_nb:
+    if added or removed:
         print("%d commits added, %d commits removed from base to remote." %
-              (added_nb, removed_nb,))
+              (len(added), len(removed),))
+    if moved:
+        print("%d commits changed section from base to remote." % (len(moved),))
     dup_add_nb = len(local[3] & added)
     dup_rem_nb = len(removed) - len(local[3] & removed)
     if dup_add_nb:
@@ -70,15 +72,16 @@ if __name__ == "__main__":
         print("Warning: %d commits removed in remote but not present in local, "
               "ignoring." % (dup_rem_nb,))
 
-    inside = [line for line in local[1] if not line.strip() in removed]
+    filter_set = removed | moved
+    inside = [line for line in local[1] if not line.strip() in filter_set]
     try:
-        input_entries = lib.parse_inside(index, inside)
+        input_entries = lib.parse_inside(index, inside, False)
     except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
-    for name in added - local[3]:
+    for name in added - local[3] | moved:
         entry = lib.InputEntry("\t%s\n" % (name,))
-        entry.from_patch(index, name, lib.git_sort.oot)
+        entry.from_patch(index, name, lib.git_sort.oot, True)
         input_entries.append(entry)
 
     try:

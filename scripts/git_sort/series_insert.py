@@ -11,11 +11,10 @@ import collections
 import pygit2
 import sys
 
-import git_sort
 import exc
+import git_sort
 import lib
 import series_conf
-import tag
 
 
 if __name__ == "__main__":
@@ -39,7 +38,7 @@ if __name__ == "__main__":
 
     try:
         before, inside, after = series_conf.split(lines)
-        current_entries = lib.parse_inside(index, inside)
+        current_entries = lib.parse_inside(index, inside, False)
     except exc.KSError as err:
         print("Error: %s" % (err,), file=sys.stderr)
         sys.exit(1)
@@ -65,7 +64,7 @@ if __name__ == "__main__":
         entry = lib.InputEntry("\t%s\n" % (name,))
         new_lines.add(entry.value)
         try:
-            entry.from_patch(index, name, git_sort.oot)
+            entry.from_patch(index, name, git_sort.oot, True)
         except exc.KSError as err:
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)

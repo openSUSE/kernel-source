@@ -356,7 +356,7 @@ ask_reuse_config()
 
 filter_config()
 {
-    sed -e '/^# .* is not set$/p' -e '/^$\|^#/d' "$@" | sort
+    sed  -e '/CONFIG_GCC_VERSION/ d' -e '/^# .* is not set$/p' -e '/^$\|^#/d' "$@" | sort
 }
 
 # Keep these in the -vanilla fragment even if -default has the same values.
@@ -401,6 +401,9 @@ for config in $config_files; do
         MAKE_ARGS="ARCH=$cpu_arch"
         ;;
     esac
+    if [ -n "$CC" ]; then
+        MAKE_ARGS="$MAKE_ARGS CC=$CC"
+    fi
     if $silent; then
 	    MAKE_ARGS="$MAKE_ARGS -s"
     fi

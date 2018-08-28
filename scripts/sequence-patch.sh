@@ -324,6 +324,8 @@ if test -z "$CONFIG"; then
 			CONFIG=$machine-smp
 		elif test -e "config/$machine/pae"; then
 			CONFIG=$machine-pae
+		elif test -e "config/$machine/azure"; then
+			CONFIG=$machine-azure
 		elif test -e "config/$machine/default"; then
 			CONFIG=$machine-default
 		elif test -n "$VARIANT" -a -e "config/$machine/${VARIANT#-}"; then
@@ -618,7 +620,20 @@ fi
 
 if test -e supported.conf; then
     echo "[ Generating Module.supported ]"
-    scripts/guards base external < supported.conf > "$SP_BUILD_DIR/Module.supported"
+    scripts/guards --list --with-guards < supported.conf | \
+    awk '
+	    /\+external / {
+		    print $(NF) " external";
+		    next;
+	    }
+	    /^-/ {
+		    print $(NF) " no";
+		    next;
+	    }
+	    {
+		    print $(NF);
+	    }
+    ' > "$SP_BUILD_DIR/Module.supported"
 fi
 
 if test -n "$CONFIG"; then
