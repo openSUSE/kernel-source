@@ -566,28 +566,6 @@ class SortIndex(object):
         raise GSKeyError
 
 
-    def sort(self, mapping):
-        """
-        Returns an OrderedDict
-        result[Head][]
-            sorted values from the mapping which are found in Head
-        """
-        result = collections.OrderedDict([(head, [],) for head in self.history])
-        for commit in list(mapping.keys()):
-            try:
-                ic = self.lookup(commit)
-            except GSKeyError:
-                continue
-            else:
-                result[ic.head].append((ic.index, mapping.pop(commit),))
-
-        for head, entries in result.items():
-            entries.sort(key=operator.itemgetter(0))
-            result[head] = [e[1] for e in entries]
-
-        return result
-
-
     def describe(self, index):
         """
         index must come from the mainline head (remotes[0]).
