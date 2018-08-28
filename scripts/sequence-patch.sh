@@ -324,6 +324,8 @@ if test -z "$CONFIG"; then
 			CONFIG=$machine-smp
 		elif test -e "config/$machine/pae"; then
 			CONFIG=$machine-pae
+		elif test -e "config/$machine/azure"; then
+			CONFIG=$machine-azure
 		elif test -e "config/$machine/default"; then
 			CONFIG=$machine-default
 		elif test -n "$VARIANT" -a -e "config/$machine/${VARIANT#-}"; then
