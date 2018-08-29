@@ -2,12 +2,17 @@
 # -*- coding: utf-8 -*-
 
 import io
+import re
 import sys
 
 import exc
 
 
 class Patch(object):
+    # This pattern was copied from quilt/scripts/patchfns.in:patch_header() in
+    # the quilt sources
+    break_matcher = re.compile(b"(---|\*\*\*|Index:)[ \t][^ \t]|^diff -")
+
     def __init__(self, f):
         assert(f.tell() == 0)
         assert(isinstance(f, io.BufferedIOBase)) # binary (bytes) io object
@@ -17,9 +22,7 @@ class Patch(object):
         self.head = []
         self.body = b""
         for line in f:
-            # These patterns were copied from
-            # quilt/scripts/patchfns.in:patch_header() in the quilt sources
-            if line.startswith((b"---", b"***", b"Index:", b"diff -",)):
+            if self.break_matcher.match(line):
                 self.body = line
                 break
             self.head.append(line.decode())

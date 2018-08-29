@@ -10,7 +10,14 @@ if [ $(docker image ls -q benjamin_poirier/docker_images/sle-12-sp2:latest | wc 
 		docker import - benjamin_poirier/docker_images/sle-12-sp2
 fi
 
-for release in sle12-sp2 sle12-sp3 opensuse-42.3 opensuse-tumbleweed; do
+for release in \
+	sle12-sp2 \
+	sle12-sp3 \
+	sle15 \
+	opensuse-42.3 \
+	opensuse-15.0 \
+	opensuse-tumbleweed \
+	; do
 	echo "Building container image for $release..."
 	docker build -q -t gs-test-$release "$libdir/$release"
 	echo "Running tests in $release:"
