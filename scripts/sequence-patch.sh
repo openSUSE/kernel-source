@@ -394,6 +394,7 @@ export TMPDIR
 ORIG_DIR=$SCRATCH_AREA/linux-$SRCVERSION.orig
 TAG=$(get_branch_name)
 TAG=${TAG//\//_}
+TAG=${TAG//\#/_}
 if $VANILLA; then
 	TAG=${TAG}-vanilla
 fi
