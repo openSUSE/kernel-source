@@ -270,6 +270,17 @@ conflict can be solved automatically using the git mergetool interface with
 the script merge_tool.py. Please see the header of that file for installation
 instructions.
 
+When using the merge tool, the LINUX_GIT reference repository must fetch from
+the repositories which are the upstream source of patches which were added in
+the remote branch of the merge (the `<commit>` argument to `git merge`) or
+which are in different subsystem maintainer sections between the local and
+remote revisions. A simple way to satisfy that condition is to fetch from all
+remotes configured for git-sort before doing a merge resolution. The script
+`scripts/git_sort/update_clone.py` can be used to create or update the
+configuration of a repository so that it contains all of the remotes
+configured for git-sort. Please see the help message of that script for more
+information.
+
 As an example, the merge in kernel-source commit da87d04b3b needed conflict
 resolution. Let's redo this resolution using merge_tool:
 ```
