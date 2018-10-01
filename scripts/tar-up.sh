@@ -198,7 +198,7 @@ CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
 cp -p rpm/* config.conf supported.conf doc/* $build_dir
 match="${flavor:+\\/$flavor$}"
-match="${arch:+^+${arch}${match:+.*}}${match}"
+match="${arch:+^+\\($(echo -n "${arch}" | sed 's/[, ]\+/\\\|/g')\\)\\>${match:+.*}}${match}"
 [ -n "$match" ] && sed -i "/^$\|\s*#\|${match}/b; s/\(.*\)/#### \1/" $build_dir/config.conf
 if test -e misc/extract-modaliases; then
 	cp misc/extract-modaliases $build_dir
