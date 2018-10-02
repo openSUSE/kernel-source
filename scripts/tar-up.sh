@@ -198,7 +198,7 @@ CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
 cp -p rpm/* config.conf supported.conf doc/* $build_dir
 match="${flavor:+\\/$flavor$}"
-match="${arch:+^+${arch}${match:+.*}}${match}"
+match="${arch:+^+\\($(echo -n "${arch}" | sed 's/[, ]\+/\\\|/g')\\)\\>${match:+.*}}${match}"
 [ -n "$match" ] && sed -i "/^$\|\s*#\|${match}/b; s/\(.*\)/#### \1/" $build_dir/config.conf
 if test -e misc/extract-modaliases; then
 	cp misc/extract-modaliases $build_dir
@@ -207,7 +207,7 @@ fi
 if grep -q '^Source.*:[[:space:]]*log\.sh[[:space:]]*$' rpm/kernel-source.spec.in; then
 	cp -p scripts/rpm-log.sh "$build_dir"/log.sh
 fi
-rm -f "$build_dir/kernel-source.changes.old" "$build_dir/gitlog-fixups"
+rm -f "$build_dir/kernel-source.changes.old" "$build_dir/gitlog-fixups" "$build_dir/gitlog-excludes"
 if test -e "$build_dir"/config-options.changes; then
 	# Rename to  avoid triggering a build service rule error
 	mv "$build_dir"/config-options.changes \
@@ -243,7 +243,7 @@ elif $using_git; then
         echo "expected \"last commit: <commit>\" in rpm/kernel-source.changes.old" >&2
         exit 1
     esac
-    if test -d rpm/gitlog-excludes; then
+    if test -e rpm/gitlog-excludes; then
 	exclude=(--excludes "$_" "${exclude[@]}")
     fi
     if test -e rpm/gitlog-fixups; then
