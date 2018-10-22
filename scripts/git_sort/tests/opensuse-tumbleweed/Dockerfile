@@ -1,5 +1,5 @@
-# https://store.docker.com/images/opensuse
-FROM opensuse:tumbleweed AS base
+# https://hub.docker.com/r/opensuse/tumbleweed/
+FROM opensuse/tumbleweed AS base
 
 RUN zypper -n ref
 

@@ -107,7 +107,7 @@ if __name__ == "__main__":
         os.chdir(cwd)
 
         print("Info: using references \"%s\" from patch \"%s\" which contains "
-              "commit %s." % (references, name, fixes[:12]), file=sys.stderr)
+              "commit %s." % (references, name, fixes[:12]))
     else:
         destination = args.destination
         references = args.references
