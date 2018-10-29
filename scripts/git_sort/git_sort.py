@@ -441,7 +441,7 @@ class Cache(object):
             # This detailed check may be needed if an older git-sort (which
             # didn't set a cache version) modified the cache.
             if (not isinstance(cache_history, list) or
-                len(cache_history) < 1 or 
+                len(cache_history) < 1 or
                 len(cache_history[0]) != 4 or
                 not isinstance(cache_history[0][3], dict)):
                 raise CInconsistent
