@@ -188,6 +188,7 @@ remotes = (
     Head(RepoURL("tj/libata.git"), "for-next"),
     Head(RepoURL("https://github.com/kdave/btrfs-devel.git"), "misc-next"),
     Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
+    Head(RepoURL("git://anongit.freedesktop.org/drm/drm-misc"), "drm-misc-next"),
     Head(RepoURL("gregkh/tty.git"), "tty-next"),
     Head(RepoURL("jj/linux-apparmor.git"), "apparmor-next"),
     Head(RepoURL("pablo/nf.git")),
@@ -441,7 +442,7 @@ class Cache(object):
             # This detailed check may be needed if an older git-sort (which
             # didn't set a cache version) modified the cache.
             if (not isinstance(cache_history, list) or
-                len(cache_history) < 1 or 
+                len(cache_history) < 1 or
                 len(cache_history[0]) != 4 or
                 not isinstance(cache_history[0][3], dict)):
                 raise CInconsistent
