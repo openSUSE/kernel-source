@@ -24,6 +24,12 @@
 # dirty scroll region tricks ...
 
 use_region=false
+if test -f scripts/kconfig/Makefile && \
+   grep -q syncconfig scripts/kconfig/Makefile; then
+    syncconfig="syncconfig"
+else
+    syncconfig="silentoldconfig"
+fi
 
 function _region_init_ () {
     echo -ne '\x1b[H\033[J'	# clear screen
@@ -456,7 +462,7 @@ for config in $config_files; do
     *)
 	_region_msg_ "working on $config"
         if $check; then
-            if ! make $MAKE_ARGS silentoldconfig </dev/null; then
+            if ! make $MAKE_ARGS $syncconfig </dev/null; then
                 echo "${config#$prefix} is out of date"
                 err=1
                 rm $config_orig
