@@ -394,6 +394,7 @@ export TMPDIR
 ORIG_DIR=$SCRATCH_AREA/linux-$SRCVERSION.orig
 TAG=$(get_branch_name)
 TAG=${TAG//\//_}
+TAG=${TAG//\#/_}
 if $VANILLA; then
 	TAG=${TAG}-vanilla
 fi
@@ -666,8 +667,14 @@ if test -n "$CONFIG"; then
 	    echo "[ No kABI references for $CONFIG ]"
 	fi
     fi
+    if test -f ${PATCH_DIR}/scripts/kconfig/Makefile && \
+       grep -q syncconfig ${PATCH_DIR}/scripts/kconfig/Makefile; then
+        syncconfig="syncconfig"
+    else
+        syncconfig="silentoldconfig"
+    fi
     test "$SP_BUILD_DIR" != "$PATCH_DIR" && \
-	make -C $PATCH_DIR O=$SP_BUILD_DIR -s silentoldconfig
+	make -C $PATCH_DIR O=$SP_BUILD_DIR -s $syncconfig
 fi
 
 # Some archs we use for the config do not exist or have a different name in the
