@@ -1,0 +1,187 @@
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 17 Oct 2018 13:07:05 +0200
+Subject: [PATCH] fsnotify: Fix busy inodes during unmount
+References: bnc#1012628
+Patch-mainline: 4.19.2
+Git-commit: 721fb6fbfd2132164c2e8777cc837f9b2c1794dc
+
+commit 721fb6fbfd2132164c2e8777cc837f9b2c1794dc upstream.
+
+Detaching of mark connector from fsnotify_put_mark() can race with
+unmounting of the filesystem like:
+
+  CPU1				CPU2
+fsnotify_put_mark()
+  spin_lock(&conn->lock);
+  ...
+  inode = fsnotify_detach_connector_from_object(conn)
+  spin_unlock(&conn->lock);
+				generic_shutdown_super()
+				  fsnotify_unmount_inodes()
+				    sees connector detached for inode
+				      -> nothing to do
+				  evict_inode()
+				    barfs on pending inode reference
+  iput(inode);
+
+Resulting in "Busy inodes after unmount" message and possible kernel
+oops. Make fsnotify_unmount_inodes() properly wait for outstanding inode
+references from detached connectors.
+
+Note that the accounting of outstanding inode references in the
+superblock can cause some cacheline contention on the counter. OTOH it
+happens only during deletion of the last notification mark from an inode
+(or during unlinking of watched inode) and that is not too bad. I have
+measured time to create & delete inotify watch 100000 times from 64
+processes in parallel (each process having its own inotify group and its
+own file on a shared superblock) on a 64 CPU machine. Average and
+standard deviation of 15 runs look like:
+
+	Avg		Stddev
+Vanilla	9.817400	0.276165
+Fixed	9.710467	0.228294
+
+So there's no statistically significant difference.
+
+Fixes: 6b3f05d24d35 ("fsnotify: Detach mark from object list when last reference is dropped")
+CC: stable@vger.kernel.org
+Signed-off-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/notify/fsnotify.c |  3 +++
+ fs/notify/mark.c     | 39 +++++++++++++++++++++++++++++++--------
+ include/linux/fs.h   |  3 +++
+ 3 files changed, 37 insertions(+), 8 deletions(-)
+
+diff --git a/fs/notify/fsnotify.c b/fs/notify/fsnotify.c
+index ababdbfab537..f43ea1aad542 100644
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@ -96,6 +96,9 @@ void fsnotify_unmount_inodes(struct super_block *sb)
+ 
+ 	if (iput_inode)
+ 		iput(iput_inode);
++	/* Wait for outstanding inode references from connectors */
++	wait_var_event(&sb->s_fsnotify_inode_refs,
++		       !atomic_long_read(&sb->s_fsnotify_inode_refs));
+ }
+ 
+ /*
+diff --git a/fs/notify/mark.c b/fs/notify/mark.c
+index 59cdb27826de..09535f6423fc 100644
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@ -179,17 +179,20 @@ static void fsnotify_connector_destroy_workfn(struct work_struct *work)
+ 	}
+ }
+ 
+-static struct inode *fsnotify_detach_connector_from_object(
+-					struct fsnotify_mark_connector *conn)
++static void *fsnotify_detach_connector_from_object(
++					struct fsnotify_mark_connector *conn,
++					unsigned int *type)
+ {
+ 	struct inode *inode = NULL;
+ 
++	*type = conn->type;
+ 	if (conn->type == FSNOTIFY_OBJ_TYPE_DETACHED)
+ 		return NULL;
+ 
+ 	if (conn->type == FSNOTIFY_OBJ_TYPE_INODE) {
+ 		inode = fsnotify_conn_inode(conn);
+ 		inode->i_fsnotify_mask = 0;
++		atomic_long_inc(&inode->i_sb->s_fsnotify_inode_refs);
+ 	} else if (conn->type == FSNOTIFY_OBJ_TYPE_VFSMOUNT) {
+ 		fsnotify_conn_mount(conn)->mnt_fsnotify_mask = 0;
+ 	}
+@@ -211,10 +214,29 @@ static void fsnotify_final_mark_destroy(struct fsnotify_mark *mark)
+ 	fsnotify_put_group(group);
+ }
+ 
++/* Drop object reference originally held by a connector */
++static void fsnotify_drop_object(unsigned int type, void *objp)
++{
++	struct inode *inode;
++	struct super_block *sb;
++
++	if (!objp)
++		return;
++	/* Currently only inode references are passed to be dropped */
++	if (WARN_ON_ONCE(type != FSNOTIFY_OBJ_TYPE_INODE))
++		return;
++	inode = objp;
++	sb = inode->i_sb;
++	iput(inode);
++	if (atomic_long_dec_and_test(&sb->s_fsnotify_inode_refs))
++		wake_up_var(&sb->s_fsnotify_inode_refs);
++}
++
+ void fsnotify_put_mark(struct fsnotify_mark *mark)
+ {
+ 	struct fsnotify_mark_connector *conn;
+-	struct inode *inode = NULL;
++	void *objp = NULL;
++	unsigned int type = FSNOTIFY_OBJ_TYPE_DETACHED;
+ 	bool free_conn = false;
+ 
+ 	/* Catch marks that were actually never attached to object */
+@@ -234,7 +256,7 @@ void fsnotify_put_mark(struct fsnotify_mark *mark)
+ 	conn = mark->connector;
+ 	hlist_del_init_rcu(&mark->obj_list);
+ 	if (hlist_empty(&conn->list)) {
+-		inode = fsnotify_detach_connector_from_object(conn);
++		objp = fsnotify_detach_connector_from_object(conn, &type);
+ 		free_conn = true;
+ 	} else {
+ 		__fsnotify_recalc_mask(conn);
+@@ -242,7 +264,7 @@ void fsnotify_put_mark(struct fsnotify_mark *mark)
+ 	mark->connector = NULL;
+ 	spin_unlock(&conn->lock);
+ 
+-	iput(inode);
++	fsnotify_drop_object(type, objp);
+ 
+ 	if (free_conn) {
+ 		spin_lock(&destroy_lock);
+@@ -709,7 +731,8 @@ void fsnotify_destroy_marks(fsnotify_connp_t *connp)
+ {
+ 	struct fsnotify_mark_connector *conn;
+ 	struct fsnotify_mark *mark, *old_mark = NULL;
+-	struct inode *inode;
++	void *objp;
++	unsigned int type;
+ 
+ 	conn = fsnotify_grab_connector(connp);
+ 	if (!conn)
+@@ -735,11 +758,11 @@ void fsnotify_destroy_marks(fsnotify_connp_t *connp)
+ 	 * mark references get dropped. It would lead to strange results such
+ 	 * as delaying inode deletion or blocking unmount.
+ 	 */
+-	inode = fsnotify_detach_connector_from_object(conn);
++	objp = fsnotify_detach_connector_from_object(conn, &type);
+ 	spin_unlock(&conn->lock);
+ 	if (old_mark)
+ 		fsnotify_put_mark(old_mark);
+-	iput(inode);
++	fsnotify_drop_object(type, objp);
+ }
+ 
+ /*
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 897eae8faee1..7b6084854bfe 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1428,6 +1428,9 @@ struct super_block {
+ 	/* Number of inodes with nlink == 0 but still referenced */
+ 	atomic_long_t s_remove_count;
+ 
++	/* Pending fsnotify inode refs */
++	atomic_long_t s_fsnotify_inode_refs;
++
+ 	/* Being remounted read-only */
+ 	int s_readonly_remount;
+ 
+-- 
+2.19.1
+
