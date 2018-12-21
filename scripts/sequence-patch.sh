@@ -38,7 +38,7 @@ esac
 usage() {
     cat <<END
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
-          [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
+          [--fast] [--rapid] [last-patch-name] [--vanilla] [--fuzz=NUM]
           [--patch-dir=PATH] [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]]
           [--ctags] [--cscope] [--etags] [--skip-reverse]
 
@@ -65,10 +65,20 @@ SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
   of the component patches fail to apply the tree will not be rolled
   back.
 
+  The --rapid option will use rapidquilt to apply patches.
+
   When used with last-patch-name, both --fast and --no-quilt
   will set up a quilt environment for the remaining patches.
 END
     exit 1
+}
+
+apply_rapid_patches() {
+    printf "%s\n" ${PATCHES_BEFORE[@]} >> $PATCH_DIR/series
+    rapidquilt push -a -d $PATCH_DIR -p $PWD $fuzz
+    status=$?
+
+    PATCHES=( ${PATCHES_AFTER[@]} )
 }
 
 apply_fast_patches() {
@@ -200,7 +210,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,etags,skip-reverse -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,rapid,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,etags,skip-reverse -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -213,6 +223,7 @@ QUIET=1
 EXTRA_SYMBOLS=
 QUILT=true
 FAST=
+RAPID=
 VANILLA=false
 SP_BUILD_DIR=
 CONFIG=
@@ -243,6 +254,9 @@ while true; do
 	    ;;
        	--fast)
 	    FAST=1
+	    ;;
+	--rapid)
+	    RAPID=1
 	    ;;
 	--arch)
 	    export PATCH_ARCH=$2
@@ -566,10 +580,12 @@ fi
 mkdir $PATCH_DIR/.pc
 echo 2 > $PATCH_DIR/.pc/.version
 
-if [ -z "$FAST" ]; then
-    apply_patches
-else
+if [ -n "$FAST" ]; then
     apply_fast_patches
+elif [ -n "$RAPID" ]; then
+    apply_rapid_patches
+else
+    apply_patches
 fi
 
 if [ -n "$EXTRA_SYMBOLS" ]; then
