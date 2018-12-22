@@ -160,8 +160,33 @@ ben@f1:~/local/src/kernel-source$ ./scripts/log
 
 Example workflow to backport a series of commits using kernel-source.git
 ========================================================================
-Refer to the section "Generate the list of commit ids to backport" to generate
-the primary list of commits to backport, /tmp/list
+Generate the list of commit ids to backport:
+```
+upstream$ git log --no-merges --topo-order --reverse --pretty=tformat:%H v3.12.6.. -- drivers/net/ethernet/emulex/benet/ > /tmp/output
+```
+
+Optionally, generate a description of the commits to backport.
+```
+upstream$ cat /tmp/output | xargs -n1 git log -n1 --oneline > /tmp/list
+```
+
+Optionally, check if commits in the list are referenced in the logs of later
+commits which are not in the list themselves. You may wish to review these
+later commits and add them to the list.
+```
+upstream$ cat /tmp/list | check_missing_fixes.sh
+```
+
+Optionally, check which commits in the list have already been applied to
+kernel-source.git. Afterwards, you may wish to regenerate the list of commit
+ids with a different starting point; or remove from series.conf the commits
+that have already been applied and cherry-pick them again during the backport;
+or skip them during the backport.
+
+```
+# note that the path is a pattern, not just a base directory
+kernel-source$ cat /tmp/list | refs_in_series.sh "drivers/net/ethernet/emulex/benet/*"
+```
 
 Generate the work tree with patches applied up to the first patch in the
 list of commits to backport:
@@ -334,145 +359,4 @@ Untracked files:
         series.conf.orig
 
 ben@f1:~/local/src/kernel-source$ git commit
-```
-
-Example workflow to backport a series of commits using kernel.git
-=================================================================
-The following instructions detail an older approach, before series.conf was
-sorted. The instructions may still be relevant to die hard users of
-kernel.git but the resulting series.conf will need to be reordered, which may
-create some context conflicts.
-
-Obtain a patch set
-------------------
-### Option 1) Patch files from an external source
-When the patches come from vendors and have uncertain content: run a first
-pass of clean_patch.sh.
-```
-patches$ for file in *; do echo $file; clean_header.sh -r "bnc#790588 FATE#313912" $file; done
-```
-
-Although not mandatory, this step gives an idea of what condition the patch
-set is in to begin with. If this step succeeds, we will be able to have nice
-tags at the end.
-
-#### Import the patch set into kernel.git
-Import the patch set into kernel.git to make sure that it applies, compiles
-and works. The custom SUSE tags (Patch-mainline, ...) will be lost in the
-process. Before doing `git am`, run armor_origin.sh which transforms the
-"Git-commit" tag into a "(cherry picked from ...)" line.
-```
-patches$ for file in *; do echo $file; armor_origin.sh $file; done
-kernel$ git am /tmp/patches/cleaned/*
-```
-
-Use `git rebase -i` to add missing commits where they belong or generally fixup
-what needs to be.
-
-```
-kernel$ git format-patch -o /tmp/patches/sp3 origin/SLE11-SP3..
-```
-
-### Option 2) Commits from a git repository
-As an alternative to the previous steps, use this procedure when there is no
-patch set that comes from the vendor and it is instead us who are doing the
-backport.
-
-#### Generate the list of commit ids to backport
-```
-upstream$ git log --no-merges --topo-order --reverse --pretty=tformat:%H v3.12.6.. -- drivers/net/ethernet/emulex/benet/ > /tmp/output
-```
-
-Optionally, generate a description of the commits to backport.
-```
-upstream$ cat /tmp/output | xargs -n1 git log -n1 --oneline > /tmp/list
-```
-
-Optionally, check if commits in the list are referenced in the logs of later
-commits which are not in the list themselves. You may wish to review these
-later commits and add them to the list.
-```
-upstream$ cat /tmp/list | check_missing_fixes.sh
-```
-
-Optionally, check which commits in the list have already been applied to
-kernel-source.git. Afterwards, you may wish to regenerate the list of commit
-ids with a different starting point; or remove from series.conf the commits
-that have already been applied and cherry-pick them again during the backport;
-or skip them during the backport.
-
-```
-# note that the path is a pattern, not just a base directory
-kernel-source$ cat /tmp/list | refs_in_series.sh "drivers/net/ethernet/emulex/benet/*"
-```
-
-#### Cherry-pick each desired commit to kernel.git
-```
-kernel$ . ../kernel-source/scripts/git_sort/backport-mode.sh
-# note that the pattern is quoted
-kernel$ bpset -s -p ../kernel-source/ -a /tmp/list_series -c /tmp/list2 "drivers/net/ethernet/emulex/benet/*"
-```
-
-Examine the next commit using the following commands
-```
-bpref
-bpnext
-bpstat
-```
-Apply the next commit completely
-```
-bpcherry-pick-all
-bpcp
-```
-
-Apply a subset of the next commit. The changes under the path specified to
-bpset are included, more can optionally be specified.
-```
-bpcherry-pick-include <path>
-bpcpi
-```
-
-After applying a commit, you may have to fix conflicts manually. Moreover,
-it's a good thing to check that the result builds. Sometimes the driver commit
-depends on a core change. In that case, the core change can be cherry-picked
-and moved just before the current commit using git rebase -i.
-
-Alternatively, instead of applying the next commit, skip it
-```
-bpskip
-```
-
-There is a command to automate the above steps. It applies the next commit and
-checks that the result builds, for all remaining commits that were fed to
-`bpset`, one commit at a time. The command stops when there are problems.
-After manually fixing the problems, the command can be run again to resume
-where it stopped. To speed things up, `make` is called with a target
-directory, which is the argument.
-```
-bpdoit drivers/net/ethernet/emulex/benet/
-
-kernel$ git format-patch -o /tmp/patches/sp3 ccdc24086d54
-```
-
-Import the patch set into kernel-source.git
--------------------------------------------
-Check series.conf to find where the patch set will go and note the last patch
-before that (ex:
-"patches.drivers/IB-0004-mlx4-Configure-extended-active-speeds.patch") and the
-next patch after that (ex: "patches.drivers/iwlwifi-sp1-compatible-options").
-```
-kernel-source$ ./scripts/sequence-patch.sh patches.drivers/IB-0004-mlx4-Configure-extended-active-speeds.patch
-kernel-source$ cd tmp/current
-kernel-source/tmp/current$ quilt import /tmp/patches/sp3/*
-kernel-source/tmp/current$ while ! ( quilt next | grep -q iwlwifi-sp1-compatible-options) &&
-	ksapply.sh -R "bnc#790588 FATE#313912" -s suse.com patches.drivers/; do true; done
-kernel-source/tmp/current$ cd ../../
-```
-
-Copy the new entries to their desired location in series.conf
-```
-kernel-source/tmp/current$ vi -p series.conf tmp/current/series
-
-kernel-source$ git add -A
-kernel-source$ scripts/log
 ```
