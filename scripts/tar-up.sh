@@ -195,8 +195,9 @@ CLEANFILES=()
 trap 'if test -n "$CLEANFILES"; then rm -rf "${CLEANFILES[@]}"; fi' EXIT
 tmpdir=$(mktemp -dt ${0##*/}.XXXXXX)
 CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
+rpmfiles=$(echo rpm/* | grep -v "~$")
 
-cp -p rpm/* config.conf supported.conf doc/* $build_dir
+cp -p $rpmfiles config.conf supported.conf doc/* $build_dir
 match="${flavor:+\\/$flavor$}"
 match="${arch:+^+\\($(echo -n "${arch}" | sed 's/[, ]\+/\\\|/g')\\)\\>${match:+.*}}${match}"
 [ -n "$match" ] && sed -i "/^$\|\s*#\|${match}/b; s/\(.*\)/#### \1/" $build_dir/config.conf
