@@ -214,6 +214,7 @@ remotes = (
     Head(RepoURL("horms/ipvs-next.git")),
     Head(RepoURL("klassert/ipsec.git")),
     Head(RepoURL("klassert/ipsec-next.git")),
+    Head(RepoURL("kvalo/wireless-drivers-next.git")),
     Head(RepoURL("mkp/scsi.git"), "4.19/scsi-queue"),
     Head(RepoURL("mkp/scsi.git"), "5.0/scsi-fixes"),
     Head(RepoURL("mkp/scsi.git"), "queue"),
