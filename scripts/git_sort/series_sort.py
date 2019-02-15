@@ -67,22 +67,31 @@ if __name__ == "__main__":
                         "as appropriate. Default: false.")
     parser.add_argument("series", nargs="?", metavar="series.conf",
                         help="series.conf file which will be modified in "
-                        "place. Default: read input from stdin.")
+                        "place. Default: if stdin is a terminal, "
+                        "\"series.conf\"; otherwise, read input from stdin.")
     args = parser.parse_args()
 
     repo_path = lib.repo_path()
     repo = pygit2.Repository(repo_path)
     index = git_sort.SortIndex(repo)
 
-    if args.series is not None:
+    filter_mode = False
+    if args.series is None:
+        if sys.stdin.isatty():
+            path = "series.conf"
+        else:
+            filter_mode = True
+    else:
+        path = args.series
+    if filter_mode:
+        f = sys.stdin
+    else:
         try:
-            f = open(args.series)
+            f = open(path)
         except FileNotFoundError as err:
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
-        series = os.path.abspath(args.series)
-    else:
-        f = sys.stdin
+        series_path = os.path.abspath(path)
     lines = f.readlines()
 
     if args.prefix is not None:
@@ -91,7 +100,7 @@ if __name__ == "__main__":
     try:
         before, inside, after = series_conf.split(lines)
     except exc.KSNotFound as err:
-        if args.series is None:
+        if filter_mode:
             before = []
             inside = lines
             after = []
@@ -137,10 +146,10 @@ if __name__ == "__main__":
             after,
         ])
 
-        if args.series is not None:
-            f = open(series, mode="w")
-        else:
+        if filter_mode:
             f = sys.stdout
+        else:
+            f = open(series_path, mode="w")
         f.writelines(output)
         try:
             lib.update_tags(index, to_update)

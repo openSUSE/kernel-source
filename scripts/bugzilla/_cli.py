@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 #
 # bugzilla - a commandline frontend for the python bugzilla module
 #
