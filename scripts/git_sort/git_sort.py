@@ -278,6 +278,7 @@ def get_heads(repo):
         result = collections.OrderedDict(
             [(Head(RepoURL(None), "HEAD"),
               str(repo.revparse_single("HEAD").id),)])
+        print("WARNING: Did not find %s in LINUX_GIT remotes." % remotes[0].repo_url.url)
 
     return result
 
