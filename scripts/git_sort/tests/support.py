@@ -3,7 +3,8 @@
 
 import datetime
 import os.path
-import pygit2
+
+import pygit2_wrapper as pygit2
 
 
 # from http://www.pygit2.org/recipes/git-show.html

@@ -22,11 +22,12 @@ import argparse
 import io
 import os
 import os.path
-import pygit2
 import shutil
 import subprocess
 import sys
 import tempfile
+
+import pygit2_wrapper as pygit2
 
 import exc
 import lib

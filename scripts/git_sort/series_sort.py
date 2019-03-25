@@ -37,14 +37,7 @@ import argparse
 import os
 import sys
 
-try:
-    import pygit2
-except ImportError as err:
-    print("Error: %s" % (err,), file=sys.stderr)
-    print("Please install the \"pygit2\" python3 module. For more details, "
-          "please refer to the \"Installation Requirements\" section of "
-          "\"scripts/git_sort/README.md\".", file=sys.stderr)
-    sys.exit(1)
+import pygit2_wrapper as pygit2
 
 import exc
 import git_sort

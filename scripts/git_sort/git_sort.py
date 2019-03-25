@@ -27,12 +27,13 @@ import operator
 import os
 import os.path
 import pprint
-import pygit2
 import re
 import shelve
 import subprocess
 import sys
 import types
+
+import pygit2_wrapper as pygit2
 
 
 class GSException(BaseException):

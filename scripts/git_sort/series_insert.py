@@ -25,8 +25,9 @@ commits that the patches backport.
 
 import argparse
 import collections
-import pygit2
 import sys
+
+import pygit2_wrapper as pygit2
 
 import exc
 import git_sort
