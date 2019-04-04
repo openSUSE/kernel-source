@@ -1,0 +1,163 @@
+From: Sean Christopherson <sean.j.christopherson@intel.com>
+Date: Mon, 11 Mar 2019 20:01:05 -0700
+Subject: [PATCH] KVM: x86: update %rip after emulating IO
+References: bnc#1012628
+Patch-mainline: 5.0.6
+Git-commit: 45def77ebf79e2e8942b89ed79294d97ce914fa0
+
+commit 45def77ebf79e2e8942b89ed79294d97ce914fa0 upstream.
+
+Most (all?) x86 platforms provide a port IO based reset mechanism, e.g.
+OUT 92h or CF9h.  Userspace may emulate said mechanism, i.e. reset a
+vCPU in response to KVM_EXIT_IO, without explicitly announcing to KVM
+that it is doing a reset, e.g. Qemu jams vCPU state and resumes running.
+
+To avoid corruping %rip after such a reset, commit 0967b7bf1c22 ("KVM:
+Skip pio instruction when it is emulated, not executed") changed the
+behavior of PIO handlers, i.e. today's "fast" PIO handling to skip the
+instruction prior to exiting to userspace.  Full emulation doesn't need
+such tricks becase re-emulating the instruction will naturally handle
+%rip being changed to point at the reset vector.
+
+Updating %rip prior to executing to userspace has several drawbacks:
+
+  - Userspace sees the wrong %rip on the exit, e.g. if PIO emulation
+    fails it will likely yell about the wrong address.
+  - Single step exits to userspace for are effectively dropped as
+    KVM_EXIT_DEBUG is overwritten with KVM_EXIT_IO.
+  - Behavior of PIO emulation is different depending on whether it
+    goes down the fast path or the slow path.
+
+Rather than skip the PIO instruction before exiting to userspace,
+snapshot the linear %rip and cancel PIO completion if the current
+value does not match the snapshot.  For a 64-bit vCPU, i.e. the most
+common scenario, the snapshot and comparison has negligible overhead
+as VMCS.GUEST_RIP will be cached regardless, i.e. there is no extra
+VMREAD in this case.
+
+All other alternatives to snapshotting the linear %rip that don't
+rely on an explicit reset announcenment suffer from one corner case
+or another.  For example, canceling PIO completion on any write to
+%rip fails if userspace does a save/restore of %rip, and attempting to
+avoid that issue by canceling PIO only if %rip changed then fails if PIO
+collides with the reset %rip.  Attempting to zero in on the exact reset
+vector won't work for APs, which means adding more hooks such as the
+vCPU's MP_STATE, and so on and so forth.
+
+Checking for a linear %rip match technically suffers from corner cases,
+e.g. userspace could theoretically rewrite the underlying code page and
+expect a different instruction to execute, or the guest hardcodes a PIO
+reset at 0xfffffff0, but those are far, far outside of what can be
+considered normal operation.
+
+Fixes: 432baf60eee3 ("KVM: VMX: use kvm_fast_pio_in for handling IN I/O")
+Cc: <stable@vger.kernel.org>
+Reported-by: Jim Mattson <jmattson@google.com>
+Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ arch/x86/include/asm/kvm_host.h |  1 +
+ arch/x86/kvm/x86.c              | 36 ++++++++++++++++++++++++---------
+ 2 files changed, 27 insertions(+), 10 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index b37a7282fb72..71d763ad2637 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -352,6 +352,7 @@ struct kvm_mmu_page {
+ };
+ 
+ struct kvm_pio_request {
++	unsigned long linear_rip;
+ 	unsigned long count;
+ 	int in;
+ 	int port;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index a1cb9052f23a..7ee802a92bc8 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6533,14 +6533,27 @@ int kvm_emulate_instruction_from_buffer(struct kvm_vcpu *vcpu,
+ }
+ EXPORT_SYMBOL_GPL(kvm_emulate_instruction_from_buffer);
+ 
++static int complete_fast_pio_out(struct kvm_vcpu *vcpu)
++{
++	vcpu->arch.pio.count = 0;
++
++	if (unlikely(!kvm_is_linear_rip(vcpu, vcpu->arch.pio.linear_rip)))
++		return 1;
++
++	return kvm_skip_emulated_instruction(vcpu);
++}
++
+ static int kvm_fast_pio_out(struct kvm_vcpu *vcpu, int size,
+ 			    unsigned short port)
+ {
+ 	unsigned long val = kvm_register_read(vcpu, VCPU_REGS_RAX);
+ 	int ret = emulator_pio_out_emulated(&vcpu->arch.emulate_ctxt,
+ 					    size, port, &val, 1);
+-	/* do not return to emulator after return from userspace */
+-	vcpu->arch.pio.count = 0;
++
++	if (!ret) {
++		vcpu->arch.pio.linear_rip = kvm_get_linear_rip(vcpu);
++		vcpu->arch.complete_userspace_io = complete_fast_pio_out;
++	}
+ 	return ret;
+ }
+ 
+@@ -6551,6 +6564,11 @@ static int complete_fast_pio_in(struct kvm_vcpu *vcpu)
+ 	/* We should only ever be called with arch.pio.count equal to 1 */
+ 	BUG_ON(vcpu->arch.pio.count != 1);
+ 
++	if (unlikely(!kvm_is_linear_rip(vcpu, vcpu->arch.pio.linear_rip))) {
++		vcpu->arch.pio.count = 0;
++		return 1;
++	}
++
+ 	/* For size less than 4 we merge, else we zero extend */
+ 	val = (vcpu->arch.pio.size < 4) ? kvm_register_read(vcpu, VCPU_REGS_RAX)
+ 					: 0;
+@@ -6563,7 +6581,7 @@ static int complete_fast_pio_in(struct kvm_vcpu *vcpu)
+ 				 vcpu->arch.pio.port, &val, 1);
+ 	kvm_register_write(vcpu, VCPU_REGS_RAX, val);
+ 
+-	return 1;
++	return kvm_skip_emulated_instruction(vcpu);
+ }
+ 
+ static int kvm_fast_pio_in(struct kvm_vcpu *vcpu, int size,
+@@ -6582,6 +6600,7 @@ static int kvm_fast_pio_in(struct kvm_vcpu *vcpu, int size,
+ 		return ret;
+ 	}
+ 
++	vcpu->arch.pio.linear_rip = kvm_get_linear_rip(vcpu);
+ 	vcpu->arch.complete_userspace_io = complete_fast_pio_in;
+ 
+ 	return 0;
+@@ -6589,16 +6608,13 @@ static int kvm_fast_pio_in(struct kvm_vcpu *vcpu, int size,
+ 
+ int kvm_fast_pio(struct kvm_vcpu *vcpu, int size, unsigned short port, int in)
+ {
+-	int ret = kvm_skip_emulated_instruction(vcpu);
++	int ret;
+ 
+-	/*
+-	 * TODO: we might be squashing a KVM_GUESTDBG_SINGLESTEP-triggered
+-	 * KVM_EXIT_DEBUG here.
+-	 */
+ 	if (in)
+-		return kvm_fast_pio_in(vcpu, size, port) && ret;
++		ret = kvm_fast_pio_in(vcpu, size, port);
+ 	else
+-		return kvm_fast_pio_out(vcpu, size, port) && ret;
++		ret = kvm_fast_pio_out(vcpu, size, port);
++	return ret && kvm_skip_emulated_instruction(vcpu);
+ }
+ EXPORT_SYMBOL_GPL(kvm_fast_pio);
+ 
+-- 
+2.21.0
+
