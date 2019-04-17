@@ -1,0 +1,130 @@
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Wed, 3 Apr 2019 12:23:11 -0400
+Subject: [PATCH] dm: disable DISCARD if the underlying storage no longer
+ supports it
+References: bnc#1012628
+Patch-mainline: 5.0.8
+Git-commit: bcb44433bba5eaff293888ef22ffa07f1f0347d6
+
+commit bcb44433bba5eaff293888ef22ffa07f1f0347d6 upstream.
+
+Storage devices which report supporting discard commands like
+WRITE_SAME_16 with unmap, but reject discard commands sent to the
+storage device.  This is a clear storage firmware bug but it doesn't
+change the fact that should a program cause discards to be sent to a
+multipath device layered on this buggy storage, all paths can end up
+failed at the same time from the discards, causing possible I/O loss.
+
+The first discard to a path will fail with Illegal Request, Invalid
+field in cdb, e.g.:
+ kernel: sd 8:0:8:19: [sdfn] tag#0 FAILED Result: hostbyte=DID_OK driverbyte=DRIVER_SENSE
+ kernel: sd 8:0:8:19: [sdfn] tag#0 Sense Key : Illegal Request [current]
+ kernel: sd 8:0:8:19: [sdfn] tag#0 Add. Sense: Invalid field in cdb
+ kernel: sd 8:0:8:19: [sdfn] tag#0 CDB: Write same(16) 93 08 00 00 00 00 00 a0 08 00 00 00 80 00 00 00
+ kernel: blk_update_request: critical target error, dev sdfn, sector 10487808
+
+The SCSI layer converts this to the BLK_STS_TARGET error number, the sd
+device disables its support for discard on this path, and because of the
+BLK_STS_TARGET error multipath fails the discard without failing any
+path or retrying down a different path.  But subsequent discards can
+cause path failures.  Any discards sent to the path which already failed
+a discard ends up failing with EIO from blk_cloned_rq_check_limits with
+an "over max size limit" error since the discard limit was set to 0 by
+the sd driver for the path.  As the error is EIO, this now fails the
+path and multipath tries to send the discard down the next path.  This
+cycle continues as discards are sent until all paths fail.
+
+Fix this by training DM core to disable DISCARD if the underlying
+storage already did so.
+
+Also, fix branching in dm_done() and clone_endio() to reflect the
+mutually exclussive nature of the IO operations in question.
+
+Cc: stable@vger.kernel.org
+Reported-by: David Jeffery <djeffery@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/md/dm-core.h |  1 +
+ drivers/md/dm-rq.c   | 11 +++++++----
+ drivers/md/dm.c      | 20 ++++++++++++++++----
+ 3 files changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/md/dm-core.h b/drivers/md/dm-core.h
+index 95c6d86ab5e8..c4ef1fceead6 100644
+--- a/drivers/md/dm-core.h
++++ b/drivers/md/dm-core.h
+@@ -115,6 +115,7 @@ struct mapped_device {
+ 	struct srcu_struct io_barrier;
+ };
+ 
++void disable_discard(struct mapped_device *md);
+ void disable_write_same(struct mapped_device *md);
+ void disable_write_zeroes(struct mapped_device *md);
+ 
+diff --git a/drivers/md/dm-rq.c b/drivers/md/dm-rq.c
+index a20531e5f3b4..582265e043a6 100644
+--- a/drivers/md/dm-rq.c
++++ b/drivers/md/dm-rq.c
+@@ -206,11 +206,14 @@ static void dm_done(struct request *clone, blk_status_t error, bool mapped)
+ 	}
+ 
+ 	if (unlikely(error == BLK_STS_TARGET)) {
+-		if (req_op(clone) == REQ_OP_WRITE_SAME &&
+-		    !clone->q->limits.max_write_same_sectors)
++		if (req_op(clone) == REQ_OP_DISCARD &&
++		    !clone->q->limits.max_discard_sectors)
++			disable_discard(tio->md);
++		else if (req_op(clone) == REQ_OP_WRITE_SAME &&
++			 !clone->q->limits.max_write_same_sectors)
+ 			disable_write_same(tio->md);
+-		if (req_op(clone) == REQ_OP_WRITE_ZEROES &&
+-		    !clone->q->limits.max_write_zeroes_sectors)
++		else if (req_op(clone) == REQ_OP_WRITE_ZEROES &&
++			 !clone->q->limits.max_write_zeroes_sectors)
+ 			disable_write_zeroes(tio->md);
+ 	}
+ 
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 7d54e660b4d1..4986eea520b6 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -963,6 +963,15 @@ static void dec_pending(struct dm_io *io, blk_status_t error)
+ 	}
+ }
+ 
++void disable_discard(struct mapped_device *md)
++{
++	struct queue_limits *limits = dm_get_queue_limits(md);
++
++	/* device doesn't really support DISCARD, disable it */
++	limits->max_discard_sectors = 0;
++	blk_queue_flag_clear(QUEUE_FLAG_DISCARD, md->queue);
++}
++
+ void disable_write_same(struct mapped_device *md)
+ {
+ 	struct queue_limits *limits = dm_get_queue_limits(md);
+@@ -988,11 +997,14 @@ static void clone_endio(struct bio *bio)
+ 	dm_endio_fn endio = tio->ti->type->end_io;
+ 
+ 	if (unlikely(error == BLK_STS_TARGET) && md->type != DM_TYPE_NVME_BIO_BASED) {
+-		if (bio_op(bio) == REQ_OP_WRITE_SAME &&
+-		    !bio->bi_disk->queue->limits.max_write_same_sectors)
++		if (bio_op(bio) == REQ_OP_DISCARD &&
++		    !bio->bi_disk->queue->limits.max_discard_sectors)
++			disable_discard(md);
++		else if (bio_op(bio) == REQ_OP_WRITE_SAME &&
++			 !bio->bi_disk->queue->limits.max_write_same_sectors)
+ 			disable_write_same(md);
+-		if (bio_op(bio) == REQ_OP_WRITE_ZEROES &&
+-		    !bio->bi_disk->queue->limits.max_write_zeroes_sectors)
++		else if (bio_op(bio) == REQ_OP_WRITE_ZEROES &&
++			 !bio->bi_disk->queue->limits.max_write_zeroes_sectors)
+ 			disable_write_zeroes(md);
+ 	}
+ 
+-- 
+2.21.0
+
