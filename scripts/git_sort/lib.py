@@ -22,11 +22,12 @@ import collections
 import operator
 import os
 import os.path
-import pygit2
 import re
 import signal
 import subprocess
 import sys
+
+import pygit2_wrapper as pygit2
 
 import exc
 import git_sort
@@ -418,6 +419,15 @@ def series_sort(index, entries):
         except AttributeError:
             # no entry.dest
             result[entry.dest_head].append(entry.value)
+
+    mainline = git_sort.remotes[0]
+    if mainline not in index.repo_heads:
+        raise exc.KSError(
+            "Did not find mainline information (ref \"%s\" from the repository "
+            "at \"%s\") in the repository at LINUX_GIT (\"%s\"). For more "
+            "information, please refer to the \"Configuration Requirements\" "
+            "section of \"scripts/git_sort/README.md\"." % (
+                mainline.rev, mainline.repo_url.url, index.repo.path,))
 
     for head in index.repo_heads:
         result[head] = flatten([

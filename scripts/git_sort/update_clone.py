@@ -20,9 +20,10 @@
 
 import argparse
 import collections
-import pygit2
 import re
 import shlex
+
+import pygit2_wrapper as pygit2
 
 import git_sort
 import lib

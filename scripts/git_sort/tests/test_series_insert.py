@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 
 import os
-import pygit2
 import shutil
 import subprocess
 import tempfile
 import unittest
 import sys
+
+import pygit2_wrapper as pygit2
 
 import git_sort
 import lib
