@@ -1,6 +1,6 @@
 FROM benjamin_poirier/docker_images/sle-12-sp2:latest AS base
 
-RUN zypper -n ref
+RUN zypper -n --no-gpg-checks ref
 
 FROM base AS packages
 

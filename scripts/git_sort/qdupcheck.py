@@ -21,9 +21,10 @@
 import argparse
 import os
 import os.path
-import pygit2
 import subprocess
 import sys
+
+import pygit2_wrapper as pygit2
 
 import exc
 import lib
