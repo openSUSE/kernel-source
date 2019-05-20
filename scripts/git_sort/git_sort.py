@@ -226,6 +226,7 @@ remotes = (
     Head(RepoURL("viro/vfs.git"), "for-linus"),
     Head(RepoURL("jeyu/linux.git"), "modules-next"),
     Head(RepoURL("nvdimm/nvdimm.git"), "libnvdimm-for-next"),
+    Head(RepoURL("herbert/crypto-2.6.git"), "master"),
 )
 
 
