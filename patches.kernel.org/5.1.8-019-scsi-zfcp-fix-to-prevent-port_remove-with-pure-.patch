@@ -1,0 +1,198 @@
+From: Steffen Maier <maier@linux.ibm.com>
+Date: Thu, 23 May 2019 15:23:46 +0200
+Subject: [PATCH] scsi: zfcp: fix to prevent port_remove with pure auto scan
+ LUNs (only sdevs)
+References: bnc#1012628
+Patch-mainline: 5.1.8
+Git-commit: ef4021fe5fd77ced0323cede27979d80a56211ca
+
+commit ef4021fe5fd77ced0323cede27979d80a56211ca upstream.
+
+When the user tries to remove a zfcp port via sysfs, we only rejected it if
+there are zfcp unit children under the port. With purely automatically
+scanned LUNs there are no zfcp units but only SCSI devices. In such cases,
+the port_remove erroneously continued. We close the port and this
+implicitly closes all LUNs under the port. The SCSI devices survive with
+their private zfcp_scsi_dev still holding a reference to the "removed"
+zfcp_port (still allocated but invisible in sysfs) [zfcp_get_port_by_wwpn
+in zfcp_scsi_slave_alloc]. This is not a problem as long as the fc_rport
+stays blocked. Once (auto) port scan brings back the removed port, we
+unblock its fc_rport again by design.  However, there is no mechanism that
+would recover (open) the LUNs under the port (no "ersfs_3" without
+zfcp_unit [zfcp_erp_strategy_followup_success]).  Any pending or new I/O to
+such LUN leads to repeated:
+
+  Done: NEEDS_RETRY Result: hostbyte=DID_IMM_RETRY driverbyte=DRIVER_OK
+
+See also v4.10 commit 6f2ce1c6af37 ("scsi: zfcp: fix rport unblock race
+with LUN recovery"). Even a manual LUN recovery
+(echo 0 > /sys/bus/scsi/devices/H:C:T:L/zfcp_failed)
+does not help, as the LUN links to the old "removed" port which remains
+to lack ZFCP_STATUS_COMMON_RUNNING [zfcp_erp_required_act].
+The only workaround is to first ensure that the fc_rport is blocked
+(e.g. port_remove again in case it was re-discovered by (auto) port scan),
+then delete the SCSI devices, and finally re-discover by (auto) port scan.
+The port scan includes an fc_rport unblock, which in turn triggers
+a new scan on the scsi target to freshly get new pure auto scan LUNs.
+
+Fix this by rejecting port_remove also if there are SCSI devices
+(even without any zfcp_unit) under this port. Re-use mechanics from v3.7
+commit d99b601b6338 ("[SCSI] zfcp: restore refcount check on port_remove").
+However, we have to give up zfcp_sysfs_port_units_mutex earlier in unit_add
+to prevent a deadlock with scsi_host scan taking shost->scan_mutex first
+and then zfcp_sysfs_port_units_mutex now in our zfcp_scsi_slave_alloc().
+
+Signed-off-by: Steffen Maier <maier@linux.ibm.com>
+Fixes: b62a8d9b45b9 ("[SCSI] zfcp: Use SCSI device data zfcp scsi dev instead of zfcp unit")
+Fixes: f8210e34887e ("[SCSI] zfcp: Allow midlayer to scan for LUNs when running in NPIV mode")
+Cc: <stable@vger.kernel.org> #2.6.37+
+Reviewed-by: Benjamin Block <bblock@linux.ibm.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/s390/scsi/zfcp_ext.h   |  1 +
+ drivers/s390/scsi/zfcp_scsi.c  |  9 ++++++
+ drivers/s390/scsi/zfcp_sysfs.c | 54 ++++++++++++++++++++++++++++++----
+ drivers/s390/scsi/zfcp_unit.c  |  8 ++++-
+ 4 files changed, 65 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/s390/scsi/zfcp_ext.h b/drivers/s390/scsi/zfcp_ext.h
+index c6acca521ffe..31e8a7240fd7 100644
+--- a/drivers/s390/scsi/zfcp_ext.h
++++ b/drivers/s390/scsi/zfcp_ext.h
+@@ -167,6 +167,7 @@ extern const struct attribute_group *zfcp_port_attr_groups[];
+ extern struct mutex zfcp_sysfs_port_units_mutex;
+ extern struct device_attribute *zfcp_sysfs_sdev_attrs[];
+ extern struct device_attribute *zfcp_sysfs_shost_attrs[];
++bool zfcp_sysfs_port_is_removing(const struct zfcp_port *const port);
+ 
+ /* zfcp_unit.c */
+ extern int zfcp_unit_add(struct zfcp_port *, u64);
+diff --git a/drivers/s390/scsi/zfcp_scsi.c b/drivers/s390/scsi/zfcp_scsi.c
+index 221d0dfb8493..e9ded2befa0d 100644
+--- a/drivers/s390/scsi/zfcp_scsi.c
++++ b/drivers/s390/scsi/zfcp_scsi.c
+@@ -129,6 +129,15 @@ static int zfcp_scsi_slave_alloc(struct scsi_device *sdev)
+ 
+ 	zfcp_sdev->erp_action.port = port;
+ 
++	mutex_lock(&zfcp_sysfs_port_units_mutex);
++	if (zfcp_sysfs_port_is_removing(port)) {
++		/* port is already gone */
++		mutex_unlock(&zfcp_sysfs_port_units_mutex);
++		put_device(&port->dev); /* undo zfcp_get_port_by_wwpn() */
++		return -ENXIO;
++	}
++	mutex_unlock(&zfcp_sysfs_port_units_mutex);
++
+ 	unit = zfcp_unit_find(port, zfcp_scsi_dev_lun(sdev));
+ 	if (unit)
+ 		put_device(&unit->dev);
+diff --git a/drivers/s390/scsi/zfcp_sysfs.c b/drivers/s390/scsi/zfcp_sysfs.c
+index 2d78732b270b..af197e2b3e69 100644
+--- a/drivers/s390/scsi/zfcp_sysfs.c
++++ b/drivers/s390/scsi/zfcp_sysfs.c
+@@ -235,6 +235,53 @@ static ZFCP_DEV_ATTR(adapter, port_rescan, S_IWUSR, NULL,
+ 
+ DEFINE_MUTEX(zfcp_sysfs_port_units_mutex);
+ 
++static void zfcp_sysfs_port_set_removing(struct zfcp_port *const port)
++{
++	lockdep_assert_held(&zfcp_sysfs_port_units_mutex);
++	atomic_set(&port->units, -1);
++}
++
++bool zfcp_sysfs_port_is_removing(const struct zfcp_port *const port)
++{
++	lockdep_assert_held(&zfcp_sysfs_port_units_mutex);
++	return atomic_read(&port->units) == -1;
++}
++
++static bool zfcp_sysfs_port_in_use(struct zfcp_port *const port)
++{
++	struct zfcp_adapter *const adapter = port->adapter;
++	unsigned long flags;
++	struct scsi_device *sdev;
++	bool in_use = true;
++
++	mutex_lock(&zfcp_sysfs_port_units_mutex);
++	if (atomic_read(&port->units) > 0)
++		goto unlock_port_units_mutex; /* zfcp_unit(s) under port */
++
++	spin_lock_irqsave(adapter->scsi_host->host_lock, flags);
++	__shost_for_each_device(sdev, adapter->scsi_host) {
++		const struct zfcp_scsi_dev *zsdev = sdev_to_zfcp(sdev);
++
++		if (sdev->sdev_state == SDEV_DEL ||
++		    sdev->sdev_state == SDEV_CANCEL)
++			continue;
++		if (zsdev->port != port)
++			continue;
++		/* alive scsi_device under port of interest */
++		goto unlock_host_lock;
++	}
++
++	/* port is about to be removed, so no more unit_add or slave_alloc */
++	zfcp_sysfs_port_set_removing(port);
++	in_use = false;
++
++unlock_host_lock:
++	spin_unlock_irqrestore(adapter->scsi_host->host_lock, flags);
++unlock_port_units_mutex:
++	mutex_unlock(&zfcp_sysfs_port_units_mutex);
++	return in_use;
++}
++
+ static ssize_t zfcp_sysfs_port_remove_store(struct device *dev,
+ 					    struct device_attribute *attr,
+ 					    const char *buf, size_t count)
+@@ -257,16 +304,11 @@ static ssize_t zfcp_sysfs_port_remove_store(struct device *dev,
+ 	else
+ 		retval = 0;
+ 
+-	mutex_lock(&zfcp_sysfs_port_units_mutex);
+-	if (atomic_read(&port->units) > 0) {
++	if (zfcp_sysfs_port_in_use(port)) {
+ 		retval = -EBUSY;
+-		mutex_unlock(&zfcp_sysfs_port_units_mutex);
+ 		put_device(&port->dev); /* undo zfcp_get_port_by_wwpn() */
+ 		goto out;
+ 	}
+-	/* port is about to be removed, so no more unit_add */
+-	atomic_set(&port->units, -1);
+-	mutex_unlock(&zfcp_sysfs_port_units_mutex);
+ 
+ 	write_lock_irq(&adapter->port_list_lock);
+ 	list_del(&port->list);
+diff --git a/drivers/s390/scsi/zfcp_unit.c b/drivers/s390/scsi/zfcp_unit.c
+index 1bf0a0984a09..e67bf7388cae 100644
+--- a/drivers/s390/scsi/zfcp_unit.c
++++ b/drivers/s390/scsi/zfcp_unit.c
+@@ -124,7 +124,7 @@ int zfcp_unit_add(struct zfcp_port *port, u64 fcp_lun)
+ 	int retval = 0;
+ 
+ 	mutex_lock(&zfcp_sysfs_port_units_mutex);
+-	if (atomic_read(&port->units) == -1) {
++	if (zfcp_sysfs_port_is_removing(port)) {
+ 		/* port is already gone */
+ 		retval = -ENODEV;
+ 		goto out;
+@@ -168,8 +168,14 @@ int zfcp_unit_add(struct zfcp_port *port, u64 fcp_lun)
+ 	write_lock_irq(&port->unit_list_lock);
+ 	list_add_tail(&unit->list, &port->unit_list);
+ 	write_unlock_irq(&port->unit_list_lock);
++	/*
++	 * lock order: shost->scan_mutex before zfcp_sysfs_port_units_mutex
++	 * due to      zfcp_unit_scsi_scan() => zfcp_scsi_slave_alloc()
++	 */
++	mutex_unlock(&zfcp_sysfs_port_units_mutex);
+ 
+ 	zfcp_unit_scsi_scan(unit);
++	return retval;
+ 
+ out:
+ 	mutex_unlock(&zfcp_sysfs_port_units_mutex);
+-- 
+2.21.0
+
