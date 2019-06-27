@@ -167,7 +167,7 @@ tag_map = {
         'accepted' : [
             {
                 'name' : 'SUSE',
-                'match' : '(bsc|boo|bnc|fate)#\d+',
+                'match' : '((bsc|boo|bnc|fate)#\d+|jsc#\w+-\d+)',
             },
             {
                 'match' : '\S+',
