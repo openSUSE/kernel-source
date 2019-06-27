@@ -22,11 +22,12 @@ import argparse
 import io
 import os
 import os.path
-import pygit2
 import shutil
 import subprocess
 import sys
 import tempfile
+
+import pygit2_wrapper as pygit2
 
 import exc
 import lib
@@ -51,7 +52,10 @@ def format_import(references, tmpdir, dstdir, rev, poi=[]):
                            src,))
     subprocess.check_call(("quilt", "import", "-P", dst, src,))
     # This will remind the user to run refresh_patch.sh
-    lib.touch(".pc/%s~refresh" % (dst,))
+    target_dir = os.path.join(".pc", dstdir)
+    if not os.path.isdir(target_dir):
+        os.mkdir(target_dir)
+    lib.touch(os.path.join(".pc", "%s~refresh" % (dst,)))
 
     return 0
 

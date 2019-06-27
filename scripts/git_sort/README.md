@@ -360,3 +360,16 @@ Untracked files:
 
 ben@f1:~/local/src/kernel-source$ git commit
 ```
+
+Reporting Problems
+==================
+If you encounter problems while using any git-sort command, please send a
+report to <kernel@suse.de> which includes the following information:
+* the command you're trying to run and its output
+* which kernel-source.git commit you are working on. If your tree has
+  local changes before the command you're trying to run, commit them using
+  `git commit -n` and push to a dummy user branch (ex:
+  "users/<user>/SLE15/bugreport1") so that others can examine the tree and try
+  to reproduce the issue.
+* the output of
+  kernel-source$ GIT_DIR=$LINUX_GIT scripts/git_sort/git_sort.py -d
