@@ -10,7 +10,7 @@ for x in /boot/@IMAGE@ /boot/initrd; do
     ln -s ${x##*/}-@KERNELRELEASE@-@FLAVOR@ $x$suffix
 done
 
-# Add symlinks of compatible modules to /lib/modules/$krel/weak-updates/, 
+# Add symlinks of compatible modules to /lib/modules/$krel/weak-updates/,
 # run depmod and mkinitrd
 wm2=/usr/lib/module-init-tools/weak-modules2
 if [ -x $wm2 ]; then
@@ -21,7 +21,7 @@ if [ -x $wm2 ]; then
         rpm -ql $nvr | /bin/bash -${-/e/} $wm2 --add-kernel-modules @KERNELRELEASE@-@FLAVOR@
     fi
 else
-    echo "$wm does not exist, please run depmod and mkinitrd manually" >&2
+    echo "$wm2 does not exist, please run depmod and mkinitrd manually" >&2
 fi
 
 message_install_bl () {
