@@ -1,15 +1,33 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
+# Copyright (C) 2018 SUSE LLC
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
+# USA.
+
 import argparse
 import io
 import os
 import os.path
-import pygit2
 import shutil
 import subprocess
 import sys
 import tempfile
+
+import pygit2_wrapper as pygit2
 
 import exc
 import lib
@@ -34,7 +52,10 @@ def format_import(references, tmpdir, dstdir, rev, poi=[]):
                            src,))
     subprocess.check_call(("quilt", "import", "-P", dst, src,))
     # This will remind the user to run refresh_patch.sh
-    lib.touch(".pc/%s~refresh" % (dst,))
+    target_dir = os.path.join(".pc", dstdir)
+    if not os.path.isdir(target_dir):
+        os.mkdir(target_dir)
+    lib.touch(os.path.join(".pc", "%s~refresh" % (dst,)))
 
     return 0
 

@@ -1,6 +1,7 @@
-#!/usr/bin/awk -f
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-# Copyright (C) 2018 SUSE LLC
+# Copyright (C) 2019 SUSE LLC
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -17,13 +18,13 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
 # USA.
 
-# from quilt's patchfns
+import sys
 
-/^(---|\*\*\*|Index:)[ \t][^ \t]|^diff -/ {
-	exit
-}
-
-{
-	print
-}
-
+try:
+    from pygit2 import *
+except ImportError as err:
+    print("Error: %s" % (err,), file=sys.stderr)
+    print("Please install the \"pygit2\" python3 module. For more details, "
+          "please refer to the \"Installation Requirements\" section of "
+          "\"scripts/git_sort/README.md\".", file=sys.stderr)
+    sys.exit(1)

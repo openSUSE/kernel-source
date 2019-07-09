@@ -1,15 +1,33 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
+# Copyright (C) 2018 SUSE LLC
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
+# USA.
+
 import collections
 import operator
 import os
 import os.path
-import pygit2
 import re
 import signal
 import subprocess
 import sys
+
+import pygit2_wrapper as pygit2
 
 import exc
 import git_sort
@@ -401,6 +419,15 @@ def series_sort(index, entries):
         except AttributeError:
             # no entry.dest
             result[entry.dest_head].append(entry.value)
+
+    mainline = git_sort.remotes[0]
+    if mainline not in index.repo_heads:
+        raise exc.KSError(
+            "Did not find mainline information (ref \"%s\" from the repository "
+            "at \"%s\") in the repository at LINUX_GIT (\"%s\"). For more "
+            "information, please refer to the \"Configuration Requirements\" "
+            "section of \"scripts/git_sort/README.md\"." % (
+                mainline.rev, mainline.repo_url.url, index.repo.path,))
 
     for head in index.repo_heads:
         result[head] = flatten([

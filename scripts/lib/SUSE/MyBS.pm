@@ -26,7 +26,16 @@ sub new {
 	}
 	$self->{url} = URI->new($api_url);
 
-	my $cfgfile = "$ENV{HOME}/.oscrc";
+	my $cfgfile;
+	foreach ("$ENV{HOME}/.oscrc", "$ENV{HOME}/.config/osc/oscrc") {
+		if (-f) {
+			$cfgfile = $_;
+			last;
+		}
+	}
+
+	defined $cfgfile or die "oscrc not found";
+
 	# replace name: value with name= value that Config::IniFiles can parse
 	open(my $fh, '<', $cfgfile) or die "$cfgfile: $!\n";
 	my $data = "";

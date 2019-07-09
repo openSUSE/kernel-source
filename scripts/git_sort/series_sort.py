@@ -1,6 +1,23 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
+# Copyright (C) 2018 SUSE LLC
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
+# USA.
+
 """
 Script to sort series.conf lines according to the upstream order of commits that
 the patches backport.
@@ -20,14 +37,7 @@ import argparse
 import os
 import sys
 
-try:
-    import pygit2
-except ImportError as err:
-    print("Error: %s" % (err,), file=sys.stderr)
-    print("Please install the \"pygit2\" python3 module. For more details, "
-          "please refer to the \"Installation Requirements\" section of "
-          "\"scripts/git_sort/README.md\".", file=sys.stderr)
-    sys.exit(1)
+import pygit2_wrapper as pygit2
 
 import exc
 import git_sort
@@ -50,22 +60,31 @@ if __name__ == "__main__":
                         "as appropriate. Default: false.")
     parser.add_argument("series", nargs="?", metavar="series.conf",
                         help="series.conf file which will be modified in "
-                        "place. Default: read input from stdin.")
+                        "place. Default: if stdin is a terminal, "
+                        "\"series.conf\"; otherwise, read input from stdin.")
     args = parser.parse_args()
 
     repo_path = lib.repo_path()
     repo = pygit2.Repository(repo_path)
     index = git_sort.SortIndex(repo)
 
-    if args.series is not None:
+    filter_mode = False
+    if args.series is None:
+        if sys.stdin.isatty():
+            path = "series.conf"
+        else:
+            filter_mode = True
+    else:
+        path = args.series
+    if filter_mode:
+        f = sys.stdin
+    else:
         try:
-            f = open(args.series)
+            f = open(path)
         except FileNotFoundError as err:
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
-        series = os.path.abspath(args.series)
-    else:
-        f = sys.stdin
+        series_path = os.path.abspath(path)
     lines = f.readlines()
 
     if args.prefix is not None:
@@ -74,7 +93,7 @@ if __name__ == "__main__":
     try:
         before, inside, after = series_conf.split(lines)
     except exc.KSNotFound as err:
-        if args.series is None:
+        if filter_mode:
             before = []
             inside = lines
             after = []
@@ -120,10 +139,10 @@ if __name__ == "__main__":
             after,
         ])
 
-        if args.series is not None:
-            f = open(series, mode="w")
-        else:
+        if filter_mode:
             f = sys.stdout
+        else:
+            f = open(series_path, mode="w")
         f.writelines(output)
         try:
             lib.update_tags(index, to_update)

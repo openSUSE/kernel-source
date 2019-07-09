@@ -8,32 +8,17 @@ from io import StringIO
 
 from suse_git import header
 
-# You'll see a slightly strange pattern here:
-#   try:
-#       self.sometest()
-#       self.assertTrue(False)
-#   except Exception, e:
-#       rest of test
-#
-# This is to test the exception contents.  Python's unittest module
-# allows us to assert that a particular exception is raised but
-# it won't let us inspect the contents of it.  The assertTrue(False)
-# will cause a test failure if an exception isn't raised; The
-# except HeaderException clause will cause a test failure if the
-# exception isn't HeaderException.  When adding new test cases,
-# please follow this pattern when the test case is expecting to fail.
-
 class TestHeaderChecker(unittest.TestCase):
     def test_empty(self):
         try:
             self.header = header.Checker("")
         except header.HeaderException as e:
-            self.assertTrue(e.errors(header.MissingTagError) == 4)
+            self.assertEqual(4, e.errors(header.MissingTagError))
             self.assertTrue(e.tag_is_missing('patch-mainline'))
             self.assertTrue(e.tag_is_missing('from'))
             self.assertTrue(e.tag_is_missing('subject'))
             self.assertTrue(e.tag_is_missing('references'))
-            self.assertTrue(e.errors() == 4)
+            self.assertEqual(4, e.errors())
 
     def test_subject_dupe(self):
         text = """
@@ -45,12 +30,11 @@ Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.DuplicateTagError) == 1)
-            self.assertTrue(e.errors() == 1)
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.DuplicateTagError))
+        self.assertEqual(1, e.errors())
 
     def test_patch_mainline_dupe(self):
         text = """
@@ -62,12 +46,12 @@ Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.DuplicateTagError) == 1)
-            self.assertTrue(e.errors() == 1)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.DuplicateTagError))
+        self.assertEqual(1, e.errors())
 
     def test_patch_mainline_empty(self):
         text = """
@@ -77,14 +61,14 @@ Patch-mainline:
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.EmptyTagError) == 1)
-            self.assertTrue(e.errors(header.MissingTagError) == 1)
-            self.assertTrue(e.tag_is_missing('patch-mainline'))
-            self.assertTrue(e.errors() == 2)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.EmptyTagError))
+        self.assertEqual(1, e.errors(header.MissingTagError))
+        self.assertTrue(e.tag_is_missing('patch-mainline'))
+        self.assertEqual(2, e.errors())
 
     def test_patch_mainline_version_no_ack_or_sob(self):
         text = """
@@ -98,10 +82,10 @@ Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
         try:
             self.header = header.Checker(text)
         except header.HeaderException as e:
-            self.assertTrue(e.errors(header.MissingTagError) == 1)
+            self.assertEqual(1, e.errors(header.MissingTagError))
             self.assertTrue(e.tag_is_missing('acked-by'))
             self.assertTrue(e.tag_is_missing('signed-off-by'))
-            self.assertTrue(e.errors() == 1)
+            self.assertEqual(1, e.errors())
 
     def test_patch_mainline_version_correct_multi_ack(self):
         text = """
@@ -215,12 +199,12 @@ Patch-mainline: n/a
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.FormatError) == 1)
-            self.assertTrue(e.errors() == 1)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.FormatError))
+        self.assertEqual(1, e.errors())
 
     def test_patch_mainline_submitted_correct_ml(self):
         text = """
@@ -250,12 +234,12 @@ Patch-mainline: Submitted
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.FormatError) == 1)
-            self.assertTrue(e.errors() == 1)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.FormatError))
+        self.assertEqual(1, e.errors())
 
     def test_patch_mainline_submitted_detail_git_commit(self):
         text = """
@@ -266,12 +250,12 @@ Git-repo: git://host/valid/path/to/repo
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.ExcludedTagError) == 1)
-            self.assertTrue(e.errors() == 1)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.ExcludedTagError))
+        self.assertEqual(1, e.errors())
 
     # Required/Excluded conflict between Patch-mainline (Submitted)
     # and Git-commit
@@ -284,13 +268,13 @@ Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.MissingTagError) == 1)
-            self.assertTrue(e.errors(header.ExcludedTagError) == 1)
-            self.assertTrue(e.errors() == 2)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.MissingTagError))
+        self.assertEqual(1, e.errors(header.ExcludedTagError))
+        self.assertEqual(2, e.errors())
 
     def test_patch_mainline_submitted_no_detail(self):
         text = """
@@ -300,12 +284,12 @@ Patch-mainline: Submitted
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.FormatError) == 1)
-            self.assertTrue(e.errors() == 1)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.FormatError))
+        self.assertEqual(1, e.errors())
 
     def test_patch_mainline_never_no_detail(self):
         text = """
@@ -318,8 +302,8 @@ Acked-by: developer@suse.com
         try:
             self.header = header.Checker(text)
         except header.HeaderException as e:
-            self.assertTrue(e.errors(header.FormatError) == 1)
-            self.assertTrue(e.errors() == 1)
+            self.assertEqual(1, e.errors(header.FormatError))
+            self.assertEqual(1, e.errors())
 
     def test_patch_mainline_yes_with_detail(self):
         text = """
@@ -329,12 +313,12 @@ Patch-mainline: Yes, v4.1-rc1
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.FormatError) == 1)
-            self.assertTrue(e.errors() == 1)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.FormatError))
+        self.assertEqual(1, e.errors())
 
     def test_patch_mainline_yes_no_detail(self):
         text = """
@@ -344,12 +328,12 @@ Patch-mainline: Yes
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.FormatError) == 1)
-            self.assertTrue(e.errors() == 1)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.FormatError))
+        self.assertEqual(1, e.errors())
 
     def test_patch_mainline_not_yet_no_detail(self):
         text = """
@@ -359,12 +343,12 @@ Patch-mainline: Not yet
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.FormatError) == 1)
-            self.assertTrue(e.errors() == 1)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.FormatError))
+        self.assertEqual(1, e.errors())
 
     def test_patch_mainline_never_detail(self):
         text = """
@@ -408,9 +392,9 @@ Acked-by: developer@suse.com
             self.header = header.Checker(text)
         except header.HeaderException as e:
             # Both policy and Git-commit require Patch-mainline
-            self.assertTrue(e.errors(header.MissingTagError) == 2)
+            self.assertEqual(2, e.errors(header.MissingTagError))
             self.assertTrue(e.tag_is_missing('patch-mainline'))
-            self.assertTrue(e.errors() == 2)
+            self.assertEqual(2, e.errors())
 
     def test_patch_mainline_queued_correct(self):
         text = """
@@ -432,14 +416,14 @@ Patch-mainline: Queued
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.MissingTagError) == 2)
-            self.assertTrue(e.tag_is_missing('git-commit'))
-            self.assertTrue(e.tag_is_missing('git-repo'))
-            self.assertTrue(e.errors() == 2)
+
+        e = cm.exception
+        self.assertEqual(2, e.errors(header.MissingTagError))
+        self.assertTrue(e.tag_is_missing('git-commit'))
+        self.assertTrue(e.tag_is_missing('git-repo'))
+        self.assertEqual(2, e.errors())
 
     def test_patch_mainline_queued_with_git_repo(self):
         text = """
@@ -450,15 +434,15 @@ Git-repo: git://path/to/git/repo
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            # Required by both Patch-mainline (Queued) and
-            # Git-repo
-            self.assertTrue(e.errors(header.MissingTagError) == 2)
-            self.assertTrue(e.tag_is_missing('git-commit'))
-            self.assertTrue(e.errors() == 2)
+
+        e = cm.exception
+        # Required by both Patch-mainline (Queued) and
+        # Git-repo
+        self.assertEqual(2, e.errors(header.MissingTagError))
+        self.assertTrue(e.tag_is_missing('git-commit'))
+        self.assertEqual(2, e.errors())
 
     def test_patch_mainline_queued_with_git_commit(self):
         text = """
@@ -469,13 +453,13 @@ Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.MissingTagError) == 1)
-            self.assertTrue(e.tag_is_missing('git-repo'))
-            self.assertTrue(e.errors() == 1)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.MissingTagError))
+        self.assertTrue(e.tag_is_missing('git-repo'))
+        self.assertEqual(1, e.errors())
 
     def test_patch_mainline_invalid(self):
         text = """
@@ -485,12 +469,12 @@ Patch-mainline: n/a
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.FormatError) == 1)
-            self.assertTrue(e.errors() == 1)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.FormatError))
+        self.assertEqual(1, e.errors())
 
     def test_diff_like_description(self):
         text = """
@@ -531,14 +515,14 @@ Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 References:
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.EmptyTagError) == 1)
-            self.assertTrue(e.errors(header.MissingTagError) == 1)
-            self.assertTrue(e.tag_is_missing('references'))
-            self.assertTrue(e.errors() == 2)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.EmptyTagError))
+        self.assertEqual(1, e.errors(header.MissingTagError))
+        self.assertTrue(e.tag_is_missing('references'))
+        self.assertEqual(2, e.errors())
 
     def test_patch_references_missing(self):
         text = """
@@ -548,13 +532,13 @@ Patch-mainline: v4.2-rc1
 Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.MissingTagError) == 1)
-            self.assertTrue(e.tag_is_missing('references'))
-            self.assertTrue(e.errors() == 1)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.MissingTagError))
+        self.assertTrue(e.tag_is_missing('references'))
+        self.assertEqual(1, e.errors())
 
     def test_patch_references_multi(self):
         text = """
@@ -604,24 +588,26 @@ Acked-by: developer@suse.com
         self.header = header.Checker(text)
 
 
-# Enable this check when we want to require a real References tag
-#    def test_patch_references_only_freeform(self):
-#        text = """
-#From: developer@site.com
-#Subject: some patch
-#Patch-mainline: v4.2-rc1
-#Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-#References: fix for blahblah
-#Acked-by: developer@suse.com
-#"""
-#        try:
-#            self.header = header.Checker(text)
-#            self.assertTrue(False)
-#        except header.HeaderException, e:
-#            self.assertTrue(e.errors(header.MissingTagError) == 1)
-#            self.assertTrue(e.tag_is_missing('references'))
-#            self.assertTrue(e.errors() == 1)
-#
+
+    @unittest.skip("Enable this check when we want to require a real "
+                   "References tag")
+    def test_patch_references_only_freeform(self):
+        text = """
+From: developer@site.com
+Subject: some patch
+Patch-mainline: v4.2-rc1
+Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+References: fix for blahblah
+Acked-by: developer@suse.com
+"""
+        with self.assertRaises(header.HeaderException) as cm:
+            self.header = header.Checker(text)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.MissingTagError))
+        self.assertTrue(e.tag_is_missing('references'))
+        self.assertEqual(1, e.errors())
+
 
     def test_patch_references_empty_update(self):
         text = """
@@ -632,12 +618,12 @@ Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 References:
 Acked-by: developer@suse.com
 """
-        try:
+        with self.assertRaises(header.HeaderException) as cm:
             self.header = header.Checker(text, True)
-            self.assertTrue(False)
-        except header.HeaderException as e:
-            self.assertTrue(e.errors(header.EmptyTagError) == 1)
-            self.assertTrue(e.errors() == 1)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.EmptyTagError))
+        self.assertEqual(1, e.errors())
 
     def test_patch_references_missing_update(self):
         text = """
@@ -697,21 +683,21 @@ Acked-by: developer@suse.com
         self.header = header.Checker(text, True)
 
 
-# Enable this check when we want to require a real References tag
-#    def test_patch_references_only_freeform_update(self):
-#        text = """
-#From: developer@site.com
-#Subject: some patch
-#Patch-mainline: v4.2-rc1
-#Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-#References: fix for blahblah
-#Acked-by: developer@suse.com
-#"""
-#        try:
-#            self.header = header.Checker(text, True)
-#            self.assertTrue(False)
-#        except header.HeaderException, e:
-#            self.assertTrue(e.errors(header.MissingTagError) == 1)
-#            self.assertTrue(e.tag_is_missing('references'))
-#            self.assertTrue(e.errors() == 1)
-#
+    @unittest.skip("Enable this check when we want to require a real "
+                   "References tag")
+    def test_patch_references_only_freeform_update(self):
+        text = """
+From: developer@site.com
+Subject: some patch
+Patch-mainline: v4.2-rc1
+Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+References: fix for blahblah
+Acked-by: developer@suse.com
+"""
+        with self.assertRaises(header.HeaderException) as cm:
+            self.header = header.Checker(text, True)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.MissingTagError))
+        self.assertTrue(e.tag_is_missing('references'))
+        self.assertEqual(1, e.errors())
