@@ -225,9 +225,12 @@ elif $using_git; then
     # users of the rpm packages.
     # FIXME: the remote might have a different name than "origin" or there
     # might be no remote at all.
-    if git cat-file -e origin/scripts 2>/dev/null; then
-        exclude[${#exclude[@]}]=^origin/scripts
-    fi
+    for remote in $(git remote)
+    do
+        if git cat-file -e ${remote}/scripts 2>/dev/null; then
+            exclude[${#exclude[@]}]=^${remote}/scripts
+        fi
+    done
     if git cat-file -e scripts 2>/dev/null; then
         exclude[${#exclude[@]}]=^scripts
     fi
