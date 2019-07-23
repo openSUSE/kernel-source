@@ -4,6 +4,8 @@ SRCVERSION=5.3-rc4
 VARIANT=
 # Set to 1 if the tree does not contain any non-vanilla patches at all
 VANILLA_ONLY=1
+# enable kernel module compression
+COMPRESS_MODULES="xz"
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:Factory
 OBS_PROJECT_ARM=openSUSE:Factory:ARM
