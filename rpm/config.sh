@@ -2,6 +2,8 @@
 SRCVERSION=5.3-rc1
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=
+# enable kernel module compression
+COMPRESS_MODULES="xz"
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:Factory
 OBS_PROJECT_ARM=openSUSE:Factory:ARM
