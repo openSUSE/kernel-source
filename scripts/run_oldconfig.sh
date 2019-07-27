@@ -438,7 +438,7 @@ for config in $config_files; do
     if [ -n "$cross_compile" -a -x /usr/bin/${cross_compile}gcc ]; then
 	MAKE_ARGS="$MAKE_ARGS CROSS_COMPILE=$cross_compile"
     fi
-    if [ -n "$CC" ]; then
+    if [ -n "$CC" -a -z "$cross_compile" ]; then
         MAKE_ARGS="$MAKE_ARGS CC=$CC"
     fi
     if $silent; then
