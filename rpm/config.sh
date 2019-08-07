@@ -5,9 +5,7 @@ VARIANT=
 # enable kernel module compression
 COMPRESS_MODULES="xz"
 # buildservice projects to build the kernel against
-OBS_PROJECT=openSUSE:Factory
-OBS_PROJECT_ARM=openSUSE:Factory:ARM
-OBS_PROJECT_PPC=openSUSE:Factory:PowerPC
+OBS_PROJECT=SUSE:SLE-15-SP1:Update
 IBS_PROJECT=SUSE:SLE-15-SP2:Update
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
