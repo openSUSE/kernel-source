@@ -8,8 +8,9 @@ COMPRESS_MODULES="xz"
 OBS_PROJECT=openSUSE:Factory
 OBS_PROJECT_ARM=openSUSE:Factory:ARM
 OBS_PROJECT_PPC=openSUSE:Factory:PowerPC
-IBS_PROJECT=SUSE:Factory:Head
-IBS_PROJECT_ARM=Devel:ARM:Factory
+IBS_PROJECT=SUSE:SLE-15-SP2:Update
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
-BUGZILLA_PRODUCT="openSUSE Tumbleweed"
+BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 15 SP2"
+# Check the sorted patches section of series.conf
+SORT_SERIES=yes
