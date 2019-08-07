@@ -29,7 +29,7 @@ copy.
 Packages are available in the following OBS project
 https://build.opensuse.org/package/show/home:benjamin_poirier:series_sort/quilt-ks
 Source is avaible from
-https://gitlab.suse.de/benjamin_poirier/quilt
+https://github.com/gobenji/quilt
 
 The packages in home:benjamin_poirier:series_sort are signed with the key
 from home:benjamin_poirier which has the following fingerprint:

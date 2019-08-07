@@ -434,11 +434,12 @@ for config in $config_files; do
         cross_arch="${config%%/*}"
 	;;
     esac
+    [ "$cross_arch" = "$(uname -m)" ] && cross_arch=
     cross_compile="${CROSS_COMPILE-${cross_arch}-suse-linux-${cross_extra}}"
-    if [ -n "$cross_compile" -a -x /usr/bin/${cross_compile}gcc ]; then
+    if [ -n "$cross_arch" -a -x /usr/bin/${cross_compile}gcc ]; then
 	MAKE_ARGS="$MAKE_ARGS CROSS_COMPILE=$cross_compile"
     fi
-    if [ -n "$CC" ]; then
+    if [ -n "$CC" -a -z "$cross_arch" ]; then
         MAKE_ARGS="$MAKE_ARGS CC=$CC"
     fi
     if $silent; then
@@ -453,6 +454,9 @@ for config in $config_files; do
 	    config_base="$(dirname "$config")/pae"
 	else
 	    config_base="$(dirname "$config")/default"
+	fi
+	if ! [ -f "$config_base" ] && [ -n "$VARIANT" ] ; then
+	    config_base="$(dirname "$config")/${VARIANT#-}"
 	fi
 	${scripts}/config-merge "$config_base" "$config" >$config_orig
     else
