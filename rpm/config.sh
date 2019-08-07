@@ -1,7 +1,7 @@
 # The version of the main tarball to use
 SRCVERSION=5.3-rc3
 # variant of the kernel-source package, either empty or "-rt"
-VARIANT=
+VARIANT=-rt
 # enable kernel module compression
 COMPRESS_MODULES="xz"
 # buildservice projects to build the kernel against
