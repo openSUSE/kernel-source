@@ -455,6 +455,9 @@ for config in $config_files; do
 	else
 	    config_base="$(dirname "$config")/default"
 	fi
+	if ! [ -f "$config_base" ] && [ -n "$VARIANT" ] ; then
+	    config_base="$(dirname "$config")/${VARIANT#-}"
+	fi
 	${scripts}/config-merge "$config_base" "$config" >$config_orig
     else
 	cp "$config" $config_orig
