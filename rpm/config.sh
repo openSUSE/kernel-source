@@ -6,6 +6,8 @@ VARIANT=
 VANILLA_ONLY=1
 # enable kernel module compression
 COMPRESS_MODULES="xz"
+# Compile binary devicetrees on master and stable branches.
+BUILD_DTBS="Yes"
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:Factory
 OBS_PROJECT_ARM=openSUSE:Factory:ARM
