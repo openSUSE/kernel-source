@@ -2,6 +2,8 @@
 SRCVERSION=5.2
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=
+# Compile binary devicetrees on master and stable branches.
+BUILD_DTBS="Yes"
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:Factory
 OBS_PROJECT_ARM=openSUSE:Factory:ARM
