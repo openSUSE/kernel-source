@@ -63,9 +63,9 @@ if __name__ == "__main__":
 
     # (before, inside, after, set(inside),)
     local, base, remote = (
-        (s[0], s[1], s[2], set([series_conf.firstword(l)
-                                for l in s[1]
-                                if series_conf.filter_patches(l)]),)
+        (s[0], s[1], s[2], lib.OrderedSet([series_conf.firstword(l)
+                                           for l in s[1]
+                                           if series_conf.filter_patches(l)]),)
         for s in [
             series_conf.split(open(s_path))
             for s_path in (local_path, base_path, remote_path,)
@@ -74,7 +74,7 @@ if __name__ == "__main__":
 
     added = remote[3] - base[3]
     removed = base[3] - remote[3]
-    moved = set(lib.list_moved_patches(base[1], remote[1]))
+    moved = lib.OrderedSet(lib.list_moved_patches(base[1], remote[1]))
 
     if added or removed:
         print("%d commits added, %d commits removed from base to remote." %
