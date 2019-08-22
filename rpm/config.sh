@@ -6,6 +6,8 @@ VARIANT=
 COMPRESS_MODULES="xz"
 # Compile binary devicetrees on master and stable branches.
 BUILD_DTBS="Yes"
+# Use new style livepatch package names
+LIVEPATCH=livepatch
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:Factory
 OBS_PROJECT_ARM=openSUSE:Factory:ARM
