@@ -400,6 +400,9 @@ for config in $config_files; do
     armv*/*)
         MAKE_ARGS="ARCH=arm"
         ;;
+    riscv*/*)
+        MAKE_ARGS="ARCH=riscv"
+        ;;
     */um)
         MAKE_ARGS="ARCH=um SUBARCH=$cpu_arch"
         ;;
