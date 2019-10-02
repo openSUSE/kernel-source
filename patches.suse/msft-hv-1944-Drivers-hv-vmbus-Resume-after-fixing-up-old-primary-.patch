@@ -1,0 +1,258 @@
+From: Dexuan Cui <decui@microsoft.com>
+Date: Thu, 5 Sep 2019 23:01:22 +0000
+Patch-mainline: v5.4-rc1
+Subject: Drivers: hv: vmbus: Resume after fixing up old primary channels
+Git-commit: d8bd2d442bb2688b428ac7164e5dc6d95d4fa65b
+References: fate#323887
+
+When the host re-offers the primary channels upon resume, the host only
+guarantees the Instance GUID  doesn't change, so vmbus_bus_suspend()
+should invalidate channel->offermsg.child_relid and figure out the
+number of primary channels that need to be fixed up upon resume.
+
+Upon resume, vmbus_onoffer() finds the old channel structs, and maps
+the new offers to the old channels, and fixes up the old structs,
+and finally the resume callbacks of the VSC drivers will re-open
+the channels.
+
+Signed-off-by: Dexuan Cui <decui@microsoft.com>
+Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Acked-by: Olaf Hering <ohering@suse.de>
+---
+ drivers/hv/channel_mgmt.c | 85 ++++++++++++++++++++++++++++++++++++-----------
+ drivers/hv/connection.c   |  2 ++
+ drivers/hv/hyperv_vmbus.h | 14 ++++++++
+ drivers/hv/vmbus_drv.c    | 17 ++++++++++
+ include/linux/hyperv.h    |  3 ++
+ 5 files changed, 101 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/hv/channel_mgmt.c b/drivers/hv/channel_mgmt.c
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@ -407,7 +407,15 @@ void hv_process_channel_removal(struct vmbus_channel *channel)
+ 		cpumask_clear_cpu(channel->target_cpu,
+ 				  &primary_channel->alloced_cpus_in_node);
+ 
+-	vmbus_release_relid(channel->offermsg.child_relid);
++	/*
++	 * Upon suspend, an in-use hv_sock channel is marked as "rescinded" and
++	 * the relid is invalidated; after hibernation, when the user-space app
++	 * destroys the channel, the relid is INVALID_RELID, and in this case
++	 * it's unnecessary and unsafe to release the old relid, since the same
++	 * relid can refer to a completely different channel now.
++	 */
++	if (channel->offermsg.child_relid != INVALID_RELID)
++		vmbus_release_relid(channel->offermsg.child_relid);
+ 
+ 	free_channel(channel);
+ }
+@@ -851,6 +859,36 @@ void vmbus_initiate_unload(bool crash)
+ 		vmbus_wait_for_unload();
+ }
+ 
++static void check_ready_for_resume_event(void)
++{
++	/*
++	 * If all the old primary channels have been fixed up, then it's safe
++	 * to resume.
++	 */
++	if (atomic_dec_and_test(&vmbus_connection.nr_chan_fixup_on_resume))
++		complete(&vmbus_connection.ready_for_resume_event);
++}
++
++static void vmbus_setup_channel_state(struct vmbus_channel *channel,
++				      struct vmbus_channel_offer_channel *offer)
++{
++	/*
++	 * Setup state for signalling the host.
++	 */
++	channel->sig_event = VMBUS_EVENT_CONNECTION_ID;
++
++	if (vmbus_proto_version != VERSION_WS2008) {
++		channel->is_dedicated_interrupt =
++				(offer->is_dedicated_interrupt != 0);
++		channel->sig_event = offer->connection_id;
++	}
++
++	memcpy(&channel->offermsg, offer,
++	       sizeof(struct vmbus_channel_offer_channel));
++	channel->monitor_grp = (u8)offer->monitorid / 32;
++	channel->monitor_bit = (u8)offer->monitorid % 32;
++}
++
+ /*
+  * find_primary_channel_by_offer - Get the channel object given the new offer.
+  * This is only used in the resume path of hibernation.
+@@ -902,14 +940,29 @@ static void vmbus_onoffer(struct vmbus_channel_message_header *hdr)
+ 		atomic_dec(&vmbus_connection.offer_in_progress);
+ 
+ 		/*
+-		 * We're resuming from hibernation: we expect the host to send
+-		 * exactly the same offers that we had before the hibernation.
++		 * We're resuming from hibernation: all the sub-channel and
++		 * hv_sock channels we had before the hibernation should have
++		 * been cleaned up, and now we must be seeing a re-offered
++		 * primary channel that we had before the hibernation.
+ 		 */
++
++		WARN_ON(oldchannel->offermsg.child_relid != INVALID_RELID);
++		/* Fix up the relid. */
++		oldchannel->offermsg.child_relid = offer->child_relid;
++
+ 		offer_sz = sizeof(*offer);
+-		if (memcmp(offer, &oldchannel->offermsg, offer_sz) == 0)
++		if (memcmp(offer, &oldchannel->offermsg, offer_sz) == 0) {
++			check_ready_for_resume_event();
+ 			return;
++		}
+ 
+-		pr_debug("Mismatched offer from the host (relid=%d)\n",
++		/*
++		 * This is not an error, since the host can also change the
++		 * other field(s) of the offer, e.g. on WS RS5 (Build 17763),
++		 * the offer->connection_id of the Mellanox VF vmbus device
++		 * can change when the host reoffers the device upon resume.
++		 */
++		pr_debug("vmbus offer changed: relid=%d\n",
+ 			 offer->child_relid);
+ 
+ 		print_hex_dump_debug("Old vmbus offer: ", DUMP_PREFIX_OFFSET,
+@@ -917,6 +970,12 @@ static void vmbus_onoffer(struct vmbus_channel_message_header *hdr)
+ 				     false);
+ 		print_hex_dump_debug("New vmbus offer: ", DUMP_PREFIX_OFFSET,
+ 				     16, 4, offer, offer_sz, false);
++
++		/* Fix up the old channel. */
++		vmbus_setup_channel_state(oldchannel, offer);
++
++		check_ready_for_resume_event();
++
+ 		return;
+ 	}
+ 
+@@ -929,21 +988,7 @@ static void vmbus_onoffer(struct vmbus_channel_message_header *hdr)
+ 		return;
+ 	}
+ 
+-	/*
+-	 * Setup state for signalling the host.
+-	 */
+-	newchannel->sig_event = VMBUS_EVENT_CONNECTION_ID;
+-
+-	if (vmbus_proto_version != VERSION_WS2008) {
+-		newchannel->is_dedicated_interrupt =
+-				(offer->is_dedicated_interrupt != 0);
+-		newchannel->sig_event = offer->connection_id;
+-	}
+-
+-	memcpy(&newchannel->offermsg, offer,
+-	       sizeof(struct vmbus_channel_offer_channel));
+-	newchannel->monitor_grp = (u8)offer->monitorid / 32;
+-	newchannel->monitor_bit = (u8)offer->monitorid % 32;
++	vmbus_setup_channel_state(newchannel, offer);
+ 
+ 	vmbus_process_offer(newchannel);
+ }
+diff --git a/drivers/hv/connection.c b/drivers/hv/connection.c
+--- a/drivers/hv/connection.c
++++ b/drivers/hv/connection.c
+@@ -29,6 +29,8 @@ struct vmbus_connection vmbus_connection = {
+ 
+ 	.ready_for_suspend_event= COMPLETION_INITIALIZER(
+ 				  vmbus_connection.ready_for_suspend_event),
++	.ready_for_resume_event	= COMPLETION_INITIALIZER(
++				  vmbus_connection.ready_for_resume_event),
+ };
+ EXPORT_SYMBOL_GPL(vmbus_connection);
+ 
+diff --git a/drivers/hv/hyperv_vmbus.h b/drivers/hv/hyperv_vmbus.h
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@ -272,6 +272,20 @@ struct vmbus_connection {
+ 	 * drop to zero.
+ 	 */
+ 	struct completion ready_for_suspend_event;
++
++	/*
++	 * The number of primary channels that should be "fixed up"
++	 * upon resume: these channels are re-offered upon resume, and some
++	 * fields of the channel offers (i.e. child_relid and connection_id)
++	 * can change, so the old offermsg must be fixed up, before the resume
++	 * callbacks of the VSC drivers start to further touch the channels.
++	 */
++	atomic_t nr_chan_fixup_on_resume;
++	/*
++	 * vmbus_bus_resume() waits for "nr_chan_fixup_on_resume" to
++	 * drop to zero.
++	 */
++	struct completion ready_for_resume_event;
+ };
+ 
+ 
+diff --git a/drivers/hv/vmbus_drv.c b/drivers/hv/vmbus_drv.c
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@ -2164,9 +2164,17 @@ static int vmbus_bus_suspend(struct device *dev)
+ 	if (atomic_read(&vmbus_connection.nr_chan_close_on_suspend) > 0)
+ 		wait_for_completion(&vmbus_connection.ready_for_suspend_event);
+ 
++	WARN_ON(atomic_read(&vmbus_connection.nr_chan_fixup_on_resume) != 0);
++
+ 	mutex_lock(&vmbus_connection.channel_mutex);
+ 
+ 	list_for_each_entry(channel, &vmbus_connection.chn_list, listentry) {
++		/*
++		 * Invalidate the field. Upon resume, vmbus_onoffer() will fix
++		 * up the field, and the other fields (if necessary).
++		 */
++		channel->offermsg.child_relid = INVALID_RELID;
++
+ 		if (is_hvsock_channel(channel)) {
+ 			if (!channel->rescind) {
+ 				pr_err("hv_sock channel not rescinded!\n");
+@@ -2181,6 +2189,8 @@ static int vmbus_bus_suspend(struct device *dev)
+ 			WARN_ON_ONCE(1);
+ 		}
+ 		spin_unlock_irqrestore(&channel->lock, flags);
++
++		atomic_inc(&vmbus_connection.nr_chan_fixup_on_resume);
+ 	}
+ 
+ 	mutex_unlock(&vmbus_connection.channel_mutex);
+@@ -2189,6 +2199,9 @@ static int vmbus_bus_suspend(struct device *dev)
+ 
+ 	vmbus_connection.conn_state = DISCONNECTED;
+ 
++	/* Reset the event for the next resume. */
++	reinit_completion(&vmbus_connection.ready_for_resume_event);
++
+ 	return 0;
+ }
+ 
+@@ -2223,8 +2236,12 @@ static int vmbus_bus_resume(struct device *dev)
+ 	if (ret != 0)
+ 		return ret;
+ 
++	WARN_ON(atomic_read(&vmbus_connection.nr_chan_fixup_on_resume) == 0);
++
+ 	vmbus_request_offers();
+ 
++	wait_for_completion(&vmbus_connection.ready_for_resume_event);
++
+ 	/* Reset the event for the next suspend. */
+ 	reinit_completion(&vmbus_connection.ready_for_suspend_event);
+ 
+diff --git a/include/linux/hyperv.h b/include/linux/hyperv.h
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@ -426,6 +426,9 @@ enum vmbus_channel_message_type {
+ 	CHANNELMSG_COUNT
+ };
+ 
++/* Hyper-V supports about 2048 channels, and the RELIDs start with 1. */
++#define INVALID_RELID	U32_MAX
++
+ struct vmbus_channel_message_header {
+ 	enum vmbus_channel_message_type msgtype;
+ 	u32 padding;
