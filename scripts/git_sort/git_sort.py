@@ -202,6 +202,7 @@ remotes = (
     Head(RepoURL("shli/md.git"), "for-next"),
     Head(RepoURL("dhowells/linux-fs.git"), "keys-uefi"),
     Head(RepoURL("tytso/ext4.git"), "dev"),
+    Head(RepoURL("s390/linux.git"), "fixes"),
     Head(RepoURL("s390/linux.git"), "for-linus"),
     Head(RepoURL("https://github.com/kdave/btrfs-devel.git"), "misc-next"),
     Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
@@ -219,13 +220,19 @@ remotes = (
     Head(RepoURL("git://git.kernel.dk/linux-block.git"), "for-next"),
     Head(RepoURL("git://git.kernel.org/pub/scm/virt/kvm/kvm.git"), "queue"),
     Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.3-rc"),
+    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.4"),
     Head(RepoURL("dhowells/linux-fs.git")),
     Head(RepoURL("herbert/cryptodev-2.6.git")),
     Head(RepoURL("helgaas/pci.git"), "next"),
     Head(RepoURL("viro/vfs.git"), "for-linus"),
+    Head(RepoURL("viro/vfs.git"), "fixes"),
     Head(RepoURL("jeyu/linux.git"), "modules-next"),
     Head(RepoURL("nvdimm/nvdimm.git"), "libnvdimm-for-next"),
+    Head(RepoURL("nvdimm/nvdimm.git"), "libnvdimm-fixes"),
+    Head(RepoURL("djbw/nvdimm.git"), "libnvdimm-pending"),
     Head(RepoURL("herbert/crypto-2.6.git"), "master"),
+    Head(RepoURL("git://git.cmpxchg.org/linux-mmots.git"), "master"),
+    Head(RepoURL("git://git.linux-nfs.org/~bfields/linux.git"), "nfsd-next"),
 )
 
 
