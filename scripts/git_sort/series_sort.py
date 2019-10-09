@@ -67,6 +67,9 @@ if __name__ == "__main__":
     repo_path = lib.repo_path()
     repo = pygit2.Repository(repo_path)
     index = git_sort.SortIndex(repo)
+    if git_sort.remotes[0] not in index.repo_heads:
+        print("WARNING: Did not find a remote fetching from \"%s\" in LINUX_GIT remotes." %
+              (git_sort.remotes[0].repo_url.url,))
 
     filter_mode = False
     if args.series is None:
