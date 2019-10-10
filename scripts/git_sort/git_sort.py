@@ -192,6 +192,7 @@ remotes = (
     Head(RepoURL("rdma/rdma.git"), "for-rc"),
     Head(RepoURL("rdma/rdma.git"), "for-next"),
     Head(RepoURL("dledford/rdma.git"), "k.o/for-next"),
+    Head(RepoURL("jejb/scsi.git"), "for-next"),
     Head(RepoURL("bp/bp.git"), "for-next"),
     Head(RepoURL("tiwai/sound.git")),
     Head(RepoURL("git://linuxtv.org/media_tree.git")),
