@@ -241,6 +241,8 @@ remotes = (
     Head(RepoURL("rafael/linux-pm.git")),
     Head(RepoURL("git://git.cmpxchg.org/linux-mmots.git"), "master"),
     Head(RepoURL("git://git.linux-nfs.org/~bfields/linux.git"), "nfsd-next"),
+    Head(RepoURL("vkoul/soundwire.git"),"fixes"),
+    Head(RepoURL("vkoul/soundwire.git"),"next"),
 )
 
 
