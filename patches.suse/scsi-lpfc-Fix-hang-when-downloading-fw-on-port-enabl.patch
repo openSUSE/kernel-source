@@ -1,0 +1,148 @@
+From: James Smart <jsmart2021@gmail.com>
+Date: Wed, 14 Aug 2019 16:56:55 -0700
+Subject: scsi: lpfc: Fix hang when downloading fw on port enabled for nvme
+Patch-mainline: v5.4-rc1
+Git-commit: 84f2ddf8cf317afcfd92e06ed5a25aea48dc200e
+References: jsc#SLE-8284 jsc#SLE-8654
+
+As part of firmware download, the adapter is reset. On the adapter the
+reset causes the function to stop and all outstanding io is terminated
+(without responses). The reset path then starts teardown of the adapter,
+starting with deregistration of the remote ports with the nvme-fc
+transport. The local port is then deregistered and the driver waits for
+local port deregistration. This never finishes.
+
+The remote port deregistrations terminated the nvme controllers, causing
+them to send aborts for all the outstanding io. The aborts were serviced in
+the driver, but stalled due to its state. The nvme layer then stops to
+reclaim it's outstanding io before continuing.  The io must be returned
+before the reset on the controller is deemed complete and the controller
+delete performed.  The remote port deregistration won't complete until all
+the controllers are terminated. And the local port deregistration won't
+complete until all controllers and remote ports are terminated. Thus things
+hang.
+
+The issue is the reset which stopped the adapter also stopped all the
+responses that would drive i/o completions, and the aborts were also
+stopped that stopped i/o completions. The driver, when resetting the
+adapter like this, needs to be generating the completions as part of the
+adapter reset so that I/O complete (in error), and any aborts are not
+queued.
+
+Fix by adding flush routines whenever the adapter port has been reset or
+discovered in error. The flush routines will generate the completions for
+the scsi and nvme outstanding io. The abort ios, if waiting, will be caught
+and flushed as well.
+
+Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+Signed-off-by: James Smart <jsmart2021@gmail.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Daniel Wagner <dwagner@suse.de>
+---
+ drivers/scsi/lpfc/lpfc_crtn.h |    1 
+ drivers/scsi/lpfc/lpfc_init.c |    4 +++
+ drivers/scsi/lpfc/lpfc_nvme.c |   47 ++++++++++++++++++++++++++++++++++++++++++
+ drivers/scsi/lpfc/lpfc_sli.c  |    9 +++++---
+ 4 files changed, 58 insertions(+), 3 deletions(-)
+
+--- a/drivers/scsi/lpfc/lpfc_crtn.h
++++ b/drivers/scsi/lpfc/lpfc_crtn.h
+@@ -595,6 +595,7 @@ void lpfc_release_io_buf(struct lpfc_hba
+ 			 struct lpfc_sli4_hdw_queue *qp);
+ void lpfc_nvme_cmd_template(void);
+ void lpfc_nvmet_cmd_template(void);
++void lpfc_nvme_cancel_iocb(struct lpfc_hba *phba, struct lpfc_iocbq *pwqeIn);
+ extern int lpfc_enable_nvmet_cnt;
+ extern unsigned long long lpfc_enable_nvmet[];
+ extern int lpfc_no_hba_reset_cnt;
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@ -1546,6 +1546,8 @@ lpfc_sli4_offline_eratt(struct lpfc_hba
+ 	spin_unlock_irq(&phba->hbalock);
+ 
+ 	lpfc_offline_prep(phba, LPFC_MBX_NO_WAIT);
++	lpfc_sli_flush_fcp_rings(phba);
++	lpfc_sli_flush_nvme_rings(phba);
+ 	lpfc_offline(phba);
+ 	lpfc_hba_down_post(phba);
+ 	lpfc_unblock_mgmt_io(phba);
+@@ -1807,6 +1809,8 @@ lpfc_sli4_port_sta_fn_reset(struct lpfc_
+ 				"2887 Reset Needed: Attempting Port "
+ 				"Recovery...\n");
+ 	lpfc_offline_prep(phba, mbx_action);
++	lpfc_sli_flush_fcp_rings(phba);
++	lpfc_sli_flush_nvme_rings(phba);
+ 	lpfc_offline(phba);
+ 	/* release interrupt for possible resource change */
+ 	lpfc_sli4_disable_intr(phba);
+--- a/drivers/scsi/lpfc/lpfc_nvme.c
++++ b/drivers/scsi/lpfc/lpfc_nvme.c
+@@ -2668,3 +2668,50 @@ lpfc_nvme_wait_for_io_drain(struct lpfc_
+ 		}
+ 	}
+ }
++
++void
++lpfc_nvme_cancel_iocb(struct lpfc_hba *phba, struct lpfc_iocbq *pwqeIn)
++{
++#if (IS_ENABLED(CONFIG_NVME_FC))
++	struct lpfc_io_buf *lpfc_ncmd;
++	struct nvmefc_fcp_req *nCmd;
++	struct lpfc_nvme_fcpreq_priv *freqpriv;
++
++	if (!pwqeIn->context1) {
++		lpfc_sli_release_iocbq(phba, pwqeIn);
++		return;
++	}
++	/* For abort iocb just return, IO iocb will do a done call */
++	if (bf_get(wqe_cmnd, &pwqeIn->wqe.gen_req.wqe_com) ==
++	    CMD_ABORT_XRI_CX) {
++		lpfc_sli_release_iocbq(phba, pwqeIn);
++		return;
++	}
++	lpfc_ncmd = (struct lpfc_io_buf *)pwqeIn->context1;
++
++	spin_lock(&lpfc_ncmd->buf_lock);
++	if (!lpfc_ncmd->nvmeCmd) {
++		spin_unlock(&lpfc_ncmd->buf_lock);
++		lpfc_release_nvme_buf(phba, lpfc_ncmd);
++		return;
++	}
++
++	nCmd = lpfc_ncmd->nvmeCmd;
++	lpfc_printf_log(phba, KERN_INFO, LOG_NVME_IOERR,
++			"6194 NVME Cancel xri %x\n",
++			lpfc_ncmd->cur_iocbq.sli4_xritag);
++
++	nCmd->transferred_length = 0;
++	nCmd->rcv_rsplen = 0;
++	nCmd->status = NVME_SC_INTERNAL;
++	freqpriv = nCmd->private;
++	freqpriv->nvme_buf = NULL;
++	lpfc_ncmd->nvmeCmd = NULL;
++
++	spin_unlock(&lpfc_ncmd->buf_lock);
++	nCmd->done(nCmd);
++
++	/* Call release with XB=1 to queue the IO into the abort list. */
++	lpfc_release_nvme_buf(phba, lpfc_ncmd);
++#endif
++}
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -1391,9 +1391,12 @@ lpfc_sli_cancel_iocbs(struct lpfc_hba *p
+ 
+ 	while (!list_empty(iocblist)) {
+ 		list_remove_head(iocblist, piocb, struct lpfc_iocbq, list);
+-		if (!piocb->iocb_cmpl)
+-			lpfc_sli_release_iocbq(phba, piocb);
+-		else {
++		if (!piocb->iocb_cmpl) {
++			if (piocb->iocb_flag & LPFC_IO_NVME)
++				lpfc_nvme_cancel_iocb(phba, piocb);
++			else
++				lpfc_sli_release_iocbq(phba, piocb);
++		} else {
+ 			piocb->iocb.ulpStatus = ulpstatus;
+ 			piocb->iocb.un.ulpWord[4] = ulpWord4;
+ 			(piocb->iocb_cmpl) (phba, piocb, piocb);
