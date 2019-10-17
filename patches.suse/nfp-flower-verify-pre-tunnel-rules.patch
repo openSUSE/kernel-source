@@ -1,0 +1,204 @@
+From: John Hurley <john.hurley@netronome.com>
+Date: Sun, 4 Aug 2019 16:09:09 +0100
+Subject: nfp: flower: verify pre-tunnel rules
+Patch-mainline: v5.4-rc1
+Git-commit: 120ffd84a9ec2430faba83db274a6946374f4631
+References: bsc#1154353
+
+Pre-tunnel rules must direct packets to an internal port based on L2
+information. Rules that egress to an internal port are already indicated
+by a non-NULL device in its nfp_fl_payload struct. Verfiy the rest of the
+match fields indicate that the rule is a pre-tunnel rule. This requires a
+full match on the destination MAC address, an option VLAN field, and no
+specific matches on other lower layer fields (with the exception of L4
+proto and flags).
+
+If a rule is identified as a pre-tunnel rule then mark it for offload to
+the pre-tunnel table. Similarly, remove it from the pre-tunnel table on
+rule deletion. The actual offloading of these commands is left to a
+following patch.
+
+Signed-off-by: John Hurley <john.hurley@netronome.com>
+Reviewed-by: Simon Horman <simon.horman@netronome.com>
+Acked-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/flower/main.h        |    5 
+ drivers/net/ethernet/netronome/nfp/flower/offload.c     |  103 +++++++++++++++-
+ drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c |   12 +
+ 3 files changed, 115 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@ -283,6 +283,7 @@ struct nfp_fl_payload {
+ 	bool in_hw;
+ 	struct {
+ 		struct net_device *dev;
++		__be16 vlan_tci;
+ 	} pre_tun_rule;
+ };
+ 
+@@ -419,4 +420,8 @@ void
+ nfp_flower_non_repr_priv_put(struct nfp_app *app, struct net_device *netdev);
+ u32 nfp_flower_get_port_id_from_netdev(struct nfp_app *app,
+ 				       struct net_device *netdev);
++int nfp_flower_xmit_pre_tun_flow(struct nfp_app *app,
++				 struct nfp_fl_payload *flow);
++int nfp_flower_xmit_pre_tun_del_flow(struct nfp_app *app,
++				     struct nfp_fl_payload *flow);
+ #endif
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@ -61,6 +61,11 @@
+ 	 NFP_FLOWER_LAYER_IPV4 | \
+ 	 NFP_FLOWER_LAYER_IPV6)
+ 
++#define NFP_FLOWER_PRE_TUN_RULE_FIELDS \
++	(NFP_FLOWER_LAYER_PORT | \
++	 NFP_FLOWER_LAYER_MAC | \
++	 NFP_FLOWER_LAYER_IPV4)
++
+ struct nfp_flower_merge_check {
+ 	union {
+ 		struct {
+@@ -1012,7 +1017,89 @@ nfp_flower_validate_pre_tun_rule(struct
+ 				 struct nfp_fl_payload *flow,
+ 				 struct netlink_ext_ack *extack)
+ {
+-	return -EOPNOTSUPP;
++	struct nfp_flower_meta_tci *meta_tci;
++	struct nfp_flower_mac_mpls *mac;
++	struct nfp_fl_act_head *act;
++	u8 *mask = flow->mask_data;
++	bool vlan = false;
++	int act_offset;
++	u8 key_layer;
++
++	meta_tci = (struct nfp_flower_meta_tci *)flow->unmasked_data;
++	if (meta_tci->tci & cpu_to_be16(NFP_FLOWER_MASK_VLAN_PRESENT)) {
++		u16 vlan_tci = be16_to_cpu(meta_tci->tci);
++
++		vlan_tci &= ~NFP_FLOWER_MASK_VLAN_PRESENT;
++		flow->pre_tun_rule.vlan_tci = cpu_to_be16(vlan_tci);
++		vlan = true;
++	} else {
++		flow->pre_tun_rule.vlan_tci = cpu_to_be16(0xffff);
++	}
++
++	key_layer = meta_tci->nfp_flow_key_layer;
++	if (key_layer & ~NFP_FLOWER_PRE_TUN_RULE_FIELDS) {
++		NL_SET_ERR_MSG_MOD(extack, "unsupported pre-tunnel rule: too many match fields");
++		return -EOPNOTSUPP;
++	}
++
++	if (!(key_layer & NFP_FLOWER_LAYER_MAC)) {
++		NL_SET_ERR_MSG_MOD(extack, "unsupported pre-tunnel rule: MAC fields match required");
++		return -EOPNOTSUPP;
++	}
++
++	/* Skip fields known to exist. */
++	mask += sizeof(struct nfp_flower_meta_tci);
++	mask += sizeof(struct nfp_flower_in_port);
++
++	/* Ensure destination MAC address is fully matched. */
++	mac = (struct nfp_flower_mac_mpls *)mask;
++	if (!is_broadcast_ether_addr(&mac->mac_dst[0])) {
++		NL_SET_ERR_MSG_MOD(extack, "unsupported pre-tunnel rule: dest MAC field must not be masked");
++		return -EOPNOTSUPP;
++	}
++
++	if (key_layer & NFP_FLOWER_LAYER_IPV4) {
++		int ip_flags = offsetof(struct nfp_flower_ipv4, ip_ext.flags);
++		int ip_proto = offsetof(struct nfp_flower_ipv4, ip_ext.proto);
++		int i;
++
++		mask += sizeof(struct nfp_flower_mac_mpls);
++
++		/* Ensure proto and flags are the only IP layer fields. */
++		for (i = 0; i < sizeof(struct nfp_flower_ipv4); i++)
++			if (mask[i] && i != ip_flags && i != ip_proto) {
++				NL_SET_ERR_MSG_MOD(extack, "unsupported pre-tunnel rule: only flags and proto can be matched in ip header");
++				return -EOPNOTSUPP;
++			}
++	}
++
++	/* Action must be a single egress or pop_vlan and egress. */
++	act_offset = 0;
++	act = (struct nfp_fl_act_head *)&flow->action_data[act_offset];
++	if (vlan) {
++		if (act->jump_id != NFP_FL_ACTION_OPCODE_POP_VLAN) {
++			NL_SET_ERR_MSG_MOD(extack, "unsupported pre-tunnel rule: match on VLAN must have VLAN pop as first action");
++			return -EOPNOTSUPP;
++		}
++
++		act_offset += act->len_lw << NFP_FL_LW_SIZ;
++		act = (struct nfp_fl_act_head *)&flow->action_data[act_offset];
++	}
++
++	if (act->jump_id != NFP_FL_ACTION_OPCODE_OUTPUT) {
++		NL_SET_ERR_MSG_MOD(extack, "unsupported pre-tunnel rule: non egress action detected where egress was expected");
++		return -EOPNOTSUPP;
++	}
++
++	act_offset += act->len_lw << NFP_FL_LW_SIZ;
++
++	/* Ensure there are no more actions after egress. */
++	if (act_offset != flow->meta.act_len) {
++		NL_SET_ERR_MSG_MOD(extack, "unsupported pre-tunnel rule: egress is not the last action");
++		return -EOPNOTSUPP;
++	}
++
++	return 0;
+ }
+ 
+ /**
+@@ -1083,8 +1170,11 @@ nfp_flower_add_offload(struct nfp_app *a
+ 		goto err_release_metadata;
+ 	}
+ 
+-	err = nfp_flower_xmit_flow(app, flow_pay,
+-				   NFP_FLOWER_CMSG_TYPE_FLOW_ADD);
++	if (flow_pay->pre_tun_rule.dev)
++		err = nfp_flower_xmit_pre_tun_flow(app, flow_pay);
++	else
++		err = nfp_flower_xmit_flow(app, flow_pay,
++					   NFP_FLOWER_CMSG_TYPE_FLOW_ADD);
+ 	if (err)
+ 		goto err_remove_rhash;
+ 
+@@ -1226,8 +1316,11 @@ nfp_flower_del_offload(struct nfp_app *a
+ 		goto err_free_merge_flow;
+ 	}
+ 
+-	err = nfp_flower_xmit_flow(app, nfp_flow,
+-				   NFP_FLOWER_CMSG_TYPE_FLOW_DEL);
++	if (nfp_flow->pre_tun_rule.dev)
++		err = nfp_flower_xmit_pre_tun_del_flow(app, nfp_flow);
++	else
++		err = nfp_flower_xmit_flow(app, nfp_flow,
++					   NFP_FLOWER_CMSG_TYPE_FLOW_DEL);
+ 	/* Fall through on error. */
+ 
+ err_free_merge_flow:
+--- a/drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c
+@@ -832,6 +832,18 @@ int nfp_tunnel_mac_event_handler(struct
+ 	return NOTIFY_OK;
+ }
+ 
++int nfp_flower_xmit_pre_tun_flow(struct nfp_app *app,
++				 struct nfp_fl_payload *flow)
++{
++	return -EOPNOTSUPP;
++}
++
++int nfp_flower_xmit_pre_tun_del_flow(struct nfp_app *app,
++				     struct nfp_fl_payload *flow)
++{
++	return -EOPNOTSUPP;
++}
++
+ int nfp_tunnel_config_start(struct nfp_app *app)
+ {
+ 	struct nfp_flower_priv *priv = app->priv;
