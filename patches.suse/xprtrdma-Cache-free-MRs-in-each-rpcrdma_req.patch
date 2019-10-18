@@ -1,0 +1,232 @@
+From: Chuck Lever <chuck.lever@oracle.com>
+Date: Mon, 19 Aug 2019 18:47:10 -0400
+Subject: xprtrdma: Cache free MRs in each rpcrdma_req
+Patch-mainline: v5.4-rc1
+Git-commit: 6dc6ec9e04c468d994bff6eb660f3146f94cbfd9
+References: jsc#SLE-8449
+
+Instead of a globally-contended MR free list, cache MRs in each
+rpcrdma_req as they are released. This means acquiring and releasing
+an MR will be lock-free in the common case, even outside the
+transport send lock.
+
+The original idea of per-rpcrdma_req MR free lists was suggested by
+Shirley Ma <shirley.ma@oracle.com> several years ago. I just now
+figured out how to make that idea work with on-demand MR allocation.
+
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/trace/events/rpcrdma.h  |   38 ++++++++++++++++++++++++++++++++++++--
+ net/sunrpc/xprtrdma/frwr_ops.c  |    9 ++++++---
+ net/sunrpc/xprtrdma/rpc_rdma.c  |   11 ++++++++---
+ net/sunrpc/xprtrdma/verbs.c     |   18 +++++++++++++++---
+ net/sunrpc/xprtrdma/xprt_rdma.h |    7 ++++---
+ 5 files changed, 69 insertions(+), 14 deletions(-)
+
+--- a/include/trace/events/rpcrdma.h
++++ b/include/trace/events/rpcrdma.h
+@@ -451,16 +451,50 @@ TRACE_EVENT(xprtrdma_createmrs,
+ 
+ 	TP_STRUCT__entry(
+ 		__field(const void *, r_xprt)
++		__string(addr, rpcrdma_addrstr(r_xprt))
++		__string(port, rpcrdma_portstr(r_xprt))
+ 		__field(unsigned int, count)
+ 	),
+ 
+ 	TP_fast_assign(
+ 		__entry->r_xprt = r_xprt;
+ 		__entry->count = count;
++		__assign_str(addr, rpcrdma_addrstr(r_xprt));
++		__assign_str(port, rpcrdma_portstr(r_xprt));
+ 	),
+ 
+-	TP_printk("r_xprt=%p: created %u MRs",
+-		__entry->r_xprt, __entry->count
++	TP_printk("peer=[%s]:%s r_xprt=%p: created %u MRs",
++		__get_str(addr), __get_str(port), __entry->r_xprt,
++		__entry->count
++	)
++);
++
++TRACE_EVENT(xprtrdma_mr_get,
++	TP_PROTO(
++		const struct rpcrdma_req *req
++	),
++
++	TP_ARGS(req),
++
++	TP_STRUCT__entry(
++		__field(const void *, req)
++		__field(unsigned int, task_id)
++		__field(unsigned int, client_id)
++		__field(u32, xid)
++	),
++
++	TP_fast_assign(
++		const struct rpc_rqst *rqst = &req->rl_slot;
++
++		__entry->req = req;
++		__entry->task_id = rqst->rq_task->tk_pid;
++		__entry->client_id = rqst->rq_task->tk_client->cl_clid;
++		__entry->xid = be32_to_cpu(rqst->rq_xid);
++	),
++
++	TP_printk("task:%u@%u xid=0x%08x req=%p",
++		__entry->task_id, __entry->client_id, __entry->xid,
++		__entry->req
+ 	)
+ );
+ 
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@ -488,8 +488,8 @@ static void frwr_wc_localinv_wake(struct
+ 
+ 	/* WARNING: Only wr_cqe and status are reliable at this point */
+ 	trace_xprtrdma_wc_li_wake(wc, frwr);
+-	complete(&frwr->fr_linv_done);
+ 	__frwr_release_mr(wc, mr);
++	complete(&frwr->fr_linv_done);
+ }
+ 
+ /**
+@@ -587,11 +587,15 @@ static void frwr_wc_localinv_done(struct
+ 	struct rpcrdma_frwr *frwr =
+ 		container_of(cqe, struct rpcrdma_frwr, fr_cqe);
+ 	struct rpcrdma_mr *mr = container_of(frwr, struct rpcrdma_mr, frwr);
++	struct rpcrdma_rep *rep = mr->mr_req->rl_reply;
+ 
+ 	/* WARNING: Only wr_cqe and status are reliable at this point */
+ 	trace_xprtrdma_wc_li_done(wc, frwr);
+-	rpcrdma_complete_rqst(frwr->fr_req->rl_reply);
+ 	__frwr_release_mr(wc, mr);
++
++	/* Ensure @rep is generated before __frwr_release_mr */
++	smp_rmb();
++	rpcrdma_complete_rqst(rep);
+ }
+ 
+ /**
+@@ -624,7 +628,6 @@ void frwr_unmap_async(struct rpcrdma_xpr
+ 
+ 		frwr = &mr->frwr;
+ 		frwr->fr_cqe.done = frwr_wc_localinv;
+-		frwr->fr_req = req;
+ 		last = &frwr->fr_invwr;
+ 		last->next = NULL;
+ 		last->wr_cqe = &frwr->fr_cqe;
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@ -348,9 +348,14 @@ static struct rpcrdma_mr_seg *rpcrdma_mr
+ 						 int nsegs, bool writing,
+ 						 struct rpcrdma_mr **mr)
+ {
+-	*mr = rpcrdma_mr_get(r_xprt);
+-	if (!*mr)
+-		goto out_getmr_err;
++	*mr = rpcrdma_mr_pop(&req->rl_free_mrs);
++	if (!*mr) {
++		*mr = rpcrdma_mr_get(r_xprt);
++		if (!*mr)
++			goto out_getmr_err;
++		trace_xprtrdma_mr_get(req);
++		(*mr)->mr_req = req;
++	}
+ 
+ 	rpcrdma_mr_push(*mr, &req->rl_registered);
+ 	return frwr_map(r_xprt, seg, nsegs, writing, req->rl_slot.rq_xid, *mr);
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -77,6 +77,7 @@
+ static void rpcrdma_sendctx_put_locked(struct rpcrdma_sendctx *sc);
+ static void rpcrdma_mrs_create(struct rpcrdma_xprt *r_xprt);
+ static void rpcrdma_mrs_destroy(struct rpcrdma_buffer *buf);
++static void rpcrdma_mr_free(struct rpcrdma_mr *mr);
+ static struct rpcrdma_regbuf *
+ rpcrdma_regbuf_alloc(size_t size, enum dma_data_direction direction,
+ 		     gfp_t flags);
+@@ -1021,6 +1022,7 @@ struct rpcrdma_req *rpcrdma_req_create(s
+ 	if (!req->rl_recvbuf)
+ 		goto out4;
+ 
++	INIT_LIST_HEAD(&req->rl_free_mrs);
+ 	INIT_LIST_HEAD(&req->rl_registered);
+ 	spin_lock(&buffer->rb_lock);
+ 	list_add(&req->rl_all, &buffer->rb_allreqs);
+@@ -1129,11 +1131,13 @@ static void rpcrdma_rep_destroy(struct r
+  * This function assumes that the caller prevents concurrent device
+  * unload and transport tear-down.
+  */
+-void
+-rpcrdma_req_destroy(struct rpcrdma_req *req)
++void rpcrdma_req_destroy(struct rpcrdma_req *req)
+ {
+ 	list_del(&req->rl_all);
+ 
++	while (!list_empty(&req->rl_free_mrs))
++		rpcrdma_mr_free(rpcrdma_mr_pop(&req->rl_free_mrs));
++
+ 	rpcrdma_regbuf_free(req->rl_recvbuf);
+ 	rpcrdma_regbuf_free(req->rl_sendbuf);
+ 	rpcrdma_regbuf_free(req->rl_rdmabuf);
+@@ -1227,7 +1231,6 @@ rpcrdma_mr_get(struct rpcrdma_xprt *r_xp
+ void rpcrdma_mr_put(struct rpcrdma_mr *mr)
+ {
+ 	struct rpcrdma_xprt *r_xprt = mr->mr_xprt;
+-	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
+ 
+ 	if (mr->mr_dir != DMA_NONE) {
+ 		trace_xprtrdma_mr_unmap(mr);
+@@ -1236,6 +1239,15 @@ void rpcrdma_mr_put(struct rpcrdma_mr *m
+ 		mr->mr_dir = DMA_NONE;
+ 	}
+ 
++	rpcrdma_mr_push(mr, &mr->mr_req->rl_free_mrs);
++}
++
++static void rpcrdma_mr_free(struct rpcrdma_mr *mr)
++{
++	struct rpcrdma_xprt *r_xprt = mr->mr_xprt;
++	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
++
++	mr->mr_req = NULL;
+ 	spin_lock(&buf->rb_mrlock);
+ 	rpcrdma_mr_push(mr, &buf->rb_mrs);
+ 	spin_unlock(&buf->rb_mrlock);
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -234,20 +234,20 @@ struct rpcrdma_sendctx {
+  * An external memory region is any buffer or page that is registered
+  * on the fly (ie, not pre-registered).
+  */
+-struct rpcrdma_req;
+ struct rpcrdma_frwr {
+ 	struct ib_mr			*fr_mr;
+ 	struct ib_cqe			fr_cqe;
+ 	struct completion		fr_linv_done;
+-	struct rpcrdma_req		*fr_req;
+ 	union {
+ 		struct ib_reg_wr	fr_regwr;
+ 		struct ib_send_wr	fr_invwr;
+ 	};
+ };
+ 
++struct rpcrdma_req;
+ struct rpcrdma_mr {
+ 	struct list_head	mr_list;
++	struct rpcrdma_req	*mr_req;
+ 	struct scatterlist	*mr_sg;
+ 	int			mr_nents;
+ 	enum dma_data_direction	mr_dir;
+@@ -325,7 +325,8 @@ struct rpcrdma_req {
+ 	struct list_head	rl_all;
+ 	struct kref		rl_kref;
+ 
+-	struct list_head	rl_registered;	/* registered segments */
++	struct list_head	rl_free_mrs;
++	struct list_head	rl_registered;
+ 	struct rpcrdma_mr_seg	rl_segments[RPCRDMA_MAX_SEGS];
+ };
+ 
