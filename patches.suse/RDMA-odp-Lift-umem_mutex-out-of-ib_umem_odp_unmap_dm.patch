@@ -1,0 +1,124 @@
+From: Jason Gunthorpe <jgg@mellanox.com>
+Date: Tue, 1 Oct 2019 12:38:18 -0300
+Subject: RDMA/odp: Lift umem_mutex out of ib_umem_odp_unmap_dma_pages()
+Patch-mainline: v5.4-rc3
+Git-commit: 9dc775e7f5508f848661bbfb2e15683affb85f24
+References: jsc#SLE-8449
+
+This fixes a race of the form:
+    CPU0                               CPU1
+mlx5_ib_invalidate_range()     mlx5_ib_invalidate_range()
+				 // This one actually makes npages == 0
+				 ib_umem_odp_unmap_dma_pages()
+				 if (npages == 0 && !dying)
+  // This one does nothing
+  ib_umem_odp_unmap_dma_pages()
+  if (npages == 0 && !dying)
+     dying = 1;
+                                    dying = 1;
+				    schedule_work(&umem_odp->work);
+     // Double schedule of the same work
+     schedule_work(&umem_odp->work);  // BOOM
+
+npages and dying must be read and written under the umem_mutex lock.
+
+Since whenever ib_umem_odp_unmap_dma_pages() is called mlx5 must also call
+mlx5_ib_update_xlt, and both need to be done in the same locking region,
+hoist the lock out of unmap.
+
+This avoids an expensive double critical section in
+mlx5_ib_invalidate_range().
+
+Fixes: 81713d3788d2 ("IB/mlx5: Add implicit MR support")
+Link: https://lore.kernel.org/r/20191001153821.23621-4-jgg@ziepe.ca
+Reviewed-by: Artemy Kovalyov <artemyko@mellanox.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/core/umem_odp.c |    6 ++++--
+ drivers/infiniband/hw/mlx5/odp.c   |   12 ++++++++----
+ 2 files changed, 12 insertions(+), 6 deletions(-)
+
+--- a/drivers/infiniband/core/umem_odp.c
++++ b/drivers/infiniband/core/umem_odp.c
+@@ -451,8 +451,10 @@ void ib_umem_odp_release(struct ib_umem_
+ 	 * that the hardware will not attempt to access the MR any more.
+ 	 */
+ 	if (!umem_odp->is_implicit_odp) {
++		mutex_lock(&umem_odp->umem_mutex);
+ 		ib_umem_odp_unmap_dma_pages(umem_odp, ib_umem_start(umem_odp),
+ 					    ib_umem_end(umem_odp));
++		mutex_unlock(&umem_odp->umem_mutex);
+ 		kvfree(umem_odp->dma_list);
+ 		kvfree(umem_odp->page_list);
+ 	}
+@@ -719,6 +721,8 @@ void ib_umem_odp_unmap_dma_pages(struct
+ 	u64 addr;
+ 	struct ib_device *dev = umem_odp->umem.ibdev;
+ 
++	lockdep_assert_held(&umem_odp->umem_mutex);
++
+ 	virt = max_t(u64, virt, ib_umem_start(umem_odp));
+ 	bound = min_t(u64, bound, ib_umem_end(umem_odp));
+ 	/* Note that during the run of this function, the
+@@ -726,7 +730,6 @@ void ib_umem_odp_unmap_dma_pages(struct
+ 	 * faults from completion. We might be racing with other
+ 	 * invalidations, so we must make sure we free each page only
+ 	 * once. */
+-	mutex_lock(&umem_odp->umem_mutex);
+ 	for (addr = virt; addr < bound; addr += BIT(umem_odp->page_shift)) {
+ 		idx = (addr - ib_umem_start(umem_odp)) >> umem_odp->page_shift;
+ 		if (umem_odp->page_list[idx]) {
+@@ -757,7 +760,6 @@ void ib_umem_odp_unmap_dma_pages(struct
+ 			umem_odp->npages--;
+ 		}
+ 	}
+-	mutex_unlock(&umem_odp->umem_mutex);
+ }
+ EXPORT_SYMBOL(ib_umem_odp_unmap_dma_pages);
+ 
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@ -278,7 +278,6 @@ void mlx5_ib_invalidate_range(struct ib_
+ 				   idx - blk_start_idx + 1, 0,
+ 				   MLX5_IB_UPD_XLT_ZAP |
+ 				   MLX5_IB_UPD_XLT_ATOMIC);
+-	mutex_unlock(&umem_odp->umem_mutex);
+ 	/*
+ 	 * We are now sure that the device will not access the
+ 	 * memory. We can safely unmap it, and mark it as dirty if
+@@ -289,10 +288,11 @@ void mlx5_ib_invalidate_range(struct ib_
+ 
+ 	if (unlikely(!umem_odp->npages && mr->parent &&
+ 		     !umem_odp->dying)) {
+-		WRITE_ONCE(umem_odp->dying, 1);
++		umem_odp->dying = 1;
+ 		atomic_inc(&mr->parent->num_leaf_free);
+ 		schedule_work(&umem_odp->work);
+ 	}
++	mutex_unlock(&umem_odp->umem_mutex);
+ }
+ 
+ void mlx5_ib_internal_fill_odp_caps(struct mlx5_ib_dev *dev)
+@@ -555,15 +555,19 @@ void mlx5_ib_free_implicit_mr(struct mlx
+ 		if (mr->parent != imr)
+ 			continue;
+ 
++		mutex_lock(&umem_odp->umem_mutex);
+ 		ib_umem_odp_unmap_dma_pages(umem_odp, ib_umem_start(umem_odp),
+ 					    ib_umem_end(umem_odp));
+ 
+-		if (umem_odp->dying)
++		if (umem_odp->dying) {
++			mutex_unlock(&umem_odp->umem_mutex);
+ 			continue;
++		}
+ 
+-		WRITE_ONCE(umem_odp->dying, 1);
++		umem_odp->dying = 1;
+ 		atomic_inc(&imr->num_leaf_free);
+ 		schedule_work(&umem_odp->work);
++		mutex_unlock(&umem_odp->umem_mutex);
+ 	}
+ 	up_read(&per_mm->umem_rwsem);
+ 

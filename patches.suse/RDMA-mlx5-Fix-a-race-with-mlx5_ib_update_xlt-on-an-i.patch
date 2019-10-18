@@ -1,0 +1,105 @@
+From: Jason Gunthorpe <jgg@mellanox.com>
+Date: Tue, 1 Oct 2019 12:38:17 -0300
+Subject: RDMA/mlx5: Fix a race with mlx5_ib_update_xlt on an implicit MR
+Patch-mainline: v5.4-rc3
+Git-commit: f28b1932eaae183b80bd8c7abecae167a0e5c61a
+References: jsc#SLE-8446
+
+mlx5_ib_update_xlt() must be protected against parallel free of the MR it
+is accessing, also it must be called single threaded while updating the
+HW. Otherwise we can have races of the form:
+
+    CPU0                               CPU1
+  mlx5_ib_update_xlt()
+   mlx5_odp_populate_klm()
+     odp_lookup() == NULL
+     pklm = ZAP
+                                      implicit_mr_get_data()
+ 				        implicit_mr_alloc()
+ 					  <update interval tree>
+					mlx5_ib_update_xlt
+					  mlx5_odp_populate_klm()
+					    odp_lookup() != NULL
+					    pklm = VALID
+					   mlx5_ib_post_send_wait()
+
+    mlx5_ib_post_send_wait() // Replaces VALID with ZAP
+
+This can be solved by putting both the SRCU and the umem_mutex lock around
+every call to mlx5_ib_update_xlt(). This ensures that the content of the
+interval tree relavent to mlx5_odp_populate_klm() (ie mr->parent == mr)
+will not change while it is running, and thus the posted WRs to update the
+KLM will always reflect the correct information.
+
+The race above will resolve by either having CPU1 wait till CPU0 completes
+the ZAP or CPU0 will run after the add and instead store VALID.
+
+The pagefault path adding children already holds the umem_mutex and SRCU,
+so the only missed lock is during MR destruction.
+
+Fixes: 81713d3788d2 ("IB/mlx5: Add implicit MR support")
+Link: https://lore.kernel.org/r/20191001153821.23621-3-jgg@ziepe.ca
+Reviewed-by: Artemy Kovalyov <artemyko@mellanox.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/mlx5/odp.c |   34 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 32 insertions(+), 2 deletions(-)
+
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@ -178,6 +178,29 @@ void mlx5_odp_populate_klm(struct mlx5_k
+ 		return;
+ 	}
+ 
++	/*
++	 * The locking here is pretty subtle. Ideally the implicit children
++	 * list would be protected by the umem_mutex, however that is not
++	 * possible. Instead this uses a weaker update-then-lock pattern:
++	 *
++	 *  srcu_read_lock()
++	 *    <change children list>
++	 *    mutex_lock(umem_mutex)
++	 *     mlx5_ib_update_xlt()
++	 *    mutex_unlock(umem_mutex)
++	 *    destroy lkey
++	 *
++	 * ie any change the children list must be followed by the locked
++	 * update_xlt before destroying.
++	 *
++	 * The umem_mutex provides the acquire/release semantic needed to make
++	 * the children list visible to a racing thread. While SRCU is not
++	 * technically required, using it gives consistent use of the SRCU
++	 * locking around the children list.
++	 */
++	lockdep_assert_held(&to_ib_umem_odp(mr->umem)->umem_mutex);
++	lockdep_assert_held(&mr->dev->mr_srcu);
++
+ 	odp = odp_lookup(offset * MLX5_IMR_MTT_SIZE,
+ 			 nentries * MLX5_IMR_MTT_SIZE, mr);
+ 
+@@ -202,15 +225,22 @@ static void mr_leaf_free_action(struct w
+ 	struct ib_umem_odp *odp = container_of(work, struct ib_umem_odp, work);
+ 	int idx = ib_umem_start(odp) >> MLX5_IMR_MTT_SHIFT;
+ 	struct mlx5_ib_mr *mr = odp->private, *imr = mr->parent;
++	struct ib_umem_odp *odp_imr = to_ib_umem_odp(imr->umem);
++	int srcu_key;
+ 
+ 	mr->parent = NULL;
+ 	synchronize_srcu(&mr->dev->mr_srcu);
+ 
+-	ib_umem_odp_release(odp);
+-	if (imr->live)
++	if (imr->live) {
++		srcu_key = srcu_read_lock(&mr->dev->mr_srcu);
++		mutex_lock(&odp_imr->umem_mutex);
+ 		mlx5_ib_update_xlt(imr, idx, 1, 0,
+ 				   MLX5_IB_UPD_XLT_INDIRECT |
+ 				   MLX5_IB_UPD_XLT_ATOMIC);
++		mutex_unlock(&odp_imr->umem_mutex);
++		srcu_read_unlock(&mr->dev->mr_srcu, srcu_key);
++	}
++	ib_umem_odp_release(odp);
+ 	mlx5_mr_cache_free(mr->dev, mr);
+ 
+ 	if (atomic_dec_and_test(&imr->num_leaf_free))

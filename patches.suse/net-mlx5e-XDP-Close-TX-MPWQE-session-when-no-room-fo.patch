@@ -1,0 +1,296 @@
+From: Shay Agroskin <shayag@mellanox.com>
+Date: Sun, 12 May 2019 18:28:27 +0300
+Subject: net/mlx5e: XDP, Close TX MPWQE session when no room for inline packet
+ left
+Patch-mainline: v5.4-rc1
+Git-commit: 6c085a8aab5183d8658c9a692bcfda3e24195b7a
+References: jsc#SLE-8464
+
+In MPWQE mode, when transmitting packets with XDP, a packet that is smaller
+than a certain size (set to 256 bytes) would be sent inline within its WQE
+TX descriptor (mem-copied), in case the hardware tx queue is congested
+beyond a pre-defined water-mark.
+
+If a MPWQE cannot contain an additional inline packet, we close this
+MPWQE session, and send the packet inlined within the next MPWQE.
+To save some MPWQE session close+open operations, we don't open MPWQE
+sessions that are contiguously smaller than certain size (set to the
+HW MPWQE maximum size). If there isn't enough contiguous room in the
+send queue, we fill it with NOPs and wrap the send queue index around.
+
+This way, qualified packets are always sent inline.
+
+Perf tests:
+Tested packet rate for UDP 64Byte multi-stream
+over two dual port ConnectX-5 100Gbps NICs.
+CPU: Intel(R) Xeon(R) CPU E5-2680 v3 @ 2.50GHz
+
+XDP_TX:
+
+With 24 channels:
+| ------ | bounced packets | inlined packets | inline ratio |
+| before | 113.6Mpps       | 96.3Mpps        | 84%          |
+| after  |   115Mpps       | 99.5Mpps        | 86%          |
+
+With one channel:
+
+| ------ | bounced packets | inlined packets | inline ratio |
+| before | 6.7Mpps         | 0pps            | 0%           |
+| after  | 6.8Mpps         | 0pps            | 0%           |
+
+As we can see, there is improvement in both inline ratio and overall
+packet rate for 24 channels. Also, we see no degradation for the
+one-channel case.
+
+Signed-off-by: Shay Agroskin <shayag@mellanox.com>
+Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en.h       |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c   |   32 +++---------
+ drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h   |   53 +++++++++++++++++----
+ drivers/net/ethernet/mellanox/mlx5/core/en_stats.c |    6 ++
+ drivers/net/ethernet/mellanox/mlx5/core/en_stats.h |    3 +
+ 5 files changed, 63 insertions(+), 33 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -480,8 +480,6 @@ struct mlx5e_xdp_mpwqe {
+ 	struct mlx5e_tx_wqe *wqe;
+ 	u8                   ds_count;
+ 	u8                   pkt_count;
+-	u8                   max_ds_count;
+-	u8                   complete;
+ 	u8                   inline_on;
+ };
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+@@ -179,34 +179,22 @@ static void mlx5e_xdp_mpwqe_session_star
+ 	struct mlx5e_xdp_mpwqe *session = &sq->mpwqe;
+ 	struct mlx5e_xdpsq_stats *stats = sq->stats;
+ 	struct mlx5_wq_cyc *wq = &sq->wq;
+-	u8  wqebbs;
+-	u16 pi;
++	u16 pi, contig_wqebbs;
++
++	pi = mlx5_wq_cyc_ctr2ix(wq, sq->pc);
++	contig_wqebbs = mlx5_wq_cyc_get_contig_wqebbs(wq, pi);
++
++	if (unlikely(contig_wqebbs < MLX5_SEND_WQE_MAX_WQEBBS))
++		mlx5e_fill_xdpsq_frag_edge(sq, wq, pi, contig_wqebbs);
+ 
+ 	mlx5e_xdpsq_fetch_wqe(sq, &session->wqe);
+ 
+ 	prefetchw(session->wqe->data);
+ 	session->ds_count  = MLX5E_XDP_TX_EMPTY_DS_COUNT;
+ 	session->pkt_count = 0;
+-	session->complete  = 0;
+ 
+ 	pi = mlx5_wq_cyc_ctr2ix(wq, sq->pc);
+ 
+-/* The mult of MLX5_SEND_WQE_MAX_WQEBBS * MLX5_SEND_WQEBB_NUM_DS
+- * (16 * 4 == 64) does not fit in the 6-bit DS field of Ctrl Segment.
+- * We use a bound lower that MLX5_SEND_WQE_MAX_WQEBBS to let a
+- * full-session WQE be cache-aligned.
+- */
+-#if L1_CACHE_BYTES < 128
+-#define MLX5E_XDP_MPW_MAX_WQEBBS (MLX5_SEND_WQE_MAX_WQEBBS - 1)
+-#else
+-#define MLX5E_XDP_MPW_MAX_WQEBBS (MLX5_SEND_WQE_MAX_WQEBBS - 2)
+-#endif
+-
+-	wqebbs = min_t(u16, mlx5_wq_cyc_get_contig_wqebbs(wq, pi),
+-		       MLX5E_XDP_MPW_MAX_WQEBBS);
+-
+-	session->max_ds_count = MLX5_SEND_WQEBB_NUM_DS * wqebbs;
+-
+ 	mlx5e_xdp_update_inline_state(sq);
+ 
+ 	stats->mpwqe++;
+@@ -244,7 +232,7 @@ static int mlx5e_xmit_xdp_frame_check_mp
+ {
+ 	if (unlikely(!sq->mpwqe.wqe)) {
+ 		if (unlikely(!mlx5e_wqc_has_room_for(&sq->wq, sq->cc, sq->pc,
+-						     MLX5_SEND_WQE_MAX_WQEBBS))) {
++						     MLX5E_XDPSQ_STOP_ROOM))) {
+ 			/* SQ is full, ring doorbell */
+ 			mlx5e_xmit_xdp_doorbell(sq);
+ 			sq->stats->full++;
+@@ -285,8 +273,8 @@ static bool mlx5e_xmit_xdp_frame_mpwqe(s
+ 
+ 	mlx5e_xdp_mpwqe_add_dseg(sq, xdptxd, stats);
+ 
+-	if (unlikely(session->complete ||
+-		     session->ds_count == session->max_ds_count))
++	if (unlikely(mlx5e_xdp_no_room_for_inline_pkt(session) ||
++		     session->ds_count == MLX5E_XDP_MPW_MAX_NUM_DS))
+ 		mlx5e_xdp_mpwqe_complete(sq);
+ 
+ 	mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo, xdpi);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+@@ -40,6 +40,26 @@
+ 	(sizeof(struct mlx5e_tx_wqe) / MLX5_SEND_WQE_DS)
+ #define MLX5E_XDP_TX_DS_COUNT (MLX5E_XDP_TX_EMPTY_DS_COUNT + 1 /* SG DS */)
+ 
++#define MLX5E_XDPSQ_STOP_ROOM (MLX5E_SQ_STOP_ROOM)
++
++#define MLX5E_XDP_INLINE_WQE_SZ_THRSD (256 - sizeof(struct mlx5_wqe_inline_seg))
++#define MLX5E_XDP_INLINE_WQE_MAX_DS_CNT \
++	DIV_ROUND_UP(MLX5E_XDP_INLINE_WQE_SZ_THRSD, MLX5_SEND_WQE_DS)
++
++/* The mult of MLX5_SEND_WQE_MAX_WQEBBS * MLX5_SEND_WQEBB_NUM_DS
++ * (16 * 4 == 64) does not fit in the 6-bit DS field of Ctrl Segment.
++ * We use a bound lower that MLX5_SEND_WQE_MAX_WQEBBS to let a
++ * full-session WQE be cache-aligned.
++ */
++#if L1_CACHE_BYTES < 128
++#define MLX5E_XDP_MPW_MAX_WQEBBS (MLX5_SEND_WQE_MAX_WQEBBS - 1)
++#else
++#define MLX5E_XDP_MPW_MAX_WQEBBS (MLX5_SEND_WQE_MAX_WQEBBS - 2)
++#endif
++
++#define MLX5E_XDP_MPW_MAX_NUM_DS \
++	(MLX5E_XDP_MPW_MAX_WQEBBS * MLX5_SEND_WQEBB_NUM_DS)
++
+ struct mlx5e_xsk_param;
+ int mlx5e_xdp_max_mtu(struct mlx5e_params *params, struct mlx5e_xsk_param *xsk);
+ bool mlx5e_xdp_handle(struct mlx5e_rq *rq, struct mlx5e_dma_info *di,
+@@ -114,6 +134,30 @@ static inline void mlx5e_xdp_update_inli
+ 		session->inline_on = 1;
+ }
+ 
++static inline bool
++mlx5e_xdp_no_room_for_inline_pkt(struct mlx5e_xdp_mpwqe *session)
++{
++	return session->inline_on &&
++	       session->ds_count + MLX5E_XDP_INLINE_WQE_MAX_DS_CNT > MLX5E_XDP_MPW_MAX_NUM_DS;
++}
++
++static inline void
++mlx5e_fill_xdpsq_frag_edge(struct mlx5e_xdpsq *sq, struct mlx5_wq_cyc *wq,
++			   u16 pi, u16 nnops)
++{
++	struct mlx5e_xdp_wqe_info *edge_wi, *wi = &sq->db.wqe_info[pi];
++
++	edge_wi = wi + nnops;
++	/* fill sq frag edge with nops to avoid wqe wrapping two pages */
++	for (; wi < edge_wi; wi++) {
++		wi->num_wqebbs = 1;
++		wi->num_pkts   = 0;
++		mlx5e_post_nop(wq, sq->sqn, &sq->pc);
++	}
++
++	sq->stats->nops += nnops;
++}
++
+ static inline void
+ mlx5e_xdp_mpwqe_add_dseg(struct mlx5e_xdpsq *sq,
+ 			 struct mlx5e_xdp_xmit_data *xdptxd,
+@@ -126,20 +170,12 @@ mlx5e_xdp_mpwqe_add_dseg(struct mlx5e_xd
+ 
+ 	session->pkt_count++;
+ 
+-#define MLX5E_XDP_INLINE_WQE_SZ_THRSD (256 - sizeof(struct mlx5_wqe_inline_seg))
+-
+ 	if (session->inline_on && dma_len <= MLX5E_XDP_INLINE_WQE_SZ_THRSD) {
+ 		struct mlx5_wqe_inline_seg *inline_dseg =
+ 			(struct mlx5_wqe_inline_seg *)dseg;
+ 		u16 ds_len = sizeof(*inline_dseg) + dma_len;
+ 		u16 ds_cnt = DIV_ROUND_UP(ds_len, MLX5_SEND_WQE_DS);
+ 
+-		if (unlikely(session->ds_count + ds_cnt > session->max_ds_count)) {
+-			/* Not enough space for inline wqe, send with memory pointer */
+-			session->complete = true;
+-			goto no_inline;
+-		}
+-
+ 		inline_dseg->byte_count = cpu_to_be32(dma_len | MLX5_INLINE_SEG);
+ 		memcpy(inline_dseg->data, xdptxd->data, dma_len);
+ 
+@@ -148,7 +184,6 @@ mlx5e_xdp_mpwqe_add_dseg(struct mlx5e_xd
+ 		return;
+ 	}
+ 
+-no_inline:
+ 	dseg->addr       = cpu_to_be64(xdptxd->dma_addr);
+ 	dseg->byte_count = cpu_to_be32(dma_len);
+ 	dseg->lkey       = sq->mkey_be;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+@@ -74,6 +74,7 @@ static const struct counter_desc sw_stat
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_xdp_tx_xmit) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_xdp_tx_mpwqe) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_xdp_tx_inlnw) },
++	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_xdp_tx_nops) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_xdp_tx_full) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_xdp_tx_err) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_xdp_tx_cqe) },
+@@ -90,6 +91,7 @@ static const struct counter_desc sw_stat
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_xdp_xmit) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_xdp_mpwqe) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_xdp_inlnw) },
++	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_xdp_nops) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_xdp_full) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_xdp_err) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_xdp_cqes) },
+@@ -200,6 +202,7 @@ static void mlx5e_grp_sw_update_stats(st
+ 		s->rx_xdp_tx_xmit  += xdpsq_stats->xmit;
+ 		s->rx_xdp_tx_mpwqe += xdpsq_stats->mpwqe;
+ 		s->rx_xdp_tx_inlnw += xdpsq_stats->inlnw;
++		s->rx_xdp_tx_nops  += xdpsq_stats->nops;
+ 		s->rx_xdp_tx_full  += xdpsq_stats->full;
+ 		s->rx_xdp_tx_err   += xdpsq_stats->err;
+ 		s->rx_xdp_tx_cqe   += xdpsq_stats->cqes;
+@@ -227,6 +230,7 @@ static void mlx5e_grp_sw_update_stats(st
+ 		s->tx_xdp_xmit    += xdpsq_red_stats->xmit;
+ 		s->tx_xdp_mpwqe   += xdpsq_red_stats->mpwqe;
+ 		s->tx_xdp_inlnw   += xdpsq_red_stats->inlnw;
++		s->tx_xdp_nops	  += xdpsq_red_stats->nops;
+ 		s->tx_xdp_full    += xdpsq_red_stats->full;
+ 		s->tx_xdp_err     += xdpsq_red_stats->err;
+ 		s->tx_xdp_cqes    += xdpsq_red_stats->cqes;
+@@ -1331,6 +1335,7 @@ static const struct counter_desc rq_xdps
+ 	{ MLX5E_DECLARE_RQ_XDPSQ_STAT(struct mlx5e_xdpsq_stats, xmit) },
+ 	{ MLX5E_DECLARE_RQ_XDPSQ_STAT(struct mlx5e_xdpsq_stats, mpwqe) },
+ 	{ MLX5E_DECLARE_RQ_XDPSQ_STAT(struct mlx5e_xdpsq_stats, inlnw) },
++	{ MLX5E_DECLARE_RQ_XDPSQ_STAT(struct mlx5e_xdpsq_stats, nops) },
+ 	{ MLX5E_DECLARE_RQ_XDPSQ_STAT(struct mlx5e_xdpsq_stats, full) },
+ 	{ MLX5E_DECLARE_RQ_XDPSQ_STAT(struct mlx5e_xdpsq_stats, err) },
+ 	{ MLX5E_DECLARE_RQ_XDPSQ_STAT(struct mlx5e_xdpsq_stats, cqes) },
+@@ -1340,6 +1345,7 @@ static const struct counter_desc xdpsq_s
+ 	{ MLX5E_DECLARE_XDPSQ_STAT(struct mlx5e_xdpsq_stats, xmit) },
+ 	{ MLX5E_DECLARE_XDPSQ_STAT(struct mlx5e_xdpsq_stats, mpwqe) },
+ 	{ MLX5E_DECLARE_XDPSQ_STAT(struct mlx5e_xdpsq_stats, inlnw) },
++	{ MLX5E_DECLARE_XDPSQ_STAT(struct mlx5e_xdpsq_stats, nops) },
+ 	{ MLX5E_DECLARE_XDPSQ_STAT(struct mlx5e_xdpsq_stats, full) },
+ 	{ MLX5E_DECLARE_XDPSQ_STAT(struct mlx5e_xdpsq_stats, err) },
+ 	{ MLX5E_DECLARE_XDPSQ_STAT(struct mlx5e_xdpsq_stats, cqes) },
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@ -81,6 +81,7 @@ struct mlx5e_sw_stats {
+ 	u64 rx_xdp_tx_xmit;
+ 	u64 rx_xdp_tx_mpwqe;
+ 	u64 rx_xdp_tx_inlnw;
++	u64 rx_xdp_tx_nops;
+ 	u64 rx_xdp_tx_full;
+ 	u64 rx_xdp_tx_err;
+ 	u64 rx_xdp_tx_cqe;
+@@ -97,6 +98,7 @@ struct mlx5e_sw_stats {
+ 	u64 tx_xdp_xmit;
+ 	u64 tx_xdp_mpwqe;
+ 	u64 tx_xdp_inlnw;
++	u64 tx_xdp_nops;
+ 	u64 tx_xdp_full;
+ 	u64 tx_xdp_err;
+ 	u64 tx_xdp_cqes;
+@@ -288,6 +290,7 @@ struct mlx5e_xdpsq_stats {
+ 	u64 xmit;
+ 	u64 mpwqe;
+ 	u64 inlnw;
++	u64 nops;
+ 	u64 full;
+ 	u64 err;
+ 	/* dirtied @completion */

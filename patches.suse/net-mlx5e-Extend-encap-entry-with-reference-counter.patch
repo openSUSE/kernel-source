@@ -1,0 +1,235 @@
+From: Vlad Buslov <vladbu@mellanox.com>
+Date: Sun, 3 Jun 2018 20:31:47 +0300
+Subject: net/mlx5e: Extend encap entry with reference counter
+Patch-mainline: v5.4-rc1
+Git-commit: 948993f2beebbdc1c9d926cfdad9827cf6bb67c0
+References: jsc#SLE-8464
+
+List of flows attached to encap entry is used as implicit reference
+counter (encap entry is deallocated when list becomes free) and as a
+mechanism to obtain encap entry that flow is attached to (through list
+head). This is not safe when concurrent modification of list of flows
+attached to encap entry is possible. Proper atomic reference counter is
+required to support concurrent access.
+
+As a preparation for extending encap with reference counting, extract code
+that lookups and deletes encap entry into standalone put/get helpers. In
+order to remove this dependency on external locking, extend encap entry
+with reference counter to manage its lifetime and extend flow structure
+with direct pointer to encap entry that flow is attached to.
+
+Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+Reviewed-by: Jianbo Liu <jianbol@mellanox.com>
+Reviewed-by: Roi Dayan <roid@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_rep.c |    5 +
+ drivers/net/ethernet/mellanox/mlx5/core/en_rep.h |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/en_tc.c  |   84 +++++++++++++++--------
+ drivers/net/ethernet/mellanox/mlx5/core/en_tc.h  |    2 
+ 4 files changed, 64 insertions(+), 28 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@ -613,12 +613,17 @@ static void mlx5e_rep_neigh_update(struc
+ 	neigh_connected = (nud_state & NUD_VALID) && !dead;
+ 
+ 	list_for_each_entry(e, &nhe->encap_list, encap_list) {
++		if (!mlx5e_encap_take(e))
++			continue;
++
+ 		encap_connected = !!(e->flags & MLX5_ENCAP_ENTRY_VALID);
+ 		priv = netdev_priv(e->out_dev);
+ 
+ 		if (encap_connected != neigh_connected ||
+ 		    !ether_addr_equal(e->h_dest, ha))
+ 			mlx5e_rep_update_flows(priv, e, neigh_connected, ha);
++
++		mlx5e_encap_put(priv, e);
+ 	}
+ 	mlx5e_rep_neigh_entry_release(nhe);
+ 	rtnl_unlock();
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+@@ -164,6 +164,7 @@ struct mlx5e_encap_entry {
+ 	u8 flags;
+ 	char *encap_header;
+ 	int encap_size;
++	refcount_t refcnt;
+ };
+ 
+ struct mlx5e_rep_sq {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -103,6 +103,7 @@ enum {
+  *        container_of(helper item, containing struct type, helper field[index])
+  */
+ struct encap_flow_item {
++	struct mlx5e_encap_entry *e; /* attached encap instance */
+ 	struct list_head list;
+ 	int index;
+ };
+@@ -1433,8 +1434,11 @@ void mlx5e_tc_update_neigh_used_value(st
+ 
+ 	list_for_each_entry(e, &nhe->encap_list, encap_list) {
+ 		struct encap_flow_item *efi, *tmp;
+-		if (!(e->flags & MLX5_ENCAP_ENTRY_VALID))
++
++		if (!(e->flags & MLX5_ENCAP_ENTRY_VALID) ||
++		    !mlx5e_encap_take(e))
+ 			continue;
++
+ 		list_for_each_entry_safe(efi, tmp, &e->flows, list) {
+ 			flow = container_of(efi, struct mlx5e_tc_flow,
+ 					    encaps[efi->index]);
+@@ -1453,6 +1457,8 @@ void mlx5e_tc_update_neigh_used_value(st
+ 
+ 			mlx5e_flow_put(netdev_priv(e->out_dev), flow);
+ 		}
++
++		mlx5e_encap_put(netdev_priv(e->out_dev), e);
+ 		if (neigh_used)
+ 			break;
+ 	}
+@@ -1472,29 +1478,33 @@ void mlx5e_tc_update_neigh_used_value(st
+ 	}
+ }
+ 
++void mlx5e_encap_put(struct mlx5e_priv *priv, struct mlx5e_encap_entry *e)
++{
++	if (!refcount_dec_and_test(&e->refcnt))
++		return;
++
++	WARN_ON(!list_empty(&e->flows));
++	mlx5e_rep_encap_entry_detach(netdev_priv(e->out_dev), e);
++
++	if (e->flags & MLX5_ENCAP_ENTRY_VALID)
++		mlx5_packet_reformat_dealloc(priv->mdev, e->encap_id);
++
++	hash_del_rcu(&e->encap_hlist);
++	kfree(e->encap_header);
++	kfree(e);
++}
++
+ static void mlx5e_detach_encap(struct mlx5e_priv *priv,
+ 			       struct mlx5e_tc_flow *flow, int out_index)
+ {
+-	struct list_head *next = flow->encaps[out_index].list.next;
+-
+ 	/* flow wasn't fully initialized */
+-	if (list_empty(&flow->encaps[out_index].list))
++	if (!flow->encaps[out_index].e)
+ 		return;
+ 
+ 	list_del(&flow->encaps[out_index].list);
+-	if (list_empty(next)) {
+-		struct mlx5e_encap_entry *e;
+-
+-		e = list_entry(next, struct mlx5e_encap_entry, flows);
+-		mlx5e_rep_encap_entry_detach(netdev_priv(e->out_dev), e);
+-
+-		if (e->flags & MLX5_ENCAP_ENTRY_VALID)
+-			mlx5_packet_reformat_dealloc(priv->mdev, e->encap_id);
+ 
+-		hash_del_rcu(&e->encap_hlist);
+-		kfree(e->encap_header);
+-		kfree(e);
+-	}
++	mlx5e_encap_put(priv, flow->encaps[out_index].e);
++	flow->encaps[out_index].e = NULL;
+ }
+ 
+ static void __mlx5e_tc_del_fdb_peer_flow(struct mlx5e_tc_flow *flow)
+@@ -2826,6 +2836,31 @@ static bool is_merged_eswitch_dev(struct
+ 
+ 
+ 
++bool mlx5e_encap_take(struct mlx5e_encap_entry *e)
++{
++	return refcount_inc_not_zero(&e->refcnt);
++}
++
++static struct mlx5e_encap_entry *
++mlx5e_encap_get(struct mlx5e_priv *priv, struct encap_key *key,
++		uintptr_t hash_key)
++{
++	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++	struct mlx5e_encap_entry *e;
++	struct encap_key e_key;
++
++	hash_for_each_possible_rcu(esw->offloads.encap_tbl, e,
++				   encap_hlist, hash_key) {
++		e_key.ip_tun_key = &e->tun_info->key;
++		e_key.tc_tunnel = e->tunnel;
++		if (!cmp_encap_info(&e_key, key) &&
++		    mlx5e_encap_take(e))
++			return e;
++	}
++
++	return NULL;
++}
++
+ static int mlx5e_attach_encap(struct mlx5e_priv *priv,
+ 			      struct mlx5e_tc_flow *flow,
+ 			      struct net_device *mirred_dev,
+@@ -2838,11 +2873,10 @@ static int mlx5e_attach_encap(struct mlx
+ 	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
+ 	struct mlx5e_tc_flow_parse_attr *parse_attr;
+ 	const struct ip_tunnel_info *tun_info;
+-	struct encap_key key, e_key;
++	struct encap_key key;
+ 	struct mlx5e_encap_entry *e;
+ 	unsigned short family;
+ 	uintptr_t hash_key;
+-	bool found = false;
+ 	int err = 0;
+ 
+ 	parse_attr = attr->parse_attr;
+@@ -2857,24 +2891,17 @@ static int mlx5e_attach_encap(struct mlx
+ 
+ 	hash_key = hash_encap_info(&key);
+ 
+-	hash_for_each_possible_rcu(esw->offloads.encap_tbl, e,
+-				   encap_hlist, hash_key) {
+-		e_key.ip_tun_key = &e->tun_info->key;
+-		e_key.tc_tunnel = e->tunnel;
+-		if (!cmp_encap_info(&e_key, &key)) {
+-			found = true;
+-			break;
+-		}
+-	}
++	e = mlx5e_encap_get(priv, &key, hash_key);
+ 
+ 	/* must verify if encap is valid or not */
+-	if (found)
++	if (e)
+ 		goto attach_flow;
+ 
+ 	e = kzalloc(sizeof(*e), GFP_KERNEL);
+ 	if (!e)
+ 		return -ENOMEM;
+ 
++	refcount_set(&e->refcnt, 1);
+ 	e->tun_info = tun_info;
+ 	err = mlx5e_tc_tun_init_encap_attr(mirred_dev, priv, e, extack);
+ 	if (err)
+@@ -2893,6 +2920,7 @@ static int mlx5e_attach_encap(struct mlx
+ 	hash_add_rcu(esw->offloads.encap_tbl, &e->encap_hlist, hash_key);
+ 
+ attach_flow:
++	flow->encaps[out_index].e = e;
+ 	list_add(&flow->encaps[out_index].list, &e->flows);
+ 	flow->encaps[out_index].index = out_index;
+ 	*encap_dev = e->out_dev;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+@@ -75,6 +75,8 @@ void mlx5e_tc_encap_flows_add(struct mlx
+ 			      struct mlx5e_encap_entry *e);
+ void mlx5e_tc_encap_flows_del(struct mlx5e_priv *priv,
+ 			      struct mlx5e_encap_entry *e);
++bool mlx5e_encap_take(struct mlx5e_encap_entry *e);
++void mlx5e_encap_put(struct mlx5e_priv *priv, struct mlx5e_encap_entry *e);
+ 
+ struct mlx5e_neigh_hash_entry;
+ void mlx5e_tc_update_neigh_used_value(struct mlx5e_neigh_hash_entry *nhe);
