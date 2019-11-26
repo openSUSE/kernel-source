@@ -243,6 +243,7 @@ remotes = (
     Head(RepoURL("vkoul/soundwire.git"),"fixes"),
     Head(RepoURL("vkoul/soundwire.git"),"next"),
     Head(RepoURL("arm64/linux.git"), "for-next/core"),
+    Head(RepoURL("git://git.infradead.org/users/hch/dma-mapping.git"), "for-next"),
 )
 
 
