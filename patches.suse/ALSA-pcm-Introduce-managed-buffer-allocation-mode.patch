@@ -1,0 +1,230 @@
+From 0dba808eae2627f40024872d2f02f75f0d2b0790 Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Sun, 17 Nov 2019 09:53:01 +0100
+Subject: [PATCH] ALSA: pcm: Introduce managed buffer allocation mode
+Git-commit: 0dba808eae2627f40024872d2f02f75f0d2b0790
+Patch-mainline: v5.5-rc1
+References: git-fixes
+
+This patch adds the support for the feature to automatically allocate
+and free PCM buffers, so called "managed buffer allocation" mode.
+It's set up via new PCM helpers, snd_pcm_set_managed_buffer() and
+snd_pcm_set_managed_buffer_all(), both of which correspond to the
+existing preallocator helpers, snd_pcm_lib_preallocate_pages() and
+snd_pcm_lib_preallocate_pages_for_all().  When the new helper is used,
+it not only performs the pre-allocation of buffers, but also it
+manages to call snd_pcm_lib_malloc_pages() before the PCM hw_params
+ops and snd_lib_pcm_free() after the PCM hw_free ops inside PCM core,
+respectively.  This allows drivers to drop the explicit calls of the
+memory allocation / release functions, and it will be a good amount of
+code reduction in the end of this patch series.
+
+When the PCM substream is set to the managed buffer allocation mode,
+the managed_buffer_alloc flag is set in the substream object.  Since
+some drivers want to know when a buffer is newly allocated or
+re-allocated at hw_params callback (e.g. want to set up the additional
+stuff for the given buffer only at allocation time), now PCM core
+turns on buffer_changed flag when the buffer has changed.
+
+The standard conversions to use the new API will be straightforward:
+- Replace snd_pcm_lib_preallocate*() calls with the corresponding
+  snd_pcm_set_managed_buffer*(); the arguments should be unchanged
+- Drop superfluous snd_pcm_lib_malloc() and snd_pcm_lib_free() calls;
+  the check of snd_pcm_lib_malloc() returns should be replaced with
+  the check of runtime->buffer_changed flag.
+- If hw_params or hw_free becomes empty, drop them from PCM ops
+
+Link: https://lore.kernel.org/r/20191117085308.23915-2-tiwai@suse.de
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ include/sound/pcm.h     |    8 ++++
+ sound/core/pcm_memory.c |   83 ++++++++++++++++++++++++++++++++++++++++--------
+ sound/core/pcm_native.c |   12 ++++++
+ 3 files changed, 90 insertions(+), 13 deletions(-)
+
+--- a/include/sound/pcm.h
++++ b/include/sound/pcm.h
+@@ -409,6 +409,7 @@ struct snd_pcm_runtime {
+ 	size_t dma_bytes;		/* size of DMA area */
+ 
+ 	struct snd_dma_buffer *dma_buffer_p;	/* allocated buffer */
++	unsigned int buffer_changed:1;	/* buffer allocation changed; set only in managed mode */
+ 
+ 	/* -- audio timestamp config -- */
+ 	struct snd_pcm_audio_tstamp_config audio_tstamp_config;
+@@ -470,6 +471,7 @@ struct snd_pcm_substream {
+ #endif /* CONFIG_SND_VERBOSE_PROCFS */
+ 	/* misc flags */
+ 	unsigned int hw_opened: 1;
++	unsigned int managed_buffer_alloc:1;
+ };
+ 
+ #define SUBSTREAM_BUSY(substream) ((substream)->ref_count > 0)
+@@ -1181,6 +1183,12 @@ void snd_pcm_lib_preallocate_pages_for_a
+ int snd_pcm_lib_malloc_pages(struct snd_pcm_substream *substream, size_t size);
+ int snd_pcm_lib_free_pages(struct snd_pcm_substream *substream);
+ 
++void snd_pcm_set_managed_buffer(struct snd_pcm_substream *substream, int type,
++				struct device *data, size_t size, size_t max);
++void snd_pcm_set_managed_buffer_all(struct snd_pcm *pcm, int type,
++				    struct device *data,
++				    size_t size, size_t max);
++
+ int _snd_pcm_lib_alloc_vmalloc_buffer(struct snd_pcm_substream *substream,
+ 				      size_t size, gfp_t gfp_flags);
+ int snd_pcm_lib_free_vmalloc_buffer(struct snd_pcm_substream *substream);
+--- a/sound/core/pcm_memory.c
++++ b/sound/core/pcm_memory.c
+@@ -193,9 +193,15 @@ static inline void preallocate_info_init
+ /*
+  * pre-allocate the buffer and create a proc file for the substream
+  */
+-static void snd_pcm_lib_preallocate_pages1(struct snd_pcm_substream *substream,
+-					  size_t size, size_t max)
++static void preallocate_pages(struct snd_pcm_substream *substream,
++			      int type, struct device *data,
++			      size_t size, size_t max, bool managed)
+ {
++	if (snd_BUG_ON(substream->dma_buffer.dev.type))
++		return;
++
++	substream->dma_buffer.dev.type = type;
++	substream->dma_buffer.dev.dev = data;
+ 
+ 	if (size > 0 && preallocate_dma && substream->number < maximum_substreams)
+ 		preallocate_pcm_pages(substream, size);
+@@ -205,8 +211,23 @@ static void snd_pcm_lib_preallocate_page
+ 	substream->dma_max = max;
+ 	if (max > 0)
+ 		preallocate_info_init(substream);
++	if (managed)
++		substream->managed_buffer_alloc = 1;
+ }
+ 
++static void preallocate_pages_for_all(struct snd_pcm *pcm, int type,
++				      void *data, size_t size, size_t max,
++				      bool managed)
++{
++	struct snd_pcm_substream *substream;
++	int stream;
++
++	for (stream = 0; stream < 2; stream++)
++		for (substream = pcm->streams[stream].substream; substream;
++		     substream = substream->next)
++			preallocate_pages(substream, type, data, size, max,
++					  managed);
++}
+ 
+ /**
+  * snd_pcm_lib_preallocate_pages - pre-allocation for the given DMA type
+@@ -222,11 +243,7 @@ void snd_pcm_lib_preallocate_pages(struc
+ 				  int type, struct device *data,
+ 				  size_t size, size_t max)
+ {
+-	if (snd_BUG_ON(substream->dma_buffer.dev.type))
+-		return;
+-	substream->dma_buffer.dev.type = type;
+-	substream->dma_buffer.dev.dev = data;
+-	snd_pcm_lib_preallocate_pages1(substream, size, max);
++	preallocate_pages(substream, type, data, size, max, false);
+ }
+ EXPORT_SYMBOL(snd_pcm_lib_preallocate_pages);
+ 
+@@ -245,15 +262,55 @@ void snd_pcm_lib_preallocate_pages_for_a
+ 					  int type, void *data,
+ 					  size_t size, size_t max)
+ {
+-	struct snd_pcm_substream *substream;
+-	int stream;
+-
+-	for (stream = 0; stream < 2; stream++)
+-		for (substream = pcm->streams[stream].substream; substream; substream = substream->next)
+-			snd_pcm_lib_preallocate_pages(substream, type, data, size, max);
++	preallocate_pages_for_all(pcm, type, data, size, max, false);
+ }
+ EXPORT_SYMBOL(snd_pcm_lib_preallocate_pages_for_all);
+ 
++/**
++ * snd_pcm_set_managed_buffer - set up buffer management for a substream
++ * @substream: the pcm substream instance
++ * @type: DMA type (SNDRV_DMA_TYPE_*)
++ * @data: DMA type dependent data
++ * @size: the requested pre-allocation size in bytes
++ * @max: the max. allowed pre-allocation size
++ *
++ * Do pre-allocation for the given DMA buffer type, and set the managed
++ * buffer allocation mode to the given substream.
++ * In this mode, PCM core will allocate a buffer automatically before PCM
++ * hw_params ops call, and release the buffer after PCM hw_free ops call
++ * as well, so that the driver doesn't need to invoke the allocation and
++ * the release explicitly in its callback.
++ * When a buffer is actually allocated before the PCM hw_params call, it
++ * turns on the runtime buffer_changed flag for drivers changing their h/w
++ * parameters accordingly.
++ */
++void snd_pcm_set_managed_buffer(struct snd_pcm_substream *substream, int type,
++				struct device *data, size_t size, size_t max)
++{
++	preallocate_pages(substream, type, data, size, max, true);
++}
++EXPORT_SYMBOL(snd_pcm_set_managed_buffer);
++
++/**
++ * snd_pcm_set_managed_buffer_all - set up buffer management for all substreams
++ *	for all substreams
++ * @pcm: the pcm instance
++ * @type: DMA type (SNDRV_DMA_TYPE_*)
++ * @data: DMA type dependent data
++ * @size: the requested pre-allocation size in bytes
++ * @max: the max. allowed pre-allocation size
++ *
++ * Do pre-allocation to all substreams of the given pcm for the specified DMA
++ * type and size, and set the managed_buffer_alloc flag to each substream.
++ */
++void snd_pcm_set_managed_buffer_all(struct snd_pcm *pcm, int type,
++				    struct device *data,
++				    size_t size, size_t max)
++{
++	preallocate_pages_for_all(pcm, type, data, size, max, true);
++}
++EXPORT_SYMBOL(snd_pcm_set_managed_buffer_all);
++
+ #ifdef CONFIG_SND_DMA_SGBUF
+ /**
+  * snd_pcm_sgbuf_ops_page - get the page struct at the given offset
+--- a/sound/core/pcm_native.c
++++ b/sound/core/pcm_native.c
+@@ -662,6 +662,14 @@ static int snd_pcm_hw_params(struct snd_
+ 	if (err < 0)
+ 		goto _error;
+ 
++	if (substream->managed_buffer_alloc) {
++		err = snd_pcm_lib_malloc_pages(substream,
++					       params_buffer_bytes(params));
++		if (err < 0)
++			goto _error;
++		runtime->buffer_changed = err > 0;
++	}
++
+ 	if (substream->ops->hw_params != NULL) {
+ 		err = substream->ops->hw_params(substream, params);
+ 		if (err < 0)
+@@ -723,6 +731,8 @@ static int snd_pcm_hw_params(struct snd_
+ 	snd_pcm_set_state(substream, SNDRV_PCM_STATE_OPEN);
+ 	if (substream->ops->hw_free != NULL)
+ 		substream->ops->hw_free(substream);
++	if (substream->managed_buffer_alloc)
++		snd_pcm_lib_free_pages(substream);
+ 	return err;
+ }
+ 
+@@ -769,6 +779,8 @@ static int snd_pcm_hw_free(struct snd_pc
+ 		return -EBADFD;
+ 	if (substream->ops->hw_free)
+ 		result = substream->ops->hw_free(substream);
++	if (substream->managed_buffer_alloc)
++		snd_pcm_lib_free_pages(substream);
+ 	snd_pcm_set_state(substream, SNDRV_PCM_STATE_OPEN);
+ 	pm_qos_remove_request(&substream->latency_pm_qos_req);
+ 	return result;
