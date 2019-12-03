@@ -292,8 +292,12 @@ Example of a merge conflict resolution involving sorted patches in series.conf
 When merging or rebasing between commits in kernel-source it is possible that
 there is a conflict involving sorted patches in series.conf. This type of
 conflict can be solved automatically using the git mergetool interface with
-the script merge_tool.py. Please see the header of that file for installation
-instructions.
+the script merge_tool.py. To set up the merge tool, add a section like this
+to git config:
+
+    [mergetool "git-sort"]
+        cmd = scripts/git_sort/merge_tool.py $LOCAL $BASE $REMOTE $MERGED
+        trustExitCode = true
 
 When using the merge tool, the LINUX_GIT reference repository must fetch from
 the repositories which are the upstream source of patches which were added in
