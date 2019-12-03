@@ -203,7 +203,6 @@ remotes = (
     Head(RepoURL("dhowells/linux-fs.git"), "keys-uefi"),
     Head(RepoURL("tytso/ext4.git"), "dev"),
     Head(RepoURL("s390/linux.git"), "fixes"),
-    Head(RepoURL("s390/linux.git"), "for-linus"),
     Head(RepoURL("https://github.com/kdave/btrfs-devel.git"), "misc-next"),
     Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
     Head(RepoURL("git://anongit.freedesktop.org/drm/drm-misc"), "drm-misc-next"),
