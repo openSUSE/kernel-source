@@ -1,0 +1,218 @@
+From 2d1632ec9b0068e5a12c5ac5d613f2dda0058f5c Mon Sep 17 00:00:00 2001
+From: Chris Down <chris@chrisdown.name>
+Date: Sun, 6 Oct 2019 17:58:38 -0700
+Subject: [PATCH] mm, memcg: make scan aggression always exclude protection
+
+References: bnc#1155780 (VM/FS functional and performance backports)
+Patch-mainline: v5.4-rc3
+Git-commit: 1bc63fb1272be0773e925f78c0fbd06c89701d55
+
+This patch is an incremental improvement on the existing
+memory.{low,min} relative reclaim work to base its scan pressure
+calculations on how much protection is available compared to the current
+usage, rather than how much the current usage is over some protection
+threshold.
+
+This change doesn't change the experience for the user in the normal
+case too much.  One benefit is that it replaces the (somewhat arbitrary)
+100% cutoff with an indefinite slope, which makes it easier to ballpark
+a memory.low value.
+
+As well as this, the old methodology doesn't quite apply generically to
+machines with varying amounts of physical memory.  Let's say we have a
+top level cgroup, workload.slice, and another top level cgroup,
+system-management.slice.  We want to roughly give 12G to
+system-management.slice, so on a 32GB machine we set memory.low to 20GB
+in workload.slice, and on a 64GB machine we set memory.low to 52GB.
+However, because these are relative amounts to the total machine size,
+while the amount of memory we want to generally be willing to yield to
+system.slice is absolute (12G), we end up putting more pressure on
+system.slice just because we have a larger machine and a larger workload
+to fill it, which seems fairly unintuitive.  With this new behaviour, we
+don't end up with this unintended side effect.
+
+Previously the way that memory.low protection works is that if you are
+50% over a certain baseline, you get 50% of your normal scan pressure.
+This is certainly better than the previous cliff-edge behaviour, but it
+can be improved even further by always considering memory under the
+currently enforced protection threshold to be out of bounds.  This means
+that we can set relatively low memory.low thresholds for variable or
+bursty workloads while still getting a reasonable level of protection,
+whereas with the previous version we may still trivially hit the 100%
+clamp.  The previous 100% clamp is also somewhat arbitrary, whereas this
+one is more concretely based on the currently enforced protection
+threshold, which is likely easier to reason about.
+
+There is also a subtle issue with the way that proportional reclaim
+worked previously -- it promotes having no memory.low, since it makes
+pressure higher during low reclaim.  This happens because we base our
+scan pressure modulation on how far memory.current is between memory.min
+and memory.low, but if memory.low is unset, we only use the overage
+method.  In most cromulent configurations, this then means that we end
+up with *more* pressure than with no memory.low at all when we're in low
+reclaim, which is not really very usable or expected.
+
+With this patch, memory.low and memory.min affect reclaim pressure in a
+more understandable and composable way.  For example, from a user
+standpoint, "protected" memory now remains untouchable from a reclaim
+aggression standpoint, and users can also have more confidence that
+bursty workloads will still receive some amount of guaranteed
+protection.
+
+Link: http://lkml.kernel.org/r/20190322160307.GA3316@chrisdown.name
+Signed-off-by: Chris Down <chris@chrisdown.name>
+Reviewed-by: Roman Gushchin <guro@fb.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Michal Hocko <mhocko@kernel.org>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Dennis Zhou <dennis@kernel.org>
+Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ include/linux/memcontrol.h | 25 +++++++++----------
+ mm/vmscan.c                | 61 +++++++++++++++-------------------------------
+ 2 files changed, 32 insertions(+), 54 deletions(-)
+
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 9cea5960c017..2b34925fc19d 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -355,17 +355,17 @@ static inline bool mem_cgroup_disabled(void)
+ 	return !cgroup_subsys_enabled(memory_cgrp_subsys);
+ }
+ 
+-static inline void mem_cgroup_protection(struct mem_cgroup *memcg,
+-					 unsigned long *min, unsigned long *low)
++static inline unsigned long mem_cgroup_protection(struct mem_cgroup *memcg,
++						  bool in_low_reclaim)
+ {
+-	if (mem_cgroup_disabled()) {
+-		*min = 0;
+-		*low = 0;
+-		return;
+-	}
++	if (mem_cgroup_disabled())
++		return 0;
++
++	if (in_low_reclaim)
++		return READ_ONCE(memcg->memory.emin);
+ 
+-	*min = READ_ONCE(memcg->memory.emin);
+-	*low = READ_ONCE(memcg->memory.elow);
++	return max(READ_ONCE(memcg->memory.emin),
++		   READ_ONCE(memcg->memory.elow));
+ }
+ 
+ enum mem_cgroup_protection mem_cgroup_protected(struct mem_cgroup *root,
+@@ -843,11 +843,10 @@ static inline void memcg_memory_event_mm(struct mm_struct *mm,
+ {
+ }
+ 
+-static inline void mem_cgroup_protection(struct mem_cgroup *memcg,
+-					 unsigned long *min, unsigned long *low)
++static inline unsigned long mem_cgroup_protection(struct mem_cgroup *memcg,
++						  bool in_low_reclaim)
+ {
+-	*min = 0;
+-	*low = 0;
++	return 0;
+ }
+ 
+ static inline enum mem_cgroup_protection mem_cgroup_protected(
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 1c4546ce36c2..fbba75ae46e4 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -2406,12 +2406,13 @@ static void get_scan_count(struct lruvec *lruvec, struct mem_cgroup *memcg,
+ 		int file = is_file_lru(lru);
+ 		unsigned long lruvec_size;
+ 		unsigned long scan;
+-		unsigned long min, low;
++		unsigned long protection;
+ 
+ 		lruvec_size = lruvec_lru_size(lruvec, lru, sc->reclaim_idx);
+-		mem_cgroup_protection(memcg, &min, &low);
++		protection = mem_cgroup_protection(memcg,
++						   sc->memcg_low_reclaim);
+ 
+-		if (min || low) {
++		if (protection) {
+ 			/*
+ 			 * Scale a cgroup's reclaim pressure by proportioning
+ 			 * its current usage to its memory.low or memory.min
+@@ -2424,13 +2425,10 @@ static void get_scan_count(struct lruvec *lruvec, struct mem_cgroup *memcg,
+ 			 * setting extremely liberal protection thresholds. It
+ 			 * also means we simply get no protection at all if we
+ 			 * set it too low, which is not ideal.
+-			 */
+-			unsigned long cgroup_size = mem_cgroup_size(memcg);
+-
+-			/*
+-			 * If there is any protection in place, we adjust scan
+-			 * pressure in proportion to how much a group's current
+-			 * usage exceeds that, in percent.
++			 *
++			 * If there is any protection in place, we reduce scan
++			 * pressure by how much of the total memory used is
++			 * within protection thresholds.
+ 			 *
+ 			 * There is one special case: in the first reclaim pass,
+ 			 * we skip over all groups that are within their low
+@@ -2440,43 +2438,24 @@ static void get_scan_count(struct lruvec *lruvec, struct mem_cgroup *memcg,
+ 			 * ideally want to honor how well-behaved groups are in
+ 			 * that case instead of simply punishing them all
+ 			 * equally. As such, we reclaim them based on how much
+-			 * of their best-effort protection they are using. Usage
+-			 * below memory.min is excluded from consideration when
+-			 * calculating utilisation, as it isn't ever
+-			 * reclaimable, so it might as well not exist for our
+-			 * purposes.
++			 * memory they are using, reducing the scan pressure
++			 * again by how much of the total memory used is under
++			 * hard protection.
+ 			 */
+-			if (sc->memcg_low_reclaim && low > min) {
+-				/*
+-				 * Reclaim according to utilisation between min
+-				 * and low
+-				 */
+-				scan = lruvec_size * (cgroup_size - min) /
+-					(low - min);
+-			} else {
+-				/* Reclaim according to protection overage */
+-				scan = lruvec_size * cgroup_size /
+-					max(min, low) - lruvec_size;
+-			}
++			unsigned long cgroup_size = mem_cgroup_size(memcg);
++
++			/* Avoid TOCTOU with earlier protection check */
++			cgroup_size = max(cgroup_size, protection);
++
++			scan = lruvec_size - lruvec_size * protection /
++				cgroup_size;
+ 
+ 			/*
+-			 * Don't allow the scan target to exceed the lruvec
+-			 * size, which otherwise could happen if we have >200%
+-			 * overage in the normal case, or >100% overage when
+-			 * sc->memcg_low_reclaim is set.
+-			 *
+-			 * This is important because other cgroups without
+-			 * memory.low have their scan target initially set to
+-			 * their lruvec size, so allowing values >100% of the
+-			 * lruvec size here could result in penalising cgroups
+-			 * with memory.low set even *more* than their peers in
+-			 * some cases in the case of large overages.
+-			 *
+-			 * Also, minimally target SWAP_CLUSTER_MAX pages to keep
++			 * Minimally target SWAP_CLUSTER_MAX pages to keep
+ 			 * reclaim moving forwards, avoiding decremeting
+ 			 * sc->priority further than desirable.
+ 			 */
+-			scan = clamp(scan, SWAP_CLUSTER_MAX, lruvec_size);
++			scan = max(scan, SWAP_CLUSTER_MAX);
+ 		} else {
+ 			scan = lruvec_size;
+ 		}

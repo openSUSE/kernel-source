@@ -1,0 +1,177 @@
+From 960f8fca2f468587a7296aad701b2c5fa904cdda Mon Sep 17 00:00:00 2001
+From: Chris Down <chris@chrisdown.name>
+Date: Sun, 6 Oct 2019 17:58:35 -0700
+Subject: [PATCH] mm, memcg: make memory.emin the baseline for utilisation
+ determination
+
+References: bnc#1155780 (VM/FS functional and performance backports)
+Patch-mainline: v5.4-rc3
+Git-commit: 9de7ca46ad2688bd51e80f7119fefa301ad7f3fa
+
+Roman points out that when when we do the low reclaim pass, we scale the
+reclaim pressure relative to position between 0 and the maximum
+protection threshold.
+
+However, if the maximum protection is based on memory.elow, and
+memory.emin is above zero, this means we still may get binary behaviour
+on second-pass low reclaim.  This is because we scale starting at 0, not
+starting at memory.emin, and since we don't scan at all below emin, we
+end up with cliff behaviour.
+
+This should be a fairly uncommon case since usually we don't go into the
+second pass, but it makes sense to scale our low reclaim pressure
+starting at emin.
+
+You can test this by catting two large sparse files, one in a cgroup
+with emin set to some moderate size compared to physical RAM, and
+another cgroup without any emin.  In both cgroups, set an elow larger
+than 50% of physical RAM.  The one with emin will have less page
+scanning, as reclaim pressure is lower.
+
+Rebase on top of and apply the same idea as what was applied to handle
+cgroup_memory=disable properly for the original proportional patch
+http://lkml.kernel.org/r/20190201045711.GA18302@chrisdown.name ("mm,
+memcg: Handle cgroup_disable=memory when getting memcg protection").
+
+Link: http://lkml.kernel.org/r/20190201051810.GA18895@chrisdown.name
+Signed-off-by: Chris Down <chris@chrisdown.name>
+Suggested-by: Roman Gushchin <guro@fb.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Dennis Zhou <dennis@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ include/linux/memcontrol.h | 19 +++++++++++-----
+ mm/vmscan.c                | 55 +++++++++++++++++++++++++++-------------------
+ 2 files changed, 46 insertions(+), 28 deletions(-)
+
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 44340eff81bf..9cea5960c017 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -355,12 +355,17 @@ static inline bool mem_cgroup_disabled(void)
+ 	return !cgroup_subsys_enabled(memory_cgrp_subsys);
+ }
+ 
+-static inline unsigned long mem_cgroup_protection(struct mem_cgroup *memcg)
++static inline void mem_cgroup_protection(struct mem_cgroup *memcg,
++					 unsigned long *min, unsigned long *low)
+ {
+-	if (mem_cgroup_disabled())
+-		return 0;
++	if (mem_cgroup_disabled()) {
++		*min = 0;
++		*low = 0;
++		return;
++	}
+ 
+-	return max(READ_ONCE(memcg->memory.emin), READ_ONCE(memcg->memory.elow));
++	*min = READ_ONCE(memcg->memory.emin);
++	*low = READ_ONCE(memcg->memory.elow);
+ }
+ 
+ enum mem_cgroup_protection mem_cgroup_protected(struct mem_cgroup *root,
+@@ -838,9 +843,11 @@ static inline void memcg_memory_event_mm(struct mm_struct *mm,
+ {
+ }
+ 
+-static inline unsigned long mem_cgroup_protection(struct mem_cgroup *memcg)
++static inline void mem_cgroup_protection(struct mem_cgroup *memcg,
++					 unsigned long *min, unsigned long *low)
+ {
+-	return 0;
++	*min = 0;
++	*low = 0;
+ }
+ 
+ static inline enum mem_cgroup_protection mem_cgroup_protected(
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index d7e332930d40..1c4546ce36c2 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -2406,12 +2406,12 @@ static void get_scan_count(struct lruvec *lruvec, struct mem_cgroup *memcg,
+ 		int file = is_file_lru(lru);
+ 		unsigned long lruvec_size;
+ 		unsigned long scan;
+-		unsigned long protection;
++		unsigned long min, low;
+ 
+ 		lruvec_size = lruvec_lru_size(lruvec, lru, sc->reclaim_idx);
+-		protection = mem_cgroup_protection(memcg);
++		mem_cgroup_protection(memcg, &min, &low);
+ 
+-		if (protection > 0) {
++		if (min || low) {
+ 			/*
+ 			 * Scale a cgroup's reclaim pressure by proportioning
+ 			 * its current usage to its memory.low or memory.min
+@@ -2426,28 +2426,38 @@ static void get_scan_count(struct lruvec *lruvec, struct mem_cgroup *memcg,
+ 			 * set it too low, which is not ideal.
+ 			 */
+ 			unsigned long cgroup_size = mem_cgroup_size(memcg);
+-			unsigned long baseline = 0;
+ 
+ 			/*
+-			 * During the reclaim first pass, we only consider
+-			 * cgroups in excess of their protection setting, but if
+-			 * that doesn't produce free pages, we come back for a
+-			 * second pass where we reclaim from all groups.
++			 * If there is any protection in place, we adjust scan
++			 * pressure in proportion to how much a group's current
++			 * usage exceeds that, in percent.
+ 			 *
+-			 * To maintain fairness in both cases, the first pass
+-			 * targets groups in proportion to their overage, and
+-			 * the second pass targets groups in proportion to their
+-			 * protection utilization.
+-			 *
+-			 * So on the first pass, a group whose size is 130% of
+-			 * its protection will be targeted at 30% of its size.
+-			 * On the second pass, a group whose size is at 40% of
+-			 * its protection will be
+-			 * targeted at 40% of its size.
++			 * There is one special case: in the first reclaim pass,
++			 * we skip over all groups that are within their low
++			 * protection. If that fails to reclaim enough pages to
++			 * satisfy the reclaim goal, we come back and override
++			 * the best-effort low protection. However, we still
++			 * ideally want to honor how well-behaved groups are in
++			 * that case instead of simply punishing them all
++			 * equally. As such, we reclaim them based on how much
++			 * of their best-effort protection they are using. Usage
++			 * below memory.min is excluded from consideration when
++			 * calculating utilisation, as it isn't ever
++			 * reclaimable, so it might as well not exist for our
++			 * purposes.
+ 			 */
+-			if (!sc->memcg_low_reclaim)
+-				baseline = lruvec_size;
+-			scan = lruvec_size * cgroup_size / protection - baseline;
++			if (sc->memcg_low_reclaim && low > min) {
++				/*
++				 * Reclaim according to utilisation between min
++				 * and low
++				 */
++				scan = lruvec_size * (cgroup_size - min) /
++					(low - min);
++			} else {
++				/* Reclaim according to protection overage */
++				scan = lruvec_size * cgroup_size /
++					max(min, low) - lruvec_size;
++			}
+ 
+ 			/*
+ 			 * Don't allow the scan target to exceed the lruvec
+@@ -2463,7 +2473,8 @@ static void get_scan_count(struct lruvec *lruvec, struct mem_cgroup *memcg,
+ 			 * some cases in the case of large overages.
+ 			 *
+ 			 * Also, minimally target SWAP_CLUSTER_MAX pages to keep
+-			 * reclaim moving forwards.
++			 * reclaim moving forwards, avoiding decremeting
++			 * sc->priority further than desirable.
+ 			 */
+ 			scan = clamp(scan, SWAP_CLUSTER_MAX, lruvec_size);
+ 		} else {
