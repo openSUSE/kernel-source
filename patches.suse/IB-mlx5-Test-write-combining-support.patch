@@ -1,0 +1,350 @@
+From: Michael Guralnik <michaelgur@mellanox.com>
+Date: Mon, 10 Jun 2019 15:21:24 +0300
+Subject: IB/mlx5: Test write combining support
+Patch-mainline: v5.5-rc1
+Git-commit: 11f552e21755cb6f804572243a1502b6bbd008dd
+References: jsc#SLE-8446
+
+Linux can run in all sorts of physical machines and VMs where write
+combining may or may not be supported. Currently there is no way to
+reliably tell if the system supports WC, or not. The driver uses WC to
+optimize posting work to the HCA, and getting this wrong in either
+direction can cause a significant performance loss.
+
+Add a test in mlx5_ib initialization process to test whether
+write-combining is supported on the machine.  The test will run as part of
+the enable_driver callback to ensure that the test runs after the device
+is setup and can create and modify the QP needed, but runs before the
+device is exposed to the users.
+
+The test opens UD QP and posts NOP WQEs, the WQE written to the BlueFlame
+is different from the WQE in memory, requesting CQE only on the BlueFlame
+WQE. By checking whether we received a completion on one of these WQEs we
+can know if BlueFlame succeeded and this write-combining must be
+supported.
+
+Change reporting of BlueFlame support to be dependent on write-combining
+support instead of the FW's guess as to what the machine can do.
+
+Link: https://lore.kernel.org/r/20191027062234.10993-1-leon@kernel.org
+Signed-off-by: Michael Guralnik <michaelgur@mellanox.com>
+Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/mlx5/main.c    |   15 ++
+ drivers/infiniband/hw/mlx5/mem.c     |  199 +++++++++++++++++++++++++++++++++++
+ drivers/infiniband/hw/mlx5/mlx5_ib.h |    6 +
+ drivers/infiniband/hw/mlx5/qp.c      |    6 -
+ 4 files changed, 223 insertions(+), 3 deletions(-)
+
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -1796,7 +1796,7 @@ static int mlx5_ib_alloc_ucontext(struct
+ 		return -EINVAL;
+ 
+ 	resp.qp_tab_size = 1 << MLX5_CAP_GEN(dev->mdev, log_max_qp);
+-	if (mlx5_core_is_pf(dev->mdev) && MLX5_CAP_GEN(dev->mdev, bf))
++	if (dev->wc_support)
+ 		resp.bf_reg_size = 1 << MLX5_CAP_GEN(dev->mdev, log_bf_reg_size);
+ 	resp.cache_line_size = cache_line_size();
+ 	resp.max_sq_desc_sz = MLX5_CAP_GEN(dev->mdev, max_wqe_sz_sq);
+@@ -6251,6 +6251,7 @@ static const struct ib_device_ops mlx5_i
+ 	.disassociate_ucontext = mlx5_ib_disassociate_ucontext,
+ 	.drain_rq = mlx5_ib_drain_rq,
+ 	.drain_sq = mlx5_ib_drain_sq,
++	.enable_driver = mlx5_ib_enable_driver,
+ 	.fill_res_entry = mlx5_ib_fill_res_entry,
+ 	.fill_stat_entry = mlx5_ib_fill_stat_entry,
+ 	.get_dev_fw_str = get_dev_fw_str,
+@@ -6694,6 +6695,18 @@ static void mlx5_ib_stage_devx_cleanup(s
+ 	}
+ }
+ 
++int mlx5_ib_enable_driver(struct ib_device *dev)
++{
++	struct mlx5_ib_dev *mdev = to_mdev(dev);
++	int ret;
++
++	ret = mlx5_ib_test_wc(mdev);
++	mlx5_ib_dbg(mdev, "Write-Combining %s",
++		    mdev->wc_support ? "supported" : "not supported");
++
++	return ret;
++}
++
+ void __mlx5_ib_remove(struct mlx5_ib_dev *dev,
+ 		      const struct mlx5_ib_profile *profile,
+ 		      int stage)
+--- a/drivers/infiniband/hw/mlx5/mem.c
++++ b/drivers/infiniband/hw/mlx5/mem.c
+@@ -34,6 +34,7 @@
+ #include <rdma/ib_umem.h>
+ #include <rdma/ib_umem_odp.h>
+ #include "mlx5_ib.h"
++#include <linux/jiffies.h>
+ 
+ /* @umem: umem object to scan
+  * @addr: ib virtual address requested by the user
+@@ -216,3 +217,201 @@ int mlx5_ib_get_buf_offset(u64 addr, int
+ 	*offset = buf_off >> ilog2(off_size);
+ 	return 0;
+ }
++
++#define WR_ID_BF 0xBF
++#define WR_ID_END 0xBAD
++#define TEST_WC_NUM_WQES 255
++#define TEST_WC_POLLING_MAX_TIME_JIFFIES msecs_to_jiffies(100)
++static int post_send_nop(struct mlx5_ib_dev *dev, struct ib_qp *ibqp, u64 wr_id,
++			 bool signaled)
++{
++	struct mlx5_ib_qp *qp = to_mqp(ibqp);
++	struct mlx5_wqe_ctrl_seg *ctrl;
++	struct mlx5_bf *bf = &qp->bf;
++	__be32 mmio_wqe[16] = {};
++	unsigned long flags;
++	unsigned int idx;
++	int i;
++
++	if (unlikely(dev->mdev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR))
++		return -EIO;
++
++	spin_lock_irqsave(&qp->sq.lock, flags);
++
++	idx = qp->sq.cur_post & (qp->sq.wqe_cnt - 1);
++	ctrl = mlx5_frag_buf_get_wqe(&qp->sq.fbc, idx);
++
++	memset(ctrl, 0, sizeof(struct mlx5_wqe_ctrl_seg));
++	ctrl->fm_ce_se = signaled ? MLX5_WQE_CTRL_CQ_UPDATE : 0;
++	ctrl->opmod_idx_opcode =
++		cpu_to_be32(((u32)(qp->sq.cur_post) << 8) | MLX5_OPCODE_NOP);
++	ctrl->qpn_ds = cpu_to_be32((sizeof(struct mlx5_wqe_ctrl_seg) / 16) |
++				   (qp->trans_qp.base.mqp.qpn << 8));
++
++	qp->sq.wrid[idx] = wr_id;
++	qp->sq.w_list[idx].opcode = MLX5_OPCODE_NOP;
++	qp->sq.wqe_head[idx] = qp->sq.head + 1;
++	qp->sq.cur_post += DIV_ROUND_UP(sizeof(struct mlx5_wqe_ctrl_seg),
++					MLX5_SEND_WQE_BB);
++	qp->sq.w_list[idx].next = qp->sq.cur_post;
++	qp->sq.head++;
++
++	memcpy(mmio_wqe, ctrl, sizeof(*ctrl));
++	((struct mlx5_wqe_ctrl_seg *)&mmio_wqe)->fm_ce_se |=
++		MLX5_WQE_CTRL_CQ_UPDATE;
++
++	/* Make sure that descriptors are written before
++	 * updating doorbell record and ringing the doorbell
++	 */
++	wmb();
++
++	qp->db.db[MLX5_SND_DBR] = cpu_to_be32(qp->sq.cur_post);
++
++	/* Make sure doorbell record is visible to the HCA before
++	 * we hit doorbell
++	 */
++	wmb();
++	for (i = 0; i < 8; i++)
++		mlx5_write64(&mmio_wqe[i * 2],
++			     bf->bfreg->map + bf->offset + i * 8);
++
++	bf->offset ^= bf->buf_size;
++
++	spin_unlock_irqrestore(&qp->sq.lock, flags);
++
++	return 0;
++}
++
++static int test_wc_poll_cq_result(struct mlx5_ib_dev *dev, struct ib_cq *cq)
++{
++	int ret;
++	struct ib_wc wc = {};
++	unsigned long end = jiffies + TEST_WC_POLLING_MAX_TIME_JIFFIES;
++
++	do {
++		ret = ib_poll_cq(cq, 1, &wc);
++		if (ret < 0 || wc.status)
++			return ret < 0 ? ret : -EINVAL;
++		if (ret)
++			break;
++	} while (!time_after(jiffies, end));
++
++	if (!ret)
++		return -ETIMEDOUT;
++
++	if (wc.wr_id != WR_ID_BF)
++		ret = 0;
++
++	return ret;
++}
++
++static int test_wc_do_send(struct mlx5_ib_dev *dev, struct ib_qp *qp)
++{
++	int err, i;
++
++	for (i = 0; i < TEST_WC_NUM_WQES; i++) {
++		err = post_send_nop(dev, qp, WR_ID_BF, false);
++		if (err)
++			return err;
++	}
++
++	return post_send_nop(dev, qp, WR_ID_END, true);
++}
++
++int mlx5_ib_test_wc(struct mlx5_ib_dev *dev)
++{
++	struct ib_cq_init_attr cq_attr = { .cqe = TEST_WC_NUM_WQES + 1 };
++	int port_type_cap = MLX5_CAP_GEN(dev->mdev, port_type);
++	struct ib_qp_init_attr qp_init_attr = {
++		.cap = { .max_send_wr = TEST_WC_NUM_WQES },
++		.qp_type = IB_QPT_UD,
++		.sq_sig_type = IB_SIGNAL_REQ_WR,
++		.create_flags = MLX5_IB_QP_CREATE_WC_TEST,
++	};
++	struct ib_qp_attr qp_attr = { .port_num = 1 };
++	struct ib_device *ibdev = &dev->ib_dev;
++	struct ib_qp *qp;
++	struct ib_cq *cq;
++	struct ib_pd *pd;
++	int ret;
++
++	if (!MLX5_CAP_GEN(dev->mdev, bf))
++		return 0;
++
++	if (!dev->mdev->roce.roce_en &&
++	    port_type_cap == MLX5_CAP_PORT_TYPE_ETH) {
++		if (mlx5_core_is_pf(dev->mdev))
++			dev->wc_support = true;
++		return 0;
++	}
++
++	ret = mlx5_alloc_bfreg(dev->mdev, &dev->wc_bfreg, true, false);
++	if (ret)
++		goto print_err;
++
++	if (!dev->wc_bfreg.wc)
++		goto out1;
++
++	pd = ib_alloc_pd(ibdev, 0);
++	if (IS_ERR(pd)) {
++		ret = PTR_ERR(pd);
++		goto out1;
++	}
++
++	cq = ib_create_cq(ibdev, NULL, NULL, NULL, &cq_attr);
++	if (IS_ERR(cq)) {
++		ret = PTR_ERR(cq);
++		goto out2;
++	}
++
++	qp_init_attr.recv_cq = cq;
++	qp_init_attr.send_cq = cq;
++	qp = ib_create_qp(pd, &qp_init_attr);
++	if (IS_ERR(qp)) {
++		ret = PTR_ERR(qp);
++		goto out3;
++	}
++
++	qp_attr.qp_state = IB_QPS_INIT;
++	ret = ib_modify_qp(qp, &qp_attr,
++			   IB_QP_STATE | IB_QP_PORT | IB_QP_PKEY_INDEX |
++				   IB_QP_QKEY);
++	if (ret)
++		goto out4;
++
++	qp_attr.qp_state = IB_QPS_RTR;
++	ret = ib_modify_qp(qp, &qp_attr, IB_QP_STATE);
++	if (ret)
++		goto out4;
++
++	qp_attr.qp_state = IB_QPS_RTS;
++	ret = ib_modify_qp(qp, &qp_attr, IB_QP_STATE | IB_QP_SQ_PSN);
++	if (ret)
++		goto out4;
++
++	ret = test_wc_do_send(dev, qp);
++	if (ret < 0)
++		goto out4;
++
++	ret = test_wc_poll_cq_result(dev, cq);
++	if (ret > 0) {
++		dev->wc_support = true;
++		ret = 0;
++	}
++
++out4:
++	ib_destroy_qp(qp);
++out3:
++	ib_destroy_cq(cq);
++out2:
++	ib_dealloc_pd(pd);
++out1:
++	mlx5_free_bfreg(dev->mdev, &dev->wc_bfreg);
++print_err:
++	if (ret)
++		mlx5_ib_err(
++			dev,
++			"Error %d while trying to test write-combining support\n",
++			ret);
++	return ret;
++}
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -248,6 +248,7 @@ struct mlx5_ib_flow_db {
+  * rely on the range reserved for that use in the ib_qp_create_flags enum.
+  */
+ #define MLX5_IB_QP_CREATE_SQPN_QP1	IB_QP_CREATE_RESERVED_START
++#define MLX5_IB_QP_CREATE_WC_TEST	(IB_QP_CREATE_RESERVED_START << 1)
+ 
+ struct wr_list {
+ 	u16	opcode;
+@@ -966,6 +967,7 @@ struct mlx5_ib_dev {
+ 	u8				fill_delay:1;
+ 	u8				is_rep:1;
+ 	u8				lag_active:1;
++	u8				wc_support:1;
+ 	struct umr_common		umrc;
+ 	/* sync used page count stats
+ 	 */
+@@ -993,6 +995,7 @@ struct mlx5_ib_dev {
+ 	/* Array with num_ports elements */
+ 	struct mlx5_ib_port	*port;
+ 	struct mlx5_sq_bfreg	bfreg;
++	struct mlx5_sq_bfreg	wc_bfreg;
+ 	struct mlx5_sq_bfreg	fp_bfreg;
+ 	struct mlx5_ib_delay_drop	delay_drop;
+ 	const struct mlx5_ib_profile	*profile;
+@@ -1506,4 +1509,7 @@ static inline bool mlx5_ib_can_use_umr(s
+ 
+ 	return true;
+ }
++
++int mlx5_ib_enable_driver(struct ib_device *dev);
++int mlx5_ib_test_wc(struct mlx5_ib_dev *dev);
+ #endif /* MLX5_IB_H */
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -1041,11 +1041,14 @@ static int create_kernel_qp(struct mlx5_
+ 					IB_QP_CREATE_BLOCK_MULTICAST_LOOPBACK |
+ 					IB_QP_CREATE_IPOIB_UD_LSO |
+ 					IB_QP_CREATE_NETIF_QP |
+-					MLX5_IB_QP_CREATE_SQPN_QP1))
++					MLX5_IB_QP_CREATE_SQPN_QP1 |
++					MLX5_IB_QP_CREATE_WC_TEST))
+ 		return -EINVAL;
+ 
+ 	if (init_attr->qp_type == MLX5_IB_QPT_REG_UMR)
+ 		qp->bf.bfreg = &dev->fp_bfreg;
++	else if (init_attr->create_flags & MLX5_IB_QP_CREATE_WC_TEST)
++		qp->bf.bfreg = &dev->wc_bfreg;
+ 	else
+ 		qp->bf.bfreg = &dev->bfreg;
+ 
+@@ -5330,7 +5333,6 @@ out:
+ 		 * we hit doorbell */
+ 		wmb();
+ 
+-		/* currently we support only regular doorbells */
+ 		mlx5_write64((__be32 *)ctrl, bf->bfreg->map + bf->offset);
+ 		/* Make sure doorbells don't leak out of SQ spinlock
+ 		 * and reach the HCA out of order.
