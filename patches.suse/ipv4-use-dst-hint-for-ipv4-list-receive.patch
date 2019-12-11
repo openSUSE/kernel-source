@@ -1,0 +1,197 @@
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Wed, 20 Nov 2019 13:47:37 +0100
+Subject: ipv4: use dst hint for ipv4 list receive
+Patch-mainline: v5.5-rc1
+Git-commit: 02b24941619fcce3d280311ac73b1e461552e9c8
+References: bsc#1154353
+
+This is alike the previous change, with some additional ipv4 specific
+quirk. Even when using the route hint we still have to do perform
+additional per packet checks about source address validity: a new
+helper is added to wrap them.
+
+Hints are explicitly disabled if the destination is a local broadcast,
+that keeps the code simple and local broadcast are a slower path anyway.
+
+UDP flood performances vs recvmmsg() receiver:
+
+vanilla		patched		delta
+Kpps		Kpps		%
+1683		1871		+11
+
+In the worst case scenario - each packet has a different
+destination address - the performance delta is within noise
+range.
+
+v3 -> v4:
+ - re-enable hints for forward
+
+v2 -> v3:
+ - really fix build (sic) and hint usage check
+ - use fib4_has_custom_rules() helpers (David A.)
+ - add ip_extract_route_hint() helper (Edward C.)
+ - use prev skb as hint instead of copying data (Willem)
+
+v1 -> v2:
+ - fix build issue with !CONFIG_IP_MULTIPLE_TABLES
+
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Reviewed-by: David Ahern <dsahern@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/route.h |    4 ++++
+ net/ipv4/ip_input.c |   35 +++++++++++++++++++++++++++++++----
+ net/ipv4/route.c    |   42 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 77 insertions(+), 4 deletions(-)
+
+--- a/include/net/route.h
++++ b/include/net/route.h
+@@ -185,6 +185,10 @@ int ip_route_input_rcu(struct sk_buff *s
+ 		       u8 tos, struct net_device *devin,
+ 		       struct fib_result *res);
+ 
++int ip_route_use_hint(struct sk_buff *skb, __be32 dst, __be32 src,
++		      u8 tos, struct net_device *devin,
++		      const struct sk_buff *hint);
++
+ static inline int ip_route_input(struct sk_buff *skb, __be32 dst, __be32 src,
+ 				 u8 tos, struct net_device *devin)
+ {
+--- a/net/ipv4/ip_input.c
++++ b/net/ipv4/ip_input.c
+@@ -302,16 +302,31 @@ drop:
+ 	return true;
+ }
+ 
++static bool ip_can_use_hint(const struct sk_buff *skb, const struct iphdr *iph,
++			    const struct sk_buff *hint)
++{
++	return hint && !skb_dst(skb) && ip_hdr(hint)->daddr == iph->daddr &&
++	       ip_hdr(hint)->tos == iph->tos;
++}
++
+ INDIRECT_CALLABLE_DECLARE(int udp_v4_early_demux(struct sk_buff *));
+ INDIRECT_CALLABLE_DECLARE(int tcp_v4_early_demux(struct sk_buff *));
+ static int ip_rcv_finish_core(struct net *net, struct sock *sk,
+-			      struct sk_buff *skb, struct net_device *dev)
++			      struct sk_buff *skb, struct net_device *dev,
++			      const struct sk_buff *hint)
+ {
+ 	const struct iphdr *iph = ip_hdr(skb);
+ 	int (*edemux)(struct sk_buff *skb);
+ 	struct rtable *rt;
+ 	int err;
+ 
++	if (ip_can_use_hint(skb, iph, hint)) {
++		err = ip_route_use_hint(skb, iph->daddr, iph->saddr, iph->tos,
++					dev, hint);
++		if (unlikely(err))
++			goto drop_error;
++	}
++
+ 	if (net->ipv4.sysctl_ip_early_demux &&
+ 	    !skb_dst(skb) &&
+ 	    !skb->sk &&
+@@ -408,7 +423,7 @@ static int ip_rcv_finish(struct net *net
+ 	if (!skb)
+ 		return NET_RX_SUCCESS;
+ 
+-	ret = ip_rcv_finish_core(net, sk, skb, dev);
++	ret = ip_rcv_finish_core(net, sk, skb, dev, NULL);
+ 	if (ret != NET_RX_DROP)
+ 		ret = dst_input(skb);
+ 	return ret;
+@@ -535,11 +550,20 @@ static void ip_sublist_rcv_finish(struct
+ 	}
+ }
+ 
++static struct sk_buff *ip_extract_route_hint(const struct net *net,
++					     struct sk_buff *skb, int rt_type)
++{
++	if (fib4_has_custom_rules(net) || rt_type == RTN_BROADCAST)
++		return NULL;
++
++	return skb;
++}
++
+ static void ip_list_rcv_finish(struct net *net, struct sock *sk,
+ 			       struct list_head *head)
+ {
++	struct sk_buff *skb, *next, *hint = NULL;
+ 	struct dst_entry *curr_dst = NULL;
+-	struct sk_buff *skb, *next;
+ 	struct list_head sublist;
+ 
+ 	INIT_LIST_HEAD(&sublist);
+@@ -554,11 +578,14 @@ static void ip_list_rcv_finish(struct ne
+ 		skb = l3mdev_ip_rcv(skb);
+ 		if (!skb)
+ 			continue;
+-		if (ip_rcv_finish_core(net, sk, skb, dev) == NET_RX_DROP)
++		if (ip_rcv_finish_core(net, sk, skb, dev, hint) == NET_RX_DROP)
+ 			continue;
+ 
+ 		dst = skb_dst(skb);
+ 		if (curr_dst != dst) {
++			hint = ip_extract_route_hint(net, skb,
++					       ((struct rtable *)dst)->rt_type);
++
+ 			/* dispatch old sublist */
+ 			if (!list_empty(&sublist))
+ 				ip_sublist_rcv_finish(&sublist);
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -2019,10 +2019,52 @@ static int ip_mkroute_input(struct sk_bu
+ 	return __mkroute_input(skb, res, in_dev, daddr, saddr, tos);
+ }
+ 
++/* Implements all the saddr-related checks as ip_route_input_slow(),
++ * assuming daddr is valid and the destination is not a local broadcast one.
++ * Uses the provided hint instead of performing a route lookup.
++ */
++int ip_route_use_hint(struct sk_buff *skb, __be32 daddr, __be32 saddr,
++		      u8 tos, struct net_device *dev,
++		      const struct sk_buff *hint)
++{
++	struct in_device *in_dev = __in_dev_get_rcu(dev);
++	struct rtable *rt = (struct rtable *)hint;
++	struct net *net = dev_net(dev);
++	int err = -EINVAL;
++	u32 tag = 0;
++
++	if (ipv4_is_multicast(saddr) || ipv4_is_lbcast(saddr))
++		goto martian_source;
++
++	if (ipv4_is_zeronet(saddr))
++		goto martian_source;
++
++	if (ipv4_is_loopback(saddr) && !IN_DEV_NET_ROUTE_LOCALNET(in_dev, net))
++		goto martian_source;
++
++	if (rt->rt_type != RTN_LOCAL)
++		goto skip_validate_source;
++
++	tos &= IPTOS_RT_MASK;
++	err = fib_validate_source(skb, saddr, daddr, tos, 0, dev, in_dev, &tag);
++	if (err < 0)
++		goto martian_source;
++
++skip_validate_source:
++	skb_dst_copy(skb, hint);
++	return 0;
++
++martian_source:
++	ip_handle_martian_source(dev, in_dev, skb, daddr, saddr);
++	return err;
++}
++
+ /*
+  *	NOTE. We drop all the packets that has local source
+  *	addresses, because every properly looped back packet
+  *	must have correct destination already attached by output routine.
++ *	Changes in the enforced policies must be applied also to
++ *	ip_route_use_hint().
+  *
+  *	Such approach solves two big problems:
+  *	1. Not simplex devices are handled properly.
