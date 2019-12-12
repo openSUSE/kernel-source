@@ -1,0 +1,176 @@
+From: Parav Pandit <parav@mellanox.com>
+Date: Wed, 18 Sep 2019 18:50:32 -0500
+Subject: net/mlx5: Support lockless FTE read lookups
+Patch-mainline: v5.5-rc1
+Git-commit: 7dee607ed0e04500459db53001d8e02f8831f084
+References: jsc#SLE-8464
+
+During connection tracking offloads with high number of connections,
+(40K connections per second), flow table group lock contention is
+observed.
+To improve the performance by reducing lock contention, lockless
+FTE read lookup is performed as described below.
+
+Each flow table entry is refcounted.
+Flow table entry is removed when refcount drops to zero.
+rhash table allows rcu protected lookup.
+Each hash table entry insertion and removal is write lock protected.
+
+Hence, it is possible to perform lockless lookup in rhash table using
+following scheme.
+
+(a) Guard FTE entry lookup per group using rcu read lock.
+(b) Before freeing the FTE entry, wait for all readers to finish
+accessing the FTE.
+
+Below example of one reader and write in parallel racing, shows
+protection in effect with rcu lock.
+
+lookup_fte_locked()
+  rcu_read_lock();
+  search_hash_table()
+                                  existing_flow_group_write_lock();
+                                  tree_put_node(fte)
+                                    drop_ref_cnt(fte)
+                                    del_sw_fte(fte)
+                                    del_hash_table_entry();
+                                    call_rcu();
+                                  existing_flow_group_write_unlock();
+  get_ref_cnt(fte) fails
+  rcu_read_unlock();
+                                  rcu grace period();
+                                    [..]
+                                    kmem_cache_free(fte);
+
+Signed-off-by: Parav Pandit <parav@mellanox.com>
+Reviewed-by: Mark Bloch <markb@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/fs_core.c |   70 +++++++++++++++++-----
+ drivers/net/ethernet/mellanox/mlx5/core/fs_core.h |    1 
+ 2 files changed, 56 insertions(+), 15 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@ -531,9 +531,16 @@ static void del_hw_fte(struct fs_node *n
+ 	}
+ }
+ 
++static void del_sw_fte_rcu(struct rcu_head *head)
++{
++	struct fs_fte *fte = container_of(head, struct fs_fte, rcu);
++	struct mlx5_flow_steering *steering = get_steering(&fte->node);
++
++	kmem_cache_free(steering->ftes_cache, fte);
++}
++
+ static void del_sw_fte(struct fs_node *node)
+ {
+-	struct mlx5_flow_steering *steering = get_steering(node);
+ 	struct mlx5_flow_group *fg;
+ 	struct fs_fte *fte;
+ 	int err;
+@@ -546,7 +553,8 @@ static void del_sw_fte(struct fs_node *n
+ 				     rhash_fte);
+ 	WARN_ON(err);
+ 	ida_simple_remove(&fg->fte_allocator, fte->index - fg->start_index);
+-	kmem_cache_free(steering->ftes_cache, fte);
++
++	call_rcu(&fte->rcu, del_sw_fte_rcu);
+ }
+ 
+ static void del_hw_flow_group(struct fs_node *node)
+@@ -1625,22 +1633,47 @@ static u64 matched_fgs_get_version(struc
+ }
+ 
+ static struct fs_fte *
+-lookup_fte_locked(struct mlx5_flow_group *g,
+-		  const u32 *match_value,
+-		  bool take_write)
++lookup_fte_for_write_locked(struct mlx5_flow_group *g, const u32 *match_value)
+ {
+ 	struct fs_fte *fte_tmp;
+ 
+-	if (take_write)
+-		nested_down_write_ref_node(&g->node, FS_LOCK_PARENT);
+-	else
+-		nested_down_read_ref_node(&g->node, FS_LOCK_PARENT);
+-	fte_tmp = rhashtable_lookup_fast(&g->ftes_hash, match_value,
+-					 rhash_fte);
++	nested_down_write_ref_node(&g->node, FS_LOCK_PARENT);
++
++	fte_tmp = rhashtable_lookup_fast(&g->ftes_hash, match_value, rhash_fte);
++	if (!fte_tmp || !tree_get_node(&fte_tmp->node)) {
++		fte_tmp = NULL;
++		goto out;
++	}
++
++	if (!fte_tmp->node.active) {
++		tree_put_node(&fte_tmp->node, false);
++		fte_tmp = NULL;
++		goto out;
++	}
++	nested_down_write_ref_node(&fte_tmp->node, FS_LOCK_CHILD);
++
++out:
++	up_write_ref_node(&g->node, false);
++	return fte_tmp;
++}
++
++static struct fs_fte *
++lookup_fte_for_read_locked(struct mlx5_flow_group *g, const u32 *match_value)
++{
++	struct fs_fte *fte_tmp;
++
++	if (!tree_get_node(&g->node))
++		return NULL;
++
++	rcu_read_lock();
++	fte_tmp = rhashtable_lookup(&g->ftes_hash, match_value, rhash_fte);
+ 	if (!fte_tmp || !tree_get_node(&fte_tmp->node)) {
++		rcu_read_unlock();
+ 		fte_tmp = NULL;
+ 		goto out;
+ 	}
++	rcu_read_unlock();
++
+ 	if (!fte_tmp->node.active) {
+ 		tree_put_node(&fte_tmp->node, false);
+ 		fte_tmp = NULL;
+@@ -1648,14 +1681,21 @@ lookup_fte_locked(struct mlx5_flow_group
+ 	}
+ 
+ 	nested_down_write_ref_node(&fte_tmp->node, FS_LOCK_CHILD);
++
+ out:
+-	if (take_write)
+-		up_write_ref_node(&g->node, false);
+-	else
+-		up_read_ref_node(&g->node);
++	tree_put_node(&g->node, false);
+ 	return fte_tmp;
+ }
+ 
++static struct fs_fte *
++lookup_fte_locked(struct mlx5_flow_group *g, const u32 *match_value, bool write)
++{
++	if (write)
++		return lookup_fte_for_write_locked(g, match_value);
++	else
++		return lookup_fte_for_read_locked(g, match_value);
++}
++
+ static struct mlx5_flow_handle *
+ try_add_to_existing_fg(struct mlx5_flow_table *ft,
+ 		       struct list_head *match_head,
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
+@@ -203,6 +203,7 @@ struct fs_fte {
+ 	enum fs_fte_status		status;
+ 	struct mlx5_fc			*counter;
+ 	struct rhash_head		hash;
++	struct rcu_head	rcu;
+ 	int				modify_mask;
+ };
+ 
