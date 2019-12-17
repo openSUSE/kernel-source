@@ -4,6 +4,7 @@ SRCVERSION=5.5
 VARIANT=
 # enable kernel module compression
 COMPRESS_MODULES="xz"
+COMPRESS_VMLINUX="xz"
 # Compile binary devicetrees on master and stable branches.
 BUILD_DTBS="Yes"
 # Use new style livepatch package names
