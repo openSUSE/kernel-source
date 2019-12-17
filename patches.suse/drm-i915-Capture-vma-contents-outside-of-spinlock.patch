@@ -1,0 +1,357 @@
+From 79c7a28e1f3a74b95ae2eae36ed0046fc8e6c7fd Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 25 Jul 2019 23:38:43 +0100
+Subject: [PATCH] drm/i915: Capture vma contents outside of spinlock
+Git-commit: 79c7a28e1f3a74b95ae2eae36ed0046fc8e6c7fd
+Patch-mainline: v5.4-rc1
+References: jsc#SLE-7953
+
+Currently we use the engine->active.lock to ensure that the request is
+not retired as we capture the data. However, we only need to ensure that
+the vma are not removed prior to use acquiring their contents, and
+since we have already relinquished our stop-machine protection, we
+assume that the user will not be overwriting the contents before we are
+able to record them.
+
+In order to capture the vma outside of the spinlock, we acquire a
+reference and mark the vma as active to prevent it from being unbound.
+However, since it is tricky allocate an entry in the fence tree (doing
+so would require taking a mutex) while inside the engine spinlock, we
+use an atomic bit and special case the handling for i915_active_wait.
+
+The core benefit is that we can use some non-atomic methods for mapping
+the device pages, we can remove the slow compression phase out of atomic
+context (i.e. stop antagonising the nmi-watchdog), and no we longer need
+large reserves of atomic pages.
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=111215
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Matthew Auld <matthew.william.auld@gmail.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190725223843.8971-1-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_active.c       |  34 +++++++++-
+ drivers/gpu/drm/i915/i915_active.h       |   3 +
+ drivers/gpu/drm/i915/i915_active_types.h |   3 +
+ drivers/gpu/drm/i915/i915_gpu_error.c    | 112 +++++++++++++++++++++----------
+ 4 files changed, 117 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_active.c b/drivers/gpu/drm/i915/i915_active.c
+index 13f304a29fc8..22341c62c204 100644
+--- a/drivers/gpu/drm/i915/i915_active.c
++++ b/drivers/gpu/drm/i915/i915_active.c
+@@ -196,6 +196,7 @@ void __i915_active_init(struct drm_i915_private *i915,
+ 	debug_active_init(ref);
+ 
+ 	ref->i915 = i915;
++	ref->flags = 0;
+ 	ref->active = active;
+ 	ref->retire = retire;
+ 	ref->tree = RB_ROOT;
+@@ -262,6 +263,34 @@ void i915_active_release(struct i915_active *ref)
+ 	active_retire(ref);
+ }
+ 
++static void __active_ungrab(struct i915_active *ref)
++{
++	clear_and_wake_up_bit(I915_ACTIVE_GRAB_BIT, &ref->flags);
++}
++
++bool i915_active_trygrab(struct i915_active *ref)
++{
++	debug_active_assert(ref);
++
++	if (test_and_set_bit(I915_ACTIVE_GRAB_BIT, &ref->flags))
++		return false;
++
++	if (!atomic_add_unless(&ref->count, 1, 0)) {
++		__active_ungrab(ref);
++		return false;
++	}
++
++	return true;
++}
++
++void i915_active_ungrab(struct i915_active *ref)
++{
++	GEM_BUG_ON(!test_bit(I915_ACTIVE_GRAB_BIT, &ref->flags));
++
++	active_retire(ref);
++	__active_ungrab(ref);
++}
++
+ int i915_active_wait(struct i915_active *ref)
+ {
+ 	struct active_node *it, *n;
+@@ -270,7 +299,7 @@ int i915_active_wait(struct i915_active *ref)
+ 	might_sleep();
+ 	might_lock(&ref->mutex);
+ 
+-	if (RB_EMPTY_ROOT(&ref->tree))
++	if (i915_active_is_idle(ref))
+ 		return 0;
+ 
+ 	err = mutex_lock_interruptible(&ref->mutex);
+@@ -292,6 +321,9 @@ int i915_active_wait(struct i915_active *ref)
+ 	if (err)
+ 		return err;
+ 
++	if (wait_on_bit(&ref->flags, I915_ACTIVE_GRAB_BIT, TASK_KILLABLE))
++		return -EINTR;
++
+ 	if (!i915_active_is_idle(ref))
+ 		return -EBUSY;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_active.h b/drivers/gpu/drm/i915/i915_active.h
+index 134166d31251..ba68b077ec6c 100644
+--- a/drivers/gpu/drm/i915/i915_active.h
++++ b/drivers/gpu/drm/i915/i915_active.h
+@@ -395,6 +395,9 @@ int i915_active_acquire(struct i915_active *ref);
+ void i915_active_release(struct i915_active *ref);
+ void __i915_active_release_nested(struct i915_active *ref, int subclass);
+ 
++bool i915_active_trygrab(struct i915_active *ref);
++void i915_active_ungrab(struct i915_active *ref);
++
+ static inline bool
+ i915_active_is_idle(const struct i915_active *ref)
+ {
+diff --git a/drivers/gpu/drm/i915/i915_active_types.h b/drivers/gpu/drm/i915/i915_active_types.h
+index 5b0a3024ce24..74743dd0d5f0 100644
+--- a/drivers/gpu/drm/i915/i915_active_types.h
++++ b/drivers/gpu/drm/i915/i915_active_types.h
+@@ -36,6 +36,9 @@ struct i915_active {
+ 	struct mutex mutex;
+ 	atomic_t count;
+ 
++	unsigned long flags;
++#define I915_ACTIVE_GRAB_BIT 0
++
+ 	int (*active)(struct i915_active *ref);
+ 	void (*retire)(struct i915_active *ref);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 56dfc2650836..674d341a23f6 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -298,7 +298,7 @@ static void *compress_next_page(struct compress *c,
+ 	if (dst->page_count >= dst->num_pages)
+ 		return ERR_PTR(-ENOSPC);
+ 
+-	page = pool_alloc(&c->pool, ATOMIC_MAYFAIL);
++	page = pool_alloc(&c->pool, ALLOW_FAIL);
+ 	if (!page)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -327,8 +327,6 @@ static int compress_page(struct compress *c,
+ 
+ 		if (zlib_deflate(zstream, Z_NO_FLUSH) != Z_OK)
+ 			return -EIO;
+-
+-		touch_nmi_watchdog();
+ 	} while (zstream->avail_in);
+ 
+ 	/* Fallback to uncompressed if we increase size? */
+@@ -407,7 +405,7 @@ static int compress_page(struct compress *c,
+ {
+ 	void *ptr;
+ 
+-	ptr = pool_alloc(&c->pool, ATOMIC_MAYFAIL);
++	ptr = pool_alloc(&c->pool, ALLOW_FAIL);
+ 	if (!ptr)
+ 		return -ENOMEM;
+ 
+@@ -1001,12 +999,14 @@ i915_error_object_create(struct drm_i915_private *i915,
+ 	dma_addr_t dma;
+ 	int ret;
+ 
++	might_sleep();
++
+ 	if (!vma || !vma->pages)
+ 		return NULL;
+ 
+ 	num_pages = min_t(u64, vma->size, vma->obj->base.size) >> PAGE_SHIFT;
+ 	num_pages = DIV_ROUND_UP(10 * num_pages, 8); /* worstcase zlib growth */
+-	dst = kmalloc(sizeof(*dst) + num_pages * sizeof(u32 *), ATOMIC_MAYFAIL);
++	dst = kmalloc(sizeof(*dst) + num_pages * sizeof(u32 *), ALLOW_FAIL);
+ 	if (!dst)
+ 		return NULL;
+ 
+@@ -1027,9 +1027,9 @@ i915_error_object_create(struct drm_i915_private *i915,
+ 
+ 		ggtt->vm.insert_page(&ggtt->vm, dma, slot, I915_CACHE_NONE, 0);
+ 
+-		s = io_mapping_map_atomic_wc(&ggtt->iomap, slot);
++		s = io_mapping_map_wc(&ggtt->iomap, slot, PAGE_SIZE);
+ 		ret = compress_page(compress, (void  __force *)s, dst);
+-		io_mapping_unmap_atomic(s);
++		io_mapping_unmap(s);
+ 		if (ret)
+ 			break;
+ 	}
+@@ -1302,10 +1302,42 @@ static void record_context(struct drm_i915_error_context *e,
+ 	e->active = atomic_read(&ctx->active_count);
+ }
+ 
+-static void
++struct capture_vma {
++	struct capture_vma *next;
++	void **slot;
++};
++
++static struct capture_vma *
++capture_vma(struct capture_vma *next,
++	    struct i915_vma *vma,
++	    struct drm_i915_error_object **out)
++{
++	struct capture_vma *c;
++
++	*out = NULL;
++	if (!vma)
++		return next;
++
++	c = kmalloc(sizeof(*c), ATOMIC_MAYFAIL);
++	if (!c)
++		return next;
++
++	if (!i915_active_trygrab(&vma->active)) {
++		kfree(c);
++		return next;
++	}
++
++	c->slot = (void **)out;
++	*c->slot = i915_vma_get(vma);
++
++	c->next = next;
++	return c;
++}
++
++static struct capture_vma *
+ request_record_user_bo(struct i915_request *request,
+ 		       struct drm_i915_error_engine *ee,
+-		       struct compress *compress)
++		       struct capture_vma *capture)
+ {
+ 	struct i915_capture_list *c;
+ 	struct drm_i915_error_object **bo;
+@@ -1315,7 +1347,7 @@ request_record_user_bo(struct i915_request *request,
+ 	for (c = request->capture_list; c; c = c->next)
+ 		max++;
+ 	if (!max)
+-		return;
++		return capture;
+ 
+ 	bo = kmalloc_array(max, sizeof(*bo), ATOMIC_MAYFAIL);
+ 	if (!bo) {
+@@ -1324,21 +1356,19 @@ request_record_user_bo(struct i915_request *request,
+ 		bo = kmalloc_array(max, sizeof(*bo), ATOMIC_MAYFAIL);
+ 	}
+ 	if (!bo)
+-		return;
++		return capture;
+ 
+ 	count = 0;
+ 	for (c = request->capture_list; c; c = c->next) {
+-		bo[count] = i915_error_object_create(request->i915,
+-						     c->vma,
+-						     compress);
+-		if (!bo[count])
+-			break;
++		capture = capture_vma(capture, c->vma, &bo[count]);
+ 		if (++count == max)
+ 			break;
+ 	}
+ 
+ 	ee->user_bo = bo;
+ 	ee->user_bo_count = count;
++
++	return capture;
+ }
+ 
+ static struct drm_i915_error_object *
+@@ -1369,6 +1399,7 @@ gem_record_rings(struct i915_gpu_state *error, struct compress *compress)
+ 	for (i = 0; i < I915_NUM_ENGINES; i++) {
+ 		struct intel_engine_cs *engine = i915->engine[i];
+ 		struct drm_i915_error_engine *ee = &error->engine[i];
++		struct capture_vma *capture = NULL;
+ 		struct i915_request *request;
+ 		unsigned long flags;
+ 
+@@ -1393,26 +1424,29 @@ gem_record_rings(struct i915_gpu_state *error, struct compress *compress)
+ 
+ 			record_context(&ee->context, ctx);
+ 
+-			/* We need to copy these to an anonymous buffer
++			/*
++			 * We need to copy these to an anonymous buffer
+ 			 * as the simplest method to avoid being overwritten
+ 			 * by userspace.
+ 			 */
+-			ee->batchbuffer =
+-				i915_error_object_create(i915,
+-							 request->batch,
+-							 compress);
++			capture = capture_vma(capture,
++					      request->batch,
++					      &ee->batchbuffer);
+ 
+ 			if (HAS_BROKEN_CS_TLB(i915))
+-				ee->wa_batchbuffer =
+-				  i915_error_object_create(i915,
+-							   engine->gt->scratch,
+-							   compress);
+-			request_record_user_bo(request, ee, compress);
++				capture = capture_vma(capture,
++						      engine->gt->scratch,
++						      &ee->wa_batchbuffer);
++
++			capture = request_record_user_bo(request, ee, capture);
+ 
+-			ee->ctx =
+-				i915_error_object_create(i915,
+-							 request->hw_context->state,
+-							 compress);
++			capture = capture_vma(capture,
++					      request->hw_context->state,
++					      &ee->ctx);
++
++			capture = capture_vma(capture,
++					      ring->vma,
++					      &ee->ringbuffer);
+ 
+ 			error->simulated |=
+ 				i915_gem_context_no_error_capture(ctx);
+@@ -1423,15 +1457,25 @@ gem_record_rings(struct i915_gpu_state *error, struct compress *compress)
+ 
+ 			ee->cpu_ring_head = ring->head;
+ 			ee->cpu_ring_tail = ring->tail;
+-			ee->ringbuffer =
+-				i915_error_object_create(i915,
+-							 ring->vma,
+-							 compress);
+ 
+ 			engine_record_requests(engine, request, ee);
+ 		}
+ 		spin_unlock_irqrestore(&engine->active.lock, flags);
+ 
++		while (capture) {
++			struct capture_vma *this = capture;
++			struct i915_vma *vma = *this->slot;
++
++			*this->slot =
++				i915_error_object_create(i915, vma, compress);
++
++			i915_active_ungrab(&vma->active);
++			i915_vma_put(vma);
++
++			capture = this->next;
++			kfree(this);
++		}
++
+ 		ee->hws_page =
+ 			i915_error_object_create(i915,
+ 						 engine->status_page.vma,
+-- 
+2.16.4
+
