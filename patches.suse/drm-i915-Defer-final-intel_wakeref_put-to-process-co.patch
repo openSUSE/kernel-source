@@ -1,0 +1,833 @@
+From c7302f204490f3eb4ef839bec228315bcd3ba43f Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 8 Aug 2019 21:27:58 +0100
+Subject: [PATCH] drm/i915: Defer final intel_wakeref_put to process context
+Git-commit: c7302f204490f3eb4ef839bec228315bcd3ba43f
+Patch-mainline: v5.4-rc1
+References: jsc#SLE-7953
+
+As we need to acquire a mutex to serialise the final
+intel_wakeref_put, we need to ensure that we are in process context at
+that time. However, we want to allow operation on the intel_wakeref from
+inside timer and other hardirq context, which means that need to defer
+that final put to a workqueue.
+
+Inside the final wakeref puts, we are safe to operate in any context, as
+we are simply marking up the HW and state tracking for the potential
+sleep. It's only the serialisation with the potential sleeping getting
+that requires careful wait avoidance. This allows us to retain the
+immediate processing as before (we only need to sleep over the same
+races as the current mutex_lock).
+
+V2: Add a selftest to ensure we exercise the code while lockdep watches.
+V3: That test was extremely loud and complained about many things!
+V4: Not a whale!
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=111295
+References: https://bugs.freedesktop.org/show_bug.cgi?id=111245
+References: https://bugs.freedesktop.org/show_bug.cgi?id=111256
+Fixes: 18398904ca9e ("drm/i915: Only recover active engines")
+Fixes: 51fbd8de87dc ("drm/i915/pmu: Atomically acquire the gt_pm wakeref")
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190808202758.10453-1-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/gem/i915_gem_pm.c               |   13 --
+ drivers/gpu/drm/i915/gt/intel_engine_cs.c            |    1 
+ drivers/gpu/drm/i915/gt/intel_engine_pm.c            |   38 ++------
+ drivers/gpu/drm/i915/gt/intel_engine_pm.h            |   18 ++-
+ drivers/gpu/drm/i915/gt/intel_gt_pm.c                |   28 ++----
+ drivers/gpu/drm/i915/gt/intel_gt_pm.h                |   21 ++++
+ drivers/gpu/drm/i915/gt/intel_lrc.c                  |    4 
+ drivers/gpu/drm/i915/gt/selftest_engine.c            |   28 ++++++
+ drivers/gpu/drm/i915/gt/selftest_engine.h            |   14 +++
+ drivers/gpu/drm/i915/gt/selftest_engine_pm.c         |   83 ++++++++++++++++++
+ drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c    |    4 
+ drivers/gpu/drm/i915/i915_debugfs.c                  |    4 
+ drivers/gpu/drm/i915/i915_gem.c                      |   26 -----
+ drivers/gpu/drm/i915/intel_wakeref.c                 |   86 +++++++++++++------
+ drivers/gpu/drm/i915/intel_wakeref.h                 |   62 +++++++++----
+ drivers/gpu/drm/i915/selftests/i915_live_selftests.h |    4 
+ 16 files changed, 302 insertions(+), 132 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/gt/selftest_engine.c
+ create mode 100644 drivers/gpu/drm/i915/gt/selftest_engine.h
+ create mode 100644 drivers/gpu/drm/i915/gt/selftest_engine_pm.c
+
+--- a/drivers/gpu/drm/i915/gem/i915_gem_pm.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_pm.c
+@@ -130,7 +130,9 @@ static bool switch_to_kernel_context_syn
+ 		}
+ 	} while (i915_retire_requests(gt->i915) && result);
+ 
+-	GEM_BUG_ON(gt->awake);
++	if (intel_gt_pm_wait_for_idle(gt))
++		result = false;
++
+ 	return result;
+ }
+ 
+@@ -161,13 +163,6 @@ void i915_gem_suspend(struct drm_i915_pr
+ 
+ 	mutex_unlock(&i915->drm.struct_mutex);
+ 
+-	/*
+-	 * Assert that we successfully flushed all the work and
+-	 * reset the GPU back to its idle, low power state.
+-	 */
+-	GEM_BUG_ON(i915->gt.awake);
+-	flush_work(&i915->gem.idle_work);
+-
+ 	cancel_delayed_work_sync(&i915->gt.hangcheck.work);
+ 
+ 	i915_gem_drain_freed_objects(i915);
+@@ -244,8 +239,6 @@ void i915_gem_resume(struct drm_i915_pri
+ {
+ 	GEM_TRACE("\n");
+ 
+-	WARN_ON(i915->gt.awake);
+-
+ 	mutex_lock(&i915->drm.struct_mutex);
+ 	intel_uncore_forcewake_get(&i915->uncore, FORCEWAKE_ALL);
+ 
+--- a/drivers/gpu/drm/i915/gt/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/gt/intel_engine_cs.c
+@@ -1577,5 +1577,6 @@ intel_engine_find_active_request(struct
+ 
+ #if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
+ #include "mock_engine.c"
++#include "selftest_engine.c"
+ #include "selftest_engine_cs.c"
+ #endif
+--- a/drivers/gpu/drm/i915/gt/intel_engine_pm.c
++++ b/drivers/gpu/drm/i915/gt/intel_engine_pm.c
+@@ -37,28 +37,6 @@ static int __engine_unpark(struct intel_
+ 	return 0;
+ }
+ 
+-void intel_engine_pm_get(struct intel_engine_cs *engine)
+-{
+-	intel_wakeref_get(&engine->i915->runtime_pm, &engine->wakeref, __engine_unpark);
+-}
+-
+-void intel_engine_park(struct intel_engine_cs *engine)
+-{
+-	/*
+-	 * We are committed now to parking this engine, make sure there
+-	 * will be no more interrupts arriving later and the engine
+-	 * is truly idle.
+-	 */
+-	if (wait_for(intel_engine_is_idle(engine), 10)) {
+-		struct drm_printer p = drm_debug_printer(__func__);
+-
+-		dev_err(engine->i915->drm.dev,
+-			"%s is not idle before parking\n",
+-			engine->name);
+-		intel_engine_dump(engine, &p, NULL);
+-	}
+-}
+-
+ static bool switch_to_kernel_context(struct intel_engine_cs *engine)
+ {
+ 	struct i915_request *rq;
+@@ -136,12 +114,18 @@ static int __engine_park(struct intel_wa
+ 	return 0;
+ }
+ 
+-void intel_engine_pm_put(struct intel_engine_cs *engine)
+-{
+-	intel_wakeref_put(&engine->i915->runtime_pm, &engine->wakeref, __engine_park);
+-}
++static const struct intel_wakeref_ops wf_ops = {
++	.get = __engine_unpark,
++	.put = __engine_park,
++};
+ 
+ void intel_engine_init__pm(struct intel_engine_cs *engine)
+ {
+-	intel_wakeref_init(&engine->wakeref);
++	struct intel_runtime_pm *rpm = &engine->i915->runtime_pm;
++
++	intel_wakeref_init(&engine->wakeref, rpm, &wf_ops);
+ }
++
++#if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
++#include "selftest_engine_pm.c"
++#endif
+--- a/drivers/gpu/drm/i915/gt/intel_engine_pm.h
++++ b/drivers/gpu/drm/i915/gt/intel_engine_pm.h
+@@ -10,24 +10,26 @@
+ #include "intel_engine_types.h"
+ #include "intel_wakeref.h"
+ 
+-struct drm_i915_private;
+-
+-void intel_engine_pm_get(struct intel_engine_cs *engine);
+-void intel_engine_pm_put(struct intel_engine_cs *engine);
+-
+ static inline bool
+ intel_engine_pm_is_awake(const struct intel_engine_cs *engine)
+ {
+ 	return intel_wakeref_is_active(&engine->wakeref);
+ }
+ 
+-static inline bool
+-intel_engine_pm_get_if_awake(struct intel_engine_cs *engine)
++static inline void intel_engine_pm_get(struct intel_engine_cs *engine)
++{
++	intel_wakeref_get(&engine->wakeref);
++}
++
++static inline bool intel_engine_pm_get_if_awake(struct intel_engine_cs *engine)
+ {
+ 	return intel_wakeref_get_if_active(&engine->wakeref);
+ }
+ 
+-void intel_engine_park(struct intel_engine_cs *engine);
++static inline void intel_engine_pm_put(struct intel_engine_cs *engine)
++{
++	intel_wakeref_put(&engine->wakeref);
++}
+ 
+ void intel_engine_init__pm(struct intel_engine_cs *engine);
+ 
+--- a/drivers/gpu/drm/i915/gt/intel_gt_pm.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt_pm.c
+@@ -17,7 +17,7 @@ static void pm_notify(struct drm_i915_pr
+ 	blocking_notifier_call_chain(&i915->gt.pm_notifications, state, i915);
+ }
+ 
+-static int intel_gt_unpark(struct intel_wakeref *wf)
++static int __gt_unpark(struct intel_wakeref *wf)
+ {
+ 	struct intel_gt *gt = container_of(wf, typeof(*gt), wakeref);
+ 	struct drm_i915_private *i915 = gt->i915;
+@@ -53,14 +53,7 @@ static int intel_gt_unpark(struct intel_
+ 	return 0;
+ }
+ 
+-void intel_gt_pm_get(struct intel_gt *gt)
+-{
+-	struct intel_runtime_pm *rpm = &gt->i915->runtime_pm;
+-
+-	intel_wakeref_get(rpm, &gt->wakeref, intel_gt_unpark);
+-}
+-
+-static int intel_gt_park(struct intel_wakeref *wf)
++static int __gt_park(struct intel_wakeref *wf)
+ {
+ 	struct drm_i915_private *i915 =
+ 		container_of(wf, typeof(*i915), gt.wakeref);
+@@ -74,22 +67,25 @@ static int intel_gt_park(struct intel_wa
+ 	if (INTEL_GEN(i915) >= 6)
+ 		gen6_rps_idle(i915);
+ 
++	/* Everything switched off, flush any residual interrupt just in case */
++	intel_synchronize_irq(i915);
++
+ 	GEM_BUG_ON(!wakeref);
+ 	intel_display_power_put(i915, POWER_DOMAIN_GT_IRQ, wakeref);
+ 
+ 	return 0;
+ }
+ 
+-void intel_gt_pm_put(struct intel_gt *gt)
+-{
+-	struct intel_runtime_pm *rpm = &gt->i915->runtime_pm;
+-
+-	intel_wakeref_put(rpm, &gt->wakeref, intel_gt_park);
+-}
++static const struct intel_wakeref_ops wf_ops = {
++	.get = __gt_unpark,
++	.put = __gt_park,
++	.flags = INTEL_WAKEREF_PUT_ASYNC,
++};
+ 
+ void intel_gt_pm_init_early(struct intel_gt *gt)
+ {
+-	intel_wakeref_init(&gt->wakeref);
++	intel_wakeref_init(&gt->wakeref, &gt->i915->runtime_pm, &wf_ops);
++
+ 	BLOCKING_INIT_NOTIFIER_HEAD(&gt->pm_notifications);
+ }
+ 
+--- a/drivers/gpu/drm/i915/gt/intel_gt_pm.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_pm.h
+@@ -17,14 +17,31 @@ enum {
+ 	INTEL_GT_PARK,
+ };
+ 
+-void intel_gt_pm_get(struct intel_gt *gt);
+-void intel_gt_pm_put(struct intel_gt *gt);
++static inline bool intel_gt_pm_is_awake(const struct intel_gt *gt)
++{
++	return intel_wakeref_is_active(&gt->wakeref);
++}
++
++static inline void intel_gt_pm_get(struct intel_gt *gt)
++{
++	intel_wakeref_get(&gt->wakeref);
++}
+ 
+ static inline bool intel_gt_pm_get_if_awake(struct intel_gt *gt)
+ {
+ 	return intel_wakeref_get_if_active(&gt->wakeref);
+ }
+ 
++static inline void intel_gt_pm_put(struct intel_gt *gt)
++{
++	intel_wakeref_put(&gt->wakeref);
++}
++
++static inline int intel_gt_pm_wait_for_idle(struct intel_gt *gt)
++{
++	return intel_wakeref_wait_for_idle(&gt->wakeref);
++}
++
+ void intel_gt_pm_init_early(struct intel_gt *gt);
+ 
+ void intel_gt_sanitize(struct intel_gt *gt, bool force);
+--- a/drivers/gpu/drm/i915/gt/intel_lrc.c
++++ b/drivers/gpu/drm/i915/gt/intel_lrc.c
+@@ -140,6 +140,7 @@
+ #include "i915_vgpu.h"
+ #include "intel_engine_pm.h"
+ #include "intel_gt.h"
++#include "intel_gt_pm.h"
+ #include "intel_lrc_reg.h"
+ #include "intel_mocs.h"
+ #include "intel_reset.h"
+@@ -557,6 +558,7 @@ execlists_schedule_in(struct i915_reques
+ 		intel_context_get(ce);
+ 		ce->inflight = rq->engine;
+ 
++		intel_gt_pm_get(ce->inflight->gt);
+ 		execlists_context_status_change(rq, INTEL_CONTEXT_SCHEDULE_IN);
+ 		intel_engine_context_in(ce->inflight);
+ 	}
+@@ -589,6 +591,7 @@ execlists_schedule_out(struct i915_reque
+ 	if (!intel_context_inflight_count(ce)) {
+ 		intel_engine_context_out(ce->inflight);
+ 		execlists_context_status_change(rq, INTEL_CONTEXT_SCHEDULE_OUT);
++		intel_gt_pm_put(ce->inflight->gt);
+ 
+ 		/*
+ 		 * If this is part of a virtual engine, its next request may
+@@ -2720,7 +2723,6 @@ static u32 *gen8_emit_fini_breadcrumb_rc
+ static void execlists_park(struct intel_engine_cs *engine)
+ {
+ 	del_timer_sync(&engine->execlists.timer);
+-	intel_engine_park(engine);
+ }
+ 
+ void intel_execlists_set_default_submission(struct intel_engine_cs *engine)
+--- /dev/null
++++ b/drivers/gpu/drm/i915/gt/selftest_engine.c
+@@ -0,0 +1,28 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0
++ *
++ * Copyright © 2018 Intel Corporation
++ */
++
++#include "i915_selftest.h"
++#include "selftest_engine.h"
++
++int intel_engine_live_selftests(struct drm_i915_private *i915)
++{
++	static int (* const tests[])(struct intel_gt *) = {
++		live_engine_pm_selftests,
++		NULL,
++	};
++	struct intel_gt *gt = &i915->gt;
++	typeof(*tests) *fn;
++
++	for (fn = tests; *fn; fn++) {
++		int err;
++
++		err = (*fn)(gt);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
+--- /dev/null
++++ b/drivers/gpu/drm/i915/gt/selftest_engine.h
+@@ -0,0 +1,14 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0
++ *
++ * Copyright © 2019 Intel Corporation
++ */
++
++#ifndef SELFTEST_ENGINE_H
++#define SELFTEST_ENGINE_H
++
++struct intel_gt;
++
++int live_engine_pm_selftests(struct intel_gt *gt);
++
++#endif
+--- /dev/null
++++ b/drivers/gpu/drm/i915/gt/selftest_engine_pm.c
+@@ -0,0 +1,83 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0
++ *
++ * Copyright © 2018 Intel Corporation
++ */
++
++#include "i915_selftest.h"
++#include "selftest_engine.h"
++#include "selftests/igt_atomic.h"
++
++static int live_engine_pm(void *arg)
++{
++	struct intel_gt *gt = arg;
++	struct intel_engine_cs *engine;
++	enum intel_engine_id id;
++
++	/*
++	 * Check we can call intel_engine_pm_put from any context. No
++	 * failures are reported directly, but if we mess up lockdep should
++	 * tell us.
++	 */
++	if (intel_gt_pm_wait_for_idle(gt)) {
++		pr_err("Unable to flush GT pm before test\n");
++		return -EBUSY;
++	}
++
++	GEM_BUG_ON(intel_gt_pm_is_awake(gt));
++	for_each_engine(engine, gt->i915, id) {
++		const typeof(*igt_atomic_phases) *p;
++
++		for (p = igt_atomic_phases; p->name; p++) {
++			/*
++			 * Acquisition is always synchronous, except if we
++			 * know that the engine is already awake, in which
++			 * case we should use intel_engine_pm_get_if_awake()
++			 * to atomically grab the wakeref.
++			 *
++			 * In practice,
++			 *    intel_engine_pm_get();
++			 *    intel_engine_pm_put();
++			 * occurs in one thread, while simultaneously
++			 *    intel_engine_pm_get_if_awake();
++			 *    intel_engine_pm_put();
++			 * occurs from atomic context in another.
++			 */
++			GEM_BUG_ON(intel_engine_pm_is_awake(engine));
++			intel_engine_pm_get(engine);
++
++			p->critical_section_begin();
++			if (!intel_engine_pm_get_if_awake(engine))
++				pr_err("intel_engine_pm_get_if_awake(%s) failed under %s\n",
++				       engine->name, p->name);
++			else
++				intel_engine_pm_put(engine);
++			intel_engine_pm_put(engine);
++			p->critical_section_end();
++
++			/* engine wakeref is sync (instant) */
++			if (intel_engine_pm_is_awake(engine)) {
++				pr_err("%s is still awake after flushing pm\n",
++				       engine->name);
++				return -EINVAL;
++			}
++
++			/* gt wakeref is async (deferred to workqueue) */
++			if (intel_gt_pm_wait_for_idle(gt)) {
++				pr_err("GT failed to idle\n");
++				return -EINVAL;
++			}
++		}
++	}
++
++	return 0;
++}
++
++int live_engine_pm_selftests(struct intel_gt *gt)
++{
++	static const struct i915_subtest tests[] = {
++		SUBTEST(live_engine_pm),
++	};
++
++	return intel_gt_live_subtests(tests, gt);
++}
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+@@ -29,6 +29,7 @@
+ #include "gt/intel_context.h"
+ #include "gt/intel_engine_pm.h"
+ #include "gt/intel_gt.h"
++#include "gt/intel_gt_pm.h"
+ #include "gt/intel_lrc_reg.h"
+ #include "intel_guc_submission.h"
+ 
+@@ -538,6 +539,7 @@ static struct i915_request *schedule_in(
+ 	if (!rq->hw_context->inflight)
+ 		rq->hw_context->inflight = rq->engine;
+ 	intel_context_inflight_inc(rq->hw_context);
++	intel_gt_pm_get(rq->engine->gt);
+ 
+ 	return i915_request_get(rq);
+ }
+@@ -550,6 +552,7 @@ static void schedule_out(struct i915_req
+ 	if (!intel_context_inflight_count(rq->hw_context))
+ 		rq->hw_context->inflight = NULL;
+ 
++	intel_gt_pm_put(rq->engine->gt);
+ 	i915_request_put(rq);
+ }
+ 
+@@ -1077,7 +1080,6 @@ static void guc_interrupts_release(struc
+ 
+ static void guc_submission_park(struct intel_engine_cs *engine)
+ {
+-	intel_engine_park(engine);
+ 	intel_engine_unpin_breadcrumbs_irq(engine);
+ 	engine->flags &= ~I915_ENGINE_NEEDS_BREADCRUMB_TASKLET;
+ }
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -40,6 +40,7 @@
+ #include "display/intel_psr.h"
+ 
+ #include "gem/i915_gem_context.h"
++#include "gt/intel_gt_pm.h"
+ #include "gt/intel_reset.h"
+ #include "gt/uc/intel_guc_submission.h"
+ 
+@@ -3665,6 +3666,9 @@ i915_drop_caches_set(void *data, u64 val
+ 			i915_retire_requests(i915);
+ 
+ 		mutex_unlock(&i915->drm.struct_mutex);
++
++		if (ret == 0 && val & DROP_IDLE)
++			ret = intel_gt_pm_wait_for_idle(&i915->gt);
+ 	}
+ 
+ 	if (val & DROP_RESET_ACTIVE && intel_gt_terminally_wedged(&i915->gt))
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -893,19 +893,6 @@ void i915_gem_runtime_suspend(struct drm
+ 	}
+ }
+ 
+-static int wait_for_engines(struct intel_gt *gt)
+-{
+-	if (wait_for(intel_engines_are_idle(gt), I915_IDLE_ENGINES_TIMEOUT)) {
+-		dev_err(gt->i915->drm.dev,
+-			"Failed to idle engines, declaring wedged!\n");
+-		GEM_TRACE_DUMP();
+-		intel_gt_set_wedged(gt);
+-		return -EIO;
+-	}
+-
+-	return 0;
+-}
+-
+ static long
+ wait_for_timelines(struct drm_i915_private *i915,
+ 		   unsigned int flags, long timeout)
+@@ -953,27 +940,20 @@ int i915_gem_wait_for_idle(struct drm_i9
+ 			   unsigned int flags, long timeout)
+ {
+ 	/* If the device is asleep, we have no requests outstanding */
+-	if (!READ_ONCE(i915->gt.awake))
++	if (!intel_gt_pm_is_awake(&i915->gt))
+ 		return 0;
+ 
+-	GEM_TRACE("flags=%x (%s), timeout=%ld%s, awake?=%s\n",
++	GEM_TRACE("flags=%x (%s), timeout=%ld%s\n",
+ 		  flags, flags & I915_WAIT_LOCKED ? "locked" : "unlocked",
+-		  timeout, timeout == MAX_SCHEDULE_TIMEOUT ? " (forever)" : "",
+-		  yesno(i915->gt.awake));
++		  timeout, timeout == MAX_SCHEDULE_TIMEOUT ? " (forever)" : "");
+ 
+ 	timeout = wait_for_timelines(i915, flags, timeout);
+ 	if (timeout < 0)
+ 		return timeout;
+ 
+ 	if (flags & I915_WAIT_LOCKED) {
+-		int err;
+-
+ 		lockdep_assert_held(&i915->drm.struct_mutex);
+ 
+-		err = wait_for_engines(&i915->gt);
+-		if (err)
+-			return err;
+-
+ 		i915_retire_requests(i915);
+ 	}
+ 
+--- a/drivers/gpu/drm/i915/intel_wakeref.c
++++ b/drivers/gpu/drm/i915/intel_wakeref.c
+@@ -4,25 +4,25 @@
+  * Copyright © 2019 Intel Corporation
+  */
+ 
++#include <linux/wait_bit.h>
++
+ #include "intel_runtime_pm.h"
+ #include "intel_wakeref.h"
+ 
+-static void rpm_get(struct intel_runtime_pm *rpm, struct intel_wakeref *wf)
++static void rpm_get(struct intel_wakeref *wf)
+ {
+-	wf->wakeref = intel_runtime_pm_get(rpm);
++	wf->wakeref = intel_runtime_pm_get(wf->rpm);
+ }
+ 
+-static void rpm_put(struct intel_runtime_pm *rpm, struct intel_wakeref *wf)
++static void rpm_put(struct intel_wakeref *wf)
+ {
+ 	intel_wakeref_t wakeref = fetch_and_zero(&wf->wakeref);
+ 
+-	intel_runtime_pm_put(rpm, wakeref);
++	intel_runtime_pm_put(wf->rpm, wakeref);
+ 	INTEL_WAKEREF_BUG_ON(!wakeref);
+ }
+ 
+-int __intel_wakeref_get_first(struct intel_runtime_pm *rpm,
+-			      struct intel_wakeref *wf,
+-			      int (*fn)(struct intel_wakeref *wf))
++int __intel_wakeref_get_first(struct intel_wakeref *wf)
+ {
+ 	/*
+ 	 * Treat get/put as different subclasses, as we may need to run
+@@ -34,11 +34,11 @@ int __intel_wakeref_get_first(struct int
+ 	if (!atomic_read(&wf->count)) {
+ 		int err;
+ 
+-		rpm_get(rpm, wf);
++		rpm_get(wf);
+ 
+-		err = fn(wf);
++		err = wf->ops->get(wf);
+ 		if (unlikely(err)) {
+-			rpm_put(rpm, wf);
++			rpm_put(wf);
+ 			mutex_unlock(&wf->mutex);
+ 			return err;
+ 		}
+@@ -52,27 +52,67 @@ int __intel_wakeref_get_first(struct int
+ 	return 0;
+ }
+ 
+-int __intel_wakeref_put_last(struct intel_runtime_pm *rpm,
+-			     struct intel_wakeref *wf,
+-			     int (*fn)(struct intel_wakeref *wf))
+-{
+-	int err;
+-
+-	err = fn(wf);
+-	if (likely(!err))
+-		rpm_put(rpm, wf);
+-	else
+-		atomic_inc(&wf->count);
++static void ____intel_wakeref_put_last(struct intel_wakeref *wf)
++{
++	if (!atomic_dec_and_test(&wf->count))
++		goto unlock;
++
++	if (likely(!wf->ops->put(wf))) {
++		rpm_put(wf);
++		wake_up_var(&wf->wakeref);
++	} else {
++		/* ops->put() must schedule its own release on deferral */
++		atomic_set_release(&wf->count, 1);
++	}
++
++unlock:
+ 	mutex_unlock(&wf->mutex);
++}
++
++void __intel_wakeref_put_last(struct intel_wakeref *wf)
++{
++	INTEL_WAKEREF_BUG_ON(work_pending(&wf->work));
++
++	/* Assume we are not in process context and so cannot sleep. */
++	if (wf->ops->flags & INTEL_WAKEREF_PUT_ASYNC ||
++	    !mutex_trylock(&wf->mutex)) {
++		schedule_work(&wf->work);
++		return;
++	}
+ 
+-	return err;
++	____intel_wakeref_put_last(wf);
+ }
+ 
+-void __intel_wakeref_init(struct intel_wakeref *wf, struct lock_class_key *key)
++static void __intel_wakeref_put_work(struct work_struct *wrk)
+ {
++	struct intel_wakeref *wf = container_of(wrk, typeof(*wf), work);
++
++	if (atomic_add_unless(&wf->count, -1, 1))
++		return;
++
++	mutex_lock(&wf->mutex);
++	____intel_wakeref_put_last(wf);
++}
++
++void __intel_wakeref_init(struct intel_wakeref *wf,
++			  struct intel_runtime_pm *rpm,
++			  const struct intel_wakeref_ops *ops,
++			  struct lock_class_key *key)
++{
++	wf->rpm = rpm;
++	wf->ops = ops;
++
+ 	__mutex_init(&wf->mutex, "wakeref", key);
+ 	atomic_set(&wf->count, 0);
+ 	wf->wakeref = 0;
++
++	INIT_WORK(&wf->work, __intel_wakeref_put_work);
++}
++
++int intel_wakeref_wait_for_idle(struct intel_wakeref *wf)
++{
++	return wait_var_event_killable(&wf->wakeref,
++				       !intel_wakeref_is_active(wf));
+ }
+ 
+ static void wakeref_auto_timeout(struct timer_list *t)
+--- a/drivers/gpu/drm/i915/intel_wakeref.h
++++ b/drivers/gpu/drm/i915/intel_wakeref.h
+@@ -8,10 +8,12 @@
+ #define INTEL_WAKEREF_H
+ 
+ #include <linux/atomic.h>
++#include <linux/bits.h>
+ #include <linux/mutex.h>
+ #include <linux/refcount.h>
+ #include <linux/stackdepot.h>
+ #include <linux/timer.h>
++#include <linux/workqueue.h>
+ 
+ #if IS_ENABLED(CONFIG_DRM_I915_DEBUG)
+ #define INTEL_WAKEREF_BUG_ON(expr) BUG_ON(expr)
+@@ -20,29 +22,42 @@
+ #endif
+ 
+ struct intel_runtime_pm;
++struct intel_wakeref;
+ 
+ typedef depot_stack_handle_t intel_wakeref_t;
+ 
++struct intel_wakeref_ops {
++	int (*get)(struct intel_wakeref *wf);
++	int (*put)(struct intel_wakeref *wf);
++
++	unsigned long flags;
++#define INTEL_WAKEREF_PUT_ASYNC BIT(0)
++};
++
+ struct intel_wakeref {
+ 	atomic_t count;
+ 	struct mutex mutex;
++
+ 	intel_wakeref_t wakeref;
++
++	struct intel_runtime_pm *rpm;
++	const struct intel_wakeref_ops *ops;
++
++	struct work_struct work;
+ };
+ 
+ void __intel_wakeref_init(struct intel_wakeref *wf,
++			  struct intel_runtime_pm *rpm,
++			  const struct intel_wakeref_ops *ops,
+ 			  struct lock_class_key *key);
+-#define intel_wakeref_init(wf) do {					\
++#define intel_wakeref_init(wf, rpm, ops) do {				\
+ 	static struct lock_class_key __key;				\
+ 									\
+-	__intel_wakeref_init((wf), &__key);				\
++	__intel_wakeref_init((wf), (rpm), (ops), &__key);		\
+ } while (0)
+ 
+-int __intel_wakeref_get_first(struct intel_runtime_pm *rpm,
+-			      struct intel_wakeref *wf,
+-			      int (*fn)(struct intel_wakeref *wf));
+-int __intel_wakeref_put_last(struct intel_runtime_pm *rpm,
+-			     struct intel_wakeref *wf,
+-			     int (*fn)(struct intel_wakeref *wf));
++int __intel_wakeref_get_first(struct intel_wakeref *wf);
++void __intel_wakeref_put_last(struct intel_wakeref *wf);
+ 
+ /**
+  * intel_wakeref_get: Acquire the wakeref
+@@ -61,12 +76,10 @@ int __intel_wakeref_put_last(struct inte
+  * code otherwise.
+  */
+ static inline int
+-intel_wakeref_get(struct intel_runtime_pm *rpm,
+-		  struct intel_wakeref *wf,
+-		  int (*fn)(struct intel_wakeref *wf))
++intel_wakeref_get(struct intel_wakeref *wf)
+ {
+ 	if (unlikely(!atomic_inc_not_zero(&wf->count)))
+-		return __intel_wakeref_get_first(rpm, wf, fn);
++		return __intel_wakeref_get_first(wf);
+ 
+ 	return 0;
+ }
+@@ -102,16 +115,12 @@ intel_wakeref_get_if_active(struct intel
+  * Returns: 0 if the wakeref was released successfully, or a negative error
+  * code otherwise.
+  */
+-static inline int
+-intel_wakeref_put(struct intel_runtime_pm *rpm,
+-		  struct intel_wakeref *wf,
+-		  int (*fn)(struct intel_wakeref *wf))
++static inline void
++intel_wakeref_put(struct intel_wakeref *wf)
+ {
+ 	INTEL_WAKEREF_BUG_ON(atomic_read(&wf->count) <= 0);
+-	if (atomic_dec_and_mutex_lock(&wf->count, &wf->mutex))
+-		return __intel_wakeref_put_last(rpm, wf, fn);
+-
+-	return 0;
++	if (unlikely(!atomic_add_unless(&wf->count, -1, 1)))
++		__intel_wakeref_put_last(wf);
+ }
+ 
+ /**
+@@ -154,6 +163,19 @@ intel_wakeref_is_active(const struct int
+ 	return READ_ONCE(wf->wakeref);
+ }
+ 
++/**
++ * intel_wakeref_wait_for_idle: Wait until the wakeref is idle
++ * @wf: the wakeref
++ *
++ * Wait for the earlier asynchronous release of the wakeref. Note
++ * this will wait for any third party as well, so make sure you only wait
++ * when you have control over the wakeref and trust no one else is acquiring
++ * it.
++ *
++ * Return: 0 on success, error code if killed.
++ */
++int intel_wakeref_wait_for_idle(struct intel_wakeref *wf);
++
+ struct intel_wakeref_auto {
+ 	struct intel_runtime_pm *rpm;
+ 	struct timer_list timer;
+--- a/drivers/gpu/drm/i915/selftests/i915_live_selftests.h
++++ b/drivers/gpu/drm/i915/selftests/i915_live_selftests.h
+@@ -12,7 +12,9 @@
+ selftest(sanitycheck, i915_live_sanitycheck) /* keep first (igt selfcheck) */
+ selftest(uncore, intel_uncore_live_selftests)
+ selftest(workarounds, intel_workarounds_live_selftests)
+-selftest(timelines, intel_timeline_live_selftests)
++selftest(gt_engines, intel_engine_live_selftests)
++selftest(gt_timelines, intel_timeline_live_selftests)
++selftest(gt_contexts, intel_context_live_selftests)
+ selftest(requests, i915_request_live_selftests)
+ selftest(active, i915_active_live_selftests)
+ selftest(objects, i915_gem_object_live_selftests)
