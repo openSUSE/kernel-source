@@ -1,0 +1,323 @@
+From b32fa811156328aea5a3c2ff05cc096490382456 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 20 Jun 2019 19:37:05 +0100
+Subject: [PATCH] drm/i915/gtt: Defer address space cleanup to an RCU worker
+Git-commit: b32fa811156328aea5a3c2ff05cc096490382456
+Patch-mainline: v5.4-rc1
+References: jsc#SLE-7953
+
+Enable RCU protection of i915_address_space and its ppgtt superclasses,
+and defer its cleanup into a worker executed after an RCU grace period.
+
+In the future we will be able to use the RCU protection to reduce the
+locking around VM lookups, but the immediate benefit is being able to
+defer the release into a kworker (process context). This is required as
+we may need to sleep to reap the WC pages stashed away inside the ppgtt.
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=110934
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190620183705.31006-1-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/Makefile.header-test     |   1 +
+ drivers/gpu/drm/i915/i915_gem_gtt.c           | 174 ++++++++++----------------
+ drivers/gpu/drm/i915/i915_gem_gtt.h           |   7 +-
+ drivers/gpu/drm/i915/selftests/i915_gem_gtt.c |   2 -
+ 4 files changed, 71 insertions(+), 113 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/Makefile.header-test b/drivers/gpu/drm/i915/Makefile.header-test
+index e6ba66f787f9..cb74242f9c3b 100644
+--- a/drivers/gpu/drm/i915/Makefile.header-test
++++ b/drivers/gpu/drm/i915/Makefile.header-test
+@@ -6,6 +6,7 @@ header_test := \
+ 	i915_active_types.h \
+ 	i915_debugfs.h \
+ 	i915_drv.h \
++	i915_gem_gtt.h \
+ 	i915_irq.h \
+ 	i915_params.h \
+ 	i915_priolist_types.h \
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 8ab820145ea6..5b858f675f29 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -482,9 +482,69 @@ static void vm_free_page(struct i915_address_space *vm, struct page *page)
+ 	spin_unlock(&vm->free_pages.lock);
+ }
+ 
++static void i915_address_space_fini(struct i915_address_space *vm)
++{
++	spin_lock(&vm->free_pages.lock);
++	if (pagevec_count(&vm->free_pages.pvec))
++		vm_free_pages_release(vm, true);
++	GEM_BUG_ON(pagevec_count(&vm->free_pages.pvec));
++	spin_unlock(&vm->free_pages.lock);
++
++	drm_mm_takedown(&vm->mm);
++
++	mutex_destroy(&vm->mutex);
++}
++
++static void ppgtt_destroy_vma(struct i915_address_space *vm)
++{
++	struct list_head *phases[] = {
++		&vm->bound_list,
++		&vm->unbound_list,
++		NULL,
++	}, **phase;
++
++	mutex_lock(&vm->i915->drm.struct_mutex);
++	for (phase = phases; *phase; phase++) {
++		struct i915_vma *vma, *vn;
++
++		list_for_each_entry_safe(vma, vn, *phase, vm_link)
++			i915_vma_destroy(vma);
++	}
++	mutex_unlock(&vm->i915->drm.struct_mutex);
++}
++
++static void __i915_vm_release(struct work_struct *work)
++{
++	struct i915_address_space *vm =
++		container_of(work, struct i915_address_space, rcu.work);
++
++	ppgtt_destroy_vma(vm);
++
++	GEM_BUG_ON(!list_empty(&vm->bound_list));
++	GEM_BUG_ON(!list_empty(&vm->unbound_list));
++
++	vm->cleanup(vm);
++	i915_address_space_fini(vm);
++
++	kfree(vm);
++}
++
++void i915_vm_release(struct kref *kref)
++{
++	struct i915_address_space *vm =
++		container_of(kref, struct i915_address_space, ref);
++
++	GEM_BUG_ON(i915_is_ggtt(vm));
++	trace_i915_ppgtt_release(vm);
++
++	vm->closed = true;
++	queue_rcu_work(vm->i915->wq, &vm->rcu);
++}
++
+ static void i915_address_space_init(struct i915_address_space *vm, int subclass)
+ {
+ 	kref_init(&vm->ref);
++	INIT_RCU_WORK(&vm->rcu, __i915_vm_release);
+ 
+ 	/*
+ 	 * The vm->mutex must be reclaim safe (for use in the shrinker).
+@@ -505,19 +565,6 @@ static void i915_address_space_init(struct i915_address_space *vm, int subclass)
+ 	INIT_LIST_HEAD(&vm->bound_list);
+ }
+ 
+-static void i915_address_space_fini(struct i915_address_space *vm)
+-{
+-	spin_lock(&vm->free_pages.lock);
+-	if (pagevec_count(&vm->free_pages.pvec))
+-		vm_free_pages_release(vm, true);
+-	GEM_BUG_ON(pagevec_count(&vm->free_pages.pvec));
+-	spin_unlock(&vm->free_pages.lock);
+-
+-	drm_mm_takedown(&vm->mm);
+-
+-	mutex_destroy(&vm->mutex);
+-}
+-
+ static int __setup_page_dma(struct i915_address_space *vm,
+ 			    struct i915_page_dma *p,
+ 			    gfp_t gfp)
+@@ -1909,62 +1956,15 @@ static void gen6_ppgtt_free_pd(struct gen6_ppgtt *ppgtt)
+ 			free_pt(&ppgtt->base.vm, pt);
+ }
+ 
+-struct gen6_ppgtt_cleanup_work {
+-	struct work_struct base;
+-	struct i915_vma *vma;
+-};
+-
+-static void gen6_ppgtt_cleanup_work(struct work_struct *wrk)
+-{
+-	struct gen6_ppgtt_cleanup_work *work =
+-		container_of(wrk, typeof(*work), base);
+-	/* Side note, vma->vm is the GGTT not the ppgtt we just destroyed! */
+-	struct drm_i915_private *i915 = work->vma->vm->i915;
+-
+-	mutex_lock(&i915->drm.struct_mutex);
+-	i915_vma_destroy(work->vma);
+-	mutex_unlock(&i915->drm.struct_mutex);
+-
+-	kfree(work);
+-}
+-
+-static int nop_set_pages(struct i915_vma *vma)
+-{
+-	return -ENODEV;
+-}
+-
+-static void nop_clear_pages(struct i915_vma *vma)
+-{
+-}
+-
+-static int nop_bind(struct i915_vma *vma,
+-		    enum i915_cache_level cache_level,
+-		    u32 unused)
+-{
+-	return -ENODEV;
+-}
+-
+-static void nop_unbind(struct i915_vma *vma)
+-{
+-}
+-
+-static const struct i915_vma_ops nop_vma_ops = {
+-	.set_pages = nop_set_pages,
+-	.clear_pages = nop_clear_pages,
+-	.bind_vma = nop_bind,
+-	.unbind_vma = nop_unbind,
+-};
+-
+ static void gen6_ppgtt_cleanup(struct i915_address_space *vm)
+ {
+ 	struct gen6_ppgtt *ppgtt = to_gen6_ppgtt(i915_vm_to_ppgtt(vm));
+-	struct gen6_ppgtt_cleanup_work *work = ppgtt->work;
++	struct drm_i915_private *i915 = vm->i915;
+ 
+ 	/* FIXME remove the struct_mutex to bring the locking under control */
+-	INIT_WORK(&work->base, gen6_ppgtt_cleanup_work);
+-	work->vma = ppgtt->vma;
+-	work->vma->ops = &nop_vma_ops;
+-	schedule_work(&work->base);
++	mutex_lock(&i915->drm.struct_mutex);
++	i915_vma_destroy(ppgtt->vma);
++	mutex_unlock(&i915->drm.struct_mutex);
+ 
+ 	gen6_ppgtt_free_pd(ppgtt);
+ 	gen6_ppgtt_free_scratch(vm);
+@@ -2146,16 +2146,10 @@ static struct i915_ppgtt *gen6_ppgtt_create(struct drm_i915_private *i915)
+ 
+ 	ppgtt->base.vm.pte_encode = ggtt->vm.pte_encode;
+ 
+-	ppgtt->work = kmalloc(sizeof(*ppgtt->work), GFP_KERNEL);
+-	if (!ppgtt->work) {
+-		err = -ENOMEM;
+-		goto err_free;
+-	}
+-
+ 	ppgtt->base.pd = __alloc_pd();
+ 	if (!ppgtt->base.pd) {
+ 		err = -ENOMEM;
+-		goto err_work;
++		goto err_free;
+ 	}
+ 
+ 	err = gen6_ppgtt_init_scratch(ppgtt);
+@@ -2174,8 +2168,6 @@ static struct i915_ppgtt *gen6_ppgtt_create(struct drm_i915_private *i915)
+ 	gen6_ppgtt_free_scratch(&ppgtt->base.vm);
+ err_pd:
+ 	kfree(ppgtt->base.pd);
+-err_work:
+-	kfree(ppgtt->work);
+ err_free:
+ 	kfree(ppgtt);
+ 	return ERR_PTR(err);
+@@ -2250,42 +2242,6 @@ i915_ppgtt_create(struct drm_i915_private *i915)
+ 	return ppgtt;
+ }
+ 
+-static void ppgtt_destroy_vma(struct i915_address_space *vm)
+-{
+-	struct list_head *phases[] = {
+-		&vm->bound_list,
+-		&vm->unbound_list,
+-		NULL,
+-	}, **phase;
+-
+-	vm->closed = true;
+-	for (phase = phases; *phase; phase++) {
+-		struct i915_vma *vma, *vn;
+-
+-		list_for_each_entry_safe(vma, vn, *phase, vm_link)
+-			i915_vma_destroy(vma);
+-	}
+-}
+-
+-void i915_vm_release(struct kref *kref)
+-{
+-	struct i915_address_space *vm =
+-		container_of(kref, struct i915_address_space, ref);
+-
+-	GEM_BUG_ON(i915_is_ggtt(vm));
+-	trace_i915_ppgtt_release(vm);
+-
+-	ppgtt_destroy_vma(vm);
+-
+-	GEM_BUG_ON(!list_empty(&vm->bound_list));
+-	GEM_BUG_ON(!list_empty(&vm->unbound_list));
+-
+-	vm->cleanup(vm);
+-	i915_address_space_fini(vm);
+-
+-	kfree(vm);
+-}
+-
+ /* Certain Gen5 chipsets require require idling the GPU before
+  * unmapping anything from the GTT when VT-d is enabled.
+  */
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.h b/drivers/gpu/drm/i915/i915_gem_gtt.h
+index 812717ccc69b..4d6f96763a98 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -35,8 +35,12 @@
+ #define __I915_GEM_GTT_H__
+ 
+ #include <linux/io-mapping.h>
++#include <linux/kref.h>
+ #include <linux/mm.h>
+ #include <linux/pagevec.h>
++#include <linux/workqueue.h>
++
++#include <drm/drm_mm.h>
+ 
+ #include "gt/intel_reset.h"
+ #include "i915_gem_fence_reg.h"
+@@ -280,6 +284,7 @@ struct pagestash {
+ 
+ struct i915_address_space {
+ 	struct kref ref;
++	struct rcu_work rcu;
+ 
+ 	struct drm_mm mm;
+ 	struct drm_i915_private *i915;
+@@ -425,8 +430,6 @@ struct gen6_ppgtt {
+ 
+ 	unsigned int pin_count;
+ 	bool scan_for_unused_pt;
+-
+-	struct gen6_ppgtt_cleanup_work *work;
+ };
+ 
+ #define __to_gen6_ppgtt(base) container_of(base, struct gen6_ppgtt, base)
+diff --git a/drivers/gpu/drm/i915/selftests/i915_gem_gtt.c b/drivers/gpu/drm/i915/selftests/i915_gem_gtt.c
+index 1a60b9fe8221..0c47276ed5df 100644
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_gtt.c
+@@ -208,9 +208,7 @@ static int igt_ppgtt_alloc(void *arg)
+ 	}
+ 
+ err_ppgtt_cleanup:
+-	mutex_lock(&dev_priv->drm.struct_mutex);
+ 	i915_vm_put(&ppgtt->vm);
+-	mutex_unlock(&dev_priv->drm.struct_mutex);
+ 	return err;
+ }
+ 
+-- 
+2.16.4
+
