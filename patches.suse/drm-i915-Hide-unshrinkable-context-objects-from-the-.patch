@@ -1,0 +1,339 @@
+From 1aff1903d0ff53f055088a77948ac8d8224d42db Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 2 Aug 2019 22:21:36 +0100
+Subject: [PATCH] drm/i915: Hide unshrinkable context objects from the shrinker
+Git-commit: 1aff1903d0ff53f055088a77948ac8d8224d42db
+Patch-mainline: v5.4-rc1
+References: jsc#SLE-7953
+
+The shrinker cannot touch objects used by the contexts (logical state
+and ring). Currently we mark those as "pin_global" to let the shrinker
+skip over them, however, if we remove them from the shrinker lists
+entirely, we don't event have to include them in our shrink accounting.
+
+By keeping the unshrinkable objects in our shrinker tracking, we report
+a large number of objects available to be shrunk, and leave the shrinker
+deeply unsatisfied when we fail to reclaim those. The shrinker will
+persist in trying to reclaim the unavailable objects, forcing the system
+into a livelock (not even hitting the dread oomkiller).
+
+V2: Extend unshrinkable protection for perma-pinned scratch and guc
+allocations (Tvrtko)
+V3: Notice that we should be pinned when marking unshrinkable and so the
+link cannot be empty; merge duplicate paths.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Matthew Auld <matthew.auld@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190802212137.22207-1-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/gem/i915_gem_object.c   | 11 ++----
+ drivers/gpu/drm/i915/gem/i915_gem_object.h   |  4 ++
+ drivers/gpu/drm/i915/gem/i915_gem_pages.c    | 13 +------
+ drivers/gpu/drm/i915/gem/i915_gem_shrinker.c | 58 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/gt/intel_context.c      |  4 +-
+ drivers/gpu/drm/i915/gt/intel_gt.c           |  3 +-
+ drivers/gpu/drm/i915/gt/intel_ringbuffer.c   | 17 ++++----
+ drivers/gpu/drm/i915/gt/uc/intel_guc.c       |  2 +-
+ drivers/gpu/drm/i915/i915_debugfs.c          |  3 +-
+ drivers/gpu/drm/i915/i915_vma.c              | 16 ++++++++
+ drivers/gpu/drm/i915/i915_vma.h              |  4 ++
+ 11 files changed, 102 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object.c b/drivers/gpu/drm/i915/gem/i915_gem_object.c
+index d5197a2a106f..4ea97fca9c35 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object.c
+@@ -63,6 +63,8 @@ void i915_gem_object_init(struct drm_i915_gem_object *obj,
+ 	spin_lock_init(&obj->vma.lock);
+ 	INIT_LIST_HEAD(&obj->vma.list);
+ 
++	INIT_LIST_HEAD(&obj->mm.link);
++
+ 	INIT_LIST_HEAD(&obj->lut_list);
+ 	INIT_LIST_HEAD(&obj->batch_pool_link);
+ 
+@@ -273,14 +275,7 @@ void i915_gem_free_object(struct drm_gem_object *gem_obj)
+ 	 * or else we may oom whilst there are plenty of deferred
+ 	 * freed objects.
+ 	 */
+-	if (i915_gem_object_has_pages(obj) &&
+-	    i915_gem_object_is_shrinkable(obj)) {
+-		unsigned long flags;
+-
+-		spin_lock_irqsave(&i915->mm.obj_lock, flags);
+-		list_del_init(&obj->mm.link);
+-		spin_unlock_irqrestore(&i915->mm.obj_lock, flags);
+-	}
++	i915_gem_object_make_unshrinkable(obj);
+ 
+ 	/*
+ 	 * Since we require blocking on struct_mutex to unbind the freed
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object.h b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+index 67aea07ea019..3714cf234d64 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object.h
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+@@ -394,6 +394,10 @@ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
+ 				     unsigned int flags);
+ void i915_gem_object_unpin_from_display_plane(struct i915_vma *vma);
+ 
++void i915_gem_object_make_unshrinkable(struct drm_i915_gem_object *obj);
++void i915_gem_object_make_shrinkable(struct drm_i915_gem_object *obj);
++void i915_gem_object_make_purgeable(struct drm_i915_gem_object *obj);
++
+ static inline bool cpu_write_needs_clflush(struct drm_i915_gem_object *obj)
+ {
+ 	if (obj->cache_dirty)
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_pages.c b/drivers/gpu/drm/i915/gem/i915_gem_pages.c
+index b36ad269f4ea..92ad3cc220e3 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_pages.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_pages.c
+@@ -153,24 +153,13 @@ static void __i915_gem_object_reset_page_iter(struct drm_i915_gem_object *obj)
+ struct sg_table *
+ __i915_gem_object_unset_pages(struct drm_i915_gem_object *obj)
+ {
+-	struct drm_i915_private *i915 = to_i915(obj->base.dev);
+ 	struct sg_table *pages;
+ 
+ 	pages = fetch_and_zero(&obj->mm.pages);
+ 	if (IS_ERR_OR_NULL(pages))
+ 		return pages;
+ 
+-	if (i915_gem_object_is_shrinkable(obj)) {
+-		unsigned long flags;
+-
+-		spin_lock_irqsave(&i915->mm.obj_lock, flags);
+-
+-		list_del(&obj->mm.link);
+-		i915->mm.shrink_count--;
+-		i915->mm.shrink_memory -= obj->base.size;
+-
+-		spin_unlock_irqrestore(&i915->mm.obj_lock, flags);
+-	}
++	i915_gem_object_make_unshrinkable(obj);
+ 
+ 	if (obj->mm.mapping) {
+ 		void *ptr;
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_shrinker.c b/drivers/gpu/drm/i915/gem/i915_gem_shrinker.c
+index 3f4c6bdcc3c3..5ab7df53c2a0 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_shrinker.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_shrinker.c
+@@ -530,3 +530,61 @@ void i915_gem_shrinker_taints_mutex(struct drm_i915_private *i915,
+ 	if (unlock)
+ 		mutex_release(&i915->drm.struct_mutex.dep_map, 0, _RET_IP_);
+ }
++
++#define obj_to_i915(obj__) to_i915((obj__)->base.dev)
++
++void i915_gem_object_make_unshrinkable(struct drm_i915_gem_object *obj)
++{
++	/*
++	 * We can only be called while the pages are pinned or when
++	 * the pages are released. If pinned, we should only be called
++	 * from a single caller under controlled conditions; and on release
++	 * only one caller may release us. Neither the two may cross.
++	 */
++	if (!list_empty(&obj->mm.link)) { /* pinned by caller */
++		struct drm_i915_private *i915 = obj_to_i915(obj);
++		unsigned long flags;
++
++		spin_lock_irqsave(&i915->mm.obj_lock, flags);
++		GEM_BUG_ON(list_empty(&obj->mm.link));
++
++		list_del_init(&obj->mm.link);
++		i915->mm.shrink_count--;
++		i915->mm.shrink_memory -= obj->base.size;
++
++		spin_unlock_irqrestore(&i915->mm.obj_lock, flags);
++	}
++}
++
++static void __i915_gem_object_make_shrinkable(struct drm_i915_gem_object *obj,
++					      struct list_head *head)
++{
++	GEM_BUG_ON(!i915_gem_object_has_pages(obj));
++	GEM_BUG_ON(!list_empty(&obj->mm.link));
++
++	if (i915_gem_object_is_shrinkable(obj)) {
++		struct drm_i915_private *i915 = obj_to_i915(obj);
++		unsigned long flags;
++
++		spin_lock_irqsave(&i915->mm.obj_lock, flags);
++		GEM_BUG_ON(!kref_read(&obj->base.refcount));
++
++		list_add_tail(&obj->mm.link, head);
++		i915->mm.shrink_count++;
++		i915->mm.shrink_memory += obj->base.size;
++
++		spin_unlock_irqrestore(&i915->mm.obj_lock, flags);
++	}
++}
++
++void i915_gem_object_make_shrinkable(struct drm_i915_gem_object *obj)
++{
++	__i915_gem_object_make_shrinkable(obj,
++					  &obj_to_i915(obj)->mm.shrink_list);
++}
++
++void i915_gem_object_make_purgeable(struct drm_i915_gem_object *obj)
++{
++	__i915_gem_object_make_shrinkable(obj,
++					  &obj_to_i915(obj)->mm.purge_list);
++}
+diff --git a/drivers/gpu/drm/i915/gt/intel_context.c b/drivers/gpu/drm/i915/gt/intel_context.c
+index 34c8e37a73b8..c8777e222b12 100644
+--- a/drivers/gpu/drm/i915/gt/intel_context.c
++++ b/drivers/gpu/drm/i915/gt/intel_context.c
+@@ -118,7 +118,7 @@ static int __context_pin_state(struct i915_vma *vma)
+ 	 * And mark it as a globally pinned object to let the shrinker know
+ 	 * it cannot reclaim the object until we release it.
+ 	 */
+-	vma->obj->pin_global++;
++	i915_vma_make_unshrinkable(vma);
+ 	vma->obj->mm.dirty = true;
+ 
+ 	return 0;
+@@ -126,8 +126,8 @@ static int __context_pin_state(struct i915_vma *vma)
+ 
+ static void __context_unpin_state(struct i915_vma *vma)
+ {
+-	vma->obj->pin_global--;
+ 	__i915_vma_unpin(vma);
++	i915_vma_make_shrinkable(vma);
+ }
+ 
+ static void __intel_context_retire(struct i915_active *active)
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 5a7d1a34e429..75d8c5ee6ecb 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -248,7 +248,8 @@ int intel_gt_init_scratch(struct intel_gt *gt, unsigned int size)
+ 	if (ret)
+ 		goto err_unref;
+ 
+-	gt->scratch = vma;
++	gt->scratch = i915_vma_make_unshrinkable(vma);
++
+ 	return 0;
+ 
+ err_unref:
+diff --git a/drivers/gpu/drm/i915/gt/intel_ringbuffer.c b/drivers/gpu/drm/i915/gt/intel_ringbuffer.c
+index 8d24a49e5139..aa2f06b80961 100644
+--- a/drivers/gpu/drm/i915/gt/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/gt/intel_ringbuffer.c
+@@ -1222,7 +1222,7 @@ int intel_ring_pin(struct intel_ring *ring)
+ 		goto err_ring;
+ 	}
+ 
+-	vma->obj->pin_global++;
++	i915_vma_make_unshrinkable(vma);
+ 
+ 	GEM_BUG_ON(ring->vaddr);
+ 	ring->vaddr = addr;
+@@ -1251,6 +1251,8 @@ void intel_ring_reset(struct intel_ring *ring, u32 tail)
+ 
+ void intel_ring_unpin(struct intel_ring *ring)
+ {
++	struct i915_vma *vma = ring->vma;
++
+ 	if (!atomic_dec_and_test(&ring->pin_count))
+ 		return;
+ 
+@@ -1259,18 +1261,17 @@ void intel_ring_unpin(struct intel_ring *ring)
+ 	/* Discard any unused bytes beyond that submitted to hw. */
+ 	intel_ring_reset(ring, ring->tail);
+ 
+-	GEM_BUG_ON(!ring->vma);
+-	i915_vma_unset_ggtt_write(ring->vma);
+-	if (i915_vma_is_map_and_fenceable(ring->vma))
+-		i915_vma_unpin_iomap(ring->vma);
++	i915_vma_unset_ggtt_write(vma);
++	if (i915_vma_is_map_and_fenceable(vma))
++		i915_vma_unpin_iomap(vma);
+ 	else
+-		i915_gem_object_unpin_map(ring->vma->obj);
++		i915_gem_object_unpin_map(vma->obj);
+ 
+ 	GEM_BUG_ON(!ring->vaddr);
+ 	ring->vaddr = NULL;
+ 
+-	ring->vma->obj->pin_global--;
+-	i915_vma_unpin(ring->vma);
++	i915_vma_unpin(vma);
++	i915_vma_make_purgeable(vma);
+ 
+ 	intel_timeline_unpin(ring->timeline);
+ }
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc.c b/drivers/gpu/drm/i915/gt/uc/intel_guc.c
+index da14f8067497..0ee8139885a5 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc.c
+@@ -626,7 +626,7 @@ struct i915_vma *intel_guc_allocate_vma(struct intel_guc *guc, u32 size)
+ 		goto err;
+ 	}
+ 
+-	return vma;
++	return i915_vma_make_unshrinkable(vma);
+ 
+ err:
+ 	i915_gem_object_put(obj);
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 461a8dd4cc47..19f156a7f501 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -363,8 +363,9 @@ static int i915_gem_object_info(struct seq_file *m, void *data)
+ 	struct drm_i915_private *i915 = node_to_i915(m->private);
+ 	int ret;
+ 
+-	seq_printf(m, "%u shrinkable objects, %llu bytes\n",
++	seq_printf(m, "%u shrinkable [%u free] objects, %llu bytes\n",
+ 		   i915->mm.shrink_count,
++		   atomic_read(&i915->mm.free_count),
+ 		   i915->mm.shrink_memory);
+ 
+ 	seq_putc(m, '\n');
+diff --git a/drivers/gpu/drm/i915/i915_vma.c b/drivers/gpu/drm/i915/i915_vma.c
+index 7734d6218ce7..101a2bb416a6 100644
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -1017,6 +1017,22 @@ int i915_vma_unbind(struct i915_vma *vma)
+ 	return 0;
+ }
+ 
++struct i915_vma *i915_vma_make_unshrinkable(struct i915_vma *vma)
++{
++	i915_gem_object_make_unshrinkable(vma->obj);
++	return vma;
++}
++
++void i915_vma_make_shrinkable(struct i915_vma *vma)
++{
++	i915_gem_object_make_shrinkable(vma->obj);
++}
++
++void i915_vma_make_purgeable(struct i915_vma *vma)
++{
++	i915_gem_object_make_purgeable(vma->obj);
++}
++
+ #if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
+ #include "selftests/i915_vma.c"
+ #endif
+diff --git a/drivers/gpu/drm/i915/i915_vma.h b/drivers/gpu/drm/i915/i915_vma.h
+index 4b769db649bf..5c4224749bde 100644
+--- a/drivers/gpu/drm/i915/i915_vma.h
++++ b/drivers/gpu/drm/i915/i915_vma.h
+@@ -459,4 +459,8 @@ void i915_vma_parked(struct drm_i915_private *i915);
+ struct i915_vma *i915_vma_alloc(void);
+ void i915_vma_free(struct i915_vma *vma);
+ 
++struct i915_vma *i915_vma_make_unshrinkable(struct i915_vma *vma);
++void i915_vma_make_shrinkable(struct i915_vma *vma);
++void i915_vma_make_purgeable(struct i915_vma *vma);
++
+ #endif
+-- 
+2.16.4
+

@@ -1,0 +1,345 @@
+From df403069029dc61e0fc09cbeb0b5900705edec5b Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 16 Aug 2019 18:16:08 +0100
+Subject: [PATCH] drm/i915/execlists: Lift process_csb() out of the irq-off spinlock
+Git-commit: df403069029dc61e0fc09cbeb0b5900705edec5b
+Patch-mainline: v5.4-rc1
+References: jsc#SLE-7953
+
+If we only call process_csb() from the tasklet, though we lose the
+ability to bypass ksoftirqd interrupt processing on direct submission
+paths, we can push it out of the irq-off spinlock.
+
+The penalty is that we then allow schedule_out to be called concurrently
+with schedule_in requiring us to handle the usage count (baked into the
+pointer itself) atomically.
+
+As we do kick the tasklets (via local_bh_enable()) after our submission,
+there is a possibility there to see if we can pull the local softirq
+processing back from the ksoftirqd.
+
+V2: Store the 'switch_priority_hint' on submission, so that we can
+safely check during process_csb().
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190816171608.11760-1-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/gt/intel_context_types.h |   4 +-
+ drivers/gpu/drm/i915/gt/intel_engine_cs.c     |   2 +-
+ drivers/gpu/drm/i915/gt/intel_engine_types.h  |  10 ++
+ drivers/gpu/drm/i915/gt/intel_lrc.c           | 136 ++++++++++++++++----------
+ drivers/gpu/drm/i915/i915_utils.h             |  20 ++--
+ 5 files changed, 108 insertions(+), 64 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_context_types.h b/drivers/gpu/drm/i915/gt/intel_context_types.h
+index 616f3f9a6825..bf9cedfccbf0 100644
+--- a/drivers/gpu/drm/i915/gt/intel_context_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_context_types.h
+@@ -41,9 +41,7 @@ struct intel_context {
+ 	struct intel_engine_cs *engine;
+ 	struct intel_engine_cs *inflight;
+ #define intel_context_inflight(ce) ptr_mask_bits((ce)->inflight, 2)
+-#define intel_context_inflight_count(ce)  ptr_unmask_bits((ce)->inflight, 2)
+-#define intel_context_inflight_inc(ce) ptr_count_inc(&(ce)->inflight)
+-#define intel_context_inflight_dec(ce) ptr_count_dec(&(ce)->inflight)
++#define intel_context_inflight_count(ce) ptr_unmask_bits((ce)->inflight, 2)
+ 
+ 	struct i915_address_space *vm;
+ 	struct i915_gem_context *gem_context;
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine_cs.c b/drivers/gpu/drm/i915/gt/intel_engine_cs.c
+index 957f27a2ec97..ba457c1c7dc0 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/gt/intel_engine_cs.c
+@@ -1459,7 +1459,7 @@ int intel_enable_engine_stats(struct intel_engine_cs *engine)
+ 
+ 		for (port = execlists->pending; (rq = *port); port++) {
+ 			/* Exclude any contexts already counted in active */
+-			if (intel_context_inflight_count(rq->hw_context) == 1)
++			if (!intel_context_inflight_count(rq->hw_context))
+ 				engine->stats.active++;
+ 		}
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine_types.h b/drivers/gpu/drm/i915/gt/intel_engine_types.h
+index 9965a32601d6..5441aa9cb863 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_engine_types.h
+@@ -204,6 +204,16 @@ struct intel_engine_execlists {
+ 	 */
+ 	unsigned int port_mask;
+ 
++	/**
++	 * @switch_priority_hint: Second context priority.
++	 *
++	 * We submit multiple contexts to the HW simultaneously and would
++	 * like to occasionally switch between them to emulate timeslicing.
++	 * To know when timeslicing is suitable, we track the priority of
++	 * the context submitted second.
++	 */
++	int switch_priority_hint;
++
+ 	/**
+ 	 * @queue_priority_hint: Highest pending priority.
+ 	 *
+diff --git a/drivers/gpu/drm/i915/gt/intel_lrc.c b/drivers/gpu/drm/i915/gt/intel_lrc.c
+index e9863f4d826b..2978cf16fb9b 100644
+--- a/drivers/gpu/drm/i915/gt/intel_lrc.c
++++ b/drivers/gpu/drm/i915/gt/intel_lrc.c
+@@ -547,27 +547,39 @@ execlists_context_status_change(struct i915_request *rq, unsigned long status)
+ 				   status, rq);
+ }
+ 
++static inline struct intel_engine_cs *
++__execlists_schedule_in(struct i915_request *rq)
++{
++	struct intel_engine_cs * const engine = rq->engine;
++	struct intel_context * const ce = rq->hw_context;
++
++	intel_context_get(ce);
++
++	intel_gt_pm_get(engine->gt);
++	execlists_context_status_change(rq, INTEL_CONTEXT_SCHEDULE_IN);
++	intel_engine_context_in(engine);
++
++	return engine;
++}
++
+ static inline struct i915_request *
+ execlists_schedule_in(struct i915_request *rq, int idx)
+ {
+-	struct intel_context *ce = rq->hw_context;
+-	int count;
++	struct intel_context * const ce = rq->hw_context;
++	struct intel_engine_cs *old;
+ 
++	GEM_BUG_ON(!intel_engine_pm_is_awake(rq->engine));
+ 	trace_i915_request_in(rq, idx);
+ 
+-	count = intel_context_inflight_count(ce);
+-	if (!count) {
+-		intel_context_get(ce);
+-		ce->inflight = rq->engine;
+-
+-		intel_gt_pm_get(ce->inflight->gt);
+-		execlists_context_status_change(rq, INTEL_CONTEXT_SCHEDULE_IN);
+-		intel_engine_context_in(ce->inflight);
+-	}
++	old = READ_ONCE(ce->inflight);
++	do {
++		if (!old) {
++			WRITE_ONCE(ce->inflight, __execlists_schedule_in(rq));
++			break;
++		}
++	} while (!try_cmpxchg(&ce->inflight, &old, ptr_inc(old)));
+ 
+-	intel_context_inflight_inc(ce);
+ 	GEM_BUG_ON(intel_context_inflight(ce) != rq->engine);
+-
+ 	return i915_request_get(rq);
+ }
+ 
+@@ -581,35 +593,45 @@ static void kick_siblings(struct i915_request *rq, struct intel_context *ce)
+ }
+ 
+ static inline void
+-execlists_schedule_out(struct i915_request *rq)
++__execlists_schedule_out(struct i915_request *rq,
++			 struct intel_engine_cs * const engine)
+ {
+-	struct intel_context *ce = rq->hw_context;
++	struct intel_context * const ce = rq->hw_context;
+ 
+-	GEM_BUG_ON(!intel_context_inflight_count(ce));
++	intel_engine_context_out(engine);
++	execlists_context_status_change(rq, INTEL_CONTEXT_SCHEDULE_OUT);
++	intel_gt_pm_put(engine->gt);
+ 
+-	trace_i915_request_out(rq);
++	/*
++	 * If this is part of a virtual engine, its next request may
++	 * have been blocked waiting for access to the active context.
++	 * We have to kick all the siblings again in case we need to
++	 * switch (e.g. the next request is not runnable on this
++	 * engine). Hopefully, we will already have submitted the next
++	 * request before the tasklet runs and do not need to rebuild
++	 * each virtual tree and kick everyone again.
++	 */
++	if (ce->engine != engine)
++		kick_siblings(rq, ce);
+ 
+-	intel_context_inflight_dec(ce);
+-	if (!intel_context_inflight_count(ce)) {
+-		intel_engine_context_out(ce->inflight);
+-		execlists_context_status_change(rq, INTEL_CONTEXT_SCHEDULE_OUT);
+-		intel_gt_pm_put(ce->inflight->gt);
++	intel_context_put(ce);
++}
+ 
+-		/*
+-		 * If this is part of a virtual engine, its next request may
+-		 * have been blocked waiting for access to the active context.
+-		 * We have to kick all the siblings again in case we need to
+-		 * switch (e.g. the next request is not runnable on this
+-		 * engine). Hopefully, we will already have submitted the next
+-		 * request before the tasklet runs and do not need to rebuild
+-		 * each virtual tree and kick everyone again.
+-		 */
+-		ce->inflight = NULL;
+-		if (rq->engine != ce->engine)
+-			kick_siblings(rq, ce);
++static inline void
++execlists_schedule_out(struct i915_request *rq)
++{
++	struct intel_context * const ce = rq->hw_context;
++	struct intel_engine_cs *cur, *old;
+ 
+-		intel_context_put(ce);
+-	}
++	trace_i915_request_out(rq);
++	GEM_BUG_ON(intel_context_inflight(ce) != rq->engine);
++
++	old = READ_ONCE(ce->inflight);
++	do
++		cur = ptr_unmask_bits(old, 2) ? ptr_dec(old) : NULL;
++	while (!try_cmpxchg(&ce->inflight, &old, cur));
++	if (!cur)
++		__execlists_schedule_out(rq, old);
+ 
+ 	i915_request_put(rq);
+ }
+@@ -684,6 +706,9 @@ assert_pending_valid(const struct intel_engine_execlists *execlists,
+ 
+ 	trace_ports(execlists, msg, execlists->pending);
+ 
++	if (!execlists->pending[0])
++		return false;
++
+ 	if (execlists->pending[execlists_num_ports(execlists)])
+ 		return false;
+ 
+@@ -941,12 +966,24 @@ need_timeslice(struct intel_engine_cs *engine, const struct i915_request *rq)
+ 	return hint >= effective_prio(rq);
+ }
+ 
++static int
++switch_prio(struct intel_engine_cs *engine, const struct i915_request *rq)
++{
++	if (list_is_last(&rq->sched.link, &engine->active.requests))
++		return INT_MIN;
++
++	return rq_prio(list_next_entry(rq, sched.link));
++}
++
+ static bool
+-enable_timeslice(struct intel_engine_cs *engine)
++enable_timeslice(const struct intel_engine_execlists *execlists)
+ {
+-	struct i915_request *last = last_active(&engine->execlists);
++	const struct i915_request *rq = *execlists->active;
+ 
+-	return last && need_timeslice(engine, last);
++	if (i915_request_completed(rq))
++		return false;
++
++	return execlists->switch_priority_hint >= effective_prio(rq);
+ }
+ 
+ static void record_preemption(struct intel_engine_execlists *execlists)
+@@ -1292,6 +1329,8 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
+ 		*port = execlists_schedule_in(last, port - execlists->pending);
+ 		memset(port + 1, 0, (last_port - port) * sizeof(*port));
+ 		execlists_submit_ports(engine);
++		execlists->switch_priority_hint =
++			switch_prio(engine, *execlists->pending);
+ 	} else {
+ 		ring_set_paused(engine, 0);
+ 	}
+@@ -1356,7 +1395,6 @@ static void process_csb(struct intel_engine_cs *engine)
+ 	const u8 num_entries = execlists->csb_size;
+ 	u8 head, tail;
+ 
+-	lockdep_assert_held(&engine->active.lock);
+ 	GEM_BUG_ON(USES_GUC_SUBMISSION(engine->i915));
+ 
+ 	/*
+@@ -1427,15 +1465,14 @@ static void process_csb(struct intel_engine_cs *engine)
+ 				       execlists->pending,
+ 				       execlists_num_ports(execlists) *
+ 				       sizeof(*execlists->pending));
+-			execlists->pending[0] = NULL;
+ 
+-			trace_ports(execlists, "promoted", execlists->active);
+-
+-			if (enable_timeslice(engine))
++			if (enable_timeslice(execlists))
+ 				mod_timer(&execlists->timer, jiffies + 1);
+ 
+ 			if (!inject_preempt_hang(execlists))
+ 				ring_set_paused(engine, 0);
++
++			WRITE_ONCE(execlists->pending[0], NULL);
+ 			break;
+ 
+ 		case CSB_COMPLETE: /* port0 completed, advanced to port1 */
+@@ -1479,8 +1516,6 @@ static void process_csb(struct intel_engine_cs *engine)
+ static void __execlists_submission_tasklet(struct intel_engine_cs *const engine)
+ {
+ 	lockdep_assert_held(&engine->active.lock);
+-
+-	process_csb(engine);
+ 	if (!engine->execlists.pending[0])
+ 		execlists_dequeue(engine);
+ }
+@@ -1494,9 +1529,12 @@ static void execlists_submission_tasklet(unsigned long data)
+ 	struct intel_engine_cs * const engine = (struct intel_engine_cs *)data;
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&engine->active.lock, flags);
+-	__execlists_submission_tasklet(engine);
+-	spin_unlock_irqrestore(&engine->active.lock, flags);
++	process_csb(engine);
++	if (!READ_ONCE(engine->execlists.pending[0])) {
++		spin_lock_irqsave(&engine->active.lock, flags);
++		__execlists_submission_tasklet(engine);
++		spin_unlock_irqrestore(&engine->active.lock, flags);
++	}
+ }
+ 
+ static void execlists_submission_timer(struct timer_list *timer)
+diff --git a/drivers/gpu/drm/i915/i915_utils.h b/drivers/gpu/drm/i915/i915_utils.h
+index d652ba5d2320..562f756da421 100644
+--- a/drivers/gpu/drm/i915/i915_utils.h
++++ b/drivers/gpu/drm/i915/i915_utils.h
+@@ -161,17 +161,15 @@ __check_struct_size(size_t base, size_t arr, size_t count, size_t *size)
+ 	((typeof(ptr))((unsigned long)(ptr) | __bits));			\
+ })
+ 
+-#define ptr_count_dec(p_ptr) do {					\
+-	typeof(p_ptr) __p = (p_ptr);					\
+-	unsigned long __v = (unsigned long)(*__p);			\
+-	*__p = (typeof(*p_ptr))(--__v);					\
+-} while (0)
+-
+-#define ptr_count_inc(p_ptr) do {					\
+-	typeof(p_ptr) __p = (p_ptr);					\
+-	unsigned long __v = (unsigned long)(*__p);			\
+-	*__p = (typeof(*p_ptr))(++__v);					\
+-} while (0)
++#define ptr_dec(ptr) ({							\
++	unsigned long __v = (unsigned long)(ptr);			\
++	(typeof(ptr))(__v - 1);						\
++})
++
++#define ptr_inc(ptr) ({							\
++	unsigned long __v = (unsigned long)(ptr);			\
++	(typeof(ptr))(__v + 1);						\
++})
+ 
+ #define page_mask_bits(ptr) ptr_mask_bits(ptr, PAGE_SHIFT)
+ #define page_unmask_bits(ptr) ptr_unmask_bits(ptr, PAGE_SHIFT)
+-- 
+2.16.4
+
