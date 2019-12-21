@@ -1,0 +1,175 @@
+From: Nikos Tsironis <ntsironis@arrikto.com>
+Date: Wed, 4 Dec 2019 16:07:42 +0200
+Subject: [PATCH] dm thin: Flush data device before committing metadata
+References: bnc#1012628
+Patch-mainline: 5.4.6
+Git-commit: 694cfe7f31db36912725e63a38a5179c8628a496
+
+commit 694cfe7f31db36912725e63a38a5179c8628a496 upstream.
+
+The thin provisioning target maintains per thin device mappings that map
+virtual blocks to data blocks in the data device.
+
+When we write to a shared block, in case of internal snapshots, or
+provision a new block, in case of external snapshots, we copy the shared
+block to a new data block (COW), update the mapping for the relevant
+virtual block and then issue the write to the new data block.
+
+Suppose the data device has a volatile write-back cache and the
+following sequence of events occur:
+
+1. We write to a shared block
+2. A new data block is allocated
+3. We copy the shared block to the new data block using kcopyd (COW)
+4. We insert the new mapping for the virtual block in the btree for that
+   thin device.
+5. The commit timeout expires and we commit the metadata, that now
+   includes the new mapping from step (4).
+6. The system crashes and the data device's cache has not been flushed,
+   meaning that the COWed data are lost.
+
+The next time we read that virtual block of the thin device we read it
+from the data block allocated in step (2), since the metadata have been
+successfully committed. The data are lost due to the crash, so we read
+garbage instead of the old, shared data.
+
+This has the following implications:
+
+1. In case of writes to shared blocks, with size smaller than the pool's
+   block size (which means we first copy the whole block and then issue
+   the smaller write), we corrupt data that the user never touched.
+
+2. In case of writes to shared blocks, with size equal to the device's
+   logical block size, we fail to provide atomic sector writes. When the
+   system recovers the user will read garbage from that sector instead
+   of the old data or the new data.
+
+3. Even for writes to shared blocks, with size equal to the pool's block
+   size (overwrites), after the system recovers, the written sectors
+   will contain garbage instead of a random mix of sectors containing
+   either old data or new data, thus we fail again to provide atomic
+   sectors writes.
+
+4. Even when the user flushes the thin device, because we first commit
+   the metadata and then pass down the flush, the same risk for
+   corruption exists (if the system crashes after the metadata have been
+   committed but before the flush is passed down to the data device.)
+
+The only case which is unaffected is that of writes with size equal to
+the pool's block size and with the FUA flag set. But, because FUA writes
+trigger metadata commits, this case can trigger the corruption
+indirectly.
+
+Moreover, apart from internal and external snapshots, the same issue
+exists for newly provisioned blocks, when block zeroing is enabled.
+After the system recovers the provisioned blocks might contain garbage
+instead of zeroes.
+
+To solve this and avoid the potential data corruption we flush the
+pool's data device **before** committing its metadata.
+
+This ensures that the data blocks of any newly inserted mappings are
+properly written to non-volatile storage and won't be lost in case of a
+crash.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Nikos Tsironis <ntsironis@arrikto.com>
+Acked-by: Joe Thornber <ejt@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/md/dm-thin.c | 42 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/md/dm-thin.c b/drivers/md/dm-thin.c
+index fcd887703f95..1696bfd23ad1 100644
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@ -328,6 +328,7 @@ struct pool_c {
+ 	dm_block_t low_water_blocks;
+ 	struct pool_features requested_pf; /* Features requested during table load */
+ 	struct pool_features adjusted_pf;  /* Features used after adjusting for constituent devices */
++	struct bio flush_bio;
+ };
+ 
+ /*
+@@ -2392,8 +2393,16 @@ static void process_deferred_bios(struct pool *pool)
+ 	while ((bio = bio_list_pop(&bio_completions)))
+ 		bio_endio(bio);
+ 
+-	while ((bio = bio_list_pop(&bios)))
+-		generic_make_request(bio);
++	while ((bio = bio_list_pop(&bios))) {
++		/*
++		 * The data device was flushed as part of metadata commit,
++		 * so complete redundant flushes immediately.
++		 */
++		if (bio->bi_opf & REQ_PREFLUSH)
++			bio_endio(bio);
++		else
++			generic_make_request(bio);
++	}
+ }
+ 
+ static void do_worker(struct work_struct *ws)
+@@ -3127,6 +3136,7 @@ static void pool_dtr(struct dm_target *ti)
+ 	__pool_dec(pt->pool);
+ 	dm_put_device(ti, pt->metadata_dev);
+ 	dm_put_device(ti, pt->data_dev);
++	bio_uninit(&pt->flush_bio);
+ 	kfree(pt);
+ 
+ 	mutex_unlock(&dm_thin_pool_table.mutex);
+@@ -3192,6 +3202,29 @@ static void metadata_low_callback(void *context)
+ 	dm_table_event(pool->ti->table);
+ }
+ 
++/*
++ * We need to flush the data device **before** committing the metadata.
++ *
++ * This ensures that the data blocks of any newly inserted mappings are
++ * properly written to non-volatile storage and won't be lost in case of a
++ * crash.
++ *
++ * Failure to do so can result in data corruption in the case of internal or
++ * external snapshots and in the case of newly provisioned blocks, when block
++ * zeroing is enabled.
++ */
++static int metadata_pre_commit_callback(void *context)
++{
++	struct pool_c *pt = context;
++	struct bio *flush_bio = &pt->flush_bio;
++
++	bio_reset(flush_bio);
++	bio_set_dev(flush_bio, pt->data_dev->bdev);
++	flush_bio->bi_opf = REQ_OP_WRITE | REQ_PREFLUSH;
++
++	return submit_bio_wait(flush_bio);
++}
++
+ static sector_t get_dev_size(struct block_device *bdev)
+ {
+ 	return i_size_read(bdev->bd_inode) >> SECTOR_SHIFT;
+@@ -3360,6 +3393,7 @@ static int pool_ctr(struct dm_target *ti, unsigned argc, char **argv)
+ 	pt->data_dev = data_dev;
+ 	pt->low_water_blocks = low_water_blocks;
+ 	pt->adjusted_pf = pt->requested_pf = pf;
++	bio_init(&pt->flush_bio, NULL, 0);
+ 	ti->num_flush_bios = 1;
+ 
+ 	/*
+@@ -3386,6 +3420,10 @@ static int pool_ctr(struct dm_target *ti, unsigned argc, char **argv)
+ 	if (r)
+ 		goto out_flags_changed;
+ 
++	dm_pool_register_pre_commit_callback(pt->pool->pmd,
++					     metadata_pre_commit_callback,
++					     pt);
++
+ 	pt->callbacks.congested_fn = pool_is_congested;
+ 	dm_table_add_target_callbacks(ti->table, &pt->callbacks);
+ 
+-- 
+2.24.1
+
