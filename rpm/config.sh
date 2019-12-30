@@ -1,5 +1,5 @@
 # The version of the main tarball to use
-SRCVERSION=5.5-rc3
+SRCVERSION=5.5-rc4
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=
 # enable kernel module compression
