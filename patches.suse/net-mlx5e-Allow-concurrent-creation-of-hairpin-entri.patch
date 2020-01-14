@@ -1,0 +1,190 @@
+From: Vlad Buslov <vladbu@mellanox.com>
+Date: Thu, 1 Aug 2019 16:54:54 +0300
+Subject: net/mlx5e: Allow concurrent creation of hairpin entries
+Patch-mainline: v5.4-rc1
+Git-commit: db76ca2424fe28923aaec5e2187e886b025a914c
+References: jsc#SLE-8464
+
+Hairpin entries creation is fully synchronized by hairpin_tbl_lock. In
+order to allow concurrent initialization of mlx5e_hairpin structure
+instances and provisioning of hairpin entries to hardware, extend
+mlx5e_hairpin_entry with 'res_ready' completion. Move call to
+mlx5e_hairpin_create() out of hairpin_tbl_lock critical section. Modify
+code that attaches new flows to existing hpe to wait for 'res_ready'
+completion before using the hpe. Insert hpe to hairpin table before
+provisioning it to hardware and modify all users of hairpin table to verify
+that hpe was fully initialized by checking hpe->hp pointer (and to wait for
+'res_ready' completion, if necessary).
+
+Modify dead peer update event handling function to save hpe's to temporary
+list with their reference counter incremented. Wait for completion of hpe's
+in temporary list and update their 'peer_gone' flag outside of
+hairpin_tbl_lock critical section.
+
+Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+Reviewed-by: Roi Dayan <roid@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_tc.c |   65 ++++++++++++++++--------
+ 1 file changed, 46 insertions(+), 19 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -39,6 +39,7 @@
+ #include <linux/mlx5/device.h>
+ #include <linux/rhashtable.h>
+ #include <linux/refcount.h>
++#include <linux/completion.h>
+ #include <net/tc_act/tc_mirred.h>
+ #include <net/tc_act/tc_vlan.h>
+ #include <net/tc_act/tc_tunnel_key.h>
+@@ -166,11 +167,16 @@ struct mlx5e_hairpin_entry {
+ 	spinlock_t flows_lock;
+ 	/* flows sharing the same hairpin */
+ 	struct list_head flows;
++	/* hpe's that were not fully initialized when dead peer update event
++	 * function traversed them.
++	 */
++	struct list_head dead_peer_wait_list;
+ 
+ 	u16 peer_vhca_id;
+ 	u8 prio;
+ 	struct mlx5e_hairpin *hp;
+ 	refcount_t refcnt;
++	struct completion res_ready;
+ };
+ 
+ struct mod_hdr_key {
+@@ -657,11 +663,14 @@ static void mlx5e_hairpin_put(struct mlx
+ 	hash_del(&hpe->hairpin_hlist);
+ 	mutex_unlock(&priv->fs.tc.hairpin_tbl_lock);
+ 
+-	netdev_dbg(priv->netdev, "del hairpin: peer %s\n",
+-		   dev_name(hpe->hp->pair->peer_mdev->device));
++	if (!IS_ERR_OR_NULL(hpe->hp)) {
++		netdev_dbg(priv->netdev, "del hairpin: peer %s\n",
++			   dev_name(hpe->hp->pair->peer_mdev->device));
++
++		mlx5e_hairpin_destroy(hpe->hp);
++	}
+ 
+ 	WARN_ON(!list_empty(&hpe->flows));
+-	mlx5e_hairpin_destroy(hpe->hp);
+ 	kfree(hpe);
+ }
+ 
+@@ -733,20 +742,34 @@ static int mlx5e_hairpin_flow_add(struct
+ 
+ 	mutex_lock(&priv->fs.tc.hairpin_tbl_lock);
+ 	hpe = mlx5e_hairpin_get(priv, peer_id, match_prio);
+-	if (hpe)
++	if (hpe) {
++		mutex_unlock(&priv->fs.tc.hairpin_tbl_lock);
++		wait_for_completion(&hpe->res_ready);
++
++		if (IS_ERR(hpe->hp)) {
++			err = -EREMOTEIO;
++			goto out_err;
++		}
+ 		goto attach_flow;
++	}
+ 
+ 	hpe = kzalloc(sizeof(*hpe), GFP_KERNEL);
+ 	if (!hpe) {
+-		err = -ENOMEM;
+-		goto create_hairpin_err;
++		mutex_unlock(&priv->fs.tc.hairpin_tbl_lock);
++		return -ENOMEM;
+ 	}
+ 
+ 	spin_lock_init(&hpe->flows_lock);
+ 	INIT_LIST_HEAD(&hpe->flows);
++	INIT_LIST_HEAD(&hpe->dead_peer_wait_list);
+ 	hpe->peer_vhca_id = peer_id;
+ 	hpe->prio = match_prio;
+ 	refcount_set(&hpe->refcnt, 1);
++	init_completion(&hpe->res_ready);
++
++	hash_add(priv->fs.tc.hairpin_tbl, &hpe->hairpin_hlist,
++		 hash_hairpin_info(peer_id, match_prio));
++	mutex_unlock(&priv->fs.tc.hairpin_tbl_lock);
+ 
+ 	params.log_data_size = 15;
+ 	params.log_data_size = min_t(u8, params.log_data_size,
+@@ -768,9 +791,11 @@ static int mlx5e_hairpin_flow_add(struct
+ 	params.num_channels = link_speed64;
+ 
+ 	hp = mlx5e_hairpin_create(priv, &params, peer_ifindex);
++	hpe->hp = hp;
++	complete_all(&hpe->res_ready);
+ 	if (IS_ERR(hp)) {
+ 		err = PTR_ERR(hp);
+-		goto create_hairpin_err;
++		goto out_err;
+ 	}
+ 
+ 	netdev_dbg(priv->netdev, "add hairpin: tirn %x rqn %x peer %s sqn %x prio %d (log) data %d packets %d\n",
+@@ -778,10 +803,6 @@ static int mlx5e_hairpin_flow_add(struct
+ 		   dev_name(hp->pair->peer_mdev->device),
+ 		   hp->pair->sqn[0], match_prio, params.log_data_size, params.log_num_packets);
+ 
+-	hpe->hp = hp;
+-	hash_add(priv->fs.tc.hairpin_tbl, &hpe->hairpin_hlist,
+-		 hash_hairpin_info(peer_id, match_prio));
+-
+ attach_flow:
+ 	if (hpe->hp->num_channels > 1) {
+ 		flow_flag_set(flow, HAIRPIN_RSS);
+@@ -789,7 +810,6 @@ attach_flow:
+ 	} else {
+ 		flow->nic_attr->hairpin_tirn = hpe->hp->tirn;
+ 	}
+-	mutex_unlock(&priv->fs.tc.hairpin_tbl_lock);
+ 
+ 	flow->hpe = hpe;
+ 	spin_lock(&hpe->flows_lock);
+@@ -798,9 +818,8 @@ attach_flow:
+ 
+ 	return 0;
+ 
+-create_hairpin_err:
+-	mutex_unlock(&priv->fs.tc.hairpin_tbl_lock);
+-	kfree(hpe);
++out_err:
++	mlx5e_hairpin_put(priv, hpe);
+ 	return err;
+ }
+ 
+@@ -3776,7 +3795,8 @@ static void mlx5e_tc_hairpin_update_dead
+ 					      struct mlx5e_priv *peer_priv)
+ {
+ 	struct mlx5_core_dev *peer_mdev = peer_priv->mdev;
+-	struct mlx5e_hairpin_entry *hpe;
++	struct mlx5e_hairpin_entry *hpe, *tmp;
++	LIST_HEAD(init_wait_list);
+ 	u16 peer_vhca_id;
+ 	int bkt;
+ 
+@@ -3786,11 +3806,18 @@ static void mlx5e_tc_hairpin_update_dead
+ 	peer_vhca_id = MLX5_CAP_GEN(peer_mdev, vhca_id);
+ 
+ 	mutex_lock(&priv->fs.tc.hairpin_tbl_lock);
+-	hash_for_each(priv->fs.tc.hairpin_tbl, bkt, hpe, hairpin_hlist) {
+-		if (hpe->peer_vhca_id == peer_vhca_id)
++	hash_for_each(priv->fs.tc.hairpin_tbl, bkt, hpe, hairpin_hlist)
++		if (refcount_inc_not_zero(&hpe->refcnt))
++			list_add(&hpe->dead_peer_wait_list, &init_wait_list);
++	mutex_unlock(&priv->fs.tc.hairpin_tbl_lock);
++
++	list_for_each_entry_safe(hpe, tmp, &init_wait_list, dead_peer_wait_list) {
++		wait_for_completion(&hpe->res_ready);
++		if (!IS_ERR_OR_NULL(hpe->hp) && hpe->peer_vhca_id == peer_vhca_id)
+ 			hpe->hp->pair->peer_gone = true;
++
++		mlx5e_hairpin_put(priv, hpe);
+ 	}
+-	mutex_unlock(&priv->fs.tc.hairpin_tbl_lock);
+ }
+ 
+ static int mlx5e_tc_netdev_event(struct notifier_block *this,

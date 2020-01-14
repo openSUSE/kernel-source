@@ -1,0 +1,163 @@
+From: Tariq Toukan <tariqt@mellanox.com>
+Date: Mon, 7 Oct 2019 14:01:29 +0300
+Subject: net/mlx5e: kTLS, Limit DUMP wqe size
+Patch-mainline: v5.4-rc6
+Git-commit: 84d1bb2b139e0184b1754aa1b5776186b475fce8
+References: jsc#SLE-8464
+
+HW expects the data size in DUMP WQEs to be up to MTU.
+Make sure they are in range.
+
+We elevate the frag page refcount by 'n-1', in addition to the
+one obtained in tx_sync_info_get(), having an overall of 'n'
+references. We bulk increments by using a single page_ref_add()
+command, to optimize perfermance.
+The refcounts are released one by one, by the corresponding completions.
+
+Fixes: d2ead1f360e8 ("net/mlx5e: Add kTLS TX HW offload support")
+Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+Reviewed-by: Eran Ben Elisha <eranbe@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en.h               |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h          |   11 +---
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls.h    |   11 +++-
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_tx.c |   34 +++++++++++--
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c          |    7 ++
+ 5 files changed, 52 insertions(+), 12 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -410,6 +410,7 @@ struct mlx5e_txqsq {
+ 	struct device             *pdev;
+ 	__be32                     mkey_be;
+ 	unsigned long              state;
++	unsigned int               hw_mtu;
+ 	struct hwtstamp_config    *tstamp;
+ 	struct mlx5_clock         *clock;
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
+@@ -15,15 +15,14 @@
+ #else
+ /* TLS offload requires additional stop_room for:
+  *  - a resync SKB.
+- * kTLS offload requires additional stop_room for:
+- * - static params WQE,
+- * - progress params WQE, and
+- * - resync DUMP per frag.
++ * kTLS offload requires fixed additional stop_room for:
++ * - a static params WQE, and a progress params WQE.
++ * The additional MTU-depending room for the resync DUMP WQEs
++ * will be calculated and added in runtime.
+  */
+ #define MLX5E_SQ_TLS_ROOM  \
+ 	(MLX5_SEND_WQE_MAX_WQEBBS + \
+-	 MLX5E_KTLS_STATIC_WQEBBS + MLX5E_KTLS_PROGRESS_WQEBBS + \
+-	 MAX_SKB_FRAGS * MLX5E_KTLS_DUMP_WQEBBS)
++	 MLX5E_KTLS_STATIC_WQEBBS + MLX5E_KTLS_PROGRESS_WQEBBS)
+ #endif
+ 
+ #define INL_HDR_START_SZ (sizeof(((struct mlx5_wqe_eth_seg *)NULL)->inline_hdr.start))
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls.h
+@@ -94,7 +94,16 @@ struct sk_buff *mlx5e_ktls_handle_tx_skb
+ void mlx5e_ktls_tx_handle_resync_dump_comp(struct mlx5e_txqsq *sq,
+ 					   struct mlx5e_tx_wqe_info *wi,
+ 					   u32 *dma_fifo_cc);
+-
++static inline u8
++mlx5e_ktls_dumps_num_wqebbs(struct mlx5e_txqsq *sq, unsigned int nfrags,
++			    unsigned int sync_len)
++{
++	/* Given the MTU and sync_len, calculates an upper bound for the
++	 * number of WQEBBs needed for the TX resync DUMP WQEs of a record.
++	 */
++	return MLX5E_KTLS_DUMP_WQEBBS *
++		(nfrags + DIV_ROUND_UP(sync_len, sq->hw_mtu));
++}
+ #else
+ 
+ static inline void mlx5e_ktls_build_netdev(struct mlx5e_priv *priv)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_tx.c
+@@ -373,7 +373,7 @@ mlx5e_ktls_tx_handle_ooo(struct mlx5e_kt
+ 		return skb;
+ 	}
+ 
+-	num_wqebbs = info.nr_frags * MLX5E_KTLS_DUMP_WQEBBS;
++	num_wqebbs = mlx5e_ktls_dumps_num_wqebbs(sq, info.nr_frags, info.sync_len);
+ 	pi = mlx5_wq_cyc_ctr2ix(wq, sq->pc);
+ 	contig_wqebbs_room = mlx5_wq_cyc_get_contig_wqebbs(wq, pi);
+ 
+@@ -382,14 +382,40 @@ mlx5e_ktls_tx_handle_ooo(struct mlx5e_kt
+ 
+ 	tx_post_resync_params(sq, priv_tx, info.rcd_sn);
+ 
+-	for (; i < info.nr_frags; i++)
+-		if (tx_post_resync_dump(sq, &info.frags[i], priv_tx->tisn, !i))
+-			goto err_out;
++	for (; i < info.nr_frags; i++) {
++		unsigned int orig_fsz, frag_offset = 0, n = 0;
++		skb_frag_t *f = &info.frags[i];
++
++		orig_fsz = skb_frag_size(f);
++
++		do {
++			bool fence = !(i || frag_offset);
++			unsigned int fsz;
++
++			n++;
++			fsz = min_t(unsigned int, sq->hw_mtu, orig_fsz - frag_offset);
++			skb_frag_size_set(f, fsz);
++			if (tx_post_resync_dump(sq, f, priv_tx->tisn, fence)) {
++				page_ref_add(skb_frag_page(f), n - 1);
++				goto err_out;
++			}
++
++			skb_frag_off_add(f, fsz);
++			frag_offset += fsz;
++		} while (frag_offset < orig_fsz);
++
++		page_ref_add(skb_frag_page(f), n - 1);
++	}
+ 
+ 	return skb;
+ 
+ err_out:
+ 	for (; i < info.nr_frags; i++)
++		/* The put_page() here undoes the page ref obtained in tx_sync_info_get().
++		 * Page refs obtained for the DUMP WQEs above (by page_ref_add) will be
++		 * released only upon their completions (or in mlx5e_free_txqsq_descs,
++		 * if channel closes).
++		 */
+ 		put_page(skb_frag_page(&info.frags[i]));
+ 
+ 	dev_kfree_skb_any(skb);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -1128,6 +1128,7 @@ static int mlx5e_alloc_txqsq(struct mlx5
+ 	sq->txq_ix    = txq_ix;
+ 	sq->uar_map   = mdev->mlx5e_res.bfreg.map;
+ 	sq->min_inline_mode = params->tx_min_inline_mode;
++	sq->hw_mtu    = MLX5E_SW2HW_MTU(params, params->sw_mtu);
+ 	sq->stats     = &c->priv->channel_stats[c->ix].sq[tc];
+ 	sq->stop_room = MLX5E_SQ_STOP_ROOM;
+ 	INIT_WORK(&sq->recover_work, mlx5e_tx_err_cqe_work);
+@@ -1135,10 +1136,14 @@ static int mlx5e_alloc_txqsq(struct mlx5
+ 		set_bit(MLX5E_SQ_STATE_VLAN_NEED_L2_INLINE, &sq->state);
+ 	if (MLX5_IPSEC_DEV(c->priv->mdev))
+ 		set_bit(MLX5E_SQ_STATE_IPSEC, &sq->state);
++#ifdef CONFIG_MLX5_EN_TLS
+ 	if (mlx5_accel_is_tls_device(c->priv->mdev)) {
+ 		set_bit(MLX5E_SQ_STATE_TLS, &sq->state);
+-		sq->stop_room += MLX5E_SQ_TLS_ROOM;
++		sq->stop_room += MLX5E_SQ_TLS_ROOM +
++			mlx5e_ktls_dumps_num_wqebbs(sq, MAX_SKB_FRAGS,
++						    TLS_MAX_PAYLOAD_SIZE);
+ 	}
++#endif
+ 
+ 	param->wq.db_numa_node = cpu_to_node(c->cpu);
+ 	err = mlx5_wq_cyc_create(mdev, &param->wq, sqc_wq, wq, &sq->wq_ctrl);

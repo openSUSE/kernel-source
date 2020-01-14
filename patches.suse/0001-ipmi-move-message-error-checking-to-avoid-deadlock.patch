@@ -1,0 +1,194 @@
+From 383035211c79d4d98481a09ad429b31c7dbf22bd Mon Sep 17 00:00:00 2001
+From: Tony Camuso <tcamuso@redhat.com>
+Date: Thu, 22 Aug 2019 08:24:53 -0400
+Subject: [PATCH] ipmi: move message error checking to avoid deadlock
+Git-commit: 383035211c79d4d98481a09ad429b31c7dbf22bd
+Patch-mainline: v5.4-rc1
+References: bsc#1152489 bnc#1151927 5.3.4
+
+V1->V2: in handle_one_rcv_msg, if data_size > 2, set requeue to zero and
+        goto out instead of calling ipmi_free_msg.
+        Kosuke Tatsukawa <tatsu@ab.jp.nec.com>
+
+In the source stack trace below, function set_need_watch tries to
+take out the same si_lock that was taken earlier by ipmi_thread.
+
+ipmi_thread() [drivers/char/ipmi/ipmi_si_intf.c:995]
+ smi_event_handler() [drivers/char/ipmi/ipmi_si_intf.c:765]
+  handle_transaction_done() [drivers/char/ipmi/ipmi_si_intf.c:555]
+   deliver_recv_msg() [drivers/char/ipmi/ipmi_si_intf.c:283]
+    ipmi_smi_msg_received() [drivers/char/ipmi/ipmi_msghandler.c:4503]
+     intf_err_seq() [drivers/char/ipmi/ipmi_msghandler.c:1149]
+      smi_remove_watch() [drivers/char/ipmi/ipmi_msghandler.c:999]
+       set_need_watch() [drivers/char/ipmi/ipmi_si_intf.c:1066]
+
+Upstream commit e1891cffd4c4896a899337a243273f0e23c028df adds code to
+ipmi_smi_msg_received() to call smi_remove_watch() via intf_err_seq()
+and this seems to be causing the deadlock.
+
+commit e1891cffd4c4896a899337a243273f0e23c028df
+Author: Corey Minyard <cminyard@mvista.com>
+Date:   Wed Oct 24 15:17:04 2018 -0500
+    ipmi: Make the smi watcher be disabled immediately when not needed
+
+The fix is to put all messages in the queue and move the message
+checking code out of ipmi_smi_msg_received and into handle_one_recv_msg,
+which processes the message checking after ipmi_thread releases its
+locks.
+
+Additionally,Kosuke Tatsukawa <tatsu@ab.jp.nec.com> reported that
+handle_new_recv_msgs calls ipmi_free_msg when handle_one_rcv_msg returns
+zero, so that the call to ipmi_free_msg in handle_one_rcv_msg introduced
+another panic when "ipmitool sensor list" was run in a loop. He
+submitted this part of the patch.
+
++free_msg:
++               requeue = 0;
++               goto out;
+
+Reported by: Osamu Samukawa <osa-samukawa@tg.jp.nec.com>
+Characterized by: Kosuke Tatsukawa <tatsu@ab.jp.nec.com>
+Signed-off-by: Tony Camuso <tcamuso@redhat.com>
+Fixes: e1891cffd4c4 ("ipmi: Make the smi watcher be disabled immediately when not needed")
+Cc: stable@vger.kernel.org # 5.1
+Signed-off-by: Corey Minyard <cminyard@mvista.com>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+---
+ drivers/char/ipmi/ipmi_msghandler.c | 114 ++++++++++++++++++------------------
+ 1 file changed, 57 insertions(+), 57 deletions(-)
+
+diff --git a/drivers/char/ipmi/ipmi_msghandler.c b/drivers/char/ipmi/ipmi_msghandler.c
+index 3548aceed4a9..2aab80e19ae0 100644
+--- a/drivers/char/ipmi/ipmi_msghandler.c
++++ b/drivers/char/ipmi/ipmi_msghandler.c
+@@ -4218,7 +4218,53 @@ static int handle_one_recv_msg(struct ipmi_smi *intf,
+ 	int chan;
+ 
+ 	ipmi_debug_msg("Recv:", msg->rsp, msg->rsp_size);
+-	if (msg->rsp_size < 2) {
++
++	if ((msg->data_size >= 2)
++	    && (msg->data[0] == (IPMI_NETFN_APP_REQUEST << 2))
++	    && (msg->data[1] == IPMI_SEND_MSG_CMD)
++	    && (msg->user_data == NULL)) {
++
++		if (intf->in_shutdown)
++			goto free_msg;
++
++		/*
++		 * This is the local response to a command send, start
++		 * the timer for these.  The user_data will not be
++		 * NULL if this is a response send, and we will let
++		 * response sends just go through.
++		 */
++
++		/*
++		 * Check for errors, if we get certain errors (ones
++		 * that mean basically we can try again later), we
++		 * ignore them and start the timer.  Otherwise we
++		 * report the error immediately.
++		 */
++		if ((msg->rsp_size >= 3) && (msg->rsp[2] != 0)
++		    && (msg->rsp[2] != IPMI_NODE_BUSY_ERR)
++		    && (msg->rsp[2] != IPMI_LOST_ARBITRATION_ERR)
++		    && (msg->rsp[2] != IPMI_BUS_ERR)
++		    && (msg->rsp[2] != IPMI_NAK_ON_WRITE_ERR)) {
++			int ch = msg->rsp[3] & 0xf;
++			struct ipmi_channel *chans;
++
++			/* Got an error sending the message, handle it. */
++
++			chans = READ_ONCE(intf->channel_list)->c;
++			if ((chans[ch].medium == IPMI_CHANNEL_MEDIUM_8023LAN)
++			    || (chans[ch].medium == IPMI_CHANNEL_MEDIUM_ASYNC))
++				ipmi_inc_stat(intf, sent_lan_command_errs);
++			else
++				ipmi_inc_stat(intf, sent_ipmb_command_errs);
++			intf_err_seq(intf, msg->msgid, msg->rsp[2]);
++		} else
++			/* The message was sent, start the timer. */
++			intf_start_seq_timer(intf, msg->msgid);
++free_msg:
++		requeue = 0;
++		goto out;
++
++	} else if (msg->rsp_size < 2) {
+ 		/* Message is too small to be correct. */
+ 		dev_warn(intf->si_dev,
+ 			 "BMC returned too small a message for netfn %x cmd %x, got %d bytes\n",
+@@ -4475,62 +4521,16 @@ void ipmi_smi_msg_received(struct ipmi_smi *intf,
+ 	unsigned long flags = 0; /* keep us warning-free. */
+ 	int run_to_completion = intf->run_to_completion;
+ 
+-	if ((msg->data_size >= 2)
+-	    && (msg->data[0] == (IPMI_NETFN_APP_REQUEST << 2))
+-	    && (msg->data[1] == IPMI_SEND_MSG_CMD)
+-	    && (msg->user_data == NULL)) {
+-
+-		if (intf->in_shutdown)
+-			goto free_msg;
+-
+-		/*
+-		 * This is the local response to a command send, start
+-		 * the timer for these.  The user_data will not be
+-		 * NULL if this is a response send, and we will let
+-		 * response sends just go through.
+-		 */
+-
+-		/*
+-		 * Check for errors, if we get certain errors (ones
+-		 * that mean basically we can try again later), we
+-		 * ignore them and start the timer.  Otherwise we
+-		 * report the error immediately.
+-		 */
+-		if ((msg->rsp_size >= 3) && (msg->rsp[2] != 0)
+-		    && (msg->rsp[2] != IPMI_NODE_BUSY_ERR)
+-		    && (msg->rsp[2] != IPMI_LOST_ARBITRATION_ERR)
+-		    && (msg->rsp[2] != IPMI_BUS_ERR)
+-		    && (msg->rsp[2] != IPMI_NAK_ON_WRITE_ERR)) {
+-			int ch = msg->rsp[3] & 0xf;
+-			struct ipmi_channel *chans;
+-
+-			/* Got an error sending the message, handle it. */
+-
+-			chans = READ_ONCE(intf->channel_list)->c;
+-			if ((chans[ch].medium == IPMI_CHANNEL_MEDIUM_8023LAN)
+-			    || (chans[ch].medium == IPMI_CHANNEL_MEDIUM_ASYNC))
+-				ipmi_inc_stat(intf, sent_lan_command_errs);
+-			else
+-				ipmi_inc_stat(intf, sent_ipmb_command_errs);
+-			intf_err_seq(intf, msg->msgid, msg->rsp[2]);
+-		} else
+-			/* The message was sent, start the timer. */
+-			intf_start_seq_timer(intf, msg->msgid);
+-
+-free_msg:
+-		ipmi_free_smi_msg(msg);
+-	} else {
+-		/*
+-		 * To preserve message order, we keep a queue and deliver from
+-		 * a tasklet.
+-		 */
+-		if (!run_to_completion)
+-			spin_lock_irqsave(&intf->waiting_rcv_msgs_lock, flags);
+-		list_add_tail(&msg->link, &intf->waiting_rcv_msgs);
+-		if (!run_to_completion)
+-			spin_unlock_irqrestore(&intf->waiting_rcv_msgs_lock,
+-					       flags);
+-	}
++	/*
++	 * To preserve message order, we keep a queue and deliver from
++	 * a tasklet.
++	 */
++	if (!run_to_completion)
++		spin_lock_irqsave(&intf->waiting_rcv_msgs_lock, flags);
++	list_add_tail(&msg->link, &intf->waiting_rcv_msgs);
++	if (!run_to_completion)
++		spin_unlock_irqrestore(&intf->waiting_rcv_msgs_lock,
++				       flags);
+ 
+ 	if (!run_to_completion)
+ 		spin_lock_irqsave(&intf->xmit_msgs_lock, flags);
+-- 
+2.16.4
+

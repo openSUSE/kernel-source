@@ -1,0 +1,236 @@
+From 43f79a33fd1a4f2cc051e47d8635fb0e4f18efe0 Mon Sep 17 00:00:00 2001
+From: Mike Kravetz <mike.kravetz@oracle.com>
+Date: Mon, 23 Sep 2019 15:37:35 -0700
+Subject: [PATCH] hugetlbfs: don't retry when pool page allocations start to
+ fail
+
+References: bnc#1155780 (VM/FS functional and performance backports)
+Patch-mainline: v5.4-rc1
+Git-commit: f60858f9d327c4dd0c432abe9ec943a83929c229
+
+When allocating hugetlbfs pool pages via /proc/sys/vm/nr_hugepages, the
+pages will be interleaved between all nodes of the system.  If nodes are
+not equal, it is quite possible for one node to fill up before the others.
+When this happens, the code still attempts to allocate pages from the
+full node.  This results in calls to direct reclaim and compaction which
+slow things down considerably.
+
+When allocating pool pages, note the state of the previous allocation for
+each node.  If previous allocation failed, do not use the aggressive retry
+algorithm on successive attempts.  The allocation will still succeed if
+there is memory available, but it will not try as hard to free up memory.
+
+Link: http://lkml.kernel.org/r/20190806014744.15446-5-mike.kravetz@oracle.com
+Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Michal Hocko <mhocko@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ mm/hugetlb.c | 89 +++++++++++++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 79 insertions(+), 10 deletions(-)
+
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 843ee2f8d356..b45a95363a84 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -1404,12 +1404,25 @@ pgoff_t __basepage_index(struct page *page)
+ }
+ 
+ static struct page *alloc_buddy_huge_page(struct hstate *h,
+-		gfp_t gfp_mask, int nid, nodemask_t *nmask)
++		gfp_t gfp_mask, int nid, nodemask_t *nmask,
++		nodemask_t *node_alloc_noretry)
+ {
+ 	int order = huge_page_order(h);
+ 	struct page *page;
++	bool alloc_try_hard = true;
+ 
+-	gfp_mask |= __GFP_COMP|__GFP_RETRY_MAYFAIL|__GFP_NOWARN;
++	/*
++	 * By default we always try hard to allocate the page with
++	 * __GFP_RETRY_MAYFAIL flag.  However, if we are allocating pages in
++	 * a loop (to adjust global huge page counts) and previous allocation
++	 * failed, do not continue to try hard on the same node.  Use the
++	 * node_alloc_noretry bitmap to manage this state information.
++	 */
++	if (node_alloc_noretry && node_isset(nid, *node_alloc_noretry))
++		alloc_try_hard = false;
++	gfp_mask |= __GFP_COMP|__GFP_NOWARN;
++	if (alloc_try_hard)
++		gfp_mask |= __GFP_RETRY_MAYFAIL;
+ 	if (nid == NUMA_NO_NODE)
+ 		nid = numa_mem_id();
+ 	page = __alloc_pages_nodemask(gfp_mask, order, nid, nmask);
+@@ -1418,6 +1431,22 @@ static struct page *alloc_buddy_huge_page(struct hstate *h,
+ 	else
+ 		__count_vm_event(HTLB_BUDDY_PGALLOC_FAIL);
+ 
++	/*
++	 * If we did not specify __GFP_RETRY_MAYFAIL, but still got a page this
++	 * indicates an overall state change.  Clear bit so that we resume
++	 * normal 'try hard' allocations.
++	 */
++	if (node_alloc_noretry && page && !alloc_try_hard)
++		node_clear(nid, *node_alloc_noretry);
++
++	/*
++	 * If we tried hard to get a page but failed, set bit so that
++	 * subsequent attempts will not try as hard until there is an
++	 * overall state change.
++	 */
++	if (node_alloc_noretry && !page && alloc_try_hard)
++		node_set(nid, *node_alloc_noretry);
++
+ 	return page;
+ }
+ 
+@@ -1426,7 +1455,8 @@ static struct page *alloc_buddy_huge_page(struct hstate *h,
+  * should use this function to get new hugetlb pages
+  */
+ static struct page *alloc_fresh_huge_page(struct hstate *h,
+-		gfp_t gfp_mask, int nid, nodemask_t *nmask)
++		gfp_t gfp_mask, int nid, nodemask_t *nmask,
++		nodemask_t *node_alloc_noretry)
+ {
+ 	struct page *page;
+ 
+@@ -1434,7 +1464,7 @@ static struct page *alloc_fresh_huge_page(struct hstate *h,
+ 		page = alloc_gigantic_page(h, gfp_mask, nid, nmask);
+ 	else
+ 		page = alloc_buddy_huge_page(h, gfp_mask,
+-				nid, nmask);
++				nid, nmask, node_alloc_noretry);
+ 	if (!page)
+ 		return NULL;
+ 
+@@ -1449,14 +1479,16 @@ static struct page *alloc_fresh_huge_page(struct hstate *h,
+  * Allocates a fresh page to the hugetlb allocator pool in the node interleaved
+  * manner.
+  */
+-static int alloc_pool_huge_page(struct hstate *h, nodemask_t *nodes_allowed)
++static int alloc_pool_huge_page(struct hstate *h, nodemask_t *nodes_allowed,
++				nodemask_t *node_alloc_noretry)
+ {
+ 	struct page *page;
+ 	int nr_nodes, node;
+ 	gfp_t gfp_mask = htlb_alloc_mask(h) | __GFP_THISNODE;
+ 
+ 	for_each_node_mask_to_alloc(h, nr_nodes, node, nodes_allowed) {
+-		page = alloc_fresh_huge_page(h, gfp_mask, node, nodes_allowed);
++		page = alloc_fresh_huge_page(h, gfp_mask, node, nodes_allowed,
++						node_alloc_noretry);
+ 		if (page)
+ 			break;
+ 	}
+@@ -1600,7 +1632,7 @@ static struct page *alloc_surplus_huge_page(struct hstate *h, gfp_t gfp_mask,
+ 		goto out_unlock;
+ 	spin_unlock(&hugetlb_lock);
+ 
+-	page = alloc_fresh_huge_page(h, gfp_mask, nid, nmask);
++	page = alloc_fresh_huge_page(h, gfp_mask, nid, nmask, NULL);
+ 	if (!page)
+ 		return NULL;
+ 
+@@ -1636,7 +1668,7 @@ struct page *alloc_migrate_huge_page(struct hstate *h, gfp_t gfp_mask,
+ 	if (hstate_is_gigantic(h))
+ 		return NULL;
+ 
+-	page = alloc_fresh_huge_page(h, gfp_mask, nid, nmask);
++	page = alloc_fresh_huge_page(h, gfp_mask, nid, nmask, NULL);
+ 	if (!page)
+ 		return NULL;
+ 
+@@ -2206,13 +2238,33 @@ static void __init gather_bootmem_prealloc(void)
+ static void __init hugetlb_hstate_alloc_pages(struct hstate *h)
+ {
+ 	unsigned long i;
++	nodemask_t *node_alloc_noretry;
++
++	if (!hstate_is_gigantic(h)) {
++		/*
++		 * Bit mask controlling how hard we retry per-node allocations.
++		 * Ignore errors as lower level routines can deal with
++		 * node_alloc_noretry == NULL.  If this kmalloc fails at boot
++		 * time, we are likely in bigger trouble.
++		 */
++		node_alloc_noretry = kmalloc(sizeof(*node_alloc_noretry),
++						GFP_KERNEL);
++	} else {
++		/* allocations done at boot time */
++		node_alloc_noretry = NULL;
++	}
++
++	/* bit mask controlling how hard we retry per-node allocations */
++	if (node_alloc_noretry)
++		nodes_clear(*node_alloc_noretry);
+ 
+ 	for (i = 0; i < h->max_huge_pages; ++i) {
+ 		if (hstate_is_gigantic(h)) {
+ 			if (!alloc_bootmem_huge_page(h))
+ 				break;
+ 		} else if (!alloc_pool_huge_page(h,
+-					 &node_states[N_MEMORY]))
++					 &node_states[N_MEMORY],
++					 node_alloc_noretry))
+ 			break;
+ 		cond_resched();
+ 	}
+@@ -2224,6 +2276,8 @@ static void __init hugetlb_hstate_alloc_pages(struct hstate *h)
+ 			h->max_huge_pages, buf, i);
+ 		h->max_huge_pages = i;
+ 	}
++
++	kfree(node_alloc_noretry);
+ }
+ 
+ static void __init hugetlb_init_hstates(void)
+@@ -2322,6 +2376,17 @@ static int set_max_huge_pages(struct hstate *h, unsigned long count, int nid,
+ 			      nodemask_t *nodes_allowed)
+ {
+ 	unsigned long min_count, ret;
++	NODEMASK_ALLOC(nodemask_t, node_alloc_noretry, GFP_KERNEL);
++
++	/*
++	 * Bit mask controlling how hard we retry per-node allocations.
++	 * If we can not allocate the bit mask, do not attempt to allocate
++	 * the requested huge pages.
++	 */
++	if (node_alloc_noretry)
++		nodes_clear(*node_alloc_noretry);
++	else
++		return -ENOMEM;
+ 
+ 	spin_lock(&hugetlb_lock);
+ 
+@@ -2355,6 +2420,7 @@ static int set_max_huge_pages(struct hstate *h, unsigned long count, int nid,
+ 	if (hstate_is_gigantic(h) && !IS_ENABLED(CONFIG_CONTIG_ALLOC)) {
+ 		if (count > persistent_huge_pages(h)) {
+ 			spin_unlock(&hugetlb_lock);
++			NODEMASK_FREE(node_alloc_noretry);
+ 			return -EINVAL;
+ 		}
+ 		/* Fall through to decrease pool */
+@@ -2387,7 +2453,8 @@ static int set_max_huge_pages(struct hstate *h, unsigned long count, int nid,
+ 		/* yield cpu to avoid soft lockup */
+ 		cond_resched();
+ 
+-		ret = alloc_pool_huge_page(h, nodes_allowed);
++		ret = alloc_pool_huge_page(h, nodes_allowed,
++						node_alloc_noretry);
+ 		spin_lock(&hugetlb_lock);
+ 		if (!ret)
+ 			goto out;
+@@ -2428,6 +2495,8 @@ static int set_max_huge_pages(struct hstate *h, unsigned long count, int nid,
+ 	h->max_huge_pages = persistent_huge_pages(h);
+ 	spin_unlock(&hugetlb_lock);
+ 
++	NODEMASK_FREE(node_alloc_noretry);
++
+ 	return 0;
+ }
+ 

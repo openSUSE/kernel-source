@@ -1,0 +1,280 @@
+From: Bryan Tan <bryantan@vmware.com>
+Date: Mon, 28 Oct 2019 18:14:52 +0000
+Subject: RDMA/vmw_pvrdma: Use resource ids from physical device if available
+Patch-mainline: v5.5-rc1
+Git-commit: a52dc3a100958f4bf5e921067ba626c2caf8e55f
+References: jsc#SLE-8449
+
+This change allows the RDMA stack to use physical resource numbers if they
+are passed up from the device. This is accomplished by separating the
+concept of the QP number from the QP handle. Previously, the two were the
+same, as the QP number was exposed to the guest and also used to reference
+a virtual QP in the device backend.
+
+With physical resource numbers exposed, the QP number given to the guest
+is the number assigned from the physical HCA's QP, while the QP handle is
+still the internal handle used to reference a virtual QP. Regardless of
+whether the device is exposing physical ids, the driver will still try to
+pick up the QP handle from the backend if possible. The MR keys exposed to
+the guest will also be the MR keys created by the physical HCA, instead of
+virtual MR keys. The distinction between handle and keys is already
+present for MRs so there is no need to do anything special here.
+
+A new version of the create QP response has been added to the device API
+to pass up the QP number and handle. The driver will also report these to
+userspace in the udata response if userspace supports it or not create the
+queuepair if not. I also had to do a refactor of the destroy qp code to
+reuse it if we fail to copy to userspace.
+
+Link: https://lore.kernel.org/r/20191028181444.19448-1-aditr@vmware.com
+Reviewed-by: Jorgen Hansen <jhansen@vmware.com>
+Signed-off-by: Adit Ranadive <aditr@vmware.com>
+Signed-off-by: Bryan Tan <bryantan@vmware.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/vmw_pvrdma/pvrdma_dev_api.h |   15 ++
+ drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c      |  115 ++++++++++++++++------
+ include/uapi/rdma/vmw_pvrdma-abi.h                |    5 
+ 3 files changed, 106 insertions(+), 29 deletions(-)
+
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_dev_api.h
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_dev_api.h
+@@ -58,7 +58,8 @@
+ #define PVRDMA_ROCEV1_VERSION		17
+ #define PVRDMA_ROCEV2_VERSION		18
+ #define PVRDMA_PPN64_VERSION		19
+-#define PVRDMA_VERSION			PVRDMA_PPN64_VERSION
++#define PVRDMA_QPHANDLE_VERSION		20
++#define PVRDMA_VERSION			PVRDMA_QPHANDLE_VERSION
+ 
+ #define PVRDMA_BOARD_ID			1
+ #define PVRDMA_REV_ID			1
+@@ -581,6 +582,17 @@ struct pvrdma_cmd_create_qp_resp {
+ 	u32 max_inline_data;
+ };
+ 
++struct pvrdma_cmd_create_qp_resp_v2 {
++	struct pvrdma_cmd_resp_hdr hdr;
++	u32 qpn;
++	u32 qp_handle;
++	u32 max_send_wr;
++	u32 max_recv_wr;
++	u32 max_send_sge;
++	u32 max_recv_sge;
++	u32 max_inline_data;
++};
++
+ struct pvrdma_cmd_modify_qp {
+ 	struct pvrdma_cmd_hdr hdr;
+ 	u32 qp_handle;
+@@ -663,6 +675,7 @@ union pvrdma_cmd_resp {
+ 	struct pvrdma_cmd_create_cq_resp create_cq_resp;
+ 	struct pvrdma_cmd_resize_cq_resp resize_cq_resp;
+ 	struct pvrdma_cmd_create_qp_resp create_qp_resp;
++	struct pvrdma_cmd_create_qp_resp_v2 create_qp_resp_v2;
+ 	struct pvrdma_cmd_query_qp_resp query_qp_resp;
+ 	struct pvrdma_cmd_destroy_qp_resp destroy_qp_resp;
+ 	struct pvrdma_cmd_create_srq_resp create_srq_resp;
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c
+@@ -52,6 +52,9 @@
+ 
+ #include "pvrdma.h"
+ 
++static void __pvrdma_destroy_qp(struct pvrdma_dev *dev,
++				struct pvrdma_qp *qp);
++
+ static inline void get_cqs(struct pvrdma_qp *qp, struct pvrdma_cq **send_cq,
+ 			   struct pvrdma_cq **recv_cq)
+ {
+@@ -195,7 +198,9 @@ struct ib_qp *pvrdma_create_qp(struct ib
+ 	union pvrdma_cmd_resp rsp;
+ 	struct pvrdma_cmd_create_qp *cmd = &req.create_qp;
+ 	struct pvrdma_cmd_create_qp_resp *resp = &rsp.create_qp_resp;
++	struct pvrdma_cmd_create_qp_resp_v2 *resp_v2 = &rsp.create_qp_resp_v2;
+ 	struct pvrdma_create_qp ucmd;
++	struct pvrdma_create_qp_resp qp_resp = {};
+ 	unsigned long flags;
+ 	int ret;
+ 	bool is_srq = !!init_attr->srq;
+@@ -260,6 +265,15 @@ struct ib_qp *pvrdma_create_qp(struct ib
+ 				goto err_qp;
+ 			}
+ 
++			/* Userspace supports qpn and qp handles? */
++			if (dev->dsr_version >= PVRDMA_QPHANDLE_VERSION &&
++			    udata->outlen < sizeof(qp_resp)) {
++				dev_warn(&dev->pdev->dev,
++					 "create queuepair not supported\n");
++				ret = -EOPNOTSUPP;
++				goto err_qp;
++			}
++
+ 			if (!is_srq) {
+ 				/* set qp->sq.wqe_cnt, shift, buf_size.. */
+ 				qp->rumem = ib_umem_get(udata, ucmd.rbuf_addr,
+@@ -379,13 +393,33 @@ struct ib_qp *pvrdma_create_qp(struct ib
+ 	}
+ 
+ 	/* max_send_wr/_recv_wr/_send_sge/_recv_sge/_inline_data */
+-	qp->qp_handle = resp->qpn;
+ 	qp->port = init_attr->port_num;
+-	qp->ibqp.qp_num = resp->qpn;
++
++	if (dev->dsr_version >= PVRDMA_QPHANDLE_VERSION) {
++		qp->ibqp.qp_num = resp_v2->qpn;
++		qp->qp_handle = resp_v2->qp_handle;
++	} else {
++		qp->ibqp.qp_num = resp->qpn;
++		qp->qp_handle = resp->qpn;
++	}
++
+ 	spin_lock_irqsave(&dev->qp_tbl_lock, flags);
+ 	dev->qp_tbl[qp->qp_handle % dev->dsr->caps.max_qp] = qp;
+ 	spin_unlock_irqrestore(&dev->qp_tbl_lock, flags);
+ 
++	if (udata) {
++		qp_resp.qpn = qp->ibqp.qp_num;
++		qp_resp.qp_handle = qp->qp_handle;
++
++		if (ib_copy_to_udata(udata, &qp_resp,
++				     min(udata->outlen, sizeof(qp_resp)))) {
++			dev_warn(&dev->pdev->dev,
++				 "failed to copy back udata\n");
++			__pvrdma_destroy_qp(dev, qp);
++			return ERR_PTR(-EINVAL);
++		}
++	}
++
+ 	return &qp->ibqp;
+ 
+ err_pdir:
+@@ -400,27 +434,15 @@ err_qp:
+ 	return ERR_PTR(ret);
+ }
+ 
+-static void pvrdma_free_qp(struct pvrdma_qp *qp)
++static void _pvrdma_free_qp(struct pvrdma_qp *qp)
+ {
++	unsigned long flags;
+ 	struct pvrdma_dev *dev = to_vdev(qp->ibqp.device);
+-	struct pvrdma_cq *scq;
+-	struct pvrdma_cq *rcq;
+-	unsigned long flags, scq_flags, rcq_flags;
+-
+-	/* In case cq is polling */
+-	get_cqs(qp, &scq, &rcq);
+-	pvrdma_lock_cqs(scq, rcq, &scq_flags, &rcq_flags);
+-
+-	_pvrdma_flush_cqe(qp, scq);
+-	if (scq != rcq)
+-		_pvrdma_flush_cqe(qp, rcq);
+ 
+ 	spin_lock_irqsave(&dev->qp_tbl_lock, flags);
+ 	dev->qp_tbl[qp->qp_handle] = NULL;
+ 	spin_unlock_irqrestore(&dev->qp_tbl_lock, flags);
+ 
+-	pvrdma_unlock_cqs(scq, rcq, &scq_flags, &rcq_flags);
+-
+ 	if (refcount_dec_and_test(&qp->refcnt))
+ 		complete(&qp->free);
+ 	wait_for_completion(&qp->free);
+@@ -435,34 +457,71 @@ static void pvrdma_free_qp(struct pvrdma
+ 	atomic_dec(&dev->num_qps);
+ }
+ 
+-/**
+- * pvrdma_destroy_qp - destroy a queue pair
+- * @qp: the queue pair to destroy
+- * @udata: user data or null for kernel object
+- *
+- * @return: 0 on success.
+- */
+-int pvrdma_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
++static void pvrdma_free_qp(struct pvrdma_qp *qp)
++{
++	struct pvrdma_cq *scq;
++	struct pvrdma_cq *rcq;
++	unsigned long scq_flags, rcq_flags;
++
++	/* In case cq is polling */
++	get_cqs(qp, &scq, &rcq);
++	pvrdma_lock_cqs(scq, rcq, &scq_flags, &rcq_flags);
++
++	_pvrdma_flush_cqe(qp, scq);
++	if (scq != rcq)
++		_pvrdma_flush_cqe(qp, rcq);
++
++	/*
++	 * We're now unlocking the CQs before clearing out the qp handle this
++	 * should still be safe. We have destroyed the backend QP and flushed
++	 * the CQEs so there should be no other completions for this QP.
++	 */
++	pvrdma_unlock_cqs(scq, rcq, &scq_flags, &rcq_flags);
++
++	_pvrdma_free_qp(qp);
++}
++
++static inline void _pvrdma_destroy_qp_work(struct pvrdma_dev *dev,
++					   u32 qp_handle)
+ {
+-	struct pvrdma_qp *vqp = to_vqp(qp);
+ 	union pvrdma_cmd_req req;
+ 	struct pvrdma_cmd_destroy_qp *cmd = &req.destroy_qp;
+ 	int ret;
+ 
+ 	memset(cmd, 0, sizeof(*cmd));
+ 	cmd->hdr.cmd = PVRDMA_CMD_DESTROY_QP;
+-	cmd->qp_handle = vqp->qp_handle;
++	cmd->qp_handle = qp_handle;
+ 
+-	ret = pvrdma_cmd_post(to_vdev(qp->device), &req, NULL, 0);
++	ret = pvrdma_cmd_post(dev, &req, NULL, 0);
+ 	if (ret < 0)
+-		dev_warn(&to_vdev(qp->device)->pdev->dev,
++		dev_warn(&dev->pdev->dev,
+ 			 "destroy queuepair failed, error: %d\n", ret);
++}
+ 
++/**
++ * pvrdma_destroy_qp - destroy a queue pair
++ * @qp: the queue pair to destroy
++ * @udata: user data or null for kernel object
++ *
++ * @return: always 0.
++ */
++int pvrdma_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
++{
++	struct pvrdma_qp *vqp = to_vqp(qp);
++
++	_pvrdma_destroy_qp_work(to_vdev(qp->device), vqp->qp_handle);
+ 	pvrdma_free_qp(vqp);
+ 
+ 	return 0;
+ }
+ 
++static void __pvrdma_destroy_qp(struct pvrdma_dev *dev,
++				struct pvrdma_qp *qp)
++{
++	_pvrdma_destroy_qp_work(dev, qp->qp_handle);
++	_pvrdma_free_qp(qp);
++}
++
+ /**
+  * pvrdma_modify_qp - modify queue pair attributes
+  * @ibqp: the queue pair
+--- a/include/uapi/rdma/vmw_pvrdma-abi.h
++++ b/include/uapi/rdma/vmw_pvrdma-abi.h
+@@ -179,6 +179,11 @@ struct pvrdma_create_qp {
+ 	__aligned_u64 qp_addr;
+ };
+ 
++struct pvrdma_create_qp_resp {
++	__u32 qpn;
++	__u32 qp_handle;
++};
++
+ /* PVRDMA masked atomic compare and swap */
+ struct pvrdma_ex_cmp_swap {
+ 	__aligned_u64 swap_val;

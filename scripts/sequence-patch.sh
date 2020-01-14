@@ -40,7 +40,7 @@ usage() {
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
           [--fast] [--rapid] [last-patch-name] [--vanilla] [--fuzz=NUM]
           [--patch-dir=PATH] [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]]
-          [--ctags] [--cscope] [--etags] [--skip-reverse]
+          [--ctags] [--cscope] [--etags] [--skip-reverse] [--dry-run]
 
   The --build-dir option supports internal shell aliases, like ~, and variable
   expansion when the variables are properly escaped.  Environment variables
@@ -67,6 +67,8 @@ SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
 
   The --rapid option will use rapidquilt to apply patches.
 
+  The --dry-run option only works with --fast and --rapid.
+
   When used with last-patch-name, both --fast and --no-quilt
   will set up a quilt environment for the remaining patches.
 END
@@ -75,7 +77,7 @@ END
 
 apply_rapid_patches() {
     printf "%s\n" ${PATCHES_BEFORE[@]} >> $PATCH_DIR/series
-    rapidquilt push -a -d $PATCH_DIR -p $PWD $fuzz
+    rapidquilt push -a -d $PATCH_DIR -p $PWD $fuzz $DRY_RUN
     status=$?
 
     PATCHES=( ${PATCHES_AFTER[@]} )
@@ -85,7 +87,7 @@ apply_fast_patches() {
     echo "[ Fast-applying ${#PATCHES_BEFORE[@]} patches. ${#PATCHES_AFTER[@]} remain. ]"
     LAST_LOG=$(echo "${PATCHES_BEFORE[@]}" | xargs cat | \
         patch -d $PATCH_DIR -p1 -E $fuzz --force --no-backup-if-mismatch \
-		-s 2>&1)
+		-s $DRY_RUN 2>&1)
     STATUS=$?
 
     if [ $STATUS -ne 0 ]; then
@@ -210,7 +212,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,rapid,vanilla,fuzz,patch-dir:,build-dir:,config:,kabi,ctags,cscope,etags,skip-reverse -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,rapid,vanilla,fuzz:,patch-dir:,build-dir:,config:,kabi,ctags,cscope,etags,skip-reverse,dry-run -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -234,6 +236,7 @@ CTAGS=false
 CSCOPE=false
 ETAGS=false
 SKIP_REVERSE=false
+DRY_RUN=
 
 while true; do
     case "$1" in
@@ -304,6 +307,9 @@ while true; do
 	--skip-reverse)
 	    SKIP_REVERSE=true
 	    ;;
+	--dry-run)
+	    DRY_RUN=--dry-run
+	    ;;
 	--)
 	    shift
 	    break ;;
@@ -317,6 +323,11 @@ unset LIMIT
 if [ $# -ge 1 ]; then
     LIMIT=$1
     shift
+fi
+
+if ! [ -z "$DRY_RUN" -o -n "$FAST" -o -n "$RAPID" ]; then
+    echo "--dry-run requires --fast or --rapid"
+    exit 1
 fi
 
 if test -z "$CONFIG"; then
@@ -466,13 +477,15 @@ else
     SP_BUILD_DIR="$PATCH_DIR"
 fi
 
-echo "Creating tree in $PATCH_DIR"
+if [ -z "$DRY_RUN" ]; then
+    echo "Creating tree in $PATCH_DIR"
 
-# Clean up from previous run
-rm -f "$PATCH_LOG"
-if [ -e $PATCH_DIR ]; then
-    echo "Cleaning up from previous run"
-    rm -rf $PATCH_DIR
+    # Clean up from previous run
+    rm -f "$PATCH_LOG"
+    if [ -e $PATCH_DIR ]; then
+	echo "Cleaning up from previous run"
+	rm -rf $PATCH_DIR
+    fi
 fi
 
 # Create fresh $SCRATCH_AREA/linux-$SRCVERSION.
@@ -565,11 +578,15 @@ remove_rejects() {
     fi
 }
 
-# Create hardlinked source tree
-echo "Linking from $ORIG_DIR"
-cp -rld $ORIG_DIR $PATCH_DIR
-# create a relative symlink
-ln -snf ${PATCH_DIR#$SCRATCH_AREA/} $SCRATCH_AREA/current
+if [ -z "$DRY_RUN" ]; then
+    # Create hardlinked source tree
+    echo "Linking from $ORIG_DIR"
+    cp -rld $ORIG_DIR $PATCH_DIR
+    # create a relative symlink
+    ln -snf ${PATCH_DIR#$SCRATCH_AREA/} $SCRATCH_AREA/current
+else
+    PATCH_DIR="$ORIG_DIR"
+fi
 
 echo -e "# Symbols: $SYMBOLS\n#" > $PATCH_DIR/series
 SERIES_PFX=
@@ -577,8 +594,10 @@ if ! $QUILT; then
     SERIES_PFX="# "
 fi
 
-mkdir $PATCH_DIR/.pc
-echo 2 > $PATCH_DIR/.pc/.version
+if [ -z "$DRY_RUN" ]; then
+    mkdir $PATCH_DIR/.pc
+    echo 2 > $PATCH_DIR/.pc/.version
+fi
 
 if [ -n "$FAST" ]; then
     apply_fast_patches
@@ -586,6 +605,10 @@ elif [ -n "$RAPID" ]; then
     apply_rapid_patches
 else
     apply_patches
+fi
+
+if [ -n "$DRY_RUN" ]; then
+    exit $status
 fi
 
 if [ -n "$EXTRA_SYMBOLS" ]; then

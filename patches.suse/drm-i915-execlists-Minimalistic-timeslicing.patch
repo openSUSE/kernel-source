@@ -1,0 +1,501 @@
+From 8ee36e048c98d4015804a23f884be2576f778a93 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 20 Jun 2019 15:20:52 +0100
+Subject: [PATCH] drm/i915/execlists: Minimalistic timeslicing
+Git-commit: 8ee36e048c98d4015804a23f884be2576f778a93
+Patch-mainline: v5.4-rc1
+References: jsc#SLE-7953
+
+If we have multiple contexts of equal priority pending execution,
+activate a timer to demote the currently executing context in favour of
+the next in the queue when that timeslice expires. This enforces
+fairness between contexts (so long as they allow preemption -- forced
+preemption, in the future, will kick those who do not obey) and allows
+us to avoid userspace blocking forward progress with e.g. unbounded
+MI_SEMAPHORE_WAIT.
+
+For the starting point here, we use the jiffie as our timeslice so that
+we should be reasonably efficient wrt frequent CPU wakeups.
+
+Testcase: igt/gem_exec_scheduler/semaphore-resolve
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190620142052.19311-2-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/gt/intel_engine_types.h |   6 +
+ drivers/gpu/drm/i915/gt/intel_lrc.c          | 116 ++++++++++++++
+ drivers/gpu/drm/i915/gt/selftest_lrc.c       | 223 +++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_scheduler.c        |   1 +
+ drivers/gpu/drm/i915/i915_scheduler_types.h  |   1 +
+ 5 files changed, 347 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine_types.h b/drivers/gpu/drm/i915/gt/intel_engine_types.h
+index b4f7b81a3c3e..9940bad37812 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_engine_types.h
+@@ -12,6 +12,7 @@
+ #include <linux/kref.h>
+ #include <linux/list.h>
+ #include <linux/llist.h>
++#include <linux/timer.h>
+ #include <linux/types.h>
+ 
+ #include "i915_gem.h"
+@@ -149,6 +150,11 @@ struct intel_engine_execlists {
+ 	 */
+ 	struct tasklet_struct tasklet;
+ 
++	/**
++	 * @timer: kick the current context if its timeslice expires
++	 */
++	struct timer_list timer;
++
+ 	/**
+ 	 * @default_priolist: priority list for I915_PRIORITY_NORMAL
+ 	 */
+diff --git a/drivers/gpu/drm/i915/gt/intel_lrc.c b/drivers/gpu/drm/i915/gt/intel_lrc.c
+index cb9d285bd00a..f8ad49006917 100644
+--- a/drivers/gpu/drm/i915/gt/intel_lrc.c
++++ b/drivers/gpu/drm/i915/gt/intel_lrc.c
+@@ -266,6 +266,7 @@ static int effective_prio(const struct i915_request *rq)
+ 		prio |= I915_PRIORITY_NOSEMAPHORE;
+ 
+ 	/* Restrict mere WAIT boosts from triggering preemption */
++	BUILD_BUG_ON(__NO_PREEMPTION & ~I915_PRIORITY_MASK); /* only internal */
+ 	return prio | __NO_PREEMPTION;
+ }
+ 
+@@ -830,6 +831,81 @@ last_active(const struct intel_engine_execlists *execlists)
+ 	return *last;
+ }
+ 
++static void
++defer_request(struct i915_request * const rq, struct list_head * const pl)
++{
++	struct i915_dependency *p;
++
++	/*
++	 * We want to move the interrupted request to the back of
++	 * the round-robin list (i.e. its priority level), but
++	 * in doing so, we must then move all requests that were in
++	 * flight and were waiting for the interrupted request to
++	 * be run after it again.
++	 */
++	list_move_tail(&rq->sched.link, pl);
++
++	list_for_each_entry(p, &rq->sched.waiters_list, wait_link) {
++		struct i915_request *w =
++			container_of(p->waiter, typeof(*w), sched);
++
++		/* Leave semaphores spinning on the other engines */
++		if (w->engine != rq->engine)
++			continue;
++
++		/* No waiter should start before the active request completed */
++		GEM_BUG_ON(i915_request_started(w));
++
++		GEM_BUG_ON(rq_prio(w) > rq_prio(rq));
++		if (rq_prio(w) < rq_prio(rq))
++			continue;
++
++		if (list_empty(&w->sched.link))
++			continue; /* Not yet submitted; unready */
++
++		/*
++		 * This should be very shallow as it is limited by the
++		 * number of requests that can fit in a ring (<64) and
++		 * the number of contexts that can be in flight on this
++		 * engine.
++		 */
++		defer_request(w, pl);
++	}
++}
++
++static void defer_active(struct intel_engine_cs *engine)
++{
++	struct i915_request *rq;
++
++	rq = __unwind_incomplete_requests(engine);
++	if (!rq)
++		return;
++
++	defer_request(rq, i915_sched_lookup_priolist(engine, rq_prio(rq)));
++}
++
++static bool
++need_timeslice(struct intel_engine_cs *engine, const struct i915_request *rq)
++{
++	int hint;
++
++	if (list_is_last(&rq->sched.link, &engine->active.requests))
++		return false;
++
++	hint = max(rq_prio(list_next_entry(rq, sched.link)),
++		   engine->execlists.queue_priority_hint);
++
++	return hint >= rq_prio(rq);
++}
++
++static bool
++enable_timeslice(struct intel_engine_cs *engine)
++{
++	struct i915_request *last = last_active(&engine->execlists);
++
++	return last && need_timeslice(engine, last);
++}
++
+ static void execlists_dequeue(struct intel_engine_cs *engine)
+ {
+ 	struct intel_engine_execlists * const execlists = &engine->execlists;
+@@ -923,6 +999,32 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
+ 			 */
+ 			last->hw_context->lrc_desc |= CTX_DESC_FORCE_RESTORE;
+ 			last = NULL;
++		} else if (need_timeslice(engine, last) &&
++			   !timer_pending(&engine->execlists.timer)) {
++			GEM_TRACE("%s: expired last=%llx:%lld, prio=%d, hint=%d\n",
++				  engine->name,
++				  last->fence.context,
++				  last->fence.seqno,
++				  last->sched.attr.priority,
++				  execlists->queue_priority_hint);
++
++			ring_set_paused(engine, 1);
++			defer_active(engine);
++
++			/*
++			 * Unlike for preemption, if we rewind and continue
++			 * executing the same context as previously active,
++			 * the order of execution will remain the same and
++			 * the tail will only advance. We do not need to
++			 * force a full context restore, as a lite-restore
++			 * is sufficient to resample the monotonic TAIL.
++			 *
++			 * If we switch to any other context, similarly we
++			 * will not rewind TAIL of current context, and
++			 * normal save/restore will preserve state and allow
++			 * us to later continue executing the same request.
++			 */
++			last = NULL;
+ 		} else {
+ 			/*
+ 			 * Otherwise if we already have a request pending
+@@ -1247,6 +1349,9 @@ static void process_csb(struct intel_engine_cs *engine)
+ 				       sizeof(*execlists->pending));
+ 			execlists->pending[0] = NULL;
+ 
++			if (enable_timeslice(engine))
++				mod_timer(&execlists->timer, jiffies + 1);
++
+ 			if (!inject_preempt_hang(execlists))
+ 				ring_set_paused(engine, 0);
+ 		} else if (status & GEN8_CTX_STATUS_PREEMPTED) {
+@@ -1317,6 +1422,15 @@ static void execlists_submission_tasklet(unsigned long data)
+ 	spin_unlock_irqrestore(&engine->active.lock, flags);
+ }
+ 
++static void execlists_submission_timer(struct timer_list *timer)
++{
++	struct intel_engine_cs *engine =
++		from_timer(engine, timer, execlists.timer);
++
++	/* Kick the tasklet for some interrupt coalescing and reset handling */
++	tasklet_hi_schedule(&engine->execlists.tasklet);
++}
++
+ static void queue_request(struct intel_engine_cs *engine,
+ 			  struct i915_sched_node *node,
+ 			  int prio)
+@@ -2542,6 +2656,7 @@ static int gen8_init_rcs_context(struct i915_request *rq)
+ 
+ static void execlists_park(struct intel_engine_cs *engine)
+ {
++	del_timer_sync(&engine->execlists.timer);
+ 	intel_engine_park(engine);
+ }
+ 
+@@ -2639,6 +2754,7 @@ int intel_execlists_submission_setup(struct intel_engine_cs *engine)
+ 
+ 	tasklet_init(&engine->execlists.tasklet,
+ 		     execlists_submission_tasklet, (unsigned long)engine);
++	timer_setup(&engine->execlists.timer, execlists_submission_timer, 0);
+ 
+ 	logical_ring_default_vfuncs(engine);
+ 	logical_ring_default_irqs(engine);
+diff --git a/drivers/gpu/drm/i915/gt/selftest_lrc.c b/drivers/gpu/drm/i915/gt/selftest_lrc.c
+index 401e8b539297..0c97f953e908 100644
+--- a/drivers/gpu/drm/i915/gt/selftest_lrc.c
++++ b/drivers/gpu/drm/i915/gt/selftest_lrc.c
+@@ -79,6 +79,225 @@ static int live_sanitycheck(void *arg)
+ 	return err;
+ }
+ 
++static int
++emit_semaphore_chain(struct i915_request *rq, struct i915_vma *vma, int idx)
++{
++	u32 *cs;
++
++	cs = intel_ring_begin(rq, 10);
++	if (IS_ERR(cs))
++		return PTR_ERR(cs);
++
++	*cs++ = MI_ARB_ON_OFF | MI_ARB_ENABLE;
++
++	*cs++ = MI_SEMAPHORE_WAIT |
++		MI_SEMAPHORE_GLOBAL_GTT |
++		MI_SEMAPHORE_POLL |
++		MI_SEMAPHORE_SAD_NEQ_SDD;
++	*cs++ = 0;
++	*cs++ = i915_ggtt_offset(vma) + 4 * idx;
++	*cs++ = 0;
++
++	if (idx > 0) {
++		*cs++ = MI_STORE_DWORD_IMM_GEN4 | MI_USE_GGTT;
++		*cs++ = i915_ggtt_offset(vma) + 4 * (idx - 1);
++		*cs++ = 0;
++		*cs++ = 1;
++	} else {
++		*cs++ = MI_NOOP;
++		*cs++ = MI_NOOP;
++		*cs++ = MI_NOOP;
++		*cs++ = MI_NOOP;
++	}
++
++	*cs++ = MI_ARB_ON_OFF | MI_ARB_DISABLE;
++
++	intel_ring_advance(rq, cs);
++	return 0;
++}
++
++static struct i915_request *
++semaphore_queue(struct intel_engine_cs *engine, struct i915_vma *vma, int idx)
++{
++	struct i915_gem_context *ctx;
++	struct i915_request *rq;
++	int err;
++
++	ctx = kernel_context(engine->i915);
++	if (!ctx)
++		return ERR_PTR(-ENOMEM);
++
++	rq = igt_request_alloc(ctx, engine);
++	if (IS_ERR(rq))
++		goto out_ctx;
++
++	err = emit_semaphore_chain(rq, vma, idx);
++	i915_request_add(rq);
++	if (err)
++		rq = ERR_PTR(err);
++
++out_ctx:
++	kernel_context_close(ctx);
++	return rq;
++}
++
++static int
++release_queue(struct intel_engine_cs *engine,
++	      struct i915_vma *vma,
++	      int idx)
++{
++	struct i915_sched_attr attr = {
++		.priority = I915_USER_PRIORITY(I915_PRIORITY_MAX),
++	};
++	struct i915_request *rq;
++	u32 *cs;
++
++	rq = i915_request_create(engine->kernel_context);
++	if (IS_ERR(rq))
++		return PTR_ERR(rq);
++
++	cs = intel_ring_begin(rq, 4);
++	if (IS_ERR(cs)) {
++		i915_request_add(rq);
++		return PTR_ERR(cs);
++	}
++
++	*cs++ = MI_STORE_DWORD_IMM_GEN4 | MI_USE_GGTT;
++	*cs++ = i915_ggtt_offset(vma) + 4 * (idx - 1);
++	*cs++ = 0;
++	*cs++ = 1;
++
++	intel_ring_advance(rq, cs);
++	i915_request_add(rq);
++
++	engine->schedule(rq, &attr);
++
++	return 0;
++}
++
++static int
++slice_semaphore_queue(struct intel_engine_cs *outer,
++		      struct i915_vma *vma,
++		      int count)
++{
++	struct intel_engine_cs *engine;
++	struct i915_request *head;
++	enum intel_engine_id id;
++	int err, i, n = 0;
++
++	head = semaphore_queue(outer, vma, n++);
++	if (IS_ERR(head))
++		return PTR_ERR(head);
++
++	i915_request_get(head);
++	for_each_engine(engine, outer->i915, id) {
++		for (i = 0; i < count; i++) {
++			struct i915_request *rq;
++
++			rq = semaphore_queue(engine, vma, n++);
++			if (IS_ERR(rq)) {
++				err = PTR_ERR(rq);
++				goto out;
++			}
++		}
++	}
++
++	err = release_queue(outer, vma, n);
++	if (err)
++		goto out;
++
++	if (i915_request_wait(head,
++			      I915_WAIT_LOCKED,
++			      2 * RUNTIME_INFO(outer->i915)->num_engines * (count + 2) * (count + 3)) < 0) {
++		pr_err("Failed to slice along semaphore chain of length (%d, %d)!\n",
++		       count, n);
++		GEM_TRACE_DUMP();
++		i915_gem_set_wedged(outer->i915);
++		err = -EIO;
++	}
++
++out:
++	i915_request_put(head);
++	return err;
++}
++
++static int live_timeslice_preempt(void *arg)
++{
++	struct drm_i915_private *i915 = arg;
++	struct drm_i915_gem_object *obj;
++	intel_wakeref_t wakeref;
++	struct i915_vma *vma;
++	void *vaddr;
++	int err = 0;
++	int count;
++
++	/*
++	 * If a request takes too long, we would like to give other users
++	 * a fair go on the GPU. In particular, users may create batches
++	 * that wait upon external input, where that input may even be
++	 * supplied by another GPU job. To avoid blocking forever, we
++	 * need to preempt the current task and replace it with another
++	 * ready task.
++	 */
++
++	mutex_lock(&i915->drm.struct_mutex);
++	wakeref = intel_runtime_pm_get(&i915->runtime_pm);
++
++	obj = i915_gem_object_create_internal(i915, PAGE_SIZE);
++	if (IS_ERR(obj)) {
++		err = PTR_ERR(obj);
++		goto err_unlock;
++	}
++
++	vma = i915_vma_instance(obj, &i915->ggtt.vm, NULL);
++	if (IS_ERR(vma)) {
++		err = PTR_ERR(vma);
++		goto err_obj;
++	}
++
++	vaddr = i915_gem_object_pin_map(obj, I915_MAP_WC);
++	if (IS_ERR(vaddr)) {
++		err = PTR_ERR(vaddr);
++		goto err_obj;
++	}
++
++	err = i915_vma_pin(vma, 0, 0, PIN_GLOBAL);
++	if (err)
++		goto err_map;
++
++	for_each_prime_number_from(count, 1, 16) {
++		struct intel_engine_cs *engine;
++		enum intel_engine_id id;
++
++		for_each_engine(engine, i915, id) {
++			memset(vaddr, 0, PAGE_SIZE);
++
++			err = slice_semaphore_queue(engine, vma, count);
++			if (err)
++				goto err_pin;
++
++			if (igt_flush_test(i915, I915_WAIT_LOCKED)) {
++				err = -EIO;
++				goto err_pin;
++			}
++		}
++	}
++
++err_pin:
++	i915_vma_unpin(vma);
++err_map:
++	i915_gem_object_unpin_map(obj);
++err_obj:
++	i915_gem_object_put(obj);
++err_unlock:
++	if (igt_flush_test(i915, I915_WAIT_LOCKED))
++		err = -EIO;
++	intel_runtime_pm_put(&i915->runtime_pm, wakeref);
++	mutex_unlock(&i915->drm.struct_mutex);
++
++	return err;
++}
++
+ static int live_busywait_preempt(void *arg)
+ {
+ 	struct drm_i915_private *i915 = arg;
+@@ -398,6 +617,9 @@ static int live_late_preempt(void *arg)
+ 	if (!ctx_lo)
+ 		goto err_ctx_hi;
+ 
++	/* Make sure ctx_lo stays before ctx_hi until we trigger preemption. */
++	ctx_lo->sched.priority = I915_USER_PRIORITY(1);
++
+ 	for_each_engine(engine, i915, id) {
+ 		struct igt_live_test t;
+ 		struct i915_request *rq;
+@@ -1812,6 +2034,7 @@ int intel_execlists_live_selftests(struct drm_i915_private *i915)
+ {
+ 	static const struct i915_subtest tests[] = {
+ 		SUBTEST(live_sanitycheck),
++		SUBTEST(live_timeslice_preempt),
+ 		SUBTEST(live_busywait_preempt),
+ 		SUBTEST(live_preempt),
+ 		SUBTEST(live_late_preempt),
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index b1ba3e65cd52..0bd452e851d8 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -394,6 +394,7 @@ bool __i915_sched_node_add_dependency(struct i915_sched_node *node,
+ 		list_add(&dep->wait_link, &signal->waiters_list);
+ 		list_add(&dep->signal_link, &node->signalers_list);
+ 		dep->signaler = signal;
++		dep->waiter = node;
+ 		dep->flags = flags;
+ 
+ 		/* Keep track of whether anyone on this chain has a semaphore */
+diff --git a/drivers/gpu/drm/i915/i915_scheduler_types.h b/drivers/gpu/drm/i915/i915_scheduler_types.h
+index 3e309631bd0b..aad81acba9dc 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler_types.h
++++ b/drivers/gpu/drm/i915/i915_scheduler_types.h
+@@ -62,6 +62,7 @@ struct i915_sched_node {
+ 
+ struct i915_dependency {
+ 	struct i915_sched_node *signaler;
++	struct i915_sched_node *waiter;
+ 	struct list_head signal_link;
+ 	struct list_head wait_link;
+ 	struct list_head dfs_link;
+-- 
+2.16.4
+

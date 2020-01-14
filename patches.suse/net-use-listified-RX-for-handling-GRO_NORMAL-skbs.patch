@@ -1,0 +1,169 @@
+From: Edward Cree <ecree@solarflare.com>
+Date: Tue, 6 Aug 2019 14:53:55 +0100
+Subject: net: use listified RX for handling GRO_NORMAL skbs
+Patch-mainline: v5.4-rc1
+Git-commit: 323ebb61e32b478e2432c5a3cbf9e2ca678a9609
+References: bsc#1154353
+
+When GRO decides not to coalesce a packet, in napi_frags_finish(), instead
+ of passing it to the stack immediately, place it on a list in the napi
+ struct.  Then, at flush time (napi_complete_done(), napi_poll(), or
+ napi_busy_loop()), call netif_receive_skb_list_internal() on the list.
+We'd like to do that in napi_gro_flush(), but it's not called if
+ !napi->gro_bitmask, so we have to do it in the callers instead.  (There are
+ a handful of drivers that call napi_gro_flush() themselves, but it's not
+ clear why, or whether this will affect them.)
+Because a full 64 packets is an inefficiently large batch, also consume the
+ list whenever it exceeds gro_normal_batch, a new net/core sysctl that
+ defaults to 8.
+
+Signed-off-by: Edward Cree <ecree@solarflare.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/netdevice.h  |    3 +++
+ net/core/dev.c             |   44 +++++++++++++++++++++++++++++++++++++++++---
+ net/core/sysctl_net_core.c |    8 ++++++++
+ 3 files changed, 52 insertions(+), 3 deletions(-)
+
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -332,6 +332,8 @@ struct napi_struct {
+ 	struct net_device	*dev;
+ 	struct gro_list		gro_hash[GRO_HASH_BUCKETS];
+ 	struct sk_buff		*skb;
++	struct list_head	rx_list; /* Pending GRO_NORMAL skbs */
++	int			rx_count; /* length of rx_list */
+ 	struct hrtimer		timer;
+ 	struct list_head	dev_list;
+ 	struct hlist_node	napi_hash_node;
+@@ -4239,6 +4241,7 @@ extern int		dev_weight_rx_bias;
+ extern int		dev_weight_tx_bias;
+ extern int		dev_rx_weight;
+ extern int		dev_tx_weight;
++extern int		gro_normal_batch;
+ 
+ bool netdev_has_upper_dev(struct net_device *dev, struct net_device *upper_dev);
+ struct net_device *netdev_upper_get_next_dev_rcu(struct net_device *dev,
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3963,6 +3963,8 @@ int dev_weight_rx_bias __read_mostly = 1
+ int dev_weight_tx_bias __read_mostly = 1;  /* bias for output_queue quota */
+ int dev_rx_weight __read_mostly = 64;
+ int dev_tx_weight __read_mostly = 64;
++/* Maximum number of GRO_NORMAL skbs to batch up for list-RX */
++int gro_normal_batch __read_mostly = 8;
+ 
+ /* Called with irq disabled */
+ static inline void ____napi_schedule(struct softnet_data *sd,
+@@ -5747,6 +5749,26 @@ struct sk_buff *napi_get_frags(struct na
+ }
+ EXPORT_SYMBOL(napi_get_frags);
+ 
++/* Pass the currently batched GRO_NORMAL SKBs up to the stack. */
++static void gro_normal_list(struct napi_struct *napi)
++{
++	if (!napi->rx_count)
++		return;
++	netif_receive_skb_list_internal(&napi->rx_list);
++	INIT_LIST_HEAD(&napi->rx_list);
++	napi->rx_count = 0;
++}
++
++/* Queue one GRO_NORMAL SKB up for list processing.  If batch size exceeded,
++ * pass the whole batch up to the stack.
++ */
++static void gro_normal_one(struct napi_struct *napi, struct sk_buff *skb)
++{
++	list_add_tail(&skb->list, &napi->rx_list);
++	if (++napi->rx_count >= gro_normal_batch)
++		gro_normal_list(napi);
++}
++
+ static gro_result_t napi_frags_finish(struct napi_struct *napi,
+ 				      struct sk_buff *skb,
+ 				      gro_result_t ret)
+@@ -5756,8 +5778,8 @@ static gro_result_t napi_frags_finish(st
+ 	case GRO_HELD:
+ 		__skb_push(skb, ETH_HLEN);
+ 		skb->protocol = eth_type_trans(skb, skb->dev);
+-		if (ret == GRO_NORMAL && netif_receive_skb_internal(skb))
+-			ret = GRO_DROP;
++		if (ret == GRO_NORMAL)
++			gro_normal_one(napi, skb);
+ 		break;
+ 
+ 	case GRO_DROP:
+@@ -6034,6 +6056,8 @@ bool napi_complete_done(struct napi_stru
+ 				 NAPIF_STATE_IN_BUSY_POLL)))
+ 		return false;
+ 
++	gro_normal_list(n);
++
+ 	if (n->gro_bitmask) {
+ 		unsigned long timeout = 0;
+ 
+@@ -6119,10 +6143,19 @@ static void busy_poll_stop(struct napi_s
+ 	 * Ideally, a new ndo_busy_poll_stop() could avoid another round.
+ 	 */
+ 	rc = napi->poll(napi, BUSY_POLL_BUDGET);
++	/* We can't gro_normal_list() here, because napi->poll() might have
++	 * rearmed the napi (napi_complete_done()) in which case it could
++	 * already be running on another CPU.
++	 */
+ 	trace_napi_poll(napi, rc, BUSY_POLL_BUDGET);
+ 	netpoll_poll_unlock(have_poll_lock);
+-	if (rc == BUSY_POLL_BUDGET)
++	if (rc == BUSY_POLL_BUDGET) {
++		/* As the whole budget was spent, we still own the napi so can
++		 * safely handle the rx_list.
++		 */
++		gro_normal_list(napi);
+ 		__napi_schedule(napi);
++	}
+ 	local_bh_enable();
+ }
+ 
+@@ -6167,6 +6200,7 @@ restart:
+ 		}
+ 		work = napi_poll(napi, BUSY_POLL_BUDGET);
+ 		trace_napi_poll(napi, work, BUSY_POLL_BUDGET);
++		gro_normal_list(napi);
+ count:
+ 		if (work > 0)
+ 			__NET_ADD_STATS(dev_net(napi->dev),
+@@ -6272,6 +6306,8 @@ void netif_napi_add(struct net_device *d
+ 	napi->timer.function = napi_watchdog;
+ 	init_gro_hash(napi);
+ 	napi->skb = NULL;
++	INIT_LIST_HEAD(&napi->rx_list);
++	napi->rx_count = 0;
+ 	napi->poll = poll;
+ 	if (weight > NAPI_POLL_WEIGHT)
+ 		netdev_err_once(dev, "%s() called with weight %d\n", __func__,
+@@ -6368,6 +6404,8 @@ static int napi_poll(struct napi_struct
+ 		goto out_unlock;
+ 	}
+ 
++	gro_normal_list(n);
++
+ 	if (n->gro_bitmask) {
+ 		/* flush too old packets
+ 		 * If HZ < 1000, flush all packets.
+--- a/net/core/sysctl_net_core.c
++++ b/net/core/sysctl_net_core.c
+@@ -567,6 +567,14 @@ static struct ctl_table net_core_table[]
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_do_static_key,
+ 	},
++	{
++		.procname	= "gro_normal_batch",
++		.data		= &gro_normal_batch,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ONE,
++	},
+ 	{ }
+ };
+ 

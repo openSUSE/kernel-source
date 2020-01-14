@@ -1,0 +1,244 @@
+From: Bernard Metzler <bmt@zurich.ibm.com>
+Date: Fri, 4 Oct 2019 14:53:56 +0200
+Subject: RDMA/siw: Fix SQ/RQ drain logic
+Patch-mainline: v5.5-rc1
+Git-commit: cf049bb31f7101d9672eaf97ade4fdd5171ddf26
+References: jsc#SLE-8381
+
+Storage ULPs (e.g. iSER & NVMeOF) use ib_drain_qp() to drain
+QP/CQ. Current SIW's own drain routines do not properly wait until all
+SQ/RQ elements are completed and reaped from the CQ. This may cause touch
+after free issues.  New logic relies on generic
+__ib_drain_sq()/__ib_drain_rq() posting a final work request, which SIW
+immediately flushes to CQ.
+
+Fixes: 303ae1cdfdf7 ("rdma/siw: application interface")
+Link: https://lore.kernel.org/r/20191004125356.20673-1-bmt@zurich.ibm.com
+Signed-off-by: Krishnamraju Eraparaju <krishna2@chelsio.com>
+Signed-off-by: Bernard Metzler <bmt@zurich.ibm.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/sw/siw/siw_main.c  |   20 ----
+ drivers/infiniband/sw/siw/siw_verbs.c |  144 ++++++++++++++++++++++++++++------
+ 2 files changed, 122 insertions(+), 42 deletions(-)
+
+--- a/drivers/infiniband/sw/siw/siw_main.c
++++ b/drivers/infiniband/sw/siw/siw_main.c
+@@ -249,24 +249,6 @@ static struct ib_qp *siw_get_base_qp(str
+ 	return NULL;
+ }
+ 
+-static void siw_verbs_sq_flush(struct ib_qp *base_qp)
+-{
+-	struct siw_qp *qp = to_siw_qp(base_qp);
+-
+-	down_write(&qp->state_lock);
+-	siw_sq_flush(qp);
+-	up_write(&qp->state_lock);
+-}
+-
+-static void siw_verbs_rq_flush(struct ib_qp *base_qp)
+-{
+-	struct siw_qp *qp = to_siw_qp(base_qp);
+-
+-	down_write(&qp->state_lock);
+-	siw_rq_flush(qp);
+-	up_write(&qp->state_lock);
+-}
+-
+ static const struct ib_device_ops siw_device_ops = {
+ 	.owner = THIS_MODULE,
+ 	.uverbs_abi_ver = SIW_ABI_VERSION,
+@@ -285,8 +267,6 @@ static const struct ib_device_ops siw_de
+ 	.destroy_cq = siw_destroy_cq,
+ 	.destroy_qp = siw_destroy_qp,
+ 	.destroy_srq = siw_destroy_srq,
+-	.drain_rq = siw_verbs_rq_flush,
+-	.drain_sq = siw_verbs_sq_flush,
+ 	.get_dma_mr = siw_get_dma_mr,
+ 	.get_port_immutable = siw_get_port_immutable,
+ 	.iw_accept = siw_accept,
+--- a/drivers/infiniband/sw/siw/siw_verbs.c
++++ b/drivers/infiniband/sw/siw/siw_verbs.c
+@@ -685,6 +685,47 @@ static int siw_copy_inline_sgl(const str
+ 	return bytes;
+ }
+ 
++/* Complete SQ WR's without processing */
++static int siw_sq_flush_wr(struct siw_qp *qp, const struct ib_send_wr *wr,
++			   const struct ib_send_wr **bad_wr)
++{
++	struct siw_sqe sqe = {};
++	int rv = 0;
++
++	while (wr) {
++		sqe.id = wr->wr_id;
++		sqe.opcode = wr->opcode;
++		rv = siw_sqe_complete(qp, &sqe, 0, SIW_WC_WR_FLUSH_ERR);
++		if (rv) {
++			if (bad_wr)
++				*bad_wr = wr;
++			break;
++		}
++		wr = wr->next;
++	}
++	return rv;
++}
++
++/* Complete RQ WR's without processing */
++static int siw_rq_flush_wr(struct siw_qp *qp, const struct ib_recv_wr *wr,
++			   const struct ib_recv_wr **bad_wr)
++{
++	struct siw_rqe rqe = {};
++	int rv = 0;
++
++	while (wr) {
++		rqe.id = wr->wr_id;
++		rv = siw_rqe_complete(qp, &rqe, 0, 0, SIW_WC_WR_FLUSH_ERR);
++		if (rv) {
++			if (bad_wr)
++				*bad_wr = wr;
++			break;
++		}
++		wr = wr->next;
++	}
++	return rv;
++}
++
+ /*
+  * siw_post_send()
+  *
+@@ -703,26 +744,54 @@ int siw_post_send(struct ib_qp *base_qp,
+ 	unsigned long flags;
+ 	int rv = 0;
+ 
++	if (wr && !qp->kernel_verbs) {
++		siw_dbg_qp(qp, "wr must be empty for user mapped sq\n");
++		*bad_wr = wr;
++		return -EINVAL;
++	}
++
+ 	/*
+ 	 * Try to acquire QP state lock. Must be non-blocking
+ 	 * to accommodate kernel clients needs.
+ 	 */
+ 	if (!down_read_trylock(&qp->state_lock)) {
+-		*bad_wr = wr;
+-		siw_dbg_qp(qp, "QP locked, state %d\n", qp->attrs.state);
+-		return -ENOTCONN;
++		if (qp->attrs.state == SIW_QP_STATE_ERROR) {
++			/*
++			 * ERROR state is final, so we can be sure
++			 * this state will not change as long as the QP
++			 * exists.
++			 *
++			 * This handles an ib_drain_sq() call with
++			 * a concurrent request to set the QP state
++			 * to ERROR.
++			 */
++			rv = siw_sq_flush_wr(qp, wr, bad_wr);
++		} else {
++			siw_dbg_qp(qp, "QP locked, state %d\n",
++				   qp->attrs.state);
++			*bad_wr = wr;
++			rv = -ENOTCONN;
++		}
++		return rv;
+ 	}
+ 	if (unlikely(qp->attrs.state != SIW_QP_STATE_RTS)) {
++		if (qp->attrs.state == SIW_QP_STATE_ERROR) {
++			/*
++			 * Immediately flush this WR to CQ, if QP
++			 * is in ERROR state. SQ is guaranteed to
++			 * be empty, so WR complets in-order.
++			 *
++			 * Typically triggered by ib_drain_sq().
++			 */
++			rv = siw_sq_flush_wr(qp, wr, bad_wr);
++		} else {
++			siw_dbg_qp(qp, "QP out of state %d\n",
++				   qp->attrs.state);
++			*bad_wr = wr;
++			rv = -ENOTCONN;
++		}
+ 		up_read(&qp->state_lock);
+-		*bad_wr = wr;
+-		siw_dbg_qp(qp, "QP out of state %d\n", qp->attrs.state);
+-		return -ENOTCONN;
+-	}
+-	if (wr && !qp->kernel_verbs) {
+-		siw_dbg_qp(qp, "wr must be empty for user mapped sq\n");
+-		up_read(&qp->state_lock);
+-		*bad_wr = wr;
+-		return -EINVAL;
++		return rv;
+ 	}
+ 	spin_lock_irqsave(&qp->sq_lock, flags);
+ 
+@@ -917,24 +986,55 @@ int siw_post_receive(struct ib_qp *base_
+ 		*bad_wr = wr;
+ 		return -EOPNOTSUPP; /* what else from errno.h? */
+ 	}
+-	/*
+-	 * Try to acquire QP state lock. Must be non-blocking
+-	 * to accommodate kernel clients needs.
+-	 */
+-	if (!down_read_trylock(&qp->state_lock)) {
+-		*bad_wr = wr;
+-		return -ENOTCONN;
+-	}
+ 	if (!qp->kernel_verbs) {
+ 		siw_dbg_qp(qp, "no kernel post_recv for user mapped sq\n");
+ 		up_read(&qp->state_lock);
+ 		*bad_wr = wr;
+ 		return -EINVAL;
+ 	}
++
++	/*
++	 * Try to acquire QP state lock. Must be non-blocking
++	 * to accommodate kernel clients needs.
++	 */
++	if (!down_read_trylock(&qp->state_lock)) {
++		if (qp->attrs.state == SIW_QP_STATE_ERROR) {
++			/*
++			 * ERROR state is final, so we can be sure
++			 * this state will not change as long as the QP
++			 * exists.
++			 *
++			 * This handles an ib_drain_rq() call with
++			 * a concurrent request to set the QP state
++			 * to ERROR.
++			 */
++			rv = siw_rq_flush_wr(qp, wr, bad_wr);
++		} else {
++			siw_dbg_qp(qp, "QP locked, state %d\n",
++				   qp->attrs.state);
++			*bad_wr = wr;
++			rv = -ENOTCONN;
++		}
++		return rv;
++	}
+ 	if (qp->attrs.state > SIW_QP_STATE_RTS) {
++		if (qp->attrs.state == SIW_QP_STATE_ERROR) {
++			/*
++			 * Immediately flush this WR to CQ, if QP
++			 * is in ERROR state. RQ is guaranteed to
++			 * be empty, so WR complets in-order.
++			 *
++			 * Typically triggered by ib_drain_rq().
++			 */
++			rv = siw_rq_flush_wr(qp, wr, bad_wr);
++		} else {
++			siw_dbg_qp(qp, "QP out of state %d\n",
++				   qp->attrs.state);
++			*bad_wr = wr;
++			rv = -ENOTCONN;
++		}
+ 		up_read(&qp->state_lock);
+-		*bad_wr = wr;
+-		return -EINVAL;
++		return rv;
+ 	}
+ 	/*
+ 	 * Serialize potentially multiple producers.

@@ -1,0 +1,193 @@
+From: Jason Gunthorpe <jgg@mellanox.com>
+Date: Tue, 1 Oct 2019 12:38:20 -0300
+Subject: RDMA/mlx5: Put live in the correct place for ODP MRs
+Patch-mainline: v5.4-rc3
+Git-commit: aa603815c7f8a8f368d6d8ea6ebf601429883439
+References: jsc#SLE-8446
+
+live is used to signal to the pagefault thread that the MR is initialized
+and ready for use. It should be after the umem is assigned and all other
+setup is completed. This prevents races (at least) of the form:
+
+    CPU0                                     CPU1
+mlx5_ib_alloc_implicit_mr()
+ implicit_mr_alloc()
+  live = 1
+ imr->umem = umem
+                                    num_pending_prefetch_inc()
+                                      if (live)
+				        atomic_inc(num_pending_prefetch)
+ atomic_set(num_pending_prefetch,0) // Overwrites other thread's store
+
+Further, live is being used with SRCU as the 'update' in an
+acquire/release fashion, so it can not be read and written raw.
+
+Move all live = 1's to after MR initialization is completed and use
+smp_store_release/smp_load_acquire() for manipulating it.
+
+Add a missing live = 0 when an implicit MR child is deleted, before
+queuing work to do synchronize_srcu().
+
+The barriers in update_odp_mr() were some broken attempt to create a
+acquire/release, but were not even applied consistently and missed the
+point, delete it as well.
+
+Fixes: 6aec21f6a832 ("IB/mlx5: Page faults handling infrastructure")
+Link: https://lore.kernel.org/r/20191001153821.23621-6-jgg@ziepe.ca
+Reviewed-by: Artemy Kovalyov <artemyko@mellanox.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/mlx5/mlx5_ib.h |    2 -
+ drivers/infiniband/hw/mlx5/mr.c      |   36 ++++-------------------------------
+ drivers/infiniband/hw/mlx5/odp.c     |   14 +++++++------
+ 3 files changed, 14 insertions(+), 38 deletions(-)
+
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -606,7 +606,7 @@ struct mlx5_ib_mr {
+ 	struct mlx5_ib_dev     *dev;
+ 	u32 out[MLX5_ST_SZ_DW(create_mkey_out)];
+ 	struct mlx5_core_sig_ctx    *sig;
+-	int			live;
++	unsigned int		live;
+ 	void			*descs_alloc;
+ 	int			access_flags; /* Needed for rereg MR */
+ 
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@ -84,32 +84,6 @@ static bool use_umr_mtt_update(struct ml
+ 		length + (start & (MLX5_ADAPTER_PAGE_SIZE - 1));
+ }
+ 
+-static void update_odp_mr(struct mlx5_ib_mr *mr)
+-{
+-	if (is_odp_mr(mr)) {
+-		/*
+-		 * This barrier prevents the compiler from moving the
+-		 * setting of umem->odp_data->private to point to our
+-		 * MR, before reg_umr finished, to ensure that the MR
+-		 * initialization have finished before starting to
+-		 * handle invalidations.
+-		 */
+-		smp_wmb();
+-		to_ib_umem_odp(mr->umem)->private = mr;
+-		/*
+-		 * Make sure we will see the new
+-		 * umem->odp_data->private value in the invalidation
+-		 * routines, before we can get page faults on the
+-		 * MR. Page faults can happen once we put the MR in
+-		 * the tree, below this line. Without the barrier,
+-		 * there can be a fault handling and an invalidation
+-		 * before umem->odp_data->private == mr is visible to
+-		 * the invalidation handler.
+-		 */
+-		smp_wmb();
+-	}
+-}
+-
+ static void reg_mr_callback(int status, struct mlx5_async_work *context)
+ {
+ 	struct mlx5_ib_mr *mr =
+@@ -1346,8 +1320,6 @@ struct ib_mr *mlx5_ib_reg_user_mr(struct
+ 	mr->umem = umem;
+ 	set_mr_fields(dev, mr, npages, length, access_flags);
+ 
+-	update_odp_mr(mr);
+-
+ 	if (use_umr) {
+ 		int update_xlt_flags = MLX5_IB_UPD_XLT_ENABLE;
+ 
+@@ -1363,10 +1335,12 @@ struct ib_mr *mlx5_ib_reg_user_mr(struct
+ 		}
+ 	}
+ 
+-	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
+-		mr->live = 1;
++	if (is_odp_mr(mr)) {
++		to_ib_umem_odp(mr->umem)->private = mr;
+ 		atomic_set(&mr->num_pending_prefetch, 0);
+ 	}
++	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING))
++		smp_store_release(&mr->live, 1);
+ 
+ 	return &mr->ibmr;
+ error:
+@@ -1607,7 +1581,7 @@ static void dereg_mr(struct mlx5_ib_dev
+ 		/* Prevent new page faults and
+ 		 * prefetch requests from succeeding
+ 		 */
+-		mr->live = 0;
++		WRITE_ONCE(mr->live, 0);
+ 
+ 		/* Wait for all running page-fault handlers to finish. */
+ 		synchronize_srcu(&dev->mr_srcu);
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@ -231,7 +231,7 @@ static void mr_leaf_free_action(struct w
+ 	mr->parent = NULL;
+ 	synchronize_srcu(&mr->dev->mr_srcu);
+ 
+-	if (imr->live) {
++	if (smp_load_acquire(&imr->live)) {
+ 		srcu_key = srcu_read_lock(&mr->dev->mr_srcu);
+ 		mutex_lock(&odp_imr->umem_mutex);
+ 		mlx5_ib_update_xlt(imr, idx, 1, 0,
+@@ -318,6 +318,7 @@ void mlx5_ib_invalidate_range(struct ib_
+ 
+ 	if (unlikely(!umem_odp->npages && mr->parent &&
+ 		     !umem_odp->dying)) {
++		WRITE_ONCE(mr->live, 0);
+ 		umem_odp->dying = 1;
+ 		atomic_inc(&mr->parent->num_leaf_free);
+ 		schedule_work(&umem_odp->work);
+@@ -459,8 +460,6 @@ static struct mlx5_ib_mr *implicit_mr_al
+ 	mr->ibmr.lkey = mr->mmkey.key;
+ 	mr->ibmr.rkey = mr->mmkey.key;
+ 
+-	mr->live = 1;
+-
+ 	mlx5_ib_dbg(dev, "key %x dev %p mr %p\n",
+ 		    mr->mmkey.key, dev->mdev, mr);
+ 
+@@ -514,6 +513,8 @@ next_mr:
+ 		mtt->parent = mr;
+ 		INIT_WORK(&odp->work, mr_leaf_free_action);
+ 
++		smp_store_release(&mtt->live, 1);
++
+ 		if (!nentries)
+ 			start_idx = addr >> MLX5_IMR_MTT_SHIFT;
+ 		nentries++;
+@@ -566,6 +567,7 @@ struct mlx5_ib_mr *mlx5_ib_alloc_implici
+ 	init_waitqueue_head(&imr->q_leaf_free);
+ 	atomic_set(&imr->num_leaf_free, 0);
+ 	atomic_set(&imr->num_pending_prefetch, 0);
++	smp_store_release(&imr->live, 1);
+ 
+ 	return imr;
+ }
+@@ -807,7 +809,7 @@ next_mr:
+ 	switch (mmkey->type) {
+ 	case MLX5_MKEY_MR:
+ 		mr = container_of(mmkey, struct mlx5_ib_mr, mmkey);
+-		if (!mr->live || !mr->ibmr.pd) {
++		if (!smp_load_acquire(&mr->live) || !mr->ibmr.pd) {
+ 			mlx5_ib_dbg(dev, "got dead MR\n");
+ 			ret = -EFAULT;
+ 			goto srcu_unlock;
+@@ -1674,12 +1676,12 @@ static bool num_pending_prefetch_inc(str
+ 
+ 		mr = container_of(mmkey, struct mlx5_ib_mr, mmkey);
+ 
+-		if (mr->ibmr.pd != pd) {
++		if (!smp_load_acquire(&mr->live)) {
+ 			ret = false;
+ 			break;
+ 		}
+ 
+-		if (!mr->live) {
++		if (mr->ibmr.pd != pd) {
+ 			ret = false;
+ 			break;
+ 		}

@@ -1,0 +1,883 @@
+From d8af05ff38ae7a42819b285ffef314942414ef8b Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 2 Aug 2019 11:00:15 +0100
+Subject: [PATCH] drm/i915: Allow sharing the idle-barrier from other kernel requests
+Git-commit: d8af05ff38ae7a42819b285ffef314942414ef8b
+Patch-mainline: v5.4-rc1
+References: jsc#SLE-7953
+
+By placing our idle-barriers in the i915_active fence tree, we expose
+those for reuse by other components that are issuing requests along the
+kernel_context. Reusing the proto-barrier active_node is perfectly fine
+as the new request implies a context-switch, and so an opportune point
+to run the idle-barrier. However, the proto-barrier is not equivalent
+to a normal active_node and care must be taken to avoid dereferencing the
+ERR_PTR used as its request marker.
+
+V2: Comment the more egregious cheek
+V3: A glossary!
+
+Reported-by: Lionel Landwerlin <lionel.g.landwerlin@intel.com>
+Fixes: ce476c80b8bf ("drm/i915: Keep contexts pinned until after the next kernel context switch")
+Fixes: a9877da2d629 ("drm/i915/oa: Reconfigure contexts on the fly")
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Lionel Landwerlin <lionel.g.landwerlin@intel.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190802100015.1281-1-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/gt/intel_context.c              |   40 +-
+ drivers/gpu/drm/i915/gt/intel_context.h              |   13 
+ drivers/gpu/drm/i915/gt/intel_engine_pm.c            |    2 
+ drivers/gpu/drm/i915/gt/selftest_context.c           |  310 +++++++++++++++++++
+ drivers/gpu/drm/i915/i915_active.c                   |  288 +++++++++++++++--
+ drivers/gpu/drm/i915/i915_active.h                   |    2 
+ drivers/gpu/drm/i915/i915_active_types.h             |    2 
+ drivers/gpu/drm/i915/selftests/i915_live_selftests.h |    3 
+ 8 files changed, 597 insertions(+), 63 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/gt/selftest_context.c
+
+--- a/drivers/gpu/drm/i915/gt/intel_context.c
++++ b/drivers/gpu/drm/i915/gt/intel_context.c
+@@ -162,23 +162,41 @@ static int __intel_context_active(struct
+ 	if (err)
+ 		goto err_ring;
+ 
++	return 0;
++
++err_ring:
++	intel_ring_unpin(ce->ring);
++err_put:
++	intel_context_put(ce);
++	return err;
++}
++
++int intel_context_active_acquire(struct intel_context *ce)
++{
++	int err;
++
++	err = i915_active_acquire(&ce->active);
++	if (err)
++		return err;
++
+ 	/* Preallocate tracking nodes */
+ 	if (!i915_gem_context_is_kernel(ce->gem_context)) {
+ 		err = i915_active_acquire_preallocate_barrier(&ce->active,
+ 							      ce->engine);
+-		if (err)
+-			goto err_state;
++		if (err) {
++			i915_active_release(&ce->active);
++			return err;
++		}
+ 	}
+ 
+ 	return 0;
++}
+ 
+-err_state:
+-	__context_unpin_state(ce->state);
+-err_ring:
+-	intel_ring_unpin(ce->ring);
+-err_put:
+-	intel_context_put(ce);
+-	return err;
++void intel_context_active_release(struct intel_context *ce)
++{
++	/* Nodes preallocated in intel_context_active() */
++	i915_active_acquire_barrier(&ce->active);
++	i915_active_release(&ce->active);
+ }
+ 
+ void
+@@ -301,3 +319,7 @@ struct i915_request *intel_context_creat
+ 
+ 	return rq;
+ }
++
++#if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
++#include "selftest_context.c"
++#endif
+--- a/drivers/gpu/drm/i915/gt/intel_context.h
++++ b/drivers/gpu/drm/i915/gt/intel_context.h
+@@ -104,17 +104,8 @@ static inline void intel_context_exit(st
+ 		ce->ops->exit(ce);
+ }
+ 
+-static inline int intel_context_active_acquire(struct intel_context *ce)
+-{
+-	return i915_active_acquire(&ce->active);
+-}
+-
+-static inline void intel_context_active_release(struct intel_context *ce)
+-{
+-	/* Nodes preallocated in intel_context_active() */
+-	i915_active_acquire_barrier(&ce->active);
+-	i915_active_release(&ce->active);
+-}
++int intel_context_active_acquire(struct intel_context *ce);
++void intel_context_active_release(struct intel_context *ce);
+ 
+ static inline struct intel_context *intel_context_get(struct intel_context *ce)
+ {
+--- a/drivers/gpu/drm/i915/gt/intel_engine_pm.c
++++ b/drivers/gpu/drm/i915/gt/intel_engine_pm.c
+@@ -90,7 +90,7 @@ static bool switch_to_kernel_context(str
+ 	/* Check again on the next retirement. */
+ 	engine->wakeref_serial = engine->serial + 1;
+ 
+-	i915_request_add_barriers(rq);
++	i915_request_add_active_barriers(rq);
+ 	__i915_request_commit(rq);
+ 
+ 	return false;
+--- /dev/null
++++ b/drivers/gpu/drm/i915/gt/selftest_context.c
+@@ -0,0 +1,310 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0
++ *
++ * Copyright © 2019 Intel Corporation
++ */
++
++#include "i915_selftest.h"
++#include "intel_gt.h"
++
++#include "gem/selftests/mock_context.h"
++#include "selftests/igt_flush_test.h"
++#include "selftests/mock_drm.h"
++
++static int request_sync(struct i915_request *rq)
++{
++	long timeout;
++	int err = 0;
++
++	i915_request_get(rq);
++
++	i915_request_add(rq);
++	timeout = i915_request_wait(rq, 0, HZ / 10);
++	if (timeout < 0)
++		err = timeout;
++	else
++		i915_request_retire_upto(rq);
++
++	i915_request_put(rq);
++
++	return err;
++}
++
++static int context_sync(struct intel_context *ce)
++{
++	struct intel_timeline *tl = ce->ring->timeline;
++	int err = 0;
++
++	do {
++		struct i915_request *rq;
++		long timeout;
++
++		rcu_read_lock();
++		rq = rcu_dereference(tl->last_request.request);
++		if (rq)
++			rq = i915_request_get_rcu(rq);
++		rcu_read_unlock();
++		if (!rq)
++			break;
++
++		timeout = i915_request_wait(rq, 0, HZ / 10);
++		if (timeout < 0)
++			err = timeout;
++		else
++			i915_request_retire_upto(rq);
++
++		i915_request_put(rq);
++	} while (!err);
++
++	return err;
++}
++
++static int __live_active_context(struct intel_engine_cs *engine,
++				 struct i915_gem_context *fixme)
++{
++	struct intel_context *ce;
++	int pass;
++	int err;
++
++	/*
++	 * We keep active contexts alive until after a subsequent context
++	 * switch as the final write from the context-save will be after
++	 * we retire the final request. We track when we unpin the context,
++	 * under the presumption that the final pin is from the last request,
++	 * and instead of immediately unpinning the context, we add a task
++	 * to unpin the context from the next idle-barrier.
++	 *
++	 * This test makes sure that the context is kept alive until a
++	 * subsequent idle-barrier (emitted when the engine wakeref hits 0
++	 * with no more outstanding requests).
++	 */
++
++	if (intel_engine_pm_is_awake(engine)) {
++		pr_err("%s is awake before starting %s!\n",
++		       engine->name, __func__);
++		return -EINVAL;
++	}
++
++	ce = intel_context_create(fixme, engine);
++	if (!ce)
++		return -ENOMEM;
++
++	for (pass = 0; pass <= 2; pass++) {
++		struct i915_request *rq;
++
++		rq = intel_context_create_request(ce);
++		if (IS_ERR(rq)) {
++			err = PTR_ERR(rq);
++			goto err;
++		}
++
++		err = request_sync(rq);
++		if (err)
++			goto err;
++
++		/* Context will be kept active until after an idle-barrier. */
++		if (i915_active_is_idle(&ce->active)) {
++			pr_err("context is not active; expected idle-barrier (%s pass %d)\n",
++			       engine->name, pass);
++			err = -EINVAL;
++			goto err;
++		}
++
++		if (!intel_engine_pm_is_awake(engine)) {
++			pr_err("%s is asleep before idle-barrier\n",
++			       engine->name);
++			err = -EINVAL;
++			goto err;
++		}
++	}
++
++	/* Now make sure our idle-barriers are flushed */
++	err = context_sync(engine->kernel_context);
++	if (err)
++		goto err;
++
++	if (!i915_active_is_idle(&ce->active)) {
++		pr_err("context is still active!");
++		err = -EINVAL;
++	}
++
++	if (intel_engine_pm_is_awake(engine)) {
++		struct drm_printer p = drm_debug_printer(__func__);
++
++		intel_engine_dump(engine, &p,
++				  "%s is still awake after idle-barriers\n",
++				  engine->name);
++		GEM_TRACE_DUMP();
++
++		err = -EINVAL;
++		goto err;
++	}
++
++err:
++	intel_context_put(ce);
++	return err;
++}
++
++static int live_active_context(void *arg)
++{
++	struct intel_gt *gt = arg;
++	struct intel_engine_cs *engine;
++	struct i915_gem_context *fixme;
++	enum intel_engine_id id;
++	struct drm_file *file;
++	int err = 0;
++
++	file = mock_file(gt->i915);
++	if (IS_ERR(file))
++		return PTR_ERR(file);
++
++	mutex_lock(&gt->i915->drm.struct_mutex);
++
++	fixme = live_context(gt->i915, file);
++	if (!fixme) {
++		err = -ENOMEM;
++		goto unlock;
++	}
++
++	for_each_engine(engine, gt->i915, id) {
++		err = __live_active_context(engine, fixme);
++		if (err)
++			break;
++
++		err = igt_flush_test(gt->i915, I915_WAIT_LOCKED);
++		if (err)
++			break;
++	}
++
++unlock:
++	mutex_unlock(&gt->i915->drm.struct_mutex);
++	mock_file_free(gt->i915, file);
++	return err;
++}
++
++static int __remote_sync(struct intel_context *ce, struct intel_context *remote)
++{
++	struct i915_request *rq;
++	int err;
++
++	err = intel_context_pin(remote);
++	if (err)
++		return err;
++
++	rq = intel_context_create_request(ce);
++	if (IS_ERR(rq)) {
++		err = PTR_ERR(rq);
++		goto unpin;
++	}
++
++	err = intel_context_prepare_remote_request(remote, rq);
++	if (err) {
++		i915_request_add(rq);
++		goto unpin;
++	}
++
++	err = request_sync(rq);
++
++unpin:
++	intel_context_unpin(remote);
++	return err;
++}
++
++static int __live_remote_context(struct intel_engine_cs *engine,
++				 struct i915_gem_context *fixme)
++{
++	struct intel_context *local, *remote;
++	int pass;
++	int err;
++
++	/*
++	 * Check that our idle barriers do not interfere with normal
++	 * activity tracking. In particular, check that operating
++	 * on the context image remotely (intel_context_prepare_remote_request),
++	 * which inserts foreign fences into intel_context.active, does not
++	 * clobber the idle-barrier.
++	 */
++
++	remote = intel_context_create(fixme, engine);
++	if (!remote)
++		return -ENOMEM;
++
++	local = intel_context_create(fixme, engine);
++	if (!local) {
++		err = -ENOMEM;
++		goto err_remote;
++	}
++
++	for (pass = 0; pass <= 2; pass++) {
++		err = __remote_sync(local, remote);
++		if (err)
++			break;
++
++		err = __remote_sync(engine->kernel_context, remote);
++		if (err)
++			break;
++
++		if (i915_active_is_idle(&remote->active)) {
++			pr_err("remote context is not active; expected idle-barrier (%s pass %d)\n",
++			       engine->name, pass);
++			err = -EINVAL;
++			break;
++		}
++	}
++
++	intel_context_put(local);
++err_remote:
++	intel_context_put(remote);
++	return err;
++}
++
++static int live_remote_context(void *arg)
++{
++	struct intel_gt *gt = arg;
++	struct intel_engine_cs *engine;
++	struct i915_gem_context *fixme;
++	enum intel_engine_id id;
++	struct drm_file *file;
++	int err = 0;
++
++	file = mock_file(gt->i915);
++	if (IS_ERR(file))
++		return PTR_ERR(file);
++
++	mutex_lock(&gt->i915->drm.struct_mutex);
++
++	fixme = live_context(gt->i915, file);
++	if (!fixme) {
++		err = -ENOMEM;
++		goto unlock;
++	}
++
++	for_each_engine(engine, gt->i915, id) {
++		err = __live_remote_context(engine, fixme);
++		if (err)
++			break;
++
++		err = igt_flush_test(gt->i915, I915_WAIT_LOCKED);
++		if (err)
++			break;
++	}
++
++unlock:
++	mutex_unlock(&gt->i915->drm.struct_mutex);
++	mock_file_free(gt->i915, file);
++	return err;
++}
++
++int intel_context_live_selftests(struct drm_i915_private *i915)
++{
++	static const struct i915_subtest tests[] = {
++		SUBTEST(live_active_context),
++		SUBTEST(live_remote_context),
++	};
++	struct intel_gt *gt = &i915->gt;
++
++	if (intel_gt_is_wedged(gt))
++		return 0;
++
++	return intel_gt_live_subtests(tests, gt);
++}
+--- a/drivers/gpu/drm/i915/i915_active.c
++++ b/drivers/gpu/drm/i915/i915_active.c
+@@ -33,6 +33,38 @@ struct active_node {
+ 	u64 timeline;
+ };
+ 
++static inline struct active_node *
++node_from_active(struct i915_active_request *active)
++{
++	return container_of(active, struct active_node, base);
++}
++
++#define take_preallocated_barriers(x) llist_del_all(&(x)->preallocated_barriers)
++
++static inline bool is_barrier(const struct i915_active_request *active)
++{
++	return IS_ERR(rcu_access_pointer(active->request));
++}
++
++static inline struct llist_node *barrier_to_ll(struct active_node *node)
++{
++	GEM_BUG_ON(!is_barrier(&node->base));
++	return (struct llist_node *)&node->base.link;
++}
++
++static inline struct intel_engine_cs *
++barrier_to_engine(struct active_node *node)
++{
++	GEM_BUG_ON(!is_barrier(&node->base));
++	return (struct intel_engine_cs *)node->base.link.prev;
++}
++
++static inline struct active_node *barrier_from_ll(struct llist_node *x)
++{
++	return container_of((struct list_head *)x,
++			    struct active_node, base.link);
++}
++
+ #if IS_ENABLED(CONFIG_DRM_I915_DEBUG_GEM) && IS_ENABLED(CONFIG_DEBUG_OBJECTS)
+ 
+ static void *active_debug_hint(void *addr)
+@@ -127,7 +159,7 @@ active_retire(struct i915_active *ref)
+ static void
+ node_retire(struct i915_active_request *base, struct i915_request *rq)
+ {
+-	active_retire(container_of(base, struct active_node, base)->ref);
++	active_retire(node_from_active(base)->ref);
+ }
+ 
+ static struct i915_active_request *
+@@ -184,6 +216,7 @@ out:
+ 	ref->cache = node;
+ 	mutex_unlock(&ref->mutex);
+ 
++	BUILD_BUG_ON(offsetof(typeof(*node), base));
+ 	return &node->base;
+ }
+ 
+@@ -201,11 +234,52 @@ void __i915_active_init(struct drm_i915_
+ 	ref->retire = retire;
+ 	ref->tree = RB_ROOT;
+ 	ref->cache = NULL;
+-	init_llist_head(&ref->barriers);
++	init_llist_head(&ref->preallocated_barriers);
+ 	atomic_set(&ref->count, 0);
+ 	__mutex_init(&ref->mutex, "i915_active", key);
+ }
+ 
++static bool __active_del_barrier(struct i915_active *ref,
++				 struct active_node *node)
++{
++	struct intel_engine_cs *engine = barrier_to_engine(node);
++	struct llist_node *head = NULL, *tail = NULL;
++	struct llist_node *pos, *next;
++
++	GEM_BUG_ON(node->timeline != engine->kernel_context->ring->timeline->fence_context);
++
++	/*
++	 * Rebuild the llist excluding our node. We may perform this
++	 * outside of the kernel_context timeline mutex and so someone
++	 * else may be manipulating the engine->barrier_tasks, in
++	 * which case either we or they will be upset :)
++	 *
++	 * A second __active_del_barrier() will report failure to claim
++	 * the active_node and the caller will just shrug and know not to
++	 * claim ownership of its node.
++	 *
++	 * A concurrent i915_request_add_active_barriers() will miss adding
++	 * any of the tasks, but we will try again on the next -- and since
++	 * we are actively using the barrier, we know that there will be
++	 * at least another opportunity when we idle.
++	 */
++	llist_for_each_safe(pos, next, llist_del_all(&engine->barrier_tasks)) {
++		if (node == barrier_from_ll(pos)) {
++			node = NULL;
++			continue;
++		}
++
++		pos->next = head;
++		head = pos;
++		if (!tail)
++			tail = pos;
++	}
++	if (head)
++		llist_add_batch(head, tail, &engine->barrier_tasks);
++
++	return !node;
++}
++
+ int i915_active_ref(struct i915_active *ref,
+ 		    u64 timeline,
+ 		    struct i915_request *rq)
+@@ -224,8 +298,20 @@ int i915_active_ref(struct i915_active *
+ 		goto out;
+ 	}
+ 
+-	if (!i915_active_request_isset(active))
+-		atomic_inc(&ref->count);
++	if (is_barrier(active)) { /* proto-node used by our idle barrier */
++		/*
++		 * This request is on the kernel_context timeline, and so
++		 * we can use it to substitute for the pending idle-barrer
++		 * request that we want to emit on the kernel_context.
++		 */
++		__active_del_barrier(ref, node_from_active(active));
++		RCU_INIT_POINTER(active->request, NULL);
++		INIT_LIST_HEAD(&active->link);
++	} else {
++		if (!i915_active_request_isset(active))
++			atomic_inc(&ref->count);
++	}
++	GEM_BUG_ON(!atomic_read(&ref->count));
+ 	__i915_active_request_set(active, rq);
+ 
+ out:
+@@ -312,6 +398,11 @@ int i915_active_wait(struct i915_active
+ 	}
+ 
+ 	rbtree_postorder_for_each_entry_safe(it, n, &ref->tree, node) {
++		if (is_barrier(&it->base)) { /* unconnected idle-barrier */
++			err = -EBUSY;
++			break;
++		}
++
+ 		err = i915_active_request_retire(&it->base, BKL(ref));
+ 		if (err)
+ 			break;
+@@ -374,6 +465,92 @@ void i915_active_fini(struct i915_active
+ }
+ #endif
+ 
++static inline bool is_idle_barrier(struct active_node *node, u64 idx)
++{
++	return node->timeline == idx && !i915_active_request_isset(&node->base);
++}
++
++static struct active_node *reuse_idle_barrier(struct i915_active *ref, u64 idx)
++{
++	struct rb_node *prev, *p;
++
++	if (RB_EMPTY_ROOT(&ref->tree))
++		return NULL;
++
++	mutex_lock(&ref->mutex);
++	GEM_BUG_ON(i915_active_is_idle(ref));
++
++	/*
++	 * Try to reuse any existing barrier nodes already allocated for this
++	 * i915_active, due to overlapping active phases there is likely a
++	 * node kept alive (as we reuse before parking). We prefer to reuse
++	 * completely idle barriers (less hassle in manipulating the llists),
++	 * but otherwise any will do.
++	 */
++	if (ref->cache && is_idle_barrier(ref->cache, idx)) {
++		p = &ref->cache->node;
++		goto match;
++	}
++
++	prev = NULL;
++	p = ref->tree.rb_node;
++	while (p) {
++		struct active_node *node =
++			rb_entry(p, struct active_node, node);
++
++		if (is_idle_barrier(node, idx))
++			goto match;
++
++		prev = p;
++		if (node->timeline < idx)
++			p = p->rb_right;
++		else
++			p = p->rb_left;
++	}
++
++	/*
++	 * No quick match, but we did find the leftmost rb_node for the
++	 * kernel_context. Walk the rb_tree in-order to see if there were
++	 * any idle-barriers on this timeline that we missed, or just use
++	 * the first pending barrier.
++	 */
++	for (p = prev; p; p = rb_next(p)) {
++		struct active_node *node =
++			rb_entry(p, struct active_node, node);
++
++		if (node->timeline > idx)
++			break;
++
++		if (node->timeline < idx)
++			continue;
++
++		if (is_idle_barrier(node, idx))
++			goto match;
++
++		/*
++		 * The list of pending barriers is protected by the
++		 * kernel_context timeline, which notably we do not hold
++		 * here. i915_request_add_active_barriers() may consume
++		 * the barrier before we claim it, so we have to check
++		 * for success.
++		 */
++		if (is_barrier(&node->base) && __active_del_barrier(ref, node))
++			goto match;
++	}
++
++	mutex_unlock(&ref->mutex);
++
++	return NULL;
++
++match:
++	rb_erase(p, &ref->tree); /* Hide from waits and sibling allocations */
++	if (p == &ref->cache->node)
++		ref->cache = NULL;
++	mutex_unlock(&ref->mutex);
++
++	return rb_entry(p, struct active_node, node);
++}
++
+ int i915_active_acquire_preallocate_barrier(struct i915_active *ref,
+ 					    struct intel_engine_cs *engine)
+ {
+@@ -382,39 +559,61 @@ int i915_active_acquire_preallocate_barr
+ 	struct llist_node *pos, *next;
+ 	int err;
+ 
+-	GEM_BUG_ON(!mask);
++	GEM_BUG_ON(!llist_empty(&ref->preallocated_barriers));
++
++	/*
++	 * Preallocate a node for each physical engine supporting the target
++	 * engine (remember virtual engines have more than one sibling).
++	 * We can then use the preallocated nodes in
++	 * i915_active_acquire_barrier()
++	 */
+ 	for_each_engine_masked(engine, i915, mask, tmp) {
+-		struct intel_context *kctx = engine->kernel_context;
++		u64 idx = engine->kernel_context->ring->timeline->fence_context;
+ 		struct active_node *node;
+ 
+-		node = kmem_cache_alloc(global.slab_cache, GFP_KERNEL);
+-		if (unlikely(!node)) {
+-			err = -ENOMEM;
+-			goto unwind;
++		node = reuse_idle_barrier(ref, idx);
++		if (!node) {
++			node = kmem_cache_alloc(global.slab_cache, GFP_KERNEL);
++			if (!node) {
++				err = ENOMEM;
++				goto unwind;
++			}
++
++			RCU_INIT_POINTER(node->base.request, NULL);
++			node->base.retire = node_retire;
++			node->timeline = idx;
++			node->ref = ref;
+ 		}
+ 
+-		i915_active_request_init(&node->base,
+-					 (void *)engine, node_retire);
+-		node->timeline = kctx->ring->timeline->fence_context;
+-		node->ref = ref;
+-		atomic_inc(&ref->count);
++		if (!i915_active_request_isset(&node->base)) {
++			/*
++			 * Mark this as being *our* unconnected proto-node.
++			 *
++			 * Since this node is not in any list, and we have
++			 * decoupled it from the rbtree, we can reuse the
++			 * request to indicate this is an idle-barrier node
++			 * and then we can use the rb_node and list pointers
++			 * for our tracking of the pending barrier.
++			 */
++			RCU_INIT_POINTER(node->base.request, ERR_PTR(-EAGAIN));
++			node->base.link.prev = (void *)engine;
++			atomic_inc(&ref->count);
++		}
+ 
++		GEM_BUG_ON(barrier_to_engine(node) != engine);
++		llist_add(barrier_to_ll(node), &ref->preallocated_barriers);
+ 		intel_engine_pm_get(engine);
+-		llist_add((struct llist_node *)&node->base.link,
+-			  &ref->barriers);
+ 	}
+ 
+ 	return 0;
+ 
+ unwind:
+-	llist_for_each_safe(pos, next, llist_del_all(&ref->barriers)) {
+-		struct active_node *node;
++	llist_for_each_safe(pos, next, take_preallocated_barriers(ref)) {
++		struct active_node *node = barrier_from_ll(pos);
+ 
+-		node = container_of((struct list_head *)pos,
+-				    typeof(*node), base.link);
+-		engine = (void *)rcu_access_pointer(node->base.request);
++		atomic_dec(&ref->count);
++		intel_engine_pm_put(barrier_to_engine(node));
+ 
+-		intel_engine_pm_put(engine);
+ 		kmem_cache_free(global.slab_cache, node);
+ 	}
+ 	return err;
+@@ -426,25 +625,27 @@ void i915_active_acquire_barrier(struct
+ 
+ 	GEM_BUG_ON(i915_active_is_idle(ref));
+ 
++	/*
++	 * Transfer the list of preallocated barriers into the
++	 * i915_active rbtree, but only as proto-nodes. They will be
++	 * populated by i915_request_add_active_barriers() to point to the
++	 * request that will eventually release them.
++	 */
+ 	mutex_lock_nested(&ref->mutex, SINGLE_DEPTH_NESTING);
+-	llist_for_each_safe(pos, next, llist_del_all(&ref->barriers)) {
+-		struct intel_engine_cs *engine;
+-		struct active_node *node;
++	llist_for_each_safe(pos, next, take_preallocated_barriers(ref)) {
++		struct active_node *node = barrier_from_ll(pos);
++		struct intel_engine_cs *engine = barrier_to_engine(node);
+ 		struct rb_node **p, *parent;
+ 
+-		node = container_of((struct list_head *)pos,
+-				    typeof(*node), base.link);
+-
+-		engine = (void *)rcu_access_pointer(node->base.request);
+-		RCU_INIT_POINTER(node->base.request, ERR_PTR(-EAGAIN));
+-
+ 		parent = NULL;
+ 		p = &ref->tree.rb_node;
+ 		while (*p) {
++			struct active_node *it;
++
+ 			parent = *p;
+-			if (rb_entry(parent,
+-				     struct active_node,
+-				     node)->timeline < node->timeline)
++
++			it = rb_entry(parent, struct active_node, node);
++			if (it->timeline < node->timeline)
+ 				p = &parent->rb_right;
+ 			else
+ 				p = &parent->rb_left;
+@@ -452,20 +653,29 @@ void i915_active_acquire_barrier(struct
+ 		rb_link_node(&node->node, parent, p);
+ 		rb_insert_color(&node->node, &ref->tree);
+ 
+-		llist_add((struct llist_node *)&node->base.link,
+-			  &engine->barrier_tasks);
++		llist_add(barrier_to_ll(node), &engine->barrier_tasks);
+ 		intel_engine_pm_put(engine);
+ 	}
+ 	mutex_unlock(&ref->mutex);
+ }
+ 
+-void i915_request_add_barriers(struct i915_request *rq)
++void i915_request_add_active_barriers(struct i915_request *rq)
+ {
+ 	struct intel_engine_cs *engine = rq->engine;
+ 	struct llist_node *node, *next;
+ 
+-	llist_for_each_safe(node, next, llist_del_all(&engine->barrier_tasks))
++	GEM_BUG_ON(intel_engine_is_virtual(engine));
++	GEM_BUG_ON(rq->timeline != engine->kernel_context->ring->timeline);
++
++	/*
++	 * Attach the list of proto-fences to the in-flight request such
++	 * that the parent i915_active will be released when this request
++	 * is retired.
++	 */
++	llist_for_each_safe(node, next, llist_del_all(&engine->barrier_tasks)) {
++		RCU_INIT_POINTER(barrier_from_ll(node)->base.request, rq);
+ 		list_add_tail((struct list_head *)node, &rq->active_list);
++	}
+ }
+ 
+ int i915_active_request_set(struct i915_active_request *active,
+--- a/drivers/gpu/drm/i915/i915_active.h
++++ b/drivers/gpu/drm/i915/i915_active.h
+@@ -413,6 +413,6 @@ static inline void i915_active_fini(stru
+ int i915_active_acquire_preallocate_barrier(struct i915_active *ref,
+ 					    struct intel_engine_cs *engine);
+ void i915_active_acquire_barrier(struct i915_active *ref);
+-void i915_request_add_barriers(struct i915_request *rq);
++void i915_request_add_active_barriers(struct i915_request *rq);
+ 
+ #endif /* _I915_ACTIVE_H_ */
+--- a/drivers/gpu/drm/i915/i915_active_types.h
++++ b/drivers/gpu/drm/i915/i915_active_types.h
+@@ -42,7 +42,7 @@ struct i915_active {
+ 	int (*active)(struct i915_active *ref);
+ 	void (*retire)(struct i915_active *ref);
+ 
+-	struct llist_head barriers;
++	struct llist_head preallocated_barriers;
+ };
+ 
+ #endif /* _I915_ACTIVE_TYPES_H_ */
+--- a/drivers/gpu/drm/i915/selftests/i915_live_selftests.h
++++ b/drivers/gpu/drm/i915/selftests/i915_live_selftests.h
+@@ -15,6 +15,7 @@ selftest(workarounds, intel_workarounds_
+ selftest(timelines, intel_timeline_live_selftests)
+ selftest(requests, i915_request_live_selftests)
+ selftest(active, i915_active_live_selftests)
++selftest(gt_contexts, intel_context_live_selftests)
+ selftest(objects, i915_gem_object_live_selftests)
+ selftest(mman, i915_gem_mman_live_selftests)
+ selftest(dmabuf, i915_gem_dmabuf_live_selftests)
+@@ -24,7 +25,7 @@ selftest(gtt, i915_gem_gtt_live_selftest
+ selftest(gem, i915_gem_live_selftests)
+ selftest(evict, i915_gem_evict_live_selftests)
+ selftest(hugepages, i915_gem_huge_page_live_selftests)
+-selftest(contexts, i915_gem_context_live_selftests)
++selftest(gem_contexts, i915_gem_context_live_selftests)
+ selftest(blt, i915_gem_object_blt_live_selftests)
+ selftest(client, i915_gem_client_blt_live_selftests)
+ selftest(reset, intel_reset_live_selftests)

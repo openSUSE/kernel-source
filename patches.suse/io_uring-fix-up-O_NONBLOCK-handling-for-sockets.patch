@@ -1,0 +1,153 @@
+From: Jens Axboe <axboe@kernel.dk>
+Date: Thu, 17 Oct 2019 09:20:46 -0600
+Subject: io_uring: fix up O_NONBLOCK handling for sockets
+Git-commit: 491381ce07ca57f68c49c79a8a43da5b60749e32
+Patch-mainline: 5.4-rc4
+References: bnc#1151927 5.3.9
+
+We've got two issues with the non-regular file handling for non-blocking
+IO:
+
+1) We don't want to re-do a short read in full for a non-regular file,
+   as we can't just read the data again.
+2) For non-regular files that don't support non-blocking IO attempts,
+   we need to punt to async context even if the file is opened as
+   non-blocking. Otherwise the caller always gets -EAGAIN.
+
+Add two new request flags to handle these cases. One is just a cache
+of the inode S_ISREG() status, the other tells io_uring that we always
+need to punt this request to async context, even if REQ_F_NOWAIT is set.
+
+Cc: stable@vger.kernel.org
+Reported-by: Hrvoje Zeba <zeba.hrvoje@gmail.com>
+Tested-by: Hrvoje Zeba <zeba.hrvoje@gmail.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/io_uring.c |   57 +++++++++++++++++++++++++++++++++++++++------------------
+ 1 file changed, 39 insertions(+), 18 deletions(-)
+
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -336,6 +336,8 @@ struct io_kiocb {
+ #define REQ_F_LINK		64	/* linked sqes */
+ #define REQ_F_LINK_DONE		128	/* linked sqes done */
+ #define REQ_F_FAIL_LINK		256	/* fail rest of links */
++#define REQ_F_ISREG		2048	/* regular file */
++#define REQ_F_MUST_PUNT		4096	/* must be punted even for NONBLOCK */
+ 	u64			user_data;
+ 	u32			result;
+ 	u32			sequence;
+@@ -868,26 +870,26 @@ static int io_iopoll_check(struct io_rin
+ 	return ret;
+ }
+ 
+-static void kiocb_end_write(struct kiocb *kiocb)
++static void kiocb_end_write(struct io_kiocb *req)
+ {
+-	if (kiocb->ki_flags & IOCB_WRITE) {
+-		struct inode *inode = file_inode(kiocb->ki_filp);
++	/*
++	 * Tell lockdep we inherited freeze protection from submission
++	 * thread.
++	 */
++	if (req->flags & REQ_F_ISREG) {
++		struct inode *inode = file_inode(req->file);
+ 
+-		/*
+-		 * Tell lockdep we inherited freeze protection from submission
+-		 * thread.
+-		 */
+-		if (S_ISREG(inode->i_mode))
+-			__sb_writers_acquired(inode->i_sb, SB_FREEZE_WRITE);
+-		file_end_write(kiocb->ki_filp);
++		__sb_writers_acquired(inode->i_sb, SB_FREEZE_WRITE);
+ 	}
++	file_end_write(req->file);
+ }
+ 
+ static void io_complete_rw(struct kiocb *kiocb, long res, long res2)
+ {
+ 	struct io_kiocb *req = container_of(kiocb, struct io_kiocb, rw);
+ 
+-	kiocb_end_write(kiocb);
++	if (kiocb->ki_flags & IOCB_WRITE)
++		kiocb_end_write(req);
+ 
+ 	if ((req->flags & REQ_F_LINK) && res != req->result)
+ 		req->flags |= REQ_F_FAIL_LINK;
+@@ -899,7 +901,8 @@ static void io_complete_rw_iopoll(struct
+ {
+ 	struct io_kiocb *req = container_of(kiocb, struct io_kiocb, rw);
+ 
+-	kiocb_end_write(kiocb);
++	if (kiocb->ki_flags & IOCB_WRITE)
++		kiocb_end_write(req);
+ 
+ 	if ((req->flags & REQ_F_LINK) && res != req->result)
+ 		req->flags |= REQ_F_FAIL_LINK;
+@@ -1013,8 +1016,17 @@ static int io_prep_rw(struct io_kiocb *r
+ 	if (!req->file)
+ 		return -EBADF;
+ 
+-	if (force_nonblock && !io_file_supports_async(req->file))
+-		force_nonblock = false;
++	if (S_ISREG(file_inode(req->file)->i_mode))
++		req->flags |= REQ_F_ISREG;
++
++	/*
++	 * If the file doesn't support async, mark it as REQ_F_MUST_PUNT so
++	 * we know to async punt it even if it was opened O_NONBLOCK
++	 */
++	if (force_nonblock && !io_file_supports_async(req->file)) {
++		req->flags |= REQ_F_MUST_PUNT;
++		return -EAGAIN;
++	}
+ 
+ 	kiocb->ki_pos = READ_ONCE(sqe->off);
+ 	kiocb->ki_flags = iocb_flags(kiocb->ki_filp);
+@@ -1035,7 +1047,8 @@ static int io_prep_rw(struct io_kiocb *r
+ 		return ret;
+ 
+ 	/* don't allow async punt if RWF_NOWAIT was requested */
+-	if (kiocb->ki_flags & IOCB_NOWAIT)
++	if ((kiocb->ki_flags & IOCB_NOWAIT) ||
++	    (req->file->f_flags & O_NONBLOCK))
+ 		req->flags |= REQ_F_NOWAIT;
+ 
+ 	if (force_nonblock)
+@@ -1269,7 +1282,9 @@ static int io_read(struct io_kiocb *req,
+ 		 * need async punt anyway, so it's more efficient to do it
+ 		 * here.
+ 		 */
+-		if (force_nonblock && ret2 > 0 && ret2 < read_size)
++		if (force_nonblock && !(req->flags & REQ_F_NOWAIT) &&
++		    (req->flags & REQ_F_ISREG) &&
++		    ret2 > 0 && ret2 < read_size)
+ 			ret2 = -EAGAIN;
+ 		/* Catch -EAGAIN return for forced non-blocking submission */
+ 		if (!force_nonblock || ret2 != -EAGAIN) {
+@@ -1336,7 +1351,7 @@ static int io_write(struct io_kiocb *req
+ 		 * released so that it doesn't complain about the held lock when
+ 		 * we return to userspace.
+ 		 */
+-		if (S_ISREG(file_inode(file)->i_mode)) {
++		if (req->flags & REQ_F_ISREG) {
+ 			__sb_start_write(file_inode(file)->i_sb,
+ 						SB_FREEZE_WRITE, true);
+ 			__sb_writers_release(file_inode(file)->i_sb,
+@@ -2079,7 +2094,13 @@ static int io_queue_sqe(struct io_ring_c
+ 	}
+ 
+ 	ret = __io_submit_sqe(ctx, req, s, true);
+-	if (ret == -EAGAIN && !(req->flags & REQ_F_NOWAIT)) {
++
++	/*
++	 * We async punt it if the file wasn't marked NOWAIT, or if the file
++	 * doesn't support non-blocking read/write attempts
++	 */
++	if (ret == -EAGAIN && (!(req->flags & REQ_F_NOWAIT) ||
++	    (req->flags & REQ_F_MUST_PUNT))) {
+ 		struct io_uring_sqe *sqe_copy;
+ 
+ 		sqe_copy = kmalloc(sizeof(*sqe_copy), GFP_KERNEL);
