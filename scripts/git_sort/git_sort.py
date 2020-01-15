@@ -244,6 +244,7 @@ remotes = (
     Head(RepoURL("arm64/linux.git"), "for-next/core"),
     Head(RepoURL("robh/linux.git"), "for-next"),
     Head(RepoURL("git://git.infradead.org/users/hch/dma-mapping.git"), "for-next"),
+    Head(RepoURL("thermal/linux.git"), "thermal/linux-next"),
 )
 
 
