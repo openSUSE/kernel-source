@@ -1,0 +1,160 @@
+From 249bd9087a5264d2b8a974081870e2e27671b4dc Mon Sep 17 00:00:00 2001
+From: Dave Chinner <dchinner@redhat.com>
+Date: Tue, 29 Oct 2019 13:04:32 -0700
+Subject: [PATCH] xfs: properly serialise fallocate against AIO+DIO
+Git-commit: 249bd9087a5264d2b8a974081870e2e27671b4dc
+Patch-mainline: v5.5-rc1
+References: bsc#1158751
+
+AIO+DIO can extend the file size on IO completion, and it holds
+no inode locks while the IO is in flight. Therefore, a race
+condition exists in file size updates if we do something like this:
+
+aio-thread			fallocate-thread
+
+lock inode
+submit IO beyond inode->i_size
+unlock inode
+.....
+				lock inode
+				break layouts
+				if (off + len > inode->i_size)
+					new_size = off + len
+				.....
+				inode_dio_wait()
+				<blocks>
+.....
+completes
+inode->i_size updated
+inode_dio_done()
+....
+				<wakes>
+				<does stuff no long beyond EOF>
+				if (new_size)
+					xfs_vn_setattr(inode, new_size)
+
+
+Yup, that attempt to extend the file size in the fallocate code
+turns into a truncate - it removes the whatever the aio write
+allocated and put to disk, and reduced the inode size back down to
+where the fallocate operation ends.
+
+Fundamentally, xfs_file_fallocate()  not compatible with racing
+AIO+DIO completions, so we need to move the inode_dio_wait() call
+up to where the lock the inode and break the layouts.
+
+Secondly, storing the inode size and then using it unchecked without
+holding the ILOCK is not safe; we can only do such a thing if we've
+locked out and drained all IO and other modification operations,
+which we don't do initially in xfs_file_fallocate.
+
+It should be noted that some of the fallocate operations are
+compound operations - they are made up of multiple manipulations
+that may zero data, and so we may need to flush and invalidate the
+file multiple times during an operation. However, we only need to
+lock out IO and other space manipulation operations once, as that
+lockout is maintained until the entire fallocate operation has been
+completed.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Acked-by: Anthony Iliopoulos <ailiopoulos@suse.com>
+
+---
+ fs/xfs/xfs_bmap_util.c |  8 +-------
+ fs/xfs/xfs_file.c      | 30 ++++++++++++++++++++++++++++++
+ fs/xfs/xfs_ioctl.c     |  1 +
+ 3 files changed, 32 insertions(+), 7 deletions(-)
+
+diff --git a/fs/xfs/xfs_bmap_util.c b/fs/xfs/xfs_bmap_util.c
+index b16081c9d646..036719b29461 100644
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -930,6 +930,7 @@ xfs_unmap_extent(
+ 	goto out_unlock;
+ }
+ 
++/* Caller must first wait for the completion of any pending DIOs if required. */
+ int
+ xfs_flush_unmap_range(
+ 	struct xfs_inode	*ip,
+@@ -941,9 +942,6 @@ xfs_flush_unmap_range(
+ 	xfs_off_t		rounding, start, end;
+ 	int			error;
+ 
+-	/* wait for the completion of any pending DIOs */
+-	inode_dio_wait(inode);
+-
+ 	rounding = max_t(xfs_off_t, 1 << mp->m_sb.sb_blocklog, PAGE_SIZE);
+ 	start = round_down(offset, rounding);
+ 	end = round_up(offset + len, rounding) - 1;
+@@ -975,10 +973,6 @@ xfs_free_file_space(
+ 	if (len <= 0)	/* if nothing being freed */
+ 		return 0;
+ 
+-	error = xfs_flush_unmap_range(ip, offset, len);
+-	if (error)
+-		return error;
+-
+ 	startoffset_fsb = XFS_B_TO_FSB(mp, offset);
+ 	endoffset_fsb = XFS_B_TO_FSBT(mp, offset + len);
+ 
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index 525b29b99116..865543e41fb4 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -817,6 +817,36 @@ xfs_file_fallocate(
+ 	if (error)
+ 		goto out_unlock;
+ 
++	/*
++	 * Must wait for all AIO to complete before we continue as AIO can
++	 * change the file size on completion without holding any locks we
++	 * currently hold. We must do this first because AIO can update both
++	 * the on disk and in memory inode sizes, and the operations that follow
++	 * require the in-memory size to be fully up-to-date.
++	 */
++	inode_dio_wait(inode);
++
++	/*
++	 * Now AIO and DIO has drained we flush and (if necessary) invalidate
++	 * the cached range over the first operation we are about to run.
++	 *
++	 * We care about zero and collapse here because they both run a hole
++	 * punch over the range first. Because that can zero data, and the range
++	 * of invalidation for the shift operations is much larger, we still do
++	 * the required flush for collapse in xfs_prepare_shift().
++	 *
++	 * Insert has the same range requirements as collapse, and we extend the
++	 * file first which can zero data. Hence insert has the same
++	 * flush/invalidate requirements as collapse and so they are both
++	 * handled at the right time by xfs_prepare_shift().
++	 */
++	if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE |
++		    FALLOC_FL_COLLAPSE_RANGE)) {
++		error = xfs_flush_unmap_range(ip, offset, len);
++		if (error)
++			goto out_unlock;
++	}
++
+ 	if (mode & FALLOC_FL_PUNCH_HOLE) {
+ 		error = xfs_free_file_space(ip, offset, len);
+ 		if (error)
+diff --git a/fs/xfs/xfs_ioctl.c b/fs/xfs/xfs_ioctl.c
+index 287f83eb791f..800f07044636 100644
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@ -623,6 +623,7 @@ xfs_ioc_space(
+ 	error = xfs_break_layouts(inode, &iolock, BREAK_UNMAP);
+ 	if (error)
+ 		goto out_unlock;
++	inode_dio_wait(inode);
+ 
+ 	switch (bf->l_whence) {
+ 	case 0: /*SEEK_SET*/
+-- 
+2.16.4
+

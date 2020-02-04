@@ -1,0 +1,145 @@
+From: Roman Gushchin <guro@fb.com>
+Date: Fri, 27 Dec 2019 13:50:34 -0800
+Subject: bpf: cgroup: prevent out-of-order release of cgroup bpf
+Patch-mainline: v5.5-rc6
+Git-commit: e10360f815ca6367357b2c2cfef17fc663e50f7b
+References: bsc#1155518
+
+Before commit 4bfc0bb2c60e ("bpf: decouple the lifetime of cgroup_bpf from cgroup itself")
+cgroup bpf structures were released with
+corresponding cgroup structures. It guaranteed the hierarchical order
+of destruction: children were always first. It preserved attached
+programs from being released before their propagated copies.
+
+But with cgroup auto-detachment there are no such guarantees anymore:
+cgroup bpf is released as soon as the cgroup is offline and there are
+no live associated sockets. It means that an attached program can be
+detached and released, while its propagated copy is still living
+in the cgroup subtree. This will obviously lead to an use-after-free
+bug.
+
+To reproduce the issue the following script can be used:
+
+  #!/bin/bash
+
+  CGROOT=/sys/fs/cgroup
+
+  mkdir -p ${CGROOT}/A ${CGROOT}/B ${CGROOT}/A/C
+  sleep 1
+
+  ./test_cgrp2_attach ${CGROOT}/A egress &
+  A_PID=$!
+  ./test_cgrp2_attach ${CGROOT}/B egress &
+  B_PID=$!
+
+  echo $$ > ${CGROOT}/A/C/cgroup.procs
+  iperf -s &
+  S_PID=$!
+  iperf -c localhost -t 100 &
+  C_PID=$!
+
+  sleep 1
+
+  echo $$ > ${CGROOT}/B/cgroup.procs
+  echo ${S_PID} > ${CGROOT}/B/cgroup.procs
+  echo ${C_PID} > ${CGROOT}/B/cgroup.procs
+
+  sleep 1
+
+  rmdir ${CGROOT}/A/C
+  rmdir ${CGROOT}/A
+
+  sleep 1
+
+  kill -9 ${S_PID} ${C_PID} ${A_PID} ${B_PID}
+
+On the unpatched kernel the following stacktrace can be obtained:
+
+[   33.619799] BUG: unable to handle page fault for address: ffffbdb4801ab002
+[   33.620677] #PF: supervisor read access in kernel mode
+[   33.621293] #PF: error_code(0x0000) - not-present page
+[   33.622754] Oops: 0000 [#1] SMP NOPTI
+[   33.623202] CPU: 0 PID: 601 Comm: iperf Not tainted 5.5.0-rc2+ #23
+[   33.625545] RIP: 0010:__cgroup_bpf_run_filter_skb+0x29f/0x3d0
+[   33.635809] Call Trace:
+[   33.636118]  ? __cgroup_bpf_run_filter_skb+0x2bf/0x3d0
+[   33.636728]  ? __switch_to_asm+0x40/0x70
+[   33.637196]  ip_finish_output+0x68/0xa0
+[   33.637654]  ip_output+0x76/0xf0
+[   33.638046]  ? __ip_finish_output+0x1c0/0x1c0
+[   33.638576]  __ip_queue_xmit+0x157/0x410
+[   33.639049]  __tcp_transmit_skb+0x535/0xaf0
+[   33.639557]  tcp_write_xmit+0x378/0x1190
+[   33.640049]  ? _copy_from_iter_full+0x8d/0x260
+[   33.640592]  tcp_sendmsg_locked+0x2a2/0xdc0
+[   33.641098]  ? sock_has_perm+0x10/0xa0
+[   33.641574]  tcp_sendmsg+0x28/0x40
+[   33.641985]  sock_sendmsg+0x57/0x60
+[   33.642411]  sock_write_iter+0x97/0x100
+[   33.642876]  new_sync_write+0x1b6/0x1d0
+[   33.643339]  vfs_write+0xb6/0x1a0
+[   33.643752]  ksys_write+0xa7/0xe0
+[   33.644156]  do_syscall_64+0x5b/0x1b0
+[   33.644605]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Fix this by grabbing a reference to the bpf structure of each ancestor
+on the initialization of the cgroup bpf structure, and dropping the
+reference at the end of releasing the cgroup bpf structure.
+
+This will restore the hierarchical order of cgroup bpf releasing,
+without adding any operations on hot paths.
+
+Thanks to Josef Bacik for the debugging and the initial analysis of
+the problem.
+
+Fixes: 4bfc0bb2c60e ("bpf: decouple the lifetime of cgroup_bpf from cgroup itself")
+Reported-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Acked-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Gary Lin <glin@suse.com>
+---
+ kernel/bpf/cgroup.c |   11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+--- a/kernel/bpf/cgroup.c
++++ b/kernel/bpf/cgroup.c
+@@ -35,8 +35,8 @@ void cgroup_bpf_offline(struct cgroup *c
+  */
+ static void cgroup_bpf_release(struct work_struct *work)
+ {
+-	struct cgroup *cgrp = container_of(work, struct cgroup,
+-					   bpf.release_work);
++	struct cgroup *p, *cgrp = container_of(work, struct cgroup,
++					       bpf.release_work);
+ 	enum bpf_cgroup_storage_type stype;
+ 	struct bpf_prog_array *old_array;
+ 	unsigned int type;
+@@ -65,6 +65,9 @@ static void cgroup_bpf_release(struct wo
+ 
+ 	mutex_unlock(&cgroup_mutex);
+ 
++	for (p = cgroup_parent(cgrp); p; p = cgroup_parent(p))
++		cgroup_bpf_put(p);
++
+ 	percpu_ref_exit(&cgrp->bpf.refcnt);
+ 	cgroup_put(cgrp);
+ }
+@@ -199,6 +202,7 @@ int cgroup_bpf_inherit(struct cgroup *cg
+  */
+ #define	NR ARRAY_SIZE(cgrp->bpf.effective)
+ 	struct bpf_prog_array *arrays[NR] = {};
++	struct cgroup *p;
+ 	int ret, i;
+ 
+ 	ret = percpu_ref_init(&cgrp->bpf.refcnt, cgroup_bpf_release_fn, 0,
+@@ -206,6 +210,9 @@ int cgroup_bpf_inherit(struct cgroup *cg
+ 	if (ret)
+ 		return ret;
+ 
++	for (p = cgroup_parent(cgrp); p; p = cgroup_parent(p))
++		cgroup_bpf_get(p);
++
+ 	for (i = 0; i < NR; i++)
+ 		INIT_LIST_HEAD(&cgrp->bpf.progs[i]);
+ 

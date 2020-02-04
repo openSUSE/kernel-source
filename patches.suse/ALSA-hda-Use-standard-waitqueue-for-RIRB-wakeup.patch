@@ -1,0 +1,157 @@
+From 88452da92ba2b264a3922218c2cec13aac51c502 Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Tue, 10 Dec 2019 15:57:27 +0100
+Subject: [PATCH] ALSA: hda: Use standard waitqueue for RIRB wakeup
+Git-commit: 88452da92ba2b264a3922218c2cec13aac51c502
+Patch-mainline: v5.6-rc1
+References: git-fixes
+
+The HD-audio CORB/RIRB communication was programmed in a way that was
+documented in the reference in decades ago, which is essentially a
+polling in the waiter side.  It's working fine but costs CPU cycles on
+some platforms that support only slow communications.  Also, for some
+platforms that had unreliable communications, we put longer wait time
+(2 ms), which accumulate quite long time if you execute many verbs in
+a shot (e.g. at the initialization or resume phase).
+
+This patch attempts to improve the situation by introducing the
+standard waitqueue in the RIRB waiter side instead of polling.  The
+test results on my machine show significant improvements.  The time
+spent for "cat /proc/asound/card*/codec#*" were changed like:
+
+* Intel SKL + Realtek codec
+  before the patch:
+   0.00user 0.04system 0:00.10elapsed 40.0%CPU
+  after the patch:
+   0.00user 0.01system 0:00.10elapsed 10.0%CPU
+
+* Nvidia GP107GL + Nvidia HDMI codec
+  before the patch:
+   0.00user 0.00system 0:02.76elapsed 0.0%CPU
+  after the patch:
+   0.00user 0.00system 0:00.01elapsed 17.0%CPU
+
+So, for Intel chips, the total time is same, while the total time is
+greatly reduced (from 2.76 to 0.01s) for Nvidia chips.
+The only negative data here is the increase of CPU time for Nvidia,
+but this is the unavoidable cost for faster wakeups, supposedly.
+
+Link: https://lore.kernel.org/r/20191210145727.22054-1-tiwai@suse.de
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ include/sound/hdaudio.h        |  1 +
+ sound/hda/hdac_bus.c           |  1 +
+ sound/hda/hdac_controller.c    |  3 +++
+ sound/pci/hda/hda_controller.c | 29 ++++++++++++++---------------
+ 4 files changed, 19 insertions(+), 15 deletions(-)
+
+diff --git a/include/sound/hdaudio.h b/include/sound/hdaudio.h
+index e05b95e83d5a..81373a2efd96 100644
+--- a/include/sound/hdaudio.h
++++ b/include/sound/hdaudio.h
+@@ -317,6 +317,7 @@ struct hdac_bus {
+ 	struct hdac_rb corb;
+ 	struct hdac_rb rirb;
+ 	unsigned int last_cmd[HDA_MAX_CODECS];	/* last sent command */
++	wait_queue_head_t rirb_wq;
+ 
+ 	/* CORB/RIRB and position buffers */
+ 	struct snd_dma_buffer rb;
+diff --git a/sound/hda/hdac_bus.c b/sound/hda/hdac_bus.c
+index 8f19876244eb..48b227fff204 100644
+--- a/sound/hda/hdac_bus.c
++++ b/sound/hda/hdac_bus.c
+@@ -43,6 +43,7 @@ int snd_hdac_bus_init(struct hdac_bus *bus, struct device *dev,
+ 	mutex_init(&bus->cmd_mutex);
+ 	mutex_init(&bus->lock);
+ 	INIT_LIST_HEAD(&bus->hlink_list);
++	init_waitqueue_head(&bus->rirb_wq);
+ 	bus->irq = -1;
+ 	return 0;
+ }
+diff --git a/sound/hda/hdac_controller.c b/sound/hda/hdac_controller.c
+index 7e7be8e4dcf9..cd1c3b282657 100644
+--- a/sound/hda/hdac_controller.c
++++ b/sound/hda/hdac_controller.c
+@@ -216,6 +216,9 @@ void snd_hdac_bus_update_rirb(struct hdac_bus *bus)
+ 		else if (bus->rirb.cmds[addr]) {
+ 			bus->rirb.res[addr] = res;
+ 			bus->rirb.cmds[addr]--;
++			if (!bus->rirb.cmds[addr] &&
++			    waitqueue_active(&bus->rirb_wq))
++				wake_up(&bus->rirb_wq);
+ 		} else {
+ 			dev_err_ratelimited(bus->dev,
+ 				"spurious response %#x:%#x, last cmd=%#08x\n",
+diff --git a/sound/pci/hda/hda_controller.c b/sound/pci/hda/hda_controller.c
+index 2f3b7a35f2d9..f30a053d981e 100644
+--- a/sound/pci/hda/hda_controller.c
++++ b/sound/pci/hda/hda_controller.c
+@@ -792,21 +792,25 @@ static int azx_rirb_get_response(struct hdac_bus *bus, unsigned int addr,
+ 	struct hda_bus *hbus = &chip->bus;
+ 	unsigned long timeout;
+ 	unsigned long loopcounter;
+-	int do_poll = 0;
++	wait_queue_entry_t wait;
+ 	bool warned = false;
+ 
++	init_wait_entry(&wait, 0);
+  again:
+ 	timeout = jiffies + msecs_to_jiffies(1000);
+ 
+ 	for (loopcounter = 0;; loopcounter++) {
+ 		spin_lock_irq(&bus->reg_lock);
+-		if (bus->polling_mode || do_poll)
++		if (!bus->polling_mode)
++			prepare_to_wait(&bus->rirb_wq, &wait,
++					TASK_UNINTERRUPTIBLE);
++		if (bus->polling_mode)
+ 			snd_hdac_bus_update_rirb(bus);
+ 		if (!bus->rirb.cmds[addr]) {
+-			if (!do_poll)
+-				bus->poll_count = 0;
+ 			if (res)
+ 				*res = bus->rirb.res[addr]; /* the last value */
++			if (!bus->polling_mode)
++				finish_wait(&bus->rirb_wq, &wait);
+ 			spin_unlock_irq(&bus->reg_lock);
+ 			return 0;
+ 		}
+@@ -814,7 +818,9 @@ static int azx_rirb_get_response(struct hdac_bus *bus, unsigned int addr,
+ 		if (time_after(jiffies, timeout))
+ 			break;
+ #define LOOP_COUNT_MAX	3000
+-		if (hbus->needs_damn_long_delay ||
++		if (!bus->polling_mode) {
++			schedule_timeout(msecs_to_jiffies(2));
++		} else if (hbus->needs_damn_long_delay ||
+ 		    loopcounter > LOOP_COUNT_MAX) {
+ 			if (loopcounter > LOOP_COUNT_MAX && !warned) {
+ 				dev_dbg_ratelimited(chip->card->dev,
+@@ -829,19 +835,12 @@ static int azx_rirb_get_response(struct hdac_bus *bus, unsigned int addr,
+ 		}
+ 	}
+ 
++	if (!bus->polling_mode)
++		finish_wait(&bus->rirb_wq, &wait);
++
+ 	if (hbus->no_response_fallback)
+ 		return -EIO;
+ 
+-	if (!bus->polling_mode && bus->poll_count < 2) {
+-		dev_dbg(chip->card->dev,
+-			"azx_get_response timeout, polling the codec once: last cmd=0x%08x\n",
+-			bus->last_cmd[addr]);
+-		do_poll = 1;
+-		bus->poll_count++;
+-		goto again;
+-	}
+-
+-
+ 	if (!bus->polling_mode) {
+ 		dev_warn(chip->card->dev,
+ 			 "azx_get_response timeout, switching to polling mode: last cmd=0x%08x\n",
+-- 
+2.16.4
+
