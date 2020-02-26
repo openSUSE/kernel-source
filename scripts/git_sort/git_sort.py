@@ -246,6 +246,7 @@ remotes = (
     Head(RepoURL("git://git.infradead.org/users/hch/dma-mapping.git"), "for-next"),
     Head(RepoURL("thermal/linux.git"), "thermal/linux-next"),
     Head(RepoURL("git://github.com/cminyard/linux-ipmi.git"), "for-next"),
+    Head(RepoURL("ras/ras.git"), "edac-for-next"),
 )
 
 
