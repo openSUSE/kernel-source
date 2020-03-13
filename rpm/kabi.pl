@@ -63,11 +63,16 @@ sub symvers_uses_namespaces {
 	my $line =  <$fh>;
 	chomp $line;
 
-	# If there are 5 tab delimited fields, then it's a newer (>=5.4)
-	# Module.symvers format with namespaces. The older Module.symvers
-	# format only has 4 fields (crc, symbol, module, export type).
-	my @l =  split(/\t/, $line);
-	if (@l > 4) {
+	# The new (>=5.4) Module.symvers format has 4 tabs (5 fields):
+	#
+	#    crc\tsymbol\tmodule\texport_type\tnamespace
+	#
+	# The older Module.symvers format only has 3 tabs (4 fields):
+	#
+	#    crc\tsymbol\tmodule\texport_type
+
+	my $num_tabs = $line =~ tr/\t//;
+	if ($num_tabs > 3) {
 		return 1;
 	} else {
 		return 0;
@@ -83,14 +88,14 @@ sub load_symvers {
 	xopen(my $fh, '<', $file);
 	while (<$fh>) {
 		chomp;
-		my @l = split(/\t/);
+		my @l = split(/\t/, $_, -1);
 		if (@l < 4) {
 			print STDERR "$file:$.: unknown line\n";
 			$errors++;
 			next;
 		}
 		if ($use_namespaces) {
-			$new = { crc => $l[0], namespace => $l[2], mod => $l[3], type => $l[4] };
+			$new = { crc => $l[0], mod => $l[2], type => $l[3], namespace => $l[4] };
 		} else {
 			$new = { crc => $l[0], mod => $l[2], type => $l[3] };
 		}
