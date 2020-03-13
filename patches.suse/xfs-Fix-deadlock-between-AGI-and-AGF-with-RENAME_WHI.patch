@@ -1,0 +1,206 @@
+From bc56ad8c74b8588685c2875de0df8ab6974828ef Mon Sep 17 00:00:00 2001
+From: kaixuxia <xiakaixu1987@gmail.com>
+Date: Tue, 3 Sep 2019 21:06:50 -0700
+Subject: [PATCH] xfs: Fix deadlock between AGI and AGF with RENAME_WHITEOUT
+Git-commit: bc56ad8c74b8588685c2875de0df8ab6974828ef
+Patch-mainline: v5.4-rc1
+References: bsc#1164482
+
+When performing rename operation with RENAME_WHITEOUT flag, we will
+hold AGF lock to allocate or free extents in manipulating the dirents
+firstly, and then doing the xfs_iunlink_remove() call last to hold
+AGI lock to modify the tmpfile info, so we the lock order AGI->AGF.
+
+The big problem here is that we have an ordering constraint on AGF
+and AGI locking - inode allocation locks the AGI, then can allocate
+a new extent for new inodes, locking the AGF after the AGI. Hence
+the ordering that is imposed by other parts of the code is AGI before
+AGF. So we get an ABBA deadlock between the AGI and AGF here.
+
+Process A:
+Call trace:
+ ? __schedule+0x2bd/0x620
+ schedule+0x33/0x90
+ schedule_timeout+0x17d/0x290
+ __down_common+0xef/0x125
+ ? xfs_buf_find+0x215/0x6c0 [xfs]
+ down+0x3b/0x50
+ xfs_buf_lock+0x34/0xf0 [xfs]
+ xfs_buf_find+0x215/0x6c0 [xfs]
+ xfs_buf_get_map+0x37/0x230 [xfs]
+ xfs_buf_read_map+0x29/0x190 [xfs]
+ xfs_trans_read_buf_map+0x13d/0x520 [xfs]
+ xfs_read_agf+0xa6/0x180 [xfs]
+ ? schedule_timeout+0x17d/0x290
+ xfs_alloc_read_agf+0x52/0x1f0 [xfs]
+ xfs_alloc_fix_freelist+0x432/0x590 [xfs]
+ ? down+0x3b/0x50
+ ? xfs_buf_lock+0x34/0xf0 [xfs]
+ ? xfs_buf_find+0x215/0x6c0 [xfs]
+ xfs_alloc_vextent+0x301/0x6c0 [xfs]
+ xfs_ialloc_ag_alloc+0x182/0x700 [xfs]
+ ? _xfs_trans_bjoin+0x72/0xf0 [xfs]
+ xfs_dialloc+0x116/0x290 [xfs]
+ xfs_ialloc+0x6d/0x5e0 [xfs]
+ ? xfs_log_reserve+0x165/0x280 [xfs]
+ xfs_dir_ialloc+0x8c/0x240 [xfs]
+ xfs_create+0x35a/0x610 [xfs]
+ xfs_generic_create+0x1f1/0x2f0 [xfs]
+ ...
+
+Process B:
+Call trace:
+ ? __schedule+0x2bd/0x620
+ ? xfs_bmapi_allocate+0x245/0x380 [xfs]
+ schedule+0x33/0x90
+ schedule_timeout+0x17d/0x290
+ ? xfs_buf_find+0x1fd/0x6c0 [xfs]
+ __down_common+0xef/0x125
+ ? xfs_buf_get_map+0x37/0x230 [xfs]
+ ? xfs_buf_find+0x215/0x6c0 [xfs]
+ down+0x3b/0x50
+ xfs_buf_lock+0x34/0xf0 [xfs]
+ xfs_buf_find+0x215/0x6c0 [xfs]
+ xfs_buf_get_map+0x37/0x230 [xfs]
+ xfs_buf_read_map+0x29/0x190 [xfs]
+ xfs_trans_read_buf_map+0x13d/0x520 [xfs]
+ xfs_read_agi+0xa8/0x160 [xfs]
+ xfs_iunlink_remove+0x6f/0x2a0 [xfs]
+ ? current_time+0x46/0x80
+ ? xfs_trans_ichgtime+0x39/0xb0 [xfs]
+ xfs_rename+0x57a/0xae0 [xfs]
+ xfs_vn_rename+0xe4/0x150 [xfs]
+ ...
+
+In this patch we move the xfs_iunlink_remove() call to
+before acquiring the AGF lock to preserve correct AGI/AGF locking
+order.
+
+Signed-off-by: kaixuxia <kaixuxia@tencent.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Acked-by: Anthony Iliopoulos <ailiopoulos@suse.com>
+
+---
+ fs/xfs/xfs_inode.c | 83 +++++++++++++++++++++++++++---------------------------
+ 1 file changed, 42 insertions(+), 41 deletions(-)
+
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index cdb97fa027fa..18f4b262e61c 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -3282,7 +3282,8 @@ xfs_rename(
+ 					spaceres);
+ 
+ 	/*
+-	 * Set up the target.
++	 * Check for expected errors before we dirty the transaction
++	 * so we can return an error without a transaction abort.
+ 	 */
+ 	if (target_ip == NULL) {
+ 		/*
+@@ -3294,6 +3295,46 @@ xfs_rename(
+ 			if (error)
+ 				goto out_trans_cancel;
+ 		}
++	} else {
++		/*
++		 * If target exists and it's a directory, check that whether
++		 * it can be destroyed.
++		 */
++		if (S_ISDIR(VFS_I(target_ip)->i_mode) &&
++		    (!xfs_dir_isempty(target_ip) ||
++		     (VFS_I(target_ip)->i_nlink > 2))) {
++			error = -EEXIST;
++			goto out_trans_cancel;
++		}
++	}
++
++	/*
++	 * Directory entry creation below may acquire the AGF. Remove
++	 * the whiteout from the unlinked list first to preserve correct
++	 * AGI/AGF locking order. This dirties the transaction so failures
++	 * after this point will abort and log recovery will clean up the
++	 * mess.
++	 *
++	 * For whiteouts, we need to bump the link count on the whiteout
++	 * inode. After this point, we have a real link, clear the tmpfile
++	 * state flag from the inode so it doesn't accidentally get misused
++	 * in future.
++	 */
++	if (wip) {
++		ASSERT(VFS_I(wip)->i_nlink == 0);
++		error = xfs_iunlink_remove(tp, wip);
++		if (error)
++			goto out_trans_cancel;
++
++		xfs_bumplink(tp, wip);
++		xfs_trans_log_inode(tp, wip, XFS_ILOG_CORE);
++		VFS_I(wip)->i_state &= ~I_LINKABLE;
++	}
++
++	/*
++	 * Set up the target.
++	 */
++	if (target_ip == NULL) {
+ 		/*
+ 		 * If target does not exist and the rename crosses
+ 		 * directories, adjust the target directory link count
+@@ -3311,22 +3352,6 @@ xfs_rename(
+ 			xfs_bumplink(tp, target_dp);
+ 		}
+ 	} else { /* target_ip != NULL */
+-		/*
+-		 * If target exists and it's a directory, check that both
+-		 * target and source are directories and that target can be
+-		 * destroyed, or that neither is a directory.
+-		 */
+-		if (S_ISDIR(VFS_I(target_ip)->i_mode)) {
+-			/*
+-			 * Make sure target dir is empty.
+-			 */
+-			if (!(xfs_dir_isempty(target_ip)) ||
+-			    (VFS_I(target_ip)->i_nlink > 2)) {
+-				error = -EEXIST;
+-				goto out_trans_cancel;
+-			}
+-		}
+-
+ 		/*
+ 		 * Link the source inode under the target name.
+ 		 * If the source inode is a directory and we are moving
+@@ -3417,30 +3442,6 @@ xfs_rename(
+ 	if (error)
+ 		goto out_trans_cancel;
+ 
+-	/*
+-	 * For whiteouts, we need to bump the link count on the whiteout inode.
+-	 * This means that failures all the way up to this point leave the inode
+-	 * on the unlinked list and so cleanup is a simple matter of dropping
+-	 * the remaining reference to it. If we fail here after bumping the link
+-	 * count, we're shutting down the filesystem so we'll never see the
+-	 * intermediate state on disk.
+-	 */
+-	if (wip) {
+-		ASSERT(VFS_I(wip)->i_nlink == 0);
+-		xfs_bumplink(tp, wip);
+-		error = xfs_iunlink_remove(tp, wip);
+-		if (error)
+-			goto out_trans_cancel;
+-		xfs_trans_log_inode(tp, wip, XFS_ILOG_CORE);
+-
+-		/*
+-		 * Now we have a real link, clear the "I'm a tmpfile" state
+-		 * flag from the inode so it doesn't accidentally get misused in
+-		 * future.
+-		 */
+-		VFS_I(wip)->i_state &= ~I_LINKABLE;
+-	}
+-
+ 	xfs_trans_ichgtime(tp, src_dp, XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG);
+ 	xfs_trans_log_inode(tp, src_dp, XFS_ILOG_CORE);
+ 	if (new_parent)
+-- 
+2.16.4
+
