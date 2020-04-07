@@ -1,0 +1,233 @@
+From: Anna-Maria Gleixner <anna-maria@linutronix.de>
+Date: Fri, 26 Jul 2019 20:30:59 +0200
+Subject: hrtimer: Prepare support for PREEMPT_RT
+Patch-mainline: v5.4-rc1
+Git-commit: f61eff83cec9cfab31fd30a2ca8856be379cdcd5
+References: bsc#1162702
+
+When PREEMPT_RT is enabled, the soft interrupt thread can be preempted.  If
+the soft interrupt thread is preempted in the middle of a timer callback,
+then calling hrtimer_cancel() can lead to two issues:
+
+  - If the caller is on a remote CPU then it has to spin wait for the timer
+    handler to complete. This can result in unbound priority inversion.
+
+  - If the caller originates from the task which preempted the timer
+    handler on the same CPU, then spin waiting for the timer handler to
+    complete is never going to end.
+
+To avoid these issues, add a new lock to the timer base which is held
+around the execution of the timer callbacks. If hrtimer_cancel() detects
+that the timer callback is currently running, it blocks on the expiry
+lock. When the callback is finished, the expiry lock is dropped by the
+softirq thread which wakes up the waiter and the system makes progress.
+
+This addresses both the priority inversion and the life lock issues.
+
+The same issue can happen in virtual machines when the vCPU which runs a
+timer callback is scheduled out. If a second vCPU of the same guest calls
+hrtimer_cancel() it will spin wait for the other vCPU to be scheduled back
+in. The expiry lock mechanism would avoid that. It'd be trivial to enable
+this when paravirt spinlocks are enabled in a guest, but it's not clear
+whether this is an actual problem in the wild, so for now it's an RT only
+mechanism.
+
+[ tglx: Refactored it for mainline ]
+
+Signed-off-by: Anna-Maria Gleixner <anna-maria@linutronix.de>
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20190726185753.737767218@linutronix.de
+Acked-by: Daniel Wagner <dwagner@suse.de>
+---
+ include/linux/hrtimer.h | 16 +++++++++
+ kernel/time/hrtimer.c   | 95 +++++++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 105 insertions(+), 6 deletions(-)
+
+diff --git a/include/linux/hrtimer.h b/include/linux/hrtimer.h
+index 7d0d0a36a8f4..5df4bcff96d5 100644
+--- a/include/linux/hrtimer.h
++++ b/include/linux/hrtimer.h
+@@ -192,6 +192,10 @@ enum  hrtimer_base_type {
+  * @nr_retries:		Total number of hrtimer interrupt retries
+  * @nr_hangs:		Total number of hrtimer interrupt hangs
+  * @max_hang_time:	Maximum time spent in hrtimer_interrupt
++ * @softirq_expiry_lock: Lock which is taken while softirq based hrtimer are
++ *			 expired
++ * @timer_waiters:	A hrtimer_cancel() invocation waits for the timer
++ *			callback to finish.
+  * @expires_next:	absolute time of the next event, is required for remote
+  *			hrtimer enqueue; it is the total first expiry time (hard
+  *			and soft hrtimer are taken into account)
+@@ -218,6 +222,10 @@ struct hrtimer_cpu_base {
+ 	unsigned short			nr_retries;
+ 	unsigned short			nr_hangs;
+ 	unsigned int			max_hang_time;
++#endif
++#ifdef CONFIG_PREEMPT_RT
++	spinlock_t			softirq_expiry_lock;
++	atomic_t			timer_waiters;
+ #endif
+ 	ktime_t				expires_next;
+ 	struct hrtimer			*next_timer;
+@@ -350,6 +358,14 @@ extern void hrtimers_resume(void);
+ 
+ DECLARE_PER_CPU(struct tick_device, tick_cpu_device);
+ 
++#ifdef CONFIG_PREEMPT_RT
++void hrtimer_cancel_wait_running(const struct hrtimer *timer);
++#else
++static inline void hrtimer_cancel_wait_running(struct hrtimer *timer)
++{
++	cpu_relax();
++}
++#endif
+ 
+ /* Exported timer functions: */
+ 
+diff --git a/kernel/time/hrtimer.c b/kernel/time/hrtimer.c
+index c101f88ae8aa..499122752649 100644
+--- a/kernel/time/hrtimer.c
++++ b/kernel/time/hrtimer.c
+@@ -1162,6 +1162,82 @@ int hrtimer_try_to_cancel(struct hrtimer *timer)
+ }
+ EXPORT_SYMBOL_GPL(hrtimer_try_to_cancel);
+ 
++#ifdef CONFIG_PREEMPT_RT
++static void hrtimer_cpu_base_init_expiry_lock(struct hrtimer_cpu_base *base)
++{
++	spin_lock_init(&base->softirq_expiry_lock);
++}
++
++static void hrtimer_cpu_base_lock_expiry(struct hrtimer_cpu_base *base)
++{
++	spin_lock(&base->softirq_expiry_lock);
++}
++
++static void hrtimer_cpu_base_unlock_expiry(struct hrtimer_cpu_base *base)
++{
++	spin_unlock(&base->softirq_expiry_lock);
++}
++
++/*
++ * The counterpart to hrtimer_cancel_wait_running().
++ *
++ * If there is a waiter for cpu_base->expiry_lock, then it was waiting for
++ * the timer callback to finish. Drop expiry_lock and reaquire it. That
++ * allows the waiter to acquire the lock and make progress.
++ */
++static void hrtimer_sync_wait_running(struct hrtimer_cpu_base *cpu_base,
++				      unsigned long flags)
++{
++	if (atomic_read(&cpu_base->timer_waiters)) {
++		raw_spin_unlock_irqrestore(&cpu_base->lock, flags);
++		spin_unlock(&cpu_base->softirq_expiry_lock);
++		spin_lock(&cpu_base->softirq_expiry_lock);
++		raw_spin_lock_irq(&cpu_base->lock);
++	}
++}
++
++/*
++ * This function is called on PREEMPT_RT kernels when the fast path
++ * deletion of a timer failed because the timer callback function was
++ * running.
++ *
++ * This prevents priority inversion, if the softirq thread on a remote CPU
++ * got preempted, and it prevents a life lock when the task which tries to
++ * delete a timer preempted the softirq thread running the timer callback
++ * function.
++ */
++void hrtimer_cancel_wait_running(const struct hrtimer *timer)
++{
++	struct hrtimer_clock_base *base = timer->base;
++
++	if (!timer->is_soft || !base || !base->cpu_base) {
++		cpu_relax();
++		return;
++	}
++
++	/*
++	 * Mark the base as contended and grab the expiry lock, which is
++	 * held by the softirq across the timer callback. Drop the lock
++	 * immediately so the softirq can expire the next timer. In theory
++	 * the timer could already be running again, but that's more than
++	 * unlikely and just causes another wait loop.
++	 */
++	atomic_inc(&base->cpu_base->timer_waiters);
++	spin_lock_bh(&base->cpu_base->softirq_expiry_lock);
++	atomic_dec(&base->cpu_base->timer_waiters);
++	spin_unlock_bh(&base->cpu_base->softirq_expiry_lock);
++}
++#else
++static inline void
++hrtimer_cpu_base_init_expiry_lock(struct hrtimer_cpu_base *base) { }
++static inline void
++hrtimer_cpu_base_lock_expiry(struct hrtimer_cpu_base *base) { }
++static inline void
++hrtimer_cpu_base_unlock_expiry(struct hrtimer_cpu_base *base) { }
++static inline void hrtimer_sync_wait_running(struct hrtimer_cpu_base *base,
++					     unsigned long flags) { }
++#endif
++
+ /**
+  * hrtimer_cancel - cancel a timer and wait for the handler to finish.
+  * @timer:	the timer to be cancelled
+@@ -1172,13 +1248,15 @@ EXPORT_SYMBOL_GPL(hrtimer_try_to_cancel);
+  */
+ int hrtimer_cancel(struct hrtimer *timer)
+ {
+-	for (;;) {
+-		int ret = hrtimer_try_to_cancel(timer);
++	int ret;
+ 
+-		if (ret >= 0)
+-			return ret;
+-		cpu_relax();
+-	}
++	do {
++		ret = hrtimer_try_to_cancel(timer);
++
++		if (ret < 0)
++			hrtimer_cancel_wait_running(timer);
++	} while (ret < 0);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(hrtimer_cancel);
+ 
+@@ -1475,6 +1553,8 @@ static void __hrtimer_run_queues(struct hrtimer_cpu_base *cpu_base, ktime_t now,
+ 				break;
+ 
+ 			__run_hrtimer(cpu_base, base, timer, &basenow, flags);
++			if (active_mask == HRTIMER_ACTIVE_SOFT)
++				hrtimer_sync_wait_running(cpu_base, flags);
+ 		}
+ 	}
+ }
+@@ -1485,6 +1565,7 @@ static __latent_entropy void hrtimer_run_softirq(struct softirq_action *h)
+ 	unsigned long flags;
+ 	ktime_t now;
+ 
++	hrtimer_cpu_base_lock_expiry(cpu_base);
+ 	raw_spin_lock_irqsave(&cpu_base->lock, flags);
+ 
+ 	now = hrtimer_update_base(cpu_base);
+@@ -1494,6 +1575,7 @@ static __latent_entropy void hrtimer_run_softirq(struct softirq_action *h)
+ 	hrtimer_update_softirq_timer(cpu_base, true);
+ 
+ 	raw_spin_unlock_irqrestore(&cpu_base->lock, flags);
++	hrtimer_cpu_base_unlock_expiry(cpu_base);
+ }
+ 
+ #ifdef CONFIG_HIGH_RES_TIMERS
+@@ -1897,6 +1979,7 @@ int hrtimers_prepare_cpu(unsigned int cpu)
+ 	cpu_base->softirq_next_timer = NULL;
+ 	cpu_base->expires_next = KTIME_MAX;
+ 	cpu_base->softirq_expires_next = KTIME_MAX;
++	hrtimer_cpu_base_init_expiry_lock(cpu_base);
+ 	return 0;
+ }
+ 
+-- 
+2.16.4
+
