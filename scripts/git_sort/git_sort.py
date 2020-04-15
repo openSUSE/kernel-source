@@ -187,7 +187,9 @@ class Head(object):
 # kernel.org prefixes and "remote branch name" can be omitted if it is "master".
 remotes = (
     Head(RepoURL("torvalds/linux.git")),
+    Head(RepoURL("netdev/net.git")),
     Head(RepoURL("davem/net.git")),
+    Head(RepoURL("netdev/net-next.git")),
     Head(RepoURL("davem/net-next.git")),
     Head(RepoURL("rdma/rdma.git"), "for-rc"),
     Head(RepoURL("rdma/rdma.git"), "for-next"),
@@ -248,6 +250,9 @@ remotes = (
     Head(RepoURL("git://github.com/cminyard/linux-ipmi.git"), "for-next"),
     Head(RepoURL("ras/ras.git"), "edac-for-next"),
     Head(RepoURL("linusw/linux-pinctrl.git"), "for-next"),
+    Head(RepoURL("efi/efi.git"), "next"),
+    Head(RepoURL("ulfh/mmc.git"), "next"),
+    Head(RepoURL("masahiroy/linux-kbuild.git"), "for-next"),
 )
 
 
