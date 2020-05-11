@@ -86,7 +86,9 @@ sub new {
 	}
 
 	$self->{ua} = LWP::UserAgent->new;
-	$self->{ua}->credentials($self->{url}->host_port, "Use your novell account",
+	my $realm = "Use your developer account";
+	$realm = "Use your novell account" if $api_url =~ /opensuse/;
+	$self->{ua}->credentials($self->{url}->host_port, $realm,
 		$cred{user}, $cred{pass});
 	if ($self->{ua}->can('ssl_opts')) {
 		$self->{ua}->ssl_opts(verify_hostname => 1);
@@ -124,6 +126,7 @@ sub api {
 	}
 	#$self->{ua}->prepare_request($req);
 	#print STDERR "req: " . $req->as_string() . "\n";
+	#$self->{ua}->add_handler(request_send => sub { my($req, $ua, $handler) = @_; print STDERR "req: " . $req->as_string() . "\n"; return; m_method => "GET"});
 	my $res = $self->{ua}->request($req);
 	if ($res->code != 200) {
 		#print STDERR $res->as_string();
