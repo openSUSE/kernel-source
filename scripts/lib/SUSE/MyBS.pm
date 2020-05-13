@@ -87,7 +87,7 @@ sub new {
 
 	$self->{ua} = LWP::UserAgent->new;
 	my $realm = "Use your developer account";
-	$realm = "Use your novell account" if $api_url =~ /opensuse/;
+	$realm = "Use your SUSE developer account" if $api_url =~ /opensuse/;
 	$self->{ua}->credentials($self->{url}->host_port, $realm,
 		$cred{user}, $cred{pass});
 	if ($self->{ua}->can('ssl_opts')) {
