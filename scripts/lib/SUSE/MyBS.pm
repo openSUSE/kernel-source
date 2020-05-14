@@ -62,7 +62,7 @@ sub new {
 		die join("\n", @Config::IniFiles::errors), "\n";
 	}
 	my %cred;
-	for my $kw (qw(user pass passx)) {
+	for my $kw (qw(user pass passx keyring)) {
 		for my $section ($api_url, "$api_url/", $self->{url}->host) {
 			if (exists($config{$section}) &&
 					exists($config{$section}{$kw})) {
@@ -71,11 +71,11 @@ sub new {
 			}
 		}
 	}
-	if (!exists($cred{user}) || !exists($cred{pass}) && !exists($cred{passx})) {
+	if (!exists($cred{user}) || !exists($cred{pass}) && !exists($cred{passx}) && !exists($cred{keyring})) {
 			die "Error: Username or password for $api_url not set in ~/.oscrc\n" .
 			"Error: Run `osc -A $api_url ls' once\n";
 	}
-	if (!exists($cred{pass})) {
+	if (!exists($cred{pass}) && exists($cred{passx})) {
 		# Not available on SLES10, hence the 'require'
 		require MIME::Base64;
 		require IO::Uncompress::Bunzip2;
@@ -83,6 +83,16 @@ sub new {
 		$cred{pass} = "";
 		IO::Uncompress::Bunzip2::bunzip2(\$bz2 => \$cred{pass})
 			or die "Decoding password for $api_url failed: $IO::Uncompress::Bunzip2::Bunzip2Error\n";
+	}
+	if (!exists($cred{pass}) && exists($cred{keyring})) {
+		open(my $secret, "$ENV{PWD}/scripts/secretstorage $api_url $cred{user} |")
+		    or die "Couldn't run secretstorage\n";
+		$cred{pass} = <$secret>;
+		close($secret);
+		die "Failed to obtain secret from secretstorage\n"
+		    if !$cred{pass};
+		chomp($cred{pass});
+
 	}
 
 	$self->{ua} = LWP::UserAgent->new;
