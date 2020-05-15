@@ -71,9 +71,10 @@ sub new {
 			}
 		}
 	}
-	if ($cred{credentials_mgr_class} eq "osc.credentials.ObfuscatedConfigFileCredentialsManager") {
-		$cred{passx}=$cred{pass};
-	}
+	if (exists($cred{credentials_mgr_class})) {
+		if ($cred{credentials_mgr_class} eq "osc.credentials.ObfuscatedConfigFileCredentialsManager") {
+			$cred{passx}=$cred{pass};
+	}}
 	if (exists($cred{passx})) {
 		# Not available on SLES10, hence the 'require'
 		require MIME::Base64;
