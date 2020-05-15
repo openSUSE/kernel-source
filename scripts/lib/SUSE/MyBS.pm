@@ -85,11 +85,13 @@ sub new {
 			or die "Decoding password for $api_url failed: $IO::Uncompress::Bunzip2::Bunzip2Error\n";
 	}
 	if (!exists($cred{pass}) && exists($cred{keyring})) {
-		open(my $secret, "$ENV{PWD}/scripts/secretstorage $api_url $cred{user} |")
-		    or die "Couldn't run secretstorage\n";
+		my $api = $api_url;
+		$api =~ s/^https?:\/\///;
+		open(my $secret, "secret-tool lookup service $api username $cred{user} |")
+		    or die "Please install the \"secret-tool\" package to use a keyring\n";
 		$cred{pass} = <$secret>;
 		close($secret);
-		die "Failed to obtain secret from secretstorage\n"
+		die "Failed to obtain secret from secret-tool\n"
 		    if !$cred{pass};
 		chomp($cred{pass});
 	}
