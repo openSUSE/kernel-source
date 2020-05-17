@@ -62,7 +62,7 @@ sub new {
 		die join("\n", @Config::IniFiles::errors), "\n";
 	}
 	my %cred;
-	for my $kw (qw(user pass passx)) {
+	for my $kw (qw(user pass passx keyring credentials_mgr_class)) {
 		for my $section ($api_url, "$api_url/", $self->{url}->host) {
 			if (exists($config{$section}) &&
 					exists($config{$section}{$kw})) {
@@ -71,11 +71,11 @@ sub new {
 			}
 		}
 	}
-	if (!exists($cred{user}) || !exists($cred{pass}) && !exists($cred{passx})) {
-			die "Error: Username or password for $api_url not set in ~/.oscrc\n" .
-			"Error: Run `osc -A $api_url ls' once\n";
-	}
-	if (!exists($cred{pass})) {
+	if (exists($cred{credentials_mgr_class})) {
+		if ($cred{credentials_mgr_class} eq "osc.credentials.ObfuscatedConfigFileCredentialsManager") {
+			$cred{passx}=$cred{pass};
+	}}
+	if (exists($cred{passx})) {
 		# Not available on SLES10, hence the 'require'
 		require MIME::Base64;
 		require IO::Uncompress::Bunzip2;
@@ -84,10 +84,25 @@ sub new {
 		IO::Uncompress::Bunzip2::bunzip2(\$bz2 => \$cred{pass})
 			or die "Decoding password for $api_url failed: $IO::Uncompress::Bunzip2::Bunzip2Error\n";
 	}
+	if (!exists($cred{pass}) && exists($cred{keyring})) {
+		my $api = $api_url;
+		$api =~ s/^https?:\/\///;
+		open(my $secret, "secret-tool lookup service $api username $cred{user} |")
+		    or die "Please install the \"secret-tool\" package to use a keyring\n";
+		$cred{pass} = <$secret>;
+		close($secret);
+		die "Failed to obtain secret from secret-tool\n"
+		    if !$cred{pass};
+		chomp($cred{pass});
+	}
+	if (!exists($cred{user}) || !exists($cred{pass})) {
+			die "Error: Username or password for $api_url not set in ~/.oscrc\n" .
+			"Error: Run `osc -A $api_url ls' once\n";
+	}
 
 	$self->{ua} = LWP::UserAgent->new;
 	my $realm = "Use your developer account";
-	$realm = "Use your novell account" if $api_url =~ /opensuse/;
+	$realm = "Use your SUSE developer account" if $api_url =~ /opensuse/;
 	$self->{ua}->credentials($self->{url}->host_port, $realm,
 		$cred{user}, $cred{pass});
 	if ($self->{ua}->can('ssl_opts')) {
