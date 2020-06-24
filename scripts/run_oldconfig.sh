@@ -362,7 +362,7 @@ ask_reuse_config()
 
 filter_config()
 {
-    sed  -e '/CONFIG_GCC_VERSION/ d' -e '/CONFIG_LD_VERSION/ d' -e '/^# .* is not set$/p' -e '/^$\|^#/d' "$@" | sort
+    sed  -e '/CONFIG_GCC_VERSION/ d' -e '/CONFIG_LD_VERSION/ d' -e '/CONFIG_CC_VERSION_TEXT/ d' -e '/^# .* is not set$/p' -e '/^$\|^#/d' "$@" | sort
 }
 
 # Keep these in the -vanilla fragment even if -default has the same values.
