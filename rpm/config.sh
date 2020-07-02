@@ -7,7 +7,7 @@ COMPRESS_MODULES="xz"
 # Use new style livepatch package names
 LIVEPATCH=livepatch
 # buildservice projects to build the kernel against
-OBS_PROJECT=SUSE:SLE-15-SP1:Update
+OBS_PROJECT=SUSE:SLE-15-SP2:Update
 IBS_PROJECT=SUSE:SLE-15-SP2:Update
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
