@@ -1,0 +1,233 @@
+From ba9d2992f91d5010552508cadb701e1176e965cf Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Fri, 3 Jul 2020 12:40:33 +0200
+Subject: [PATCH] sched: Fix loadavg accounting race
+
+References: bnc#1155798 (CPU scheduler functional and performance backports)
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git
+Git-commit: dbfb089d360b1cc623c51a2c7cf9b99eff78e0e7
+Patch-mainline: Queued in subsystem maintainer repository
+
+The recent commit:
+
+  c6e7bd7afaeb ("sched/core: Optimize ttwu() spinning on p->on_cpu")
+
+moved these lines in ttwu():
+
+	p->sched_contributes_to_load = !!task_contributes_to_load(p);
+	p->state = TASK_WAKING;
+
+up before:
+
+	smp_cond_load_acquire(&p->on_cpu, !VAL);
+
+into the 'p->on_rq == 0' block, with the thinking that once we hit
+schedule() the current task cannot change it's ->state anymore. And
+while this is true, it is both incorrect and flawed.
+
+It is incorrect in that we need at least an ACQUIRE on 'p->on_rq == 0'
+to avoid weak hardware from re-ordering things for us. This can fairly
+easily be achieved by relying on the control-dependency already in
+place.
+
+The second problem, which makes the flaw in the original argument, is
+that while schedule() will not change prev->state, it will read it a
+number of times (arguably too many times since it's marked volatile).
+The previous condition 'p->on_cpu == 0' was sufficient because that
+indicates schedule() has completed, and will no longer read
+prev->state. So now the trick is to make this same true for the (much)
+earlier 'prev->on_rq == 0' case.
+
+Furthermore, in order to make the ordering stick, the 'prev->on_rq = 0'
+assignment needs to he a RELEASE, but adding additional ordering to
+schedule() is an unwelcome proposition at the best of times, doubly so
+for mere accounting.
+
+Luckily we can push the prev->state load up before rq->lock, with the
+only caveat that we then have to re-read the state after. However, we
+know that if it changed, we no longer have to worry about the blocking
+path. This gives us the required ordering, if we block, we did the
+prev->state load before an (effective) smp_mb() and the p->on_rq store
+needs not change.
+
+With this we end up with the effective ordering:
+
+	LOAD p->state           LOAD-ACQUIRE p->on_rq == 0
+	MB
+	STORE p->on_rq, 0       STORE p->state, TASK_WAKING
+
+which ensures the TASK_WAKING store happens after the prev->state
+load, and all is well again.
+
+Fixes: c6e7bd7afaeb ("sched/core: Optimize ttwu() spinning on p->on_cpu")
+Reported-by: Dave Jones <davej@codemonkey.org.uk>
+Reported-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Tested-by: Dave Jones <davej@codemonkey.org.uk>
+Tested-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+Link: https://lkml.kernel.org/r/20200707102957.GN117543@hirez.programming.kicks-ass.net
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ include/linux/sched.h |  4 ---
+ kernel/sched/core.c   | 67 +++++++++++++++++++++++++++++++++++++++------------
+ 2 files changed, 51 insertions(+), 20 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 731075c96751..01c98186c004 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -111,10 +111,6 @@ struct task_group;
+ 
+ #define task_is_stopped_or_traced(task)	((task->state & (__TASK_STOPPED | __TASK_TRACED)) != 0)
+ 
+-#define task_contributes_to_load(task)	((task->state & TASK_UNINTERRUPTIBLE) != 0 && \
+-					 (task->flags & PF_FROZEN) == 0 && \
+-					 (task->state & TASK_NOLOAD) == 0)
+-
+ #ifdef CONFIG_DEBUG_ATOMIC_SLEEP
+ 
+ /*
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index c3745e24234c..5f55bb4a1f9d 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -1205,9 +1205,6 @@ static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
+ 
+ void activate_task(struct rq *rq, struct task_struct *p, int flags)
+ {
+-	if (task_contributes_to_load(p))
+-		rq->nr_uninterruptible--;
+-
+ 	enqueue_task(rq, p, flags);
+ 
+ 	p->on_rq = TASK_ON_RQ_QUEUED;
+@@ -1217,9 +1214,6 @@ void deactivate_task(struct rq *rq, struct task_struct *p, int flags)
+ {
+ 	p->on_rq = (flags & DEQUEUE_SLEEP) ? 0 : TASK_ON_RQ_MIGRATING;
+ 
+-	if (task_contributes_to_load(p))
+-		rq->nr_uninterruptible++;
+-
+ 	dequeue_task(rq, p, flags);
+ }
+ 
+@@ -2130,10 +2124,10 @@ ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
+ 
+ 	lockdep_assert_held(&rq->lock);
+ 
+-#ifdef CONFIG_SMP
+ 	if (p->sched_contributes_to_load)
+ 		rq->nr_uninterruptible--;
+ 
++#ifdef CONFIG_SMP
+ 	if (wake_flags & WF_MIGRATED)
+ 		en_flags |= ENQUEUE_MIGRATED;
+ #endif
+@@ -2500,7 +2494,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+ 	 * __schedule().  See the comment for smp_mb__after_spinlock().
+ 	 */
+ 	smp_rmb();
+-	if (p->on_rq && ttwu_remote(p, wake_flags))
++	if (READ_ONCE(p->on_rq) && ttwu_remote(p, wake_flags))
+ 		goto unlock;
+ 
+ 	if (p->in_iowait) {
+@@ -2509,9 +2503,6 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+ 	}
+ 
+ #ifdef CONFIG_SMP
+-	p->sched_contributes_to_load = !!task_contributes_to_load(p);
+-	p->state = TASK_WAKING;
+-
+ 	/*
+ 	 * Ensure we load p->on_cpu _after_ p->on_rq, otherwise it would be
+ 	 * possible to, falsely, observe p->on_cpu == 0.
+@@ -2530,8 +2521,20 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+ 	 *
+ 	 * Pairs with the LOCK+smp_mb__after_spinlock() on rq->lock in
+ 	 * __schedule().  See the comment for smp_mb__after_spinlock().
++	 *
++	 * Form a control-dep-acquire with p->on_rq == 0 above, to ensure
++	 * schedule()'s deactivate_task() has 'happened' and p will no longer
++	 * care about it's own p->state. See the comment in __schedule().
+ 	 */
+-	smp_rmb();
++	smp_acquire__after_ctrl_dep();
++
++	/*
++	 * We're doing the wakeup (@success == 1), they did a dequeue (p->on_rq
++	 * == 0), which means we need to do an enqueue, change p->state to
++	 * TASK_WAKING such that we can unlock p->pi_lock before doing the
++	 * enqueue, such as ttwu_queue_wakelist().
++	 */
++	p->state = TASK_WAKING;
+ 
+ 	/*
+ 	 * If the owning (remote) CPU is still in the middle of schedule() with
+@@ -3933,6 +3936,7 @@ static void __sched notrace __schedule(bool preempt)
+ {
+ 	struct task_struct *prev, *next;
+ 	unsigned long *switch_count;
++	unsigned long prev_state;
+ 	struct rq_flags rf;
+ 	struct rq *rq;
+ 	int cpu;
+@@ -3949,12 +3953,22 @@ static void __sched notrace __schedule(bool preempt)
+ 	local_irq_disable();
+ 	rcu_note_context_switch(preempt);
+ 
++	/* See deactivate_task() below. */
++	prev_state = prev->state;
++
+ 	/*
+ 	 * Make sure that signal_pending_state()->signal_pending() below
+ 	 * can't be reordered with __set_current_state(TASK_INTERRUPTIBLE)
+-	 * done by the caller to avoid the race with signal_wake_up().
++	 * done by the caller to avoid the race with signal_wake_up():
++	 *
++	 * __set_current_state(@state)		signal_wake_up()
++	 * schedule()				  set_tsk_thread_flag(p, TIF_SIGPENDING)
++	 *					  wake_up_state(p, state)
++	 *   LOCK rq->lock			    LOCK p->pi_state
++	 *   smp_mb__after_spinlock()		    smp_mb__after_spinlock()
++	 *     if (signal_pending_state())	    if (p->state & @state)
+ 	 *
+-	 * The membarrier system call requires a full memory barrier
++	 * Also, the membarrier system call requires a full memory barrier
+ 	 * after coming from user-space, before storing to rq->curr.
+ 	 */
+ 	rq_lock(rq, &rf);
+@@ -3965,10 +3979,31 @@ static void __sched notrace __schedule(bool preempt)
+ 	update_rq_clock(rq);
+ 
+ 	switch_count = &prev->nivcsw;
+-	if (!preempt && prev->state) {
+-		if (signal_pending_state(prev->state, prev)) {
++	/*
++	 * We must re-load prev->state in case ttwu_remote() changed it
++	 * before we acquired rq->lock.
++	 */
++	if (!preempt && prev_state && prev_state == prev->state) {
++		if (signal_pending_state(prev_state, prev)) {
+ 			prev->state = TASK_RUNNING;
+ 		} else {
++			prev->sched_contributes_to_load =
++				(prev_state & TASK_UNINTERRUPTIBLE) &&
++				!(prev_state & TASK_NOLOAD) &&
++				!(prev->flags & PF_FROZEN);
++
++			if (prev->sched_contributes_to_load)
++				rq->nr_uninterruptible++;
++
++			/*
++			 * __schedule()			ttwu()
++			 *   prev_state = prev->state;	  if (READ_ONCE(p->on_rq) && ...)
++			 *   LOCK rq->lock		    goto out;
++			 *   smp_mb__after_spinlock();	  smp_acquire__after_ctrl_dep();
++			 *   p->on_rq = 0;		  p->state = TASK_WAKING;
++			 *
++			 * After this, schedule() must not care about p->state any more.
++			 */
+ 			deactivate_task(rq, prev, DEQUEUE_SLEEP | DEQUEUE_NOCLOCK);
+ 
+ 			if (prev->in_iowait) {
