@@ -65,6 +65,7 @@ class RepoURL(object):
         k_org_prefixes = [
             "http://git.kernel.org/pub/scm/linux/kernel/git/",
             "https://git.kernel.org/pub/scm/linux/kernel/git/",
+            "ssh://git@gitolite.kernel.org/pub/scm/linux/kernel/git/",
             "https://kernel.googlesource.com/pub/scm/linux/kernel/git/",
         ]
         for prefix in k_org_prefixes:
