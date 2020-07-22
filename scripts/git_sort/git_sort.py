@@ -65,6 +65,7 @@ class RepoURL(object):
         k_org_prefixes = [
             "http://git.kernel.org/pub/scm/linux/kernel/git/",
             "https://git.kernel.org/pub/scm/linux/kernel/git/",
+            "ssh://git@gitolite.kernel.org/pub/scm/linux/kernel/git/",
             "https://kernel.googlesource.com/pub/scm/linux/kernel/git/",
         ]
         for prefix in k_org_prefixes:
@@ -223,8 +224,6 @@ remotes = (
     Head(RepoURL("mkp/scsi.git"), "fixes"),
     Head(RepoURL("git://git.kernel.dk/linux-block.git"), "for-next"),
     Head(RepoURL("git://git.kernel.org/pub/scm/virt/kvm/kvm.git"), "queue"),
-    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.7"),
-    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.8"),
     Head(RepoURL("dhowells/linux-fs.git")),
     Head(RepoURL("herbert/cryptodev-2.6.git")),
     Head(RepoURL("helgaas/pci.git"), "next"),
