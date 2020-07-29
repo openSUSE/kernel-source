@@ -1,0 +1,109 @@
+From: Boris Burkov <boris@bur.io>
+Date: Thu, 16 Jul 2020 13:29:46 -0700
+Subject: [PATCH] btrfs: fix mount failure caused by race with umount
+References: bnc#1012628
+Patch-mainline: 5.7.11
+Git-commit: 48cfa61b58a1fee0bc49eef04f8ccf31493b7cdd
+
+commit 48cfa61b58a1fee0bc49eef04f8ccf31493b7cdd upstream.
+
+It is possible to cause a btrfs mount to fail by racing it with a slow
+umount. The crux of the sequence is generic_shutdown_super not yet
+calling sop->put_super before btrfs_mount_root calls btrfs_open_devices.
+If that occurs, btrfs_open_devices will decide the opened counter is
+non-zero, increment it, and skip resetting fs_devices->total_rw_bytes to
+0. From here, mount will call sget which will result in grab_super
+trying to take the super block umount semaphore. That semaphore will be
+held by the slow umount, so mount will block. Before up-ing the
+semaphore, umount will delete the super block, resulting in mount's sget
+reliably allocating a new one, which causes the mount path to dutifully
+fill it out, and increment total_rw_bytes a second time, which causes
+the mount to fail, as we see double the expected bytes.
+
+Here is the sequence laid out in greater detail:
+
+CPU0                                                    CPU1
+down_write sb->s_umount
+btrfs_kill_super
+  kill_anon_super(sb)
+    generic_shutdown_super(sb);
+      shrink_dcache_for_umount(sb);
+      sync_filesystem(sb);
+      evict_inodes(sb); // SLOW
+
+                                              btrfs_mount_root
+                                                btrfs_scan_one_device
+                                                fs_devices = device->fs_devices
+                                                fs_info->fs_devices = fs_devices
+                                                // fs_devices-opened makes this a no-op
+                                                btrfs_open_devices(fs_devices, mode, fs_type)
+                                                s = sget(fs_type, test, set, flags, fs_info);
+                                                  find sb in s_instances
+                                                  grab_super(sb);
+                                                    down_write(&s->s_umount); // blocks
+
+      sop->put_super(sb)
+        // sb->fs_devices->opened == 2; no-op
+      spin_lock(&sb_lock);
+      hlist_del_init(&sb->s_instances);
+      spin_unlock(&sb_lock);
+      up_write(&sb->s_umount);
+                                                    return 0;
+                                                  retry lookup
+                                                  don't find sb in s_instances (deleted by CPU0)
+                                                  s = alloc_super
+                                                  return s;
+                                                btrfs_fill_super(s, fs_devices, data)
+                                                  open_ctree // fs_devices total_rw_bytes improperly set!
+                                                    btrfs_read_chunk_tree
+                                                      read_one_dev // increment total_rw_bytes again!!
+                                                      super_total_bytes < fs_devices->total_rw_bytes // ERROR!!!
+
+To fix this, we clear total_rw_bytes from within btrfs_read_chunk_tree
+before the calls to read_one_dev, while holding the sb umount semaphore
+and the uuid mutex.
+
+To reproduce, it is sufficient to dirty a decent number of inodes, then
+quickly umount and mount.
+
+  for i in $(seq 0 500)
+  do
+    dd if=/dev/zero of="/mnt/foo/$i" bs=1M count=1
+  done
+  umount /mnt/foo&
+  mount /mnt/foo
+
+does the trick for me.
+
+CC: stable@vger.kernel.org # 4.4+
+Signed-off-by: Boris Burkov <boris@bur.io>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/btrfs/volumes.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+index 21c7d3d87827..45cf455f906d 100644
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -7055,6 +7055,14 @@ int btrfs_read_chunk_tree(struct btrfs_fs_info *fs_info)
+ 	mutex_lock(&uuid_mutex);
+ 	mutex_lock(&fs_info->chunk_mutex);
+ 
++	/*
++	 * It is possible for mount and umount to race in such a way that
++	 * we execute this code path, but open_fs_devices failed to clear
++	 * total_rw_bytes. We certainly want it cleared before reading the
++	 * device items, so clear it here.
++	 */
++	fs_info->fs_devices->total_rw_bytes = 0;
++
+ 	/*
+ 	 * Read all device items, and then all the chunk items. All
+ 	 * device items are found before any chunk item (their object id
+-- 
+2.28.0
+
