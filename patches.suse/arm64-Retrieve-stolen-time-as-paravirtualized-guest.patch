@@ -1,0 +1,244 @@
+From: Steven Price <steven.price@arm.com>
+Date: Mon, 21 Oct 2019 16:28:23 +0100
+Subject: arm64: Retrieve stolen time as paravirtualized guest
+Patch-mainline: v5.5-rc1
+Git-commit: e0685fa228fdaf386f82ac0d64b2d6f3e0ddd588
+References: bsc#1172197 jsc#SLE-13593
+
+Enable paravirtualization features when running under a hypervisor
+supporting the PV_TIME_ST hypercall.
+
+For each (v)CPU, we ask the hypervisor for the location of a shared
+page which the hypervisor will use to report stolen time to us. We set
+pv_time_ops to the stolen time function which simply reads the stolen
+value from the shared page for a VCPU. We guarantee single-copy
+atomicity using READ_ONCE which means we can also read the stolen
+time for another VCPU than the currently running one while it is
+potentially being updated by the hypervisor.
+
+Signed-off-by: Steven Price <steven.price@arm.com>
+Signed-off-by: Marc Zyngier <maz@kernel.org>
+Acked-by: Liang Yan <lyan@suse.com>
+---
+ Documentation/admin-guide/kernel-parameters.txt |    6 -
+ arch/arm64/include/asm/paravirt.h               |    9 +
+ arch/arm64/kernel/paravirt.c                    |  140 ++++++++++++++++++++++++
+ arch/arm64/kernel/time.c                        |    3 
+ include/linux/cpuhotplug.h                      |    1 
+ 5 files changed, 155 insertions(+), 4 deletions(-)
+
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -3091,9 +3091,9 @@
+ 			[X86,PV_OPS] Disable paravirtualized VMware scheduler
+ 			clock and use the default one.
+ 
+-	no-steal-acc	[X86,KVM] Disable paravirtualized steal time accounting.
+-			steal time is computed, but won't influence scheduler
+-			behaviour
++	no-steal-acc	[X86,KVM,ARM64] Disable paravirtualized steal time
++			accounting. steal time is computed, but won't
++			influence scheduler behaviour
+ 
+ 	nolapic		[X86-32,APIC] Do not enable or use the local APIC.
+ 
+--- a/arch/arm64/include/asm/paravirt.h
++++ b/arch/arm64/include/asm/paravirt.h
+@@ -21,6 +21,13 @@ static inline u64 paravirt_steal_clock(i
+ {
+ 	return pv_ops.time.steal_clock(cpu);
+ }
+-#endif
++
++int __init pv_time_init(void);
++
++#else
++
++#define pv_time_init() do {} while (0)
++
++#endif // CONFIG_PARAVIRT
+ 
+ #endif
+--- a/arch/arm64/kernel/paravirt.c
++++ b/arch/arm64/kernel/paravirt.c
+@@ -6,13 +6,153 @@
+  * Author: Stefano Stabellini <stefano.stabellini@eu.citrix.com>
+  */
+ 
++#define pr_fmt(fmt) "arm-pv: " fmt
++
++#include <linux/arm-smccc.h>
++#include <linux/cpuhotplug.h>
+ #include <linux/export.h>
++#include <linux/io.h>
+ #include <linux/jump_label.h>
++#include <linux/printk.h>
++#include <linux/psci.h>
++#include <linux/reboot.h>
++#include <linux/slab.h>
+ #include <linux/types.h>
++
+ #include <asm/paravirt.h>
++#include <asm/pvclock-abi.h>
++#include <asm/smp_plat.h>
+ 
+ struct static_key paravirt_steal_enabled;
+ struct static_key paravirt_steal_rq_enabled;
+ 
+ struct paravirt_patch_template pv_ops;
+ EXPORT_SYMBOL_GPL(pv_ops);
++
++struct pv_time_stolen_time_region {
++	struct pvclock_vcpu_stolen_time *kaddr;
++};
++
++static DEFINE_PER_CPU(struct pv_time_stolen_time_region, stolen_time_region);
++
++static bool steal_acc = true;
++static int __init parse_no_stealacc(char *arg)
++{
++	steal_acc = false;
++	return 0;
++}
++
++early_param("no-steal-acc", parse_no_stealacc);
++
++/* return stolen time in ns by asking the hypervisor */
++static u64 pv_steal_clock(int cpu)
++{
++	struct pv_time_stolen_time_region *reg;
++
++	reg = per_cpu_ptr(&stolen_time_region, cpu);
++	if (!reg->kaddr) {
++		pr_warn_once("stolen time enabled but not configured for cpu %d\n",
++			     cpu);
++		return 0;
++	}
++
++	return le64_to_cpu(READ_ONCE(reg->kaddr->stolen_time));
++}
++
++static int stolen_time_dying_cpu(unsigned int cpu)
++{
++	struct pv_time_stolen_time_region *reg;
++
++	reg = this_cpu_ptr(&stolen_time_region);
++	if (!reg->kaddr)
++		return 0;
++
++	memunmap(reg->kaddr);
++	memset(reg, 0, sizeof(*reg));
++
++	return 0;
++}
++
++static int init_stolen_time_cpu(unsigned int cpu)
++{
++	struct pv_time_stolen_time_region *reg;
++	struct arm_smccc_res res;
++
++	reg = this_cpu_ptr(&stolen_time_region);
++
++	arm_smccc_1_1_invoke(ARM_SMCCC_HV_PV_TIME_ST, &res);
++
++	if (res.a0 == SMCCC_RET_NOT_SUPPORTED)
++		return -EINVAL;
++
++	reg->kaddr = memremap(res.a0,
++			      sizeof(struct pvclock_vcpu_stolen_time),
++			      MEMREMAP_WB);
++
++	if (!reg->kaddr) {
++		pr_warn("Failed to map stolen time data structure\n");
++		return -ENOMEM;
++	}
++
++	if (le32_to_cpu(reg->kaddr->revision) != 0 ||
++	    le32_to_cpu(reg->kaddr->attributes) != 0) {
++		pr_warn_once("Unexpected revision or attributes in stolen time data\n");
++		return -ENXIO;
++	}
++
++	return 0;
++}
++
++static int pv_time_init_stolen_time(void)
++{
++	int ret;
++
++	ret = cpuhp_setup_state(CPUHP_AP_ARM_KVMPV_STARTING,
++				"hypervisor/arm/pvtime:starting",
++				init_stolen_time_cpu, stolen_time_dying_cpu);
++	if (ret < 0)
++		return ret;
++	return 0;
++}
++
++static bool has_pv_steal_clock(void)
++{
++	struct arm_smccc_res res;
++
++	/* To detect the presence of PV time support we require SMCCC 1.1+ */
++	if (psci_ops.smccc_version < SMCCC_VERSION_1_1)
++		return false;
++
++	arm_smccc_1_1_invoke(ARM_SMCCC_ARCH_FEATURES_FUNC_ID,
++			     ARM_SMCCC_HV_PV_TIME_FEATURES, &res);
++
++	if (res.a0 != SMCCC_RET_SUCCESS)
++		return false;
++
++	arm_smccc_1_1_invoke(ARM_SMCCC_HV_PV_TIME_FEATURES,
++			     ARM_SMCCC_HV_PV_TIME_ST, &res);
++
++	return (res.a0 == SMCCC_RET_SUCCESS);
++}
++
++int __init pv_time_init(void)
++{
++	int ret;
++
++	if (!has_pv_steal_clock())
++		return 0;
++
++	ret = pv_time_init_stolen_time();
++	if (ret)
++		return ret;
++
++	pv_ops.time.steal_clock = pv_steal_clock;
++
++	static_key_slow_inc(&paravirt_steal_enabled);
++	if (steal_acc)
++		static_key_slow_inc(&paravirt_steal_rq_enabled);
++
++	pr_info("using stolen time PV\n");
++
++	return 0;
++}
+--- a/arch/arm64/kernel/time.c
++++ b/arch/arm64/kernel/time.c
+@@ -30,6 +30,7 @@
+ 
+ #include <asm/thread_info.h>
+ #include <asm/stacktrace.h>
++#include <asm/paravirt.h>
+ 
+ unsigned long profile_pc(struct pt_regs *regs)
+ {
+@@ -65,4 +66,6 @@ void __init time_init(void)
+ 
+ 	/* Calibrate the delay loop directly */
+ 	lpj_fine = arch_timer_rate / HZ;
++
++	pv_time_init();
+ }
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@ -136,6 +136,7 @@ enum cpuhp_state {
+ 	/* Must be the last timer callback */
+ 	CPUHP_AP_DUMMY_TIMER_STARTING,
+ 	CPUHP_AP_ARM_XEN_STARTING,
++	CPUHP_AP_ARM_KVMPV_STARTING,
+ 	CPUHP_AP_ARM_CORESIGHT_STARTING,
+ 	CPUHP_AP_ARM64_ISNDEP_STARTING,
+ 	CPUHP_AP_SMPCFD_DYING,
