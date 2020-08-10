@@ -1,0 +1,230 @@
+From a0b224b90bb60b3fbd2cae750227c995c9e61055 Mon Sep 17 00:00:00 2001
+From: Mark Hills <mark@xwax.org>
+Date: Wed, 8 Jul 2020 11:18:48 +0100
+Subject: [PATCH] ALSA: echoaudio: Address bugs in the interrupt handling
+Git-commit: a0b224b90bb60b3fbd2cae750227c995c9e61055
+Patch-mainline: v5.9-rc1
+References: git-fixes
+
+Distorted audio appears occasionally, affecting either playback or
+capture and requiring the affected substream to be closed by all
+applications and re-opened.
+
+The best way I have found to reproduce the bug is to use dmix in
+combination with Chromium, which opens the audio device multiple times
+in threads. Anecdotally, the problems appear to have increased with
+faster CPUs. I ruled out 32-bit counter wrapping; it often happens
+much earlier.
+
+Since applying this patch I have not had problems, where previously
+they would occur several times a day.
+
+The patch targets the following issues:
+
+* Check for progress using the counter from the hardware, not after it
+  has been truncated to the buffer.
+
+  This is a clean way to address a possible bug where if a whole
+  ringbuffer advances between interrupts, it goes unnoticed.
+
+* Move last_period state from chip to pipe
+
+  This more logically belongs as part of pipe, and code is reasier to
+  read if it is "counter position last time a period elapsed".
+
+  Now the code has no references to period count. A period is just
+  when the regular counter crosses a threshold. This increases
+  readability and reduces scope for bugs.
+
+* Treat period notification and buffer advance independently:
+
+  This helps to clarify what is the responsibility of the interrupt
+  handler, and what is pcm_pointer().
+
+  Removing shared state between these operations means race conditions
+  are fixed without introducing locks. Synchronisation is only around
+  the read of pipe->dma_counter. There may be cache line contention
+  around "struct audiopipe" but I did not have cause to profile this.
+
+Pay attention to be robust where dma_counter wrapping is not a
+multiple of period_size or buffer_size.
+
+This is a revised patch based on feedback from Takashi and Giuliano.
+
+Signed-off-by: Mark Hills <mark@xwax.org>
+Link: https://lore.kernel.org/r/20200708101848.3457-5-mark@xwax.org
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ sound/pci/echoaudio/echoaudio.c | 85 ++++++++++++++++++++++++++++-------------
+ sound/pci/echoaudio/echoaudio.h |  8 +++-
+ 2 files changed, 65 insertions(+), 28 deletions(-)
+
+diff --git a/sound/pci/echoaudio/echoaudio.c b/sound/pci/echoaudio/echoaudio.c
+index c97928e7e56b..31449b7c51c6 100644
+--- a/sound/pci/echoaudio/echoaudio.c
++++ b/sound/pci/echoaudio/echoaudio.c
+@@ -2,6 +2,7 @@
+ /*
+  *  ALSA driver for Echoaudio soundcards.
+  *  Copyright (C) 2003-2004 Giuliano Pochini <pochini@shiny.it>
++ *  Copyright (C) 2020 Mark Hills <mark@xwax.org>
+  */
+ 
+ #include <linux/module.h>
+@@ -590,7 +591,7 @@ static int init_engine(struct snd_pcm_substream *substream,
+ 	/* This stuff is used by the irq handler, so it must be
+ 	 * initialized before chip->substream
+ 	 */
+-	chip->last_period[pipe_index] = 0;
++	pipe->last_period = 0;
+ 	pipe->last_counter = 0;
+ 	pipe->position = 0;
+ 	smp_wmb();
+@@ -759,7 +760,7 @@ static int pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+ 				pipe = chip->substream[i]->runtime->private_data;
+ 				switch (pipe->state) {
+ 				case PIPE_STATE_STOPPED:
+-					chip->last_period[i] = 0;
++					pipe->last_period = 0;
+ 					pipe->last_counter = 0;
+ 					pipe->position = 0;
+ 					*pipe->dma_counter = 0;
+@@ -807,19 +808,26 @@ static snd_pcm_uframes_t pcm_pointer(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_pcm_runtime *runtime = substream->runtime;
+ 	struct audiopipe *pipe = runtime->private_data;
+-	size_t cnt, bufsize, pos;
++	u32 counter, step;
+ 
+-	cnt = le32_to_cpu(*pipe->dma_counter);
+-	pipe->position += cnt - pipe->last_counter;
+-	pipe->last_counter = cnt;
+-	bufsize = substream->runtime->buffer_size;
+-	pos = bytes_to_frames(substream->runtime, pipe->position);
++	/*
++	 * IRQ handling runs concurrently. Do not share tracking of
++	 * counter with it, which would race or require locking
++	 */
+ 
+-	while (pos >= bufsize) {
+-		pipe->position -= frames_to_bytes(substream->runtime, bufsize);
+-		pos -= bufsize;
+-	}
+-	return pos;
++	counter = le32_to_cpu(*pipe->dma_counter);  /* presumed atomic */
++
++	step = counter - pipe->last_counter;  /* handles wrapping */
++	pipe->last_counter = counter;
++
++	/* counter doesn't neccessarily wrap on a multiple of
++	 * buffer_size, so can't derive the position; must
++	 * accumulate */
++
++	pipe->position += step;
++	pipe->position %= frames_to_bytes(runtime, runtime->buffer_size); /* wrap */
++
++	return bytes_to_frames(runtime, pipe->position);
+ }
+ 
+ 
+@@ -1782,14 +1790,43 @@ static const struct snd_kcontrol_new snd_echo_channels_info = {
+ 
+ 
+ /******************************************************************************
+-	IRQ Handler
++	IRQ Handling
+ ******************************************************************************/
++/* Check if a period has elapsed since last interrupt
++ *
++ * Don't make any updates to state; PCM core handles this with the
++ * correct locks.
++ *
++ * \return true if a period has elapsed, otherwise false
++ */
++static bool period_has_elapsed(struct snd_pcm_substream *substream)
++{
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct audiopipe *pipe = runtime->private_data;
++	u32 counter, step;
++	size_t period_bytes;
++
++	if (pipe->state != PIPE_STATE_STARTED)
++		return false;
++
++	period_bytes = frames_to_bytes(runtime, runtime->period_size);
++
++	counter = le32_to_cpu(*pipe->dma_counter);  /* presumed atomic */
++
++	step = counter - pipe->last_period;  /* handles wrapping */
++	step -= step % period_bytes;  /* acknowledge whole periods only */
++
++	if (step == 0)
++		return false;  /* haven't advanced a whole period yet */
++
++	pipe->last_period += step;  /* used exclusively by us */
++	return true;
++}
+ 
+ static irqreturn_t snd_echo_interrupt(int irq, void *dev_id)
+ {
+ 	struct echoaudio *chip = dev_id;
+-	struct snd_pcm_substream *substream;
+-	int period, ss, st;
++	int ss, st;
+ 
+ 	spin_lock(&chip->lock);
+ 	st = service_irq(chip);
+@@ -1800,17 +1837,13 @@ static irqreturn_t snd_echo_interrupt(int irq, void *dev_id)
+ 	/* The hardware doesn't tell us which substream caused the irq,
+ 	thus we have to check all running substreams. */
+ 	for (ss = 0; ss < DSP_MAXPIPES; ss++) {
++		struct snd_pcm_substream *substream;
++
+ 		substream = chip->substream[ss];
+-		if (substream && ((struct audiopipe *)substream->runtime->
+-				private_data)->state == PIPE_STATE_STARTED) {
+-			period = pcm_pointer(substream) /
+-				substream->runtime->period_size;
+-			if (period != chip->last_period[ss]) {
+-				chip->last_period[ss] = period;
+-				spin_unlock(&chip->lock);
+-				snd_pcm_period_elapsed(substream);
+-				spin_lock(&chip->lock);
+-			}
++		if (substream && period_has_elapsed(substream)) {
++			spin_unlock(&chip->lock);
++			snd_pcm_period_elapsed(substream);
++			spin_lock(&chip->lock);
+ 		}
+ 	}
+ 	spin_unlock(&chip->lock);
+diff --git a/sound/pci/echoaudio/echoaudio.h b/sound/pci/echoaudio/echoaudio.h
+index 6fd283e4e676..30c640931f1e 100644
+--- a/sound/pci/echoaudio/echoaudio.h
++++ b/sound/pci/echoaudio/echoaudio.h
+@@ -298,7 +298,12 @@ struct audiopipe {
+ 					 * the current dma position
+ 					 * (lower 32 bits only)
+ 					 */
+-	u32 last_counter;		/* The last position, which is used
++	u32 last_period;                /* Counter position last time a
++					 * period elapsed
++					 */
++	u32 last_counter;		/* Used exclusively by pcm_pointer
++					 * under PCM core locks.
++					 * The last position, which is used
+ 					 * to compute...
+ 					 */
+ 	u32 position;			/* ...the number of bytes tranferred
+@@ -332,7 +337,6 @@ struct audioformat {
+ struct echoaudio {
+ 	spinlock_t lock;
+ 	struct snd_pcm_substream *substream[DSP_MAXPIPES];
+-	int last_period[DSP_MAXPIPES];
+ 	struct mutex mode_mutex;
+ 	u16 num_digital_modes, digital_mode_list[6];
+ 	u16 num_clock_sources, clock_source_list[10];
+-- 
+2.16.4
+
