@@ -97,8 +97,8 @@ set_var()
 		fi
 		sed -i "/\\<$name[ =]/d" "${prefix}config/$config"
 		case "$val" in
-		y | m) echo "$name=$val" ;;
 		n) echo "# $name is not set" ;;
+		*) echo "$name=$val" ;;
 		esac >> ${prefix}config/$config
 	done
 }
@@ -159,6 +159,12 @@ until [ "$#" = "0" ] ; do
 		value=n
 		shift 2
 		;;
+	-nco|--new-config-option)
+		mode=single
+		option="${2%%=*}"
+		value="${2#*=}"
+		shift 2
+		;;
 	--flavor)
 		set_flavor="$2"
 		shift 2
@@ -212,6 +218,11 @@ FOO
 FOO=X
 CONFIG_FOO
 CONFIG_FOO=X
+run with the following to modify option taking a value:
+	-nco|--new-config-option OPTION=VALUE
+as above, OPTION can be used with or without the CONFIG_ prefix; for string
+options requiring double quotes, these must be used in argument (and shell
+escaped)
 
 Run with -s|--silent in both modes to suppress most output
 EOF
