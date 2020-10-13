@@ -251,6 +251,7 @@ remotes = (
     Head(RepoURL("efi/efi.git"), "next"),
     Head(RepoURL("ulfh/mmc.git"), "next"),
     Head(RepoURL("masahiroy/linux-kbuild.git"), "for-next"),
+    Head(RepoURL("bluetooth/bluetooth-next.git")),
     Head(RepoURL("clk/linux.git"), "clk-next"),
 )
 
