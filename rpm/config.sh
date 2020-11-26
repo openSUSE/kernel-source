@@ -13,6 +13,7 @@ LIVEPATCH=livepatch
 OBS_PROJECT=openSUSE:Factory
 OBS_PROJECT_ARM=openSUSE:Factory:ARM
 OBS_PROJECT_PPC=openSUSE:Factory:PowerPC
+OBS_PROJECT_RISCV=openSUSE:Factory:RISCV
 IBS_PROJECT=SUSE:Factory:Head
 IBS_PROJECT_ARM=Devel:ARM:Factory
 # Bugzilla info
