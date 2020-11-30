@@ -253,6 +253,7 @@ remotes = (
     Head(RepoURL("masahiroy/linux-kbuild.git"), "for-next"),
     Head(RepoURL("bluetooth/bluetooth-next.git")),
     Head(RepoURL("clk/linux.git"), "clk-next"),
+    Head(RepoURL("git://github.com/ceph/ceph-client"), "testing"),
 )
 
 
