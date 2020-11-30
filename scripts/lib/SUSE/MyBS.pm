@@ -638,6 +638,7 @@ sub create_project {
 	for my $macro (@{$options->{macros} || []}) {
 		$prjconf .= "$macro\n";
 	}
+	$prjconf .= ":Macros\n";
 	$self->put("/source/$project/_config", $prjconf);
 	return { name => $project, qa_repos => \@qa_repos };
 }
