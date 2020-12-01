@@ -87,7 +87,6 @@ ${0##*/} perpares a 'kernel-source' package for submission into autobuild
 
 these options are recognized:
     -nf                to proceed if a new unknown .config option is found during make oldconfig
-    -u		       update generated files in an existing kernel-source dir
     -i                 ignore kabi failures
     -d, --dir=DIR      create package in DIR instead of default kernel-source$VARIANT
     -a, --arch=ARCH    create package for architecture ARCH only
