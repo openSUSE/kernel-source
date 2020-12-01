@@ -1,0 +1,190 @@
+From 6d4572a9d71d5fc2affee0258d8582d39859188c Mon Sep 17 00:00:00 2001
+From: Qu Wenruo <wqu@suse.com>
+Date: Wed, 24 Jun 2020 07:23:50 +0800
+Patch-mainline: v5.9-rc1
+Git-commit: 6d4572a9d71d5fc2affee0258d8582d39859188c
+References: bsc#1161099
+Subject: [PATCH] btrfs: allow btrfs_truncate_block() to fallback to nocow for
+ data space reservation
+
+[BUG]
+When the data space is exhausted, even if the inode has NOCOW attribute,
+we will still refuse to truncate unaligned range due to ENOSPC.
+
+The following script can reproduce it pretty easily:
+  #!/bin/bash
+
+  dev=/dev/test/test
+  mnt=/mnt/btrfs
+
+  umount $dev &> /dev/null
+  umount $mnt &> /dev/null
+
+  mkfs.btrfs -f $dev -b 1G
+  mount -o nospace_cache $dev $mnt
+  touch $mnt/foobar
+  chattr +C $mnt/foobar
+
+  xfs_io -f -c "pwrite -b 4k 0 4k" $mnt/foobar > /dev/null
+  xfs_io -f -c "pwrite -b 4k 0 1G" $mnt/padding &> /dev/null
+  sync
+
+  xfs_io -c "fpunch 0 2k" $mnt/foobar
+  umount $mnt
+
+Currently this will fail at the fpunch part.
+
+[CAUSE]
+Because btrfs_truncate_block() always reserves space without checking
+the NOCOW attribute.
+
+Since the writeback path follows NOCOW bit, we only need to bother the
+space reservation code in btrfs_truncate_block().
+
+[FIX]
+Make btrfs_truncate_block() follow btrfs_buffered_write() to try to
+reserve data space first, and fall back to NOCOW check only when we
+don't have enough space.
+
+Such always-try-reserve is an optimization introduced in
+btrfs_buffered_write(), to avoid expensive btrfs_check_can_nocow() call.
+
+This patch will export check_can_nocow() as btrfs_check_can_nocow(), and
+use it in btrfs_truncate_block() to fix the problem.
+
+Reported-by: Martin Doucha <martin.doucha@suse.com>
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Reviewed-by: Anand Jain <anand.jain@oracle.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/ctree.h |    2 ++
+ fs/btrfs/file.c  |   12 ++++++------
+ fs/btrfs/inode.c |   44 +++++++++++++++++++++++++++++++++++++-------
+ 3 files changed, 45 insertions(+), 13 deletions(-)
+
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -3057,6 +3057,8 @@ int btrfs_dirty_pages(struct inode *inod
+ 		      size_t num_pages, loff_t pos, size_t write_bytes,
+ 		      struct extent_state **cached);
+ int btrfs_fdatawrite_range(struct inode *inode, loff_t start, loff_t end);
++int btrfs_check_can_nocow(struct btrfs_inode *inode, loff_t pos,
++			  size_t *write_bytes, bool nowait);
+ 
+ /* tree-defrag.c */
+ int btrfs_defrag_leaves(struct btrfs_trans_handle *trans,
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -1542,8 +1542,8 @@ lock_and_cleanup_extent_if_need(struct b
+ 	return ret;
+ }
+ 
+-static noinline int check_can_nocow(struct btrfs_inode *inode, loff_t pos,
+-				    size_t *write_bytes, bool nowait)
++int btrfs_check_can_nocow(struct btrfs_inode *inode, loff_t pos,
++			  size_t *write_bytes, bool nowait)
+ {
+ 	struct btrfs_fs_info *fs_info = inode->root->fs_info;
+ 	struct btrfs_root *root = inode->root;
+@@ -1658,8 +1658,8 @@ static noinline ssize_t btrfs_buffered_w
+ 		if (ret < 0) {
+ 			if ((BTRFS_I(inode)->flags & (BTRFS_INODE_NODATACOW |
+ 						      BTRFS_INODE_PREALLOC)) &&
+-			    check_can_nocow(BTRFS_I(inode), pos,
+-					    &write_bytes, false) > 0) {
++			    btrfs_check_can_nocow(BTRFS_I(inode), pos,
++						  &write_bytes, false) > 0) {
+ 				/*
+ 				 * For nodata cow case, no need to reserve
+ 				 * data space.
+@@ -1938,8 +1938,8 @@ static ssize_t btrfs_file_write_iter(str
+ 		 */
+ 		if (!(BTRFS_I(inode)->flags & (BTRFS_INODE_NODATACOW |
+ 					      BTRFS_INODE_PREALLOC)) ||
+-		    check_can_nocow(BTRFS_I(inode), pos, &nocow_bytes,
+-				    true) <= 0) {
++		    btrfs_check_can_nocow(BTRFS_I(inode), pos, &nocow_bytes,
++					  true) <= 0) {
+ 			inode_unlock(inode);
+ 			return -EAGAIN;
+ 		}
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -5019,11 +5019,13 @@ int btrfs_truncate_block(struct inode *i
+ 	struct extent_state *cached_state = NULL;
+ 	struct extent_changeset *data_reserved = NULL;
+ 	char *kaddr;
++	bool only_release_metadata = false;
+ 	u32 blocksize = fs_info->sectorsize;
+ 	pgoff_t index = from >> PAGE_SHIFT;
+ 	unsigned offset = from & (blocksize - 1);
+ 	struct page *page;
+ 	gfp_t mask = btrfs_alloc_write_mask(mapping);
++	size_t write_bytes = blocksize;
+ 	int ret = 0;
+ 	u64 block_start;
+ 	u64 block_end;
+@@ -5035,11 +5037,27 @@ int btrfs_truncate_block(struct inode *i
+ 	block_start = round_down(from, blocksize);
+ 	block_end = block_start + blocksize - 1;
+ 
+-	ret = btrfs_delalloc_reserve_space(inode, &data_reserved,
+-					   block_start, blocksize);
+-	if (ret)
+-		goto out;
+ 
++	ret = btrfs_check_data_free_space(inode, &data_reserved, block_start,
++					  blocksize);
++	if (ret < 0) {
++		if ((BTRFS_I(inode)->flags & (BTRFS_INODE_NODATACOW |
++					      BTRFS_INODE_PREALLOC)) &&
++		    btrfs_check_can_nocow(BTRFS_I(inode), block_start,
++					  &write_bytes, false) > 0) {
++			/* For nocow case, no need to reserve data space */
++			only_release_metadata = true;
++		} else {
++			goto out;
++		}
++	}
++	ret = btrfs_delalloc_reserve_metadata(BTRFS_I(inode), blocksize);
++	if (ret < 0) {
++		if (!only_release_metadata)
++			btrfs_free_reserved_data_space(inode, data_reserved,
++					block_start, blocksize);
++		goto out;
++	}
+ again:
+ 	page = find_or_create_page(mapping, index, mask);
+ 	if (!page) {
+@@ -5108,14 +5126,26 @@ again:
+ 	set_page_dirty(page);
+ 	unlock_extent_cached(io_tree, block_start, block_end, &cached_state);
+ 
++	if (only_release_metadata)
++		set_extent_bit(&BTRFS_I(inode)->io_tree, block_start,
++				block_end, EXTENT_NORESERVE, NULL, NULL,
++				GFP_NOFS);
++
+ out_unlock:
+-	if (ret)
+-		btrfs_delalloc_release_space(inode, data_reserved, block_start,
+-					     blocksize, true);
++	if (ret) {
++		if (only_release_metadata)
++			btrfs_delalloc_release_metadata(BTRFS_I(inode),
++					blocksize, true);
++		else
++			btrfs_delalloc_release_space(inode, data_reserved,
++					block_start, blocksize, true);
++	}
+ 	btrfs_delalloc_release_extents(BTRFS_I(inode), blocksize);
+ 	unlock_page(page);
+ 	put_page(page);
+ out:
++	if (only_release_metadata)
++		btrfs_end_write_no_snapshotting(BTRFS_I(inode)->root);
+ 	extent_changeset_free(data_reserved);
+ 	return ret;
+ }
