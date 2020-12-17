@@ -1,0 +1,148 @@
+From: "Ahmed S. Darwish" <a.darwish@linutronix.de>
+Date: Thu, 26 Nov 2020 14:29:42 +0100
+Subject: scsi: qla2xxx: Remove in_interrupt() from qla82xx-specific code
+Patch-mainline: v5.11-rc1
+Git-commit: 8ac246bdd07a0f948f0e33eb4797bd2645cd8224
+References: bsc#1171688 bsc#1172733
+
+qla82xx_idc_lock() spins on a certain hardware state until it's updated. At
+the end of each spin, if in_interrupt() is true, it does 20 loops of
+cpu_relax(). Otherwise, it yields the CPU.
+
+While in_interrupt() is ill-defined and does not provide what the name
+suggests, it is not needed here: qla82xx_idc_lock() is always called from
+process context. Below is an analysis of its callers, in order of
+appearance:
+
+  - qla_nx.c: qla82xx_device_bootstrap(), only called by
+    qla82xx_device_state_handler(), has multiple msleep()s.
+
+  - qla_nx.c: qla82xx_need_qsnt_handler(), has one second msleep()
+
+  - qla_nx.c: qla82xx_wait_for_state_change(), one second msleep()
+
+  - qla_nx.c: qla82xx_need_reset_handler(), can sleep up to 10 seconds
+
+  - qla_nx.c: qla82xx_device_state_handler(), has multiple msleep()s
+
+  - qla_nx.c: qla82xx_abort_isp(), if it's a qla82xx controller, calls
+    qla82xx_device_state_handler(), which sleeps. It's also bound to
+    isp_operations ->abort_isp() hook, where all the callers are in process
+    context.
+
+  - qla_nx.c: qla82xx_beacon_on(), bound to isp_operations ->beacon_on()
+    hook.  That hook is only called once, in a mutex locked context, from
+    qla2x00_beacon_store().
+
+  - qla_nx.c: qla82xx_beacon_off(), bound to isp_operations ->beacon_off()
+    hook.  Like ->beacon_on(), it's only called once, in a mutex locked
+    context, from qla2x00_beacon_store().
+
+  - qla_nx.c: qla82xx_fw_dump(), calls qla2x00_wait_for_chip_reset(), which
+    has msleep() in a loop. It is bound to isp_operations ->fw_dump()
+    hook. That hook *is* called from atomic context at qla_isr.c by
+    multiple interrupt handlers. Nonetheless, it's other controllers
+    interrupt handlers, and not the qla82xx.
+
+  - qla82xx_msix_default() and qla82xx_msix_rsp_q() call
+    qla24xx_process_response_queue() which doesn't implement the firmware
+    dumping.
+
+  - qla_attr.c: qla2x00_sysfs_write_fw_dump(), and
+    qla2x00_sysfs_write_reset(), process-context sysfs ->write() hooks.
+
+  - qla_os.c: qla2x00_probe_one(). PCI ->probe(), process context.
+
+  - qla_os.c: qla2x00_clear_drv_active(), called solely from
+    qla2x00_remove_one(), which is PCI ->remove() hook, process context.
+
+  - qla_os.c: qla2x00_do_dpc(), kthread function, process context.
+
+Remove the in_interrupt() check. Change qla82xx_idc_lock() specification to
+a purely process-context function. Mark it with "Context: task, might
+sleep".
+
+Change qla82xx_idc_lock() implementation to sleep 100ms, instead of a
+schedule(), for each spin. This is more deterministic, and it matches the
+other qla models idc_lock() functions.
+
+Link: https://lore.kernel.org/r/20201126132952.2287996-5-bigeasy@linutronix.de
+Cc: Nilesh Javali <njavali@marvell.com>
+Cc: <GR-QLogic-Storage-Upstream@marvell.com>
+Reviewed-by: Himanshu Madhani <himanshu.madhani@oracle.com>
+Reviewed-by: Daniel Wagner <dwagner@suse.de>
+Signed-off-by: Ahmed S. Darwish <a.darwish@linutronix.de>
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+---
+ drivers/scsi/qla2xxx/qla_def.h |    5 +++++
+ drivers/scsi/qla2xxx/qla_nx.c  |   25 +++++++++++--------------
+ 2 files changed, 16 insertions(+), 14 deletions(-)
+
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -3297,8 +3297,10 @@ struct isp_operations {
+ 	void (*fw_dump)(struct scsi_qla_host *vha);
+ 	void (*mpi_fw_dump)(struct scsi_qla_host *, int);
+ 
++	/* Context: task, might sleep */
+ 	int (*beacon_on) (struct scsi_qla_host *);
+ 	int (*beacon_off) (struct scsi_qla_host *);
++
+ 	void (*beacon_blink) (struct scsi_qla_host *);
+ 
+ 	void *(*read_optrom)(struct scsi_qla_host *, void *,
+@@ -3309,7 +3311,10 @@ struct isp_operations {
+ 	int (*get_flash_version) (struct scsi_qla_host *, void *);
+ 	int (*start_scsi) (srb_t *);
+ 	int (*start_scsi_mq) (srb_t *);
++
++	/* Context: task, might sleep */
+ 	int (*abort_isp) (struct scsi_qla_host *);
++
+ 	int (*iospace_config)(struct qla_hw_data *);
+ 	int (*initialize_adapter)(struct scsi_qla_host *);
+ };
+--- a/drivers/scsi/qla2xxx/qla_nx.c
++++ b/drivers/scsi/qla2xxx/qla_nx.c
+@@ -490,29 +490,26 @@ qla82xx_rd_32(struct qla_hw_data *ha, ul
+ 	return data;
+ }
+ 
+-#define IDC_LOCK_TIMEOUT 100000000
++/*
++ * Context: task, might sleep
++ */
+ int qla82xx_idc_lock(struct qla_hw_data *ha)
+ {
+-	int i;
+-	int done = 0, timeout = 0;
++	const int delay_ms = 100, timeout_ms = 2000;
++	int done, total = 0;
+ 
+-	while (!done) {
++	might_sleep();
++
++	while (true) {
+ 		/* acquire semaphore5 from PCI HW block */
+ 		done = qla82xx_rd_32(ha, QLA82XX_PCIE_REG(PCIE_SEM5_LOCK));
+ 		if (done == 1)
+ 			break;
+-		if (timeout >= IDC_LOCK_TIMEOUT)
++		if (WARN_ON_ONCE(total >= timeout_ms))
+ 			return -1;
+ 
+-		timeout++;
+-
+-		/* Yield CPU */
+-		if (!in_interrupt())
+-			schedule();
+-		else {
+-			for (i = 0; i < 20; i++)
+-				cpu_relax();
+-		}
++		total += delay_ms;
++		msleep(delay_ms);
+ 	}
+ 
+ 	return 0;
