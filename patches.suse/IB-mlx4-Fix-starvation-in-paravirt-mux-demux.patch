@@ -1,0 +1,180 @@
+From 7fd1507df7cee9c533f38152fcd1dd769fcac6ce Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?H=C3=A5kon=20Bugge?= <haakon.bugge@oracle.com>
+Date: Mon, 3 Aug 2020 08:19:39 +0200
+Subject: [PATCH 1/1] IB/mlx4: Fix starvation in paravirt mux/demux
+Git-commit: 7fd1507df7cee9c533f38152fcd1dd769fcac6ce
+Patch-mainline: v5.10-rc1
+References: bsc#1152489
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The mlx4 driver will proxy MAD packets through the PF driver. A VM or an
+instantiated VF will send its MAD packets to the PF driver using
+loop-back. The PF driver will be informed by an interrupt, but defer the
+handling and polling of CQEs to a worker thread running on an ordered
+work-queue.
+
+Consider the following scenario: the VMs will in short proximity in time,
+for example due to a network event, send many MAD packets to the PF
+driver. Lets say there are K VMs, each sending N packets.
+
+The interrupt from the first VM will start the worker thread, which will
+poll N CQEs. A common case here is where the PF driver will multiplex the
+packets received from the VMs out on the wire QP.
+
+But before the wire QP has returned a send CQE and associated interrupt,
+the other K - 1 VMs have sent their N packets as well.
+
+The PF driver has to multiplex K * N packets out on the wire QP. But the
+send-queue on the wire QP has a finite capacity.
+
+So, in this scenario, if K * N is larger than the send-queue capacity of
+the wire QP, we will get MAD packets dropped on the floor with this
+dynamic debug message:
+
+mlx4_ib_multiplex_mad: failed sending GSI to wire on behalf of slave 2 (-11)
+
+and this despite the fact that the wire send-queue could have capacity,
+but the PF driver isn't aware, because the wire send CQEs have not yet
+been polled.
+
+We can also have a similar scenario inbound, with a wire recv-queue larger
+than the tunnel QP's send-queue. If many remote peers send MAD packets to
+the very same VM, the tunnel send-queue destined to the VM could allegedly
+be construed to be full by the PF driver.
+
+This starvation is fixed by introducing separate work queues for the wire
+QPs vs. the tunnel QPs.
+
+With this fix, using a dual ported HCA, 8 VFs instantiated, we could run
+cmtime on each of the 18 interfaces towards a similar configured peer,
+each cmtime instance with 800 QPs (all in all 14400 QPs) without a single
+CM packet getting lost.
+
+Fixes: 3cf69cc8dbeb ("IB/mlx4: Add CM paravirtualization")
+Link: https://lore.kernel.org/r/20200803061941.1139994-5-haakon.bugge@oracle.com
+Signed-off-by: Håkon Bugge <haakon.bugge@oracle.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Nicolas Morey-Chaisemartin <nmoreychaisemartin@suse.com>
+---
+ drivers/infiniband/hw/mlx4/mad.c     | 34 +++++++++++++++++++++++++---
+ drivers/infiniband/hw/mlx4/mlx4_ib.h |  2 ++
+ 2 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/infiniband/hw/mlx4/mad.c b/drivers/infiniband/hw/mlx4/mad.c
+index e1310820352e..8bd16474708f 100644
+--- a/drivers/infiniband/hw/mlx4/mad.c
++++ b/drivers/infiniband/hw/mlx4/mad.c
+@@ -1297,6 +1297,18 @@ static void mlx4_ib_tunnel_comp_handler(struct ib_cq *cq, void *arg)
+ 	spin_unlock_irqrestore(&dev->sriov.going_down_lock, flags);
+ }
+ 
++static void mlx4_ib_wire_comp_handler(struct ib_cq *cq, void *arg)
++{
++	unsigned long flags;
++	struct mlx4_ib_demux_pv_ctx *ctx = cq->cq_context;
++	struct mlx4_ib_dev *dev = to_mdev(ctx->ib_dev);
++
++	spin_lock_irqsave(&dev->sriov.going_down_lock, flags);
++	if (!dev->sriov.is_going_down && ctx->state == DEMUX_PV_STATE_ACTIVE)
++		queue_work(ctx->wi_wq, &ctx->work);
++	spin_unlock_irqrestore(&dev->sriov.going_down_lock, flags);
++}
++
+ static int mlx4_ib_post_pv_qp_buf(struct mlx4_ib_demux_pv_ctx *ctx,
+ 				  struct mlx4_ib_demux_pv_qp *tun_qp,
+ 				  int index)
+@@ -1997,7 +2009,8 @@ static int create_pv_resources(struct ib_device *ibdev, int slave, int port,
+ 		cq_size *= 2;
+ 
+ 	cq_attr.cqe = cq_size;
+-	ctx->cq = ib_create_cq(ctx->ib_dev, mlx4_ib_tunnel_comp_handler,
++	ctx->cq = ib_create_cq(ctx->ib_dev,
++			       create_tun ? mlx4_ib_tunnel_comp_handler : mlx4_ib_wire_comp_handler,
+ 			       NULL, ctx, &cq_attr);
+ 	if (IS_ERR(ctx->cq)) {
+ 		ret = PTR_ERR(ctx->cq);
+@@ -2034,6 +2047,7 @@ static int create_pv_resources(struct ib_device *ibdev, int slave, int port,
+ 		INIT_WORK(&ctx->work, mlx4_ib_sqp_comp_worker);
+ 
+ 	ctx->wq = to_mdev(ibdev)->sriov.demux[port - 1].wq;
++	ctx->wi_wq = to_mdev(ibdev)->sriov.demux[port - 1].wi_wq;
+ 
+ 	ret = ib_req_notify_cq(ctx->cq, IB_CQ_NEXT_COMP);
+ 	if (ret) {
+@@ -2177,7 +2191,7 @@ static int mlx4_ib_alloc_demux_ctx(struct mlx4_ib_dev *dev,
+ 		goto err_mcg;
+ 	}
+ 
+-	snprintf(name, sizeof name, "mlx4_ibt%d", port);
++	snprintf(name, sizeof(name), "mlx4_ibt%d", port);
+ 	ctx->wq = alloc_ordered_workqueue(name, WQ_MEM_RECLAIM);
+ 	if (!ctx->wq) {
+ 		pr_err("Failed to create tunnelling WQ for port %d\n", port);
+@@ -2185,7 +2199,15 @@ static int mlx4_ib_alloc_demux_ctx(struct mlx4_ib_dev *dev,
+ 		goto err_wq;
+ 	}
+ 
+-	snprintf(name, sizeof name, "mlx4_ibud%d", port);
++	snprintf(name, sizeof(name), "mlx4_ibwi%d", port);
++	ctx->wi_wq = alloc_ordered_workqueue(name, WQ_MEM_RECLAIM);
++	if (!ctx->wi_wq) {
++		pr_err("Failed to create wire WQ for port %d\n", port);
++		ret = -ENOMEM;
++		goto err_wiwq;
++	}
++
++	snprintf(name, sizeof(name), "mlx4_ibud%d", port);
+ 	ctx->ud_wq = alloc_ordered_workqueue(name, WQ_MEM_RECLAIM);
+ 	if (!ctx->ud_wq) {
+ 		pr_err("Failed to create up/down WQ for port %d\n", port);
+@@ -2196,6 +2218,10 @@ static int mlx4_ib_alloc_demux_ctx(struct mlx4_ib_dev *dev,
+ 	return 0;
+ 
+ err_udwq:
++	destroy_workqueue(ctx->wi_wq);
++	ctx->wi_wq = NULL;
++
++err_wiwq:
+ 	destroy_workqueue(ctx->wq);
+ 	ctx->wq = NULL;
+ 
+@@ -2243,12 +2269,14 @@ static void mlx4_ib_free_demux_ctx(struct mlx4_ib_demux_ctx *ctx)
+ 				ctx->tun[i]->state = DEMUX_PV_STATE_DOWNING;
+ 		}
+ 		flush_workqueue(ctx->wq);
++		flush_workqueue(ctx->wi_wq);
+ 		for (i = 0; i < dev->dev->caps.sqp_demux; i++) {
+ 			destroy_pv_resources(dev, i, ctx->port, ctx->tun[i], 0);
+ 			free_pv_object(dev, i, ctx->port);
+ 		}
+ 		kfree(ctx->tun);
+ 		destroy_workqueue(ctx->ud_wq);
++		destroy_workqueue(ctx->wi_wq);
+ 		destroy_workqueue(ctx->wq);
+ 	}
+ }
+diff --git a/drivers/infiniband/hw/mlx4/mlx4_ib.h b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+index db3cc61de0db..27bb23756663 100644
+--- a/drivers/infiniband/hw/mlx4/mlx4_ib.h
++++ b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+@@ -455,6 +455,7 @@ struct mlx4_ib_demux_pv_ctx {
+ 	struct ib_pd *pd;
+ 	struct work_struct work;
+ 	struct workqueue_struct *wq;
++	struct workqueue_struct *wi_wq;
+ 	struct mlx4_ib_demux_pv_qp qp[2];
+ };
+ 
+@@ -462,6 +463,7 @@ struct mlx4_ib_demux_ctx {
+ 	struct ib_device *ib_dev;
+ 	int port;
+ 	struct workqueue_struct *wq;
++	struct workqueue_struct *wi_wq;
+ 	struct workqueue_struct *ud_wq;
+ 	spinlock_t ud_lock;
+ 	atomic64_t subnet_prefix;
+-- 
+2.29.2.405.gfdfcad78fd04
+
