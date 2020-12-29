@@ -1,0 +1,200 @@
+From: Nicholas Piggin <npiggin@gmail.com>
+Date: Thu, 25 Jun 2020 15:34:03 +1000
+Subject: ring-buffer: speed up buffer resets by avoiding synchronize_rcu for
+ each CPU
+Git-commit: b23d7a5f4a07af02343cdd28fe1f7488bac3afda
+Patch-mainline: v5.9-rc1
+References: CVE-2020-27825 bsc#1179960
+
+On a 144 thread system, `perf ftrace` takes about 20 seconds to start
+up, due to calling synchronize_rcu() for each CPU.
+
+  cat /proc/108560/stack
+    0xc0003e7eb336f470
+    __switch_to+0x2e0/0x480
+    __wait_rcu_gp+0x20c/0x220
+    synchronize_rcu+0x9c/0xc0
+    ring_buffer_reset_cpu+0x88/0x2e0
+    tracing_reset_online_cpus+0x84/0xe0
+    tracing_open+0x1d4/0x1f0
+
+On a system with 10x more threads, it starts to become an annoyance.
+
+Batch these up so we disable all the per-cpu buffers first, then
+synchronize_rcu() once, then reset each of the buffers. This brings
+the time down to about 0.5s.
+
+Link: https://lkml.kernel.org/r/20200625053403.2386972-1-npiggin@gmail.com
+
+Tested-by: Anton Blanchard <anton@ozlabs.org>
+Acked-by: Paul E. McKenney <paulmck@kernel.org>
+Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Acked-by: Miroslav Benes <mbenes@suse.cz>
+---
+ include/linux/ring_buffer.h |    1 
+ kernel/trace/ring_buffer.c  |   85 ++++++++++++++++++++++++++++++++++++--------
+ kernel/trace/trace.c        |    4 --
+ 3 files changed, 73 insertions(+), 17 deletions(-)
+
+--- a/include/linux/ring_buffer.h
++++ b/include/linux/ring_buffer.h
+@@ -143,6 +143,7 @@ int ring_buffer_iter_empty(struct ring_b
+ unsigned long ring_buffer_size(struct ring_buffer *buffer, int cpu);
+ 
+ void ring_buffer_reset_cpu(struct ring_buffer *buffer, int cpu);
++void ring_buffer_reset_online_cpus(struct ring_buffer *buffer);
+ void ring_buffer_reset(struct ring_buffer *buffer);
+ 
+ #ifdef CONFIG_RING_BUFFER_ALLOW_SWAP
+--- a/kernel/trace/ring_buffer.c
++++ b/kernel/trace/ring_buffer.c
+@@ -269,6 +269,9 @@ EXPORT_SYMBOL_GPL(ring_buffer_event_data
+ #define for_each_buffer_cpu(buffer, cpu)		\
+ 	for_each_cpu(cpu, buffer->cpumask)
+ 
++#define for_each_online_buffer_cpu(buffer, cpu)		\
++	for_each_cpu_and(cpu, buffer->cpumask, cpu_online_mask)
++
+ #define TS_SHIFT	27
+ #define TS_MASK		((1ULL << TS_SHIFT) - 1)
+ #define TS_DELTA_TEST	(~TS_MASK)
+@@ -4409,6 +4412,26 @@ rb_reset_cpu(struct ring_buffer_per_cpu
+ 	rb_head_page_activate(cpu_buffer);
+ }
+ 
++/* Must have disabled the cpu buffer then done a synchronize_rcu */
++static void reset_disabled_cpu_buffer(struct ring_buffer_per_cpu *cpu_buffer)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&cpu_buffer->reader_lock, flags);
++
++	if (RB_WARN_ON(cpu_buffer, local_read(&cpu_buffer->committing)))
++		goto out;
++
++	arch_spin_lock(&cpu_buffer->lock);
++
++	rb_reset_cpu(cpu_buffer);
++
++	arch_spin_unlock(&cpu_buffer->lock);
++
++ out:
++	raw_spin_unlock_irqrestore(&cpu_buffer->reader_lock, flags);
++}
++
+ /**
+  * ring_buffer_reset_cpu - reset a ring buffer per CPU buffer
+  * @buffer: The ring buffer to reset a per cpu buffer of
+@@ -4417,7 +4440,6 @@ rb_reset_cpu(struct ring_buffer_per_cpu
+ void ring_buffer_reset_cpu(struct ring_buffer *buffer, int cpu)
+ {
+ 	struct ring_buffer_per_cpu *cpu_buffer = buffer->buffers[cpu];
+-	unsigned long flags;
+ 
+ 	if (!cpumask_test_cpu(cpu, buffer->cpumask))
+ 		return;
+@@ -4428,24 +4450,42 @@ void ring_buffer_reset_cpu(struct ring_b
+ 	/* Make sure all commits have finished */
+ 	synchronize_rcu();
+ 
+-	raw_spin_lock_irqsave(&cpu_buffer->reader_lock, flags);
++	reset_disabled_cpu_buffer(cpu_buffer);
+ 
+-	if (RB_WARN_ON(cpu_buffer, local_read(&cpu_buffer->committing)))
+-		goto out;
++	atomic_dec(&cpu_buffer->record_disabled);
++	atomic_dec(&cpu_buffer->resize_disabled);
++}
++EXPORT_SYMBOL_GPL(ring_buffer_reset_cpu);
+ 
+-	arch_spin_lock(&cpu_buffer->lock);
++/**
++ * ring_buffer_reset_cpu - reset a ring buffer per CPU buffer
++ * @buffer: The ring buffer to reset a per cpu buffer of
++ * @cpu: The CPU buffer to be reset
++ */
++void ring_buffer_reset_online_cpus(struct ring_buffer *buffer)
++{
++	struct ring_buffer_per_cpu *cpu_buffer;
++	int cpu;
+ 
+-	rb_reset_cpu(cpu_buffer);
++	for_each_online_buffer_cpu(buffer, cpu) {
++		cpu_buffer = buffer->buffers[cpu];
+ 
+-	arch_spin_unlock(&cpu_buffer->lock);
++		atomic_inc(&cpu_buffer->resize_disabled);
++		atomic_inc(&cpu_buffer->record_disabled);
++	}
+ 
+- out:
+-	raw_spin_unlock_irqrestore(&cpu_buffer->reader_lock, flags);
++	/* Make sure all commits have finished */
++	synchronize_rcu();
+ 
+-	atomic_dec(&cpu_buffer->record_disabled);
+-	atomic_dec(&cpu_buffer->resize_disabled);
++	for_each_online_buffer_cpu(buffer, cpu) {
++		cpu_buffer = buffer->buffers[cpu];
++
++		reset_disabled_cpu_buffer(cpu_buffer);
++
++		atomic_dec(&cpu_buffer->record_disabled);
++		atomic_dec(&cpu_buffer->resize_disabled);
++	}
+ }
+-EXPORT_SYMBOL_GPL(ring_buffer_reset_cpu);
+ 
+ /**
+  * ring_buffer_reset - reset a ring buffer
+@@ -4453,10 +4493,27 @@ EXPORT_SYMBOL_GPL(ring_buffer_reset_cpu)
+  */
+ void ring_buffer_reset(struct ring_buffer *buffer)
+ {
++	struct ring_buffer_per_cpu *cpu_buffer;
+ 	int cpu;
+ 
+-	for_each_buffer_cpu(buffer, cpu)
+-		ring_buffer_reset_cpu(buffer, cpu);
++	for_each_buffer_cpu(buffer, cpu) {
++		cpu_buffer = buffer->buffers[cpu];
++
++		atomic_inc(&cpu_buffer->resize_disabled);
++		atomic_inc(&cpu_buffer->record_disabled);
++	}
++
++	/* Make sure all commits have finished */
++	synchronize_rcu();
++
++	for_each_buffer_cpu(buffer, cpu) {
++		cpu_buffer = buffer->buffers[cpu];
++
++		reset_disabled_cpu_buffer(cpu_buffer);
++
++		atomic_dec(&cpu_buffer->record_disabled);
++		atomic_dec(&cpu_buffer->resize_disabled);
++	}
+ }
+ EXPORT_SYMBOL_GPL(ring_buffer_reset);
+ 
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -1875,7 +1875,6 @@ void tracing_reset(struct trace_buffer *
+ void tracing_reset_online_cpus(struct trace_buffer *buf)
+ {
+ 	struct ring_buffer *buffer = buf->buffer;
+-	int cpu;
+ 
+ 	if (!buffer)
+ 		return;
+@@ -1887,8 +1886,7 @@ void tracing_reset_online_cpus(struct tr
+ 
+ 	buf->time_start = buffer_ftrace_now(buf, buf->cpu);
+ 
+-	for_each_online_cpu(cpu)
+-		ring_buffer_reset_cpu(buffer, cpu);
++	ring_buffer_reset_online_cpus(buffer);
+ 
+ 	ring_buffer_record_enable(buffer);
+ }
