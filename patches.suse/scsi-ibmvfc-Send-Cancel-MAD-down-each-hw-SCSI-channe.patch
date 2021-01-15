@@ -1,0 +1,183 @@
+From a835f386f9709504a99346be011da92b5ea905e5 Mon Sep 17 00:00:00 2001
+From: Tyrel Datwyler <tyreld@linux.ibm.com>
+Date: Thu, 14 Jan 2021 14:31:45 -0600
+Subject: [PATCH] scsi: ibmvfc: Send Cancel MAD down each hw SCSI channel
+
+References: jsc#SLE-15442 bsc#1180814 ltc#187461
+Patch-mainline: queued
+Git-repo: https://git.kernel.org/pub/scm/linux/kernel/git/mkp/scsi.git
+Git-commit: a835f386f9709504a99346be011da92b5ea905e5
+
+In general the client needs to send Cancel MADs and task management
+commands down the same channel as the command(s) intended to cancel or
+abort. The client assigns cancel keys per LUN and thus must send a Cancel
+down each channel commands were submitted for that LUN. Further, the client
+then must wait for those cancel completions prior to submitting a LUN RESET
+or ABORT TASK SET.
+
+Add a cancel rsp iu syncronization field to the ibmvfc_queue struct such
+that the cancel routine can sync the cancel response to each queue that
+requires a cancel command. Build a list of each cancel event sent and wait
+for the completion of each submitted cancel.
+
+Link: https://lore.kernel.org/r/20210114203148.246656-19-tyreld@linux.ibm.com
+Reviewed-by: Brian King <brking@linux.vnet.ibm.com>
+Signed-off-by: Tyrel Datwyler <tyreld@linux.ibm.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ drivers/scsi/ibmvscsi/ibmvfc.c | 109 +++++++++++++++++++++++++++++----
+ drivers/scsi/ibmvscsi/ibmvfc.h |   3 +
+ 2 files changed, 100 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/scsi/ibmvscsi/ibmvfc.c b/drivers/scsi/ibmvscsi/ibmvfc.c
+index fba2556af1da..fc94665ead68 100644
+--- a/drivers/scsi/ibmvscsi/ibmvfc.c
++++ b/drivers/scsi/ibmvscsi/ibmvfc.c
+@@ -2418,18 +2418,82 @@ static struct ibmvfc_event *ibmvfc_init_tmf(struct ibmvfc_queue *queue,
+ 	return evt;
+ }
+ 
+-/**
+- * ibmvfc_cancel_all - Cancel all outstanding commands to the device
+- * @sdev:	scsi device to cancel commands
+- * @type:	type of error recovery being performed
+- *
+- * This sends a cancel to the VIOS for the specified device. This does
+- * NOT send any abort to the actual device. That must be done separately.
+- *
+- * Returns:
+- *	0 on success / other on failure
+- **/
+-static int ibmvfc_cancel_all(struct scsi_device *sdev, int type)
++static int ibmvfc_cancel_all_mq(struct scsi_device *sdev, int type)
++{
++	struct ibmvfc_host *vhost = shost_priv(sdev->host);
++	struct ibmvfc_event *evt, *found_evt, *temp;
++	struct ibmvfc_queue *queues = vhost->scsi_scrqs.scrqs;
++	unsigned long flags;
++	int num_hwq, i;
++	int fail = 0;
++	LIST_HEAD(cancelq);
++	u16 status;
++
++	ENTER;
++	spin_lock_irqsave(vhost->host->host_lock, flags);
++	num_hwq = vhost->scsi_scrqs.active_queues;
++	for (i = 0; i < num_hwq; i++) {
++		spin_lock(queues[i].q_lock);
++		spin_lock(&queues[i].l_lock);
++		found_evt = NULL;
++		list_for_each_entry(evt, &queues[i].sent, queue_list) {
++			if (evt->cmnd && evt->cmnd->device == sdev) {
++				found_evt = evt;
++				break;
++			}
++		}
++		spin_unlock(&queues[i].l_lock);
++
++		if (found_evt && vhost->logged_in) {
++			evt = ibmvfc_init_tmf(&queues[i], sdev, type);
++			evt->sync_iu = &queues[i].cancel_rsp;
++			ibmvfc_send_event(evt, vhost, default_timeout);
++			list_add_tail(&evt->cancel, &cancelq);
++		}
++
++		spin_unlock(queues[i].q_lock);
++	}
++	spin_unlock_irqrestore(vhost->host->host_lock, flags);
++
++	if (list_empty(&cancelq)) {
++		if (vhost->log_level > IBMVFC_DEFAULT_LOG_LEVEL)
++			sdev_printk(KERN_INFO, sdev, "No events found to cancel\n");
++		return 0;
++	}
++
++	sdev_printk(KERN_INFO, sdev, "Cancelling outstanding commands.\n");
++
++	list_for_each_entry_safe(evt, temp, &cancelq, cancel) {
++		wait_for_completion(&evt->comp);
++		status = be16_to_cpu(evt->queue->cancel_rsp.mad_common.status);
++		list_del(&evt->cancel);
++		ibmvfc_free_event(evt);
++
++		if (status != IBMVFC_MAD_SUCCESS) {
++			sdev_printk(KERN_WARNING, sdev, "Cancel failed with rc=%x\n", status);
++			switch (status) {
++			case IBMVFC_MAD_DRIVER_FAILED:
++			case IBMVFC_MAD_CRQ_ERROR:
++			/* Host adapter most likely going through reset, return success to
++			 * the caller will wait for the command being cancelled to get returned
++			 */
++				break;
++			default:
++				fail = 1;
++				break;
++			}
++		}
++	}
++
++	if (fail)
++		return -EIO;
++
++	sdev_printk(KERN_INFO, sdev, "Successfully cancelled outstanding commands\n");
++	LEAVE;
++	return 0;
++}
++
++static int ibmvfc_cancel_all_sq(struct scsi_device *sdev, int type)
+ {
+ 	struct ibmvfc_host *vhost = shost_priv(sdev->host);
+ 	struct ibmvfc_event *evt, *found_evt;
+@@ -2498,6 +2562,27 @@ static int ibmvfc_cancel_all(struct scsi_device *sdev, int type)
+ 	return 0;
+ }
+ 
++/**
++ * ibmvfc_cancel_all - Cancel all outstanding commands to the device
++ * @sdev:	scsi device to cancel commands
++ * @type:	type of error recovery being performed
++ *
++ * This sends a cancel to the VIOS for the specified device. This does
++ * NOT send any abort to the actual device. That must be done separately.
++ *
++ * Returns:
++ *	0 on success / other on failure
++ **/
++static int ibmvfc_cancel_all(struct scsi_device *sdev, int type)
++{
++	struct ibmvfc_host *vhost = shost_priv(sdev->host);
++
++	if (vhost->mq_enabled && vhost->using_channels)
++		return ibmvfc_cancel_all_mq(sdev, type);
++	else
++		return ibmvfc_cancel_all_sq(sdev, type);
++}
++
+ /**
+  * ibmvfc_match_key - Match function for specified cancel key
+  * @evt:	ibmvfc event struct
+diff --git a/drivers/scsi/ibmvscsi/ibmvfc.h b/drivers/scsi/ibmvscsi/ibmvfc.h
+index 2dbce7071409..c3bb83c9d8a6 100644
+--- a/drivers/scsi/ibmvscsi/ibmvfc.h
++++ b/drivers/scsi/ibmvscsi/ibmvfc.h
+@@ -737,6 +737,7 @@ struct ibmvfc_target {
+ /* a unit of work for the hosting partition */
+ struct ibmvfc_event {
+ 	struct list_head queue_list;
++	struct list_head cancel;
+ 	struct ibmvfc_host *vhost;
+ 	struct ibmvfc_queue *queue;
+ 	struct ibmvfc_target *tgt;
+@@ -790,6 +791,8 @@ struct ibmvfc_queue {
+ 	struct list_head free;
+ 	spinlock_t l_lock;
+ 
++	union ibmvfc_iu cancel_rsp;
++
+ 	/* Sub-CRQ fields */
+ 	struct ibmvfc_host *vhost;
+ 	unsigned long cookie;
+-- 
+2.26.2
+
