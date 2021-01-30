@@ -1,0 +1,210 @@
+From: Pavel Begunkov <asml.silence@gmail.com>
+Date: Tue, 26 Jan 2021 11:17:03 +0000
+Subject: [PATCH] io_uring: stop SQPOLL submit on creator's death
+References: bsc#1012628
+Patch-mainline: 5.10.12
+Git-commit: d9d05217cb6990b9a56e13b56e7a1b71e2551f6c
+
+[ Upstream commit d9d05217cb6990b9a56e13b56e7a1b71e2551f6c ]
+
+When the creator of SQPOLL io_uring dies (i.e. sqo_task), we don't want
+its internals like ->files and ->mm to be poked by the SQPOLL task, it
+have never been nice and recently got racy. That can happen when the
+owner undergoes destruction and SQPOLL tasks tries to submit new
+requests in parallel, and so calls io_sq_thread_acquire*().
+
+That patch halts SQPOLL submissions when sqo_task dies by introducing
+sqo_dead flag. Once set, the SQPOLL task must not do any submission,
+which is synchronised by uring_lock as well as the new flag.
+
+The tricky part is to make sure that disabling always happens, that
+means either the ring is discovered by creator's do_exit() -> cancel,
+or if the final close() happens before it's done by the creator. The
+last is guaranteed by the fact that for SQPOLL the creator task and only
+it holds exactly one file note, so either it pins up to do_exit() or
+removed by the creator on the final put in flush. (see comments in
+uring_flush() around file->f_count == 2).
+
+One more place that can trigger io_sq_thread_acquire_*() is
+__io_req_task_submit(). Shoot off requests on sqo_dead there, even
+though actually we don't need to. That's because cancellation of
+sqo_task should wait for the request before going any further.
+
+note 1: io_disable_sqo_submit() does io_ring_set_wakeup_flag() so the
+caller would enter the ring to get an error, but it still doesn't
+guarantee that the flag won't be cleared.
+
+note 2: if final __userspace__ close happens not from the creator
+task, the file note will pin the ring until the task dies.
+
+Cc: stable@vger.kernel.org # 5.5+
+Fixed: b1b6b5a30dce8 ("kernel/io_uring: cancel io_uring before task works")
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/io_uring.c | 58 ++++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 50 insertions(+), 8 deletions(-)
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 70439e97457d..bcc26fc04d00 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -260,6 +260,7 @@ struct io_ring_ctx {
+ 		unsigned int		drain_next: 1;
+ 		unsigned int		eventfd_async: 1;
+ 		unsigned int		restricted: 1;
++		unsigned int		sqo_dead: 1;
+ 
+ 		/*
+ 		 * Ring buffer of indices into array of io_uring_sqe, which is
+@@ -2083,11 +2084,9 @@ static void io_req_task_cancel(struct callback_head *cb)
+ static void __io_req_task_submit(struct io_kiocb *req)
+ {
+ 	struct io_ring_ctx *ctx = req->ctx;
+-	bool fail;
+ 
+-	fail = __io_sq_thread_acquire_mm(ctx);
+ 	mutex_lock(&ctx->uring_lock);
+-	if (!fail)
++	if (!ctx->sqo_dead && !__io_sq_thread_acquire_mm(ctx))
+ 		__io_queue_sqe(req, NULL);
+ 	else
+ 		__io_req_task_cancel(req, -EFAULT);
+@@ -6796,7 +6795,7 @@ static enum sq_ret __io_sq_thread(struct io_ring_ctx *ctx,
+ 		to_submit = 8;
+ 
+ 	mutex_lock(&ctx->uring_lock);
+-	if (likely(!percpu_ref_is_dying(&ctx->refs)))
++	if (likely(!percpu_ref_is_dying(&ctx->refs) && !ctx->sqo_dead))
+ 		ret = io_submit_sqes(ctx, to_submit);
+ 	mutex_unlock(&ctx->uring_lock);
+ 
+@@ -8487,6 +8486,10 @@ static void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
+ 	mutex_lock(&ctx->uring_lock);
+ 	percpu_ref_kill(&ctx->refs);
+ 	/* if force is set, the ring is going away. always drop after that */
++
++	if (WARN_ON_ONCE((ctx->flags & IORING_SETUP_SQPOLL) && !ctx->sqo_dead))
++		ctx->sqo_dead = 1;
++
+ 	ctx->cq_overflow_flushed = 1;
+ 	if (ctx->rings)
+ 		__io_cqring_overflow_flush(ctx, true, NULL, NULL);
+@@ -8745,6 +8748,18 @@ static bool __io_uring_cancel_task_requests(struct io_ring_ctx *ctx,
+ 	return ret;
+ }
+ 
++static void io_disable_sqo_submit(struct io_ring_ctx *ctx)
++{
++	WARN_ON_ONCE(ctx->sqo_task != current);
++
++	mutex_lock(&ctx->uring_lock);
++	ctx->sqo_dead = 1;
++	mutex_unlock(&ctx->uring_lock);
++
++	/* make sure callers enter the ring to get error */
++	io_ring_set_wakeup_flag(ctx);
++}
++
+ /*
+  * We need to iteratively cancel requests, in case a request has dependent
+  * hard links. These persist even for failure of cancelations, hence keep
+@@ -8756,6 +8771,8 @@ static void io_uring_cancel_task_requests(struct io_ring_ctx *ctx,
+ 	struct task_struct *task = current;
+ 
+ 	if ((ctx->flags & IORING_SETUP_SQPOLL) && ctx->sq_data) {
++		/* for SQPOLL only sqo_task has task notes */
++		io_disable_sqo_submit(ctx);
+ 		task = ctx->sq_data->thread;
+ 		atomic_inc(&task->io_uring->in_idle);
+ 		io_sq_thread_park(ctx->sq_data);
+@@ -8927,6 +8944,7 @@ void __io_uring_task_cancel(void)
+ static int io_uring_flush(struct file *file, void *data)
+ {
+ 	struct io_uring_task *tctx = current->io_uring;
++	struct io_ring_ctx *ctx = file->private_data;
+ 
+ 	if (!tctx)
+ 		return 0;
+@@ -8942,7 +8960,16 @@ static int io_uring_flush(struct file *file, void *data)
+ 	if (atomic_long_read(&file->f_count) != 2)
+ 		return 0;
+ 
+-	io_uring_del_task_file(file);
++	if (ctx->flags & IORING_SETUP_SQPOLL) {
++		/* there is only one file note, which is owned by sqo_task */
++		WARN_ON_ONCE((ctx->sqo_task == current) ==
++			     !xa_load(&tctx->xa, (unsigned long)file));
++
++		io_disable_sqo_submit(ctx);
++	}
++
++	if (!(ctx->flags & IORING_SETUP_SQPOLL) || ctx->sqo_task == current)
++		io_uring_del_task_file(file);
+ 	return 0;
+ }
+ 
+@@ -9016,8 +9043,9 @@ static unsigned long io_uring_nommu_get_unmapped_area(struct file *file,
+ 
+ #endif /* !CONFIG_MMU */
+ 
+-static void io_sqpoll_wait_sq(struct io_ring_ctx *ctx)
++static int io_sqpoll_wait_sq(struct io_ring_ctx *ctx)
+ {
++	int ret = 0;
+ 	DEFINE_WAIT(wait);
+ 
+ 	do {
+@@ -9026,6 +9054,11 @@ static void io_sqpoll_wait_sq(struct io_ring_ctx *ctx)
+ 
+ 		prepare_to_wait(&ctx->sqo_sq_wait, &wait, TASK_INTERRUPTIBLE);
+ 
++		if (unlikely(ctx->sqo_dead)) {
++			ret = -EOWNERDEAD;
++			goto out;
++		}
++
+ 		if (!io_sqring_full(ctx))
+ 			break;
+ 
+@@ -9033,6 +9066,8 @@ static void io_sqpoll_wait_sq(struct io_ring_ctx *ctx)
+ 	} while (!signal_pending(current));
+ 
+ 	finish_wait(&ctx->sqo_sq_wait, &wait);
++out:
++	return ret;
+ }
+ 
+ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
+@@ -9076,10 +9111,16 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
+ 	if (ctx->flags & IORING_SETUP_SQPOLL) {
+ 		io_cqring_overflow_flush(ctx, false, NULL, NULL);
+ 
++		ret = -EOWNERDEAD;
++		if (unlikely(ctx->sqo_dead))
++			goto out;
+ 		if (flags & IORING_ENTER_SQ_WAKEUP)
+ 			wake_up(&ctx->sq_data->wait);
+-		if (flags & IORING_ENTER_SQ_WAIT)
+-			io_sqpoll_wait_sq(ctx);
++		if (flags & IORING_ENTER_SQ_WAIT) {
++			ret = io_sqpoll_wait_sq(ctx);
++			if (ret)
++				goto out;
++		}
+ 		submitted = to_submit;
+ 	} else if (to_submit) {
+ 		ret = io_uring_add_task_file(ctx, f.file);
+@@ -9498,6 +9539,7 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p,
+ 	trace_io_uring_create(ret, ctx, p->sq_entries, p->cq_entries, p->flags);
+ 	return ret;
+ err:
++	io_disable_sqo_submit(ctx);
+ 	io_ring_ctx_wait_and_kill(ctx);
+ 	return ret;
+ }
+-- 
+2.30.0
+
