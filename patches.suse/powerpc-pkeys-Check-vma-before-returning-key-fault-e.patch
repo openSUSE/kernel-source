@@ -1,0 +1,252 @@
+From c46241a370a61f0f264791abb9fc869016e749ce Mon Sep 17 00:00:00 2001
+From: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
+Date: Tue, 5 May 2020 12:47:09 +0530
+Subject: [PATCH] powerpc/pkeys: Check vma before returning key fault error to
+ the user
+
+References: bsc#1181544 ltc#191080
+Patch-mainline: v5.8-rc1
+Git-commit: c46241a370a61f0f264791abb9fc869016e749ce
+
+If multiple threads in userspace keep changing the protection keys
+mapping a range, there can be a scenario where kernel takes a key fault
+but the pkey value found in the siginfo struct is a permissive one.
+
+This can confuse the userspace as shown in the below test case.
+
+/* use this to control the number of test iterations */
+
+static void pkeyreg_set(int pkey, unsigned long rights)
+{
+	unsigned long reg, shift;
+
+	shift = (NR_PKEYS - pkey - 1) * PKEY_BITS_PER_PKEY;
+	asm volatile("mfspr	%0, 0xd" : "=r"(reg));
+	reg &= ~(((unsigned long) PKEY_BITS_MASK) << shift);
+	reg |= (rights & PKEY_BITS_MASK) << shift;
+	asm volatile("mtspr	0xd, %0" : : "r"(reg));
+}
+
+static unsigned long pkeyreg_get(void)
+{
+	unsigned long reg;
+
+	asm volatile("mfspr	%0, 0xd" : "=r"(reg));
+	return reg;
+}
+
+static int sys_pkey_mprotect(void *addr, size_t len, int prot, int pkey)
+{
+	return syscall(SYS_pkey_mprotect, addr, len, prot, pkey);
+}
+
+static int sys_pkey_alloc(unsigned long flags, unsigned long access_rights)
+{
+	return syscall(SYS_pkey_alloc, flags, access_rights);
+}
+
+static int sys_pkey_free(int pkey)
+{
+	return syscall(SYS_pkey_free, pkey);
+}
+
+static int faulting_pkey;
+static int permissive_pkey;
+static pthread_barrier_t pkey_set_barrier;
+static pthread_barrier_t mprotect_barrier;
+
+static void pkey_handle_fault(int signum, siginfo_t *sinfo, void *ctx)
+{
+	unsigned long pkeyreg;
+
+	/* FIXME: printf is not signal-safe but for the current purpose,
+	          it gets the job done. */
+	printf("pkey: exp = %d, got = %d\n", faulting_pkey, sinfo->si_pkey);
+	fflush(stdout);
+
+	assert(sinfo->si_code == SEGV_PKUERR);
+	assert(sinfo->si_pkey == faulting_pkey);
+
+	/* clear pkey permissions to let the faulting instruction continue */
+	pkeyreg_set(faulting_pkey, 0x0);
+}
+
+static void *do_mprotect_fault(void *p)
+{
+	unsigned long rights, pkeyreg, pgsize;
+	unsigned int i;
+	void *region;
+	int pkey;
+
+	srand(time(NULL));
+	pgsize = sysconf(_SC_PAGESIZE);
+	rights = PKEY_DISABLE_WRITE;
+	region = p;
+
+	/* allocate key, no permissions */
+	assert((pkey = sys_pkey_alloc(0, PKEY_DISABLE_ACCESS)) > 0);
+	pkeyreg_set(4, 0x0);
+
+	/* cache the pkey here as the faulting pkey for future reference
+	   in the signal handler */
+	faulting_pkey = pkey;
+	printf("%s: faulting pkey = %d\n", __func__, faulting_pkey);
+
+	/* try to allocate, mprotect and free pkeys repeatedly */
+	for (i = 0; i < NUM_ITERATIONS; i++) {
+		/* sync up with the other thread here */
+		pthread_barrier_wait(&pkey_set_barrier);
+
+		/* make sure that the pkey used by the non-faulting thread
+		   is made permissive for this thread's context too so that
+		   no faults are triggered because it still might have been
+		   set to a restrictive value */
+//		pkeyreg_set(permissive_pkey, 0x0);
+
+		/* sync up with the other thread here */
+		pthread_barrier_wait(&mprotect_barrier);
+
+		/* perform mprotect */
+		assert(!sys_pkey_mprotect(region, pgsize, PROT_READ | PROT_WRITE, pkey));
+
+		/* choose a random byte from the protected region and
+		   attempt to write to it, this will generate a fault */
+		*((char *) region + (rand() % pgsize)) = rand();
+
+		/* restore pkey permissions as the signal handler may have
+		   cleared the bit out for the sake of continuing */
+		pkeyreg_set(pkey, PKEY_DISABLE_WRITE);
+	}
+
+	/* free pkey */
+	sys_pkey_free(pkey);
+
+	return NULL;
+}
+
+static void *do_mprotect_nofault(void *p)
+{
+	unsigned long pgsize;
+	unsigned int i, j;
+	void *region;
+	int pkey;
+
+	pgsize = sysconf(_SC_PAGESIZE);
+	region = p;
+
+	/* try to allocate, mprotect and free pkeys repeatedly */
+	for (i = 0; i < NUM_ITERATIONS; i++) {
+		/* allocate pkey, all permissions */
+		assert((pkey = sys_pkey_alloc(0, 0)) > 0);
+		permissive_pkey = pkey;
+
+		/* sync up with the other thread here */
+		pthread_barrier_wait(&pkey_set_barrier);
+		pthread_barrier_wait(&mprotect_barrier);
+
+		/* perform mprotect on the common page, no faults will
+		   be triggered as this is most permissive */
+		assert(!sys_pkey_mprotect(region, pgsize, PROT_READ | PROT_WRITE, pkey));
+
+		/* free pkey */
+		assert(!sys_pkey_free(pkey));
+	}
+
+	return NULL;
+}
+
+int main(int argc, char **argv)
+{
+	pthread_t fault_thread, nofault_thread;
+	unsigned long pgsize;
+	struct sigaction act;
+	pthread_attr_t attr;
+	cpu_set_t fault_cpuset, nofault_cpuset;
+	unsigned int i;
+	void *region;
+
+	/* allocate memory region to protect */
+	pgsize = sysconf(_SC_PAGESIZE);
+	assert(region = memalign(pgsize, pgsize));
+
+	CPU_ZERO(&fault_cpuset);
+	CPU_SET(0, &fault_cpuset);
+	CPU_ZERO(&nofault_cpuset);
+	CPU_SET(8, &nofault_cpuset);
+	assert(!pthread_attr_init(&attr));
+
+	/* setup sigsegv signal handler */
+	act.sa_handler = 0;
+	act.sa_sigaction = pkey_handle_fault;
+	assert(!sigprocmask(SIG_SETMASK, 0, &act.sa_mask));
+	act.sa_flags = SA_SIGINFO;
+	act.sa_restorer = 0;
+	assert(!sigaction(SIGSEGV, &act, NULL));
+
+	/* setup barrier for the two threads */
+	pthread_barrier_init(&pkey_set_barrier, NULL, 2);
+	pthread_barrier_init(&mprotect_barrier, NULL, 2);
+
+	/* setup and start threads */
+	assert(!pthread_create(&fault_thread, &attr, &do_mprotect_fault, region));
+	assert(!pthread_setaffinity_np(fault_thread, sizeof(cpu_set_t), &fault_cpuset));
+	assert(!pthread_create(&nofault_thread, &attr, &do_mprotect_nofault, region));
+	assert(!pthread_setaffinity_np(nofault_thread, sizeof(cpu_set_t), &nofault_cpuset));
+
+	/* cleanup */
+	assert(!pthread_attr_destroy(&attr));
+	assert(!pthread_join(fault_thread, NULL));
+	assert(!pthread_join(nofault_thread, NULL));
+	assert(!pthread_barrier_destroy(&pkey_set_barrier));
+	assert(!pthread_barrier_destroy(&mprotect_barrier));
+	free(region);
+
+	puts("PASS");
+
+	return EXIT_SUCCESS;
+}
+
+The above test can result the below failure without this patch.
+
+pkey: exp = 3, got = 3
+pkey: exp = 3, got = 4
+a.out: pkey-siginfo-race.c:100: pkey_handle_fault: Assertion `sinfo->si_pkey == faulting_pkey' failed.
+Aborted
+
+Check for vma access before considering this a key fault. If vma pkey allow
+access retry the acess again.
+
+Test case is written by Sandipan Das <sandipan@linux.ibm.com> hence added SOB
+from him.
+
+Signed-off-by: Sandipan Das <sandipan@linux.ibm.com>
+Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200505071729.54912-3-aneesh.kumar@linux.ibm.com
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ arch/powerpc/mm/fault.c | 8 --------
+ 1 file changed, 8 deletions(-)
+
+diff --git a/arch/powerpc/mm/fault.c b/arch/powerpc/mm/fault.c
+index 8e529e4708e1..44457bae77a0 100644
+--- a/arch/powerpc/mm/fault.c
++++ b/arch/powerpc/mm/fault.c
+@@ -319,14 +319,6 @@ static bool bad_stack_expansion(struct pt_regs *regs, unsigned long address,
+ static bool access_pkey_error(bool is_write, bool is_exec, bool is_pkey,
+ 			      struct vm_area_struct *vma)
+ {
+-	/*
+-	 * Read or write was blocked by protection keys.  This is
+-	 * always an unconditional error and can never result in
+-	 * a follow-up action to resolve the fault, like a COW.
+-	 */
+-	if (is_pkey)
+-		return true;
+-
+ 	/*
+ 	 * Make sure to check the VMA so that we do not perform
+ 	 * faults just to hit a pkey fault as soon as we fill in a
+-- 
+2.26.2
+
