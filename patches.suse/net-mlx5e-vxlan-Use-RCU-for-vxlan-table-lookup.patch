@@ -1,0 +1,155 @@
+From: Saeed Mahameed <saeedm@mellanox.com>
+Date: Fri, 15 May 2020 17:09:05 -0700
+Subject: net/mlx5e: vxlan: Use RCU for vxlan table lookup
+Patch-mainline: v5.9-rc1
+Git-commit: 7a64ca862ac96d5e78a59bd57549034134ee0949
+References: git-fixes
+
+Remove the spinlock protecting the vxlan table and use RCU instead.
+This will improve performance as it will eliminate contention on data
+path cores.
+
+Fixes: b3f63c3d5e2c ("net/mlx5e: Add netdev support for VXLAN tunneling")
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Reviewed-by: Maxim Mikityanskiy <maximmi@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/lib/vxlan.c |   65 ++++++++------------
+ 1 file changed, 27 insertions(+), 38 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/vxlan.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/vxlan.c
+@@ -40,7 +40,6 @@
+ 
+ struct mlx5_vxlan {
+ 	struct mlx5_core_dev		*mdev;
+-	spinlock_t			lock; /* protect vxlan table */
+ 	/* max_num_ports is usuallly 4, 16 buckets is more than enough */
+ 	DECLARE_HASHTABLE(htable, 4);
+ 	int				num_ports;
+@@ -80,45 +79,46 @@ static int mlx5_vxlan_core_del_port_cmd(
+ 	return mlx5_cmd_exec(mdev, in, sizeof(in), out, sizeof(out));
+ }
+ 
+-static struct mlx5_vxlan_port*
+-mlx5_vxlan_lookup_port_locked(struct mlx5_vxlan *vxlan, u16 port)
++struct mlx5_vxlan_port *mlx5_vxlan_lookup_port(struct mlx5_vxlan *vxlan, u16 port)
+ {
+-	struct mlx5_vxlan_port *vxlanp;
++	struct mlx5_vxlan_port *retptr = NULL, *vxlanp;
+ 
+-	hash_for_each_possible(vxlan->htable, vxlanp, hlist, port) {
+-		if (vxlanp->udp_port == port)
+-			return vxlanp;
+-	}
++	if (!mlx5_vxlan_allowed(vxlan))
++		return NULL;
+ 
+-	return NULL;
++	rcu_read_lock();
++	hash_for_each_possible_rcu(vxlan->htable, vxlanp, hlist, port)
++		if (vxlanp->udp_port == port) {
++			retptr = vxlanp;
++			break;
++		}
++	rcu_read_unlock();
++
++	return retptr;
+ }
+ 
+-struct mlx5_vxlan_port *mlx5_vxlan_lookup_port(struct mlx5_vxlan *vxlan, u16 port)
++static struct mlx5_vxlan_port *vxlan_lookup_port(struct mlx5_vxlan *vxlan, u16 port)
+ {
+ 	struct mlx5_vxlan_port *vxlanp;
+ 
+-	if (!mlx5_vxlan_allowed(vxlan))
+-		return NULL;
+-
+-	spin_lock_bh(&vxlan->lock);
+-	vxlanp = mlx5_vxlan_lookup_port_locked(vxlan, port);
+-	spin_unlock_bh(&vxlan->lock);
+-
+-	return vxlanp;
++	hash_for_each_possible(vxlan->htable, vxlanp, hlist, port)
++		if (vxlanp->udp_port == port)
++			return vxlanp;
++	return NULL;
+ }
+ 
+ int mlx5_vxlan_add_port(struct mlx5_vxlan *vxlan, u16 port)
+ {
+ 	struct mlx5_vxlan_port *vxlanp;
+-	int ret = -ENOSPC;
++	int ret = 0;
+ 
+-	vxlanp = mlx5_vxlan_lookup_port(vxlan, port);
++	mutex_lock(&vxlan->sync_lock);
++	vxlanp = vxlan_lookup_port(vxlan, port);
+ 	if (vxlanp) {
+ 		refcount_inc(&vxlanp->refcount);
+-		return 0;
++		goto unlock;
+ 	}
+ 
+-	mutex_lock(&vxlan->sync_lock);
+ 	if (vxlan->num_ports >= mlx5_vxlan_max_udp_ports(vxlan->mdev)) {
+ 		mlx5_core_info(vxlan->mdev,
+ 			       "UDP port (%d) not offloaded, max number of UDP ports (%d) are already offloaded\n",
+@@ -140,9 +140,7 @@ int mlx5_vxlan_add_port(struct mlx5_vxla
+ 	vxlanp->udp_port = port;
+ 	refcount_set(&vxlanp->refcount, 1);
+ 
+-	spin_lock_bh(&vxlan->lock);
+-	hash_add(vxlan->htable, &vxlanp->hlist, port);
+-	spin_unlock_bh(&vxlan->lock);
++	hash_add_rcu(vxlan->htable, &vxlanp->hlist, port);
+ 
+ 	vxlan->num_ports++;
+ 	mutex_unlock(&vxlan->sync_lock);
+@@ -159,34 +157,26 @@ unlock:
+ int mlx5_vxlan_del_port(struct mlx5_vxlan *vxlan, u16 port)
+ {
+ 	struct mlx5_vxlan_port *vxlanp;
+-	bool remove = false;
+ 	int ret = 0;
+ 
+ 	mutex_lock(&vxlan->sync_lock);
+ 
+-	spin_lock_bh(&vxlan->lock);
+-	vxlanp = mlx5_vxlan_lookup_port_locked(vxlan, port);
++	vxlanp = vxlan_lookup_port(vxlan, port);
+ 	if (!vxlanp) {
+ 		ret = -ENOENT;
+ 		goto out_unlock;
+ 	}
+ 
+ 	if (refcount_dec_and_test(&vxlanp->refcount)) {
+-		hash_del(&vxlanp->hlist);
+-		remove = true;
+-	}
+-
+-out_unlock:
+-	spin_unlock_bh(&vxlan->lock);
+-
+-	if (remove) {
++		hash_del_rcu(&vxlanp->hlist);
++		synchronize_rcu();
+ 		mlx5_vxlan_core_del_port_cmd(vxlan->mdev, port);
+ 		kfree(vxlanp);
+ 		vxlan->num_ports--;
+ 	}
+ 
++out_unlock:
+ 	mutex_unlock(&vxlan->sync_lock);
+-
+ 	return ret;
+ }
+ 
+@@ -203,7 +193,6 @@ struct mlx5_vxlan *mlx5_vxlan_create(str
+ 
+ 	vxlan->mdev = mdev;
+ 	mutex_init(&vxlan->sync_lock);
+-	spin_lock_init(&vxlan->lock);
+ 	hash_init(vxlan->htable);
+ 
+ 	/* Hardware adds 4789 (IANA_VXLAN_UDP_PORT) by default */
