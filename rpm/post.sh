@@ -1,5 +1,6 @@
 # Flag to trigger /etc/init.d/purge-kernels on next reboot (fate#312018)
-touch /boot/do_purge_kernels
+# ... but avoid the first installion (bsc#1180058)
+test $1 -gt 1 && touch /boot/do_purge_kernels
 
 suffix=
 if test "@FLAVOR@" = "vanilla"; then
