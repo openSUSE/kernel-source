@@ -421,41 +421,7 @@ for config in $config_files; do
         MAKE_ARGS="ARCH=$cpu_arch"
         ;;
     esac
-    unset cross_arch
-    unset cross_extra
-    case $config in
-    arm64/*)
-	cross_arch="aarch64"
-	;;
-    arm*/*)
-	cross_arch="arm"
-        cross_extra="gnueabi-"
-	;;
-    ppc64le/*)
-	cross_arch="powerpc64le"
-	;;
-    ppc64/*)
-	cross_arch="powerpc64"
-	;;
-    ppc/*)
-        cross_arch="powerpc"
-	;;
-    i386/*)
-	# hack: whatever i386-suse-linux-gcc is, it does not support asm-goto
-	cross_arch="x86_64"
-	;;
-    *)
-        cross_arch="${config%%/*}"
-	;;
-    esac
-    [ "$cross_arch" = "$(uname -m)" ] && cross_arch=
-    cross_compile="${CROSS_COMPILE-${cross_arch}-suse-linux-${cross_extra}}"
-    if [ -n "$cross_arch" -a -x /usr/bin/${cross_compile}gcc ]; then
-	MAKE_ARGS="$MAKE_ARGS CROSS_COMPILE=$cross_compile"
-    fi
-    if [ -n "$CC" -a -z "$cross_arch" ]; then
-        MAKE_ARGS="$MAKE_ARGS CC=$CC"
-    fi
+    MAKE_ARGS="$MAKE_ARGS CROSS_COMPILE=scripts/dummy-tools/"
     if $silent; then
 	    MAKE_ARGS="$MAKE_ARGS -s"
     fi
