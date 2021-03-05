@@ -423,6 +423,7 @@ for config in $config_files; do
     esac
     if [ -d scripts/dummy-tools ] ; then
 	MAKE_ARGS="$MAKE_ARGS CROSS_COMPILE=scripts/dummy-tools/"
+	chmod 755 scripts/dummy-tools/*
     fi
     if $silent; then
 	MAKE_ARGS="$MAKE_ARGS -s"
