@@ -421,9 +421,11 @@ for config in $config_files; do
         MAKE_ARGS="ARCH=$cpu_arch"
         ;;
     esac
-    MAKE_ARGS="$MAKE_ARGS CROSS_COMPILE=scripts/dummy-tools/"
+    if [ -d scripts/dummy-tools ] ; then
+	MAKE_ARGS="$MAKE_ARGS CROSS_COMPILE=scripts/dummy-tools/"
+    fi
     if $silent; then
-	    MAKE_ARGS="$MAKE_ARGS -s"
+	MAKE_ARGS="$MAKE_ARGS -s"
     fi
     config="${prefix}config/$config"
     config_orig="config-orig"
