@@ -1,0 +1,148 @@
+From 8f1c0fd2c84c8bf738b7139d09d4ea53027f47c3 Mon Sep 17 00:00:00 2001
+From: Sukadev Bhattiprolu <sukadev@linux.ibm.com>
+Date: Tue, 23 Feb 2021 21:02:29 -0800
+Subject: [PATCH] ibmvnic: fix a race between open and reset
+
+References: bsc#1176855 ltc#187293
+Patch-mainline: v5.12-rc1
+Git-commit: 8f1c0fd2c84c8bf738b7139d09d4ea53027f47c3
+
+__ibmvnic_reset() currently reads the adapter->state before getting the
+rtnl and saves that state as the "target state" for the reset. If this
+read occurs when adapter is in PROBED state, the target state would be
+PROBED.
+
+Just after the target state is saved, and before the actual reset process
+is started (i.e before rtnl is acquired) if we get an ibmvnic_open() call
+we would move the adapter to OPEN state.
+
+But when the reset is processed (after ibmvnic_open()) drops the rtnl),
+it will leave the adapter in PROBED state even though we already moved
+it to OPEN.
+
+To fix this, use the RTNL to improve serialization when reading/updating
+the adapter state. i.e determine the target state of a reset only after
+getting the RTNL. And if a reset is in progress during an open, simply
+set the target state of the adapter and let the reset code finish the
+open (like we currently do if failover is pending).
+
+One twist to this serialization is if the adapter state changes when we
+drop the RTNL to update the link state. Account for this by checking if
+there was an intervening open and update the target state for the reset
+accordingly (see new comments in the code). Note that only the reset
+functions and ibmvnic_open() can set the adapter to OPEN state and this
+must happen under rtnl.
+
+Fixes: 7d7195a026ba ("ibmvnic: Do not process device remove during device reset")
+Signed-off-by: Sukadev Bhattiprolu <sukadev@linux.ibm.com>
+Reviewed-by: Dany Madden <drt@linux.ibm.com>
+Link: https://lore.kernel.org/r/20210224050229.1155468-1-sukadev@linux.ibm.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ drivers/net/ethernet/ibm/ibmvnic.c | 63 ++++++++++++++++++++++++++----
+ 1 file changed, 55 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@ -1202,12 +1202,25 @@ static int ibmvnic_open(struct net_devic
+ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+ 	int rc;
+ 
+-	/* If device failover is pending, just set device state and return.
+-	 * Device operation will be handled by reset routine.
++	ASSERT_RTNL();
++
++	/* If device failover is pending or we are about to reset, just set
++	 * device state and return. Device operation will be handled by reset
++	 * routine.
++	 *
++	 * It should be safe to overwrite the adapter->state here. Since
++	 * we hold the rtnl, either the reset has not actually started or
++	 * the rtnl got dropped during the set_link_state() in do_reset().
++	 * In the former case, no one else is changing the state (again we
++	 * have the rtnl) and in the latter case, do_reset() will detect and
++	 * honor our setting below.
+ 	 */
+-	if (adapter->failover_pending) {
++	if (adapter->failover_pending || (test_bit(0, &adapter->resetting))) {
++		netdev_dbg(netdev, "[S:%d FOP:%d] Resetting, deferring open\n",
++			   adapter->state, adapter->failover_pending);
+ 		adapter->state = VNIC_OPEN;
+-		return 0;
++		rc = 0;
++		goto out;
+ 	}
+ 
+ 	if (adapter->state != VNIC_CLOSED) {
+@@ -1227,10 +1240,12 @@ static int ibmvnic_open(struct net_devic
+ 
+ out:
+ 	/*
+-	 * If open fails due to a pending failover, set device state and
+-	 * return. Device operation will be handled by reset routine.
++	 * If open failed and there is a pending failover or in-progress reset,
++	 * set device state and return. Device operation will be handled by
++	 * reset routine. See also comments above regarding rtnl.
+ 	 */
+-	if (rc && adapter->failover_pending) {
++	if (rc &&
++	    (adapter->failover_pending || (test_bit(0, &adapter->resetting)))) {
+ 		adapter->state = VNIC_OPEN;
+ 		rc = 0;
+ 	}
+@@ -2043,6 +2058,14 @@ static int do_reset(struct ibmvnic_adapt
+ 	if (rwi->reset_reason == VNIC_RESET_FAILOVER)
+ 		adapter->failover_pending = false;
+ 
++	/* read the state and check (again) after getting rtnl */
++	reset_state = adapter->state;
++
++	if (reset_state == VNIC_REMOVING || reset_state == VNIC_REMOVED) {
++		rc = -EBUSY;
++		goto out;
++	}
++
+ 	netif_carrier_off(netdev);
+ 	adapter->reset_reason = rwi->reset_reason;
+ 
+@@ -2069,7 +2092,24 @@ static int do_reset(struct ibmvnic_adapt
+ 		if (rc)
+ 			goto out;
+ 
++		if (adapter->state == VNIC_OPEN) {
++			/* When we dropped rtnl, ibmvnic_open() got
++			 * it and noticed that we are resetting and
++			 * set the adapter state to OPEN. Update our
++			 * new "target" state, and resume the reset
++			 * from VNIC_CLOSING state.
++			 */
++			netdev_dbg(netdev,
++				   "Open changed state from %d, updating.\n",
++				   reset_state);
++			reset_state = VNIC_OPEN;
++			adapter->state = VNIC_CLOSING;
++		}
++
+ 		if (adapter->state != VNIC_CLOSING) {
++			/* If someone else changed the adapter state
++			 * when we dropped the rtnl, fail the reset
++			 */
+ 			rc = -1;
+ 			goto out;
+ 		}
+@@ -2205,6 +2245,14 @@ static int do_hard_reset(struct ibmvnic_
+ 	netdev_dbg(adapter->netdev, "Hard resetting driver (%d)\n",
+ 		   rwi->reset_reason);
+ 
++	/* read the state and check (again) after getting rtnl */
++	reset_state = adapter->state;
++
++	if (reset_state == VNIC_REMOVING || reset_state == VNIC_REMOVED) {
++		rc = -EBUSY;
++		goto out;
++	}
++
+ 	netif_carrier_off(netdev);
+ 	adapter->reset_reason = rwi->reset_reason;
+ 
