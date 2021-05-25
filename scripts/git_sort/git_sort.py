@@ -222,7 +222,7 @@ remotes = (
     Head(RepoURL("mkp/scsi.git"), "fixes"),
     Head(RepoURL("git://git.kernel.dk/linux-block.git"), "for-next"),
     Head(RepoURL("git://git.kernel.org/pub/scm/virt/kvm/kvm.git"), "queue"),
-    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.11"),
+    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.13"),
     Head(RepoURL("dhowells/linux-fs.git")),
     Head(RepoURL("herbert/cryptodev-2.6.git")),
     Head(RepoURL("helgaas/pci.git"), "next"),
@@ -254,6 +254,7 @@ remotes = (
     Head(RepoURL("bluetooth/bluetooth-next.git")),
     Head(RepoURL("clk/linux.git"), "clk-next"),
     Head(RepoURL("git://github.com/ceph/ceph-client"), "testing"),
+    Head(RepoURL("bpf/bpf.git")),
 )
 
 
