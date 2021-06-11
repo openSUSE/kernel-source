@@ -566,9 +566,11 @@ sub upload_package {
 		&$progresscb('DELETE', "$project/$link");
 	}
 	# delete stale kernel-obs-build
-	my $kob = "kernel-obs-build";
-	$self->post("/build/$project?cmd=wipe&package=$kob");
-	&$progresscb('WIPE', "$project $kob");
+	if (-e "kernel-obs-build.spec") {
+		my $kob = "kernel-obs-build";
+		$self->post("/build/$project?cmd=wipe&package=$kob");
+		&$progresscb('WIPE', "$project $kob");
+	}
 	return $revision;
 }
 
