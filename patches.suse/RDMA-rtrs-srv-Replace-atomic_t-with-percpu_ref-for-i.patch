@@ -1,0 +1,157 @@
+From: Md Haris Iqbal <haris.iqbal@cloud.ionos.com>
+Date: Fri, 28 May 2021 13:30:11 +0200
+Subject: RDMA/rtrs-srv: Replace atomic_t with percpu_ref for ids_inflight
+Patch-mainline: v5.14-rc1
+Git-commit: 0cdfb3b20797804ae835d7a325b08d8523794089
+References: jsc#SLE-15176
+
+ids_inflight is used to track the inflight IOs. But the use of atomic_t
+variable can cause performance drops and can also become a performance
+bottleneck.
+
+This commit replaces the use of atomic_t with a percpu_ref structure. The
+advantage it offers is, it doesn't check if the reference has fallen to 0,
+until the user explicitly signals it to; and that is done by the
+percpu_ref_kill() function call. After that, the percpu_ref structure
+behaves like an atomic_t and for every put call, checks whether the
+reference has fallen to 0 or not.
+
+rtrs_srv_stats_rdma_to_str shows the count of ids_inflight as 0
+for user-mode tools not to be confused.
+
+Fixes: 9cb837480424e ("RDMA/rtrs: server: main functionality")
+Link: https://lore.kernel.org/r/20210528113018.52290-14-jinpu.wang@ionos.com
+Signed-off-by: Md Haris Iqbal <haris.iqbal@ionos.com>
+Signed-off-by: Jack Wang <jinpu.wang@ionos.com>
+Signed-off-by: Gioh Kim <gi-oh.kim@ionos.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/ulp/rtrs/rtrs-srv-stats.c |   12 +++----
+ drivers/infiniband/ulp/rtrs/rtrs-srv.c       |   43 +++++++++++++++++----------
+ drivers/infiniband/ulp/rtrs/rtrs-srv.h       |    4 +-
+ 3 files changed, 35 insertions(+), 24 deletions(-)
+
+--- a/drivers/infiniband/ulp/rtrs/rtrs-srv-stats.c
++++ b/drivers/infiniband/ulp/rtrs/rtrs-srv-stats.c
+@@ -27,12 +27,10 @@ ssize_t rtrs_srv_stats_rdma_to_str(struc
+ 				    char *page, size_t len)
+ {
+ 	struct rtrs_srv_stats_rdma_stats *r = &stats->rdma_stats;
+-	struct rtrs_srv_sess *sess = stats->sess;
+ 
+-	return scnprintf(page, len, "%lld %lld %lld %lld %u\n",
+-			 (s64)atomic64_read(&r->dir[READ].cnt),
+-			 (s64)atomic64_read(&r->dir[READ].size_total),
+-			 (s64)atomic64_read(&r->dir[WRITE].cnt),
+-			 (s64)atomic64_read(&r->dir[WRITE].size_total),
+-			 atomic_read(&sess->ids_inflight));
++	return scnprintf(page, len, "%lld %lld %lld %lldn %u\n",
++			  (s64)atomic64_read(&r->dir[READ].cnt),
++			  (s64)atomic64_read(&r->dir[READ].size_total),
++			  (s64)atomic64_read(&r->dir[WRITE].cnt),
++			  (s64)atomic64_read(&r->dir[WRITE].size_total), 0);
+ }
+--- a/drivers/infiniband/ulp/rtrs/rtrs-srv.c
++++ b/drivers/infiniband/ulp/rtrs/rtrs-srv.c
+@@ -147,7 +147,6 @@ static void rtrs_srv_free_ops_ids(struct
+ 	struct rtrs_srv *srv = sess->srv;
+ 	int i;
+ 
+-	WARN_ON(atomic_read(&sess->ids_inflight));
+ 	if (sess->ops_ids) {
+ 		for (i = 0; i < srv->queue_depth; i++)
+ 			free_id(sess->ops_ids[i]);
+@@ -162,11 +161,19 @@ static struct ib_cqe io_comp_cqe = {
+ 	.done = rtrs_srv_rdma_done
+ };
+ 
++static inline void rtrs_srv_inflight_ref_release(struct percpu_ref *ref)
++{
++	struct rtrs_srv_sess *sess = container_of(ref, struct rtrs_srv_sess, ids_inflight_ref);
++
++	percpu_ref_exit(&sess->ids_inflight_ref);
++	complete(&sess->complete_done);
++}
++
+ static int rtrs_srv_alloc_ops_ids(struct rtrs_srv_sess *sess)
+ {
+ 	struct rtrs_srv *srv = sess->srv;
+ 	struct rtrs_srv_op *id;
+-	int i;
++	int i, ret;
+ 
+ 	sess->ops_ids = kcalloc(srv->queue_depth, sizeof(*sess->ops_ids),
+ 				GFP_KERNEL);
+@@ -180,8 +187,14 @@ static int rtrs_srv_alloc_ops_ids(struct
+ 
+ 		sess->ops_ids[i] = id;
+ 	}
+-	init_waitqueue_head(&sess->ids_waitq);
+-	atomic_set(&sess->ids_inflight, 0);
++
++	ret = percpu_ref_init(&sess->ids_inflight_ref,
++			      rtrs_srv_inflight_ref_release, 0, GFP_KERNEL);
++	if (ret) {
++		pr_err("Percpu reference init failed\n");
++		goto err;
++	}
++	init_completion(&sess->complete_done);
+ 
+ 	return 0;
+ 
+@@ -192,21 +205,14 @@ err:
+ 
+ static inline void rtrs_srv_get_ops_ids(struct rtrs_srv_sess *sess)
+ {
+-	atomic_inc(&sess->ids_inflight);
++	percpu_ref_get(&sess->ids_inflight_ref);
+ }
+ 
+ static inline void rtrs_srv_put_ops_ids(struct rtrs_srv_sess *sess)
+ {
+-	if (atomic_dec_and_test(&sess->ids_inflight))
+-		wake_up(&sess->ids_waitq);
++	percpu_ref_put(&sess->ids_inflight_ref);
+ }
+ 
+-static void rtrs_srv_wait_ops_ids(struct rtrs_srv_sess *sess)
+-{
+-	wait_event(sess->ids_waitq, !atomic_read(&sess->ids_inflight));
+-}
+-
+-
+ static void rtrs_srv_reg_mr_done(struct ib_cq *cq, struct ib_wc *wc)
+ {
+ 	struct rtrs_srv_con *con = cq->cq_context;
+@@ -1512,8 +1518,15 @@ static void rtrs_srv_close_work(struct w
+ 		rdma_disconnect(con->c.cm_id);
+ 		ib_drain_qp(con->c.qp);
+ 	}
+-	/* Wait for all inflights */
+-	rtrs_srv_wait_ops_ids(sess);
++
++	/*
++	 * Degrade ref count to the usual model with a single shared
++	 * atomic_t counter
++	 */
++	percpu_ref_kill(&sess->ids_inflight_ref);
++
++	/* Wait for all completion */
++	wait_for_completion(&sess->complete_done);
+ 
+ 	/* Notify upper layer if we are the last path */
+ 	rtrs_srv_sess_down(sess);
+--- a/drivers/infiniband/ulp/rtrs/rtrs-srv.h
++++ b/drivers/infiniband/ulp/rtrs/rtrs-srv.h
+@@ -81,8 +81,8 @@ struct rtrs_srv_sess {
+ 	spinlock_t		state_lock;
+ 	int			cur_cq_vector;
+ 	struct rtrs_srv_op	**ops_ids;
+-	atomic_t		ids_inflight;
+-	wait_queue_head_t	ids_waitq;
++	struct percpu_ref       ids_inflight_ref;
++	struct completion       complete_done;
+ 	struct rtrs_srv_mr	*mrs;
+ 	unsigned int		mrs_num;
+ 	dma_addr_t		*dma_addr;
