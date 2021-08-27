@@ -11,9 +11,9 @@ for x in /boot/@IMAGE@ /boot/initrd; do
     ln -s ${x##*/}-@KERNELRELEASE@-@FLAVOR@ $x$suffix
 done
 @USRMERGE@# compat stuff for /boot.
-@USRMERGE@# if /boot is not a speparate partition we can just link the kernel
-@USRMERGE@# there to save space. Otherwise copy.
-@USRMERGE@if mountpoint -q /boot; then
+@USRMERGE@# if /boot and /usr are not speparate partitions we can just link
+@USRMERGE@# the kernel there to save space. Otherwise copy.
+@USRMERGE@if mountpoint -q /boot || mountpoint -q /usr; then
 @USRMERGE@    copy_or_link="cp -a"
 @USRMERGE@else
 @USRMERGE@    copy_or_link="ln -sf"
