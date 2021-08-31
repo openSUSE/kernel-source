@@ -9,11 +9,11 @@ LIVEPATCH=livepatch
 # Compile binary devicetrees for Leap
 BUILD_DTBS="Yes"
 # buildservice projects to build the kernel against
-OBS_PROJECT=SUSE:SLE-15-SP2:Update
-OBS_PROJECT_ARM=openSUSE:Step:15-SP3
-IBS_PROJECT=SUSE:SLE-15-SP3:Update
+OBS_PROJECT=SUSE:SLE-15-SP4:GA
+OBS_PROJECT_ARM=openSUSE:Step:15-SP4
+IBS_PROJECT=SUSE:SLE-15-SP4:GA
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
-BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 15 SP3"
+BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 15 SP4"
 # Check the sorted patches section of series.conf
 SORT_SERIES=yes
