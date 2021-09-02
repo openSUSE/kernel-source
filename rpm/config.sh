@@ -9,9 +9,9 @@ LIVEPATCH=livepatch
 # Compile binary devicetrees for Leap
 BUILD_DTBS="Yes"
 # buildservice projects to build the kernel against
-OBS_PROJECT=SUSE:SLE-15-SP4:GA
+OBS_PROJECT=SUSE:SLE-15-SP4:Update
 OBS_PROJECT_ARM=openSUSE:Step:15-SP4
-IBS_PROJECT=SUSE:SLE-15-SP4:GA
+IBS_PROJECT=SUSE:SLE-15-SP4:Update
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
 BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 15 SP4"
