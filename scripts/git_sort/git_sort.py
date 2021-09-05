@@ -239,6 +239,7 @@ remotes = (
     Head(RepoURL("herbert/crypto-2.6.git"), "master"),
     Head(RepoURL("rafael/linux-pm.git")),
     Head(RepoURL("git://git.linux-nfs.org/~bfields/linux.git"), "nfsd-next"),
+    Head(RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"), "for-next"),
     Head(RepoURL("vkoul/soundwire.git"),"fixes"),
     Head(RepoURL("vkoul/soundwire.git"),"next"),
     Head(RepoURL("arm64/linux.git"), "for-next/core"),
