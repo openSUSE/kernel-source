@@ -108,7 +108,7 @@ tag_map = {
         'accepted' : [
             {
                 'name' : 'SUSE',
-                'match' : '.*@(suse\.(com|de|cz)|novell.com)',
+                'match' : '.*@suse\.(com|de|cz)',
             },
             {
                 'match' : '.*',
@@ -120,7 +120,7 @@ tag_map = {
         'accepted' : [
             {
                 'name' : 'SUSE',
-                'match' : '.*@(suse\.(com|de|cz)|novell.com)',
+                'match' : '.*@suse\.(com|de|cz)',
             },
             {
                 'match' : '.*',
@@ -132,7 +132,7 @@ tag_map = {
         'accepted' : [
             {
                 'name' : 'SUSE',
-                'match' : '.*@(suse\.(com|de|cz)|novell.com)',
+                'match' : '.*@suse\.(com|de|cz)',
             },
             {
                 'match' : '.*',
@@ -145,7 +145,7 @@ tag_map = {
         'accepted' : [
             {
                 'name' : 'SUSE',
-                'match' : '.*@(suse\.(com|de|cz)|novell.com)',
+                'match' : '.*@suse\.(com|de|cz)',
             },
             {
                 'match' : '.*',
