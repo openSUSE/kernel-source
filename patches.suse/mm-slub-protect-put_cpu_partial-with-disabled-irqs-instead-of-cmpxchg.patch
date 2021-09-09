@@ -1,0 +1,170 @@
+From: Vlastimil Babka <vbabka@suse.cz>
+Date: Wed, 28 Jul 2021 12:26:27 +0200
+Subject: mm, slub: protect put_cpu_partial() with disabled irqs instead of
+ cmpxchg
+Git-commit: e0a043aa4145a14d6a8864847811491699a81310
+Patch-mainline: v5.15-rc1
+References: bsc#1189998
+
+Jann Horn reported [1] the following theoretically possible race:
+
+  task A: put_cpu_partial() calls preempt_disable()
+  task A: oldpage = this_cpu_read(s->cpu_slab->partial)
+  interrupt: kfree() reaches unfreeze_partials() and discards the page
+  task B (on another CPU): reallocates page as page cache
+  task A: reads page->pages and page->pobjects, which are actually
+  halves of the pointer page->lru.prev
+  task B (on another CPU): frees page
+  interrupt: allocates page as SLUB page and places it on the percpu partial list
+  task A: this_cpu_cmpxchg() succeeds
+
+  which would cause page->pages and page->pobjects to end up containing
+  halves of pointers that would then influence when put_cpu_partial()
+  happens and show up in root-only sysfs files. Maybe that's acceptable,
+  I don't know. But there should probably at least be a comment for now
+  to point out that we're reading union fields of a page that might be
+  in a completely different state.
+
+Additionally, the this_cpu_cmpxchg() approach in put_cpu_partial() is only safe
+against s->cpu_slab->partial manipulation in ___slab_alloc() if the latter
+disables irqs, otherwise a __slab_free() in an irq handler could call
+put_cpu_partial() in the middle of ___slab_alloc() manipulating ->partial
+and corrupt it. This becomes an issue on RT after a local_lock is introduced
+in later patch. The fix means taking the local_lock also in put_cpu_partial()
+on RT.
+
+After debugging this issue, Mike Galbraith suggested [2] that to avoid
+different locking schemes on RT and !RT, we can just protect put_cpu_partial()
+with disabled irqs (to be converted to local_lock_irqsave() later) everywhere.
+This should be acceptable as it's not a fast path, and moving the actual
+partial unfreezing outside of the irq disabled section makes it short, and with
+the retry loop gone the code can be also simplified. In addition, the race
+reported by Jann should no longer be possible.
+
+[1] https://lore.kernel.org/lkml/CAG48ez1mvUuXwg0YPH5ANzhQLpbphqk-ZS+jbRz+H66fvm4FcA@mail.gmail.com/
+[2] https://lore.kernel.org/linux-rt-users/e3470ab357b48bccfbd1f5133b982178a7d2befb.camel@gmx.de/
+
+Reported-by: Jann Horn <jannh@google.com>
+Suggested-by: Mike Galbraith <efault@gmx.de>
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+---
+ mm/slub.c |   83 +++++++++++++++++++++++++++++++++-----------------------------
+ 1 file changed, 45 insertions(+), 38 deletions(-)
+
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -2025,7 +2025,12 @@ static inline void *acquire_slab(struct
+ 	return freelist;
+ }
+ 
++#ifdef CONFIG_SLUB_CPU_PARTIAL
+ static void put_cpu_partial(struct kmem_cache *s, struct page *page, int drain);
++#else
++static inline void put_cpu_partial(struct kmem_cache *s, struct page *page,
++				   int drain) { }
++#endif
+ static inline bool pfmemalloc_match(struct page *page, gfp_t gfpflags);
+ 
+ /*
+@@ -2459,14 +2464,6 @@ static void unfreeze_partials_cpu(struct
+ 		__unfreeze_partials(s, partial_page);
+ }
+ 
+-#else	/* CONFIG_SLUB_CPU_PARTIAL */
+-
+-static inline void unfreeze_partials(struct kmem_cache *s) { }
+-static inline void unfreeze_partials_cpu(struct kmem_cache *s,
+-				  struct kmem_cache_cpu *c) { }
+-
+-#endif	/* CONFIG_SLUB_CPU_PARTIAL */
+-
+ /*
+  * Put a page that was just frozen (in __slab_free|get_partial_node) into a
+  * partial page slot if available.
+@@ -2476,46 +2473,56 @@ static inline void unfreeze_partials_cpu
+  */
+ static void put_cpu_partial(struct kmem_cache *s, struct page *page, int drain)
+ {
+-#ifdef CONFIG_SLUB_CPU_PARTIAL
+ 	struct page *oldpage;
+-	int pages;
+-	int pobjects;
++	struct page *page_to_unfreeze = NULL;
++	unsigned long flags;
++	int pages = 0;
++	int pobjects = 0;
+ 
+-	preempt_disable();
+-	do {
+-		pages = 0;
+-		pobjects = 0;
+-		oldpage = this_cpu_read(s->cpu_slab->partial);
++	local_irq_save(flags);
++
++	oldpage = this_cpu_read(s->cpu_slab->partial);
+ 
+-		if (oldpage) {
++	if (oldpage) {
++		if (drain && oldpage->pobjects > slub_cpu_partial(s)) {
++			/*
++			 * Partial array is full. Move the existing set to the
++			 * per node partial list. Postpone the actual unfreezing
++			 * outside of the critical section.
++			 */
++			page_to_unfreeze = oldpage;
++			oldpage = NULL;
++		} else {
+ 			pobjects = oldpage->pobjects;
+ 			pages = oldpage->pages;
+-			if (drain && pobjects > slub_cpu_partial(s)) {
+-				/*
+-				 * partial array is full. Move the existing
+-				 * set to the per node partial list.
+-				 */
+-				unfreeze_partials(s);
+-				oldpage = NULL;
+-				pobjects = 0;
+-				pages = 0;
+-				stat(s, CPU_PARTIAL_DRAIN);
+-			}
+ 		}
++	}
+ 
+-		pages++;
+-		pobjects += page->objects - page->inuse;
++	pages++;
++	pobjects += page->objects - page->inuse;
+ 
+-		page->pages = pages;
+-		page->pobjects = pobjects;
+-		page->next = oldpage;
+-
+-	} while (this_cpu_cmpxchg(s->cpu_slab->partial, oldpage, page)
+-								!= oldpage);
+-	preempt_enable();
+-#endif	/* CONFIG_SLUB_CPU_PARTIAL */
++	page->pages = pages;
++	page->pobjects = pobjects;
++	page->next = oldpage;
++
++	this_cpu_write(s->cpu_slab->partial, page);
++
++	local_irq_restore(flags);
++
++	if (page_to_unfreeze) {
++		__unfreeze_partials(s, page_to_unfreeze);
++		stat(s, CPU_PARTIAL_DRAIN);
++	}
+ }
+ 
++#else	/* CONFIG_SLUB_CPU_PARTIAL */
++
++static inline void unfreeze_partials(struct kmem_cache *s) { }
++static inline void unfreeze_partials_cpu(struct kmem_cache *s,
++				  struct kmem_cache_cpu *c) { }
++
++#endif	/* CONFIG_SLUB_CPU_PARTIAL */
++
+ static inline void flush_slab(struct kmem_cache *s, struct kmem_cache_cpu *c)
+ {
+ 	unsigned long flags;
