@@ -6,7 +6,7 @@
 # this will double the required space below /boot
 # remove the files from the old packages to make room for the new initrd
 # rpm may complain about low disk space if /boot/vmlinux does not fit
-if [ @BASE_PACKAGE@ = 1 -a "$YAST_IS_RUNNING" != "" ]; then
+if [ "$YAST_IS_RUNNING" != "" ]; then
 	mydf="$( POSIXLY_CORRECT=1 df -P /boot/ | awk '/^(\/|-[[:blank:]])/{ print $4}' )"
 	if test "$mydf" != "" ; then
 		echo "Free diskspace below /boot: $mydf blocks"
