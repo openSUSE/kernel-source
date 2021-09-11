@@ -2,13 +2,9 @@
 # ... but avoid the first installion (bsc#1180058)
 test $1 -gt 1 && touch /boot/do_purge_kernels
 
-suffix=
-if test "@FLAVOR@" = "vanilla"; then
-    suffix=-@FLAVOR@
-fi
 for x in /boot/@IMAGE@ /boot/initrd; do
-    rm -f $x$suffix
-    ln -s ${x##*/}-@KERNELRELEASE@-@FLAVOR@ $x$suffix
+    rm -f $x
+    ln -s ${x##*/}-@KERNELRELEASE@-@FLAVOR@ $x
 done
 @USRMERGE@# compat stuff for /boot.
 @USRMERGE@# if /boot and /usr are not speparate partitions we can just link
