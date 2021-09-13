@@ -1,0 +1,272 @@
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Tue, 21 Jul 2020 10:22:33 -0400
+Subject: btrfs: do async reclaim for data reservations
+Git-commit: 5705674081cee751659a6adb4849645a566a6cf4
+Patch-mainline: v5.10-rc1
+References: bsc#1135481
+
+Now that we have the data ticketing stuff in place, move normal data
+reservations to use an async reclaim helper to satisfy tickets.  Before
+we could have multiple tasks race in and both allocate chunks, resulting
+in more data chunks than we would necessarily need.  Serializing these
+allocations and making a single thread responsible for flushing will
+only allocate chunks as needed, as well as cut down on transaction
+commits and other flush related activities.
+
+Priority reservations will still work as they have before, simply
+trying to allocate a chunk until they can make their reservation.
+
+Reviewed-by: Nikolay Borisov <nborisov@suse.com>
+Tested-by: Nikolay Borisov <nborisov@suse.com>
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Acked-by: Nikolay Borisov <nborisov@suse.com>
+---
+ fs/btrfs/ctree.h      |    3 -
+ fs/btrfs/disk-io.c    |    3 -
+ fs/btrfs/space-info.c |  118 ++++++++++++++++++++++++++++++++++++--------------
+ fs/btrfs/super.c      |    1 
+ 4 files changed, 90 insertions(+), 35 deletions(-)
+
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -495,7 +495,7 @@ struct btrfs_stripe_hash_table {
+ 
+ #define BTRFS_STRIPE_HASH_TABLE_BITS 11
+ 
+-void btrfs_init_async_reclaim_work(struct work_struct *work);
++void btrfs_init_async_reclaim_work(struct btrfs_fs_info *fs_info);
+ 
+ /* fs_info */
+ struct reloc_control;
+@@ -908,6 +908,7 @@ struct btrfs_fs_info {
+ 
+ 	/* Used to reclaim the metadata space in the background. */
+ 	struct work_struct async_reclaim_work;
++	struct work_struct async_data_reclaim_work;
+ 
+ 	spinlock_t unused_bgs_lock;
+ 	struct list_head unused_bgs;
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -2794,7 +2794,7 @@ void btrfs_init_fs_info(struct btrfs_fs_
+ 	fs_info->check_integrity_print_mask = 0;
+ #endif
+ 	btrfs_init_balance(fs_info);
+-	btrfs_init_async_reclaim_work(&fs_info->async_reclaim_work);
++	btrfs_init_async_reclaim_work(fs_info);
+ 
+ 	spin_lock_init(&fs_info->block_group_cache_lock);
+ 	fs_info->block_group_cache_tree = RB_ROOT;
+@@ -4053,6 +4053,7 @@ void __cold close_ctree(struct btrfs_fs_
+ 	btrfs_cleanup_defrag_inodes(fs_info);
+ 
+ 	cancel_work_sync(&fs_info->async_reclaim_work);
++	cancel_work_sync(&fs_info->async_data_reclaim_work);
+ 
+ 	if (!sb_rdonly(fs_info->sb)) {
+ 		/*
+--- a/fs/btrfs/space-info.c
++++ b/fs/btrfs/space-info.c
+@@ -849,9 +849,79 @@ static void btrfs_async_reclaim_metadata
+ 	} while (flush_state <= COMMIT_TRANS);
+ }
+ 
+-void btrfs_init_async_reclaim_work(struct work_struct *work)
++static const enum btrfs_flush_state data_flush_states[] = {
++	FLUSH_DELALLOC_WAIT,
++	RUN_DELAYED_IPUTS,
++	FLUSH_DELAYED_REFS,
++	COMMIT_TRANS,
++};
++
++static void btrfs_async_reclaim_data_space(struct work_struct *work)
+ {
+-	INIT_WORK(work, btrfs_async_reclaim_metadata_space);
++	struct btrfs_fs_info *fs_info;
++	struct btrfs_space_info *space_info;
++	u64 last_tickets_id;
++	int flush_state = 0;
++
++	fs_info = container_of(work, struct btrfs_fs_info, async_data_reclaim_work);
++	space_info = fs_info->data_sinfo;
++
++	spin_lock(&space_info->lock);
++	if (list_empty(&space_info->tickets)) {
++		space_info->flush = 0;
++		spin_unlock(&space_info->lock);
++		return;
++	}
++	last_tickets_id = space_info->tickets_id;
++	spin_unlock(&space_info->lock);
++
++	while (!space_info->full) {
++		flush_space(fs_info, space_info, U64_MAX, ALLOC_CHUNK_FORCE);
++		spin_lock(&space_info->lock);
++		if (list_empty(&space_info->tickets)) {
++			space_info->flush = 0;
++			spin_unlock(&space_info->lock);
++			return;
++		}
++		last_tickets_id = space_info->tickets_id;
++		spin_unlock(&space_info->lock);
++	}
++
++	while (flush_state < ARRAY_SIZE(data_flush_states)) {
++		flush_space(fs_info, space_info, U64_MAX,
++			    data_flush_states[flush_state]);
++		spin_lock(&space_info->lock);
++		if (list_empty(&space_info->tickets)) {
++			space_info->flush = 0;
++			spin_unlock(&space_info->lock);
++			return;
++		}
++
++		if (last_tickets_id == space_info->tickets_id) {
++			flush_state++;
++		} else {
++			last_tickets_id = space_info->tickets_id;
++			flush_state = 0;
++		}
++
++		if (flush_state >= ARRAY_SIZE(data_flush_states)) {
++			if (space_info->full) {
++				if (maybe_fail_all_tickets(fs_info, space_info))
++					flush_state = 0;
++				else
++					space_info->flush = 0;
++			} else {
++				flush_state = 0;
++			}
++		}
++		spin_unlock(&space_info->lock);
++	}
++}
++
++void btrfs_init_async_reclaim_work(struct btrfs_fs_info *fs_info)
++{
++	INIT_WORK(&fs_info->async_reclaim_work, btrfs_async_reclaim_metadata_space);
++	INIT_WORK(&fs_info->async_data_reclaim_work, btrfs_async_reclaim_data_space);
+ }
+ 
+ static const enum btrfs_flush_state priority_flush_states[] = {
+@@ -871,13 +941,6 @@ static const enum btrfs_flush_state evic
+ 	COMMIT_TRANS,
+ };
+ 
+-static const enum btrfs_flush_state data_flush_states[] = {
+-	FLUSH_DELALLOC_WAIT,
+-	RUN_DELAYED_IPUTS,
+-	FLUSH_DELAYED_REFS,
+-	COMMIT_TRANS,
+-};
+-
+ static void priority_reclaim_metadata_space(struct btrfs_fs_info *fs_info,
+ 				struct btrfs_space_info *space_info,
+ 				struct reserve_ticket *ticket,
+@@ -910,12 +973,8 @@ static void priority_reclaim_metadata_sp
+ 
+ static void priority_reclaim_data_space(struct btrfs_fs_info *fs_info,
+ 					struct btrfs_space_info *space_info,
+-					struct reserve_ticket *ticket,
+-					const enum btrfs_flush_state *states,
+-					int states_nr)
++					struct reserve_ticket *ticket)
+ {
+-	int flush_state = 0;
+-
+ 	while (!space_info->full) {
+ 		flush_space(fs_info, space_info, U64_MAX, ALLOC_CHUNK_FORCE);
+ 		spin_lock(&space_info->lock);
+@@ -925,17 +984,6 @@ static void priority_reclaim_data_space(
+ 		}
+ 		spin_unlock(&space_info->lock);
+ 	}
+-
+-	while (flush_state < states_nr) {
+-		flush_space(fs_info, space_info, U64_MAX, states[flush_state]);
+-		spin_lock(&space_info->lock);
+-		if (ticket->bytes == 0) {
+-			spin_unlock(&space_info->lock);
+-			return;
+-		}
+-		spin_unlock(&space_info->lock);
+-		flush_state++;
+-	}
+ }
+ 
+ static void wait_reserve_ticket(struct btrfs_fs_info *fs_info,
+@@ -990,6 +1038,7 @@ static int handle_reserve_ticket(struct
+ 	int ret;
+ 
+ 	switch (flush) {
++	case BTRFS_RESERVE_FLUSH_DATA:
+ 	case BTRFS_RESERVE_FLUSH_ALL:
+ 	case BTRFS_RESERVE_FLUSH_ALL_STEAL:
+ 		wait_reserve_ticket(fs_info, space_info, ticket);
+@@ -1004,12 +1053,8 @@ static int handle_reserve_ticket(struct
+ 						evict_flush_states,
+ 						ARRAY_SIZE(evict_flush_states));
+ 		break;
+-	case BTRFS_RESERVE_FLUSH_DATA:
+-		priority_reclaim_data_space(fs_info, space_info, ticket,
+-				data_flush_states, ARRAY_SIZE(data_flush_states));
+-		break;
+ 	case BTRFS_RESERVE_FLUSH_FREE_SPACE_INODE:
+-		priority_reclaim_data_space(fs_info, space_info, ticket, NULL, 0);
++		priority_reclaim_data_space(fs_info, space_info, ticket);
+ 		break;
+ 	default:
+ 		ASSERT(0);
+@@ -1071,6 +1116,7 @@ static int __reserve_bytes(struct btrfs_
+ 			   struct btrfs_space_info *space_info, u64 orig_bytes,
+ 			   enum btrfs_reserve_flush_enum flush)
+ {
++	struct work_struct *async_work;
+ 	struct reserve_ticket ticket;
+ 	u64 used;
+ 	int ret = 0;
+@@ -1079,6 +1125,11 @@ static int __reserve_bytes(struct btrfs_
+ 	ASSERT(orig_bytes);
+ 	ASSERT(!current->journal_info || flush != BTRFS_RESERVE_FLUSH_ALL);
+ 
++	if (flush == BTRFS_RESERVE_FLUSH_DATA)
++		async_work = &fs_info->async_data_reclaim_work;
++	else
++		async_work = &fs_info->async_reclaim_work;
++
+ 	spin_lock(&space_info->lock);
+ 	ret = -ENOSPC;
+ 	used = btrfs_space_info_used(space_info, true);
+@@ -1119,7 +1170,9 @@ static int __reserve_bytes(struct btrfs_
+ 		space_info->reclaim_size += ticket.bytes;
+ 		ticket.steal = (flush == BTRFS_RESERVE_FLUSH_ALL_STEAL);
+ 		init_waitqueue_head(&ticket.wait);
+-		if (is_normal_flushing(flush)) {
++		if (flush == BTRFS_RESERVE_FLUSH_ALL ||
++		    flush == BTRFS_RESERVE_FLUSH_ALL_STEAL ||
++		    flush == BTRFS_RESERVE_FLUSH_DATA) {
+ 			list_add_tail(&ticket.list, &space_info->tickets);
+ 			if (!space_info->flush) {
+ 				space_info->flush = 1;
+@@ -1127,8 +1180,7 @@ static int __reserve_bytes(struct btrfs_
+ 							  space_info->flags,
+ 							  orig_bytes, flush,
+ 							  "enospc");
+-				queue_work(system_unbound_wq,
+-					   &fs_info->async_reclaim_work);
++				queue_work(system_unbound_wq, async_work);
+ 			}
+ 		} else {
+ 			list_add_tail(&ticket.list,
+--- a/fs/btrfs/super.c
++++ b/fs/btrfs/super.c
+@@ -1766,6 +1766,7 @@ static int btrfs_remount(struct super_bl
+ 		 * the filesystem is busy.
+ 		 */
+ 		cancel_work_sync(&fs_info->async_reclaim_work);
++		cancel_work_sync(&fs_info->async_data_reclaim_work);
+ 
+ 		/* wait for the uuid_scan task to finish */
+ 		down(&fs_info->uuid_tree_rescan_sem);
