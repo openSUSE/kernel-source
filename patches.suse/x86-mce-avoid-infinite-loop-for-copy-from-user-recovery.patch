@@ -1,0 +1,167 @@
+From: Tony Luck <tony.luck@intel.com>
+Date: Mon, 13 Sep 2021 14:52:39 -0700
+Subject: x86/mce: Avoid infinite loop for copy from user recovery
+Git-commit: 81065b35e2486c024c7aa86caed452e1f01a59d4
+Patch-mainline: v5.15-rc2
+References: bsc#1190497
+
+There are two cases for machine check recovery:
+
+1) The machine check was triggered by ring3 (application) code.
+   This is the simpler case. The machine check handler simply queues
+   work to be executed on return to user. That code unmaps the page
+   from all users and arranges to send a SIGBUS to the task that
+   triggered the poison.
+
+2) The machine check was triggered in kernel code that is covered by
+   an exception table entry. In this case the machine check handler
+   still queues a work entry to unmap the page, etc. but this will
+   not be called right away because the #MC handler returns to the
+   fix up code address in the exception table entry.
+
+Problems occur if the kernel triggers another machine check before the
+return to user processes the first queued work item.
+
+Specifically, the work is queued using the ->mce_kill_me callback
+structure in the task struct for the current thread. Attempting to queue
+a second work item using this same callback results in a loop in the
+linked list of work functions to call. So when the kernel does return to
+user, it enters an infinite loop processing the same entry for ever.
+
+There are some legitimate scenarios where the kernel may take a second
+machine check before returning to the user.
+
+1) Some code (e.g. futex) first tries a get_user() with page faults
+   disabled. If this fails, the code retries with page faults enabled
+   expecting that this will resolve the page fault.
+
+2) Copy from user code retries a copy in byte-at-time mode to check
+   whether any additional bytes can be copied.
+
+On the other side of the fence are some bad drivers that do not check
+the return value from individual get_user() calls and may access
+multiple user addresses without noticing that some/all calls have
+failed.
+
+Fix by adding a counter (current->mce_count) to keep track of repeated
+machine checks before task_work() is called. First machine check saves
+the address information and calls task_work_add(). Subsequent machine
+checks before that task_work call back is executed check that the address
+is in the same page as the first machine check (since the callback will
+offline exactly one page).
+
+Expected worst case is four machine checks before moving on (e.g. one
+user access with page faults disabled, then a repeat to the same address
+with page faults enabled ... repeat in copy tail bytes). Just in case
+there is some code that loops forever enforce a limit of 10.
+
+ [ bp: Massage commit message, drop noinstr, fix typo, extend panic
+   messages. ]
+
+Fixes: 5567d11c21a1 ("x86/mce: Send #MC singal from task work")
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Cc: <stable@vger.kernel.org>
+Link: https://lkml.kernel.org/r/YT/IJ9ziLqmtqEPu@agluck-desk2.amr.corp.intel.com
+---
+ arch/x86/kernel/cpu/mce/core.c | 43 +++++++++++++++++++++++++++++++-----------
+ include/linux/sched.h          |  1 +
+ 2 files changed, 33 insertions(+), 11 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mce/core.c b/arch/x86/kernel/cpu/mce/core.c
+index 8cb7816d03b4..193204aee880 100644
+--- a/arch/x86/kernel/cpu/mce/core.c
++++ b/arch/x86/kernel/cpu/mce/core.c
+@@ -1253,6 +1253,9 @@ static void __mc_scan_banks(struct mce *m, struct pt_regs *regs, struct mce *fin
+ 
+ static void kill_me_now(struct callback_head *ch)
+ {
++	struct task_struct *p = container_of(ch, struct task_struct, mce_kill_me);
++
++	p->mce_count = 0;
+ 	force_sig(SIGBUS);
+ }
+ 
+@@ -1262,6 +1265,7 @@ static void kill_me_maybe(struct callback_head *cb)
+ 	int flags = MF_ACTION_REQUIRED;
+ 	int ret;
+ 
++	p->mce_count = 0;
+ 	pr_err("Uncorrected hardware memory error in user-access at %llx", p->mce_addr);
+ 
+ 	if (!p->mce_ripv)
+@@ -1290,17 +1294,34 @@ static void kill_me_maybe(struct callback_head *cb)
+ 	}
+ }
+ 
+-static void queue_task_work(struct mce *m, int kill_current_task)
++static void queue_task_work(struct mce *m, char *msg, int kill_current_task)
+ {
+-	current->mce_addr = m->addr;
+-	current->mce_kflags = m->kflags;
+-	current->mce_ripv = !!(m->mcgstatus & MCG_STATUS_RIPV);
+-	current->mce_whole_page = whole_page(m);
++	int count = ++current->mce_count;
+ 
+-	if (kill_current_task)
+-		current->mce_kill_me.func = kill_me_now;
+-	else
+-		current->mce_kill_me.func = kill_me_maybe;
++	/* First call, save all the details */
++	if (count == 1) {
++		current->mce_addr = m->addr;
++		current->mce_kflags = m->kflags;
++		current->mce_ripv = !!(m->mcgstatus & MCG_STATUS_RIPV);
++		current->mce_whole_page = whole_page(m);
++
++		if (kill_current_task)
++			current->mce_kill_me.func = kill_me_now;
++		else
++			current->mce_kill_me.func = kill_me_maybe;
++	}
++
++	/* Ten is likely overkill. Don't expect more than two faults before task_work() */
++	if (count > 10)
++		mce_panic("Too many consecutive machine checks while accessing user data", m, msg);
++
++	/* Second or later call, make sure page address matches the one from first call */
++	if (count > 1 && (current->mce_addr >> PAGE_SHIFT) != (m->addr >> PAGE_SHIFT))
++		mce_panic("Consecutive machine checks to different user pages", m, msg);
++
++	/* Do not call task_work_add() more than once */
++	if (count > 1)
++		return;
+ 
+ 	task_work_add(current, &current->mce_kill_me, TWA_RESUME);
+ }
+@@ -1438,7 +1459,7 @@ noinstr void do_machine_check(struct pt_regs *regs)
+ 		/* If this triggers there is no way to recover. Die hard. */
+ 		BUG_ON(!on_thread_stack() || !user_mode(regs));
+ 
+-		queue_task_work(&m, kill_current_task);
++		queue_task_work(&m, msg, kill_current_task);
+ 
+ 	} else {
+ 		/*
+@@ -1456,7 +1477,7 @@ noinstr void do_machine_check(struct pt_regs *regs)
+ 		}
+ 
+ 		if (m.kflags & MCE_IN_KERNEL_COPYIN)
+-			queue_task_work(&m, kill_current_task);
++			queue_task_work(&m, msg, kill_current_task);
+ 	}
+ out:
+ 	mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 1780260f237b..361c7bc72cbb 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1468,6 +1468,7 @@ struct task_struct {
+ 					mce_whole_page : 1,
+ 					__mce_reserved : 62;
+ 	struct callback_head		mce_kill_me;
++	int				mce_count;
+ #endif
+ 
+ #ifdef CONFIG_KRETPROBES
+
