@@ -426,6 +426,7 @@ for config in $config_files; do
 	chmod 755 scripts/dummy-tools/*
 	chmod 755 scripts/*
     fi
+    MAKE_ARGS="$MAKE_ARGS RUSTC=/nothing/nowhere"
     if $silent; then
 	MAKE_ARGS="$MAKE_ARGS -s"
     fi
