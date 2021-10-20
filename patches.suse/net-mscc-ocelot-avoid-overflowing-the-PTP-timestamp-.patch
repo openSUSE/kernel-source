@@ -1,0 +1,195 @@
+From 3b4241817601a2f59beea471baa51763d7262232 Mon Sep 17 00:00:00 2001
+From: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date: Tue, 12 Oct 2021 14:40:36 +0300
+Subject: [PATCH] net: mscc: ocelot: avoid overflowing the PTP timestamp FIFO
+Git-commit: 52849bcf0029ccc553be304e4f804938a39112e2
+Patch-mainline: v5.15-rc6
+References: stable-5.14.14
+
+commit 52849bcf0029ccc553be304e4f804938a39112e2 upstream.
+
+PTP packets with 2-step TX timestamp requests are matched to packets
+based on the egress port number and a 6-bit timestamp identifier.
+All PTP timestamps are held in a common FIFO that is 128 entry deep.
+
+This patch ensures that back-to-back timestamping requests cannot exceed
+the hardware FIFO capacity. If that happens, simply send the packets
+without requesting a TX timestamp to be taken (in the case of felix,
+since the DSA API has a void return code in ds->ops->port_txtstamp) or
+drop them (in the case of ocelot).
+
+I've moved the ts_id_lock from a per-port basis to a per-switch basis,
+because we need separate accounting for both numbers of PTP frames in
+flight. And since we need locking to inc/dec the per-switch counter,
+that also offers protection for the per-port counter and hence there is
+no reason to have a per-port counter anymore.
+
+Fixes: 4e3b0468e6d7 ("net: mscc: PTP Hardware Clock (PHC) support")
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/net/dsa/ocelot/felix.c     |  6 ++++-
+ drivers/net/ethernet/mscc/ocelot.c | 37 ++++++++++++++++++++++++------
+ include/soc/mscc/ocelot.h          |  5 +++-
+ include/soc/mscc/ocelot_ptp.h      |  1 +
+ 4 files changed, 40 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/dsa/ocelot/felix.c b/drivers/net/dsa/ocelot/felix.c
+index a2a15919b960..42d64a6a0a65 100644
+--- a/drivers/net/dsa/ocelot/felix.c
++++ b/drivers/net/dsa/ocelot/felix.c
+@@ -1406,8 +1406,12 @@ static void felix_txtstamp(struct dsa_switch *ds, int port,
+ 	if (!ocelot->ptp)
+ 		return;
+ 
+-	if (ocelot_port_txtstamp_request(ocelot, port, skb, &clone))
++	if (ocelot_port_txtstamp_request(ocelot, port, skb, &clone)) {
++		dev_err_ratelimited(ds->dev,
++				    "port %d delivering skb without TX timestamp\n",
++				    port);
+ 		return;
++	}
+ 
+ 	if (clone)
+ 		OCELOT_SKB_CB(skb)->clone = clone;
+diff --git a/drivers/net/ethernet/mscc/ocelot.c b/drivers/net/ethernet/mscc/ocelot.c
+index 51a236622f57..87ac24a7e003 100644
+--- a/drivers/net/ethernet/mscc/ocelot.c
++++ b/drivers/net/ethernet/mscc/ocelot.c
+@@ -536,22 +536,36 @@ void ocelot_port_disable(struct ocelot *ocelot, int port)
+ }
+ EXPORT_SYMBOL(ocelot_port_disable);
+ 
+-static void ocelot_port_add_txtstamp_skb(struct ocelot *ocelot, int port,
+-					 struct sk_buff *clone)
++static int ocelot_port_add_txtstamp_skb(struct ocelot *ocelot, int port,
++					struct sk_buff *clone)
+ {
+ 	struct ocelot_port *ocelot_port = ocelot->ports[port];
++	unsigned long flags;
++
++	spin_lock_irqsave(&ocelot->ts_id_lock, flags);
+ 
+-	spin_lock(&ocelot_port->ts_id_lock);
++	if (ocelot_port->ptp_skbs_in_flight == OCELOT_MAX_PTP_ID ||
++	    ocelot->ptp_skbs_in_flight == OCELOT_PTP_FIFO_SIZE) {
++		spin_unlock_irqrestore(&ocelot->ts_id_lock, flags);
++		return -EBUSY;
++	}
+ 
+ 	skb_shinfo(clone)->tx_flags |= SKBTX_IN_PROGRESS;
+ 	/* Store timestamp ID in OCELOT_SKB_CB(clone)->ts_id */
+ 	OCELOT_SKB_CB(clone)->ts_id = ocelot_port->ts_id;
++
+ 	ocelot_port->ts_id++;
+ 	if (ocelot_port->ts_id == OCELOT_MAX_PTP_ID)
+ 		ocelot_port->ts_id = 0;
++
++	ocelot_port->ptp_skbs_in_flight++;
++	ocelot->ptp_skbs_in_flight++;
++
+ 	skb_queue_tail(&ocelot_port->tx_skbs, clone);
+ 
+-	spin_unlock(&ocelot_port->ts_id_lock);
++	spin_unlock_irqrestore(&ocelot->ts_id_lock, flags);
++
++	return 0;
+ }
+ 
+ u32 ocelot_ptp_rew_op(struct sk_buff *skb)
+@@ -600,6 +614,7 @@ int ocelot_port_txtstamp_request(struct ocelot *ocelot, int port,
+ {
+ 	struct ocelot_port *ocelot_port = ocelot->ports[port];
+ 	u8 ptp_cmd = ocelot_port->ptp_cmd;
++	int err;
+ 
+ 	/* Store ptp_cmd in OCELOT_SKB_CB(skb)->ptp_cmd */
+ 	if (ptp_cmd == IFH_REW_OP_ORIGIN_PTP) {
+@@ -617,7 +632,10 @@ int ocelot_port_txtstamp_request(struct ocelot *ocelot, int port,
+ 		if (!(*clone))
+ 			return -ENOMEM;
+ 
+-		ocelot_port_add_txtstamp_skb(ocelot, port, *clone);
++		err = ocelot_port_add_txtstamp_skb(ocelot, port, *clone);
++		if (err)
++			return err;
++
+ 		OCELOT_SKB_CB(skb)->ptp_cmd = ptp_cmd;
+ 	}
+ 
+@@ -676,9 +694,14 @@ void ocelot_get_txtstamp(struct ocelot *ocelot)
+ 		id = SYS_PTP_STATUS_PTP_MESS_ID_X(val);
+ 		txport = SYS_PTP_STATUS_PTP_MESS_TXPORT_X(val);
+ 
+-		/* Retrieve its associated skb */
+ 		port = ocelot->ports[txport];
+ 
++		spin_lock(&ocelot->ts_id_lock);
++		port->ptp_skbs_in_flight--;
++		ocelot->ptp_skbs_in_flight--;
++		spin_unlock(&ocelot->ts_id_lock);
++
++		/* Retrieve its associated skb */
+ 		spin_lock_irqsave(&port->tx_skbs.lock, flags);
+ 
+ 		skb_queue_walk_safe(&port->tx_skbs, skb, skb_tmp) {
+@@ -1917,7 +1940,6 @@ void ocelot_init_port(struct ocelot *ocelot, int port)
+ 	struct ocelot_port *ocelot_port = ocelot->ports[port];
+ 
+ 	skb_queue_head_init(&ocelot_port->tx_skbs);
+-	spin_lock_init(&ocelot_port->ts_id_lock);
+ 
+ 	/* Basic L2 initialization */
+ 
+@@ -2041,6 +2063,7 @@ int ocelot_init(struct ocelot *ocelot)
+ 	mutex_init(&ocelot->stats_lock);
+ 	mutex_init(&ocelot->ptp_lock);
+ 	spin_lock_init(&ocelot->ptp_clock_lock);
++	spin_lock_init(&ocelot->ts_id_lock);
+ 	snprintf(queue_name, sizeof(queue_name), "%s-stats",
+ 		 dev_name(ocelot->dev));
+ 	ocelot->stats_queue = create_singlethread_workqueue(queue_name);
+diff --git a/include/soc/mscc/ocelot.h b/include/soc/mscc/ocelot.h
+index 2f5ce4d4fdbf..33b1e78eab24 100644
+--- a/include/soc/mscc/ocelot.h
++++ b/include/soc/mscc/ocelot.h
+@@ -600,10 +600,10 @@ struct ocelot_port {
+ 	/* The VLAN ID that will be transmitted as untagged, on egress */
+ 	struct ocelot_vlan		native_vlan;
+ 
++	unsigned int			ptp_skbs_in_flight;
+ 	u8				ptp_cmd;
+ 	struct sk_buff_head		tx_skbs;
+ 	u8				ts_id;
+-	spinlock_t			ts_id_lock;
+ 
+ 	phy_interface_t			phy_mode;
+ 
+@@ -677,6 +677,9 @@ struct ocelot {
+ 	struct ptp_clock		*ptp_clock;
+ 	struct ptp_clock_info		ptp_info;
+ 	struct hwtstamp_config		hwtstamp_config;
++	unsigned int			ptp_skbs_in_flight;
++	/* Protects the 2-step TX timestamp ID logic */
++	spinlock_t			ts_id_lock;
+ 	/* Protects the PTP interface state */
+ 	struct mutex			ptp_lock;
+ 	/* Protects the PTP clock */
+diff --git a/include/soc/mscc/ocelot_ptp.h b/include/soc/mscc/ocelot_ptp.h
+index 6e54442b49ad..f085884b1fa2 100644
+--- a/include/soc/mscc/ocelot_ptp.h
++++ b/include/soc/mscc/ocelot_ptp.h
+@@ -14,6 +14,7 @@
+ #include <soc/mscc/ocelot.h>
+ 
+ #define OCELOT_MAX_PTP_ID		63
++#define OCELOT_PTP_FIFO_SIZE		128
+ 
+ #define PTP_PIN_CFG_RSZ			0x20
+ #define PTP_PIN_TOD_SEC_MSB_RSZ		PTP_PIN_CFG_RSZ
+-- 
+2.26.2
+
