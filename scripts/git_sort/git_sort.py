@@ -207,7 +207,7 @@ remotes = (
     Head(RepoURL("tytso/ext4.git"), "dev"),
     Head(RepoURL("s390/linux.git"), "fixes"),
     Head(RepoURL("https://github.com/kdave/btrfs-devel.git"), "misc-next"),
-    Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
+    Head(RepoURL("git://anongit.freedesktop.org/drm/drm"), "drm-next"),
     Head(RepoURL("git://anongit.freedesktop.org/drm/drm-misc"), "drm-misc-next"),
     Head(RepoURL("gregkh/tty.git"), "tty-next"),
     Head(RepoURL("jj/linux-apparmor.git"), "apparmor-next"),
