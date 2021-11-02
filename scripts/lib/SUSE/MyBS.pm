@@ -369,7 +369,7 @@ sub create_project {
 			}
 			# For each regular repository foo, there is a
 			# repository named QA_foo, building against foo
-			my $qa_name = ($name eq "standard") ? "QA"
+			my $qa_name = (($name eq "standard") || ($name eq "pool")) ? "QA"
 					: "QA_$name";
 			$writer->startTag("repository", name => $qa_name);
 			$writer->emptyTag("path", repository => $name,
