@@ -242,7 +242,7 @@ sub get_repo_archs {
 		if (defined($repository)) {
 			return if $attr{name} ne $repository;
 		}
-		if ($attr{name} eq "standard" ||
+		if ($attr{name} eq "standard" || $attr{name} eq "pool" ||
 		    $attr{name} eq "ports" && $project !~ /\bopenSUSE:Factory\b/ ||
 		    $attr{name} =~ /^SUSE_.*_Update$/ && $project =~ /^SUSE:Maintenance:/) {
 			$self->{has_match} = 1;
