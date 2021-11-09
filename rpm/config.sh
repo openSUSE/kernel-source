@@ -3,7 +3,7 @@ SRCVERSION=5.14
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=
 # enable kernel module compression
-COMPRESS_MODULES="zstd"
+COMPRESS_MODULES="xz"
 # Use new style livepatch package names
 LIVEPATCH=livepatch
 # Compile binary devicetrees for Leap
