@@ -242,7 +242,7 @@ sub get_repo_archs {
 		if (defined($repository)) {
 			return if $attr{name} ne $repository;
 		}
-		if ($attr{name} eq "standard" ||
+		if ($attr{name} eq "standard" || $attr{name} eq "pool" ||
 		    $attr{name} eq "ports" && $project !~ /\bopenSUSE:Factory\b/ ||
 		    $attr{name} =~ /^SUSE_.*_Update$/ && $project =~ /^SUSE:Maintenance:/) {
 			$self->{has_match} = 1;
@@ -369,7 +369,7 @@ sub create_project {
 			}
 			# For each regular repository foo, there is a
 			# repository named QA_foo, building against foo
-			my $qa_name = ($name eq "standard") ? "QA"
+			my $qa_name = (($name eq "standard") || ($name eq "pool")) ? "QA"
 					: "QA_$name";
 			$writer->startTag("repository", name => $qa_name);
 			$writer->emptyTag("path", repository => $name,
