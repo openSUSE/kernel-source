@@ -41,6 +41,7 @@ tag_map = {
                 'name' : 'No',
                 'match' : 'No,?\s+.+',
                 'excludes' : [ 'Git-commit', 'Git-repo' ],
+                'error' : "Please use 'Not yet' or 'Never'",
             }, {
                 # Never, typically used for patches that have been rejected
                 # for upstream inclusion but still have a compelling reason
