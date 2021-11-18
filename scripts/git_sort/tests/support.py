@@ -75,7 +75,7 @@ def format_patch(commit, mainline=None, repo=None, references=None,
             f.write("Git-repo: %s\n" % (repo,))
             f.write("Git-commit: %s\n" % (str(commit.id),))
         else:
-            f.write("Patch-mainline: No\n")
+            f.write("Patch-mainline: Not yet, to be submitted by partner developer\n")
         if references is not None:
             f.write("References: %s\n" % (references,))
         f.write("Subject: %s" % (commit.message,))
