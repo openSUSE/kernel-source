@@ -13,6 +13,7 @@ tag_regex = re.compile("(\S+):[ \t]*(.*)")
 tag_map = {
     'Patch-mainline' : {
         'required' : True,
+        'required_on_kabi' : False,
         'accepted' : [
             {
                 # In mainline repo, tagged for release
@@ -277,9 +278,12 @@ class Tag:
         return False
 
 class HeaderChecker(patch.PatchChecker):
-    def __init__(self, stream, updating=False):
+    def __init__(self, stream, updating=False, filename="<unknown>"):
         patch.PatchChecker.__init__(self)
         self.updating = updating
+        self.filename = filename
+        self.kabi = re.match("^patches[.]kabi/", self.filename)
+
         if isinstance(stream, str):
             stream = StringIO(stream)
         self.stream = stream
@@ -294,6 +298,10 @@ class HeaderChecker(patch.PatchChecker):
 
     def get_rulename(self, ruleset, rulename):
         if rulename in ruleset:
+            if self.kabi:
+                 kabi_rule = "%s_on_kabi" % rulename
+                 if kabi_rule in ruleset:
+                     return kabi_rule
             if self.updating:
                  updating_rule = "%s_on_update" % rulename
                  if updating_rule in ruleset:
@@ -439,6 +447,9 @@ class HeaderChecker(patch.PatchChecker):
                         found = True
                 if not found:
                     required = True
+                    if self.kabi and 'required_on_kabi' in tag_map[entry]:
+                        if not tag_map[entry]['required_on_kabi']:
+                            required = False
                     if self.updating and 'required_on_update' in tag_map[entry]:
                         if not tag_map[entry]['required_on_update']:
                             required = False

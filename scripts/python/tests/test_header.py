@@ -706,3 +706,12 @@ Acked-by: developer@suse.com
         self.assertEqual(1, e.errors(header.MissingTagError))
         self.assertTrue(e.tag_is_missing('references'))
         self.assertEqual(1, e.errors())
+
+    def test_no_patch_mainline_for_kabi(self):
+        text = """
+From: developer@site.com
+Subject: some patch
+References: FATE#123456
+Acked-by: developer@suse.com
+"""
+        self.header = header.Checker(text, False, "patches.kabi/FATE123456_fix_kabi.patch")
