@@ -3,6 +3,7 @@
 
 import datetime
 import os.path
+import re
 
 import pygit2_wrapper as pygit2
 
@@ -69,7 +70,8 @@ def format_patch(commit, mainline=None, repo=None, references=None,
         f.write("Date: %s\n" % (dt.strftime("%c %z"),))
         if mainline and repo is None:
             f.write("Patch-mainline: %s\n" % (mainline,))
-            f.write("Git-commit: %s\n" % (str(commit.id),))
+            if re.match("^v", mainline):
+                f.write("Git-commit: %s\n" % (str(commit.id),))
         elif mainline is None and repo:
             f.write("Patch-mainline: Queued in subsystem maintainer repository\n")
             f.write("Git-repo: %s\n" % (repo,))
