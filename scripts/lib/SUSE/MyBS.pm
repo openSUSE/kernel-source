@@ -62,7 +62,7 @@ sub new {
 		die join("\n", @Config::IniFiles::errors), "\n";
 	}
 	my %cred;
-	for my $kw (qw(user pass passx keyring credentials_mgr_class)) {
+	for my $kw (qw(user pass passx keyring gnome_keyring credentials_mgr_class)) {
 		for my $section ($api_url, "$api_url/", $self->{url}->host) {
 			if (exists($config{$section}) &&
 					exists($config{$section}{$kw})) {
@@ -84,7 +84,7 @@ sub new {
 		IO::Uncompress::Bunzip2::bunzip2(\$bz2 => \$cred{pass})
 			or die "Decoding password for $api_url failed: $IO::Uncompress::Bunzip2::Bunzip2Error\n";
 	}
-	if (!exists($cred{pass}) && exists($cred{keyring})) {
+	if (!exists($cred{pass}) && (exists($cred{keyring}) || exists($cred{gnome_keyring}))) {
 		my $api = $api_url;
 		$api =~ s/^https?:\/\///;
 		open(my $secret, "secret-tool lookup service $api username $cred{user} |")
