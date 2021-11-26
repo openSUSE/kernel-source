@@ -1,0 +1,533 @@
+From: Shyam Prasad N <sprasad@microsoft.com>
+Date: Wed, 3 Feb 2021 23:20:46 -0800
+Subject: [PATCH] cifs: Identify a connection by a conn_id.
+Git-commit: 6d82c27ae5d048ba9219cccdf832f8406e507d5f
+Patch-mainline: v5.12-rc1
+References: bsc#1192606
+
+Introduced a new field conn_id in TCP_Server_Info structure.
+This is a non-persistent unique identifier maintained by the client
+for a connection to a file server. For this, a global counter named
+tcpSesNextId is maintained. On allocating a new TCP_Server_Info,
+this counter is incremented and assigned.
+
+Changed the dynamic tracepoints related to reconnects and
+crediting to be more informative (with conn_id printed).
+Debugging a crediting issue helped me understand the
+important things to print here.
+
+Always call dynamic tracepoints outside the scope of spinlocks.
+To do this, copy out the credits and in_flight fields of the
+server struct before dropping the lock.
+
+Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+Reviewed-by: Pavel Shilovsky <pshilov@microsoft.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Acked-by: Enzo Matsumiya <ematsumiya@suse.de>
+---
+ fs/cifs/cifsfs.c    |    1 
+ fs/cifs/cifsglob.h  |    2 +
+ fs/cifs/connect.c   |   11 +++++----
+ fs/cifs/smb2ops.c   |   63 ++++++++++++++++++++++++++++++++++++++--------------
+ fs/cifs/trace.h     |   36 +++++++++++++++++++++--------
+ fs/cifs/transport.c |   53 ++++++++++++++++++++++++++++++++-----------
+ 6 files changed, 122 insertions(+), 44 deletions(-)
+
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@ -1506,6 +1506,7 @@ init_cifs(void)
+  */
+ 	atomic_set(&sesInfoAllocCount, 0);
+ 	atomic_set(&tconInfoAllocCount, 0);
++	atomic_set(&tcpSesNextId, 0);
+ 	atomic_set(&tcpSesAllocCount, 0);
+ 	atomic_set(&tcpSesReconnectCount, 0);
+ 	atomic_set(&tconInfoReconnectCount, 0);
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -577,6 +577,7 @@ inc_rfc1001_len(void *buf, int count)
+ struct TCP_Server_Info {
+ 	struct list_head tcp_ses_list;
+ 	struct list_head smb_ses_list;
++	__u64 conn_id; /* connection identifier (useful for debugging) */
+ 	int srv_count; /* reference counter */
+ 	/* 15 character server name + 0x20 16th byte indicating type = srv */
+ 	char server_RFC1001_name[RFC1001_NAME_LEN_WITH_NULL];
+@@ -1845,6 +1846,7 @@ GLOBAL_EXTERN spinlock_t GlobalMid_Lock;
+  */
+ GLOBAL_EXTERN atomic_t sesInfoAllocCount;
+ GLOBAL_EXTERN atomic_t tconInfoAllocCount;
++GLOBAL_EXTERN atomic_t tcpSesNextId;
+ GLOBAL_EXTERN atomic_t tcpSesAllocCount;
+ GLOBAL_EXTERN atomic_t tcpSesReconnectCount;
+ GLOBAL_EXTERN atomic_t tconInfoReconnectCount;
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -242,7 +242,7 @@ cifs_reconnect(struct TCP_Server_Info *s
+ 	server->max_read = 0;
+ 
+ 	cifs_dbg(FYI, "Mark tcp session as need reconnect\n");
+-	trace_smb3_reconnect(server->CurrentMid, server->hostname);
++	trace_smb3_reconnect(server->CurrentMid, server->conn_id, server->hostname);
+ 
+ 	/* before reconnecting the tcp session, mark the smb session (uid)
+ 		and the tid bad so they are not used until reconnected */
+@@ -846,7 +846,7 @@ static void
+ smb2_add_credits_from_hdr(char *buffer, struct TCP_Server_Info *server)
+ {
+ 	struct smb2_sync_hdr *shdr = (struct smb2_sync_hdr *)buffer;
+-	int scredits = server->credits;
++	int scredits, in_flight;
+ 
+ 	/*
+ 	 * SMB1 does not use credits.
+@@ -857,12 +857,14 @@ smb2_add_credits_from_hdr(char *buffer,
+ 	if (shdr->CreditRequest) {
+ 		spin_lock(&server->req_lock);
+ 		server->credits += le16_to_cpu(shdr->CreditRequest);
++		scredits = server->credits;
++		in_flight = server->in_flight;
+ 		spin_unlock(&server->req_lock);
+ 		wake_up(&server->request_q);
+ 
+ 		trace_smb3_add_credits(server->CurrentMid,
+-				server->hostname, scredits,
+-				le16_to_cpu(shdr->CreditRequest));
++				server->conn_id, server->hostname, scredits,
++				le16_to_cpu(shdr->CreditRequest), in_flight);
+ 		cifs_server_dbg(FYI, "%s: added %u credits total=%d\n",
+ 				__func__, le16_to_cpu(shdr->CreditRequest),
+ 				scredits);
+@@ -1317,6 +1319,7 @@ cifs_get_tcp_session(struct smb3_fs_cont
+ 		goto out_err_crypto_release;
+ 	}
+ 
++	tcp_ses->conn_id = atomic_inc_return(&tcpSesNextId);
+ 	tcp_ses->noblocksnd = ctx->noblocksnd;
+ 	tcp_ses->noautotune = ctx->noautotune;
+ 	tcp_ses->tcp_nodelay = ctx->sockopt_tcp_nodelay;
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -62,17 +62,19 @@ smb2_add_credits(struct TCP_Server_Info
+ 		 const struct cifs_credits *credits, const int optype)
+ {
+ 	int *val, rc = -1;
++	int scredits, in_flight;
+ 	unsigned int add = credits->value;
+ 	unsigned int instance = credits->instance;
+ 	bool reconnect_detected = false;
++	bool reconnect_with_invalid_credits = false;
+ 
+ 	spin_lock(&server->req_lock);
+ 	val = server->ops->get_credits_field(server, optype);
+ 
+ 	/* eg found case where write overlapping reconnect messed up credits */
+ 	if (((optype & CIFS_OP_MASK) == CIFS_NEG_OP) && (*val != 0))
+-		trace_smb3_reconnect_with_invalid_credits(server->CurrentMid,
+-			server->hostname, *val, add);
++		reconnect_with_invalid_credits = true;
++
+ 	if ((instance == 0) || (instance == server->reconnect_instance))
+ 		*val += add;
+ 	else
+@@ -98,14 +100,26 @@ smb2_add_credits(struct TCP_Server_Info
+ 			server->oplock_credits++;
+ 		}
+ 	}
++	scredits = *val;
++	in_flight = server->in_flight;
+ 	spin_unlock(&server->req_lock);
+ 	wake_up(&server->request_q);
+ 
+ 	if (reconnect_detected) {
++		trace_smb3_reconnect_detected(server->CurrentMid,
++			server->conn_id, server->hostname, scredits, add, in_flight);
++
+ 		cifs_dbg(FYI, "trying to put %d credits from the old server instance %d\n",
+ 			 add, instance);
+ 	}
+ 
++	if (reconnect_with_invalid_credits) {
++		trace_smb3_reconnect_with_invalid_credits(server->CurrentMid,
++			server->conn_id, server->hostname, scredits, add, in_flight);
++		cifs_dbg(FYI, "Negotiate operation when server credits is non-zero. Optype: %d, server credits: %d, credits added: %d\n",
++			 optype, scredits, add);
++	}
++
+ 	if (server->tcpStatus == CifsNeedReconnect
+ 	    || server->tcpStatus == CifsExiting)
+ 		return;
+@@ -124,23 +138,30 @@ smb2_add_credits(struct TCP_Server_Info
+ 		cifs_dbg(FYI, "disabling oplocks\n");
+ 		break;
+ 	default:
+-		trace_smb3_add_credits(server->CurrentMid,
+-			server->hostname, rc, add);
+-		cifs_dbg(FYI, "%s: added %u credits total=%d\n", __func__, add, rc);
++		/* change_conf rebalanced credits for different types */
++		break;
+ 	}
++
++	trace_smb3_add_credits(server->CurrentMid,
++			server->conn_id, server->hostname, scredits, add, in_flight);
++	cifs_dbg(FYI, "%s: added %u credits total=%d\n", __func__, add, scredits);
+ }
+ 
+ static void
+ smb2_set_credits(struct TCP_Server_Info *server, const int val)
+ {
++	int scredits, in_flight;
++
+ 	spin_lock(&server->req_lock);
+ 	server->credits = val;
+ 	if (val == 1)
+ 		server->reconnect_instance++;
++	scredits = server->credits;
++	in_flight = server->in_flight;
+ 	spin_unlock(&server->req_lock);
+ 
+ 	trace_smb3_set_credits(server->CurrentMid,
+-			server->hostname, val, val);
++			server->conn_id, server->hostname, scredits, val, in_flight);
+ 	cifs_dbg(FYI, "%s: set %u credits\n", __func__, val);
+ 
+ 	/* don't log while holding the lock */
+@@ -172,7 +193,7 @@ smb2_wait_mtu_credits(struct TCP_Server_
+ 		      unsigned int *num, struct cifs_credits *credits)
+ {
+ 	int rc = 0;
+-	unsigned int scredits;
++	unsigned int scredits, in_flight;
+ 
+ 	spin_lock(&server->req_lock);
+ 	while (1) {
+@@ -209,17 +230,18 @@ smb2_wait_mtu_credits(struct TCP_Server_
+ 				DIV_ROUND_UP(*num, SMB2_MAX_BUFFER_SIZE);
+ 			credits->instance = server->reconnect_instance;
+ 			server->credits -= credits->value;
+-			scredits = server->credits;
+ 			server->in_flight++;
+ 			if (server->in_flight > server->max_in_flight)
+ 				server->max_in_flight = server->in_flight;
+ 			break;
+ 		}
+ 	}
++	scredits = server->credits;
++	in_flight = server->in_flight;
+ 	spin_unlock(&server->req_lock);
+ 
+ 	trace_smb3_add_credits(server->CurrentMid,
+-			server->hostname, scredits, -(credits->value));
++			server->conn_id, server->hostname, scredits, -(credits->value), in_flight);
+ 	cifs_dbg(FYI, "%s: removed %u credits total=%d\n",
+ 			__func__, credits->value, scredits);
+ 
+@@ -232,14 +254,14 @@ smb2_adjust_credits(struct TCP_Server_In
+ 		    const unsigned int payload_size)
+ {
+ 	int new_val = DIV_ROUND_UP(payload_size, SMB2_MAX_BUFFER_SIZE);
+-	int scredits;
++	int scredits, in_flight;
+ 
+ 	if (!credits->value || credits->value == new_val)
+ 		return 0;
+ 
+ 	if (credits->value < new_val) {
+ 		trace_smb3_too_many_credits(server->CurrentMid,
+-				server->hostname, 0, credits->value - new_val);
++				server->conn_id, server->hostname, 0, credits->value - new_val, 0);
+ 		cifs_server_dbg(VFS, "request has less credits (%d) than required (%d)",
+ 				credits->value, new_val);
+ 
+@@ -249,9 +271,13 @@ smb2_adjust_credits(struct TCP_Server_In
+ 	spin_lock(&server->req_lock);
+ 
+ 	if (server->reconnect_instance != credits->instance) {
++		scredits = server->credits;
++		in_flight = server->in_flight;
+ 		spin_unlock(&server->req_lock);
++
+ 		trace_smb3_reconnect_detected(server->CurrentMid,
+-			server->hostname, 0, 0);
++			server->conn_id, server->hostname, scredits,
++			credits->value - new_val, in_flight);
+ 		cifs_server_dbg(VFS, "trying to return %d credits to old session\n",
+ 			 credits->value - new_val);
+ 		return -EAGAIN;
+@@ -259,15 +285,18 @@ smb2_adjust_credits(struct TCP_Server_In
+ 
+ 	server->credits += credits->value - new_val;
+ 	scredits = server->credits;
++	in_flight = server->in_flight;
+ 	spin_unlock(&server->req_lock);
+ 	wake_up(&server->request_q);
+-	credits->value = new_val;
+ 
+ 	trace_smb3_add_credits(server->CurrentMid,
+-			server->hostname, scredits, credits->value - new_val);
++			server->conn_id, server->hostname, scredits,
++			credits->value - new_val, in_flight);
+ 	cifs_dbg(FYI, "%s: adjust added %u credits total=%d\n",
+ 			__func__, credits->value - new_val, scredits);
+ 
++	credits->value = new_val;
++
+ 	return 0;
+ }
+ 
+@@ -2370,7 +2399,7 @@ static bool
+ smb2_is_status_pending(char *buf, struct TCP_Server_Info *server)
+ {
+ 	struct smb2_sync_hdr *shdr = (struct smb2_sync_hdr *)buf;
+-	int scredits;
++	int scredits, in_flight;
+ 
+ 	if (shdr->Status != STATUS_PENDING)
+ 		return false;
+@@ -2379,11 +2408,13 @@ smb2_is_status_pending(char *buf, struct
+ 		spin_lock(&server->req_lock);
+ 		server->credits += le16_to_cpu(shdr->CreditRequest);
+ 		scredits = server->credits;
++		in_flight = server->in_flight;
+ 		spin_unlock(&server->req_lock);
+ 		wake_up(&server->request_q);
+ 
+ 		trace_smb3_add_credits(server->CurrentMid,
+-				server->hostname, scredits, le16_to_cpu(shdr->CreditRequest));
++				server->conn_id, server->hostname, scredits,
++				le16_to_cpu(shdr->CreditRequest), in_flight);
+ 		cifs_dbg(FYI, "%s: status pending add %u credits total=%d\n",
+ 				__func__, le16_to_cpu(shdr->CreditRequest), scredits);
+ 	}
+--- a/fs/cifs/trace.h
++++ b/fs/cifs/trace.h
+@@ -851,17 +851,21 @@ DEFINE_SMB3_LEASE_ERR_EVENT(lease_err);
+ 
+ DECLARE_EVENT_CLASS(smb3_reconnect_class,
+ 	TP_PROTO(__u64	currmid,
++		__u64 conn_id,
+ 		char *hostname),
+-	TP_ARGS(currmid, hostname),
++	TP_ARGS(currmid, conn_id, hostname),
+ 	TP_STRUCT__entry(
+ 		__field(__u64, currmid)
++		__field(__u64, conn_id)
+ 		__field(char *, hostname)
+ 	),
+ 	TP_fast_assign(
+ 		__entry->currmid = currmid;
++		__entry->conn_id = conn_id;
+ 		__entry->hostname = hostname;
+ 	),
+-	TP_printk("server=%s current_mid=0x%llx",
++	TP_printk("conn_id=0x%llx server=%s current_mid=%llu",
++		__entry->conn_id,
+ 		__entry->hostname,
+ 		__entry->currmid)
+ )
+@@ -869,44 +873,56 @@ DECLARE_EVENT_CLASS(smb3_reconnect_class
+ #define DEFINE_SMB3_RECONNECT_EVENT(name)        \
+ DEFINE_EVENT(smb3_reconnect_class, smb3_##name,  \
+ 	TP_PROTO(__u64	currmid,		\
+-		char *hostname),		\
+-	TP_ARGS(currmid, hostname))
++		__u64 conn_id,			\
++		char *hostname),				\
++	TP_ARGS(currmid, conn_id, hostname))
+ 
+ DEFINE_SMB3_RECONNECT_EVENT(reconnect);
+ DEFINE_SMB3_RECONNECT_EVENT(partial_send_reconnect);
+ 
+ DECLARE_EVENT_CLASS(smb3_credit_class,
+ 	TP_PROTO(__u64	currmid,
++		__u64 conn_id,
+ 		char *hostname,
+ 		int credits,
+-		int credits_to_add),
+-	TP_ARGS(currmid, hostname, credits, credits_to_add),
++		int credits_to_add,
++		int in_flight),
++	TP_ARGS(currmid, conn_id, hostname, credits, credits_to_add, in_flight),
+ 	TP_STRUCT__entry(
+ 		__field(__u64, currmid)
++		__field(__u64, conn_id)
+ 		__field(char *, hostname)
+ 		__field(int, credits)
+ 		__field(int, credits_to_add)
++		__field(int, in_flight)
+ 	),
+ 	TP_fast_assign(
+ 		__entry->currmid = currmid;
++		__entry->conn_id = conn_id;
+ 		__entry->hostname = hostname;
+ 		__entry->credits = credits;
+ 		__entry->credits_to_add = credits_to_add;
++		__entry->in_flight = in_flight;
+ 	),
+-	TP_printk("server=%s current_mid=0x%llx credits=%d credits_to_add=%d",
++	TP_printk("conn_id=0x%llx server=%s current_mid=%llu "
++			"credits=%d credit_change=%d in_flight=%d",
++		__entry->conn_id,
+ 		__entry->hostname,
+ 		__entry->currmid,
+ 		__entry->credits,
+-		__entry->credits_to_add)
++		__entry->credits_to_add,
++		__entry->in_flight)
+ )
+ 
+ #define DEFINE_SMB3_CREDIT_EVENT(name)        \
+ DEFINE_EVENT(smb3_credit_class, smb3_##name,  \
+ 	TP_PROTO(__u64	currmid,		\
++		__u64 conn_id,			\
+ 		char *hostname,			\
+ 		int  credits,			\
+-		int  credits_to_add),		\
+-	TP_ARGS(currmid, hostname, credits, credits_to_add))
++		int  credits_to_add,	\
++		int in_flight),			\
++	TP_ARGS(currmid, conn_id, hostname, credits, credits_to_add, in_flight))
+ 
+ DEFINE_SMB3_CREDIT_EVENT(reconnect_with_invalid_credits);
+ DEFINE_SMB3_CREDIT_EVENT(reconnect_detected);
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@ -449,7 +449,7 @@ unmask:
+ 		 */
+ 		server->tcpStatus = CifsNeedReconnect;
+ 		trace_smb3_partial_send_reconnect(server->CurrentMid,
+-						  server->hostname);
++						  server->conn_id, server->hostname);
+ 	}
+ smbd_done:
+ 	if (rc < 0 && rc != -EINTR)
+@@ -531,7 +531,7 @@ wait_for_free_credits(struct TCP_Server_
+ 	int *credits;
+ 	int optype;
+ 	long int t;
+-	int scredits = server->credits;
++	int scredits, in_flight;
+ 
+ 	if (timeout < 0)
+ 		t = MAX_JIFFY_OFFSET;
+@@ -555,22 +555,38 @@ wait_for_free_credits(struct TCP_Server_
+ 			server->max_in_flight = server->in_flight;
+ 		*credits -= 1;
+ 		*instance = server->reconnect_instance;
++		scredits = *credits;
++		in_flight = server->in_flight;
+ 		spin_unlock(&server->req_lock);
++
++		trace_smb3_add_credits(server->CurrentMid,
++				server->conn_id, server->hostname, scredits, -1, in_flight);
++		cifs_dbg(FYI, "%s: remove %u credits total=%d\n",
++				__func__, 1, scredits);
++
+ 		return 0;
+ 	}
+ 
+ 	while (1) {
+ 		if (*credits < num_credits) {
++			scredits = *credits;
+ 			spin_unlock(&server->req_lock);
++
+ 			cifs_num_waiters_inc(server);
+ 			rc = wait_event_killable_timeout(server->request_q,
+ 				has_credits(server, credits, num_credits), t);
+ 			cifs_num_waiters_dec(server);
+ 			if (!rc) {
++				spin_lock(&server->req_lock);
++				scredits = *credits;
++				in_flight = server->in_flight;
++				spin_unlock(&server->req_lock);
++
+ 				trace_smb3_credit_timeout(server->CurrentMid,
+-					server->hostname, num_credits, 0);
++						server->conn_id, server->hostname, scredits,
++						num_credits, in_flight);
+ 				cifs_server_dbg(VFS, "wait timed out after %d ms\n",
+-					 timeout);
++						timeout);
+ 				return -EBUSY;
+ 			}
+ 			if (rc == -ERESTARTSYS)
+@@ -599,6 +615,7 @@ wait_for_free_credits(struct TCP_Server_
+ 			    server->in_flight > 2 * MAX_COMPOUND &&
+ 			    *credits <= MAX_COMPOUND) {
+ 				spin_unlock(&server->req_lock);
++
+ 				cifs_num_waiters_inc(server);
+ 				rc = wait_event_killable_timeout(
+ 					server->request_q,
+@@ -607,12 +624,17 @@ wait_for_free_credits(struct TCP_Server_
+ 					t);
+ 				cifs_num_waiters_dec(server);
+ 				if (!rc) {
++					spin_lock(&server->req_lock);
++					scredits = *credits;
++					in_flight = server->in_flight;
++					spin_unlock(&server->req_lock);
++
+ 					trace_smb3_credit_timeout(
+-						server->CurrentMid,
+-						server->hostname, num_credits,
+-						0);
++							server->CurrentMid,
++							server->conn_id, server->hostname,
++							scredits, num_credits, in_flight);
+ 					cifs_server_dbg(VFS, "wait timed out after %d ms\n",
+-						 timeout);
++							timeout);
+ 					return -EBUSY;
+ 				}
+ 				if (rc == -ERESTARTSYS)
+@@ -629,16 +651,18 @@ wait_for_free_credits(struct TCP_Server_
+ 			/* update # of requests on the wire to server */
+ 			if ((flags & CIFS_TIMEOUT_MASK) != CIFS_BLOCKING_OP) {
+ 				*credits -= num_credits;
+-				scredits = *credits;
+ 				server->in_flight += num_credits;
+ 				if (server->in_flight > server->max_in_flight)
+ 					server->max_in_flight = server->in_flight;
+ 				*instance = server->reconnect_instance;
+ 			}
++			scredits = *credits;
++			in_flight = server->in_flight;
+ 			spin_unlock(&server->req_lock);
+ 
+ 			trace_smb3_add_credits(server->CurrentMid,
+-					server->hostname, scredits, -(num_credits));
++					server->conn_id, server->hostname, scredits,
++					-(num_credits), in_flight);
+ 			cifs_dbg(FYI, "%s: remove %u credits total=%d\n",
+ 					__func__, num_credits, scredits);
+ 			break;
+@@ -660,13 +684,13 @@ wait_for_compound_request(struct TCP_Ser
+ 			  const int flags, unsigned int *instance)
+ {
+ 	int *credits;
+-	int scredits, sin_flight;
++	int scredits, in_flight;
+ 
+ 	credits = server->ops->get_credits_field(server, flags & CIFS_OP_MASK);
+ 
+ 	spin_lock(&server->req_lock);
+ 	scredits = *credits;
+-	sin_flight = server->in_flight;
++	in_flight = server->in_flight;
+ 
+ 	if (*credits < num) {
+ 		/*
+@@ -688,9 +712,10 @@ wait_for_compound_request(struct TCP_Ser
+ 		if (server->in_flight == 0) {
+ 			spin_unlock(&server->req_lock);
+ 			trace_smb3_insufficient_credits(server->CurrentMid,
+-					server->hostname, scredits, sin_flight);
++					server->conn_id, server->hostname, scredits,
++					num, in_flight);
+ 			cifs_dbg(FYI, "%s: %d requests in flight, needed %d total=%d\n",
+-					__func__, sin_flight, num, scredits);
++					__func__, in_flight, num, scredits);
+ 			return -EDEADLK;
+ 		}
+ 	}
