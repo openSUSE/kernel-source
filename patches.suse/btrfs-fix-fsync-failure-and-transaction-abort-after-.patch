@@ -1,0 +1,410 @@
+From: Filipe Manana <fdmanana@suse.com>
+Date: Mon, 24 May 2021 11:35:53 +0100
+Git-commit: ea7036de0d36c4e6c9508f68789e9567d514333a
+Patch-mainline: v5.13-rc5
+References: bsc#1193002
+Subject: [PATCH] btrfs: fix fsync failure and transaction abort after writes
+ to prealloc extents
+
+When doing a series of partial writes to different ranges of preallocated
+extents with transaction commits and fsyncs in between, we can end up with
+a checksum items in a log tree. This causes an fsync to fail with -EIO and
+abort the transaction, turning the filesystem to RO mode, when syncing the
+log.
+
+For this to happen, we need to have a full fsync of a file following one
+or more fast fsyncs.
+
+The following example reproduces the problem and explains how it happens:
+
+  $ mkfs.btrfs -f /dev/sdc
+  $ mount /dev/sdc /mnt
+
+  # Create our test file with 2 preallocated extents. Leave a 1M hole
+  # between them to ensure that we get two file extent items that will
+  # never be merged into a single one. The extents are contiguous on disk,
+  # which will later result in the checksums for their data to be merged
+  # into a single checksum item in the csums btree.
+  #
+  $ xfs_io -f \
+           -c "falloc 0 1M" \
+           -c "falloc 3M 3M" \
+           /mnt/foobar
+
+  # Now write to the second extent and leave only 1M of it as unwritten,
+  # which corresponds to the file range [4M, 5M[.
+  #
+  # Then fsync the file to flush delalloc and to clear full sync flag from
+  # the inode, so that a future fsync will use the fast code path.
+  #
+  # After the writeback triggered by the fsync we have 3 file extent items
+  # that point to the second extent we previously allocated:
+  #
+  # 1) One file extent item of type BTRFS_FILE_EXTENT_REG that covers the
+  #    file range [3M, 4M[
+  #
+  # 2) One file extent item of type BTRFS_FILE_EXTENT_PREALLOC that covers
+  #    the file range [4M, 5M[
+  #
+  # 3) One file extent item of type BTRFS_FILE_EXTENT_REG that covers the
+  #    file range [5M, 6M[
+  #
+  # All these file extent items have a generation of 6, which is the ID of
+  # the transaction where they were created. The split of the original file
+  # extent item is done at btrfs_mark_extent_written() when ordered extents
+  # complete for the file ranges [3M, 4M[ and [5M, 6M[.
+  #
+  $ xfs_io -c "pwrite -S 0xab 3M 1M" \
+           -c "pwrite -S 0xef 5M 1M" \
+           -c "fsync" \
+           /mnt/foobar
+
+  # Commit the current transaction. This wipes out the log tree created by
+  # the previous fsync.
+  sync
+
+  # Now write to the unwritten range of the second extent we allocated,
+  # corresponding to the file range [4M, 5M[, and fsync the file, which
+  # triggers the fast fsync code path.
+  #
+  # The fast fsync code path sees that there is a new extent map covering
+  # the file range [4M, 5M[ and therefore it will log a checksum item
+  # covering the range [1M, 2M[ of the second extent we allocated.
+  #
+  # Also, after the fsync finishes we no longer have the 3 file extent
+  # items that pointed to 3 sections of the second extent we allocated.
+  # Instead we end up with a single file extent item pointing to the whole
+  # extent, with a type of BTRFS_FILE_EXTENT_REG and a generation of 7 (the
+  # current transaction ID). This is due to the file extent item merging we
+  # do when completing ordered extents into ranges that point to unwritten
+  # (preallocated) extents. This merging is done at
+  # btrfs_mark_extent_written().
+  #
+  $ xfs_io -c "pwrite -S 0xcd 4M 1M" \
+           -c "fsync" \
+           /mnt/foobar
+
+  # Now do some write to our file outside the range of the second extent
+  # that we allocated with fallocate() and truncate the file size from 6M
+  # down to 5M.
+  #
+  # The truncate operation sets the full sync runtime flag on the inode,
+  # forcing the next fsync to use the slow code path. It also changes the
+  # length of the second file extent item so that it represents the file
+  # range [3M, 5M[ and not the range [3M, 6M[ anymore.
+  #
+  # Finally fsync the file. Since this is a fsync that triggers the slow
+  # code path, it will remove all items associated to the inode from the
+  # log tree and then it will scan for file extent items in the
+  # fs/subvolume tree that have a generation matching the current
+  # transaction ID, which is 7. This means it will log 2 file extent
+  # items:
+  #
+  # 1) One for the first extent we allocated, covering the file range
+  #    [0, 1M[
+  #
+  # 2) Another for the first 2M of the second extent we allocated,
+  #    covering the file range [3M, 5M[
+  #
+  # When logging the first file extent item we log a single checksum item
+  # that has all the checksums for the entire extent.
+  #
+  # When logging the second file extent item, we also lookup for the
+  # checksums that are associated with the range [0, 2M[ of the second
+  # extent we allocated (file range [3M, 5M[), and then we log them with
+  # btrfs_csum_file_blocks(). However that results in ending up with a log
+  # that has two checksum items with ranges that overlap:
+  #
+  # 1) One for the range [1M, 2M[ of the second extent we allocated,
+  #    corresponding to the file range [4M, 5M[, which we logged in the
+  #    previous fsync that used the fast code path;
+  #
+  # 2) One for the ranges [0, 1M[ and [0, 2M[ of the first and second
+  #    extents, respectively, corresponding to the files ranges [0, 1M[
+  #    and [3M, 5M[. This one was added during this last fsync that uses
+  #    the slow code path and overlaps with the previous one logged by
+  #    the previous fast fsync.
+  #
+  # This happens because when logging the checksums for the second
+  # extent, we notice they start at an offset that matches the end of the
+  # checksums item that we logged for the first extent, and because both
+  # extents are contiguous on disk, btrfs_csum_file_blocks() decides to
+  # extend that existing checksums item and append the checksums for the
+  # second extent to this item. The end result is we end up with two
+  # checksum items in the log tree that have overlapping ranges, as
+  # listed before, resulting in the fsync to fail with -EIO and aborting
+  # the transaction, turning the filesystem into RO mode.
+  #
+  $ xfs_io -c "pwrite -S 0xff 0 1M" \
+           -c "truncate 5M" \
+           -c "fsync" \
+           /mnt/foobar
+  fsync: Input/output error
+
+After running the example, dmesg/syslog shows the tree checker complained
+about the checksum items with overlapping ranges and we aborted the
+transaction:
+
+  $ dmesg
+  (...)
+  [756289.557487] BTRFS critical (device sdc): corrupt leaf: root=18446744073709551610 block=30720000 slot=5, csum end range (16777216) goes beyond the start range (15728640) of the next csum item
+  [756289.560583] BTRFS info (device sdc): leaf 30720000 gen 7 total ptrs 7 free space 11677 owner 18446744073709551610
+  [756289.562435] BTRFS info (device sdc): refs 2 lock_owner 0 current 2303929
+  [756289.563654]       item 0 key (257 1 0) itemoff 16123 itemsize 160
+  [756289.564649]               inode generation 6 size 5242880 mode 100600
+  [756289.565636]       item 1 key (257 12 256) itemoff 16107 itemsize 16
+  [756289.566694]       item 2 key (257 108 0) itemoff 16054 itemsize 53
+  [756289.567725]               extent data disk bytenr 13631488 nr 1048576
+  [756289.568697]               extent data offset 0 nr 1048576 ram 1048576
+  [756289.569689]       item 3 key (257 108 1048576) itemoff 16001 itemsize 53
+  [756289.570682]               extent data disk bytenr 0 nr 0
+  [756289.571363]               extent data offset 0 nr 2097152 ram 2097152
+  [756289.572213]       item 4 key (257 108 3145728) itemoff 15948 itemsize 53
+  [756289.573246]               extent data disk bytenr 14680064 nr 3145728
+  [756289.574121]               extent data offset 0 nr 2097152 ram 3145728
+  [756289.574993]       item 5 key (18446744073709551606 128 13631488) itemoff 12876 itemsize 3072
+  [756289.576113]       item 6 key (18446744073709551606 128 15728640) itemoff 11852 itemsize 1024
+  [756289.577286] BTRFS error (device sdc): block=30720000 write time tree block corruption detected
+  [756289.578644] ------------[ cut here ]------------
+  [756289.579376] WARNING: CPU: 0 PID: 2303929 at fs/btrfs/disk-io.c:465 csum_one_extent_buffer+0xed/0x100 [btrfs]
+  [756289.580857] Modules linked in: btrfs dm_zero dm_dust loop dm_snapshot (...)
+  [756289.591534] CPU: 0 PID: 2303929 Comm: xfs_io Tainted: G        W         5.12.0-rc8-btrfs-next-87 #1
+  [756289.592580] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.14.0-0-g155821a1990b-prebuilt.qemu.org 04/01/2014
+  [756289.594161] RIP: 0010:csum_one_extent_buffer+0xed/0x100 [btrfs]
+  [756289.595122] Code: 5d c3 e8 76 60 (...)
+  [756289.597509] RSP: 0018:ffffb51b416cb898 EFLAGS: 00010282
+  [756289.598142] RAX: 0000000000000000 RBX: fffff02b8a365bc0 RCX: 0000000000000000
+  [756289.598970] RDX: 0000000000000000 RSI: ffffffffa9112421 RDI: 00000000ffffffff
+  [756289.599798] RBP: ffffa06500880000 R08: 0000000000000000 R09: 0000000000000000
+  [756289.600619] R10: 0000000000000000 R11: 0000000000000001 R12: 0000000000000000
+  [756289.601456] R13: ffffa0652b1d8980 R14: ffffa06500880000 R15: 0000000000000000
+  [756289.602278] FS:  00007f08b23c9800(0000) GS:ffffa0682be00000(0000) knlGS:0000000000000000
+  [756289.603217] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+  [756289.603892] CR2: 00005652f32d0138 CR3: 000000025d616003 CR4: 0000000000370ef0
+  [756289.604725] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+  [756289.605563] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+  [756289.606400] Call Trace:
+  [756289.606704]  btree_csum_one_bio+0x244/0x2b0 [btrfs]
+  [756289.607313]  btrfs_submit_metadata_bio+0xb7/0x100 [btrfs]
+  [756289.608040]  submit_one_bio+0x61/0x70 [btrfs]
+  [756289.608587]  btree_write_cache_pages+0x587/0x610 [btrfs]
+  [756289.609258]  ? free_debug_processing+0x1d5/0x240
+  [756289.609812]  ? __module_address+0x28/0xf0
+  [756289.610298]  ? lock_acquire+0x1a0/0x3e0
+  [756289.610754]  ? lock_acquired+0x19f/0x430
+  [756289.611220]  ? lock_acquire+0x1a0/0x3e0
+  [756289.611675]  do_writepages+0x43/0xf0
+  [756289.612101]  ? __filemap_fdatawrite_range+0xa4/0x100
+  [756289.612800]  __filemap_fdatawrite_range+0xc5/0x100
+  [756289.613393]  btrfs_write_marked_extents+0x68/0x160 [btrfs]
+  [756289.614085]  btrfs_sync_log+0x21c/0xf20 [btrfs]
+  [756289.614661]  ? finish_wait+0x90/0x90
+  [756289.615096]  ? __mutex_unlock_slowpath+0x45/0x2a0
+  [756289.615661]  ? btrfs_log_inode_parent+0x3c9/0xdc0 [btrfs]
+  [756289.616338]  ? lock_acquire+0x1a0/0x3e0
+  [756289.616801]  ? lock_acquired+0x19f/0x430
+  [756289.617284]  ? lock_acquire+0x1a0/0x3e0
+  [756289.617750]  ? lock_release+0x214/0x470
+  [756289.618221]  ? lock_acquired+0x19f/0x430
+  [756289.618704]  ? dput+0x20/0x4a0
+  [756289.619079]  ? dput+0x20/0x4a0
+  [756289.619452]  ? lockref_put_or_lock+0x9/0x30
+  [756289.619969]  ? lock_release+0x214/0x470
+  [756289.620445]  ? lock_release+0x214/0x470
+  [756289.620924]  ? lock_release+0x214/0x470
+  [756289.621415]  btrfs_sync_file+0x46a/0x5b0 [btrfs]
+  [756289.621982]  do_fsync+0x38/0x70
+  [756289.622395]  __x64_sys_fsync+0x10/0x20
+  [756289.622907]  do_syscall_64+0x33/0x80
+  [756289.623438]  entry_SYSCALL_64_after_hwframe+0x44/0xae
+  [756289.624063] RIP: 0033:0x7f08b27fbb7b
+  [756289.624588] Code: 0f 05 48 3d 00 (...)
+  [756289.626760] RSP: 002b:00007ffe2583f940 EFLAGS: 00000293 ORIG_RAX: 000000000000004a
+  [756289.627639] RAX: ffffffffffffffda RBX: 00005652f32cd0f0 RCX: 00007f08b27fbb7b
+  [756289.628464] RDX: 00005652f32cbca0 RSI: 00005652f32cd110 RDI: 0000000000000003
+  [756289.629323] RBP: 00005652f32cd110 R08: 0000000000000000 R09: 00007f08b28c4be0
+  [756289.630172] R10: fffffffffffff39a R11: 0000000000000293 R12: 0000000000000001
+  [756289.631007] R13: 00005652f32cd0f0 R14: 0000000000000001 R15: 00005652f32cc480
+  [756289.631819] irq event stamp: 0
+  [756289.632188] hardirqs last  enabled at (0): [<0000000000000000>] 0x0
+  [756289.632911] hardirqs last disabled at (0): [<ffffffffa7e97c29>] copy_process+0x879/0x1cc0
+  [756289.633893] softirqs last  enabled at (0): [<ffffffffa7e97c29>] copy_process+0x879/0x1cc0
+  [756289.634871] softirqs last disabled at (0): [<0000000000000000>] 0x0
+  [756289.635606] ---[ end trace 0a039fdc16ff3fef ]---
+  [756289.636179] BTRFS: error (device sdc) in btrfs_sync_log:3136: errno=-5 IO failure
+  [756289.637082] BTRFS info (device sdc): forced readonly
+
+Having checksum items covering ranges that overlap is dangerous as in some
+cases it can lead to having extent ranges for which we miss checksums
+after log replay or getting the wrong checksum item. There were some fixes
+in the past for bugs that resulted in this problem, and were explained and
+fixed by the following commits:
+
+  27b9a8122ff71a ("Btrfs: fix csum tree corruption, duplicate and outdated checksums")
+  b84b8390d6009c ("Btrfs: fix file read corruption after extent cloning and fsync")
+  40e046acbd2f36 ("Btrfs: fix missing data checksums after replaying a log tree")
+  e289f03ea79bbc ("btrfs: fix corrupt log due to concurrent fsync of inodes with shared extents")
+
+Fix the issue by making btrfs_csum_file_blocks() taking into account the
+start offset of the next checksum item when it decides to extend an
+existing checksum item, so that it never extends the checksum to end at a
+range that goes beyond the start range of the next checksum item.
+
+When we can not access the next checksum item without releasing the path,
+simply drop the optimization of extending the previous checksum item and
+fallback to inserting a new checksum item - this happens rarely and the
+optimization is not significant enough for a log tree in order to justify
+the extra complexity, as it would only save a few bytes (the size of a
+struct btrfs_item) of leaf space.
+
+This behaviour is only needed when inserting into a log tree because
+for the regular checksums tree we never have a case where we try to
+insert a range of checksums that overlap with a range that was previously
+inserted.
+
+A test case for fstests will follow soon.
+
+Reported-by: Philipp Fent <fent@in.tum.de>
+Link: https://lore.kernel.org/linux-btrfs/93c4600e-5263-5cba-adf0-6f47526e7561@in.tum.de/
+CC: stable@vger.kernel.org # 5.4+
+Tested-by: Anand Jain <anand.jain@oracle.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/file-item.c | 98 ++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 76 insertions(+), 22 deletions(-)
+
+diff --git a/fs/btrfs/file-item.c b/fs/btrfs/file-item.c
+index 2b49c7b08..5725ca356 100644
+--- a/fs/btrfs/file-item.c
++++ b/fs/btrfs/file-item.c
+@@ -825,6 +825,37 @@ int btrfs_del_csums(struct btrfs_trans_handle *trans,
+ 	return ret;
+ }
+ 
++static int find_next_csum_offset(struct btrfs_root *root,
++				 struct btrfs_path *path,
++				 u64 *next_offset)
++{
++	const u32 nritems = btrfs_header_nritems(path->nodes[0]);
++	struct btrfs_key found_key;
++	int slot = path->slots[0] + 1;
++	int ret;
++
++	if (nritems == 0 || slot >= nritems) {
++		ret = btrfs_next_leaf(root, path);
++		if (ret < 0) {
++			return ret;
++		} else if (ret > 0) {
++			*next_offset = (u64)-1;
++			return 0;
++		}
++		slot = path->slots[0];
++	}
++
++	btrfs_item_key_to_cpu(path->nodes[0], &found_key, slot);
++
++	if (found_key.objectid != BTRFS_EXTENT_CSUM_OBJECTID ||
++	    found_key.type != BTRFS_EXTENT_CSUM_KEY)
++		*next_offset = (u64)-1;
++	else
++		*next_offset = found_key.offset;
++
++	return 0;
++}
++
+ int btrfs_csum_file_blocks(struct btrfs_trans_handle *trans,
+ 			   struct btrfs_root *root,
+ 			   struct btrfs_ordered_sum *sums)
+@@ -840,7 +871,6 @@ int btrfs_csum_file_blocks(struct btrfs_trans_handle *trans,
+ 	u64 total_bytes = 0;
+ 	u64 csum_offset;
+ 	u64 bytenr;
+-	u32 nritems;
+ 	u32 ins_size;
+ 	int index = 0;
+ 	int found_next;
+@@ -883,26 +913,10 @@ int btrfs_csum_file_blocks(struct btrfs_trans_handle *trans,
+ 			goto insert;
+ 		}
+ 	} else {
+-		int slot = path->slots[0] + 1;
+-		/* we didn't find a csum item, insert one */
+-		nritems = btrfs_header_nritems(path->nodes[0]);
+-		if (!nritems || (path->slots[0] >= nritems - 1)) {
+-			ret = btrfs_next_leaf(root, path);
+-			if (ret < 0) {
+-				goto out;
+-			} else if (ret > 0) {
+-				found_next = 1;
+-				goto insert;
+-			}
+-			slot = path->slots[0];
+-		}
+-		btrfs_item_key_to_cpu(path->nodes[0], &found_key, slot);
+-		if (found_key.objectid != BTRFS_EXTENT_CSUM_OBJECTID ||
+-		    found_key.type != BTRFS_EXTENT_CSUM_KEY) {
+-			found_next = 1;
+-			goto insert;
+-		}
+-		next_offset = found_key.offset;
++		/* We didn't find a csum item, insert one. */
++		ret = find_next_csum_offset(root, path, &next_offset);
++		if (ret < 0)
++			goto out;
+ 		found_next = 1;
+ 		goto insert;
+ 	}
+@@ -957,8 +971,48 @@ int btrfs_csum_file_blocks(struct btrfs_trans_handle *trans,
+ 		tmp = sums->len - total_bytes;
+ 		tmp >>= fs_info->sb->s_blocksize_bits;
+ 		WARN_ON(tmp < 1);
++		extend_nr = max_t(int, 1, tmp);
++
++		/*
++		 * A log tree can already have checksum items with a subset of
++		 * the checksums we are trying to log. This can happen after
++		 * doing a sequence of partial writes into prealloc extents and
++		 * fsyncs in between, with a full fsync logging a larger subrange
++		 * of an extent for which a previous fast fsync logged a smaller
++		 * subrange. And this happens in particular due to merging file
++		 * extent items when we complete an ordered extent for a range
++		 * covered by a prealloc extent - this is done at
++		 * btrfs_mark_extent_written().
++		 *
++		 * So if we try to extend the previous checksum item, which has
++		 * a range that ends at the start of the range we want to insert,
++		 * make sure we don't extend beyond the start offset of the next
++		 * checksum item. If we are at the last item in the leaf, then
++		 * forget the optimization of extending and add a new checksum
++		 * item - it is not worth the complexity of releasing the path,
++		 * getting the first key for the next leaf, repeat the btree
++		 * search, etc, because log trees are temporary anyway and it
++		 * would only save a few bytes of leaf space.
++		 */
++		if (root->root_key.objectid == BTRFS_TREE_LOG_OBJECTID) {
++			if (path->slots[0] + 1 >=
++			    btrfs_header_nritems(path->nodes[0])) {
++				ret = find_next_csum_offset(root, path, &next_offset);
++				if (ret < 0)
++					goto out;
++				found_next = 1;
++				goto insert;
++			}
++
++			ret = find_next_csum_offset(root, path, &next_offset);
++			if (ret < 0)
++				goto out;
++
++			tmp = div64_u64(next_offset - bytenr, fs_info->sectorsize);
++			if (tmp <= INT_MAX)
++				extend_nr = min_t(int, extend_nr, tmp);
++		}
+ 
+-		extend_nr = max_t(int, 1, (int)tmp);
+ 		diff = (csum_offset + extend_nr) * csum_size;
+ 		diff = min(diff,
+ 			   MAX_CSUM_ITEMS(fs_info, csum_size) * csum_size);
+-- 
+2.26.2
+
