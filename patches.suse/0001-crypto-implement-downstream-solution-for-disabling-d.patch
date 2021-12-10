@@ -1,0 +1,213 @@
+From 3c65e45d809ab7d58fd87dfbaef307992ae7d403 Mon Sep 17 00:00:00 2001
+From: Nicolai Stange <nstange@suse.de>
+Date: Sun, 28 Nov 2021 20:45:56 +0100
+Subject: [PATCH 1/2] crypto: implement downstream solution for disabling
+ drivers in FIPS mode
+References: jsc#SLE-21132,bsc#1191270
+Patch-mainline: Never, downstream solution to block unapproved crypto drivers
+
+Non-verified crypto implementations from drivers/crypto must not be used in
+FIPS mode and this has to be enforced from the crypto API.
+
+The most reasonable way of achieving this is to make the testmgr to force
+these algorithm instances' tests to fail: the crypto API's lookup
+primitives only return algorithm implementations which have successfully
+completed their associated tests. From the resp. driver's perspective, the
+algorithm registrations would still succeed, so no errors would get thrown
+e.g. during boot and potential services outside the scope of FIPS could
+still be provided.
+
+Implement the new suse_fips_is_driver_unapproved() for searching a given
+driver name on a to-be-populated list of unapproved implementations to be
+rejected in FIPS mode. Make alg_test() query it in FIPS mode if the
+algorithm has not been determined to be disallowed by some other means
+already, i.e. if no matching test with ->fips_allowed == 0 has been found.
+
+Now that it's more common to have driver algorithm instances in failed
+state potentially aliasing with approved implementations around, there's
+one subtlety in the crypto API's lookup code which needs to get addressed.
+A lot of those crypto drivers register "fused" implementations of certain
+algorithm constructions, which would otherwise get served by some generic
+templates. However, these instances are kept on the global algorithms list
+and crypto_alg_lookup() would return -ELIBBAD upon encountering a matching
+such one in forced-fail state, c.f. commit eb02c38f0197 ("crypto: api -
+Keep failed instances alive"). This would then subsequently prevent the
+calling code from attempting to construct an (approved) instantiation of
+the generic templates. Make crypto_alg_lookup()'s caller,
+crypto_larval_lookup(), pass on the -ELIBBAD only if it had been caused by
+some generic template instantiation in failed state, i.e. by a real test
+failure rather by than some unapproved driver.
+
+Finally, due to the asynchronous nature of the testmgr execution, the
+algorithm registration code always keeps a placeholder test larval on the
+global algorithm list until alg_test() eventually gets to run and has a
+chance to force-fail the test for unapproved drivers. Until that has
+happened, any matching request coming in through crypto_alg_mod_lookup()
+would end up waiting on this test larval in crypto_larval_wait().
+crypto_larval_wait() would return -EAGAIN once the test has been
+force-failed asynchronously and the whole lookup would then subsequently
+fail. As failing test larvals are much more common in FIPS mode now, make
+crypto_larval_lookup() to retry the whole operation when any of its two
+descendant crypto_larval_wait() invocations return -EAGAIN.
+
+Signed-off-by: Nicolai Stange <nstange@suse.de>
+---
+ crypto/api.c                          |   35 +++++++++++++++++++++
+ crypto/suse_fips_unapproved_drivers.h |    1 
+ crypto/testmgr.c                      |   56 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 92 insertions(+)
+ create mode 100644 crypto/suse_fips_unapproved_drivers.h
+
+--- a/crypto/api.c
++++ b/crypto/api.c
+@@ -20,6 +20,7 @@
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ #include <linux/completion.h>
++#include <linux/fips.h>
+ #include "internal.h"
+ 
+ LIST_HEAD(crypto_alg_list);
+@@ -225,6 +226,7 @@ static struct crypto_alg *crypto_larval_
+ 	type &= ~(CRYPTO_ALG_LARVAL | CRYPTO_ALG_DEAD);
+ 	mask &= ~(CRYPTO_ALG_LARVAL | CRYPTO_ALG_DEAD);
+ 
++again:
+ 	alg = crypto_alg_lookup(name, type, mask);
+ 	if (!alg && !(mask & CRYPTO_NOLOAD)) {
+ 		request_module("crypto-%s", name);
+@@ -236,11 +238,44 @@ static struct crypto_alg *crypto_larval_
+ 		alg = crypto_alg_lookup(name, type, mask);
+ 	}
+ 
++	/*
++	 * As a downstream solution, unapproved crypto driver
++	 * instances' tests are forced to fail in FIPS mode from
++	 * testmgr. A lot of those register "fused" implementations of
++	 * certain algorithm constructions, which would otherwise get
++	 * served by some generic templates. However, those driver
++	 * instances are kept on the global algorithms list in failed
++	 * state and crypto_alg_lookup() would return -ELIBBAD upon
++	 * encountering a matching such one. In order to still allow
++	 * the generic template implementations to serve the request,
++	 * check if the the ELIBBAD had been coming from a matching
++	 * template instantiation in failed state and ignore it if
++	 * not.
++	 */
++	if (fips_enabled && IS_ERR(alg) && PTR_ERR(alg) == -ELIBBAD &&
++	    strchr(name, '(')) {
++		alg = crypto_alg_lookup(name,
++					type | CRYPTO_ALG_INSTANCE,
++					mask | CRYPTO_ALG_INSTANCE);
++	}
++
+ 	if (!IS_ERR_OR_NULL(alg) && crypto_is_larval(alg))
+ 		alg = crypto_larval_wait(alg);
+ 	else if (!alg)
+ 		alg = crypto_larval_add(name, type, mask);
+ 
++	/*
++	 * As outlined above, unapproved crypto driver instances'
++	 * tests are forced to fail in FIPS mode from testmgr. If
++	 * crypto_larval_wait() returned -EAGAIN, chances are the wait
++	 * had been on such a driver instance's failed test larval.
++	 * Retry the search in this case.
++	 */
++	if (fips_enabled && IS_ERR(alg) && PTR_ERR(alg) == -EAGAIN) {
++		cond_resched();
++		goto again;
++	}
++
+ 	return alg;
+ }
+ 
+--- /dev/null
++++ b/crypto/suse_fips_unapproved_drivers.h
+@@ -0,0 +1 @@
++
+--- a/crypto/testmgr.c
++++ b/crypto/testmgr.c
+@@ -5560,6 +5560,50 @@ static void testmgr_onetime_init(void)
+ #endif
+ }
+ 
++#ifdef CONFIG_CRYPTO_FIPS
++static bool suse_fips_is_driver_unapproved(const char *driver)
++{
++	/*
++	 * unapproved_drivers[] contains a sorted list of
++	 * cra_driver_name's to reject in FIPS mode.
++	 */
++	static const char *unapproved_drivers[] = {
++#include "suse_fips_unapproved_drivers.h"
++	};
++	int start = 0;
++	int end = ARRAY_SIZE(unapproved_drivers);
++
++	if (!fips_enabled)
++		return false;
++
++	while (start < end) {
++		int i = (start + end) / 2;
++		int diff = strcmp(unapproved_drivers[i], driver);
++
++		if (diff > 0) {
++			end = i;
++			continue;
++		}
++
++		if (diff < 0) {
++			start = i + 1;
++			continue;
++		}
++
++		pr_info("alg: disabling driver '%s' in FIPS mode\n", driver);
++
++		return true;
++	}
++
++	return false;
++}
++#else /* !CONFIG_CRYPTO_FIPS */
++static bool suse_fips_is_driver_unapproved(const char *driver)
++{
++	return false;
++}
++#endif /* CONFIG_CRYPTO_FIPS */
++
+ static int alg_find_test(const char *alg)
+ {
+ 	int start = 0;
+@@ -5611,6 +5655,8 @@ int alg_test(const char *driver, const c
+ 
+ 		if (fips_enabled && !alg_test_descs[i].fips_allowed)
+ 			goto non_fips_alg;
++		else if (suse_fips_is_driver_unapproved(driver))
++			goto non_fips_alg;
+ 
+ 		rc = alg_test_cipher(alg_test_descs + i, driver, type, mask);
+ 		goto test_done;
+@@ -5624,6 +5670,8 @@ int alg_test(const char *driver, const c
+ 	if (fips_enabled && ((i >= 0 && !alg_test_descs[i].fips_allowed) ||
+ 			     (j >= 0 && !alg_test_descs[j].fips_allowed)))
+ 		goto non_fips_alg;
++	else if (suse_fips_is_driver_unapproved(driver))
++		goto non_fips_alg;
+ 
+ 	rc = 0;
+ 	if (i >= 0)
+@@ -5652,6 +5700,14 @@ test_done:
+ 	return rc;
+ 
+ notest:
++	/*
++	 * Unapproved drivers can register constructions for which
++	 * there is no matching test with ->fips_allowed == 0, check
++	 * for this.
++	 */
++	if (suse_fips_is_driver_unapproved(driver))
++		goto non_fips_alg;
++
+ 	printk(KERN_INFO "alg: No test for %s (%s)\n", alg, driver);
+ 	return 0;
+ non_fips_alg:
