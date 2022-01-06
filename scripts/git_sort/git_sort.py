@@ -210,6 +210,7 @@ remotes = (
     Head(RepoURL("git://anongit.freedesktop.org/drm/drm"), "drm-next"),
     Head(RepoURL("git://anongit.freedesktop.org/drm/drm-misc"), "drm-misc-next"),
     Head(RepoURL("gregkh/tty.git"), "tty-next"),
+    Head(RepoURL("gregkh/usb.git"), "usb-testing"),
     Head(RepoURL("jj/linux-apparmor.git"), "apparmor-next"),
     Head(RepoURL("pablo/nf.git")),
     Head(RepoURL("pablo/nf-next.git")),
