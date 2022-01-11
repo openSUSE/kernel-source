@@ -1,0 +1,191 @@
+From 8f1ba8b0ee2679f0b3d22d2a5c1bc70c436fd872 Mon Sep 17 00:00:00 2001
+From: Benjamin Li <benl@squareup.com>
+Date: Wed, 27 Oct 2021 10:03:05 -0700
+Subject: [PATCH] wcn36xx: ensure pairing of init_scan/finish_scan and start_scan/end_scan
+Git-commit: 8f1ba8b0ee2679f0b3d22d2a5c1bc70c436fd872
+Patch-mainline: v5.17-rc1
+References: git-fixes
+
+An SMD capture from the downstream prima driver on WCN3680B shows the
+following command sequence for connected scans:
+
+- init_scan_req
+    - start_scan_req, channel 1
+    - end_scan_req, channel 1
+    - start_scan_req, channel 2
+    - ...
+    - end_scan_req, channel 3
+- finish_scan_req
+- init_scan_req
+    - start_scan_req, channel 4
+    - ...
+    - end_scan_req, channel 6
+- finish_scan_req
+- ...
+    - end_scan_req, channel 165
+- finish_scan_req
+
+Upstream currently never calls wcn36xx_smd_end_scan, and in some cases[1]
+still sends finish_scan_req twice in a row or before init_scan_req. A
+typical connected scan looks like this:
+
+- init_scan_req
+    - start_scan_req, channel 1
+- finish_scan_req
+- init_scan_req
+    - start_scan_req, channel 2
+- ...
+    - start_scan_req, channel 165
+- finish_scan_req
+- finish_scan_req
+
+This patch cleans up scanning so that init/finish and start/end are always
+paired together and correctly nested.
+
+- init_scan_req
+    - start_scan_req, channel 1
+    - end_scan_req, channel 1
+- finish_scan_req
+- init_scan_req
+    - start_scan_req, channel 2
+    - end_scan_req, channel 2
+- ...
+    - start_scan_req, channel 165
+    - end_scan_req, channel 165
+- finish_scan_req
+
+Note that upstream will not do batching of 3 active-probe scans before
+returning to the operating channel, and this patch does not change that.
+To match downstream in this aspect, adjust IEEE80211_PROBE_DELAY and/or
+the 125ms max off-channel time in ieee80211_scan_state_decision.
+
+[1]: commit d195d7aac09b ("wcn36xx: Ensure finish scan is not requested
+before start scan") addressed one case of finish_scan_req being sent
+without a preceding init_scan_req (the case of the operating channel
+coinciding with the first scan channel); two other cases are:
+1) if SW scan is started and aborted immediately, without scanning any
+   channels, we send a finish_scan_req without ever sending init_scan_req,
+   and
+2) as SW scan logic always returns us to the operating channel before
+   calling wcn36xx_sw_scan_complete, finish_scan_req is always sent twice
+   at the end of a SW scan
+
+Fixes: 8e84c2582169 ("wcn36xx: mac80211 driver for Qualcomm WCN3660/WCN3680 hardware")
+Signed-off-by: Benjamin Li <benl@squareup.com>
+Tested-by: Bryan O'Donoghue <bryan.odonoghue@linaro.org>
+Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+Link: https://lore.kernel.org/r/20211027170306.555535-4-benl@squareup.com
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/net/wireless/ath/wcn36xx/main.c    |   34 +++++++++++++++++++++++------
+ drivers/net/wireless/ath/wcn36xx/smd.c     |    4 +++
+ drivers/net/wireless/ath/wcn36xx/wcn36xx.h |    1 
+ 3 files changed, 32 insertions(+), 7 deletions(-)
+
+--- a/drivers/net/wireless/ath/wcn36xx/main.c
++++ b/drivers/net/wireless/ath/wcn36xx/main.c
+@@ -400,6 +400,7 @@ static void wcn36xx_change_opchannel(str
+ static int wcn36xx_config(struct ieee80211_hw *hw, u32 changed)
+ {
+ 	struct wcn36xx *wcn = hw->priv;
++	int ret;
+ 
+ 	wcn36xx_dbg(WCN36XX_DBG_MAC, "mac config changed 0x%08x\n", changed);
+ 
+@@ -415,17 +416,31 @@ static int wcn36xx_config(struct ieee802
+ 			 * want to receive/transmit regular data packets, then
+ 			 * simply stop the scan session and exit PS mode.
+ 			 */
+-			wcn36xx_smd_finish_scan(wcn, HAL_SYS_MODE_SCAN,
+-						wcn->sw_scan_vif);
+-			wcn->sw_scan_channel = 0;
++			if (wcn->sw_scan_channel)
++				wcn36xx_smd_end_scan(wcn, wcn->sw_scan_channel);
++			if (wcn->sw_scan_init) {
++				wcn36xx_smd_finish_scan(wcn, HAL_SYS_MODE_SCAN,
++							wcn->sw_scan_vif);
++			}
+ 		} else if (wcn->sw_scan) {
+ 			/* A scan is ongoing, do not change the operating
+ 			 * channel, but start a scan session on the channel.
+ 			 */
+-			wcn36xx_smd_init_scan(wcn, HAL_SYS_MODE_SCAN,
+-					      wcn->sw_scan_vif);
++			if (wcn->sw_scan_channel)
++				wcn36xx_smd_end_scan(wcn, wcn->sw_scan_channel);
++			if (!wcn->sw_scan_init) {
++				/* This can fail if we are unable to notify the
++				 * operating channel.
++				 */
++				ret = wcn36xx_smd_init_scan(wcn,
++							    HAL_SYS_MODE_SCAN,
++							    wcn->sw_scan_vif);
++				if (ret) {
++					mutex_unlock(&wcn->conf_mutex);
++					return -EIO;
++				}
++			}
+ 			wcn36xx_smd_start_scan(wcn, ch);
+-			wcn->sw_scan_channel = ch;
+ 		} else {
+ 			wcn36xx_change_opchannel(wcn, ch);
+ 		}
+@@ -713,7 +728,12 @@ static void wcn36xx_sw_scan_complete(str
+ 	struct wcn36xx *wcn = hw->priv;
+ 
+ 	/* ensure that any scan session is finished */
+-	wcn36xx_smd_finish_scan(wcn, HAL_SYS_MODE_SCAN, wcn->sw_scan_vif);
++	if (wcn->sw_scan_channel)
++		wcn36xx_smd_end_scan(wcn, wcn->sw_scan_channel);
++	if (wcn->sw_scan_init) {
++		wcn36xx_smd_finish_scan(wcn, HAL_SYS_MODE_SCAN,
++					wcn->sw_scan_vif);
++	}
+ 	wcn->sw_scan = false;
+ 	wcn->sw_scan_opchannel = 0;
+ }
+--- a/drivers/net/wireless/ath/wcn36xx/smd.c
++++ b/drivers/net/wireless/ath/wcn36xx/smd.c
+@@ -721,6 +721,7 @@ int wcn36xx_smd_init_scan(struct wcn36xx
+ 		wcn36xx_err("hal_init_scan response failed err=%d\n", ret);
+ 		goto out;
+ 	}
++	wcn->sw_scan_init = true;
+ out:
+ 	mutex_unlock(&wcn->hal_mutex);
+ 	return ret;
+@@ -751,6 +752,7 @@ int wcn36xx_smd_start_scan(struct wcn36x
+ 		wcn36xx_err("hal_start_scan response failed err=%d\n", ret);
+ 		goto out;
+ 	}
++	wcn->sw_scan_channel = scan_channel;
+ out:
+ 	mutex_unlock(&wcn->hal_mutex);
+ 	return ret;
+@@ -781,6 +783,7 @@ int wcn36xx_smd_end_scan(struct wcn36xx
+ 		wcn36xx_err("hal_end_scan response failed err=%d\n", ret);
+ 		goto out;
+ 	}
++	wcn->sw_scan_channel = 0;
+ out:
+ 	mutex_unlock(&wcn->hal_mutex);
+ 	return ret;
+@@ -822,6 +825,7 @@ int wcn36xx_smd_finish_scan(struct wcn36
+ 		wcn36xx_err("hal_finish_scan response failed err=%d\n", ret);
+ 		goto out;
+ 	}
++	wcn->sw_scan_init = false;
+ out:
+ 	mutex_unlock(&wcn->hal_mutex);
+ 	return ret;
+--- a/drivers/net/wireless/ath/wcn36xx/wcn36xx.h
++++ b/drivers/net/wireless/ath/wcn36xx/wcn36xx.h
+@@ -245,6 +245,7 @@ struct wcn36xx {
+ 	struct cfg80211_scan_request *scan_req;
+ 	bool			sw_scan;
+ 	u8			sw_scan_opchannel;
++	bool			sw_scan_init;
+ 	u8			sw_scan_channel;
+ 	struct ieee80211_vif	*sw_scan_vif;
+ 	struct mutex		scan_lock;
