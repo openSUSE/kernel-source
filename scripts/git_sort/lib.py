@@ -35,6 +35,11 @@ import git_sort
 from patch import Patch
 import series_conf
 
+try:
+    from collections.abc import MutableSet
+except ImportError:
+    from collections import MutableSet
+
 
 # https://stackoverflow.com/a/952952
 flatten = lambda l: [item for sublist in l for item in sublist]
@@ -566,7 +571,7 @@ class Link(object):
     __slots__ = 'prev', 'next', 'key', '__weakref__'
 
 
-class OrderedSet(collections.MutableSet):
+class OrderedSet(MutableSet):
     'Set the remembers the order elements were added'
     # Big-O running times for all methods are the same as for regular sets.
     # The internal self.__map dictionary maps keys to links in a doubly linked list.
