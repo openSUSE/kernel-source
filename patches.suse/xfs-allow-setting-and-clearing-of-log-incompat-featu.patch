@@ -1,0 +1,248 @@
+From 908ce71e54f8265fa909200410d6c50ab9a2d302 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Sun, 8 Aug 2021 08:27:12 -0700
+Subject: [PATCH] xfs: allow setting and clearing of log incompat feature flags
+Git-commit: 908ce71e54f8265fa909200410d6c50ab9a2d302
+Patch-mainline: v5.15-rc1
+References: bsc#1193791
+
+Log incompat feature flags in the superblock exist for one purpose: to
+protect the contents of a dirty log from replay on a kernel that isn't
+prepared to handle those dirty contents.  This means that they can be
+cleared if (a) we know the log is clean and (b) we know that there
+aren't any other threads in the system that might be setting or relying
+upon a log incompat flag.
+
+Therefore, clear the log incompat flags when we've finished recovering
+the log, when we're unmounting cleanly, remounting read-only, or
+freezing; and provide a function so that subsequent patches can start
+using this.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Allison Henderson <allison.henderson@oracle.com>
+Reviewed-by: Chandan Babu R <chandanrlinux@gmail.com>
+Acked-by: Anthony Iliopoulos <ailiop@suse.com>
+
+---
+ fs/xfs/libxfs/xfs_format.h |  15 +++++
+ fs/xfs/xfs_log.c           |  14 +++++
+ fs/xfs/xfs_log_recover.c   |  16 ++++++
+ fs/xfs/xfs_mount.c         | 110 +++++++++++++++++++++++++++++++++++++
+ fs/xfs/xfs_mount.h         |   2 +
+ 5 files changed, 157 insertions(+)
+
+diff --git a/fs/xfs/libxfs/xfs_format.h b/fs/xfs/libxfs/xfs_format.h
+index 37570cf0537e..5d8a129150d5 100644
+--- a/fs/xfs/libxfs/xfs_format.h
++++ b/fs/xfs/libxfs/xfs_format.h
+@@ -495,6 +495,21 @@ xfs_sb_has_incompat_log_feature(
+ 	return (sbp->sb_features_log_incompat & feature) != 0;
+ }
+ 
++static inline void
++xfs_sb_remove_incompat_log_features(
++	struct xfs_sb	*sbp)
++{
++	sbp->sb_features_log_incompat &= ~XFS_SB_FEAT_INCOMPAT_LOG_ALL;
++}
++
++static inline void
++xfs_sb_add_incompat_log_features(
++	struct xfs_sb	*sbp,
++	unsigned int	features)
++{
++	sbp->sb_features_log_incompat |= features;
++}
++
+ /*
+  * V5 superblock specific feature checks
+  */
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index eb8341027cc7..e0d4ffce7a8a 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -972,6 +972,20 @@ int
+ xfs_log_quiesce(
+ 	struct xfs_mount	*mp)
+ {
++	/*
++	 * Clear log incompat features since we're quiescing the log.  Report
++	 * failures, though it's not fatal to have a higher log feature
++	 * protection level than the log contents actually require.
++	 */
++	if (xfs_clear_incompat_log_features(mp)) {
++		int error;
++
++		error = xfs_sync_sb(mp, false);
++		if (error)
++			xfs_warn(mp,
++	"Failed to clear log incompat features on quiesce");
++	}
++
+ 	cancel_delayed_work_sync(&mp->m_log->l_work);
+ 	xfs_log_force(mp, XFS_LOG_SYNC);
+ 
+diff --git a/fs/xfs/xfs_log_recover.c b/fs/xfs/xfs_log_recover.c
+index ea96b5e45364..1d324c8bac6b 100644
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@ -3471,6 +3471,22 @@ xlog_recover_finish(
+ 		 */
+ 		xfs_log_force(log->l_mp, XFS_LOG_SYNC);
+ 
++		/*
++		 * Now that we've recovered the log and all the intents, we can
++		 * clear the log incompat feature bits in the superblock
++		 * because there's no longer anything to protect.  We rely on
++		 * the AIL push to write out the updated superblock after
++		 * everything else.
++		 */
++		if (xfs_clear_incompat_log_features(log->l_mp)) {
++			error = xfs_sync_sb(log->l_mp, false);
++			if (error < 0) {
++				xfs_alert(log->l_mp,
++	"Failed to clear log incompat features on recovery");
++				return error;
++			}
++		}
++
+ 		xlog_recover_process_iunlinks(log);
+ 
+ 		xlog_recover_check_summary(log);
+diff --git a/fs/xfs/xfs_mount.c b/fs/xfs/xfs_mount.c
+index ff08192d8d2a..74349eab5b58 100644
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -1241,6 +1241,116 @@ xfs_force_summary_recalc(
+ 	xfs_fs_mark_sick(mp, XFS_SICK_FS_COUNTERS);
+ }
+ 
++/*
++ * Enable a log incompat feature flag in the primary superblock.  The caller
++ * cannot have any other transactions in progress.
++ */
++int
++xfs_add_incompat_log_feature(
++	struct xfs_mount	*mp,
++	uint32_t		feature)
++{
++	struct xfs_dsb		*dsb;
++	int			error;
++
++	ASSERT(hweight32(feature) == 1);
++	ASSERT(!(feature & XFS_SB_FEAT_INCOMPAT_LOG_UNKNOWN));
++
++	/*
++	 * Force the log to disk and kick the background AIL thread to reduce
++	 * the chances that the bwrite will stall waiting for the AIL to unpin
++	 * the primary superblock buffer.  This isn't a data integrity
++	 * operation, so we don't need a synchronous push.
++	 */
++	error = xfs_log_force(mp, XFS_LOG_SYNC);
++	if (error)
++		return error;
++	xfs_ail_push_all(mp->m_ail);
++
++	/*
++	 * Lock the primary superblock buffer to serialize all callers that
++	 * are trying to set feature bits.
++	 */
++	xfs_buf_lock(mp->m_sb_bp);
++	xfs_buf_hold(mp->m_sb_bp);
++
++	if (XFS_FORCED_SHUTDOWN(mp)) {
++		error = -EIO;
++		goto rele;
++	}
++
++	if (xfs_sb_has_incompat_log_feature(&mp->m_sb, feature))
++		goto rele;
++
++	/*
++	 * Write the primary superblock to disk immediately, because we need
++	 * the log_incompat bit to be set in the primary super now to protect
++	 * the log items that we're going to commit later.
++	 */
++	dsb = mp->m_sb_bp->b_addr;
++	xfs_sb_to_disk(dsb, &mp->m_sb);
++	dsb->sb_features_log_incompat |= cpu_to_be32(feature);
++	error = xfs_bwrite(mp->m_sb_bp);
++	if (error)
++		goto shutdown;
++
++	/*
++	 * Add the feature bits to the incore superblock before we unlock the
++	 * buffer.
++	 */
++	xfs_sb_add_incompat_log_features(&mp->m_sb, feature);
++	xfs_buf_relse(mp->m_sb_bp);
++
++	/* Log the superblock to disk. */
++	return xfs_sync_sb(mp, false);
++shutdown:
++	xfs_force_shutdown(mp, SHUTDOWN_META_IO_ERROR);
++rele:
++	xfs_buf_relse(mp->m_sb_bp);
++	return error;
++}
++
++/*
++ * Clear all the log incompat flags from the superblock.
++ *
++ * The caller cannot be in a transaction, must ensure that the log does not
++ * contain any log items protected by any log incompat bit, and must ensure
++ * that there are no other threads that depend on the state of the log incompat
++ * feature flags in the primary super.
++ *
++ * Returns true if the superblock is dirty.
++ */
++bool
++xfs_clear_incompat_log_features(
++	struct xfs_mount	*mp)
++{
++	bool			ret = false;
++
++	if (!xfs_sb_version_hascrc(&mp->m_sb) ||
++	    !xfs_sb_has_incompat_log_feature(&mp->m_sb,
++				XFS_SB_FEAT_INCOMPAT_LOG_ALL) ||
++	    XFS_FORCED_SHUTDOWN(mp))
++		return false;
++
++	/*
++	 * Update the incore superblock.  We synchronize on the primary super
++	 * buffer lock to be consistent with the add function, though at least
++	 * in theory this shouldn't be necessary.
++	 */
++	xfs_buf_lock(mp->m_sb_bp);
++	xfs_buf_hold(mp->m_sb_bp);
++
++	if (xfs_sb_has_incompat_log_feature(&mp->m_sb,
++				XFS_SB_FEAT_INCOMPAT_LOG_ALL)) {
++		xfs_info(mp, "Clearing log incompat feature flags.");
++		xfs_sb_remove_incompat_log_features(&mp->m_sb);
++		ret = true;
++	}
++
++	xfs_buf_relse(mp->m_sb_bp);
++	return ret;
++}
++
+ /*
+  * Update the in-core delayed block counter.
+  *
+diff --git a/fs/xfs/xfs_mount.h b/fs/xfs/xfs_mount.h
+index 91a10233d04c..32143102cc91 100644
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -388,6 +388,8 @@ int	xfs_zero_extent(struct xfs_inode *ip, xfs_fsblock_t start_fsb,
+ struct xfs_error_cfg * xfs_error_get_cfg(struct xfs_mount *mp,
+ 		int error_class, int error);
+ void xfs_force_summary_recalc(struct xfs_mount *mp);
++int xfs_add_incompat_log_feature(struct xfs_mount *mp, uint32_t feature);
++bool xfs_clear_incompat_log_features(struct xfs_mount *mp);
+ void xfs_mod_delalloc(struct xfs_mount *mp, int64_t delta);
+ 
+ #endif	/* __XFS_MOUNT_H__ */
+-- 
+2.34.1
+
