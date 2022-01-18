@@ -1,0 +1,181 @@
+From 7993f1a431bc5271369d359941485a9340658ac3 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Wed, 15 Dec 2021 11:52:23 -0800
+Subject: [PATCH] xfs: only run COW extent recovery when there are no live
+ extents
+Git-commit: 7993f1a431bc5271369d359941485a9340658ac3
+Patch-mainline: v5.17-rc1
+References: bsc#1193791
+
+As part of multiple customer escalations due to file data corruption
+after copy on write operations, I wrote some fstests that use fsstress
+to hammer on COW to shake things loose.  Regrettably, I caught some
+filesystem shutdowns due to incorrect rmap operations with the following
+loop:
+
+mount <filesystem>				# (0)
+fsstress <run only readonly ops> &		# (1)
+while true; do
+	fsstress <run all ops>
+	mount -o remount,ro			# (2)
+	fsstress <run only readonly ops>
+	mount -o remount,rw			# (3)
+done
+
+When (2) happens, notice that (1) is still running.  xfs_remount_ro will
+call xfs_blockgc_stop to walk the inode cache to free all the COW
+extents, but the blockgc mechanism races with (1)'s reader threads to
+take IOLOCKs and loses, which means that it doesn't clean them all out.
+Call such a file (A).
+
+When (3) happens, xfs_remount_rw calls xfs_reflink_recover_cow, which
+walks the ondisk refcount btree and frees any COW extent that it finds.
+This function does not check the inode cache, which means that incore
+COW forks of inode (A) is now inconsistent with the ondisk metadata.  If
+one of those former COW extents are allocated and mapped into another
+file (B) and someone triggers a COW to the stale reservation in (A), A's
+dirty data will be written into (B) and once that's done, those blocks
+will be transferred to (A)'s data fork without bumping the refcount.
+
+The results are catastrophic -- file (B) and the refcount btree are now
+corrupt.  In the first patch, we fixed the race condition in (2) so that
+(A) will always flush the COW fork.  In this second patch, we move the
+_recover_cow call to the initial mount call in (0) for safety.
+
+As mentioned previously, xfs_reflink_recover_cow walks the refcount
+btree looking for COW staging extents, and frees them.  This was
+intended to be run at mount time (when we know there are no live inodes)
+to clean up any leftover staging events that may have been left behind
+during an unclean shutdown.  As a time "optimization" for readonly
+mounts, we deferred this to the ro->rw transition, not realizing that
+any failure to clean all COW forks during a rw->ro transition would
+result in catastrophic corruption.
+
+Therefore, remove this optimization and only run the recovery routine
+when we're guaranteed not to have any COW staging extents anywhere,
+which means we always run this at mount time.  While we're at it, move
+the callsite to xfs_log_mount_finish because any refcount btree
+expansion (however unlikely given that we're removing records from the
+right side of the index) must be fed by a per-AG reservation, which
+doesn't exist in its current location.
+
+Fixes: 174edb0e46e5 ("xfs: store in-progress CoW allocations in the refcount btree")
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Chandan Babu R <chandan.babu@oracle.com>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Acked-by: Anthony Iliopoulos <ailiop@suse.com>
+
+---
+ fs/xfs/xfs_log_recover.c | 23 +++++++++++++++++++++++
+ fs/xfs/xfs_mount.c       | 10 ----------
+ fs/xfs/xfs_reflink.c     |  5 ++++-
+ fs/xfs/xfs_super.c       |  9 ---------
+ 4 files changed, 27 insertions(+), 20 deletions(-)
+
+diff --git a/fs/xfs/xfs_log_recover.c b/fs/xfs/xfs_log_recover.c
+index fd3cc52db9be..2917435b10c4 100644
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@ -26,6 +26,7 @@
+ #include "xfs_error.h"
+ #include "xfs_buf_item.h"
+ #include "xfs_ag.h"
++#include "xfs_reflink.h"
+ 
+ #define BLK_AVG(blk1, blk2)	((blk1+blk2) >> 1)
+ 
+@@ -3473,6 +3474,28 @@ xlog_recover_finish(
+ 
+ 	xlog_recover_process_iunlinks(log);
+ 	xlog_recover_check_summary(log);
++
++	/*
++	 * Recover any CoW staging blocks that are still referenced by the
++	 * ondisk refcount metadata.  During mount there cannot be any live
++	 * staging extents as we have not permitted any user modifications.
++	 * Therefore, it is safe to free them all right now, even on a
++	 * read-only mount.
++	 */
++	error = xfs_reflink_recover_cow(log->l_mp);
++	if (error) {
++		xfs_alert(log->l_mp,
++	"Failed to recover leftover CoW staging extents, err %d.",
++				error);
++		/*
++		 * If we get an error here, make sure the log is shut down
++		 * but return zero so that any log items committed since the
++		 * end of intents processing can be pushed through the CIL
++		 * and AIL.
++		 */
++		xfs_force_shutdown(log->l_mp, SHUTDOWN_LOG_IO_ERROR);
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/fs/xfs/xfs_mount.c b/fs/xfs/xfs_mount.c
+index d2c40ae8b0a1..f45c7b6d1353 100644
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -917,15 +917,6 @@ xfs_mountfs(
+ 			xfs_warn(mp,
+ 	"Unable to allocate reserve blocks. Continuing without reserve pool.");
+ 
+-		/* Recover any CoW blocks that never got remapped. */
+-		error = xfs_reflink_recover_cow(mp);
+-		if (error) {
+-			xfs_err(mp,
+-	"Error %d recovering leftover CoW allocations.", error);
+-			xfs_force_shutdown(mp, SHUTDOWN_CORRUPT_INCORE);
+-			goto out_quota;
+-		}
+-
+ 		/* Reserve AG blocks for future btree expansion. */
+ 		error = xfs_fs_reserve_ag_blocks(mp);
+ 		if (error && error != -ENOSPC)
+@@ -936,7 +927,6 @@ xfs_mountfs(
+ 
+  out_agresv:
+ 	xfs_fs_unreserve_ag_blocks(mp);
+- out_quota:
+ 	xfs_qm_unmount_quotas(mp);
+  out_rtunmount:
+ 	xfs_rtunmount_inodes(mp);
+diff --git a/fs/xfs/xfs_reflink.c b/fs/xfs/xfs_reflink.c
+index c256104772cb..5abce1cc6bcc 100644
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@ -749,7 +749,10 @@ xfs_reflink_end_cow(
+ }
+ 
+ /*
+- * Free leftover CoW reservations that didn't get cleaned out.
++ * Free all CoW staging blocks that are still referenced by the ondisk refcount
++ * metadata.  The ondisk metadata does not track which inode created the
++ * staging extent, so callers must ensure that there are no cached inodes with
++ * live CoW staging extents.
+  */
+ int
+ xfs_reflink_recover_cow(
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index ca4c939703d5..58af8fac48ff 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -1691,15 +1691,6 @@ xfs_remount_rw(
+ 	 */
+ 	xfs_restore_resvblks(mp);
+ 	xfs_log_work_queue(mp);
+-
+-	/* Recover any CoW blocks that never got remapped. */
+-	error = xfs_reflink_recover_cow(mp);
+-	if (error) {
+-		xfs_err(mp,
+-			"Error %d recovering leftover CoW allocations.", error);
+-		xfs_force_shutdown(mp, SHUTDOWN_CORRUPT_INCORE);
+-		return error;
+-	}
+ 	xfs_blockgc_start(mp);
+ 
+ 	/* Create the per-AG metadata reservation pool .*/
+-- 
+2.34.1
