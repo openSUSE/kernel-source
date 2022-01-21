@@ -1,0 +1,275 @@
+From d71457135325a6aa969533ea629bd1706270513e Mon Sep 17 00:00:00 2001
+From: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date: Tue, 19 Oct 2021 13:27:10 +0100
+Subject: [PATCH] drm/i915: Flush TLBs before releasing backing store
+Git-commit: 7938d61591d33394a21bdd7797a245b65428f44c
+Patch-mainline: v5.17-rc2
+References: CVE-2022-0330 bsc#1194880
+
+We need to flush TLBs before releasing backing store otherwise userspace
+is able to encounter stale entries if a) it is not declaring GPU access to
+certain buffers and b) this GPU execution then races with the backing
+store release getting triggered asynchronously.
+
+Approach taken is to mark any buffer objects which were ever bound to the
+GPU and triggering a serialized TLB flush when their backing store is
+released.
+
+Alternatively the flushing could be done on VMA unbind, at which point we
+would be able to ascertain whether there is potential parallel GPU
+execution (which could race), but choice essentially boils down to paying
+the cost of TLB flushes maybe needlessly at VMA unbind time (when the
+backing store is not known to be definitely going away, so flushing not
+always required for safety), versus potentially needlessly at backing
+store relase time since at that point cannot tell whether there is a
+parallel GPU execution happening.
+
+Therefore simplicity of implementation has been chosen for now, with scope
+to benchmark and refine later as required.
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reported-by: Sushma Venkatesh Reddy <sushma.venkatesh.reddy@intel.com>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Cc: Jon Bloomfield <jon.bloomfield@intel.com>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Jani Nikula <jani.nikula@intel.com>
+Cc: stable@vger.kernel.org
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ .../gpu/drm/i915/gem/i915_gem_object_types.h  |  3 +
+ drivers/gpu/drm/i915/gem/i915_gem_pages.c     | 10 ++
+ drivers/gpu/drm/i915/gt/intel_gt.c            | 99 +++++++++++++++++++
+ drivers/gpu/drm/i915/gt/intel_gt.h            |  2 +
+ drivers/gpu/drm/i915/gt/intel_gt_types.h      |  2 +
+ drivers/gpu/drm/i915/i915_reg.h               | 11 +++
+ drivers/gpu/drm/i915/i915_vma.c               |  4 +
+ 7 files changed, 131 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object_types.h b/drivers/gpu/drm/i915/gem/i915_gem_object_types.h
+index 08b35587bc6d..352c102f3459 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object_types.h
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object_types.h
+@@ -118,6 +118,9 @@ struct drm_i915_gem_object {
+ 
+ 	I915_SELFTEST_DECLARE(struct list_head st_link);
+ 
++	unsigned long flags;
++#define I915_BO_WAS_BOUND_BIT    0
++
+ 	/*
+ 	 * Is the object to be mapped as read-only to the GPU
+ 	 * Only honoured if hardware has relevant pte bit
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_pages.c b/drivers/gpu/drm/i915/gem/i915_gem_pages.c
+index 18f0ce0135c1..aa63fa0ab575 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_pages.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_pages.c
+@@ -8,6 +8,8 @@
+ #include "i915_gem_object.h"
+ #include "i915_scatterlist.h"
+ 
++#include "gt/intel_gt.h"
++
+ void __i915_gem_object_set_pages(struct drm_i915_gem_object *obj,
+ 				 struct sg_table *pages,
+ 				 unsigned int sg_page_sizes)
+@@ -176,6 +178,14 @@ __i915_gem_object_unset_pages(struct drm_i915_gem_object *obj)
+ 	__i915_gem_object_reset_page_iter(obj);
+ 	obj->mm.page_sizes.phys = obj->mm.page_sizes.sg = 0;
+ 
++	if (test_and_clear_bit(I915_BO_WAS_BOUND_BIT, &obj->flags)) {
++		struct drm_i915_private *i915 = to_i915(obj->base.dev);
++		intel_wakeref_t wakeref;
++
++		with_intel_runtime_pm_if_in_use(&i915->runtime_pm, wakeref)
++			intel_gt_invalidate_tlbs(&i915->gt);
++	}
++
+ 	return pages;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index d48ec9a76ed1..c8c070375d29 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -15,6 +15,8 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 
+ 	spin_lock_init(&gt->irq_lock);
+ 
++	mutex_init(&gt->tlb_invalidate_lock);
++
+ 	INIT_LIST_HEAD(&gt->closed_vma);
+ 	spin_lock_init(&gt->closed_lock);
+ 
+@@ -266,3 +268,100 @@ void intel_gt_driver_late_release(struct intel_gt *gt)
+ 	intel_uc_driver_late_release(&gt->uc);
+ 	intel_gt_fini_reset(gt);
+ }
++
++struct reg_and_bit {
++	i915_reg_t reg;
++	u32 bit;
++};
++
++static struct reg_and_bit
++get_reg_and_bit(const struct intel_engine_cs *engine, const bool gen8,
++		const i915_reg_t *regs, const unsigned int num)
++{
++	const unsigned int class = engine->class;
++	struct reg_and_bit rb = { };
++
++	if (WARN_ON_ONCE(class >= num || !regs[class].reg))
++		return rb;
++
++	rb.reg = regs[class];
++	if (gen8 && class == VIDEO_DECODE_CLASS)
++		rb.reg.reg += 4 * engine->instance; /* GEN8_M2TCR */
++	else
++		rb.bit = engine->instance;
++
++	rb.bit = BIT(rb.bit);
++
++	return rb;
++}
++
++void intel_gt_invalidate_tlbs(struct intel_gt *gt)
++{
++	static const i915_reg_t gen8_regs[] = {
++		[RENDER_CLASS]			= GEN8_RTCR,
++		[VIDEO_DECODE_CLASS]		= GEN8_M1TCR, /* , GEN8_M2TCR */
++		[VIDEO_ENHANCEMENT_CLASS]	= GEN8_VTCR,
++		[COPY_ENGINE_CLASS]		= GEN8_BTCR,
++	};
++	static const i915_reg_t gen12_regs[] = {
++		[RENDER_CLASS]			= GEN12_GFX_TLB_INV_CR,
++		[VIDEO_DECODE_CLASS]		= GEN12_VD_TLB_INV_CR,
++		[VIDEO_ENHANCEMENT_CLASS]	= GEN12_VE_TLB_INV_CR,
++		[COPY_ENGINE_CLASS]		= GEN12_BLT_TLB_INV_CR,
++	};
++	struct drm_i915_private *i915 = gt->i915;
++	struct intel_uncore *uncore = gt->uncore;
++	struct intel_engine_cs *engine;
++	enum intel_engine_id id;
++	const i915_reg_t *regs;
++	unsigned int num = 0;
++
++	if (I915_SELFTEST_ONLY(gt->awake == -ENODEV))
++		return;
++
++	if (INTEL_GEN(i915) == 12) {
++		regs = gen12_regs;
++		num = ARRAY_SIZE(gen12_regs);
++	} else if (INTEL_GEN(i915) >= 8 && INTEL_GEN(i915) <= 11) {
++		regs = gen8_regs;
++		num = ARRAY_SIZE(gen8_regs);
++	} else if (INTEL_GEN(i915) < 8) {
++		return;
++	}
++
++	if (WARN_ONCE(!num, "Platform does not implement TLB invalidation!"))
++		return;
++
++	GEM_TRACE("\n");
++
++	assert_rpm_wakelock_held(&i915->runtime_pm);
++
++	mutex_lock(&gt->tlb_invalidate_lock);
++	intel_uncore_forcewake_get(uncore, FORCEWAKE_ALL);
++
++	for_each_engine(engine, gt, id) {
++		/*
++		 * HW architecture suggest typical invalidation time at 40us,
++		 * with pessimistic cases up to 100us and a recommendation to
++		 * cap at 1ms. We go a bit higher just in case.
++		 */
++		const unsigned int timeout_us = 100;
++		const unsigned int timeout_ms = 4;
++		struct reg_and_bit rb;
++
++		rb = get_reg_and_bit(engine, regs == gen8_regs, regs, num);
++		if (!i915_mmio_reg_offset(rb.reg))
++			continue;
++
++		intel_uncore_write_fw(uncore, rb.reg, rb.bit);
++		if (__intel_wait_for_register_fw(uncore,
++						 rb.reg, rb.bit, 0,
++						 timeout_us, timeout_ms,
++						 NULL))
++			DRM_ERROR_RATELIMITED("%s TLB invalidation did not complete in %ums!\n",
++					      engine->name, timeout_ms);
++	}
++
++	intel_uncore_forcewake_put(uncore, FORCEWAKE_ALL);
++	mutex_unlock(&gt->tlb_invalidate_lock);
++}
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.h b/drivers/gpu/drm/i915/gt/intel_gt.h
+index 4920cb351f10..4eab15bdcd97 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt.h
+@@ -57,4 +57,6 @@ static inline bool intel_gt_is_wedged(struct intel_gt *gt)
+ 
+ void intel_gt_queue_hangcheck(struct intel_gt *gt);
+ 
++void intel_gt_invalidate_tlbs(struct intel_gt *gt);
++
+ #endif /* __INTEL_GT_H__ */
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_types.h b/drivers/gpu/drm/i915/gt/intel_gt_types.h
+index dc295c196d11..82a78719b32d 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_types.h
+@@ -40,6 +40,8 @@ struct intel_gt {
+ 
+ 	struct intel_uc uc;
+ 
++	struct mutex tlb_invalidate_lock;
++
+ 	struct intel_gt_timelines {
+ 		spinlock_t lock; /* protects active_list */
+ 		struct list_head active_list;
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 7b6e68f082f8..1386d0f5eac6 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -2519,6 +2519,12 @@ static inline bool i915_mmio_reg_valid(i915_reg_t reg)
+ #define   GAMT_CHKN_DISABLE_DYNAMIC_CREDIT_SHARING	(1 << 28)
+ #define   GAMT_CHKN_DISABLE_I2M_CYCLE_ON_WR_PORT	(1 << 24)
+ 
++#define GEN8_RTCR	_MMIO(0x4260)
++#define GEN8_M1TCR	_MMIO(0x4264)
++#define GEN8_M2TCR	_MMIO(0x4268)
++#define GEN8_BTCR	_MMIO(0x426c)
++#define GEN8_VTCR	_MMIO(0x4270)
++
+ #if 0
+ #define PRB0_TAIL	_MMIO(0x2030)
+ #define PRB0_HEAD	_MMIO(0x2034)
+@@ -2602,6 +2608,11 @@ static inline bool i915_mmio_reg_valid(i915_reg_t reg)
+ #define   FAULT_VA_HIGH_BITS		(0xf << 0)
+ #define   FAULT_GTT_SEL			(1 << 4)
+ 
++#define GEN12_GFX_TLB_INV_CR	_MMIO(0xced8)
++#define GEN12_VD_TLB_INV_CR	_MMIO(0xcedc)
++#define GEN12_VE_TLB_INV_CR	_MMIO(0xcee0)
++#define GEN12_BLT_TLB_INV_CR	_MMIO(0xcee4)
++
+ #define FPGA_DBG		_MMIO(0x42300)
+ #define   FPGA_DBG_RM_NOCLAIM	(1 << 31)
+ 
+diff --git a/drivers/gpu/drm/i915/i915_vma.c b/drivers/gpu/drm/i915/i915_vma.c
+index e0e677b2a3a9..c24f49ee10d7 100644
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -341,6 +341,10 @@ int i915_vma_bind(struct i915_vma *vma, enum i915_cache_level cache_level,
+ 		return ret;
+ 
+ 	vma->flags |= bind_flags;
++
++	if (vma->obj)
++		set_bit(I915_BO_WAS_BOUND_BIT, &vma->obj->flags);
++
+ 	return 0;
+ }
+ 
+-- 
+2.32.0
+
