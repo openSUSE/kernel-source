@@ -1,0 +1,305 @@
+From: Naohiro Aota <naohiro.aota@wdc.com>
+Date: Thu, 11 Nov 2021 14:14:38 +0900
+Subject: [PATCH] btrfs: zoned: cache reported zone during mount
+References: bsc#1012628
+Patch-mainline: 5.16.3
+Git-commit: 16beac87e95e2fb278b552397c8260637f8a63f7
+
+commit 16beac87e95e2fb278b552397c8260637f8a63f7 upstream.
+
+When mounting a device, we are reporting the zones twice: once for
+checking the zone attributes in btrfs_get_dev_zone_info and once for
+loading block groups' zone info in
+btrfs_load_block_group_zone_info(). With a lot of block groups, that
+leads to a lot of REPORT ZONE commands and slows down the mount
+process.
+
+This patch introduces a zone info cache in struct
+btrfs_zoned_device_info. The cache is populated while in
+btrfs_get_dev_zone_info() and used for
+btrfs_load_block_group_zone_info() to reduce the number of REPORT ZONE
+commands. The zone cache is then released after loading the block
+groups, as it will not be much effective during the run time.
+
+Benchmark: Mount an HDD with 57,007 block groups
+Before patch: 171.368 seconds
+After patch: 64.064 seconds
+
+While it still takes a minute due to the slowness of loading all the
+block groups, the patch reduces the mount time by 1/3.
+
+Link: https://lore.kernel.org/linux-btrfs/CAHQ7scUiLtcTqZOMMY5kbWUBOhGRwKo6J6wYPT5WY+C=cD49nQ@mail.gmail.com/
+Fixes: 5b316468983d ("btrfs: get zone information of zoned block devices")
+CC: stable@vger.kernel.org
+Signed-off-by: Naohiro Aota <naohiro.aota@wdc.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/btrfs/dev-replace.c |  2 +-
+ fs/btrfs/disk-io.c     |  2 +
+ fs/btrfs/volumes.c     |  2 +-
+ fs/btrfs/zoned.c       | 86 +++++++++++++++++++++++++++++++++++++-----
+ fs/btrfs/zoned.h       |  8 +++-
+ 5 files changed, 87 insertions(+), 13 deletions(-)
+
+diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+index c85a7d44da79..e0238dd5f2f2 100644
+--- a/fs/btrfs/dev-replace.c
++++ b/fs/btrfs/dev-replace.c
+@@ -322,7 +322,7 @@ static int btrfs_init_dev_replace_tgtdev(struct btrfs_fs_info *fs_info,
+ 	set_blocksize(device->bdev, BTRFS_BDEV_BLOCKSIZE);
+ 	device->fs_devices = fs_info->fs_devices;
+ 
+-	ret = btrfs_get_dev_zone_info(device);
++	ret = btrfs_get_dev_zone_info(device, false);
+ 	if (ret)
+ 		goto error;
+ 
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index b3f2e2232326..5f0a879c1043 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -3571,6 +3571,8 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
+ 		goto fail_sysfs;
+ 	}
+ 
++	btrfs_free_zone_cache(fs_info);
++
+ 	if (!sb_rdonly(sb) && fs_info->fs_devices->missing_devices &&
+ 	    !btrfs_check_rw_degradable(fs_info, NULL)) {
+ 		btrfs_warn(fs_info,
+diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+index fd0ced829edb..42391d4aeb11 100644
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -2643,7 +2643,7 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
+ 	device->fs_info = fs_info;
+ 	device->bdev = bdev;
+ 
+-	ret = btrfs_get_dev_zone_info(device);
++	ret = btrfs_get_dev_zone_info(device, false);
+ 	if (ret)
+ 		goto error_free_device;
+ 
+diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+index 678a29469511..b06059a5db2a 100644
+--- a/fs/btrfs/zoned.c
++++ b/fs/btrfs/zoned.c
+@@ -5,6 +5,7 @@
+ #include <linux/blkdev.h>
+ #include <linux/sched/mm.h>
+ #include <linux/atomic.h>
++#include <linux/vmalloc.h>
+ #include "ctree.h"
+ #include "volumes.h"
+ #include "zoned.h"
+@@ -213,6 +214,8 @@ static int emulate_report_zones(struct btrfs_device *device, u64 pos,
+ static int btrfs_get_dev_zones(struct btrfs_device *device, u64 pos,
+ 			       struct blk_zone *zones, unsigned int *nr_zones)
+ {
++	struct btrfs_zoned_device_info *zinfo = device->zone_info;
++	u32 zno;
+ 	int ret;
+ 
+ 	if (!*nr_zones)
+@@ -224,6 +227,34 @@ static int btrfs_get_dev_zones(struct btrfs_device *device, u64 pos,
+ 		return 0;
+ 	}
+ 
++	/* Check cache */
++	if (zinfo->zone_cache) {
++		unsigned int i;
++
++		ASSERT(IS_ALIGNED(pos, zinfo->zone_size));
++		zno = pos >> zinfo->zone_size_shift;
++		/*
++		 * We cannot report zones beyond the zone end. So, it is OK to
++		 * cap *nr_zones to at the end.
++		 */
++		*nr_zones = min_t(u32, *nr_zones, zinfo->nr_zones - zno);
++
++		for (i = 0; i < *nr_zones; i++) {
++			struct blk_zone *zone_info;
++
++			zone_info = &zinfo->zone_cache[zno + i];
++			if (!zone_info->len)
++				break;
++		}
++
++		if (i == *nr_zones) {
++			/* Cache hit on all the zones */
++			memcpy(zones, zinfo->zone_cache + zno,
++			       sizeof(*zinfo->zone_cache) * *nr_zones);
++			return 0;
++		}
++	}
++
+ 	ret = blkdev_report_zones(device->bdev, pos >> SECTOR_SHIFT, *nr_zones,
+ 				  copy_zone_info_cb, zones);
+ 	if (ret < 0) {
+@@ -237,6 +268,11 @@ static int btrfs_get_dev_zones(struct btrfs_device *device, u64 pos,
+ 	if (!ret)
+ 		return -EIO;
+ 
++	/* Populate cache */
++	if (zinfo->zone_cache)
++		memcpy(zinfo->zone_cache + zno, zones,
++		       sizeof(*zinfo->zone_cache) * *nr_zones);
++
+ 	return 0;
+ }
+ 
+@@ -300,7 +336,7 @@ int btrfs_get_dev_zone_info_all_devices(struct btrfs_fs_info *fs_info)
+ 		if (!device->bdev)
+ 			continue;
+ 
+-		ret = btrfs_get_dev_zone_info(device);
++		ret = btrfs_get_dev_zone_info(device, true);
+ 		if (ret)
+ 			break;
+ 	}
+@@ -309,7 +345,7 @@ int btrfs_get_dev_zone_info_all_devices(struct btrfs_fs_info *fs_info)
+ 	return ret;
+ }
+ 
+-int btrfs_get_dev_zone_info(struct btrfs_device *device)
++int btrfs_get_dev_zone_info(struct btrfs_device *device, bool populate_cache)
+ {
+ 	struct btrfs_fs_info *fs_info = device->fs_info;
+ 	struct btrfs_zoned_device_info *zone_info = NULL;
+@@ -339,6 +375,8 @@ int btrfs_get_dev_zone_info(struct btrfs_device *device)
+ 	if (!zone_info)
+ 		return -ENOMEM;
+ 
++	device->zone_info = zone_info;
++
+ 	if (!bdev_is_zoned(bdev)) {
+ 		if (!fs_info->zone_size) {
+ 			ret = calculate_emulated_zone_size(fs_info);
+@@ -407,6 +445,23 @@ int btrfs_get_dev_zone_info(struct btrfs_device *device)
+ 		goto out;
+ 	}
+ 
++	/*
++	 * Enable zone cache only for a zoned device. On a non-zoned device, we
++	 * fill the zone info with emulated CONVENTIONAL zones, so no need to
++	 * use the cache.
++	 */
++	if (populate_cache && bdev_is_zoned(device->bdev)) {
++		zone_info->zone_cache = vzalloc(sizeof(struct blk_zone) *
++						zone_info->nr_zones);
++		if (!zone_info->zone_cache) {
++			btrfs_err_in_rcu(device->fs_info,
++				"zoned: failed to allocate zone cache for %s",
++				rcu_str_deref(device->name));
++			ret = -ENOMEM;
++			goto out;
++		}
++	}
++
+ 	/* Get zones type */
+ 	nactive = 0;
+ 	while (sector < nr_sectors) {
+@@ -505,8 +560,6 @@ int btrfs_get_dev_zone_info(struct btrfs_device *device)
+ 
+ 	kfree(zones);
+ 
+-	device->zone_info = zone_info;
+-
+ 	switch (bdev_zoned_model(bdev)) {
+ 	case BLK_ZONED_HM:
+ 		model = "host-managed zoned";
+@@ -539,11 +592,7 @@ int btrfs_get_dev_zone_info(struct btrfs_device *device)
+ out:
+ 	kfree(zones);
+ out_free_zone_info:
+-	bitmap_free(zone_info->active_zones);
+-	bitmap_free(zone_info->empty_zones);
+-	bitmap_free(zone_info->seq_zones);
+-	kfree(zone_info);
+-	device->zone_info = NULL;
++	btrfs_destroy_dev_zone_info(device);
+ 
+ 	return ret;
+ }
+@@ -558,6 +607,7 @@ void btrfs_destroy_dev_zone_info(struct btrfs_device *device)
+ 	bitmap_free(zone_info->active_zones);
+ 	bitmap_free(zone_info->seq_zones);
+ 	bitmap_free(zone_info->empty_zones);
++	vfree(zone_info->zone_cache);
+ 	kfree(zone_info);
+ 	device->zone_info = NULL;
+ }
+@@ -1975,3 +2025,21 @@ void btrfs_clear_data_reloc_bg(struct btrfs_block_group *bg)
+ 		fs_info->data_reloc_bg = 0;
+ 	spin_unlock(&fs_info->relocation_bg_lock);
+ }
++
++void btrfs_free_zone_cache(struct btrfs_fs_info *fs_info)
++{
++	struct btrfs_fs_devices *fs_devices = fs_info->fs_devices;
++	struct btrfs_device *device;
++
++	if (!btrfs_is_zoned(fs_info))
++		return;
++
++	mutex_lock(&fs_devices->device_list_mutex);
++	list_for_each_entry(device, &fs_devices->devices, dev_list) {
++		if (device->zone_info) {
++			vfree(device->zone_info->zone_cache);
++			device->zone_info->zone_cache = NULL;
++		}
++	}
++	mutex_unlock(&fs_devices->device_list_mutex);
++}
+diff --git a/fs/btrfs/zoned.h b/fs/btrfs/zoned.h
+index e53ab7b96437..4344f4818389 100644
+--- a/fs/btrfs/zoned.h
++++ b/fs/btrfs/zoned.h
+@@ -28,6 +28,7 @@ struct btrfs_zoned_device_info {
+ 	unsigned long *seq_zones;
+ 	unsigned long *empty_zones;
+ 	unsigned long *active_zones;
++	struct blk_zone *zone_cache;
+ 	struct blk_zone sb_zones[2 * BTRFS_SUPER_MIRROR_MAX];
+ };
+ 
+@@ -35,7 +36,7 @@ struct btrfs_zoned_device_info {
+ int btrfs_get_dev_zone(struct btrfs_device *device, u64 pos,
+ 		       struct blk_zone *zone);
+ int btrfs_get_dev_zone_info_all_devices(struct btrfs_fs_info *fs_info);
+-int btrfs_get_dev_zone_info(struct btrfs_device *device);
++int btrfs_get_dev_zone_info(struct btrfs_device *device, bool populate_cache);
+ void btrfs_destroy_dev_zone_info(struct btrfs_device *device);
+ int btrfs_check_zoned_mode(struct btrfs_fs_info *fs_info);
+ int btrfs_check_mountopts_zoned(struct btrfs_fs_info *info);
+@@ -76,6 +77,7 @@ bool btrfs_can_activate_zone(struct btrfs_fs_devices *fs_devices,
+ void btrfs_zone_finish_endio(struct btrfs_fs_info *fs_info, u64 logical,
+ 			     u64 length);
+ void btrfs_clear_data_reloc_bg(struct btrfs_block_group *bg);
++void btrfs_free_zone_cache(struct btrfs_fs_info *fs_info);
+ #else /* CONFIG_BLK_DEV_ZONED */
+ static inline int btrfs_get_dev_zone(struct btrfs_device *device, u64 pos,
+ 				     struct blk_zone *zone)
+@@ -88,7 +90,8 @@ static inline int btrfs_get_dev_zone_info_all_devices(struct btrfs_fs_info *fs_i
+ 	return 0;
+ }
+ 
+-static inline int btrfs_get_dev_zone_info(struct btrfs_device *device)
++static inline int btrfs_get_dev_zone_info(struct btrfs_device *device,
++					  bool populate_cache)
+ {
+ 	return 0;
+ }
+@@ -232,6 +235,7 @@ static inline void btrfs_zone_finish_endio(struct btrfs_fs_info *fs_info,
+ 
+ static inline void btrfs_clear_data_reloc_bg(struct btrfs_block_group *bg) { }
+ 
++static inline void btrfs_free_zone_cache(struct btrfs_fs_info *fs_info) { }
+ #endif
+ 
+ static inline bool btrfs_dev_is_sequential(struct btrfs_device *device, u64 pos)
+-- 
+2.34.1
+
