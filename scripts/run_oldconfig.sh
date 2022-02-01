@@ -424,7 +424,9 @@ for config in $config_files; do
     if [ -d scripts/dummy-tools ] ; then
 	MAKE_ARGS="$MAKE_ARGS CROSS_COMPILE=scripts/dummy-tools/"
 	chmod 755 scripts/dummy-tools/*
+	chmod 755 scripts/*
     fi
+    MAKE_ARGS="$MAKE_ARGS RUSTC=/nothing/nowhere"
     if $silent; then
 	MAKE_ARGS="$MAKE_ARGS -s"
     fi

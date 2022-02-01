@@ -207,9 +207,11 @@ remotes = (
     Head(RepoURL("tytso/ext4.git"), "dev"),
     Head(RepoURL("s390/linux.git"), "fixes"),
     Head(RepoURL("https://github.com/kdave/btrfs-devel.git"), "misc-next"),
-    Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
+    Head(RepoURL("git://anongit.freedesktop.org/drm/drm"), "drm-next"),
     Head(RepoURL("git://anongit.freedesktop.org/drm/drm-misc"), "drm-misc-next"),
+    Head(RepoURL("gregkh/driver-core.git"), "driver-core-next"),
     Head(RepoURL("gregkh/tty.git"), "tty-next"),
+    Head(RepoURL("gregkh/usb.git"), "usb-next"),
     Head(RepoURL("jj/linux-apparmor.git"), "apparmor-next"),
     Head(RepoURL("pablo/nf.git")),
     Head(RepoURL("pablo/nf-next.git")),
@@ -222,7 +224,7 @@ remotes = (
     Head(RepoURL("mkp/scsi.git"), "fixes"),
     Head(RepoURL("git://git.kernel.dk/linux-block.git"), "for-next"),
     Head(RepoURL("git://git.kernel.org/pub/scm/virt/kvm/kvm.git"), "queue"),
-    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.13"),
+    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.15"),
     Head(RepoURL("dhowells/linux-fs.git")),
     Head(RepoURL("herbert/cryptodev-2.6.git")),
     Head(RepoURL("helgaas/pci.git"), "next"),
@@ -239,6 +241,7 @@ remotes = (
     Head(RepoURL("herbert/crypto-2.6.git"), "master"),
     Head(RepoURL("rafael/linux-pm.git")),
     Head(RepoURL("git://git.linux-nfs.org/~bfields/linux.git"), "nfsd-next"),
+    Head(RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"), "for-next"),
     Head(RepoURL("vkoul/soundwire.git"),"fixes"),
     Head(RepoURL("vkoul/soundwire.git"),"next"),
     Head(RepoURL("arm64/linux.git"), "for-next/core"),
@@ -255,6 +258,8 @@ remotes = (
     Head(RepoURL("clk/linux.git"), "clk-next"),
     Head(RepoURL("git://github.com/ceph/ceph-client"), "testing"),
     Head(RepoURL("bpf/bpf.git")),
+    Head(RepoURL("linusw/linux-gpio.git"), "for-next"),
+    Head(RepoURL("paulmck/linux-rcu.git"), "dev.2021.11.12a"),
 )
 
 

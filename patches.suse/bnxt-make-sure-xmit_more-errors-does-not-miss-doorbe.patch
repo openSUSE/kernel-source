@@ -1,0 +1,133 @@
+From: Jakub Kicinski <kuba@kernel.org>
+Date: Thu, 12 Aug 2021 14:42:41 -0700
+Subject: bnxt: make sure xmit_more + errors does not miss doorbells
+Patch-mainline: v5.14-rc7
+Git-commit: e8d8c5d80f5e9d4586c68061b62c642752289095
+References: git-fixes
+
+skbs are freed on error and not put on the ring. We may, however,
+be in a situation where we're freeing the last skb of a batch,
+and there is a doorbell ring pending because of xmit_more() being
+true earlier. Make sure we ring the door bell in such situations.
+
+Since errors are rare don't pay attention to xmit_more() and just
+always flush the pending frames.
+
+The busy case should be safe to be left alone because it can
+only happen if start_xmit races with completions and they
+both enable the queue. In that case the kick can't be pending.
+
+Noticed while reading the code.
+
+Fixes: 4d172f21cefe ("bnxt_en: Implement xmit_more.")
+Reviewed-by: Michael Chan <michael.chan@broadcom.com>
+Reviewed-by: Edwin Peer <edwin.peer@broadcom.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c |   36 ++++++++++++++++++++----------
+ drivers/net/ethernet/broadcom/bnxt/bnxt.h |    1 
+ 2 files changed, 25 insertions(+), 12 deletions(-)
+
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -344,6 +344,13 @@ static u16 bnxt_xmit_get_cfa_action(stru
+ 	return md_dst->u.port_info.port_id;
+ }
+ 
++static void bnxt_txr_db_kick(struct bnxt *bp, struct bnxt_tx_ring_info *txr,
++			     u16 prod)
++{
++	bnxt_db_write(bp, &txr->tx_db, prod);
++	txr->kick_pending = 0;
++}
++
+ static bool bnxt_txr_netif_try_stop_queue(struct bnxt *bp,
+ 					  struct bnxt_tx_ring_info *txr,
+ 					  struct netdev_queue *txq)
+@@ -391,6 +398,10 @@ static netdev_tx_t bnxt_start_xmit(struc
+ 
+ 	free_size = bnxt_tx_avail(bp, txr);
+ 	if (unlikely(free_size < skb_shinfo(skb)->nr_frags + 2)) {
++		/* We must have raced with NAPI cleanup */
++		if (net_ratelimit() && txr->kick_pending)
++			netif_warn(bp, tx_err, dev,
++				   "bnxt: ring busy w/ flush pending!\n");
+ 		if (bnxt_txr_netif_try_stop_queue(bp, txr, txq))
+ 			return NETDEV_TX_BUSY;
+ 	}
+@@ -494,21 +505,16 @@ static netdev_tx_t bnxt_start_xmit(struc
+ normal_tx:
+ 	if (length < BNXT_MIN_PKT_SIZE) {
+ 		pad = BNXT_MIN_PKT_SIZE - length;
+-		if (skb_pad(skb, pad)) {
++		if (skb_pad(skb, pad))
+ 			/* SKB already freed. */
+-			tx_buf->skb = NULL;
+-			return NETDEV_TX_OK;
+-		}
++			goto tx_kick_pending;
+ 		length = BNXT_MIN_PKT_SIZE;
+ 	}
+ 
+ 	mapping = dma_map_single(&pdev->dev, skb->data, len, DMA_TO_DEVICE);
+ 
+-	if (unlikely(dma_mapping_error(&pdev->dev, mapping))) {
+-		dev_kfree_skb_any(skb);
+-		tx_buf->skb = NULL;
+-		return NETDEV_TX_OK;
+-	}
++	if (unlikely(dma_mapping_error(&pdev->dev, mapping)))
++		goto tx_free;
+ 
+ 	dma_unmap_addr_set(tx_buf, mapping, mapping);
+ 	flags = (len << TX_BD_LEN_SHIFT) | TX_BD_TYPE_LONG_TX_BD |
+@@ -593,13 +599,15 @@ normal_tx:
+ 	txr->tx_prod = prod;
+ 
+ 	if (!netdev_xmit_more() || netif_xmit_stopped(txq))
+-		bnxt_db_write(bp, &txr->tx_db, prod);
++		bnxt_txr_db_kick(bp, txr, prod);
++	else
++		txr->kick_pending = 1;
+ 
+ tx_done:
+ 
+ 	if (unlikely(bnxt_tx_avail(bp, txr) <= MAX_SKB_FRAGS + 1)) {
+ 		if (netdev_xmit_more() && !tx_buf->is_push)
+-			bnxt_db_write(bp, &txr->tx_db, prod);
++			bnxt_txr_db_kick(bp, txr, prod);
+ 
+ 		bnxt_txr_netif_try_stop_queue(bp, txr, txq);
+ 	}
+@@ -611,7 +619,6 @@ tx_dma_error:
+ 	/* start back at beginning and unmap skb */
+ 	prod = txr->tx_prod;
+ 	tx_buf = &txr->tx_buf_ring[prod];
+-	tx_buf->skb = NULL;
+ 	dma_unmap_single(&pdev->dev, dma_unmap_addr(tx_buf, mapping),
+ 			 skb_headlen(skb), PCI_DMA_TODEVICE);
+ 	prod = NEXT_TX(prod);
+@@ -625,7 +632,12 @@ tx_dma_error:
+ 			       PCI_DMA_TODEVICE);
+ 	}
+ 
++tx_free:
+ 	dev_kfree_skb_any(skb);
++tx_kick_pending:
++	if (txr->kick_pending)
++		bnxt_txr_db_kick(bp, txr, txr->tx_prod);
++	txr->tx_buf_ring[txr->tx_prod].skb = NULL;
+ 	return NETDEV_TX_OK;
+ }
+ 
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -765,6 +765,7 @@ struct bnxt_tx_ring_info {
+ 	u16			tx_prod;
+ 	u16			tx_cons;
+ 	u16			txq_index;
++	u8			kick_pending;
+ 	struct bnxt_db_info	tx_db;
+ 
+ 	struct tx_bd		*tx_desc_ring[MAX_TX_PAGES];

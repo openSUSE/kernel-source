@@ -9,7 +9,7 @@ LIVEPATCH=livepatch
 # Compile binary devicetrees for Leap
 BUILD_DTBS="Yes"
 # buildservice projects to build the kernel against
-OBS_PROJECT=SUSE:SLE-15-SP2:Update
+OBS_PROJECT=SUSE:SLE-15-SP3:Update
 OBS_PROJECT_ARM=openSUSE:Step:15-SP3
 IBS_PROJECT=SUSE:SLE-15-SP3:Update
 # Bugzilla info

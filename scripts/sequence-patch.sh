@@ -69,6 +69,9 @@ SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
 
   The --dry-run option only works with --fast and --rapid.
 
+  The --signing-key option specifies a pathname for a key to be used for
+  module signing and for signing the kernel for use with UEFI Secure Boot.
+
   When used with last-patch-name, both --fast and --no-quilt
   will set up a quilt environment for the remaining patches.
 END
@@ -212,7 +215,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,rapid,vanilla,fuzz:,patch-dir:,build-dir:,config:,kabi,ctags,cscope,etags,skip-reverse,dry-run -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,rapid,vanilla,fuzz:,patch-dir:,build-dir:,config:,kabi,ctags,cscope,etags,skip-reverse,dry-run,signing-key: -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -237,6 +240,7 @@ CSCOPE=false
 ETAGS=false
 SKIP_REVERSE=false
 DRY_RUN=
+SIGNING_KEY=
 
 while true; do
     case "$1" in
@@ -310,6 +314,10 @@ while true; do
 	--dry-run)
 	    DRY_RUN=--dry-run
 	    ;;
+	--signing-key)
+            SIGNING_KEY="$2"
+            shift
+            ;;
 	--)
 	    shift
 	    break ;;
@@ -714,6 +722,107 @@ if test -n "$CONFIG"; then
     fi
     test "$SP_BUILD_DIR" != "$PATCH_DIR" && \
 	make -C $PATCH_DIR O=$SP_BUILD_DIR -s $syncconfig
+fi
+
+filter_fingerprints() {
+    grep 'SHA1 Fingerprint' | sed -e 's/SHA1 Fingerprint.//' | \
+        tr -d ' :' | tr a-z A-Z
+}
+
+cert_fingerprint() {
+    local cert=$1
+
+    openssl x509 -fingerprint -noout -in "$cert" | filter_fingerprints
+}
+
+cert_fingerprint8() {
+    local cert=$1
+
+    cert_fingerprint "$cert" | cut -b 1-8
+}
+
+cert_signature_algo() {
+    local cert=$1
+
+    # openssl doesn't have a way to just show the algo
+    openssl x509 -noout -text -in "$cert" | grep 'Signature Algorithm' | \
+        tr -d ' ' | uniq |  cut -d ':' -f 2
+}
+
+get_config_option() {
+    local config=$1
+    local option=$2
+
+    sed -n "/^CONFIG_$option=/s///p" "$config" |tr -d '"' | tail -1
+}
+
+set_config_option() {
+    local config=$1
+    local option=$2
+    local value=$3
+
+    sed -i -e "/^CONFIG_$option=/s;=.*;=$value;" "$config"
+}
+
+set_config_option_string() {
+    local config=$1
+    local option=$2
+    local value=$3
+
+    set_config_option "$config" "$option" "\"$value\""
+}
+
+copy_signing_key() {
+    local cert=$1
+
+    echo "[ Copying signing key $SIGNING_KEY ]"
+
+    if ! test -f "$cert"; then
+        echo "*** ERROR: Signing key $cert does not exist"
+        return
+    fi
+    keyexts=$(openssl x509 -in $cert -ext keyUsage,extendedKeyUsage -noout)
+
+    if ! echo $keyexts | grep -q "Code Signing"; then
+        echo "*** WARNING: Signing key must have extendedKeyUsage=codeSigning" \
+             "to be used to sign kernel for Secure Boot" >&2
+    fi
+    if ! echo $keyexts | grep -q "Digital Signature"; then
+        echo "*** WARNING: Signing key must have keyUsage=digitalSignature" \
+             "to be used to sign modules" >&2
+    fi
+
+    mkdir -p "$SP_BUILD_DIR/certs"
+    certname="$(cert_fingerprint8 "$cert").pem"
+    cp "$cert" "$SP_BUILD_DIR/certs/$certname"
+
+    if test -z "$CONFIG"; then
+        echo "*** WARNING: signing key copied to certs/$certname but" \
+             "no config available to enable"
+        return
+    fi
+
+    local config="$SP_BUILD_DIR/.config"
+
+    # Check for algo compatibility
+    config_algo="$(get_config_option $config MODULE_SIG_HASH)"
+    if test -z "$config_algo"; then
+        echo "*** WARNING: Module signing is disabled in active config"
+        return
+    fi
+
+    cert_algo=$(cert_signature_algo $cert)
+    cert_algo=${cert_algo%%WithRSAEncryption}
+    if test "$config_algo" != "$cert_algo"; then
+        echo "*** WARNING: Signing key uses hash algo '$cert_algo' but" \
+             " kernel config uses '$config_algo'"
+    fi
+
+    set_config_option_string $config MODULE_SIG_KEY "certs/$certname"
+}
+
+if test -n "$SIGNING_KEY"; then
+    copy_signing_key $SIGNING_KEY
 fi
 
 # Some archs we use for the config do not exist or have a different name in the

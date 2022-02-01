@@ -1,0 +1,251 @@
+From 22061a1ffabdb9c3385de159c5db7aac3a4df1cc Mon Sep 17 00:00:00 2001
+From: Hugh Dickins <hughd@google.com>
+Date: Tue, 15 Jun 2021 18:24:03 -0700
+Subject: [PATCH] mm/thp: unmap_mapping_page() to fix THP
+ truncate_cleanup_page()
+Git-commit: 22061a1ffabdb9c3385de159c5db7aac3a4df1cc
+Patch-mainline: v5.13-rc7
+References: bsc#1189569
+
+There is a race between THP unmapping and truncation, when truncate sees
+pmd_none() and skips the entry, after munmap's zap_huge_pmd() cleared
+it, but before its page_remove_rmap() gets to decrement
+Compound_mapcount: generating false "BUG: Bad page cache" reports that
+the page is still mapped when deleted.  This commit fixes that, but not
+in the way I hoped.
+
+The first attempt used try_to_unmap(page, TTU_SYNC|TTU_IGNORE_MLOCK)
+instead of unmap_mapping_range() in truncate_cleanup_page(): it has
+often been an annoyance that we usually call unmap_mapping_range() with
+no pages locked, but there apply it to a single locked page.
+try_to_unmap() looks more suitable for a single locked page.
+
+However, try_to_unmap_one() contains a VM_BUG_ON_PAGE(!pvmw.pte,page):
+it is used to insert THP migration entries, but not used to unmap THPs.
+Copy zap_huge_pmd() and add THP handling now? Perhaps, but their TLB
+needs are different, I'm too ignorant of the DAX cases, and couldn't
+decide how far to go for anon+swap.  Set that aside.
+
+The second attempt took a different tack: make no change in truncate.c,
+but modify zap_huge_pmd() to insert an invalidated huge pmd instead of
+clearing it initially, then pmd_clear() between page_remove_rmap() and
+unlocking at the end.  Nice.  But powerpc blows that approach out of the
+water, with its serialize_against_pte_lookup(), and interesting pgtable
+usage.  It would need serious help to get working on powerpc (with a
+minor optimization issue on s390 too).  Set that aside.
+
+Just add an "if (page_mapped(page)) synchronize_rcu();" or other such
+delay, after unmapping in truncate_cleanup_page()? Perhaps, but though
+that's likely to reduce or eliminate the number of incidents, it would
+give less assurance of whether we had identified the problem correctly.
+
+This successful iteration introduces "unmap_mapping_page(page)" instead
+of try_to_unmap(), and goes the usual unmap_mapping_range_tree() route,
+with an addition to details.  Then zap_pmd_range() watches for this
+case, and does spin_unlock(pmd_lock) if so - just like
+page_vma_mapped_walk() now does in the PVMW_SYNC case.  Not pretty, but
+safe.
+
+Note that unmap_mapping_page() is doing a VM_BUG_ON(!PageLocked) to
+assert its interface; but currently that's only used to make sure that
+page->mapping is stable, and zap_pmd_range() doesn't care if the page is
+locked or not.  Along these lines, in invalidate_inode_pages2_range()
+move the initial unmap_mapping_range() out from under page lock, before
+then calling unmap_mapping_page() under page lock if still mapped.
+
+Link: https://lkml.kernel.org/r/a2a4a148-cdd8-942c-4ef8-51b77f643dbe@google.com
+Fixes: fc127da085c2 ("truncate: handle file thp")
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Reviewed-by: Yang Shi <shy828301@gmail.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jue Wang <juew@google.com>
+Cc: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Ralph Campbell <rcampbell@nvidia.com>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Wang Yugui <wangyugui@e16-tech.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Acked-by: Jan Kara <jack@suse.cz>
+
+---
+ include/linux/mm.h |    3 +++
+ mm/memory.c        |   42 ++++++++++++++++++++++++++++++++++++++++++
+ mm/truncate.c      |   43 +++++++++++++++++++------------------------
+ 3 files changed, 64 insertions(+), 24 deletions(-)
+
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1448,6 +1448,7 @@ struct zap_details {
+ 	struct address_space *check_mapping;	/* Check page->mapping if set */
+ 	pgoff_t	first_index;			/* Lowest page->index to unmap */
+ 	pgoff_t last_index;			/* Highest page->index to unmap */
++	struct page *single_page;		/* Locked page to be unmapped */
+ };
+ 
+ struct page *vm_normal_page(struct vm_area_struct *vma, unsigned long addr,
+@@ -1538,6 +1539,7 @@ extern vm_fault_t handle_mm_fault(struct
+ extern int fixup_user_fault(struct task_struct *tsk, struct mm_struct *mm,
+ 			    unsigned long address, unsigned int fault_flags,
+ 			    bool *unlocked);
++void unmap_mapping_page(struct page *page);
+ void unmap_mapping_pages(struct address_space *mapping,
+ 		pgoff_t start, pgoff_t nr, bool even_cows);
+ void unmap_mapping_range(struct address_space *mapping,
+@@ -1558,6 +1560,7 @@ static inline int fixup_user_fault(struc
+ 	BUG();
+ 	return -EFAULT;
+ }
++static inline void unmap_mapping_page(struct page *page) { }
+ static inline void unmap_mapping_pages(struct address_space *mapping,
+ 		pgoff_t start, pgoff_t nr, bool even_cows) { }
+ static inline void unmap_mapping_range(struct address_space *mapping,
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1154,7 +1154,18 @@ static inline unsigned long zap_pmd_rang
+ 			else if (zap_huge_pmd(tlb, vma, pmd, addr))
+ 				goto next;
+ 			/* fall through */
++		} else if (details && details->single_page &&
++			   PageTransCompound(details->single_page) &&
++			   next - addr == HPAGE_PMD_SIZE && pmd_none(*pmd)) {
++			spinlock_t *ptl = pmd_lock(tlb->mm, pmd);
++			/*
++			 * Take and drop THP pmd lock so that we cannot return
++			 * prematurely, while zap_huge_pmd() has cleared *pmd,
++			 * but not yet decremented compound_mapcount().
++			 */
++			spin_unlock(ptl);
+ 		}
++
+ 		/*
+ 		 * Here there can be other concurrent MADV_DONTNEED or
+ 		 * trans huge page faults running, and if the pmd is
+@@ -2678,6 +2689,37 @@ static inline void unmap_mapping_range_t
+ }
+ 
+ /**
++ * unmap_mapping_page() - Unmap single page from processes.
++ * @page: The locked page to be unmapped.
++ *
++ * Unmap this page from any userspace process which still has it mmaped.
++ * Typically, for efficiency, the range of nearby pages has already been
++ * unmapped by unmap_mapping_pages() or unmap_mapping_range().  But once
++ * truncation or invalidation holds the lock on a page, it may find that
++ * the page has been remapped again: and then uses unmap_mapping_page()
++ * to unmap it finally.
++ */
++void unmap_mapping_page(struct page *page)
++{
++	struct address_space *mapping = page->mapping;
++	struct zap_details details = { };
++	pgoff_t nr = PageTransHuge(page) ? HPAGE_PMD_NR : 1;
++
++	VM_BUG_ON(!PageLocked(page));
++	VM_BUG_ON(PageTail(page));
++
++	details.check_mapping = mapping;
++	details.first_index = page->index;
++	details.last_index = page->index + nr - 1;
++	details.single_page = page;
++
++	i_mmap_lock_write(mapping);
++	if (unlikely(!RB_EMPTY_ROOT(&mapping->i_mmap.rb_root)))
++		unmap_mapping_range_tree(&mapping->i_mmap, &details);
++	i_mmap_unlock_write(mapping);
++}
++
++/**
+  * unmap_mapping_pages() - Unmap pages from processes.
+  * @mapping: The address space containing pages to be unmapped.
+  * @start: Index of first page to be unmapped.
+--- a/mm/truncate.c
++++ b/mm/truncate.c
+@@ -173,13 +173,10 @@ void do_invalidatepage(struct page *page
+  * its lock, b) when a concurrent invalidate_mapping_pages got there first and
+  * c) when tmpfs swizzles a page between a tmpfs inode and swapper_space.
+  */
+-static void
+-truncate_cleanup_page(struct address_space *mapping, struct page *page)
++static void truncate_cleanup_page(struct page *page)
+ {
+-	if (page_mapped(page)) {
+-		pgoff_t nr = PageTransHuge(page) ? HPAGE_PMD_NR : 1;
+-		unmap_mapping_pages(mapping, page->index, nr, false);
+-	}
++	if (page_mapped(page))
++		unmap_mapping_page(page);
+ 
+ 	if (page_has_private(page))
+ 		do_invalidatepage(page, 0, PAGE_SIZE);
+@@ -224,7 +221,7 @@ int truncate_inode_page(struct address_s
+ 	if (page->mapping != mapping)
+ 		return -EIO;
+ 
+-	truncate_cleanup_page(mapping, page);
++	truncate_cleanup_page(page);
+ 	delete_from_page_cache(page);
+ 	return 0;
+ }
+@@ -362,7 +359,7 @@ void truncate_inode_pages_range(struct a
+ 			pagevec_add(&locked_pvec, page);
+ 		}
+ 		for (i = 0; i < pagevec_count(&locked_pvec); i++)
+-			truncate_cleanup_page(mapping, locked_pvec.pages[i]);
++			truncate_cleanup_page(locked_pvec.pages[i]);
+ 		delete_from_page_cache_batch(mapping, &locked_pvec);
+ 		for (i = 0; i < pagevec_count(&locked_pvec); i++)
+ 			unlock_page(locked_pvec.pages[i]);
+@@ -703,6 +700,16 @@ int invalidate_inode_pages2_range(struct
+ 				continue;
+ 			}
+ 
++			if (!did_range_unmap && page_mapped(page)) {
++				/*
++				 * If page is mapped, before taking its lock,
++				 * zap the rest of the file in one hit.
++				 */
++				unmap_mapping_pages(mapping, index,
++						(1 + end - index), false);
++				did_range_unmap = 1;
++			}
++
+ 			lock_page(page);
+ 			WARN_ON(page_to_index(page) != index);
+ 			if (page->mapping != mapping) {
+@@ -710,23 +717,11 @@ int invalidate_inode_pages2_range(struct
+ 				continue;
+ 			}
+ 			wait_on_page_writeback(page);
+-			if (page_mapped(page)) {
+-				if (!did_range_unmap) {
+-					/*
+-					 * Zap the rest of the file in one hit.
+-					 */
+-					unmap_mapping_pages(mapping, index,
+-						(1 + end - index), false);
+-					did_range_unmap = 1;
+-				} else {
+-					/*
+-					 * Just zap this page
+-					 */
+-					unmap_mapping_pages(mapping, index,
+-								1, false);
+-				}
+-			}
++
++			if (page_mapped(page))
++				unmap_mapping_page(page);
+ 			BUG_ON(page_mapped(page));
++
+ 			ret2 = do_launder_page(mapping, page);
+ 			if (ret2 == 0) {
+ 				if (!invalidate_complete_page2(mapping, page))

@@ -635,7 +635,8 @@ def _do_info(bz, opt):
     elif opt.versions:
         proddict = bz.getproducts()[0]
         for v in proddict['versions']:
-            print(to_encoding(v["name"]))
+            if v["is_active"]:
+                print(to_encoding(v["name"]))
 
     elif opt.component_owners:
         details = bz.getcomponentsdetails(productname)

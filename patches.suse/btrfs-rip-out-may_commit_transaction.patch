@@ -1,0 +1,213 @@
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Tue, 22 Jun 2021 15:51:58 +0300
+Subject: btrfs: rip out may_commit_transaction
+Git-commit: c416a30cddec0840520e9ffb170aea6c6b6c64af
+Patch-mainline: v5.14-rc1
+References: bsc#1135481
+
+may_commit_transaction was introduced before the ticketing
+infrastructure existed.  There was a problem where we'd legitimately be
+out of space, but every reservation would trigger a transaction commit
+and then fail.  Thus if you had 1000 things trying to make a
+reservation, they'd all do the flushing loop and thus commit the
+transaction 1000 times before they'd get their ENOSPC.
+
+This helper was introduced to short circuit this, if there wasn't space
+that could be reclaimed by committing the transaction then simply ENOSPC
+out.  This made true ENOSPC tests much faster as we didn't waste a bunch
+of time.
+
+However many of our bugs over the years have been from cases where we
+didn't account for some space that would be reclaimed by committing a
+transaction.  The delayed refs rsv space, delayed rsv, many pinned bytes
+miscalculations, etc.  And in the meantime the original problem has been
+solved with ticketing.  We no longer will commit the transaction 1000
+times.  Instead we'll get 1000 waiters, we will go through the flushing
+mechanisms, and if there's no progress after 2 loops we ENOSPC everybody
+out.  The ticketing infrastructure gives us a deterministic way to see
+if we're making progress or not, thus we avoid a lot of extra work.
+
+So simplify this step by simply unconditionally committing the
+transaction.  This removes what is arguably our most common source of
+early ENOSPC bugs and will allow us to drastically simplify many of the
+things we track because we simply won't need them with this stuff gone.
+
+Reviewed-by: Nikolay Borisov <nborisov@suse.com>
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Acked-by: Nikolay Borisov <nborisov@suse.com>
+---
+ fs/btrfs/ctree.h             |    1
+ fs/btrfs/space-info.c        |  117 +------------------------------------------
+ include/trace/events/btrfs.h |    3 -
+ 3 files changed, 5 insertions(+), 116 deletions(-)
+
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -2618,7 +2618,6 @@ enum btrfs_flush_state {
+ 	ALLOC_CHUNK_FORCE	=	8,
+ 	RUN_DELAYED_IPUTS	=	9,
+ 	COMMIT_TRANS		=	10,
+-	FORCE_COMMIT_TRANS	=	11,
+ };
+
+ int btrfs_subvolume_reserve_metadata(struct btrfs_root *root,
+--- a/fs/btrfs/space-info.c
++++ b/fs/btrfs/space-info.c
+@@ -441,109 +441,6 @@ static void shrink_delalloc(struct btrfs
+ 	}
+ }
+
+-/**
+- * maybe_commit_transaction - possibly commit the transaction if its ok to
+- * @root - the root we're allocating for
+- * @bytes - the number of bytes we want to reserve
+- * @force - force the commit
+- *
+- * This will check to make sure that committing the transaction will actually
+- * get us somewhere and then commit the transaction if it does.  Otherwise it
+- * will return -ENOSPC.
+- */
+-static int may_commit_transaction(struct btrfs_fs_info *fs_info,
+-				  struct btrfs_space_info *space_info)
+-{
+-	struct reserve_ticket *ticket = NULL;
+-	struct btrfs_block_rsv *delayed_rsv = &fs_info->delayed_block_rsv;
+-	struct btrfs_block_rsv *delayed_refs_rsv = &fs_info->delayed_refs_rsv;
+-	struct btrfs_block_rsv *trans_rsv = &fs_info->trans_block_rsv;
+-	struct btrfs_trans_handle *trans;
+-	u64 reclaim_bytes = 0;
+-	u64 bytes_needed = 0;
+-	u64 cur_free_bytes = 0;
+-
+-	trans = (struct btrfs_trans_handle *)current->journal_info;
+-	if (trans)
+-		return -EAGAIN;
+-
+-	spin_lock(&space_info->lock);
+-	cur_free_bytes = btrfs_space_info_used(space_info, true);
+-	if (cur_free_bytes < space_info->total_bytes)
+-		cur_free_bytes = space_info->total_bytes - cur_free_bytes;
+-	else
+-		cur_free_bytes = 0;
+-
+-	if (!list_empty(&space_info->priority_tickets))
+-		ticket = list_first_entry(&space_info->priority_tickets,
+-					  struct reserve_ticket, list);
+-	else if (!list_empty(&space_info->tickets))
+-		ticket = list_first_entry(&space_info->tickets,
+-					  struct reserve_ticket, list);
+-	if (ticket)
+-		bytes_needed = ticket->bytes;
+-
+-	if (bytes_needed > cur_free_bytes)
+-		bytes_needed -= cur_free_bytes;
+-	else
+-		bytes_needed = 0;
+-	spin_unlock(&space_info->lock);
+-
+-	if (!bytes_needed)
+-		return 0;
+-
+-	trans = btrfs_join_transaction(fs_info->extent_root);
+-	if (IS_ERR(trans))
+-		return PTR_ERR(trans);
+-
+-	/*
+-	 * See if there is enough pinned space to make this reservation, or if
+-	 * we have block groups that are going to be freed, allowing us to
+-	 * possibly do a chunk allocation the next loop through.
+-	 */
+-	if (test_bit(BTRFS_TRANS_HAVE_FREE_BGS, &trans->transaction->flags) ||
+-	    __percpu_counter_compare(&space_info->total_bytes_pinned,
+-				     bytes_needed,
+-				     BTRFS_TOTAL_BYTES_PINNED_BATCH) >= 0)
+-		goto commit;
+-
+-	/*
+-	 * See if there is some space in the delayed insertion reserve for this
+-	 * reservation.  If the space_info's don't match (like for DATA or
+-	 * SYSTEM) then just go enospc, reclaiming this space won't recover any
+-	 * space to satisfy those reservations.
+-	 */
+-	if (space_info != delayed_rsv->space_info)
+-		goto enospc;
+-
+-	spin_lock(&delayed_rsv->lock);
+-	reclaim_bytes += delayed_rsv->reserved;
+-	spin_unlock(&delayed_rsv->lock);
+-
+-	spin_lock(&delayed_refs_rsv->lock);
+-	reclaim_bytes += delayed_refs_rsv->reserved;
+-	spin_unlock(&delayed_refs_rsv->lock);
+-
+-	spin_lock(&trans_rsv->lock);
+-	reclaim_bytes += trans_rsv->reserved;
+-	spin_unlock(&trans_rsv->lock);
+-
+-	if (reclaim_bytes >= bytes_needed)
+-		goto commit;
+-	bytes_needed -= reclaim_bytes;
+-
+-	if (__percpu_counter_compare(&space_info->total_bytes_pinned,
+-				   bytes_needed,
+-				   BTRFS_TOTAL_BYTES_PINNED_BATCH) < 0)
+-		goto enospc;
+-
+-commit:
+-	return btrfs_commit_transaction(trans);
+-enospc:
+-	btrfs_end_transaction(trans);
+-	return -ENOSPC;
+-}
+-
+ /*
+  * Try to flush some data based on policy set by @state. This is only advisory
+  * and may fail for various reasons. The caller is supposed to examine the
+@@ -618,9 +515,7 @@ static void flush_space(struct btrfs_fs_
+ 		btrfs_wait_on_delayed_iputs(fs_info);
+ 		break;
+ 	case COMMIT_TRANS:
+-		ret = may_commit_transaction(fs_info, space_info);
+-		break;
+-	case FORCE_COMMIT_TRANS:
++		ASSERT(current->journal_info == NULL);
+ 		trans = btrfs_join_transaction(root);
+ 		if (IS_ERR(trans)) {
+ 			ret = PTR_ERR(trans);
+@@ -992,7 +887,7 @@ static void btrfs_preempt_reclaim_metada
+ 			   (delayed_block_rsv->reserved +
+ 			    delayed_refs_rsv->reserved)) {
+ 			to_reclaim = space_info->bytes_pinned;
+-			flush = FORCE_COMMIT_TRANS;
++			flush = COMMIT_TRANS;
+ 		} else if (delayed_block_rsv->reserved >
+ 			   delayed_refs_rsv->reserved) {
+ 			to_reclaim = delayed_block_rsv->reserved;
+@@ -1062,12 +957,8 @@ static void btrfs_preempt_reclaim_metada
+  *   the information it needs to make the right decision.
+  *
+  * COMMIT_TRANS
+- *   This is where we reclaim all of the pinned space generated by the previous
+- *   two stages.  We will not commit the transaction if we don't think we're
+- *   likely to satisfy our request, which means if our current free space +
+- *   total_bytes_pinned < reservation we will not commit.  This is why the
+- *   previous states are actually important, to make sure we know for sure
+- *   whether committing the transaction will allow us to make progress.
++ *   This is where we reclaim all of the pinned space generated by running the
++ *   iputs
+  *
+  * ALLOC_CHUNK_FORCE
+  *   For data we start with alloc chunk force, however we could have been full
+--- a/include/trace/events/btrfs.h
++++ b/include/trace/events/btrfs.h
+@@ -1051,8 +1051,7 @@ TRACE_EVENT(btrfs_space_reservation,
+ 	EM( ALLOC_CHUNK,		"ALLOC_CHUNK")			\
+ 	EM( ALLOC_CHUNK_FORCE,		"ALLOC_CHUNK_FORCE")		\
+ 	EM( RUN_DELAYED_IPUTS,		"RUN_DELAYED_IPUTS")		\
+-	EM( COMMIT_TRANS,		"COMMIT_TRANS")			\
+-	EMe(FORCE_COMMIT_TRANS,		"FORCE_COMMIT_TRANS")
++	EMe(COMMIT_TRANS,		"COMMIT_TRANS")
+
+ /*
+  * First define the enums in the above macros to be exported to userspace via

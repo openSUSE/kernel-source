@@ -1,0 +1,229 @@
+From: NeilBrown <neilb@suse.de>
+Date: Mon, 1 Nov 2021 14:49:44 +1100
+Subject: [PATCH] SUNRPC: improve 'swap' handling: scheduling and PF_MEMALLOC
+Patch-mainline: Not yet - undergoing review
+References: bsc#1191876
+
+rpc tasks can be marked as RPC_TASK_SWAPPER.  This causes GFP_MEMALLOC
+to be used for some allocations.  This is needed in some cases, but not
+in all where it is currently provided, and in some where it isn't
+provided.
+
+Currently *all* tasks associated with a rpc_client on which swap is
+enabled get the flag and hence some GFP_MEMALLOC support.
+
+GFP_MEMALLOC is provided for ->buf_alloc() but only swap-writes need it.
+However xdr_alloc_bvec does not get GFP_MEMALLOC - though it often does
+need it.
+
+xdr_alloc_bvec is called while the XPRT_LOCK is held.  If this blocks,
+then it blocks all other queued tasks.  So this allocation needs
+GFP_MEMALLOC for *all* requests, not just writes, when the xprt is used
+for any swap writes.
+
+Similarly, if the transport is not connected, that will block all
+requests including swap writes, so memory allocations should get
+GFP_MEMALLOC if swap writes are possible.
+
+So with this patch:
+ 1/ we ONLY set RPC_TASK_SWAPPER for swap writes.
+ 2/ __rpc_execute() sets PF_MEMALLOC while handling any task
+    with RPC_TASK_SWAPPER set, or when handling any task that
+    holds the XPRT_LOCKED lock on an xprt used for swap.
+    This removes the need for the RPC_IS_SWAPPER() test
+    in ->buf_alloc handlers.
+ 3/ xprt_prepare_transmit() sets PF_MEMALLOC after locking
+    any task to a swapper xprt.  __rpc_execute() will clear it.
+ 3/ PF_MEMALLOC is set for all the connect workers.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Acked-by: NeilBrown <neilb@suse.com>
+
+---
+ fs/nfs/write.c                  |    2 ++
+ net/sunrpc/clnt.c               |    2 --
+ net/sunrpc/sched.c              |   20 +++++++++++++++++---
+ net/sunrpc/xprt.c               |    3 +++
+ net/sunrpc/xprtrdma/transport.c |    6 ++++--
+ net/sunrpc/xprtsock.c           |   11 ++++++++++-
+ 6 files changed, 36 insertions(+), 8 deletions(-)
+
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -1417,6 +1417,8 @@ static void nfs_initiate_write(struct nf
+ {
+ 	int priority = flush_task_priority(how);
+ 
++	if (IS_SWAPFILE(hdr->inode))
++		task_setup_data->flags |= RPC_TASK_SWAPPER;
+ 	task_setup_data->priority = priority;
+ 	rpc_ops->write_setup(hdr, msg, &task_setup_data->rpc_client);
+ 	trace_nfs_initiate_write(hdr->inode, hdr->io_start, hdr->good_bytes,
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@ -1096,8 +1096,6 @@ void rpc_task_set_client(struct rpc_task
+ 			task->tk_flags |= RPC_TASK_TIMEOUT;
+ 		if (clnt->cl_noretranstimeo)
+ 			task->tk_flags |= RPC_TASK_NO_RETRANS_TIMEOUT;
+-		if (atomic_read(&clnt->cl_swapper))
+-			task->tk_flags |= RPC_TASK_SWAPPER;
+ 		/* Add to the client's list of all tasks */
+ 		spin_lock(&clnt->cl_lock);
+ 		list_add_tail(&task->tk_task, &clnt->cl_tasks);
+--- a/net/sunrpc/sched.c
++++ b/net/sunrpc/sched.c
+@@ -875,6 +875,15 @@ void rpc_release_calldata(const struct r
+ 		ops->rpc_release(calldata);
+ }
+ 
++static bool xprt_needs_memalloc(struct rpc_xprt *xprt, struct rpc_task *tk)
++{
++	if (!xprt)
++		return false;
++	if (!atomic_read(&xprt->swapper))
++		return false;
++	return test_bit(XPRT_LOCKED, &xprt->state) && xprt->snd_task == tk;
++}
++
+ /*
+  * This is the RPC `scheduler' (or rather, the finite state machine).
+  */
+@@ -883,6 +892,7 @@ static void __rpc_execute(struct rpc_tas
+ 	struct rpc_wait_queue *queue;
+ 	int task_is_async = RPC_IS_ASYNC(task);
+ 	int status = 0;
++	unsigned long pflags = current->flags;
+ 
+ 	dprintk("RPC: %5u __rpc_execute flags=0x%x\n",
+ 			task->tk_pid, task->tk_flags);
+@@ -908,6 +918,10 @@ static void __rpc_execute(struct rpc_tas
+ 		}
+ 		if (!do_action)
+ 			break;
++		if (RPC_IS_SWAPPER(task) ||
++		    xprt_needs_memalloc(task->tk_xprt, task))
++			current->flags |= PF_MEMALLOC;
++
+ 		trace_rpc_task_run_action(task, do_action);
+ 		do_action(task);
+ 
+@@ -943,7 +957,7 @@ static void __rpc_execute(struct rpc_tas
+ 		rpc_clear_running(task);
+ 		spin_unlock(&queue->lock);
+ 		if (task_is_async)
+-			return;
++			goto out;
+ 
+ 		/* sync task: sleep here */
+ 		dprintk("RPC: %5u sync task going to sleep\n", task->tk_pid);
+@@ -969,6 +983,8 @@ static void __rpc_execute(struct rpc_tas
+ 			task->tk_status);
+ 	/* Release all resources associated with the task */
+ 	rpc_release_task(task);
++out:
++	current_restore_flags(pflags, PF_MEMALLOC);
+ }
+ 
+ /*
+@@ -1027,8 +1043,6 @@ int rpc_malloc(struct rpc_task *task)
+ 
+ 	if (RPC_IS_ASYNC(task))
+ 		gfp = GFP_NOWAIT | __GFP_NOWARN;
+-	if (RPC_IS_SWAPPER(task))
+-		gfp |= __GFP_MEMALLOC;
+ 
+ 	size += sizeof(struct rpc_buffer);
+ 	if (size <= RPC_BUFFER_MAXSIZE)
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@ -1412,6 +1412,9 @@ bool xprt_prepare_transmit(struct rpc_ta
+ 		return false;
+ 
+ 	}
++	if (atomic_read(&xprt->swapper))
++		/* This will be clear in __rpc_execute */
++		current->flags |= PF_MEMALLOC;
+ 	return true;
+ }
+ 
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -238,8 +238,11 @@ xprt_rdma_connect_worker(struct work_str
+ 	struct rpcrdma_xprt *r_xprt = container_of(work, struct rpcrdma_xprt,
+ 						   rx_connect_worker.work);
+ 	struct rpc_xprt *xprt = &r_xprt->rx_xprt;
++	unsigned int pflags = current->flags;
+ 	int rc;
+ 
++	if (atomic_read(&xprt->swapper))
++		current->flags |= PF_MEMALLOC;
+ 	rc = rpcrdma_ep_connect(&r_xprt->rx_ep, &r_xprt->rx_ia);
+ 	xprt_clear_connecting(xprt);
+ 	if (r_xprt->rx_ep.rep_connected > 0) {
+@@ -250,6 +253,7 @@ xprt_rdma_connect_worker(struct work_str
+ 		rc = -EAGAIN;
+ 	}
+ 	xprt_wake_pending_tasks(xprt, rc);
++	current_restore_flags(pflags, PF_MEMALLOC);
+ }
+ 
+ /**
+@@ -614,8 +618,6 @@ xprt_rdma_allocate(struct rpc_task *task
+ 	flags = RPCRDMA_DEF_GFP;
+ 	if (RPC_IS_ASYNC(task))
+ 		flags = GFP_NOWAIT | __GFP_NOWARN;
+-	if (RPC_IS_SWAPPER(task))
+-		flags |= __GFP_MEMALLOC;
+ 
+ 	if (!rpcrdma_check_regbuf(r_xprt, req->rl_sendbuf, rqst->rq_callsize,
+ 				  flags))
+--- a/net/sunrpc/xprtsock.c
++++ b/net/sunrpc/xprtsock.c
+@@ -2167,7 +2167,10 @@ static void xs_udp_setup_socket(struct w
+ 	struct rpc_xprt *xprt = &transport->xprt;
+ 	struct socket *sock;
+ 	int status = -EIO;
++	unsigned int pflags = current->flags;
+ 
++	if (atomic_read(&xprt->swapper))
++		current->flags |= PF_MEMALLOC;
+ 	sock = xs_create_sock(xprt, transport,
+ 			xs_addr(xprt)->sa_family, SOCK_DGRAM,
+ 			IPPROTO_UDP, false);
+@@ -2187,6 +2190,7 @@ out:
+ 	xprt_clear_connecting(xprt);
+ 	xprt_unlock_connect(xprt, transport);
+ 	xprt_wake_pending_tasks(xprt, status);
++	current_restore_flags(pflags, PF_MEMALLOC);
+ }
+ 
+ /**
+@@ -2364,7 +2368,10 @@ static void xs_tcp_setup_socket(struct w
+ 	struct socket *sock = transport->sock;
+ 	struct rpc_xprt *xprt = &transport->xprt;
+ 	int status = -EIO;
++	unsigned int pflags = current->flags;
+ 
++	if (atomic_read(&xprt->swapper))
++		current->flags |= PF_MEMALLOC;
+ 	if (!sock) {
+ 		sock = xs_create_sock(xprt, transport,
+ 				xs_addr(xprt)->sa_family, SOCK_STREAM,
+@@ -2401,7 +2408,7 @@ static void xs_tcp_setup_socket(struct w
+ 	case -EINPROGRESS:
+ 	case -EALREADY:
+ 		xprt_unlock_connect(xprt, transport);
+-		return;
++		goto out_restore;
+ 	case -EINVAL:
+ 		/* Happens, for instance, if the user specified a link
+ 		 * local IPv6 address without a scope-id.
+@@ -2427,6 +2434,8 @@ out:
+ 	xprt_clear_connecting(xprt);
+ 	xprt_unlock_connect(xprt, transport);
+ 	xprt_wake_pending_tasks(xprt, status);
++out_restore:
++	current_restore_flags(pflags, PF_MEMALLOC);
+ }
+ 
+ /**
