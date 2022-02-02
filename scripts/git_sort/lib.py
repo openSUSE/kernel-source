@@ -267,11 +267,25 @@ class InputEntry(object):
             raise exc.KSError("Could not find patch \"%s\"" % (name,))
 
         with Patch(open(name, mode="rb")) as patch:
+            mainline_tags = patch.get("Patch-mainline")
             commit_tags = patch.get("Git-commit")
             repo_tags = patch.get("Git-repo")
 
+        if len(repo_tags) > 1:
+            raise exc.KSError("Multiple Patch-mainline tags found. Patch \"%s\" is "
+                          "tagged improperly." % (name,))
+
         if not commit_tags:
             self.dest_head = git_sort.oot
+            mainline = mainline_tags[0]
+            if not re.match("^(Submitted|Not yet)", mainline, re.IGNORECASE):
+                raise exc.KSError(
+                    "There is a problem with patch \"%s\". "
+                    "The Patch-mainline tag \"%s\" is not supported in sorted "
+                    "section. Please add the patches without a commit id that "
+                    "are neither 'Submitted' nor 'Not yet' submitted to the "
+                    "manually maintained section below sorted section." % (
+                        name, mainline,))
             return
 
         class BadTag(Exception):
