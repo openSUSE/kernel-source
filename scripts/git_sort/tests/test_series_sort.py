@@ -124,7 +124,7 @@ class TestSeriesSort(unittest.TestCase):
         tests.support.format_patch(self.repo.get(n1), repo=net_repo)
         tests.support.format_patch(self.repo.get(n2), repo=net_repo)
         tests.support.format_patch(self.repo.get(oot0))
-        tests.support.format_patch(self.repo.get(oot1))
+        tests.support.format_patch(self.repo.get(oot1), mainline="Submitted http://lore.kernel.org/somelist/somemessage")
         os.chdir(self.ks_dir)
 
 
