@@ -133,6 +133,8 @@ def series_header(series):
 
 
 def series_footer(series):
+    if series_header(series) == series:
+        return []
     return series_header(reversed(series))
 
 
