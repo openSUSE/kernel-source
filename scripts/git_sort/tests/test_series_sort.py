@@ -226,6 +226,35 @@ class TestSeriesSort(unittest.TestCase):
         os.unlink(series)
 
 
+    def test_sort_empty(self):
+        (tmp, series,) = tempfile.mkstemp(dir=self.ks_dir)
+        with open(series, mode="w") as f:
+            f.write(
+"""
+	patches.suse/unsorted-before.patch
+
+	########################################################
+	# sorted patches
+	########################################################
+
+	########################################################
+	# end of sorted patches
+	########################################################
+
+	patches.suse/unsorted-after.patch
+""")
+
+        subprocess.check_call([self.ss_path, "-c", series])
+        with open(series) as f:
+            content1 = f.read()
+        subprocess.check_call([self.ss_path, series])
+        with open(series) as f:
+            content2 = f.read()
+        self.assertEqual(content2, content1)
+
+        os.unlink(series)
+
+
 class TestFromPatch(unittest.TestCase):
     """
     The naming of these tests stems from the following factors which determine
