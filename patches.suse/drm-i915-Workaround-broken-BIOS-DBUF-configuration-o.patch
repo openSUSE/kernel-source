@@ -1,0 +1,168 @@
+From 15512021eb3975a8c2366e3883337e252bb0eee5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Fri, 4 Feb 2022 16:18:18 +0200
+Subject: [PATCH] drm/i915: Workaround broken BIOS DBUF configuration on
+ TGL/RKL
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 4e6f55120c7eccf6f9323bb681632e23cbcb3f3c
+Patch-mainline: v5.17-rc4
+References: bsc#1193640
+
+[ backport note: contining a partial cherry-pick of the commit 1cd967c69410
+  as preliminary change for making intel_plane_disable_noatomic() accessible
+  from the code in this patch -- tiwai ]
+
+On TGL/RKL the BIOS likes to use some kind of bogus DBUF layout
+that doesn't match what the spec recommends. With a single active
+pipe that is not going to be a problem, but with multiple pipes
+active skl_commit_modeset_enables() goes into an infinite loop
+since it can't figure out any order in which it can commit the
+pipes without causing DBUF overlaps between the planes.
+
+We'd need some kind of extra DBUF defrag stage in between to
+make the transition possible. But that is clearly way too complex
+a solution, so in the name of simplicity let's just sanitize the
+DBUF state by simply turning off all planes when we detect a
+pipe encroaching on its neighbours' DBUF slices. We only have
+to disable the primary planes as all other planes should have
+already been disabled (if they somehow were enabled) by
+earlier sanitization steps.
+
+And for good measure let's also sanitize in case the DBUF
+allocations of the pipes already seem to overlap each other.
+
+Cc: <stable@vger.kernel.org> # v5.14+
+Closes: https://gitlab.freedesktop.org/drm/intel/-/issues/4762
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220204141818.1900-3-ville.syrjala@linux.intel.com
+Reviewed-by: Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_display.c |    5 +
+ drivers/gpu/drm/i915/display/intel_display.h |    2 
+ drivers/gpu/drm/i915/intel_pm.c              |   68 +++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_pm.h              |    1 
+ 4 files changed, 74 insertions(+), 2 deletions(-)
+
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -1833,8 +1833,8 @@ static void fixup_plane_bitmasks(struct
+ 	}
+ }
+ 
+-static void intel_plane_disable_noatomic(struct intel_crtc *crtc,
+-					 struct intel_plane *plane)
++void intel_plane_disable_noatomic(struct intel_crtc *crtc,
++				  struct intel_plane *plane)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ 	struct intel_crtc_state *crtc_state =
+@@ -13411,6 +13411,7 @@ intel_modeset_setup_hw_state(struct drm_
+ 		vlv_wm_sanitize(dev_priv);
+ 	} else if (DISPLAY_VER(dev_priv) >= 9) {
+ 		skl_wm_get_hw_state(dev_priv);
++		skl_wm_sanitize(dev_priv);
+ 	} else if (HAS_PCH_SPLIT(dev_priv)) {
+ 		ilk_wm_get_hw_state(dev_priv);
+ 	}
+--- a/drivers/gpu/drm/i915/display/intel_display.h
++++ b/drivers/gpu/drm/i915/display/intel_display.h
+@@ -629,6 +629,8 @@ void intel_plane_unpin_fb(struct intel_p
+ struct intel_encoder *
+ intel_get_crtc_new_encoder(const struct intel_atomic_state *state,
+ 			   const struct intel_crtc_state *crtc_state);
++void intel_plane_disable_noatomic(struct intel_crtc *crtc,
++				  struct intel_plane *plane);
+ 
+ unsigned int intel_surf_alignment(const struct drm_framebuffer *fb,
+ 				  int color_plane);
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -6681,6 +6681,74 @@ void skl_wm_get_hw_state(struct drm_i915
+ 	dbuf_state->enabled_slices = dev_priv->dbuf.enabled_slices;
+ }
+ 
++static bool skl_dbuf_is_misconfigured(struct drm_i915_private *i915)
++{
++	const struct intel_dbuf_state *dbuf_state =
++		to_intel_dbuf_state(i915->dbuf.obj.state);
++	struct skl_ddb_entry entries[I915_MAX_PIPES] = {};
++	struct intel_crtc *crtc;
++
++	for_each_intel_crtc(&i915->drm, crtc) {
++		const struct intel_crtc_state *crtc_state =
++			to_intel_crtc_state(crtc->base.state);
++
++		entries[crtc->pipe] = crtc_state->wm.skl.ddb;
++	}
++
++	for_each_intel_crtc(&i915->drm, crtc) {
++		const struct intel_crtc_state *crtc_state =
++			to_intel_crtc_state(crtc->base.state);
++		u8 slices;
++
++		slices = skl_compute_dbuf_slices(crtc, dbuf_state->active_pipes,
++						 dbuf_state->joined_mbus);
++		if (dbuf_state->slices[crtc->pipe] & ~slices)
++			return true;
++
++		if (skl_ddb_allocation_overlaps(&crtc_state->wm.skl.ddb, entries,
++						I915_MAX_PIPES, crtc->pipe))
++			return true;
++	}
++
++	return false;
++}
++
++void skl_wm_sanitize(struct drm_i915_private *i915)
++{
++	struct intel_crtc *crtc;
++
++	/*
++	 * On TGL/RKL (at least) the BIOS likes to assign the planes
++	 * to the wrong DBUF slices. This will cause an infinite loop
++	 * in skl_commit_modeset_enables() as it can't find a way to
++	 * transition between the old bogus DBUF layout to the new
++	 * proper DBUF layout without DBUF allocation overlaps between
++	 * the planes (which cannot be allowed or else the hardware
++	 * may hang). If we detect a bogus DBUF layout just turn off
++	 * all the planes so that skl_commit_modeset_enables() can
++	 * simply ignore them.
++	 */
++	if (!skl_dbuf_is_misconfigured(i915))
++		return;
++
++	drm_dbg_kms(&i915->drm, "BIOS has misprogrammed the DBUF, disabling all planes\n");
++
++	for_each_intel_crtc(&i915->drm, crtc) {
++		struct intel_plane *plane = to_intel_plane(crtc->base.primary);
++		const struct intel_plane_state *plane_state =
++			to_intel_plane_state(plane->base.state);
++		struct intel_crtc_state *crtc_state =
++			to_intel_crtc_state(crtc->base.state);
++
++		if (plane_state->uapi.visible)
++			intel_plane_disable_noatomic(crtc, plane);
++
++		drm_WARN_ON(&i915->drm, crtc_state->active_planes != 0);
++
++		memset(&crtc_state->wm.skl.ddb, 0, sizeof(crtc_state->wm.skl.ddb));
++	}
++}
++
+ static void ilk_pipe_wm_get_hw_state(struct intel_crtc *crtc)
+ {
+ 	struct drm_device *dev = crtc->base.dev;
+--- a/drivers/gpu/drm/i915/intel_pm.h
++++ b/drivers/gpu/drm/i915/intel_pm.h
+@@ -48,6 +48,7 @@ void skl_pipe_wm_get_hw_state(struct int
+ 			      struct skl_pipe_wm *out);
+ void g4x_wm_sanitize(struct drm_i915_private *dev_priv);
+ void vlv_wm_sanitize(struct drm_i915_private *dev_priv);
++void skl_wm_sanitize(struct drm_i915_private *dev_priv);
+ bool intel_can_enable_sagv(struct drm_i915_private *dev_priv,
+ 			   const struct intel_bw_state *bw_state);
+ void intel_sagv_pre_plane_update(struct intel_atomic_state *state);
