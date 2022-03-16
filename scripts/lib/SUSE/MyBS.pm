@@ -74,7 +74,19 @@ sub new {
 	if (exists($cred{credentials_mgr_class})) {
 		if ($cred{credentials_mgr_class} eq "osc.credentials.ObfuscatedConfigFileCredentialsManager") {
 			$cred{passx}=$cred{pass};
-	}}
+		} elsif ($cred{credentials_mgr_class} eq "osc.credentials.KeyringCredentialsManager:pass.Keyring") {
+			# emulate by invoking the pass command directly
+			my $api = $api_url;
+			$api =~ s/^https?:\/\///;
+			open(my $secret, "pass show $api/$cred{user} |")
+				or die "Failed to invoke pass\n";
+			$cred{pass} = <$secret>;
+			close($secret);
+			die "Failed to obtain secret from pass\n"
+				if !$cred{pass};
+			chomp($cred{pass});
+		}
+	}
 	if (exists($cred{passx})) {
 		# Not available on SLES10, hence the 'require'
 		require MIME::Base64;
