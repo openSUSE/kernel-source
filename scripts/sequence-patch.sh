@@ -215,7 +215,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,rapid,vanilla,fuzz:,patch-dir:,build-dir:,config:,kabi,ctags,cscope,etags,skip-reverse,dry-run,signing-key: -- "$@"`
+options="$(getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,rapid,vanilla,fuzz:,patch-dir:,build-dir:,config:,kabi,ctags,cscope,etags,skip-reverse,dry-run,signing-key: -- "$@")"
 
 if [ $? -ne 0 ]
 then

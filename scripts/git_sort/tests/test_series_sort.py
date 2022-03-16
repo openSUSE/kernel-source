@@ -124,7 +124,7 @@ class TestSeriesSort(unittest.TestCase):
         tests.support.format_patch(self.repo.get(n1), repo=net_repo)
         tests.support.format_patch(self.repo.get(n2), repo=net_repo)
         tests.support.format_patch(self.repo.get(oot0))
-        tests.support.format_patch(self.repo.get(oot1))
+        tests.support.format_patch(self.repo.get(oot1), mainline="Submitted http://lore.kernel.org/somelist/somemessage")
         os.chdir(self.ks_dir)
 
 
@@ -207,6 +207,35 @@ class TestSeriesSort(unittest.TestCase):
 	# out-of-tree patches
 	patches.suse/oot-0.patch
 	patches.suse/oot-1.patch
+
+	########################################################
+	# end of sorted patches
+	########################################################
+
+	patches.suse/unsorted-after.patch
+""")
+
+        subprocess.check_call([self.ss_path, "-c", series])
+        with open(series) as f:
+            content1 = f.read()
+        subprocess.check_call([self.ss_path, series])
+        with open(series) as f:
+            content2 = f.read()
+        self.assertEqual(content2, content1)
+
+        os.unlink(series)
+
+
+    def test_sort_empty(self):
+        (tmp, series,) = tempfile.mkstemp(dir=self.ks_dir)
+        with open(series, mode="w") as f:
+            f.write(
+"""
+	patches.suse/unsorted-before.patch
+
+	########################################################
+	# sorted patches
+	########################################################
 
 	########################################################
 	# end of sorted patches
