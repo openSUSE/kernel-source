@@ -1,0 +1,147 @@
+From 018f3a13dd6300701103f268b6bfec0a56beea57 Mon Sep 17 00:00:00 2001
+From: Lai Jiangshan <laijs@linux.alibaba.com>
+Date: Tue, 17 Aug 2021 09:32:37 +0800
+Subject: [PATCH 4/5] workqueue: Mark barrier work with WORK_STRUCT_INACTIVE
+Git-commit: 018f3a13dd6300701103f268b6bfec0a56beea57
+Patch-mainline: v5.15-rc1
+References: bsc#1190232
+
+Currently, WORK_NO_COLOR has two meanings:
+	Not participate in flushing
+	Not participate in nr_active
+
+And only non-barrier work items are marked with WORK_STRUCT_INACTIVE
+when they are in inactive_works list.  The barrier work items are not
+marked INACTIVE even linked in inactive_works list since these tail
+items are always moved together with the head work item.
+
+These definitions are simple, clean and practical. (Except a small
+blemish that only the first meaning of WORK_NO_COLOR is documented in
+include/linux/workqueue.h while both meanings are in workqueue.c)
+
+But dual-purpose WORK_NO_COLOR used for barrier work items has proven to
+be problematical[1].  Only the second purpose is obligatory.  So we plan
+to make barrier work items participate in flushing but keep them still
+not participating in nr_active.
+
+So the plan is to mark barrier work items inactive without using
+WORK_NO_COLOR in this patch so that we can assign a flushing color to
+them in next patch.
+
+The reasonable way is to add or reuse a bit in work data of the work
+item.  But adding a bit will double the size of pool_workqueue.
+
+Currently, WORK_STRUCT_INACTIVE is only used in try_to_grab_pending()
+for user-queued work items and try_to_grab_pending() can't work for
+barrier work items.  So we extend WORK_STRUCT_INACTIVE to also mark
+barrier work items no matter which list they are in because we don't
+need to determind which list a barrier work item is in.
+
+So the meaning of WORK_STRUCT_INACTIVE becomes just "the work items don't
+participate in nr_active" (no matter whether it is a barrier work item or
+a user-queued work item).  And WORK_STRUCT_INACTIVE for user-queued work
+items means they are in inactive_works list.
+
+This patch does it by setting WORK_STRUCT_INACTIVE for barrier work items
+in insert_wq_barrier() and checking WORK_STRUCT_INACTIVE first in
+pwq_dec_nr_in_flight().  And the meaning of WORK_NO_COLOR is reduced to
+only "not participating in flushing".
+
+There is no functionality change intended in this patch.  Because
+WORK_NO_COLOR+WORK_STRUCT_INACTIVE represents the previous WORK_NO_COLOR
+in meaning and try_to_grab_pending() doesn't use for barrier work items
+and avoids being confused by this extended WORK_STRUCT_INACTIVE.
+
+A bunch of comment for nr_active & WORK_STRUCT_INACTIVE is also added for
+documenting how WORK_STRUCT_INACTIVE works in nr_active management.
+
+[1]: https://lore.kernel.org/lkml/20210812083814.32453-1-lizhe.67@bytedance.com/
+Signed-off-by: Lai Jiangshan <laijs@linux.alibaba.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+---
+ kernel/workqueue.c | 42 ++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 34 insertions(+), 8 deletions(-)
+
+diff --git a/kernel/workqueue.c b/kernel/workqueue.c
+index 84fd2a8f56aa..6657bcbd2064 100644
+--- a/kernel/workqueue.c
++++ b/kernel/workqueue.c
+@@ -205,6 +205,23 @@ struct pool_workqueue {
+ 	int			refcnt;		/* L: reference count */
+ 	int			nr_in_flight[WORK_NR_COLORS];
+ 						/* L: nr of in_flight works */
++
++	/*
++	 * nr_active management and WORK_STRUCT_INACTIVE:
++	 *
++	 * When pwq->nr_active >= max_active, new work item is queued to
++	 * pwq->inactive_works instead of pool->worklist and marked with
++	 * WORK_STRUCT_INACTIVE.
++	 *
++	 * All work items marked with WORK_STRUCT_INACTIVE do not participate
++	 * in pwq->nr_active and all work items in pwq->inactive_works are
++	 * marked with WORK_STRUCT_INACTIVE.  But not all WORK_STRUCT_INACTIVE
++	 * work items are in pwq->inactive_works.  Some of them are ready to
++	 * run in pool->worklist or worker->scheduled.  Those work itmes are
++	 * only struct wq_barrier which is used for flush_work() and should
++	 * not participate in pwq->nr_active.  For non-barrier work item, it
++	 * is marked with WORK_STRUCT_INACTIVE iff it is in pwq->inactive_works.
++	 */
+ 	int			nr_active;	/* L: nr of active works */
+ 	int			max_active;	/* L: max active works */
+ 	struct list_head	inactive_works;	/* L: inactive works */
+@@ -1171,19 +1188,21 @@ static void pwq_dec_nr_in_flight(struct pool_workqueue *pwq, unsigned long work_
+ {
+ 	int color = get_work_color(work_data);
+ 
+-	/* uncolored work items don't participate in flushing or nr_active */
++	if (!(work_data & WORK_STRUCT_INACTIVE)) {
++		pwq->nr_active--;
++		if (!list_empty(&pwq->inactive_works)) {
++			/* one down, submit an inactive one */
++			if (pwq->nr_active < pwq->max_active)
++				pwq_activate_first_inactive(pwq);
++		}
++	}
++
++	/* uncolored work items don't participate in flushing */
+ 	if (color == WORK_NO_COLOR)
+ 		goto out_put;
+ 
+ 	pwq->nr_in_flight[color]--;
+ 
+-	pwq->nr_active--;
+-	if (!list_empty(&pwq->inactive_works)) {
+-		/* one down, submit an inactive one */
+-		if (pwq->nr_active < pwq->max_active)
+-			pwq_activate_first_inactive(pwq);
+-	}
+-
+ 	/* is flush in progress and are we at the flushing tip? */
+ 	if (likely(pwq->flush_color != color))
+ 		goto out_put;
+@@ -1283,6 +1302,10 @@ static int try_to_grab_pending(struct work_struct *work, bool is_dwork,
+ 		debug_work_deactivate(work);
+ 
+ 		/*
++		 * A cancelable inactive work item must be in the
++		 * pwq->inactive_works since a queued barrier can't be
++		 * canceled (see the comments in insert_wq_barrier()).
++		 *
+ 		 * An inactive work item cannot be grabbed directly because
+ 		 * it might have linked NO_COLOR work items which, if left
+ 		 * on the inactive_works list, will confuse pwq->nr_active
+@@ -2675,6 +2698,9 @@ static void insert_wq_barrier(struct pool_workqueue *pwq,
+ 
+ 	barr->task = current;
+ 
++	/* The barrier work item does not participate in pwq->nr_active. */
++	work_flags |= WORK_STRUCT_INACTIVE;
++
+ 	/*
+ 	 * If @target is currently being executed, schedule the
+ 	 * barrier to the worker; otherwise, put it after @target.
+-- 
+2.26.2
+

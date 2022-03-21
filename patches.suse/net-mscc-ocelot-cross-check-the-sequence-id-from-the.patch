@@ -1,0 +1,146 @@
+From 9d2cec10ea9e1275138517c57c811982490b3bce Mon Sep 17 00:00:00 2001
+From: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date: Tue, 12 Oct 2021 14:40:39 +0300
+Subject: [PATCH] net: mscc: ocelot: cross-check the sequence id from the timestamp FIFO with the skb PTP header
+Git-commit: ebb4c6a990f786d7e0e4618a0d3766cd660125d8
+Patch-mainline: v5.15-rc6
+References: stable-5.14.14
+
+commit ebb4c6a990f786d7e0e4618a0d3766cd660125d8 upstream.
+
+The sad reality is that when a PTP frame with a TX timestamping request
+is transmitted, it isn't guaranteed that it will make it all the way to
+the wire (due to congestion inside the switch), and that a timestamp
+will be taken by the hardware and placed in the timestamp FIFO where an
+IRQ will be raised for it.
+
+The implication is that if enough PTP frames are silently dropped by the
+hardware such that the timestamp ID has rolled over, it is possible to
+match a timestamp to an old skb.
+
+Furthermore, nobody will match on the real skb corresponding to this
+timestamp, since we stupidly matched on a previous one that was stale in
+the queue, and stopped there.
+
+So PTP timestamping will be broken and there will be no way to recover.
+
+It looks like the hardware parses the sequenceID from the PTP header,
+and also provides that metadata for each timestamp. The driver currently
+ignores this, but it shouldn't.
+
+As an extra resiliency measure, do the following:
+
+- check whether the PTP sequenceID also matches between the skb and the
+  timestamp, treat the skb as stale otherwise and free it
+
+- if we see a stale skb, don't stop there and try to match an skb one
+  more time, chances are there's one more skb in the queue with the same
+  timestamp ID, otherwise we wouldn't have ever found the stale one (it
+  is by timestamp ID that we matched it).
+
+While this does not prevent PTP packet drops, it at least prevents
+the catastrophic consequences of incorrect timestamp matching.
+
+Since we already call ptp_classify_raw in the TX path, save the result
+in the skb->cb of the clone, and just use that result in the interrupt
+code path.
+
+Fixes: 4e3b0468e6d7 ("net: mscc: PTP Hardware Clock (PHC) support")
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/net/ethernet/mscc/ocelot.c | 24 +++++++++++++++++++++++-
+ include/soc/mscc/ocelot.h          |  1 +
+ 2 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/mscc/ocelot.c b/drivers/net/ethernet/mscc/ocelot.c
+index 83b5abb05133..acfbe94b5291 100644
+--- a/drivers/net/ethernet/mscc/ocelot.c
++++ b/drivers/net/ethernet/mscc/ocelot.c
+@@ -642,6 +642,7 @@ int ocelot_port_txtstamp_request(struct ocelot *ocelot, int port,
+ 			return err;
+ 
+ 		OCELOT_SKB_CB(skb)->ptp_cmd = ptp_cmd;
++		OCELOT_SKB_CB(*clone)->ptp_class = ptp_class;
+ 	}
+ 
+ 	return 0;
+@@ -675,6 +676,17 @@ static void ocelot_get_hwtimestamp(struct ocelot *ocelot,
+ 	spin_unlock_irqrestore(&ocelot->ptp_clock_lock, flags);
+ }
+ 
++static bool ocelot_validate_ptp_skb(struct sk_buff *clone, u16 seqid)
++{
++	struct ptp_header *hdr;
++
++	hdr = ptp_parse_header(clone, OCELOT_SKB_CB(clone)->ptp_class);
++	if (WARN_ON(!hdr))
++		return false;
++
++	return seqid == ntohs(hdr->sequence_id);
++}
++
+ void ocelot_get_txtstamp(struct ocelot *ocelot)
+ {
+ 	int budget = OCELOT_PTP_QUEUE_SZ;
+@@ -682,10 +694,10 @@ void ocelot_get_txtstamp(struct ocelot *ocelot)
+ 	while (budget--) {
+ 		struct sk_buff *skb, *skb_tmp, *skb_match = NULL;
+ 		struct skb_shared_hwtstamps shhwtstamps;
++		u32 val, id, seqid, txport;
+ 		struct ocelot_port *port;
+ 		struct timespec64 ts;
+ 		unsigned long flags;
+-		u32 val, id, txport;
+ 
+ 		val = ocelot_read(ocelot, SYS_PTP_STATUS);
+ 
+@@ -698,6 +710,7 @@ void ocelot_get_txtstamp(struct ocelot *ocelot)
+ 		/* Retrieve the ts ID and Tx port */
+ 		id = SYS_PTP_STATUS_PTP_MESS_ID_X(val);
+ 		txport = SYS_PTP_STATUS_PTP_MESS_TXPORT_X(val);
++		seqid = SYS_PTP_STATUS_PTP_MESS_SEQ_ID(val);
+ 
+ 		port = ocelot->ports[txport];
+ 
+@@ -707,6 +720,7 @@ void ocelot_get_txtstamp(struct ocelot *ocelot)
+ 		spin_unlock(&ocelot->ts_id_lock);
+ 
+ 		/* Retrieve its associated skb */
++try_again:
+ 		spin_lock_irqsave(&port->tx_skbs.lock, flags);
+ 
+ 		skb_queue_walk_safe(&port->tx_skbs, skb, skb_tmp) {
+@@ -722,6 +736,14 @@ void ocelot_get_txtstamp(struct ocelot *ocelot)
+ 		if (WARN_ON(!skb_match))
+ 			continue;
+ 
++		if (!ocelot_validate_ptp_skb(skb_match, seqid)) {
++			dev_err_ratelimited(ocelot->dev,
++					    "port %d received stale TX timestamp for seqid %d, discarding\n",
++					    txport, seqid);
++			dev_kfree_skb_any(skb);
++			goto try_again;
++		}
++
+ 		/* Get the h/w timestamp */
+ 		ocelot_get_hwtimestamp(ocelot, &ts);
+ 
+diff --git a/include/soc/mscc/ocelot.h b/include/soc/mscc/ocelot.h
+index 33b1e78eab24..498409388237 100644
+--- a/include/soc/mscc/ocelot.h
++++ b/include/soc/mscc/ocelot.h
+@@ -694,6 +694,7 @@ struct ocelot_policer {
+ 
+ struct ocelot_skb_cb {
+ 	struct sk_buff *clone;
++	unsigned int ptp_class; /* valid only for clones */
+ 	u8 ptp_cmd;
+ 	u8 ts_id;
+ };
+-- 
+2.26.2
+

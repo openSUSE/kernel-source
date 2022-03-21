@@ -35,6 +35,11 @@ import git_sort
 from patch import Patch
 import series_conf
 
+try:
+    from collections.abc import MutableSet
+except ImportError:
+    from collections import MutableSet
+
 
 # https://stackoverflow.com/a/952952
 flatten = lambda l: [item for sublist in l for item in sublist]
@@ -128,6 +133,8 @@ def series_header(series):
 
 
 def series_footer(series):
+    if series_header(series) == series:
+        return []
     return series_header(reversed(series))
 
 
@@ -262,11 +269,25 @@ class InputEntry(object):
             raise exc.KSError("Could not find patch \"%s\"" % (name,))
 
         with Patch(open(name, mode="rb")) as patch:
+            mainline_tags = patch.get("Patch-mainline")
             commit_tags = patch.get("Git-commit")
             repo_tags = patch.get("Git-repo")
 
+        if len(repo_tags) > 1:
+            raise exc.KSError("Multiple Patch-mainline tags found. Patch \"%s\" is "
+                          "tagged improperly." % (name,))
+
         if not commit_tags:
             self.dest_head = git_sort.oot
+            mainline = mainline_tags[0]
+            if not re.match("^(Submitted|Not yet)", mainline, re.IGNORECASE):
+                raise exc.KSError(
+                    "There is a problem with patch \"%s\". "
+                    "The Patch-mainline tag \"%s\" is not supported in sorted "
+                    "section. Please add the patches without a commit id that "
+                    "are neither 'Submitted' nor 'Not yet' submitted to the "
+                    "manually maintained section below sorted section." % (
+                        name, mainline,))
             return
 
         class BadTag(Exception):
@@ -566,7 +587,7 @@ class Link(object):
     __slots__ = 'prev', 'next', 'key', '__weakref__'
 
 
-class OrderedSet(collections.MutableSet):
+class OrderedSet(MutableSet):
     'Set the remembers the order elements were added'
     # Big-O running times for all methods are the same as for regular sets.
     # The internal self.__map dictionary maps keys to links in a doubly linked list.

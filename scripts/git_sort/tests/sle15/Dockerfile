@@ -1,20 +1,20 @@
 # http://registry.suse.de/
-FROM registry.suse.de/home/david_chang/branches/devel/docker/images/sle15/images/suse/sles15:2.0.3 AS base
+FROM registry.suse.de/suse/containers/sle-server/15/containers/bci/python:3.9 AS base
 
+RUN rpm -e container-suseconnect
+RUN zypper -n ar -G http://download.suse.de/ibs/SUSE:/SLE-15:/GA/standard/SUSE:SLE-15:GA.repo
+RUN zypper -n ar -G http://download.suse.de/ibs/SUSE:/SLE-15:/Update/standard/SUSE:SLE-15:Update.repo
 RUN zypper -n ref
 
 FROM base AS packages
 
-RUN zypper -n in git python3 python3-dbm rcs awk
+RUN zypper -n in git-core python3 python3-dbm rcs awk
 
 RUN git config --global user.email "you@example.com"
 RUN git config --global user.name "Your Name"
 
 RUN zypper -n ar -G https://download.opensuse.org/repositories/Kernel:/tools/SLE_15/Kernel:tools.repo
-RUN zypper -n in python3-pygit2
-
-RUN zypper -n ar -G https://download.opensuse.org/repositories/home:/benjamin_poirier:/series_sort/SLE_15/home:benjamin_poirier:series_sort.repo
-RUN zypper -n in --from home_benjamin_poirier_series_sort quilt
+RUN zypper -n in python3-pygit2 quilt
 
 FROM packages
 

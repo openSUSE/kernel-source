@@ -1,0 +1,154 @@
+From cc1d0d93d55ac12e7faee9acfcd7c28c8b86cf89 Mon Sep 17 00:00:00 2001
+From: Qu Wenruo <wqu@suse.com>
+Date: Mon, 26 Jul 2021 14:34:58 +0800
+Patch-mainline: v5.15-rc1
+References: jsc#SLE-17681
+Git-commit: cc1d0d93d55ac12e7faee9acfcd7c28c8b86cf89
+Subject: [PATCH 09/18] btrfs: subpage: fix writeback which does not have
+ ordered extent
+
+[BUG]
+When running fsstress with subpage RW support, there are random
+BUG_ON()s triggered with the following trace:
+
+ kernel BUG at fs/btrfs/file-item.c:667!
+ Internal error: Oops - BUG: 0 [#1] SMP
+ CPU: 1 PID: 3486 Comm: kworker/u13:2 5.11.0-rc4-custom+ #43
+ Hardware name: Radxa ROCK Pi 4B (DT)
+ Workqueue: btrfs-worker-high btrfs_work_helper [btrfs]
+ pstate: 60000005 (nZCv daif -PAN -UAO -TCO BTYPE=--)
+ pc : btrfs_csum_one_bio+0x420/0x4e0 [btrfs]
+ lr : btrfs_csum_one_bio+0x400/0x4e0 [btrfs]
+ Call trace:
+  btrfs_csum_one_bio+0x420/0x4e0 [btrfs]
+  btrfs_submit_bio_start+0x20/0x30 [btrfs]
+  run_one_async_start+0x28/0x44 [btrfs]
+  btrfs_work_helper+0x128/0x1b4 [btrfs]
+  process_one_work+0x22c/0x430
+  worker_thread+0x70/0x3a0
+  kthread+0x13c/0x140
+  ret_from_fork+0x10/0x30
+
+[CAUSE]
+Above BUG_ON() means there is some bio range which doesn't have ordered
+extent, which indeed is worth a BUG_ON().
+
+Unlike regular sectorsize == PAGE_SIZE case, in subpage we have extra
+subpage dirty bitmap to record which range is dirty and should be
+written back.
+
+This means, if we submit bio for a subpage range, we do not only need to
+clear page dirty, but also need to clear subpage dirty bits.
+
+In __extent_writepage_io(), we will call btrfs_page_clear_dirty() for
+any range we submit a bio.
+
+But there is loophole, if we hit a range which is beyond i_size, we just
+call btrfs_writepage_endio_finish_ordered() to finish the ordered io,
+then break out, without clearing the subpage dirty.
+
+This means, if we hit above branch, the subpage dirty bits are still
+there, if other range of the page get dirtied and we need to writeback
+that page again, we will submit bio for the old range, leaving a wild
+bio range which doesn't have ordered extent.
+
+[FIX]
+Fix it by always calling btrfs_page_clear_dirty() in
+__extent_writepage_io().
+
+Also to avoid such problem from happening again, add a new assert,
+btrfs_page_assert_not_dirty(), to make sure both page dirty and subpage
+dirty bits are cleared before exiting __extent_writepage_io().
+
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/extent_io.c | 16 ++++++++++++++++
+ fs/btrfs/subpage.c   | 20 ++++++++++++++++++++
+ fs/btrfs/subpage.h   |  3 +++
+ 3 files changed, 39 insertions(+)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 4ee10669ed6b..e1a464f6b42f 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -3864,6 +3864,15 @@ static noinline_for_stack int __extent_writepage_io(struct btrfs_inode *inode,
+ 		if (cur >= i_size) {
+ 			btrfs_writepage_endio_finish_ordered(inode, page, cur,
+ 							     end, true);
++			/*
++			 * This range is beyond i_size, thus we don't need to
++			 * bother writing back.
++			 * But we still need to clear the dirty subpage bit, or
++			 * the next time the page gets dirtied, we will try to
++			 * writeback the sectors with subpage dirty bits,
++			 * causing writeback without ordered extent.
++			 */
++			btrfs_page_clear_dirty(fs_info, page, cur, end + 1 - cur);
+ 			break;
+ 		}
+ 
+@@ -3914,6 +3923,7 @@ static noinline_for_stack int __extent_writepage_io(struct btrfs_inode *inode,
+ 			else
+ 				btrfs_writepage_endio_finish_ordered(inode,
+ 						page, cur, cur + iosize - 1, true);
++			btrfs_page_clear_dirty(fs_info, page, cur, iosize);
+ 			cur += iosize;
+ 			continue;
+ 		}
+@@ -3949,6 +3959,12 @@ static noinline_for_stack int __extent_writepage_io(struct btrfs_inode *inode,
+ 		cur += iosize;
+ 		nr++;
+ 	}
++	/*
++	 * If we finish without problem, we should not only clear page dirty,
++	 * but also empty subpage dirty bits
++	 */
++	if (!ret)
++		btrfs_page_assert_not_dirty(fs_info, page);
+ 	*nr_ret = nr;
+ 	return ret;
+ }
+diff --git a/fs/btrfs/subpage.c b/fs/btrfs/subpage.c
+index 640bcd21bf28..3c311841cdee 100644
+--- a/fs/btrfs/subpage.c
++++ b/fs/btrfs/subpage.c
+@@ -559,3 +559,23 @@ IMPLEMENT_BTRFS_PAGE_OPS(writeback, set_page_writeback, end_page_writeback,
+ 			 PageWriteback);
+ IMPLEMENT_BTRFS_PAGE_OPS(ordered, SetPageOrdered, ClearPageOrdered,
+ 			 PageOrdered);
++
++/*
++ * Make sure not only the page dirty bit is cleared, but also subpage dirty bit
++ * is cleared.
++ */
++void btrfs_page_assert_not_dirty(const struct btrfs_fs_info *fs_info,
++				 struct page *page)
++{
++	struct btrfs_subpage *subpage = (struct btrfs_subpage *)page->private;
++
++	if (!IS_ENABLED(CONFIG_BTRFS_ASSERT))
++		return;
++
++	ASSERT(!PageDirty(page));
++	if (fs_info->sectorsize == PAGE_SIZE)
++		return;
++
++	ASSERT(PagePrivate(page) && page->private);
++	ASSERT(subpage->dirty_bitmap == 0);
++}
+diff --git a/fs/btrfs/subpage.h b/fs/btrfs/subpage.h
+index 4d7aca85d915..0120948f37a1 100644
+--- a/fs/btrfs/subpage.h
++++ b/fs/btrfs/subpage.h
+@@ -126,4 +126,7 @@ DECLARE_BTRFS_SUBPAGE_OPS(ordered);
+ bool btrfs_subpage_clear_and_test_dirty(const struct btrfs_fs_info *fs_info,
+ 		struct page *page, u64 start, u32 len);
+ 
++void btrfs_page_assert_not_dirty(const struct btrfs_fs_info *fs_info,
++				 struct page *page);
++
+ #endif
+-- 
+2.33.0
+
