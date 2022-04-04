@@ -1,5 +1,5 @@
-#!/usr/bin/python
-# -*- coding: utf-8 -*-,
+#!/usr/bin/env python3
+# vim: sw=4 ts=4 et si:
 
 import sys
 import re
@@ -331,7 +331,7 @@ class HeaderChecker(patch.PatchChecker):
             target[tag].append(new_req)
 
     def do_patch(self):
-        for line in self.stream:
+        for line in self.stream.readlines():
             if diffstart.match(line):
                 break
 
