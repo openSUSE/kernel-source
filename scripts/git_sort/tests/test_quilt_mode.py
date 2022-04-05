@@ -168,7 +168,7 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
             content2 = f.read()
         self.assertEqual(content2, content1)
 
-        subprocess.check_call(("git", "init", "./",), stdout=subprocess.DEVNULL)
+        pygit2.init_repository("./")
         subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
                               stdout=subprocess.DEVNULL)
         subprocess.check_call(("git", "commit", "-m", "import",),
@@ -460,7 +460,7 @@ class TestMergeTool(unittest.TestCase):
         self.ks_dir = tempfile.mkdtemp(prefix="gs_ks")
         os.chdir(self.ks_dir)
 
-        subprocess.check_call(("git", "init", "./",), stdout=subprocess.DEVNULL)
+        pygit2.init_repository("./")
         subprocess.check_call(
             ("git", "config", "--add", "mergetool.git-sort.cmd",
              "%s $LOCAL $BASE $REMOTE $MERGED" % (
