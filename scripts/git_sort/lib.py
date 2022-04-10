@@ -280,6 +280,11 @@ class InputEntry(object):
         if not commit_tags:
             self.dest_head = git_sort.oot
             mainline = mainline_tags[0]
+            if re.match("^(v[1-9]|Queued)", mainline, re.IGNORECASE):
+                raise exc.KSError(
+                    "There is a problem with patch \"%s\". "
+                    "The Patch-mainline tag \"%s\" requires Git-commit." % (
+                        name, mainline,))
             if not re.match("^(Submitted|Not yet)", mainline, re.IGNORECASE):
                 raise exc.KSError(
                     "There is a problem with patch \"%s\". "
