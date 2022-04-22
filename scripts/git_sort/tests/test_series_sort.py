@@ -955,6 +955,18 @@ class TestFromPatch(unittest.TestCase):
 "Error: There is a problem with patch \"%s\". The Git-repo tag is incorrect or the patch is in the wrong section of series.conf and (the Git-commit tag is incorrect or the relevant remote is outdated or not available locally) or an entry for this repository is missing from \"remotes\". In the last case, please edit \"remotes\" in \"scripts/git_sort/git_sort.py\" and commit the result. Manual intervention is required.\n" % (name,))
 
 
+    def test_malformed(self):
+        """
+        Generate a series and destroy the Git-commit tag on one of the patches
+        This should report a specific error so that this situation is not conflated with wrong Patch-mainline tag in out-of-tree section
+        """
+
+        name, series2 = self.prepare_found_indexed_upstream_good()
+        subprocess.call(['sed', '-i', '-e', 's/commit/comit/', name])
+        self.check_failure(
+'Error: There is a problem with patch "%s". The Patch-mainline tag "Queued in subsystem maintainer repository" requires Git-commit.\n' % (name))
+
+
 if __name__ == '__main__':
     # Run a single testcase
     suite = unittest.TestLoader().loadTestsFromTestCase(TestFromPatch)
