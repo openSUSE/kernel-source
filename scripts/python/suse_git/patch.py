@@ -1,5 +1,5 @@
-#!/usr/bin/python
-# -*- coding: utf-8 -*-,
+#!/usr/bin/env python3
+# vim: sw=4 ts=4 et si:
 
 import sys
 
