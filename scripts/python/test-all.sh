@@ -1,1 +1,2 @@
-python3 -m unittest discover
+#! /bin/sh
+python3 -m unittest discover "$@"

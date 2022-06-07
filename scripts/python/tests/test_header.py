@@ -1,10 +1,10 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-,
+# vim:set shiftwidth=4 softtabstop=4 expandtab textwidth=79:
 
 import sys
 import os.path
 import unittest
-from io import StringIO
 
 from suse_git import header
 
