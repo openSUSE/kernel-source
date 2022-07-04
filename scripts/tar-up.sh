@@ -166,12 +166,6 @@ check_for_merge_conflicts $referenced_files kernel-source.changes{,.old} || \
 	inconsistent=true
 scripts/check-conf || inconsistent=true
 scripts/check-cvs-add --committed || inconsistent=true
-# FIXME: someone should clean up the mess and make this check fatal
-if $inconsistent; then
-    echo "Inconsistencies found."
-    echo "Please clean up series.conf and/or the patches directories!"
-    echo
-fi
 
 tsfile=source-timestamp
 if ! scripts/cvs-wd-timestamp > $build_dir/$tsfile; then
@@ -195,6 +189,15 @@ trap 'if test -n "$CLEANFILES"; then rm -rf "${CLEANFILES[@]}"; fi' EXIT
 tmpdir=$(mktemp -dt ${0##*/}.XXXXXX)
 CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 rpmfiles=$(ls rpm/* | grep -v "~$")
+rpmstatus=$(for i in $rpmfiles ; do git status -s $i ; done)
+[ -z "$rpmstatus" ] || { inconsistent=true ; echo "$rpmstatus" ; }
+
+# FIXME: someone should clean up the mess and make this check fatal
+if $inconsistent; then
+    echo "Inconsistencies found."
+    echo "Please clean up series.conf and/or the patches directories!"
+    echo
+fi
 
 cp -p $rpmfiles config.conf supported.conf doc/* $build_dir
 match="${flavor:+\\/$flavor$}"
