@@ -106,6 +106,58 @@ apply_fast_patches() {
 SKIPPED_PATCHES=
 
 # Patch kernel normally
+apply_one_patch() {
+    echo "[ $PATCH ]"
+    echo "[ $PATCH ]" >> $PATCH_LOG
+    backup_dir=$PATCH_DIR/.pc/$PATCH
+
+    LAST_LOG=$(patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
+            --no-backup-if-mismatch --force < $PATCH 2>&1)
+    STATUS=$?
+
+    if [ $STATUS -ne 0 ]; then
+        restore_files $backup_dir $PATCH_DIR
+
+        if $SKIP_REVERSE; then
+            patch -R -d $PATCH_DIR -p1 -E $fuzz --force --dry-run \
+                    < $PATCH > /dev/null 2>&1
+            ST=$?
+            if [ $ST -eq 0 ]; then
+                LAST_LOG="[ skipped: can be reverse-applied ]"
+                [ -n "$QUIET" ] && echo "$LAST_LOG"
+                STATUS=0
+                SKIPPED_PATCHES="$SKIPPED_PATCHES $PATCH"
+                PATCH="# $PATCH"
+                remove_rejects $backup_dir $PATCH_DIR
+            fi
+        fi
+
+        # Backup directory is no longer needed
+        rm -rf $backup_dir
+    else
+        if $QUILT; then
+            echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
+        fi
+    fi
+
+    if ! $QUILT; then
+        rm -rf $PATCH_DIR/.pc/
+    fi
+    echo "$LAST_LOG" >> $PATCH_LOG
+    [ -z "$QUIET" ] && echo "$LAST_LOG"
+    if [ $STATUS -ne 0 ]; then
+        [ -n "$QUIET" ] && echo "$LAST_LOG"
+        echo "Patch $PATCH failed (rolled back)."
+        echo "Logfile: $PATCH_LOG"
+        status=1
+        return 1
+    else
+        echo "$SERIES_PFX$PATCH" >> $PATCH_DIR/series
+    fi
+
+    return 0
+}
+
 apply_patches() {
     set -- "${PATCHES[@]}"
     n=0
@@ -139,53 +191,7 @@ apply_patches() {
             status=1
             break
         fi
-        echo "[ $PATCH ]"
-        echo "[ $PATCH ]" >> $PATCH_LOG
-        backup_dir=$PATCH_DIR/.pc/$PATCH
-
-        LAST_LOG=$(patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
-                --no-backup-if-mismatch --force < $PATCH 2>&1)
-        STATUS=$?
-
-        if [ $STATUS -ne 0 ]; then
-            restore_files $backup_dir $PATCH_DIR
-
-	    if $SKIP_REVERSE; then
-		patch -R -d $PATCH_DIR -p1 -E $fuzz --force --dry-run \
-			< $PATCH > /dev/null 2>&1
-		ST=$?
-		if [ $ST -eq 0 ]; then
-			LAST_LOG="[ skipped: can be reverse-applied ]"
-			[ -n "$QUIET" ] && echo "$LAST_LOG"
-			STATUS=0
-			SKIPPED_PATCHES="$SKIPPED_PATCHES $PATCH"
-			PATCH="# $PATCH"
-			remove_rejects $backup_dir $PATCH_DIR
-		fi
-	    fi
-
-	    # Backup directory is no longer needed
-	    rm -rf $backup_dir
-	else
-	    if $QUILT; then
-		echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
-	    fi
-        fi
-
-        if ! $QUILT; then
-            rm -rf $PATCH_DIR/.pc/
-        fi
-        echo "$LAST_LOG" >> $PATCH_LOG
-        [ -z "$QUIET" ] && echo "$LAST_LOG"
-        if [ $STATUS -ne 0 ]; then
-            [ -n "$QUIET" ] && echo "$LAST_LOG"
-            echo "Patch $PATCH failed (rolled back)."
-            echo "Logfile: $PATCH_LOG"
-            status=1
-            break
-        else
-            echo "$SERIES_PFX$PATCH" >> $PATCH_DIR/series
-        fi
+        apply_one_patch || break
 
         shift
 	if $QUILT; then
