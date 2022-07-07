@@ -373,7 +373,7 @@ ask_reuse_config()
 
 filter_config()
 {
-    sed  -e '/CONFIG_GCC_VERSION/ d' -e '/CONFIG_LD_VERSION/ d' -e '/CONFIG_CC_VERSION_TEXT/ d' -e '/^# .* is not set$/p' -e '/^$\|^#/d' "$@" | sort
+    sed  -e '/CONFIG_GCC_VERSION/ d' -e '/CONFIG_LD_VERSION/ d' -e '/CONFIG_CC_VERSION_TEXT/ d' -e '/CONFIG_PAHOLE_VERSION/ d' -e '/^# .* is not set$/p' -e '/^$\|^#/d' "$@" | sort
 }
 
 # Keep these in the -vanilla fragment even if -default has the same values.
@@ -423,6 +423,9 @@ for config in $config_files; do
     esac
     if [ -d scripts/dummy-tools ] ; then
 	MAKE_ARGS="$MAKE_ARGS CROSS_COMPILE=scripts/dummy-tools/"
+	if [ -e scripts/dummy-tools/pahole ]; then
+		MAKE_ARGS="$MAKE_ARGS PAHOLE=scripts/dummy-tools/pahole"
+	fi
 	chmod 755 scripts/dummy-tools/*
 	chmod 755 scripts/*
     fi

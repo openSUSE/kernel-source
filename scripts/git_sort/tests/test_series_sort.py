@@ -124,7 +124,7 @@ class TestSeriesSort(unittest.TestCase):
         tests.support.format_patch(self.repo.get(n1), repo=net_repo)
         tests.support.format_patch(self.repo.get(n2), repo=net_repo)
         tests.support.format_patch(self.repo.get(oot0))
-        tests.support.format_patch(self.repo.get(oot1))
+        tests.support.format_patch(self.repo.get(oot1), mainline="Submitted http://lore.kernel.org/somelist/somemessage")
         os.chdir(self.ks_dir)
 
 
@@ -207,6 +207,35 @@ class TestSeriesSort(unittest.TestCase):
 	# out-of-tree patches
 	patches.suse/oot-0.patch
 	patches.suse/oot-1.patch
+
+	########################################################
+	# end of sorted patches
+	########################################################
+
+	patches.suse/unsorted-after.patch
+""")
+
+        subprocess.check_call([self.ss_path, "-c", series])
+        with open(series) as f:
+            content1 = f.read()
+        subprocess.check_call([self.ss_path, series])
+        with open(series) as f:
+            content2 = f.read()
+        self.assertEqual(content2, content1)
+
+        os.unlink(series)
+
+
+    def test_sort_empty(self):
+        (tmp, series,) = tempfile.mkstemp(dir=self.ks_dir)
+        with open(series, mode="w") as f:
+            f.write(
+"""
+	patches.suse/unsorted-before.patch
+
+	########################################################
+	# sorted patches
+	########################################################
 
 	########################################################
 	# end of sorted patches
@@ -924,6 +953,18 @@ class TestFromPatch(unittest.TestCase):
 
         self.check_failure(
 "Error: There is a problem with patch \"%s\". The Git-repo tag is incorrect or the patch is in the wrong section of series.conf and (the Git-commit tag is incorrect or the relevant remote is outdated or not available locally) or an entry for this repository is missing from \"remotes\". In the last case, please edit \"remotes\" in \"scripts/git_sort/git_sort.py\" and commit the result. Manual intervention is required.\n" % (name,))
+
+
+    def test_malformed(self):
+        """
+        Generate a series and destroy the Git-commit tag on one of the patches
+        This should report a specific error so that this situation is not conflated with wrong Patch-mainline tag in out-of-tree section
+        """
+
+        name, series2 = self.prepare_found_indexed_upstream_good()
+        subprocess.call(['sed', '-i', '-e', 's/commit/comit/', name])
+        self.check_failure(
+'Error: There is a problem with patch "%s". The Patch-mainline tag "Queued in subsystem maintainer repository" requires Git-commit.\n' % (name))
 
 
 if __name__ == '__main__':

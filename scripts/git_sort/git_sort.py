@@ -258,6 +258,7 @@ remotes = (
     Head(RepoURL("clk/linux.git"), "clk-next"),
     Head(RepoURL("git://github.com/ceph/ceph-client"), "testing"),
     Head(RepoURL("bpf/bpf.git")),
+    Head(RepoURL("bpf/bpf-next.git")),
     Head(RepoURL("linusw/linux-gpio.git"), "for-next"),
 )
 
