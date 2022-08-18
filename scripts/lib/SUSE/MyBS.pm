@@ -201,6 +201,16 @@ sub api {
 	if (exists($self->{sshkey})) {
 		$req->header("Authorization", $self->ssh_auth());
 	}
+	my $cookies = $self->{cookies};
+	if (keys % { $cookies } ) {
+		my @cookies = ();
+		foreach my $cookie (keys % { $cookies } ) {
+			@cookies = (@cookies, "$cookie=" . $cookies->{$cookie});
+		}
+		my $cookies = join("; ", @cookies);
+		#print "Cookies: $cookies\n";
+		$req->header("Cookie" => $cookies);
+	}
 	if ($data) {
 		$req->add_content($data);
 		$req->header("Content-type" => "application/octet-stream");
@@ -213,6 +223,14 @@ sub api {
 		#print STDERR $res->as_string();
 		die "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
 	}
+	my $headers = $res->headers();
+	my $cookie = $headers->{'set-cookie'};
+	if ($cookie) {
+		my @cookie = split /\s*([^=;]+)\s*=\s*([^=;]+)\s*;?/, $cookie;
+		#print "Cookie: $cookie[1]=$cookie[2]\n";
+		$self->{cookies}{$cookie[1]} = $cookie[2];
+	}
+
 	return $res->content();
 }
 
