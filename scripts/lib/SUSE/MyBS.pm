@@ -198,9 +198,6 @@ sub api {
 	my $url = $self->{url} . $path;
 
 	my $req = HTTP::Request->new($method => $url);
-	if (exists($self->{sshkey})) {
-		$req->header("Authorization", $self->ssh_auth());
-	}
 	my $cookies = $self->{cookies};
 	if (keys % { $cookies } ) {
 		my @cookies = ();
@@ -210,6 +207,10 @@ sub api {
 		my $cookies = join("; ", @cookies);
 		#print "Cookies: $cookies\n";
 		$req->header("Cookie" => $cookies);
+	} else {
+		if (exists($self->{sshkey})) {
+			$req->header("Authorization", $self->ssh_auth());
+		}
 	}
 	if ($data) {
 		$req->add_content($data);
