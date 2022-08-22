@@ -12,6 +12,8 @@ use HTTP::Request;
 use File::Temp qw(tempfile);
 use Config::IniFiles;
 use Digest::MD5;
+use IPC::Open2;
+use MIME::Base64;
 
 use SUSE::MyBS::Buildresults;
 
@@ -62,7 +64,7 @@ sub new {
 		die join("\n", @Config::IniFiles::errors), "\n";
 	}
 	my %cred;
-	for my $kw (qw(user pass passx keyring gnome_keyring credentials_mgr_class)) {
+	for my $kw (qw(user pass passx sshkey keyring gnome_keyring credentials_mgr_class)) {
 		for my $section ($api_url, "$api_url/", $self->{url}->host) {
 			if (exists($config{$section}) &&
 					exists($config{$section}{$kw})) {
@@ -71,52 +73,74 @@ sub new {
 			}
 		}
 	}
-	if (exists($cred{credentials_mgr_class})) {
-		if ($cred{credentials_mgr_class} eq "osc.credentials.ObfuscatedConfigFileCredentialsManager") {
-			$cred{passx}=$cred{pass};
-		} elsif ($cred{credentials_mgr_class} eq "osc.credentials.KeyringCredentialsManager:pass.Keyring") {
-			# emulate by invoking the pass command directly
+	if (exists($cred{sshkey})) {
+		my $sshkey = $cred{sshkey};
+		my $home = $ENV{'HOME'} . "/";
+
+		$sshkey =~ s,^~[/],$home,;
+		$sshkey="~/.ssh/" . $sshkey unless $sshkey =~ /^\//;
+		$sshkey =~ s,^~[/],$home,;
+		die "Cannot access SSH key file $sshkey\n" unless -r $sshkey;
+		$self->{sshkey} = $sshkey;
+		$self->{user} = $cred{user};
+		if ( -x "/usr/lib/osc/ssh-keygen") {
+			print STDERR "Using OBS keygen in /usr/lib/osc/ssh-keygen\n";
+			$self->{keygen} = "/usr/lib/osc/ssh-keygen";
+		} else {
+			$self->{keygen} = "ssh-keygen";
+		}
+	} else {
+		if (exists($cred{credentials_mgr_class})) {
+			if ($cred{credentials_mgr_class} eq "osc.credentials.ObfuscatedConfigFileCredentialsManager") {
+				$cred{passx}=$cred{pass};
+			} elsif ($cred{credentials_mgr_class} eq "osc.credentials.KeyringCredentialsManager:pass.Keyring") {
+				# emulate by invoking the pass command directly
+				my $api = $api_url;
+				$api =~ s/^https?:\/\///;
+				open(my $secret, "pass show $api/$cred{user} |")
+					or die "Failed to invoke pass\n";
+				$cred{pass} = <$secret>;
+				close($secret);
+				die "Failed to obtain secret from pass\n"
+				if !$cred{pass};
+				chomp($cred{pass});
+			}
+		}
+		if (exists($cred{passx})) {
+			# Not available on SLES10, hence the 'require'
+			require MIME::Base64;
+			require IO::Uncompress::Bunzip2;
+			my $bz2 = MIME::Base64::decode_base64($cred{passx});
+			$cred{pass} = "";
+			IO::Uncompress::Bunzip2::bunzip2(\$bz2 => \$cred{pass})
+				or die "Decoding password for $api_url failed: $IO::Uncompress::Bunzip2::Bunzip2Error\n";
+		}
+		if (!exists($cred{pass}) && (exists($cred{keyring}) || exists($cred{gnome_keyring}))) {
 			my $api = $api_url;
 			$api =~ s/^https?:\/\///;
-			open(my $secret, "pass show $api/$cred{user} |")
-				or die "Failed to invoke pass\n";
+			open(my $secret, "secret-tool lookup service $api username $cred{user} |")
+				or die "Please install the \"secret-tool\" package to use a keyring\n";
 			$cred{pass} = <$secret>;
 			close($secret);
-			die "Failed to obtain secret from pass\n"
-				if !$cred{pass};
+			die "Failed to obtain secret from secret-tool\n"
+			if !$cred{pass};
 			chomp($cred{pass});
 		}
 	}
-	if (exists($cred{passx})) {
-		# Not available on SLES10, hence the 'require'
-		require MIME::Base64;
-		require IO::Uncompress::Bunzip2;
-		my $bz2 = MIME::Base64::decode_base64($cred{passx});
-		$cred{pass} = "";
-		IO::Uncompress::Bunzip2::bunzip2(\$bz2 => \$cred{pass})
-			or die "Decoding password for $api_url failed: $IO::Uncompress::Bunzip2::Bunzip2Error\n";
-	}
-	if (!exists($cred{pass}) && (exists($cred{keyring}) || exists($cred{gnome_keyring}))) {
-		my $api = $api_url;
-		$api =~ s/^https?:\/\///;
-		open(my $secret, "secret-tool lookup service $api username $cred{user} |")
-		    or die "Please install the \"secret-tool\" package to use a keyring\n";
-		$cred{pass} = <$secret>;
-		close($secret);
-		die "Failed to obtain secret from secret-tool\n"
-		    if !$cred{pass};
-		chomp($cred{pass});
-	}
-	if (!exists($cred{user}) || !exists($cred{pass})) {
-			die "Error: Username or password for $api_url not set in ~/.oscrc\n" .
-			"Error: Run `osc -A $api_url ls' once\n";
+	if (!exists($cred{user}) || (!exists($cred{pass}) && !exists($cred{sshkey}))) {
+		die "Error: Username or password for $api_url not set in ~/.oscrc\n" .
+		"Error: Run `osc -A $api_url ls' once\n";
 	}
 
 	$self->{ua} = LWP::UserAgent->new;
 	my $realm = "Use your developer account";
 	$realm = "Use your SUSE developer account" if $api_url =~ /opensuse/;
-	$self->{ua}->credentials($self->{url}->host_port, $realm,
-		$cred{user}, $cred{pass});
+	if (exists($self->{sshkey})) {
+		$self->{realm} = $realm;
+	} else {
+		$self->{ua}->credentials($self->{url}->host_port, $realm,
+			$cred{user}, $cred{pass});
+	}
 	if ($self->{ua}->can('ssl_opts')) {
 		$self->{ua}->ssl_opts(verify_hostname => 1);
 	}
@@ -142,11 +166,52 @@ sub new {
 	return $self;
 }
 
+sub ssh_auth {
+	my $self = $_[0];
+	my $now = time();
+	my $key = $self->{sshkey};
+	my $realm = $self->{realm};
+	my $user = $self->{user};
+	my $data = "(created): $now";
+	my $keygen = $self->{keygen};
+
+	my $pid = open2(my $reader, my $writer, $keygen, '-Y', 'sign', '-f', $key, '-n', $realm, '-q');
+	print $writer $data;
+	close $writer;
+	my $sig = do {
+		local $/ = undef;
+		<$reader>;
+	};
+	die "Failed to get SSH signature.\n" unless $sig =~ /\A-----BEGIN SSH SIGNATURE-----\n\K.*(?=\n-----END SSH SIGNATURE-----\Z)/ms;
+	$sig = $&;
+	$sig = encode_base64(decode_base64($sig), '');
+	$sig = "keyId=\"$user\",algorithm=\"ssh\",headers=\"(created)\",created=$now,signature=\"$sig\"";
+	$sig = "Signature $sig";
+
+	waitpid $pid, 0;
+
+	return $sig;
+}
+
 sub api {
 	my ($self, $method, $path, $data) = @_;
 	my $url = $self->{url} . $path;
 
 	my $req = HTTP::Request->new($method => $url);
+	my $cookies = $self->{cookies};
+	if (keys % { $cookies } ) {
+		my @cookies = ();
+		foreach my $cookie (keys % { $cookies } ) {
+			@cookies = (@cookies, "$cookie=" . $cookies->{$cookie});
+		}
+		my $cookies = join("; ", @cookies);
+		#print "Cookies: $cookies\n";
+		$req->header("Cookie" => $cookies);
+	} else {
+		if (exists($self->{sshkey})) {
+			$req->header("Authorization", $self->ssh_auth());
+		}
+	}
 	if ($data) {
 		$req->add_content($data);
 		$req->header("Content-type" => "application/octet-stream");
@@ -159,6 +224,14 @@ sub api {
 		#print STDERR $res->as_string();
 		die "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
 	}
+	my $headers = $res->headers();
+	my $cookie = $headers->{'set-cookie'};
+	if ($cookie) {
+		my @cookie = split /\s*([^=;]+)\s*=\s*([^=;]+)\s*;?/, $cookie;
+		#print "Cookie: $cookie[1]=$cookie[2]\n";
+		$self->{cookies}{$cookie[1]} = $cookie[2];
+	}
+
 	return $res->content();
 }
 
