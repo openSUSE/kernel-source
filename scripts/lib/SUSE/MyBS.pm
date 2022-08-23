@@ -166,13 +166,19 @@ sub new {
 			$self->get("/about");
 		};
 		if ($@) {
-			# Use the canned certificate as a backup
-			# XXX: Check that we really got an unknown cert error
-			(my $pkg = __PACKAGE__) =~ s@::@/@g;
-			$pkg .= ".pm";
-			(my $cert = $INC{$pkg}) =~ s@[^/]*$@@;
-			$cert .= "SUSE_Trust_Root.pem";
-			$self->{ua}->ssl_opts(SSL_ca_file => $cert);
+			my $error = $@;
+			if ($@ =~ /certificate verify failed/) {
+				$self->unlock_cookie();
+				# Use the canned certificate as a backup
+				# XXX: Check that we really got an unknown cert error
+				(my $pkg = __PACKAGE__) =~ s@::@/@g;
+				$pkg .= ".pm";
+				(my $cert = $INC{$pkg}) =~ s@[^/]*$@@;
+				$cert .= "SUSE_Trust_Root.pem";
+				$self->{ua}->ssl_opts(SSL_ca_file => $cert);
+			} else {
+				die $error;
+			}
 		}
 	}
 	return $self;
@@ -264,8 +270,16 @@ sub lock_cookie {
 sub DESTROY {
 	my $self = $_[0];
 
+	$self->unlock_cookie();
+}
+
+sub unlock_cookie {
+	my $self = $_[0];
+
 	if ($self->{lock}) {
 		unlink($lockfile, $self->{cookiefile});
+		$self->{lock} = undef;
+		$self->{cookiefile} = undef;
 	}
 }
 
