@@ -27,7 +27,7 @@ else
     echo "WARNING: not in a GIT working directory, things might break." >&2
     echo >&2
 fi
-scripts_dir=$(dirname "$0")
+scripts_dir="$(dirname "$0")"
 
 get_branch_name()
 {
@@ -41,7 +41,7 @@ get_branch_name()
 
 _find_tarball()
 {
-    local version=$1 suffixes=$2 dir subdir major suffix
+    local version=$1 suffixes=$2 dir subdir major suffix tarball sig dc
 
     set -- ${version//[.-]/ }
     if test $1 -le 2; then
@@ -59,8 +59,26 @@ _find_tarball()
     for dir in . $MIRROR {/mounts,/labs,}/mirror/kernel; do
         for subdir in "" "/v$major" "/testing" "/v$major/testing"; do
             for suffix in $suffixes; do
-                if test -r "$dir$subdir/linux-$version.$suffix"; then
-                    echo "$_"
+                tarball="$dir$subdir/linux-$version.$suffix"
+                if test -r "$tarball"; then
+                    sig="${tarball%.*}.sign"
+                    if ! [ -r "$sig" ] ; then
+                        echo "Missing signature $sig for tarball $tarball" >&2
+                        continue
+                    fi
+                    echo "Verifying $tarball" >&2
+                    case $suffix in
+                        *.gz) dc="gzip -dc";;
+                        *.xz) dc="xzcat";;
+                        *.bz2) dc="bzip2 -dc";;
+                        *) echo "Unknown archive format $suffix" >&2
+                            continue;;
+                    esac
+                    if ! $dc < "$tarball" | gpgv --keyring "$scripts_dir/linux.keyring" "$sig" - ; then
+                        echo "$tarball signature $sig verification failed" >&2
+                        continue
+                    fi
+                    echo "$tarball"
                     return
                 fi
             done
@@ -114,7 +132,9 @@ get_tarball()
         return
     fi
     # Reuse the locally generated tarball if already there
-    if test -e "$dest/linux-$version.$suffix"; then
+    tarball="$dest/linux-$version.$suffix"
+    if test -e "$tarball"; then
+        echo "Reusing $tarball" >&2
         return
     fi
     echo "Warning: could not find linux-$version.$suffix, trying to create it from git" >&2
