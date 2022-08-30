@@ -39,6 +39,10 @@ get_branch_name()
     fi
 }
 
+get_kernel_sig(){
+    echo "${1%.*}.sign"
+}
+
 _find_tarball()
 {
     local version=$1 suffixes=$2 dir subdir major suffix tarball sig dc
@@ -61,7 +65,7 @@ _find_tarball()
             for suffix in $suffixes; do
                 tarball="$dir$subdir/linux-$version.$suffix"
                 if test -r "$tarball"; then
-                    sig="${tarball%.*}.sign"
+                    sig="$(get_kernel_sig "$tarball")"
                     if ! [ -r "$sig" ] ; then
                         echo "Missing signature $sig for tarball $tarball" >&2
                         continue
@@ -123,18 +127,27 @@ _get_tarball_from_git()
 
 get_tarball()
 {
-    local version=$1 suffix=$2 dest=$3 url=$4 tarball compress
+    local version=$1 suffix=$2 dest=$3 url=$4 tarball compress sig
 
     tarball=$(_find_tarball "$version" "$suffix")
     if test -n "$tarball"; then
+        sig="$(get_kernel_sig "$dest/linux-$version.$suffix")"
         cp -p "$tarball" "$dest/linux-$version.$suffix.part" || exit
+        cp -p "$(get_kernel_sig "$tarball")" "$sig.part" || exit
         mv "$dest/linux-$version.$suffix.part" "$dest/linux-$version.$suffix"
+        mv "$sig.part" "$sig"
+        cp -p "$scripts_dir/linux.keyring" "$dest"
         return
     fi
     # Reuse the locally generated tarball if already there
     tarball="$dest/linux-$version.$suffix"
     if test -e "$tarball"; then
         echo "Reusing $tarball" >&2
+        sig="$(get_kernel_sig "$tarball")"
+        if [ -e $sig ] ; then
+            echo "Reusing $sig" >&2
+            cp -p "$scripts_dir/linux.keyring" "$dest"
+        fi
         return
     fi
     echo "Warning: could not find linux-$version.$suffix, trying to create it from git" >&2
