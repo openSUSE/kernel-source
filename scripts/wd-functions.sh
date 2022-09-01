@@ -27,7 +27,7 @@ else
     echo "WARNING: not in a GIT working directory, things might break." >&2
     echo >&2
 fi
-scripts_dir=$(dirname "$0")
+scripts_dir="$(dirname "$0")"
 
 get_branch_name()
 {
@@ -39,9 +39,13 @@ get_branch_name()
     fi
 }
 
+get_kernel_sig(){
+    echo "${1%.*}.sign"
+}
+
 _find_tarball()
 {
-    local version=$1 suffixes=$2 dir subdir major suffix
+    local version=$1 suffixes=$2 dir subdir major suffix tarball sig dc
 
     set -- ${version//[.-]/ }
     if test $1 -le 2; then
@@ -59,8 +63,26 @@ _find_tarball()
     for dir in . $MIRROR {/mounts,/labs,}/mirror/kernel; do
         for subdir in "" "/v$major" "/testing" "/v$major/testing"; do
             for suffix in $suffixes; do
-                if test -r "$dir$subdir/linux-$version.$suffix"; then
-                    echo "$_"
+                tarball="$dir$subdir/linux-$version.$suffix"
+                if test -r "$tarball"; then
+                    sig="$(get_kernel_sig "$tarball")"
+                    if ! [ -r "$sig" ] ; then
+                        echo "Missing signature $sig for tarball $tarball" >&2
+                        continue
+                    fi
+                    echo "Verifying $tarball" >&2
+                    case $suffix in
+                        *.gz) dc="gzip -dc";;
+                        *.xz) dc="xzcat";;
+                        *.bz2) dc="bzip2 -dc";;
+                        *) echo "Unknown archive format $suffix" >&2
+                            continue;;
+                    esac
+                    if ! $dc < "$tarball" | gpgv --keyring "$scripts_dir/linux.keyring" "$sig" - ; then
+                        echo "$tarball signature $sig verification failed" >&2
+                        continue
+                    fi
+                    echo "$tarball"
                     return
                 fi
             done
@@ -105,16 +127,27 @@ _get_tarball_from_git()
 
 get_tarball()
 {
-    local version=$1 suffix=$2 dest=$3 url=$4 tarball compress
+    local version=$1 suffix=$2 dest=$3 url=$4 tarball compress sig
 
     tarball=$(_find_tarball "$version" "$suffix")
     if test -n "$tarball"; then
+        sig="$(get_kernel_sig "$dest/linux-$version.$suffix")"
         cp -p "$tarball" "$dest/linux-$version.$suffix.part" || exit
+        cp -p "$(get_kernel_sig "$tarball")" "$sig.part" || exit
         mv "$dest/linux-$version.$suffix.part" "$dest/linux-$version.$suffix"
+        mv "$sig.part" "$sig"
+        cp -p "$scripts_dir/linux.keyring" "$dest"
         return
     fi
     # Reuse the locally generated tarball if already there
-    if test -e "$dest/linux-$version.$suffix"; then
+    tarball="$dest/linux-$version.$suffix"
+    if test -e "$tarball"; then
+        echo "Reusing $tarball" >&2
+        sig="$(get_kernel_sig "$tarball")"
+        if [ -e $sig ] ; then
+            echo "Reusing $sig" >&2
+            cp -p "$scripts_dir/linux.keyring" "$dest"
+        fi
         return
     fi
     echo "Warning: could not find linux-$version.$suffix, trying to create it from git" >&2
