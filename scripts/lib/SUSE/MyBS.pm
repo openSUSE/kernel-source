@@ -287,15 +287,17 @@ sub save_cookie {
 	my ($self, $cookie) = @_;
 	my $fh = $self->{lock};
 
-	print $fh $cookie;
+	if ($fh) {
+		print $fh $cookie;
 
-	close($fh);
+		close($fh);
 
-	move($self->{cookiefile}, $cookiefile);
-	unlink($lockfile);
+		move($self->{cookiefile}, $cookiefile);
+		unlink($lockfile);
 
-	$self->{lock} = undef;
-	$self->{cookiefile} = undef;
+		$self->{lock} = undef;
+		$self->{cookiefile} = undef;
+	}
 }
 
 sub ssh_auth {
