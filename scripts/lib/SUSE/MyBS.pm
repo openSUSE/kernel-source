@@ -10,12 +10,22 @@ use XML::Parser;
 use XML::Writer;
 use HTTP::Request;
 use File::Temp qw(tempfile);
+use File::Copy qw(move);
+use File::Basename;
+use File::Path qw/make_path/;
 use Config::IniFiles;
 use Digest::MD5;
 use IPC::Open2;
 use MIME::Base64;
+use Fcntl;
+use POSIX qw(strftime);
+use Errno;
 
 use SUSE::MyBS::Buildresults;
+
+my $cookiefile = "~/.local/state/MyBS/cookie";
+my $lockfile = $cookiefile . ".lock";
+my $locktime = 300;
 
 sub new {
 	my ($class, $api_url) = @_;
@@ -147,6 +157,8 @@ sub new {
 
 	bless($self, $class);
 
+	$self->load_cookie();
+
 	if ($self->{url}->scheme eq "https" &&
 				$self->{url}->host eq "api.suse.de" &&
 				$self->{ua}->can('ssl_opts')) {
@@ -154,16 +166,138 @@ sub new {
 			$self->get("/about");
 		};
 		if ($@) {
-			# Use the canned certificate as a backup
-			# XXX: Check that we really got an unknown cert error
-			(my $pkg = __PACKAGE__) =~ s@::@/@g;
-			$pkg .= ".pm";
-			(my $cert = $INC{$pkg}) =~ s@[^/]*$@@;
-			$cert .= "SUSE_Trust_Root.pem";
-			$self->{ua}->ssl_opts(SSL_ca_file => $cert);
+			my $error = $@;
+			if ($@ =~ /certificate verify failed/) {
+				$self->unlock_cookie();
+				# Use the canned certificate as a backup
+				# XXX: Check that we really got an unknown cert error
+				(my $pkg = __PACKAGE__) =~ s@::@/@g;
+				$pkg .= ".pm";
+				(my $cert = $INC{$pkg}) =~ s@[^/]*$@@;
+				$cert .= "SUSE_Trust_Root.pem";
+				$self->{ua}->ssl_opts(SSL_ca_file => $cert);
+			} else {
+				die $error;
+			}
 		}
 	}
 	return $self;
+}
+
+sub check_cookie {
+	my $self = $_[0];
+	my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($cookiefile);
+	# printf("Loaded cookie from %s, current cookie time is %s\n", $self->{cookietime} ? $self->{cookietime} : 'none', $mtime ? $mtime : 'none');
+	if ($mtime && (!$self->{cookietime} || ($self->{cookietime} < $mtime))) {
+		$self->load_cookie();
+		return 1;
+	}
+	return undef;
+}
+
+sub load_cookie {
+	my $self = $_[0];
+	my $home = $ENV{'HOME'} . "/";
+	$cookiefile =~ s,^~[/],$home,;
+	my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($cookiefile);
+	$self->{cookietime} = $mtime;
+	if (-r $cookiefile) {
+		my $cookie = do {
+			open(my $fh, $cookiefile);
+			local $/ = undef;
+			<$fh>;
+		};
+		# print "Loading ";
+		$self->process_cookie($cookie);
+	}
+}
+
+sub process_cookie {
+	my ($self, $cookie) = @_;
+	my @cookie = split /\s*([^=;]+)\s*=\s*([^=;]+)\s*;?/, $cookie;
+	# print "Cookie: $cookie[1]=$cookie[2]\n";
+	$self->{cookies}{$cookie[1]} = $cookie[2];
+}
+
+sub open_cookie {
+	my $self = $_[0];
+	my $home = $ENV{'HOME'} . "/";
+	$lockfile =~ s,^~[/],$home,;
+	my $dir = dirname($lockfile);
+	make_path($dir);
+	my $fh, my $filename;
+	my $ret = sysopen $fh, $lockfile, O_CREAT|O_EXCL|O_WRONLY, 0644;
+	if ($ret) {
+		($fh, $filename) = tempfile( 'cookie-XXXXXX', DIR => $dir);
+	} else {
+		if (!$!{EEXIST}) {
+			die "Cannot access $lockfile: $!\n";
+		}
+	}
+	return undef unless $ret;
+	$self->{lock} = $fh;
+	$self->{cookiefile} = $filename;
+	return $fh;
+}
+
+sub lock_cookie {
+	my $self = $_[0];
+	die "Deadlock: Already locked!\n" if $self->{lock};
+	my $ret = $self->open_cookie();
+	my $delay = 1;
+	while (!$ret) {
+		my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($lockfile);
+		if ($mtime) {
+			my $age = time() - $mtime;
+			my $remain = $locktime - $age;
+			if ($remain > 0) {
+				sleep((($remain > 0) && ($remain < $delay)) ? $remain : $delay);
+				$delay *= 2;
+			} else {
+				my $date = strftime("%F %R", localtime($mtime));
+				print STDERR "Cookie file $cookiefile locked for $age seconds since $date\n";
+				unlink "$lockfile";
+			}
+		} else {
+			if (!$!{ENOENT}) {
+				die "Cannot access $lockfile: $!\n";
+			}
+			$ret = $self->open_cookie();
+		}
+	}
+}
+
+sub DESTROY {
+	my $self = $_[0];
+
+	$self->unlock_cookie();
+}
+
+sub unlock_cookie {
+	my $self = $_[0];
+
+	if ($self->{lock}) {
+		unlink($lockfile, $self->{cookiefile});
+		$self->{lock} = undef;
+		$self->{cookiefile} = undef;
+	}
+}
+
+sub save_cookie {
+	my ($self, $cookie) = @_;
+	my $fh = $self->{lock};
+
+	if ($fh) {
+		print $fh $cookie;
+
+		close($fh);
+
+		move($self->{cookiefile}, $cookiefile);
+		unlink($lockfile);
+
+		$self->{lock} = undef;
+		$self->{cookiefile} = undef;
+	}
 }
 
 sub ssh_auth {
@@ -205,11 +339,12 @@ sub api {
 			@cookies = (@cookies, "$cookie=" . $cookies->{$cookie});
 		}
 		my $cookies = join("; ", @cookies);
-		#print "Cookies: $cookies\n";
+		# print "Cookies: $cookies\n";
 		$req->header("Cookie" => $cookies);
 	} else {
 		if (exists($self->{sshkey})) {
-			$req->header("Authorization", $self->ssh_auth());
+			$self->lock_cookie();
+			$req->header("Authorization", $self->ssh_auth()) unless $self->check_cookie();
 		}
 	}
 	if ($data) {
@@ -220,6 +355,11 @@ sub api {
 	#print STDERR "req: " . $req->as_string() . "\n";
 	#$self->{ua}->add_handler(request_send => sub { my($req, $ua, $handler) = @_; print STDERR "req: " . $req->as_string() . "\n"; return; m_method => "GET"});
 	my $res = $self->{ua}->request($req);
+	if (($res->code == 401) && (keys % { $cookies } ) && exists($self->{sshkey})) {
+		$self->lock_cookie();
+		$req->header("Authorization", $self->ssh_auth()) unless $self->check_cookie();
+		$res = $self->{ua}->request($req);
+	}
 	if ($res->code != 200) {
 		#print STDERR $res->as_string();
 		die "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
@@ -227,9 +367,8 @@ sub api {
 	my $headers = $res->headers();
 	my $cookie = $headers->{'set-cookie'};
 	if ($cookie) {
-		my @cookie = split /\s*([^=;]+)\s*=\s*([^=;]+)\s*;?/, $cookie;
-		#print "Cookie: $cookie[1]=$cookie[2]\n";
-		$self->{cookies}{$cookie[1]} = $cookie[2];
+		$self->process_cookie($cookie);
+		$self->save_cookie($cookie);
 	}
 
 	return $res->content();

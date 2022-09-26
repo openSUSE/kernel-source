@@ -277,6 +277,12 @@ class InputEntry(object):
             raise exc.KSError("Multiple Patch-mainline tags found. Patch \"%s\" is "
                           "tagged improperly." % (name,))
 
+        if not mainline_tags:
+            raise exc.KSError(
+                "There is a problem with patch \"%s\". "
+                "The Patch-mainline tag is missing." % (
+                    name,))
+
         if not commit_tags:
             self.dest_head = git_sort.oot
             mainline = mainline_tags[0]
