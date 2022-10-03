@@ -129,6 +129,9 @@ for f in "$build_dir"/*; do
 	"linux-$SRCVERSION.$suffix")
 		continue
 		;;
+	"linux-$SRCVERSION.tar.sign")
+		continue
+		;;
 	patches.*)
 		rm -rf "$f"
 	esac

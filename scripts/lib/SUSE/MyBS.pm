@@ -10,10 +10,22 @@ use XML::Parser;
 use XML::Writer;
 use HTTP::Request;
 use File::Temp qw(tempfile);
+use File::Copy qw(move);
+use File::Basename;
+use File::Path qw/make_path/;
 use Config::IniFiles;
 use Digest::MD5;
+use IPC::Open2;
+use MIME::Base64;
+use Fcntl;
+use POSIX qw(strftime);
+use Errno;
 
 use SUSE::MyBS::Buildresults;
+
+my $cookiefile = "~/.local/state/MyBS/cookie";
+my $lockfile = $cookiefile . ".lock";
+my $locktime = 300;
 
 sub new {
 	my ($class, $api_url) = @_;
@@ -62,7 +74,7 @@ sub new {
 		die join("\n", @Config::IniFiles::errors), "\n";
 	}
 	my %cred;
-	for my $kw (qw(user pass passx keyring gnome_keyring credentials_mgr_class)) {
+	for my $kw (qw(user pass passx sshkey keyring gnome_keyring credentials_mgr_class)) {
 		for my $section ($api_url, "$api_url/", $self->{url}->host) {
 			if (exists($config{$section}) &&
 					exists($config{$section}{$kw})) {
@@ -71,57 +83,81 @@ sub new {
 			}
 		}
 	}
-	if (exists($cred{credentials_mgr_class})) {
-		if ($cred{credentials_mgr_class} eq "osc.credentials.ObfuscatedConfigFileCredentialsManager") {
-			$cred{passx}=$cred{pass};
-		} elsif ($cred{credentials_mgr_class} eq "osc.credentials.KeyringCredentialsManager:pass.Keyring") {
-			# emulate by invoking the pass command directly
+	if (exists($cred{sshkey})) {
+		my $sshkey = $cred{sshkey};
+		my $home = $ENV{'HOME'} . "/";
+
+		$sshkey =~ s,^~[/],$home,;
+		$sshkey="~/.ssh/" . $sshkey unless $sshkey =~ /^\//;
+		$sshkey =~ s,^~[/],$home,;
+		die "Cannot access SSH key file $sshkey\n" unless -r $sshkey;
+		$self->{sshkey} = $sshkey;
+		$self->{user} = $cred{user};
+		if ( -x "/usr/lib/osc/ssh-keygen") {
+			print STDERR "Using OBS keygen in /usr/lib/osc/ssh-keygen\n";
+			$self->{keygen} = "/usr/lib/osc/ssh-keygen";
+		} else {
+			$self->{keygen} = "ssh-keygen";
+		}
+	} else {
+		if (exists($cred{credentials_mgr_class})) {
+			if ($cred{credentials_mgr_class} eq "osc.credentials.ObfuscatedConfigFileCredentialsManager") {
+				$cred{passx}=$cred{pass};
+			} elsif ($cred{credentials_mgr_class} eq "osc.credentials.KeyringCredentialsManager:pass.Keyring") {
+				# emulate by invoking the pass command directly
+				my $api = $api_url;
+				$api =~ s/^https?:\/\///;
+				open(my $secret, "pass show $api/$cred{user} |")
+					or die "Failed to invoke pass\n";
+				$cred{pass} = <$secret>;
+				close($secret);
+				die "Failed to obtain secret from pass\n"
+				if !$cred{pass};
+				chomp($cred{pass});
+			}
+		}
+		if (exists($cred{passx})) {
+			# Not available on SLES10, hence the 'require'
+			require MIME::Base64;
+			require IO::Uncompress::Bunzip2;
+			my $bz2 = MIME::Base64::decode_base64($cred{passx});
+			$cred{pass} = "";
+			IO::Uncompress::Bunzip2::bunzip2(\$bz2 => \$cred{pass})
+				or die "Decoding password for $api_url failed: $IO::Uncompress::Bunzip2::Bunzip2Error\n";
+		}
+		if (!exists($cred{pass}) && (exists($cred{keyring}) || exists($cred{gnome_keyring}))) {
 			my $api = $api_url;
 			$api =~ s/^https?:\/\///;
-			open(my $secret, "pass show $api/$cred{user} |")
-				or die "Failed to invoke pass\n";
+			open(my $secret, "secret-tool lookup service $api username $cred{user} |")
+				or die "Please install the \"secret-tool\" package to use a keyring\n";
 			$cred{pass} = <$secret>;
 			close($secret);
-			die "Failed to obtain secret from pass\n"
-				if !$cred{pass};
+			die "Failed to obtain secret from secret-tool\n"
+			if !$cred{pass};
 			chomp($cred{pass});
 		}
 	}
-	if (exists($cred{passx})) {
-		# Not available on SLES10, hence the 'require'
-		require MIME::Base64;
-		require IO::Uncompress::Bunzip2;
-		my $bz2 = MIME::Base64::decode_base64($cred{passx});
-		$cred{pass} = "";
-		IO::Uncompress::Bunzip2::bunzip2(\$bz2 => \$cred{pass})
-			or die "Decoding password for $api_url failed: $IO::Uncompress::Bunzip2::Bunzip2Error\n";
-	}
-	if (!exists($cred{pass}) && (exists($cred{keyring}) || exists($cred{gnome_keyring}))) {
-		my $api = $api_url;
-		$api =~ s/^https?:\/\///;
-		open(my $secret, "secret-tool lookup service $api username $cred{user} |")
-		    or die "Please install the \"secret-tool\" package to use a keyring\n";
-		$cred{pass} = <$secret>;
-		close($secret);
-		die "Failed to obtain secret from secret-tool\n"
-		    if !$cred{pass};
-		chomp($cred{pass});
-	}
-	if (!exists($cred{user}) || !exists($cred{pass})) {
-			die "Error: Username or password for $api_url not set in ~/.oscrc\n" .
-			"Error: Run `osc -A $api_url ls' once\n";
+	if (!exists($cred{user}) || (!exists($cred{pass}) && !exists($cred{sshkey}))) {
+		die "Error: Username or password for $api_url not set in ~/.oscrc\n" .
+		"Error: Run `osc -A $api_url ls' once\n";
 	}
 
 	$self->{ua} = LWP::UserAgent->new;
 	my $realm = "Use your developer account";
 	$realm = "Use your SUSE developer account" if $api_url =~ /opensuse/;
-	$self->{ua}->credentials($self->{url}->host_port, $realm,
-		$cred{user}, $cred{pass});
+	if (exists($self->{sshkey})) {
+		$self->{realm} = $realm;
+	} else {
+		$self->{ua}->credentials($self->{url}->host_port, $realm,
+			$cred{user}, $cred{pass});
+	}
 	if ($self->{ua}->can('ssl_opts')) {
 		$self->{ua}->ssl_opts(verify_hostname => 1);
 	}
 
 	bless($self, $class);
+
+	$self->load_cookie();
 
 	if ($self->{url}->scheme eq "https" &&
 				$self->{url}->host eq "api.suse.de" &&
@@ -130,16 +166,165 @@ sub new {
 			$self->get("/about");
 		};
 		if ($@) {
-			# Use the canned certificate as a backup
-			# XXX: Check that we really got an unknown cert error
-			(my $pkg = __PACKAGE__) =~ s@::@/@g;
-			$pkg .= ".pm";
-			(my $cert = $INC{$pkg}) =~ s@[^/]*$@@;
-			$cert .= "SUSE_Trust_Root.pem";
-			$self->{ua}->ssl_opts(SSL_ca_file => $cert);
+			my $error = $@;
+			if ($@ =~ /certificate verify failed/) {
+				$self->unlock_cookie();
+				# Use the canned certificate as a backup
+				# XXX: Check that we really got an unknown cert error
+				(my $pkg = __PACKAGE__) =~ s@::@/@g;
+				$pkg .= ".pm";
+				(my $cert = $INC{$pkg}) =~ s@[^/]*$@@;
+				$cert .= "SUSE_Trust_Root.pem";
+				$self->{ua}->ssl_opts(SSL_ca_file => $cert);
+			} else {
+				die $error;
+			}
 		}
 	}
 	return $self;
+}
+
+sub check_cookie {
+	my $self = $_[0];
+	my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($cookiefile);
+	# printf("Loaded cookie from %s, current cookie time is %s\n", $self->{cookietime} ? $self->{cookietime} : 'none', $mtime ? $mtime : 'none');
+	if ($mtime && (!$self->{cookietime} || ($self->{cookietime} < $mtime))) {
+		$self->load_cookie();
+		return 1;
+	}
+	return undef;
+}
+
+sub load_cookie {
+	my $self = $_[0];
+	my $home = $ENV{'HOME'} . "/";
+	$cookiefile =~ s,^~[/],$home,;
+	my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($cookiefile);
+	$self->{cookietime} = $mtime;
+	if (-r $cookiefile) {
+		my $cookie = do {
+			open(my $fh, $cookiefile);
+			local $/ = undef;
+			<$fh>;
+		};
+		# print "Loading ";
+		$self->process_cookie($cookie);
+	}
+}
+
+sub process_cookie {
+	my ($self, $cookie) = @_;
+	my @cookie = split /\s*([^=;]+)\s*=\s*([^=;]+)\s*;?/, $cookie;
+	# print "Cookie: $cookie[1]=$cookie[2]\n";
+	$self->{cookies}{$cookie[1]} = $cookie[2];
+}
+
+sub open_cookie {
+	my $self = $_[0];
+	my $home = $ENV{'HOME'} . "/";
+	$lockfile =~ s,^~[/],$home,;
+	my $dir = dirname($lockfile);
+	make_path($dir);
+	my $fh, my $filename;
+	my $ret = sysopen $fh, $lockfile, O_CREAT|O_EXCL|O_WRONLY, 0644;
+	if ($ret) {
+		($fh, $filename) = tempfile( 'cookie-XXXXXX', DIR => $dir);
+	} else {
+		if (!$!{EEXIST}) {
+			die "Cannot access $lockfile: $!\n";
+		}
+	}
+	return undef unless $ret;
+	$self->{lock} = $fh;
+	$self->{cookiefile} = $filename;
+	return $fh;
+}
+
+sub lock_cookie {
+	my $self = $_[0];
+	die "Deadlock: Already locked!\n" if $self->{lock};
+	my $ret = $self->open_cookie();
+	my $delay = 1;
+	while (!$ret) {
+		my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($lockfile);
+		if ($mtime) {
+			my $age = time() - $mtime;
+			my $remain = $locktime - $age;
+			if ($remain > 0) {
+				sleep((($remain > 0) && ($remain < $delay)) ? $remain : $delay);
+				$delay *= 2;
+			} else {
+				my $date = strftime("%F %R", localtime($mtime));
+				print STDERR "Cookie file $cookiefile locked for $age seconds since $date\n";
+				unlink "$lockfile";
+			}
+		} else {
+			if (!$!{ENOENT}) {
+				die "Cannot access $lockfile: $!\n";
+			}
+			$ret = $self->open_cookie();
+		}
+	}
+}
+
+sub DESTROY {
+	my $self = $_[0];
+
+	$self->unlock_cookie();
+}
+
+sub unlock_cookie {
+	my $self = $_[0];
+
+	if ($self->{lock}) {
+		unlink($lockfile, $self->{cookiefile});
+		$self->{lock} = undef;
+		$self->{cookiefile} = undef;
+	}
+}
+
+sub save_cookie {
+	my ($self, $cookie) = @_;
+	my $fh = $self->{lock};
+
+	if ($fh) {
+		print $fh $cookie;
+
+		close($fh);
+
+		move($self->{cookiefile}, $cookiefile);
+		unlink($lockfile);
+
+		$self->{lock} = undef;
+		$self->{cookiefile} = undef;
+	}
+}
+
+sub ssh_auth {
+	my $self = $_[0];
+	my $now = time();
+	my $key = $self->{sshkey};
+	my $realm = $self->{realm};
+	my $user = $self->{user};
+	my $data = "(created): $now";
+	my $keygen = $self->{keygen};
+
+	my $pid = open2(my $reader, my $writer, $keygen, '-Y', 'sign', '-f', $key, '-n', $realm, '-q');
+	print $writer $data;
+	close $writer;
+	my $sig = do {
+		local $/ = undef;
+		<$reader>;
+	};
+	die "Failed to get SSH signature.\n" unless $sig =~ /\A-----BEGIN SSH SIGNATURE-----\n\K.*(?=\n-----END SSH SIGNATURE-----\Z)/ms;
+	$sig = $&;
+	$sig = encode_base64(decode_base64($sig), '');
+	$sig = "keyId=\"$user\",algorithm=\"ssh\",headers=\"(created)\",created=$now,signature=\"$sig\"";
+	$sig = "Signature $sig";
+
+	waitpid $pid, 0;
+
+	return $sig;
 }
 
 sub api {
@@ -147,6 +332,21 @@ sub api {
 	my $url = $self->{url} . $path;
 
 	my $req = HTTP::Request->new($method => $url);
+	my $cookies = $self->{cookies};
+	if (keys % { $cookies } ) {
+		my @cookies = ();
+		foreach my $cookie (keys % { $cookies } ) {
+			@cookies = (@cookies, "$cookie=" . $cookies->{$cookie});
+		}
+		my $cookies = join("; ", @cookies);
+		# print "Cookies: $cookies\n";
+		$req->header("Cookie" => $cookies);
+	} else {
+		if (exists($self->{sshkey})) {
+			$self->lock_cookie();
+			$req->header("Authorization", $self->ssh_auth()) unless $self->check_cookie();
+		}
+	}
 	if ($data) {
 		$req->add_content($data);
 		$req->header("Content-type" => "application/octet-stream");
@@ -155,10 +355,22 @@ sub api {
 	#print STDERR "req: " . $req->as_string() . "\n";
 	#$self->{ua}->add_handler(request_send => sub { my($req, $ua, $handler) = @_; print STDERR "req: " . $req->as_string() . "\n"; return; m_method => "GET"});
 	my $res = $self->{ua}->request($req);
+	if (($res->code == 401) && (keys % { $cookies } ) && exists($self->{sshkey})) {
+		$self->lock_cookie();
+		$req->header("Authorization", $self->ssh_auth()) unless $self->check_cookie();
+		$res = $self->{ua}->request($req);
+	}
 	if ($res->code != 200) {
 		#print STDERR $res->as_string();
 		die "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
 	}
+	my $headers = $res->headers();
+	my $cookie = $headers->{'set-cookie'};
+	if ($cookie) {
+		$self->process_cookie($cookie);
+		$self->save_cookie($cookie);
+	}
+
 	return $res->content();
 }
 

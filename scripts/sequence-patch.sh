@@ -38,7 +38,7 @@ esac
 usage() {
     cat <<END
 SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
-          [--fast] [--rapid] [last-patch-name] [--vanilla] [--fuzz=NUM]
+          [--fast] [--rapid] [stop-before-patch-name] [--vanilla] [--fuzz=NUM]
           [--patch-dir=PATH] [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]]
           [--ctags] [--cscope] [--etags] [--skip-reverse] [--dry-run]
 
@@ -72,7 +72,7 @@ SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
   The --signing-key option specifies a pathname for a key to be used for
   module signing and for signing the kernel for use with UEFI Secure Boot.
 
-  When used with last-patch-name, both --fast and --no-quilt
+  When used with stop-before-patch-name, both --fast and --no-quilt
   will set up a quilt environment for the remaining patches.
 END
     exit 1
@@ -82,8 +82,6 @@ apply_rapid_patches() {
     printf "%s\n" ${PATCHES_BEFORE[@]} >> $PATCH_DIR/series
     rapidquilt push -a -d $PATCH_DIR -p $PWD $fuzz $DRY_RUN
     status=$?
-
-    PATCHES=( ${PATCHES_AFTER[@]} )
 }
 
 apply_fast_patches() {
@@ -100,20 +98,83 @@ apply_fast_patches() {
         echo "Logfile: $PATCH_LOG"
         status=1
     fi
-
-    PATCHES=( ${PATCHES_AFTER[@]} )
 }
 SKIPPED_PATCHES=
 
 # Patch kernel normally
+apply_one_patch() {
+    echo "[ $PATCH ]"
+    echo "[ $PATCH ]" >> $PATCH_LOG
+    backup_dir=$PATCH_DIR/.pc/$PATCH
+
+    LAST_LOG=$(patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
+            --no-backup-if-mismatch --force < $PATCH 2>&1)
+    STATUS=$?
+
+    if [ $STATUS -ne 0 ]; then
+        restore_files $backup_dir $PATCH_DIR
+
+        if $SKIP_REVERSE; then
+            patch -R -d $PATCH_DIR -p1 -E $fuzz --force --dry-run \
+                    < $PATCH > /dev/null 2>&1
+            ST=$?
+            if [ $ST -eq 0 ]; then
+                LAST_LOG="[ skipped: can be reverse-applied ]"
+                [ -n "$QUIET" ] && echo "$LAST_LOG"
+                STATUS=0
+                SKIPPED_PATCHES="$SKIPPED_PATCHES $PATCH"
+                PATCH="# $PATCH"
+                remove_rejects $backup_dir $PATCH_DIR
+            fi
+        fi
+
+        # Backup directory is no longer needed
+        rm -rf $backup_dir
+    else
+        if $QUILT; then
+            echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
+        fi
+    fi
+
+    if ! $QUILT; then
+        rm -rf $PATCH_DIR/.pc/
+    fi
+    echo "$LAST_LOG" >> $PATCH_LOG
+    [ -z "$QUIET" ] && echo "$LAST_LOG"
+    if [ $STATUS -ne 0 ]; then
+        [ -n "$QUIET" ] && echo "$LAST_LOG"
+        echo "Patch $PATCH failed (rolled back)."
+        echo "Logfile: $PATCH_LOG"
+        status=1
+        return 1
+    else
+        echo "$SERIES_PFX$PATCH" >> $PATCH_DIR/series
+    fi
+
+    return 0
+}
+
 apply_patches() {
-    set -- "${PATCHES[@]}"
-    n=0
-    while [ $# -gt 0 ]; do
-        PATCH="$1"
-        if ! $QUILT && test "$PATCH" = "$LIMIT"; then
-            STEP_BY_STEP=1
-            echo "Stopping before $PATCH"
+    for ((n=0; n<${#PATCHES_BEFORE[@]}; n++)); do
+        PATCH=${PATCHES_BEFORE[n]}
+        if [ ! -r "$PATCH" ]; then
+            echo "Patch $PATCH not found."
+            status=1
+            break
+        fi
+        apply_one_patch || break
+    done
+}
+
+apply_rest_patches() {
+    STEP_BY_STEP=1
+    echo "Stopping before ${PATCHES[0]}"
+    for ((n=0; n<${#PATCHES[@]}; n++)); do
+        PATCH=${PATCHES[n]}
+        if [ ! -r "$PATCH" ]; then
+            echo "Patch $PATCH not found."
+            status=1
+            break
         fi
         if [ -n "$STEP_BY_STEP" ]; then
             while true; do
@@ -124,7 +185,7 @@ apply_patches() {
                         break
                         ;;
                     ([nN])
-                        break 2	# break out of outer loop
+                        break 2 # break out of outer loop
                         ;;
                     ([aA])
                         unset STEP_BY_STEP
@@ -133,68 +194,7 @@ apply_patches() {
                 esac
             done
         fi
-
-        if [ ! -r "$PATCH" ]; then
-            echo "Patch $PATCH not found."
-            status=1
-            break
-        fi
-        echo "[ $PATCH ]"
-        echo "[ $PATCH ]" >> $PATCH_LOG
-        backup_dir=$PATCH_DIR/.pc/$PATCH
-
-        LAST_LOG=$(patch -d $PATCH_DIR --backup --prefix=$backup_dir/ -p1 -E $fuzz \
-                --no-backup-if-mismatch --force < $PATCH 2>&1)
-        STATUS=$?
-
-        if [ $STATUS -ne 0 ]; then
-            restore_files $backup_dir $PATCH_DIR
-
-	    if $SKIP_REVERSE; then
-		patch -R -d $PATCH_DIR -p1 -E $fuzz --force --dry-run \
-			< $PATCH > /dev/null 2>&1
-		ST=$?
-		if [ $ST -eq 0 ]; then
-			LAST_LOG="[ skipped: can be reverse-applied ]"
-			[ -n "$QUIET" ] && echo "$LAST_LOG"
-			STATUS=0
-			SKIPPED_PATCHES="$SKIPPED_PATCHES $PATCH"
-			PATCH="# $PATCH"
-			remove_rejects $backup_dir $PATCH_DIR
-		fi
-	    fi
-
-	    # Backup directory is no longer needed
-	    rm -rf $backup_dir
-	else
-	    if $QUILT; then
-		echo "$PATCH" >> $PATCH_DIR/.pc/applied-patches
-	    fi
-        fi
-
-        if ! $QUILT; then
-            rm -rf $PATCH_DIR/.pc/
-        fi
-        echo "$LAST_LOG" >> $PATCH_LOG
-        [ -z "$QUIET" ] && echo "$LAST_LOG"
-        if [ $STATUS -ne 0 ]; then
-            [ -n "$QUIET" ] && echo "$LAST_LOG"
-            echo "Patch $PATCH failed (rolled back)."
-            echo "Logfile: $PATCH_LOG"
-            status=1
-            break
-        else
-            echo "$SERIES_PFX$PATCH" >> $PATCH_DIR/series
-        fi
-
-        shift
-	if $QUILT; then
-		unset PATCHES[$n]
-	fi
-	let n++
-        if $QUILT && test "$PATCH" = "$LIMIT"; then
-            break
-        fi
+        apply_one_patch || break
     done
 }
 
@@ -613,6 +613,12 @@ elif [ -n "$RAPID" ]; then
     apply_rapid_patches
 else
     apply_patches
+fi
+
+PATCHES=( ${PATCHES_AFTER[@]} )
+
+if ! $QUILT && [ -z "$FAST$RAPID" ]; then
+    apply_rest_patches
 fi
 
 if [ -n "$DRY_RUN" ]; then
