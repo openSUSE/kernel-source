@@ -1,0 +1,253 @@
+From: Alistair Popple <apopple@nvidia.com>
+Date: Fri, 21 Jan 2022 22:10:46 -0800
+Subject: mm/migrate.c: rework migration_entry_wait() to not take a pageref
+Git-commit: ffa65753c43142f3b803486442813744da71cff2
+Patch-mainline: v5.17-rc1
+References: jsc#PED-1294
+
+[ SLE15-SP5 backport: adjust to missing page -> folio conversion backports ]
+
+This fixes the FIXME in migrate_vma_check_page().
+
+Before migrating a page migration code will take a reference and check
+there are no unexpected page references, failing the migration if there
+are.  When a thread faults on a migration entry it will take a temporary
+reference to the page to wait for the page to become unlocked signifying
+the migration entry has been removed.
+
+This reference is dropped just prior to waiting on the page lock,
+however the extra reference can cause migration failures so it is
+desirable to avoid taking it.
+
+As migration code already has a reference to the migrating page an extra
+reference to wait on PG_locked is unnecessary so long as the reference
+can't be dropped whilst setting up the wait.
+
+When faulting on a migration entry the ptl is taken to check the
+migration entry.  Removing a migration entry also requires the ptl, and
+migration code won't drop its page reference until after the migration
+entry has been removed.  Therefore retaining the ptl of a migration
+entry is sufficient to ensure the page has a reference.  Reworking
+migration_entry_wait() to hold the ptl until the wait setup is complete
+means the extra page reference is no longer needed.
+
+[apopple@nvidia.com: v5]
+  Link: https://lkml.kernel.org/r/20211213033848.1973946-1-apopple@nvidia.com
+
+Link: https://lkml.kernel.org/r/20211118020754.954425-1-apopple@nvidia.com
+Signed-off-by: Alistair Popple <apopple@nvidia.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Cc: David Howells <dhowells@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: Jerome Glisse <jglisse@redhat.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Ralph Campbell <rcampbell@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+---
+ include/linux/migrate.h |    2 +
+ mm/filemap.c            |   91 ++++++++++++++++++++++++++++++++++++++++++++++++
+ mm/migrate.c            |   39 ++------------------
+ 3 files changed, 97 insertions(+), 35 deletions(-)
+
+--- a/include/linux/migrate.h
++++ b/include/linux/migrate.h
+@@ -51,6 +51,8 @@ extern int migrate_huge_page_move_mappin
+ 				  struct page *newpage, struct page *page);
+ extern int migrate_page_move_mapping(struct address_space *mapping,
+ 		struct page *newpage, struct page *page, int extra_count);
++void migration_entry_wait_on_locked(swp_entry_t entry, pte_t *ptep,
++				spinlock_t *ptl);
+ #else
+ 
+ static inline void putback_movable_pages(struct list_head *l) {}
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -21,6 +21,7 @@
+ #include <linux/gfp.h>
+ #include <linux/mm.h>
+ #include <linux/swap.h>
++#include <linux/swapops.h>
+ #include <linux/mman.h>
+ #include <linux/pagemap.h>
+ #include <linux/file.h>
+@@ -42,6 +43,7 @@
+ #include <linux/psi.h>
+ #include <linux/ramfs.h>
+ #include <linux/page_idle.h>
++#include <linux/migrate.h>
+ #include <asm/pgalloc.h>
+ #include <asm/tlbflush.h>
+ #include "internal.h"
+@@ -1403,6 +1405,95 @@ repeat:
+ 	return wait->flags & WQ_FLAG_WOKEN ? 0 : -EINTR;
+ }
+ 
++#ifdef CONFIG_MIGRATION
++/**
++ * migration_entry_wait_on_locked - Wait for a migration entry to be removed
++ * @entry: migration swap entry.
++ * @ptep: mapped pte pointer. Will return with the ptep unmapped. Only required
++ *        for pte entries, pass NULL for pmd entries.
++ * @ptl: already locked ptl. This function will drop the lock.
++ *
++ * Wait for a migration entry referencing the given page to be removed. This is
++ * equivalent to put_and_wait_on_page_locked(page, TASK_UNINTERRUPTIBLE) except
++ * this can be called without taking a reference on the page. Instead this
++ * should be called while holding the ptl for the migration entry referencing
++ * the page.
++ *
++ * Returns after unmapping and unlocking the pte/ptl with pte_unmap_unlock().
++ *
++ * This follows the same logic as wait_on_page_bit_common() so see the comments
++ * there.
++ */
++void migration_entry_wait_on_locked(swp_entry_t entry, pte_t *ptep,
++				spinlock_t *ptl)
++{
++	struct wait_page_queue wait_page;
++	wait_queue_entry_t *wait = &wait_page.wait;
++	bool thrashing = false;
++	bool delayacct = false;
++	unsigned long pflags;
++	wait_queue_head_t *q;
++	struct page *page = compound_head(pfn_swap_entry_to_page(entry));
++
++	q = page_waitqueue(page);
++	if (!PageUptodate(page) && PageWorkingset(page)) {
++		if (!PageSwapBacked(page)) {
++			delayacct_thrashing_start();
++			delayacct = true;
++		}
++		psi_memstall_enter(&pflags);
++		thrashing = true;
++	}
++
++	init_wait(wait);
++	wait->func = wake_page_function;
++	wait_page.page = page;
++	wait_page.bit_nr = PG_locked;
++	wait->flags = 0;
++
++	spin_lock_irq(&q->lock);
++	SetPageWaiters(page);
++	if (!trylock_page_bit_common(page, PG_locked, wait))
++		__add_wait_queue_entry_tail(q, wait);
++	spin_unlock_irq(&q->lock);
++
++	/*
++	 * If a migration entry exists for the page the migration path must hold
++	 * a valid reference to the page, and it must take the ptl to remove the
++	 * migration entry. So the page is valid until the ptl is dropped.
++	 */
++	if (ptep)
++		pte_unmap_unlock(ptep, ptl);
++	else
++		spin_unlock(ptl);
++
++	for (;;) {
++		unsigned int flags;
++
++		set_current_state(TASK_UNINTERRUPTIBLE);
++
++		/* Loop until we've been woken or interrupted */
++		flags = smp_load_acquire(&wait->flags);
++		if (!(flags & WQ_FLAG_WOKEN)) {
++			if (signal_pending_state(TASK_UNINTERRUPTIBLE, current))
++				break;
++
++			io_schedule();
++			continue;
++		}
++		break;
++	}
++
++	finish_wait(q, wait);
++
++	if (thrashing) {
++		if (delayacct)
++			delayacct_thrashing_end();
++		psi_memstall_leave(&pflags);
++	}
++}
++#endif
++
+ void wait_on_page_bit(struct page *page, int bit_nr)
+ {
+ 	wait_queue_head_t *q = page_waitqueue(page);
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -290,7 +290,6 @@ void __migration_entry_wait(struct mm_st
+ {
+ 	pte_t pte;
+ 	swp_entry_t entry;
+-	struct page *page;
+ 
+ 	spin_lock(ptl);
+ 	pte = *ptep;
+@@ -301,18 +300,7 @@ void __migration_entry_wait(struct mm_st
+ 	if (!is_migration_entry(entry))
+ 		goto out;
+ 
+-	page = pfn_swap_entry_to_page(entry);
+-	page = compound_head(page);
+-
+-	/*
+-	 * Once page cache replacement of page migration started, page_count
+-	 * is zero; but we must not call put_and_wait_on_page_locked() without
+-	 * a ref. Use get_page_unless_zero(), and just fault again if it fails.
+-	 */
+-	if (!get_page_unless_zero(page))
+-		goto out;
+-	pte_unmap_unlock(ptep, ptl);
+-	put_and_wait_on_page_locked(page, TASK_UNINTERRUPTIBLE);
++	migration_entry_wait_on_locked(entry, ptep, ptl);
+ 	return;
+ out:
+ 	pte_unmap_unlock(ptep, ptl);
+@@ -337,16 +325,11 @@ void migration_entry_wait_huge(struct vm
+ void pmd_migration_entry_wait(struct mm_struct *mm, pmd_t *pmd)
+ {
+ 	spinlock_t *ptl;
+-	struct page *page;
+ 
+ 	ptl = pmd_lock(mm, pmd);
+ 	if (!is_pmd_migration_entry(*pmd))
+ 		goto unlock;
+-	page = pfn_swap_entry_to_page(pmd_to_swp_entry(*pmd));
+-	if (!get_page_unless_zero(page))
+-		goto unlock;
+-	spin_unlock(ptl);
+-	put_and_wait_on_page_locked(page, TASK_UNINTERRUPTIBLE);
++	migration_entry_wait_on_locked(pmd_to_swp_entry(*pmd), NULL, ptl);
+ 	return;
+ unlock:
+ 	spin_unlock(ptl);
+@@ -2409,22 +2392,8 @@ static bool migrate_vma_check_page(struc
+ 		return false;
+ 
+ 	/* Page from ZONE_DEVICE have one extra reference */
+-	if (is_zone_device_page(page)) {
+-		/*
+-		 * Private page can never be pin as they have no valid pte and
+-		 * GUP will fail for those. Yet if there is a pending migration
+-		 * a thread might try to wait on the pte migration entry and
+-		 * will bump the page reference count. Sadly there is no way to
+-		 * differentiate a regular pin from migration wait. Hence to
+-		 * avoid 2 racing thread trying to migrate back to CPU to enter
+-		 * infinite loop (one stopping migration because the other is
+-		 * waiting on pte migration entry). We always return true here.
+-		 *
+-		 * FIXME proper solution is to rework migration_entry_wait() so
+-		 * it does not need to take a reference on page.
+-		 */
+-		return is_device_private_page(page);
+-	}
++	if (is_zone_device_page(page))
++		extra++;
+ 
+ 	/* For file back page */
+ 	if (page_mapping(page))
