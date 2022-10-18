@@ -1,0 +1,150 @@
+From: Shyam Prasad N <sprasad@microsoft.com>
+Date: Fri, 24 Jun 2022 09:43:59 +0000
+Subject: [PATCH] cifs: avoid deadlocks while updating iface
+Git-commit: 8da33fd11c05b7c64ef6456970f2fce61851806e
+References: bsc#1193629
+Patch-mainline: v5.19-rc4
+
+We use cifs_tcp_ses_lock to protect a lot of things.
+Not only does it protect the lists of connections, sessions,
+tree connects, open file lists, etc., we also use it to
+protect some fields in each of it's entries.
+
+In this case, cifs_mark_ses_for_reconnect takes the
+cifs_tcp_ses_lock to traverse the lists, and then calls
+cifs_update_iface. However, that can end up calling
+cifs_put_tcp_session, which picks up the same lock again.
+
+Avoid this by taking a ref for the session, drop the lock,
+and then call update iface.
+
+Also, in cifs_update_iface, avoid nested locking of iface_lock
+and chan_lock, as much as possible. When unavoidable, we need
+to pick iface_lock first.
+
+Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Acked-by: Paulo Alcantara <palcantara@suse.de>
+---
+ fs/cifs/connect.c | 15 ++++++++++++---
+ fs/cifs/sess.c    | 33 +++++++++++++++++++++------------
+ 2 files changed, 33 insertions(+), 15 deletions(-)
+
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index e666d2643ede..8d56325915d0 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -236,7 +236,7 @@ cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server,
+ 				      bool mark_smb_session)
+ {
+ 	struct TCP_Server_Info *pserver;
+-	struct cifs_ses *ses;
++	struct cifs_ses *ses, *nses;
+ 	struct cifs_tcon *tcon;
+ 
+ 	/*
+@@ -250,10 +250,19 @@ cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server,
+ 
+ 
+ 	spin_lock(&cifs_tcp_ses_lock);
+-	list_for_each_entry(ses, &pserver->smb_ses_list, smb_ses_list) {
++	list_for_each_entry_safe(ses, nses, &pserver->smb_ses_list, smb_ses_list) {
+ 		/* check if iface is still active */
+-		if (!cifs_chan_is_iface_active(ses, server))
++		if (!cifs_chan_is_iface_active(ses, server)) {
++			/*
++			 * HACK: drop the lock before calling
++			 * cifs_chan_update_iface to avoid deadlock
++			 */
++			ses->ses_count++;
++			spin_unlock(&cifs_tcp_ses_lock);
+ 			cifs_chan_update_iface(ses, server);
++			spin_lock(&cifs_tcp_ses_lock);
++			ses->ses_count--;
++		}
+ 
+ 		spin_lock(&ses->chan_lock);
+ 		if (!mark_smb_session && cifs_chan_needs_reconnect(ses, server))
+diff --git a/fs/cifs/sess.c b/fs/cifs/sess.c
+index 7c26ee70c8b0..b85718f32b53 100644
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@ -256,29 +256,34 @@ int cifs_try_adding_channels(struct cifs_sb_info *cifs_sb, struct cifs_ses *ses)
+ 
+ /*
+  * update the iface for the channel if necessary.
+- * will return 0 when iface is updated. 1 otherwise
++ * will return 0 when iface is updated, 1 if removed, 2 otherwise
+  * Must be called with chan_lock held.
+  */
+ int
+ cifs_chan_update_iface(struct cifs_ses *ses, struct TCP_Server_Info *server)
+ {
+-	unsigned int chan_index = cifs_ses_get_chan_index(ses, server);
++	unsigned int chan_index;
+ 	struct cifs_server_iface *iface = NULL;
+ 	struct cifs_server_iface *old_iface = NULL;
+ 	int rc = 0;
+ 
+-	/* primary channel. This can never go away */
+-	if (!chan_index)
++	spin_lock(&ses->chan_lock);
++	chan_index = cifs_ses_get_chan_index(ses, server);
++	if (!chan_index) {
++		spin_unlock(&ses->chan_lock);
+ 		return 0;
++	}
+ 
+ 	if (ses->chans[chan_index].iface) {
+ 		old_iface = ses->chans[chan_index].iface;
+-		if (old_iface->is_active)
++		if (old_iface->is_active) {
++			spin_unlock(&ses->chan_lock);
+ 			return 1;
++		}
+ 	}
++	spin_unlock(&ses->chan_lock);
+ 
+ 	spin_lock(&ses->iface_lock);
+-
+ 	/* then look for a new one */
+ 	list_for_each_entry(iface, &ses->iface_list, iface_head) {
+ 		if (!iface->is_active ||
+@@ -295,8 +300,6 @@ cifs_chan_update_iface(struct cifs_ses *ses, struct TCP_Server_Info *server)
+ 		cifs_dbg(FYI, "unable to find a suitable iface\n");
+ 	}
+ 
+-	ses->chans[chan_index].iface = iface;
+-
+ 	/* now drop the ref to the current iface */
+ 	if (old_iface && iface) {
+ 		kref_put(&old_iface->refcount, release_iface);
+@@ -311,14 +314,20 @@ cifs_chan_update_iface(struct cifs_ses *ses, struct TCP_Server_Info *server)
+ 		WARN_ON(!iface);
+ 		cifs_dbg(FYI, "adding new iface: %pIS\n", &iface->sockaddr);
+ 	}
+-
+ 	spin_unlock(&ses->iface_lock);
+ 
++	spin_lock(&ses->chan_lock);
++	chan_index = cifs_ses_get_chan_index(ses, server);
++	ses->chans[chan_index].iface = iface;
++
+ 	/* No iface is found. if secondary chan, drop connection */
+-	if (!iface && CIFS_SERVER_IS_CHAN(server)) {
+-		cifs_put_tcp_session(server, false);
++	if (!iface && CIFS_SERVER_IS_CHAN(server))
+ 		ses->chans[chan_index].server = NULL;
+-	}
++
++	spin_unlock(&ses->chan_lock);
++
++	if (!iface && CIFS_SERVER_IS_CHAN(server))
++		cifs_put_tcp_session(server, false);
+ 
+ 	return rc;
+ }
+-- 
+2.37.3
+
+
