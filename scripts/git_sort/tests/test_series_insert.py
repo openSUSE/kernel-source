@@ -53,11 +53,19 @@ class TestSeriesInsert(unittest.TestCase):
         # setup stub kernel-source content
         self.ks_dir = tempfile.mkdtemp(prefix="gs_ks")
         patch_dir = os.path.join(self.ks_dir, "patches.suse")
+        self.si_path = os.path.join(lib.libdir(), "series_insert.py")
         os.mkdir(patch_dir)
         os.chdir(patch_dir)
         for commit in commits:
             tests.support.format_patch(self.repo.get(commit),
                                        mainline="v3.45-rc6")
+        series = os.path.join(self.ks_dir, "series.conf");
+        content = tests.support.format_series((
+            (None,
+             ("patches.suse/mainline-%d.patch" % (i,) for i in (0, 2,))),
+        ))
+        with open(series, mode="w") as f:
+            f.write(content)
 
     def tearDown(self):
         shutil.rmtree(os.environ["XDG_CACHE_HOME"])
@@ -66,18 +74,11 @@ class TestSeriesInsert(unittest.TestCase):
 
 
     def test_simple(self):
-        si_path = os.path.join(lib.libdir(), "series_insert.py")
         os.chdir(self.ks_dir)
 
         series = "series.conf"
-        series1 = tests.support.format_series((
-            (None,
-             ("patches.suse/mainline-%d.patch" % (i,) for i in (0, 2,))),
-        ))
-        with open(series, mode="w") as f:
-            f.write(series1)
 
-        subprocess.check_call([si_path, "patches.suse/mainline-1.patch"])
+        subprocess.check_call([self.si_path, "patches.suse/mainline-1.patch"])
         with open(series) as f:
             content = f.read()
         self.assertEqual(content,
@@ -85,6 +86,9 @@ class TestSeriesInsert(unittest.TestCase):
                 (None,
                  ("patches.suse/mainline-%d.patch" % (i,) for i in range(3))),
             )))
+
+    def test_invalid(self):
+        os.chdir(self.ks_dir)
 
         content = []
         with open("patches.suse/mainline-1.patch") as f:
@@ -95,11 +99,8 @@ class TestSeriesInsert(unittest.TestCase):
         with open("patches.suse/mainline-1.patch", mode="w+") as f:
             f.writelines(content)
 
-        with open(series, mode="w") as f:
-            f.write(series1)
-
         try:
-            subprocess.check_output([si_path, "patches.suse/mainline-1.patch"],
+            subprocess.check_output([self.si_path, "patches.suse/mainline-1.patch"],
                                    stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
@@ -110,7 +111,28 @@ class TestSeriesInsert(unittest.TestCase):
         else:
             self.assertTrue(False)
 
-        os.unlink(series)
+    def test_noheader(self):
+        os.chdir(self.ks_dir)
+
+        content = []
+        with open("patches.suse/mainline-1.patch") as f:
+            for line in f:
+                if not line.startswith("Git-commit: ") and not line.startswith("Patch-mainline: "):
+                    content.append(line)
+        with open("patches.suse/mainline-1.patch", mode="w+") as f:
+            f.writelines(content)
+
+        try:
+            subprocess.check_output([self.si_path, "patches.suse/mainline-1.patch"],
+                                   stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as err:
+            self.assertEqual(err.returncode, 1)
+            self.assertEqual(
+                err.output.decode(),
+                'Error: There is a problem with patch "patches.suse/mainline-1.patch". '
+                'The Patch-mainline tag is missing.\n')
+        else:
+            self.assertTrue(False)
 
 
 if __name__ == '__main__':
