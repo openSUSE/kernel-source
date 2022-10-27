@@ -1,0 +1,387 @@
+From: Gilad Naaman <gnaaman@drivenets.com>
+Date: Thu, 19 Aug 2021 10:17:27 +0300
+Subject: net-next: When a bond have a massive amount of VLANs with IPv6
+ addresses, performance of changing link state, attaching a VRF, changing an
+ IPv6 address, etc. go down dramtically.
+Patch-mainline: v5.15-rc1
+Git-commit: 406f42fa0d3cbcea3766c3111d79ac5afe711c5b
+References: jsc#PED-1565
+
+The source of most of the slow down is the `dev_addr_lists.c` module,
+which mainatins a linked list of HW addresses.
+When using IPv6, this list grows for each IPv6 address added on a
+VLAN, since each IPv6 address has a multicast HW address associated with
+it.
+
+When performing any modification to the involved links, this list is
+traversed many times, often for nothing, all while holding the RTNL
+lock.
+
+Instead, this patch adds an auxilliary rbtree which cuts down
+traversal time significantly.
+
+Performance can be seen with the following script:
+
+	#!/bin/bash
+	ip netns del test || true 2>/dev/null
+	ip netns add test
+
+	echo 1 | ip netns exec test tee /proc/sys/net/ipv6/conf/all/keep_addr_on_down > /dev/null
+
+	set -e
+
+	ip -n test link add foo type veth peer name bar
+	ip -n test link add b1 type bond
+	ip -n test link add florp type vrf table 10
+
+	ip -n test link set bar master b1
+	ip -n test link set foo up
+	ip -n test link set bar up
+	ip -n test link set b1 up
+	ip -n test link set florp up
+
+	VLAN_COUNT=1500
+	BASE_DEV=b1
+
+	echo Creating vlans
+	ip netns exec test time -p bash -c "for i in \$(seq 1 $VLAN_COUNT);
+	do ip -n test link add link $BASE_DEV name foo.\$i type vlan id \$i; done"
+
+	echo Bringing them up
+	ip netns exec test time -p bash -c "for i in \$(seq 1 $VLAN_COUNT);
+	do ip -n test link set foo.\$i up; done"
+
+	echo Assiging IPv6 Addresses
+	ip netns exec test time -p bash -c "for i in \$(seq 1 $VLAN_COUNT);
+	do ip -n test address add dev foo.\$i 2000::\$i/64; done"
+
+	echo Attaching to VRF
+	ip netns exec test time -p bash -c "for i in \$(seq 1 $VLAN_COUNT);
+	do ip -n test link set foo.\$i master florp; done"
+
+On an Intel(R) Xeon(R) CPU E5-2650 v3 @ 2.30GHz machine, the performance
+before the patch is (truncated):
+
+	Creating vlans
+	real 108.35
+	Bringing them up
+	real 4.96
+	Assiging IPv6 Addresses
+	real 19.22
+	Attaching to VRF
+	real 458.84
+
+After the patch:
+
+	Creating vlans
+	real 5.59
+	Bringing them up
+	real 5.07
+	Assiging IPv6 Addresses
+	real 5.64
+	Attaching to VRF
+	real 25.37
+
+Cc: David S. Miller <davem@davemloft.net>
+Cc: Jakub Kicinski <kuba@kernel.org>
+Cc: Lu Wei <luwei32@huawei.com>
+Cc: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Cc: Taehee Yoo <ap420073@gmail.com>
+Signed-off-by: Gilad Naaman <gnaaman@drivenets.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/netdevice.h |    5 +
+ net/core/dev_addr_lists.c |  144 +++++++++++++++++++++++++++++++---------------
+ 2 files changed, 103 insertions(+), 46 deletions(-)
+
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -47,6 +47,7 @@
+ #include <uapi/linux/if_bonding.h>
+ #include <uapi/linux/pkt_cls.h>
+ #include <linux/hashtable.h>
++#include <linux/rbtree.h>
+ 
+ struct netpoll_info;
+ struct device;
+@@ -208,6 +209,7 @@ struct sk_buff;
+ 
+ struct netdev_hw_addr {
+ 	struct list_head	list;
++	struct rb_node		node;
+ 	unsigned char		addr[MAX_ADDR_LEN];
+ 	unsigned char		type;
+ #define NETDEV_HW_ADDR_T_LAN		1
+@@ -224,6 +226,9 @@ struct netdev_hw_addr {
+ struct netdev_hw_addr_list {
+ 	struct list_head	list;
+ 	int			count;
++
++	/* Auxiliary tree for faster lookup on addition and deletion */
++	struct rb_root		tree;
+ };
+ 
+ #define netdev_hw_addr_list_count(l) ((l)->count)
+--- a/net/core/dev_addr_lists.c
++++ b/net/core/dev_addr_lists.c
+@@ -16,10 +16,9 @@
+  * General list handling functions
+  */
+ 
+-static int __hw_addr_create_ex(struct netdev_hw_addr_list *list,
+-			       const unsigned char *addr, int addr_len,
+-			       unsigned char addr_type, bool global,
+-			       bool sync)
++static struct netdev_hw_addr*
++__hw_addr_create(const unsigned char *addr, int addr_len,
++		 unsigned char addr_type, bool global, bool sync)
+ {
+ 	struct netdev_hw_addr *ha;
+ 	int alloc_size;
+@@ -29,32 +28,44 @@ static int __hw_addr_create_ex(struct ne
+ 		alloc_size = L1_CACHE_BYTES;
+ 	ha = kmalloc(alloc_size, GFP_ATOMIC);
+ 	if (!ha)
+-		return -ENOMEM;
++		return NULL;
+ 	memcpy(ha->addr, addr, addr_len);
+ 	ha->type = addr_type;
+ 	ha->refcount = 1;
+ 	ha->global_use = global;
+ 	ha->synced = sync ? 1 : 0;
+ 	ha->sync_cnt = 0;
+-	list_add_tail_rcu(&ha->list, &list->list);
+-	list->count++;
+ 
+-	return 0;
++	return ha;
+ }
+ 
+ static int __hw_addr_add_ex(struct netdev_hw_addr_list *list,
+ 			    const unsigned char *addr, int addr_len,
+ 			    unsigned char addr_type, bool global, bool sync,
+-			    int sync_count)
++			    int sync_count, bool exclusive)
+ {
++	struct rb_node **ins_point = &list->tree.rb_node, *parent = NULL;
+ 	struct netdev_hw_addr *ha;
+ 
+ 	if (addr_len > MAX_ADDR_LEN)
+ 		return -EINVAL;
+ 
+-	list_for_each_entry(ha, &list->list, list) {
+-		if (ha->type == addr_type &&
+-		    !memcmp(ha->addr, addr, addr_len)) {
++	while (*ins_point) {
++		int diff;
++
++		ha = rb_entry(*ins_point, struct netdev_hw_addr, node);
++		diff = memcmp(addr, ha->addr, addr_len);
++		if (diff == 0)
++			diff = memcmp(&addr_type, &ha->type, sizeof(addr_type));
++
++		parent = *ins_point;
++		if (diff < 0) {
++			ins_point = &parent->rb_left;
++		} else if (diff > 0) {
++			ins_point = &parent->rb_right;
++		} else {
++			if (exclusive)
++				return -EEXIST;
+ 			if (global) {
+ 				/* check if addr is already used as global */
+ 				if (ha->global_use)
+@@ -73,8 +84,25 @@ static int __hw_addr_add_ex(struct netde
+ 		}
+ 	}
+ 
+-	return __hw_addr_create_ex(list, addr, addr_len, addr_type, global,
+-				   sync);
++	ha = __hw_addr_create(addr, addr_len, addr_type, global, sync);
++	if (!ha)
++		return -ENOMEM;
++
++	/* The first address in dev->dev_addrs is pointed to by dev->dev_addr
++	 * and mutated freely by device drivers and netdev ops, so if we insert
++	 * it into the tree we'll end up with an invalid rbtree.
++	 */
++	if (list->count > 0) {
++		rb_link_node(&ha->node, parent, ins_point);
++		rb_insert_color(&ha->node, &list->tree);
++	} else {
++		RB_CLEAR_NODE(&ha->node);
++	}
++
++	list_add_tail_rcu(&ha->list, &list->list);
++	list->count++;
++
++	return 0;
+ }
+ 
+ static int __hw_addr_add(struct netdev_hw_addr_list *list,
+@@ -82,7 +110,7 @@ static int __hw_addr_add(struct netdev_h
+ 			 unsigned char addr_type)
+ {
+ 	return __hw_addr_add_ex(list, addr, addr_len, addr_type, false, false,
+-				0);
++				0, false);
+ }
+ 
+ static int __hw_addr_del_entry(struct netdev_hw_addr_list *list,
+@@ -103,24 +131,61 @@ static int __hw_addr_del_entry(struct ne
+ 
+ 	if (--ha->refcount)
+ 		return 0;
++
++	if (!RB_EMPTY_NODE(&ha->node))
++		rb_erase(&ha->node, &list->tree);
++
+ 	list_del_rcu(&ha->list);
+ 	kfree_rcu(ha, rcu_head);
+ 	list->count--;
+ 	return 0;
+ }
+ 
++static struct netdev_hw_addr *__hw_addr_lookup(struct netdev_hw_addr_list *list,
++					       const unsigned char *addr, int addr_len,
++					       unsigned char addr_type)
++{
++	struct netdev_hw_addr *ha;
++	struct rb_node *node;
++
++	/* The first address isn't inserted into the tree because in the dev->dev_addrs
++	 * list it's the address pointed to by dev->dev_addr which is freely mutated
++	 * in place, so we need to check it separately.
++	 */
++	ha = list_first_entry(&list->list, struct netdev_hw_addr, list);
++	if (ha && !memcmp(addr, ha->addr, addr_len) &&
++	    (!addr_type || addr_type == ha->type))
++		return ha;
++
++	node = list->tree.rb_node;
++
++	while (node) {
++		struct netdev_hw_addr *ha = rb_entry(node, struct netdev_hw_addr, node);
++		int diff = memcmp(addr, ha->addr, addr_len);
++
++		if (diff == 0 && addr_type)
++			diff = memcmp(&addr_type, &ha->type, sizeof(addr_type));
++
++		if (diff < 0)
++			node = node->rb_left;
++		else if (diff > 0)
++			node = node->rb_right;
++		else
++			return ha;
++	}
++
++	return NULL;
++}
++
+ static int __hw_addr_del_ex(struct netdev_hw_addr_list *list,
+ 			    const unsigned char *addr, int addr_len,
+ 			    unsigned char addr_type, bool global, bool sync)
+ {
+-	struct netdev_hw_addr *ha;
++	struct netdev_hw_addr *ha = __hw_addr_lookup(list, addr, addr_len, addr_type);
+ 
+-	list_for_each_entry(ha, &list->list, list) {
+-		if (!memcmp(ha->addr, addr, addr_len) &&
+-		    (ha->type == addr_type || !addr_type))
+-			return __hw_addr_del_entry(list, ha, global, sync);
+-	}
+-	return -ENOENT;
++	if (!ha)
++		return -ENOENT;
++	return __hw_addr_del_entry(list, ha, global, sync);
+ }
+ 
+ static int __hw_addr_del(struct netdev_hw_addr_list *list,
+@@ -137,7 +202,7 @@ static int __hw_addr_sync_one(struct net
+ 	int err;
+ 
+ 	err = __hw_addr_add_ex(to_list, ha->addr, addr_len, ha->type,
+-			       false, true, ha->sync_cnt);
++			       false, true, ha->sync_cnt, false);
+ 	if (err && err != -EEXIST)
+ 		return err;
+ 
+@@ -407,6 +472,7 @@ static void __hw_addr_flush(struct netde
+ {
+ 	struct netdev_hw_addr *ha, *tmp;
+ 
++	list->tree = RB_ROOT;
+ 	list_for_each_entry_safe(ha, tmp, &list->list, list) {
+ 		list_del_rcu(&ha->list);
+ 		kfree_rcu(ha, rcu_head);
+@@ -418,6 +484,7 @@ void __hw_addr_init(struct netdev_hw_add
+ {
+ 	INIT_LIST_HEAD(&list->list);
+ 	list->count = 0;
++	list->tree = RB_ROOT;
+ }
+ EXPORT_SYMBOL(__hw_addr_init);
+ 
+@@ -552,22 +619,14 @@ EXPORT_SYMBOL(dev_addr_del);
+  */
+ int dev_uc_add_excl(struct net_device *dev, const unsigned char *addr)
+ {
+-	struct netdev_hw_addr *ha;
+ 	int err;
+ 
+ 	netif_addr_lock_bh(dev);
+-	list_for_each_entry(ha, &dev->uc.list, list) {
+-		if (!memcmp(ha->addr, addr, dev->addr_len) &&
+-		    ha->type == NETDEV_HW_ADDR_T_UNICAST) {
+-			err = -EEXIST;
+-			goto out;
+-		}
+-	}
+-	err = __hw_addr_create_ex(&dev->uc, addr, dev->addr_len,
+-				  NETDEV_HW_ADDR_T_UNICAST, true, false);
++	err = __hw_addr_add_ex(&dev->uc, addr, dev->addr_len,
++			       NETDEV_HW_ADDR_T_UNICAST, true, false,
++			       0, true);
+ 	if (!err)
+ 		__dev_set_rx_mode(dev);
+-out:
+ 	netif_addr_unlock_bh(dev);
+ 	return err;
+ }
+@@ -745,22 +804,14 @@ EXPORT_SYMBOL(dev_uc_init);
+  */
+ int dev_mc_add_excl(struct net_device *dev, const unsigned char *addr)
+ {
+-	struct netdev_hw_addr *ha;
+ 	int err;
+ 
+ 	netif_addr_lock_bh(dev);
+-	list_for_each_entry(ha, &dev->mc.list, list) {
+-		if (!memcmp(ha->addr, addr, dev->addr_len) &&
+-		    ha->type == NETDEV_HW_ADDR_T_MULTICAST) {
+-			err = -EEXIST;
+-			goto out;
+-		}
+-	}
+-	err = __hw_addr_create_ex(&dev->mc, addr, dev->addr_len,
+-				  NETDEV_HW_ADDR_T_MULTICAST, true, false);
++	err = __hw_addr_add_ex(&dev->mc, addr, dev->addr_len,
++			       NETDEV_HW_ADDR_T_MULTICAST, true, false,
++			       0, true);
+ 	if (!err)
+ 		__dev_set_rx_mode(dev);
+-out:
+ 	netif_addr_unlock_bh(dev);
+ 	return err;
+ }
+@@ -773,7 +824,8 @@ static int __dev_mc_add(struct net_devic
+ 
+ 	netif_addr_lock_bh(dev);
+ 	err = __hw_addr_add_ex(&dev->mc, addr, dev->addr_len,
+-			       NETDEV_HW_ADDR_T_MULTICAST, global, false, 0);
++			       NETDEV_HW_ADDR_T_MULTICAST, global, false,
++			       0, false);
+ 	if (!err)
+ 		__dev_set_rx_mode(dev);
+ 	netif_addr_unlock_bh(dev);
