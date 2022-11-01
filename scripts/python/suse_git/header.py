@@ -59,6 +59,11 @@ tag_map = {
                 'match' : 'Submitted,?\s+.+',
                 'excludes' : [ 'Git-commit', 'Git-repo' ],
             }, {
+                # Catch a frequent misuse of 'Not yet'.
+                'match' : 'Not yet,\s+submitted',
+                'error' : "Please use 'Submitted'",
+                'excludes' : [ 'Git-commit', 'Git-repo' ],
+            }, {
                 # Should be used rarely.  Description should provide
                 # reason for the patch not being accepted upstream.
                 'name' : 'Not yet',
