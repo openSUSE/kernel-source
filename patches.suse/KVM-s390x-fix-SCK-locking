@@ -1,0 +1,124 @@
+From: Claudio Imbrenda <imbrenda@linux.ibm.com>
+Date: Tue, 1 Mar 2022 15:33:40 +0100
+Subject: KVM: s390x: fix SCK locking
+Git-commit: c0573ba5c5a2244dc02060b1f374d4593c1d20b7
+Patch-mainline: v5.18-rc1
+References: git-fixes
+
+When handling the SCK instruction, the kvm lock is taken, even though
+the vcpu lock is already being held. The normal locking order is kvm
+lock first and then vcpu lock. This is can (and in some circumstances
+does) lead to deadlocks.
+
+The function kvm_s390_set_tod_clock is called both by the SCK handler
+and by some IOCTLs to set the clock. The IOCTLs will not hold the vcpu
+lock, so they can safely take the kvm lock. The SCK handler holds the
+vcpu lock, but will also somehow need to acquire the kvm lock without
+relinquishing the vcpu lock.
+
+The solution is to factor out the code to set the clock, and provide
+two wrappers. One is called like the original function and does the
+locking, the other is called kvm_s390_try_set_tod_clock and uses
+trylock to try to acquire the kvm lock. This new wrapper is then used
+in the SCK handler. If locking fails, -EAGAIN is returned, which is
+eventually propagated to userspace, thus also freeing the vcpu lock and
+allowing for forward progress.
+
+This is not the most efficient or elegant way to solve this issue, but
+the SCK instruction is deprecated and its performance is not critical.
+
+The goal of this patch is just to provide a simple but correct way to
+fix the bug.
+
+Fixes: 6a3f95a6b04c ("KVM: s390: Intercept SCK instruction")
+Signed-off-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+Reviewed-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+Reviewed-by: Janis Schoetterl-Glausch <scgl@linux.ibm.com>
+Link: https://lore.kernel.org/r/20220301143340.111129-1-imbrenda@linux.ibm.com
+Cc: stable@vger.kernel.org
+Signed-off-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ arch/s390/kvm/kvm-s390.c |   19 ++++++++++++++++---
+ arch/s390/kvm/kvm-s390.h |    4 ++--
+ arch/s390/kvm/priv.c     |   15 ++++++++++++++-
+ 3 files changed, 32 insertions(+), 6 deletions(-)
+
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -3869,14 +3869,12 @@ retry:
+ 	return 0;
+ }
+ 
+-void kvm_s390_set_tod_clock(struct kvm *kvm,
+-			    const struct kvm_s390_vm_tod_clock *gtod)
++static void __kvm_s390_set_tod_clock(struct kvm *kvm, const struct kvm_s390_vm_tod_clock *gtod)
+ {
+ 	struct kvm_vcpu *vcpu;
+ 	struct kvm_s390_tod_clock_ext htod;
+ 	int i;
+ 
+-	mutex_lock(&kvm->lock);
+ 	preempt_disable();
+ 
+ 	get_tod_clock_ext((char *)&htod);
+@@ -3897,7 +3895,22 @@ void kvm_s390_set_tod_clock(struct kvm *
+ 
+ 	kvm_s390_vcpu_unblock_all(kvm);
+ 	preempt_enable();
++}
++
++void kvm_s390_set_tod_clock(struct kvm *kvm, const struct kvm_s390_vm_tod_clock *gtod)
++{
++	mutex_lock(&kvm->lock);
++	__kvm_s390_set_tod_clock(kvm, gtod);
++	mutex_unlock(&kvm->lock);
++}
++
++int kvm_s390_try_set_tod_clock(struct kvm *kvm, const struct kvm_s390_vm_tod_clock *gtod)
++{
++	if (!mutex_trylock(&kvm->lock))
++		return 0;
++	__kvm_s390_set_tod_clock(kvm, gtod);
+ 	mutex_unlock(&kvm->lock);
++	return 1;
+ }
+ 
+ /**
+--- a/arch/s390/kvm/kvm-s390.h
++++ b/arch/s390/kvm/kvm-s390.h
+@@ -326,8 +326,8 @@ int kvm_s390_handle_sigp(struct kvm_vcpu
+ int kvm_s390_handle_sigp_pei(struct kvm_vcpu *vcpu);
+ 
+ /* implemented in kvm-s390.c */
+-void kvm_s390_set_tod_clock(struct kvm *kvm,
+-			    const struct kvm_s390_vm_tod_clock *gtod);
++void kvm_s390_set_tod_clock(struct kvm *kvm, const struct kvm_s390_vm_tod_clock *gtod);
++int kvm_s390_try_set_tod_clock(struct kvm *kvm, const struct kvm_s390_vm_tod_clock *gtod);
+ long kvm_arch_fault_in_page(struct kvm_vcpu *vcpu, gpa_t gpa, int writable);
+ int kvm_s390_store_status_unloaded(struct kvm_vcpu *vcpu, unsigned long addr);
+ int kvm_s390_vcpu_store_status(struct kvm_vcpu *vcpu, unsigned long addr);
+--- a/arch/s390/kvm/priv.c
++++ b/arch/s390/kvm/priv.c
+@@ -103,7 +103,20 @@ static int handle_set_clock(struct kvm_v
+ 		return kvm_s390_inject_prog_cond(vcpu, rc);
+ 
+ 	VCPU_EVENT(vcpu, 3, "SCK: setting guest TOD to 0x%llx", gtod.tod);
+-	kvm_s390_set_tod_clock(vcpu->kvm, &gtod);
++	/*
++	 * To set the TOD clock the kvm lock must be taken, but the vcpu lock
++	 * is already held in handle_set_clock. The usual lock order is the
++	 * opposite.  As SCK is deprecated and should not be used in several
++	 * cases, for example when the multiple epoch facility or TOD clock
++	 * steering facility is installed (see Principles of Operation),  a
++	 * slow path can be used.  If the lock can not be taken via try_lock,
++	 * the instruction will be retried via -EAGAIN at a later point in
++	 * time.
++	 */
++	if (!kvm_s390_try_set_tod_clock(vcpu->kvm, &gtod)) {
++		kvm_s390_retry_instr(vcpu);
++		return -EAGAIN;
++	}
+ 
+ 	kvm_s390_set_psw_cc(vcpu, 0);
+ 	return 0;
