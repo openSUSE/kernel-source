@@ -152,6 +152,9 @@ for f in "$build_dir"/*; do
 	"$build_dir/linux-$SRCVERSION.tar.bz2")
 		continue
 		;;
+	"$build_dir/linux-$SRCVERSION.tar.sign")
+		continue
+		;;
 	"$build_dir"/patches.*)
 		rm -rf "$f"
 	esac
