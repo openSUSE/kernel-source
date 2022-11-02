@@ -1,0 +1,209 @@
+From 925ca893b4a65177394581737b95d03fea2660f2 Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Wed, 13 Apr 2022 07:48:08 +0200
+Subject: [PATCH] ALSA: memalloc: Add fallback SG-buffer allocations for x86
+Git-commit: 925ca893b4a65177394581737b95d03fea2660f2
+Patch-mainline: v5.18-rc3
+References: jsc#PED-850
+
+The recent change for memory allocator replaced the SG-buffer handling
+helper for x86 with the standard non-contiguous page handler.  This
+works for most cases, but there is a corner case I obviously
+overlooked, namely, the fallback of non-contiguous handler without
+IOMMU.  When the system runs without IOMMU, the core handler tries to
+use the continuous pages with a single SGL entry.  It works nicely for
+most cases, but when the system memory gets fragmented, the large
+allocation may fail frequently.
+
+Ideally the non-contig handler could deal with the proper SG pages,
+it's cumbersome to extend for now.  As a workaround, here we add new
+types for (minimalistic) SG allocations, instead, so that the
+allocator falls back to those types automatically when the allocation
+with the standard API failed.
+
+BTW, one better (but pretty minor) improvement from the previous
+SG-buffer code is that this provides the proper mmap support without
+the PCM's page fault handling.
+
+Fixes: 2c95b92ecd92 ("ALSA: memalloc: Unify x86 SG-buffer handling (take#3)")
+Buglink: https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/2272
+Buglink: https://bugzilla.suse.com/show_bug.cgi?id=1198248
+Cc: <stable@vger.kernel.org>
+Link: https://lore.kernel.org/r/20220413054808.7547-1-tiwai@suse.de
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ include/sound/memalloc.h |   5 ++
+ sound/core/memalloc.c    | 111 ++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 115 insertions(+), 1 deletion(-)
+
+diff --git a/include/sound/memalloc.h b/include/sound/memalloc.h
+index 653dfffb3ac8..8d79cebf95f3 100644
+--- a/include/sound/memalloc.h
++++ b/include/sound/memalloc.h
+@@ -51,6 +51,11 @@ struct snd_dma_device {
+ #define SNDRV_DMA_TYPE_DEV_SG	SNDRV_DMA_TYPE_DEV /* no SG-buf support */
+ #define SNDRV_DMA_TYPE_DEV_WC_SG	SNDRV_DMA_TYPE_DEV_WC
+ #endif
++/* fallback types, don't use those directly */
++#ifdef CONFIG_SND_DMA_SGBUF
++#define SNDRV_DMA_TYPE_DEV_SG_FALLBACK		10
++#define SNDRV_DMA_TYPE_DEV_WC_SG_FALLBACK	11
++#endif
+ 
+ /*
+  * info for buffer allocation
+diff --git a/sound/core/memalloc.c b/sound/core/memalloc.c
+index 6fd763d4d15b..15dc7160ba34 100644
+--- a/sound/core/memalloc.c
++++ b/sound/core/memalloc.c
+@@ -499,6 +499,10 @@ static const struct snd_malloc_ops snd_dma_wc_ops = {
+ };
+ #endif /* CONFIG_X86 */
+ 
++#ifdef CONFIG_SND_DMA_SGBUF
++static void *snd_dma_sg_fallback_alloc(struct snd_dma_buffer *dmab, size_t size);
++#endif
++
+ /*
+  * Non-contiguous pages allocator
+  */
+@@ -509,8 +513,18 @@ static void *snd_dma_noncontig_alloc(struct snd_dma_buffer *dmab, size_t size)
+ 
+ 	sgt = dma_alloc_noncontiguous(dmab->dev.dev, size, dmab->dev.dir,
+ 				      DEFAULT_GFP, 0);
+-	if (!sgt)
++	if (!sgt) {
++#ifdef CONFIG_SND_DMA_SGBUF
++		if (dmab->dev.type == SNDRV_DMA_TYPE_DEV_WC_SG)
++			dmab->dev.type = SNDRV_DMA_TYPE_DEV_WC_SG_FALLBACK;
++		else
++			dmab->dev.type = SNDRV_DMA_TYPE_DEV_SG_FALLBACK;
++		return snd_dma_sg_fallback_alloc(dmab, size);
++#else
+ 		return NULL;
++#endif
++	}
++
+ 	dmab->dev.need_sync = dma_need_sync(dmab->dev.dev,
+ 					    sg_dma_address(sgt->sgl));
+ 	p = dma_vmap_noncontiguous(dmab->dev.dev, size, sgt);
+@@ -633,6 +647,8 @@ static void *snd_dma_sg_wc_alloc(struct snd_dma_buffer *dmab, size_t size)
+ 
+ 	if (!p)
+ 		return NULL;
++	if (dmab->dev.type != SNDRV_DMA_TYPE_DEV_WC_SG)
++		return p;
+ 	for_each_sgtable_page(sgt, &iter, 0)
+ 		set_memory_wc(sg_wc_address(&iter), 1);
+ 	return p;
+@@ -665,6 +681,95 @@ static const struct snd_malloc_ops snd_dma_sg_wc_ops = {
+ 	.get_page = snd_dma_noncontig_get_page,
+ 	.get_chunk_size = snd_dma_noncontig_get_chunk_size,
+ };
++
++/* Fallback SG-buffer allocations for x86 */
++struct snd_dma_sg_fallback {
++	size_t count;
++	struct page **pages;
++	dma_addr_t *addrs;
++};
++
++static void __snd_dma_sg_fallback_free(struct snd_dma_buffer *dmab,
++				       struct snd_dma_sg_fallback *sgbuf)
++{
++	size_t i;
++
++	if (sgbuf->count && dmab->dev.type == SNDRV_DMA_TYPE_DEV_WC_SG_FALLBACK)
++		set_pages_array_wb(sgbuf->pages, sgbuf->count);
++	for (i = 0; i < sgbuf->count && sgbuf->pages[i]; i++)
++		dma_free_coherent(dmab->dev.dev, PAGE_SIZE,
++				  page_address(sgbuf->pages[i]),
++				  sgbuf->addrs[i]);
++	kvfree(sgbuf->pages);
++	kvfree(sgbuf->addrs);
++	kfree(sgbuf);
++}
++
++static void *snd_dma_sg_fallback_alloc(struct snd_dma_buffer *dmab, size_t size)
++{
++	struct snd_dma_sg_fallback *sgbuf;
++	struct page **pages;
++	size_t i, count;
++	void *p;
++
++	sgbuf = kzalloc(sizeof(*sgbuf), GFP_KERNEL);
++	if (!sgbuf)
++		return NULL;
++	count = PAGE_ALIGN(size) >> PAGE_SHIFT;
++	pages = kvcalloc(count, sizeof(*pages), GFP_KERNEL);
++	if (!pages)
++		goto error;
++	sgbuf->pages = pages;
++	sgbuf->addrs = kvcalloc(count, sizeof(*sgbuf->addrs), GFP_KERNEL);
++	if (!sgbuf->addrs)
++		goto error;
++
++	for (i = 0; i < count; sgbuf->count++, i++) {
++		p = dma_alloc_coherent(dmab->dev.dev, PAGE_SIZE,
++				       &sgbuf->addrs[i], DEFAULT_GFP);
++		if (!p)
++			goto error;
++		sgbuf->pages[i] = virt_to_page(p);
++	}
++
++	if (dmab->dev.type == SNDRV_DMA_TYPE_DEV_WC_SG_FALLBACK)
++		set_pages_array_wc(pages, count);
++	p = vmap(pages, count, VM_MAP, PAGE_KERNEL);
++	if (!p)
++		goto error;
++	dmab->private_data = sgbuf;
++	return p;
++
++ error:
++	__snd_dma_sg_fallback_free(dmab, sgbuf);
++	return NULL;
++}
++
++static void snd_dma_sg_fallback_free(struct snd_dma_buffer *dmab)
++{
++	vunmap(dmab->area);
++	__snd_dma_sg_fallback_free(dmab, dmab->private_data);
++}
++
++static int snd_dma_sg_fallback_mmap(struct snd_dma_buffer *dmab,
++				    struct vm_area_struct *area)
++{
++	struct snd_dma_sg_fallback *sgbuf = dmab->private_data;
++
++	if (dmab->dev.type == SNDRV_DMA_TYPE_DEV_WC_SG_FALLBACK)
++		area->vm_page_prot = pgprot_writecombine(area->vm_page_prot);
++	return vm_map_pages(area, sgbuf->pages, sgbuf->count);
++}
++
++static const struct snd_malloc_ops snd_dma_sg_fallback_ops = {
++	.alloc = snd_dma_sg_fallback_alloc,
++	.free = snd_dma_sg_fallback_free,
++	.mmap = snd_dma_sg_fallback_mmap,
++	/* reuse vmalloc helpers */
++	.get_addr = snd_dma_vmalloc_get_addr,
++	.get_page = snd_dma_vmalloc_get_page,
++	.get_chunk_size = snd_dma_vmalloc_get_chunk_size,
++};
+ #endif /* CONFIG_SND_DMA_SGBUF */
+ 
+ /*
+@@ -736,6 +841,10 @@ static const struct snd_malloc_ops *dma_ops[] = {
+ #ifdef CONFIG_GENERIC_ALLOCATOR
+ 	[SNDRV_DMA_TYPE_DEV_IRAM] = &snd_dma_iram_ops,
+ #endif /* CONFIG_GENERIC_ALLOCATOR */
++#ifdef CONFIG_SND_DMA_SGBUF
++	[SNDRV_DMA_TYPE_DEV_SG_FALLBACK] = &snd_dma_sg_fallback_ops,
++	[SNDRV_DMA_TYPE_DEV_WC_SG_FALLBACK] = &snd_dma_sg_fallback_ops,
++#endif
+ #endif /* CONFIG_HAS_DMA */
+ };
+ 
+-- 
+2.35.3
+
