@@ -1,0 +1,359 @@
+From 51cad2872435f79c63b81503d8d1c9f143172489 Mon Sep 17 00:00:00 2001
+From: Mustafa Ismail <mustafa.ismail@intel.com>
+Date: Mon, 28 Feb 2022 12:36:50 -0600
+Subject: [PATCH 1/1] RDMA/irdma: Add support for address handle re-use
+Git-commit: 51cad2872435f79c63b81503d8d1c9f143172489
+Patch-mainline: v5.18
+References: git-fixes
+
+Address handles (AH) are a limited HW resource and some user applications
+may create large numbers of identical AH's.  Avoid running out of AH's by
+reusing existing identical ones.
+
+Link: https://lore.kernel.org/r/20220228183650.290-1-shiraz.saleem@intel.com
+Signed-off-by: Mustafa Ismail <mustafa.ismail@intel.com>
+Signed-off-by: Shiraz Saleem <shiraz.saleem@intel.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Nicolas Morey-Chaisemartin <nmoreychaisemartin@suse.com>
+---
+ drivers/infiniband/hw/irdma/main.c  |   2 +-
+ drivers/infiniband/hw/irdma/main.h  |   2 +
+ drivers/infiniband/hw/irdma/verbs.c | 217 ++++++++++++++++++++--------
+ drivers/infiniband/hw/irdma/verbs.h |   3 +
+ 4 files changed, 164 insertions(+), 60 deletions(-)
+
+diff --git a/drivers/infiniband/hw/irdma/main.c b/drivers/infiniband/hw/irdma/main.c
+index 4f4c3454bc43..514453777e07 100644
+--- a/drivers/infiniband/hw/irdma/main.c
++++ b/drivers/infiniband/hw/irdma/main.c
+@@ -242,7 +242,7 @@ static void irdma_fill_device_info(struct irdma_device *iwdev, struct ice_pf *pf
+ 	rf->gen_ops.request_reset = irdma_request_reset;
+ 	rf->limits_sel = 7;
+ 	rf->iwdev = iwdev;
+-
++	mutex_init(&iwdev->ah_tbl_lock);
+ 	iwdev->netdev = vsi->netdev;
+ 	iwdev->vsi_num = vsi->vsi_num;
+ 	iwdev->init_state = INITIAL_STATE;
+diff --git a/drivers/infiniband/hw/irdma/main.h b/drivers/infiniband/hw/irdma/main.h
+index 44365d1dc7b2..5123f5feaa2f 100644
+--- a/drivers/infiniband/hw/irdma/main.h
++++ b/drivers/infiniband/hw/irdma/main.h
+@@ -332,6 +332,8 @@ struct irdma_device {
+ 	struct workqueue_struct *cleanup_wq;
+ 	struct irdma_sc_vsi vsi;
+ 	struct irdma_cm_core cm_core;
++	DECLARE_HASHTABLE(ah_hash_tbl, 8);
++	struct mutex ah_tbl_lock; /* protect AH hash table access */
+ 	u32 roce_cwnd;
+ 	u32 roce_ackcreds;
+ 	u32 vendor_id;
+diff --git a/drivers/infiniband/hw/irdma/verbs.c b/drivers/infiniband/hw/irdma/verbs.c
+index e731768c2b2a..46f475394af5 100644
+--- a/drivers/infiniband/hw/irdma/verbs.c
++++ b/drivers/infiniband/hw/irdma/verbs.c
+@@ -4074,17 +4074,47 @@ static int irdma_detach_mcast(struct ib_qp *ibqp, union ib_gid *ibgid, u16 lid)
+ 	return 0;
+ }
+ 
+-/**
+- * irdma_create_ah - create address handle
+- * @ibah: address handle
+- * @attr: address handle attributes
+- * @udata: User data
+- *
+- * returns 0 on success, error otherwise
+- */
+-static int irdma_create_ah(struct ib_ah *ibah,
+-			   struct rdma_ah_init_attr *attr,
+-			   struct ib_udata *udata)
++static int irdma_create_hw_ah(struct irdma_device *iwdev, struct irdma_ah *ah, bool sleep)
++{
++	struct irdma_pci_f *rf = iwdev->rf;
++	int err;
++
++	err = irdma_alloc_rsrc(rf, rf->allocated_ahs, rf->max_ah, &ah->sc_ah.ah_info.ah_idx,
++			       &rf->next_ah);
++	if (err)
++		return err;
++
++	err = irdma_ah_cqp_op(rf, &ah->sc_ah, IRDMA_OP_AH_CREATE, sleep,
++			      irdma_gsi_ud_qp_ah_cb, &ah->sc_ah);
++
++	if (err) {
++		ibdev_dbg(&iwdev->ibdev, "VERBS: CQP-OP Create AH fail");
++		goto err_ah_create;
++	}
++
++	if (!sleep) {
++		int cnt = CQP_COMPL_WAIT_TIME_MS * CQP_TIMEOUT_THRESHOLD;
++
++		do {
++			irdma_cqp_ce_handler(rf, &rf->ccq.sc_cq);
++			mdelay(1);
++		} while (!ah->sc_ah.ah_info.ah_valid && --cnt);
++
++		if (!cnt) {
++			ibdev_dbg(&iwdev->ibdev, "VERBS: CQP create AH timed out");
++			err = -ETIMEDOUT;
++			goto err_ah_create;
++		}
++	}
++	return 0;
++
++err_ah_create:
++	irdma_free_rsrc(iwdev->rf, iwdev->rf->allocated_ahs, ah->sc_ah.ah_info.ah_idx);
++
++	return err;
++}
++
++static int irdma_setup_ah(struct ib_ah *ibah, struct rdma_ah_init_attr *attr)
+ {
+ 	struct irdma_pd *pd = to_iwpd(ibah->pd);
+ 	struct irdma_ah *ah = container_of(ibah, struct irdma_ah, ibah);
+@@ -4093,21 +4123,13 @@ static int irdma_create_ah(struct ib_ah *ibah,
+ 	struct irdma_device *iwdev = to_iwdev(ibah->pd->device);
+ 	struct irdma_pci_f *rf = iwdev->rf;
+ 	struct irdma_sc_ah *sc_ah;
+-	u32 ah_id = 0;
+ 	struct irdma_ah_info *ah_info;
+-	struct irdma_create_ah_resp uresp;
+ 	union irdma_sockaddr sgid_addr, dgid_addr;
+ 	int err;
+ 	u8 dmac[ETH_ALEN];
+ 
+-	err = irdma_alloc_rsrc(rf, rf->allocated_ahs, rf->max_ah, &ah_id,
+-			       &rf->next_ah);
+-	if (err)
+-		return err;
+-
+ 	ah->pd = pd;
+ 	sc_ah = &ah->sc_ah;
+-	sc_ah->ah_info.ah_idx = ah_id;
+ 	sc_ah->ah_info.vsi = &iwdev->vsi;
+ 	irdma_sc_init_ah(&rf->sc_dev, sc_ah);
+ 	ah->sgid_index = ah_attr->grh.sgid_index;
+@@ -4118,7 +4140,6 @@ static int irdma_create_ah(struct ib_ah *ibah,
+ 	ah->av.attrs = *ah_attr;
+ 	ah->av.net_type = rdma_gid_attr_network_type(sgid_attr);
+ 	ah_info = &sc_ah->ah_info;
+-	ah_info->ah_idx = ah_id;
+ 	ah_info->pd_idx = pd->sc_pd.pd_id;
+ 	if (ah_attr->ah_flags & IB_AH_GRH) {
+ 		ah_info->flow_label = ah_attr->grh.flow_label;
+@@ -4155,15 +4176,13 @@ static int irdma_create_ah(struct ib_ah *ibah,
+ 	err = rdma_read_gid_l2_fields(sgid_attr, &ah_info->vlan_tag,
+ 				      ah_info->mac_addr);
+ 	if (err)
+-		goto error;
++		return err;
+ 
+ 	ah_info->dst_arpindex = irdma_add_arp(iwdev->rf, ah_info->dest_ip_addr,
+ 					      ah_info->ipv4_valid, dmac);
+ 
+-	if (ah_info->dst_arpindex == -1) {
+-		err = -EINVAL;
+-		goto error;
+-	}
++	if (ah_info->dst_arpindex == -1)
++		return -EINVAL;
+ 
+ 	if (ah_info->vlan_tag >= VLAN_N_VID && iwdev->dcb)
+ 		ah_info->vlan_tag = 0;
+@@ -4174,43 +4193,38 @@ static int irdma_create_ah(struct ib_ah *ibah,
+ 			rt_tos2priority(ah_info->tc_tos) << VLAN_PRIO_SHIFT;
+ 	}
+ 
+-	err = irdma_ah_cqp_op(iwdev->rf, sc_ah, IRDMA_OP_AH_CREATE,
+-			      attr->flags & RDMA_CREATE_AH_SLEEPABLE,
+-			      irdma_gsi_ud_qp_ah_cb, sc_ah);
+-
+-	if (err) {
+-		ibdev_dbg(&iwdev->ibdev,
+-			  "VERBS: CQP-OP Create AH fail");
+-		goto error;
+-	}
+-
+-	if (!(attr->flags & RDMA_CREATE_AH_SLEEPABLE)) {
+-		int cnt = CQP_COMPL_WAIT_TIME_MS * CQP_TIMEOUT_THRESHOLD;
+-
+-		do {
+-			irdma_cqp_ce_handler(rf, &rf->ccq.sc_cq);
+-			mdelay(1);
+-		} while (!sc_ah->ah_info.ah_valid && --cnt);
++	return 0;
++}
+ 
+-		if (!cnt) {
+-			ibdev_dbg(&iwdev->ibdev,
+-				  "VERBS: CQP create AH timed out");
+-			err = -ETIMEDOUT;
+-			goto error;
++/**
++ * irdma_ah_exists - Check for existing identical AH
++ * @iwdev: irdma device
++ * @new_ah: AH to check for
++ *
++ * returns true if AH is found, false if not found.
++ */
++static bool irdma_ah_exists(struct irdma_device *iwdev,
++			    struct irdma_ah *new_ah)
++{
++	struct irdma_ah *ah;
++	u32 key = new_ah->sc_ah.ah_info.dest_ip_addr[0] ^
++		  new_ah->sc_ah.ah_info.dest_ip_addr[1] ^
++		  new_ah->sc_ah.ah_info.dest_ip_addr[2] ^
++		  new_ah->sc_ah.ah_info.dest_ip_addr[3];
++
++	hash_for_each_possible(iwdev->ah_hash_tbl, ah, list, key) {
++		/* Set ah_valid and ah_id the same so memcmp can work */
++		new_ah->sc_ah.ah_info.ah_idx = ah->sc_ah.ah_info.ah_idx;
++		new_ah->sc_ah.ah_info.ah_valid = ah->sc_ah.ah_info.ah_valid;
++		if (!memcmp(&ah->sc_ah.ah_info, &new_ah->sc_ah.ah_info,
++			    sizeof(ah->sc_ah.ah_info))) {
++			refcount_inc(&ah->refcnt);
++			new_ah->parent_ah = ah;
++			return true;
+ 		}
+ 	}
+ 
+-	if (udata) {
+-		uresp.ah_id = ah->sc_ah.ah_info.ah_idx;
+-		err = ib_copy_to_udata(udata, &uresp,
+-				       min(sizeof(uresp), udata->outlen));
+-	}
+-	return 0;
+-
+-error:
+-	irdma_free_rsrc(iwdev->rf, iwdev->rf->allocated_ahs, ah_id);
+-
+-	return err;
++	return false;
+ }
+ 
+ /**
+@@ -4223,6 +4237,17 @@ static int irdma_destroy_ah(struct ib_ah *ibah, u32 ah_flags)
+ 	struct irdma_device *iwdev = to_iwdev(ibah->device);
+ 	struct irdma_ah *ah = to_iwah(ibah);
+ 
++	if ((ah_flags & RDMA_DESTROY_AH_SLEEPABLE) && ah->parent_ah) {
++		mutex_lock(&iwdev->ah_tbl_lock);
++		if (!refcount_dec_and_test(&ah->parent_ah->refcnt)) {
++			mutex_unlock(&iwdev->ah_tbl_lock);
++			return 0;
++		}
++		hash_del(&ah->parent_ah->list);
++		kfree(ah->parent_ah);
++		mutex_unlock(&iwdev->ah_tbl_lock);
++	}
++
+ 	irdma_ah_cqp_op(iwdev->rf, &ah->sc_ah, IRDMA_OP_AH_DESTROY,
+ 			false, NULL, ah);
+ 
+@@ -4232,6 +4257,80 @@ static int irdma_destroy_ah(struct ib_ah *ibah, u32 ah_flags)
+ 	return 0;
+ }
+ 
++/**
++ * irdma_create_user_ah - create user address handle
++ * @ibah: address handle
++ * @attr: address handle attributes
++ * @udata: User data
++ *
++ * returns 0 on success, error otherwise
++ */
++static int irdma_create_user_ah(struct ib_ah *ibah,
++				struct rdma_ah_init_attr *attr,
++				struct ib_udata *udata)
++{
++	struct irdma_ah *ah = container_of(ibah, struct irdma_ah, ibah);
++	struct irdma_device *iwdev = to_iwdev(ibah->pd->device);
++	struct irdma_create_ah_resp uresp;
++	struct irdma_ah *parent_ah;
++	int err;
++
++	err = irdma_setup_ah(ibah, attr);
++	if (err)
++		return err;
++	mutex_lock(&iwdev->ah_tbl_lock);
++	if (!irdma_ah_exists(iwdev, ah)) {
++		err = irdma_create_hw_ah(iwdev, ah, true);
++		if (err) {
++			mutex_unlock(&iwdev->ah_tbl_lock);
++			return err;
++		}
++		/* Add new AH to list */
++		parent_ah = kmemdup(ah, sizeof(*ah), GFP_KERNEL);
++		if (parent_ah) {
++			u32 key = parent_ah->sc_ah.ah_info.dest_ip_addr[0] ^
++				  parent_ah->sc_ah.ah_info.dest_ip_addr[1] ^
++				  parent_ah->sc_ah.ah_info.dest_ip_addr[2] ^
++				  parent_ah->sc_ah.ah_info.dest_ip_addr[3];
++
++			ah->parent_ah = parent_ah;
++			hash_add(iwdev->ah_hash_tbl, &parent_ah->list, key);
++			refcount_set(&parent_ah->refcnt, 1);
++		}
++	}
++	mutex_unlock(&iwdev->ah_tbl_lock);
++
++	uresp.ah_id = ah->sc_ah.ah_info.ah_idx;
++	err = ib_copy_to_udata(udata, &uresp, min(sizeof(uresp), udata->outlen));
++	if (err)
++		irdma_destroy_ah(ibah, attr->flags);
++
++	return err;
++}
++
++/**
++ * irdma_create_ah - create address handle
++ * @ibah: address handle
++ * @attr: address handle attributes
++ * @udata: NULL
++ *
++ * returns 0 on success, error otherwise
++ */
++static int irdma_create_ah(struct ib_ah *ibah, struct rdma_ah_init_attr *attr,
++			   struct ib_udata *udata)
++{
++	struct irdma_ah *ah = container_of(ibah, struct irdma_ah, ibah);
++	struct irdma_device *iwdev = to_iwdev(ibah->pd->device);
++	int err;
++
++	err = irdma_setup_ah(ibah, attr);
++	if (err)
++		return err;
++	err = irdma_create_hw_ah(iwdev, ah, attr->flags & RDMA_CREATE_AH_SLEEPABLE);
++
++	return err;
++}
++
+ /**
+  * irdma_query_ah - Query address handle
+  * @ibah: pointer to address handle
+@@ -4265,7 +4364,7 @@ static enum rdma_link_layer irdma_get_link_layer(struct ib_device *ibdev,
+ static const struct ib_device_ops irdma_roce_dev_ops = {
+ 	.attach_mcast = irdma_attach_mcast,
+ 	.create_ah = irdma_create_ah,
+-	.create_user_ah = irdma_create_ah,
++	.create_user_ah = irdma_create_user_ah,
+ 	.destroy_ah = irdma_destroy_ah,
+ 	.detach_mcast = irdma_detach_mcast,
+ 	.get_link_layer = irdma_get_link_layer,
+diff --git a/drivers/infiniband/hw/irdma/verbs.h b/drivers/infiniband/hw/irdma/verbs.h
+index 541105b728e3..08ba24d0b843 100644
+--- a/drivers/infiniband/hw/irdma/verbs.h
++++ b/drivers/infiniband/hw/irdma/verbs.h
+@@ -45,6 +45,9 @@ struct irdma_ah {
+ 	struct irdma_av av;
+ 	u8 sgid_index;
+ 	union ib_gid dgid;
++	struct hlist_node list;
++	refcount_t refcnt;
++	struct irdma_ah *parent_ah; /* AH from cached list */
+ };
+ 
+ struct irdma_hmc_pble {
+-- 
+2.38.0.1.gee35aeee4b76
+
