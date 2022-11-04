@@ -1,0 +1,238 @@
+From 2f1f570cd730c81807ae143a83766068dd82d577 Mon Sep 17 00:00:00 2001
+From: Cezary Rojewski <cezary.rojewski@intel.com>
+Date: Mon, 16 May 2022 12:11:07 +0200
+Subject: [PATCH] ASoC: Intel: avs: Coredump and recovery flow
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 2f1f570cd730c81807ae143a83766068dd82d577
+Patch-mainline: v5.19-rc1
+References: jsc#PED-850
+
+In rare occasions, under stress conditions or hardware malfunction, DSP
+firmware may fail. Software is notified about such situation with
+EXCEPTION_CAUGHT notification. IPC timeout is also counted as critical
+device failure. More often than not, driver can recover from such
+situations by performing full reset: killing and restarting ADSP.
+
+Signed-off-by: Amadeusz Sławiński <amadeuszx.slawinski@linux.intel.com>
+Signed-off-by: Cezary Rojewski <cezary.rojewski@intel.com>
+Link: https://lore.kernel.org/r/20220516101116.190192-7-cezary.rojewski@intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ sound/soc/intel/Kconfig        |  1 +
+ sound/soc/intel/avs/avs.h      |  4 ++
+ sound/soc/intel/avs/ipc.c      | 97 +++++++++++++++++++++++++++++++++-
+ sound/soc/intel/avs/messages.h |  5 ++
+ 4 files changed, 105 insertions(+), 2 deletions(-)
+
+diff --git a/sound/soc/intel/Kconfig b/sound/soc/intel/Kconfig
+index 039b45a4a799..1aaf9bdf721c 100644
+--- a/sound/soc/intel/Kconfig
++++ b/sound/soc/intel/Kconfig
+@@ -219,6 +219,7 @@ config SND_SOC_INTEL_AVS
+ 	select SND_HDA_EXT_CORE
+ 	select SND_HDA_DSP_LOADER
+ 	select SND_INTEL_DSP_CONFIG
++	select WANT_DEV_COREDUMP
+ 	help
+ 	  Enable support for Intel(R) cAVS 1.5 platforms with DSP
+ 	  capabilities. This includes Skylake, Kabylake, Amberlake and
+diff --git a/sound/soc/intel/avs/avs.h b/sound/soc/intel/avs/avs.h
+index e628f78d1864..9096f6c3d598 100644
+--- a/sound/soc/intel/avs/avs.h
++++ b/sound/soc/intel/avs/avs.h
+@@ -42,6 +42,7 @@ struct avs_dsp_ops {
+ 	int (* const load_basefw)(struct avs_dev *, struct firmware *);
+ 	int (* const load_lib)(struct avs_dev *, struct firmware *, u32);
+ 	int (* const transfer_mods)(struct avs_dev *, bool, struct avs_module_entry *, u32);
++	int (* const coredump)(struct avs_dev *, union avs_notify_msg *);
+ };
+ 
+ #define avs_dsp_op(adev, op, ...) \
+@@ -164,12 +165,15 @@ struct avs_ipc {
+ 	struct avs_ipc_msg rx;
+ 	u32 default_timeout_ms;
+ 	bool ready;
++	atomic_t recovering;
+ 
+ 	bool rx_completed;
+ 	spinlock_t rx_lock;
+ 	struct mutex msg_mutex;
+ 	struct completion done_completion;
+ 	struct completion busy_completion;
++
++	struct work_struct recovery_work;
+ };
+ 
+ #define AVS_EIPC	EREMOTEIO
+diff --git a/sound/soc/intel/avs/ipc.c b/sound/soc/intel/avs/ipc.c
+index 68aaf01edbf2..98cdc05071fb 100644
+--- a/sound/soc/intel/avs/ipc.c
++++ b/sound/soc/intel/avs/ipc.c
+@@ -14,6 +14,89 @@
+ 
+ #define AVS_IPC_TIMEOUT_MS	300
+ 
++static void avs_dsp_recovery(struct avs_dev *adev)
++{
++	struct avs_soc_component *acomp;
++	unsigned int core_mask;
++	int ret;
++
++	mutex_lock(&adev->comp_list_mutex);
++	/* disconnect all running streams */
++	list_for_each_entry(acomp, &adev->comp_list, node) {
++		struct snd_soc_pcm_runtime *rtd;
++		struct snd_soc_card *card;
++
++		card = acomp->base.card;
++		if (!card)
++			continue;
++
++		for_each_card_rtds(card, rtd) {
++			struct snd_pcm *pcm;
++			int dir;
++
++			pcm = rtd->pcm;
++			if (!pcm || rtd->dai_link->no_pcm)
++				continue;
++
++			for_each_pcm_streams(dir) {
++				struct snd_pcm_substream *substream;
++
++				substream = pcm->streams[dir].substream;
++				if (!substream || !substream->runtime)
++					continue;
++
++				snd_pcm_stop(substream, SNDRV_PCM_STATE_DISCONNECTED);
++			}
++		}
++	}
++	mutex_unlock(&adev->comp_list_mutex);
++
++	/* forcibly shutdown all cores */
++	core_mask = GENMASK(adev->hw_cfg.dsp_cores - 1, 0);
++	avs_dsp_core_disable(adev, core_mask);
++
++	/* attempt dsp reboot */
++	ret = avs_dsp_boot_firmware(adev, true);
++	if (ret < 0)
++		dev_err(adev->dev, "dsp reboot failed: %d\n", ret);
++
++	pm_runtime_mark_last_busy(adev->dev);
++	pm_runtime_enable(adev->dev);
++	pm_request_autosuspend(adev->dev);
++
++	atomic_set(&adev->ipc->recovering, 0);
++}
++
++static void avs_dsp_recovery_work(struct work_struct *work)
++{
++	struct avs_ipc *ipc = container_of(work, struct avs_ipc, recovery_work);
++
++	avs_dsp_recovery(to_avs_dev(ipc->dev));
++}
++
++static void avs_dsp_exception_caught(struct avs_dev *adev, union avs_notify_msg *msg)
++{
++	struct avs_ipc *ipc = adev->ipc;
++
++	/* Account for the double-exception case. */
++	ipc->ready = false;
++
++	if (!atomic_add_unless(&ipc->recovering, 1, 1)) {
++		dev_err(adev->dev, "dsp recovery is already in progress\n");
++		return;
++	}
++
++	dev_crit(adev->dev, "communication severed, rebooting dsp..\n");
++
++	/* Re-enabled on recovery completion. */
++	pm_runtime_disable(adev->dev);
++
++	/* Process received notification. */
++	avs_dsp_op(adev, coredump, msg);
++
++	schedule_work(&ipc->recovery_work);
++}
++
+ static void avs_dsp_receive_rx(struct avs_dev *adev, u64 header)
+ {
+ 	struct avs_ipc *ipc = adev->ipc;
+@@ -57,6 +140,9 @@ static void avs_dsp_process_notification(struct avs_dev *adev, u64 header)
+ 		data_size = sizeof(struct avs_notify_res_data);
+ 		break;
+ 
++	case AVS_NOTIFY_EXCEPTION_CAUGHT:
++		break;
++
+ 	case AVS_NOTIFY_MODULE_EVENT:
+ 		/* To know the total payload size, header needs to be read first. */
+ 		memcpy_fromio(&mod_data, avs_uplink_addr(adev), sizeof(mod_data));
+@@ -84,6 +170,10 @@ static void avs_dsp_process_notification(struct avs_dev *adev, u64 header)
+ 		complete(&adev->fw_ready);
+ 		break;
+ 
++	case AVS_NOTIFY_EXCEPTION_CAUGHT:
++		avs_dsp_exception_caught(adev, &msg);
++		break;
++
+ 	default:
+ 		break;
+ 	}
+@@ -278,9 +368,10 @@ static int avs_dsp_do_send_msg(struct avs_dev *adev, struct avs_ipc_msg *request
+ 	ret = avs_ipc_wait_busy_completion(ipc, timeout);
+ 	if (ret) {
+ 		if (ret == -ETIMEDOUT) {
+-			dev_crit(adev->dev, "communication severed: %d, rebooting dsp..\n", ret);
++			union avs_notify_msg msg = AVS_NOTIFICATION(EXCEPTION_CAUGHT);
+ 
+-			avs_ipc_block(ipc);
++			/* Same treatment as on exception, just stack_dump=0. */
++			avs_dsp_exception_caught(adev, &msg);
+ 		}
+ 		goto exit;
+ 	}
+@@ -368,6 +459,7 @@ int avs_ipc_init(struct avs_ipc *ipc, struct device *dev)
+ 	ipc->dev = dev;
+ 	ipc->ready = false;
+ 	ipc->default_timeout_ms = AVS_IPC_TIMEOUT_MS;
++	INIT_WORK(&ipc->recovery_work, avs_dsp_recovery_work);
+ 	init_completion(&ipc->done_completion);
+ 	init_completion(&ipc->busy_completion);
+ 	spin_lock_init(&ipc->rx_lock);
+@@ -379,4 +471,5 @@ int avs_ipc_init(struct avs_ipc *ipc, struct device *dev)
+ void avs_ipc_block(struct avs_ipc *ipc)
+ {
+ 	ipc->ready = false;
++	cancel_work_sync(&ipc->recovery_work);
+ }
+diff --git a/sound/soc/intel/avs/messages.h b/sound/soc/intel/avs/messages.h
+index 0395dd7150eb..94875a153124 100644
+--- a/sound/soc/intel/avs/messages.h
++++ b/sound/soc/intel/avs/messages.h
+@@ -187,6 +187,7 @@ enum avs_notify_msg_type {
+ 	AVS_NOTIFY_PHRASE_DETECTED = 4,
+ 	AVS_NOTIFY_RESOURCE_EVENT = 5,
+ 	AVS_NOTIFY_FW_READY = 8,
++	AVS_NOTIFY_EXCEPTION_CAUGHT = 10,
+ 	AVS_NOTIFY_MODULE_EVENT = 12,
+ };
+ 
+@@ -205,6 +206,10 @@ union avs_notify_msg {
+ 		};
+ 		union {
+ 			u32 val;
++			struct {
++				u32 core_id:2;
++				u32 stack_dump_size:16;
++			} coredump;
+ 		} ext;
+ 	};
+ } __packed;
+-- 
+2.35.3
+
