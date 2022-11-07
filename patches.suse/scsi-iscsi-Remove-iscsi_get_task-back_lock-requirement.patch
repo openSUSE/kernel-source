@@ -1,0 +1,309 @@
+From: Mike Christie <michael.christie@oracle.com>
+Date: Thu, 16 Jun 2022 17:45:55 -0500
+Subject: scsi: iscsi: Remove iscsi_get_task back_lock requirement
+Git-commit: e1c6a7ec14290a0e371b09300685638f9009f2ab
+Patch-mainline: v6.0-rc1
+References: jsc#PED-1496
+
+We currently require that the back_lock is held when calling the functions
+that manipulate the iscsi_task refcount. The only reason for this is to
+handle races where we are handling SCSI-ml EH callbacks and the cmd is
+completing at the same time the normal completion path is running, and we
+can't return from the EH callback until the driver has stopped accessing
+the cmd. Holding the back_lock while also accessing the task->state made it
+simple to check that a cmd is completing and also get/put a refcount at the
+same time, and at the time we were not as concerned about performance.
+
+The problem is that we don't want to take the back_lock from the xmit path
+for normal I/O since it causes contention with the completion path if the
+user has chosen to try and split those paths on different CPUs (in this
+case abusing the CPUs and ignoring caching improves perf for some uses).
+
+Begins to remove the back_lock requirement for iscsi_get/put_task by
+removing the requirement for the get path. Instead of always holding the
+back_lock we detect if something has done the last put and is about to call
+iscsi_free_task(). A subsequent commit will then allow iSCSI code to do the
+last put on a task and only grab the back_lock if the refcount is now zero
+and it's going to call iscsi_free_task().
+
+Link: https://lore.kernel.org/r/20220616224557.115234-8-michael.christie@oracle.com
+Reviewed-by: Lee Duncan <lduncan@suse.com>
+Signed-off-by: Mike Christie <michael.christie@oracle.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Lee Duncan <lduncan@suse.com>
+---
+ drivers/scsi/be2iscsi/be_main.c | 19 ++++++++-
+ drivers/scsi/libiscsi.c         | 95 ++++++++++++++++++++++++++++-------------
+ drivers/scsi/libiscsi_tcp.c     |  6 ++-
+ include/scsi/libiscsi.h         |  2 +-
+ 4 files changed, 89 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/scsi/be2iscsi/be_main.c b/drivers/scsi/be2iscsi/be_main.c
+index 02026476c39c..50a577ac3bb4 100644
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@ -231,6 +231,7 @@ static int beiscsi_eh_abort(struct scsi_cmnd *sc)
+ 	cls_session = starget_to_session(scsi_target(sc->device));
+ 	session = cls_session->dd_data;
+ 
++completion_check:
+ 	/* check if we raced, task just got cleaned up under us */
+ 	spin_lock_bh(&session->back_lock);
+ 	if (!abrt_task || !abrt_task->sc) {
+@@ -238,7 +239,13 @@ static int beiscsi_eh_abort(struct scsi_cmnd *sc)
+ 		return SUCCESS;
+ 	}
+ 	/* get a task ref till FW processes the req for the ICD used */
+-	__iscsi_get_task(abrt_task);
++	if (!iscsi_get_task(abrt_task)) {
++		spin_unlock(&session->back_lock);
++		/* We are just about to call iscsi_free_task so wait for it. */
++		udelay(5);
++		goto completion_check;
++	}
++
+ 	abrt_io_task = abrt_task->dd_data;
+ 	conn = abrt_task->conn;
+ 	beiscsi_conn = conn->dd_data;
+@@ -323,7 +330,15 @@ static int beiscsi_eh_device_reset(struct scsi_cmnd *sc)
+ 		}
+ 
+ 		/* get a task ref till FW processes the req for the ICD used */
+-		__iscsi_get_task(task);
++		if (!iscsi_get_task(task)) {
++			/*
++			 * The task has completed in the driver and is
++			 * completing in libiscsi. Just ignore it here. When we
++			 * call iscsi_eh_device_reset, it will wait for us.
++			 */
++			continue;
++		}
++
+ 		io_task = task->dd_data;
+ 		/* mark WRB invalid which have been not processed by FW yet */
+ 		if (is_chip_be2_be3r(phba)) {
+diff --git a/drivers/scsi/libiscsi.c b/drivers/scsi/libiscsi.c
+index fce9f9e5b00b..3a6b827496dd 100644
+--- a/drivers/scsi/libiscsi.c
++++ b/drivers/scsi/libiscsi.c
+@@ -83,6 +83,8 @@ MODULE_PARM_DESC(debug_libiscsi_eh,
+ 				"%s " dbg_fmt, __func__, ##arg);	\
+ 	} while (0);
+ 
++#define ISCSI_CMD_COMPL_WAIT 5
++
+ inline void iscsi_conn_queue_xmit(struct iscsi_conn *conn)
+ {
+ 	struct Scsi_Host *shost = conn->session->host;
+@@ -482,11 +484,11 @@ static void iscsi_free_task(struct iscsi_task *task)
+ 	}
+ }
+ 
+-void __iscsi_get_task(struct iscsi_task *task)
++bool iscsi_get_task(struct iscsi_task *task)
+ {
+-	refcount_inc(&task->refcount);
++	return refcount_inc_not_zero(&task->refcount);
+ }
+-EXPORT_SYMBOL_GPL(__iscsi_get_task);
++EXPORT_SYMBOL_GPL(iscsi_get_task);
+ 
+ void __iscsi_put_task(struct iscsi_task *task)
+ {
+@@ -600,20 +602,17 @@ static bool cleanup_queued_task(struct iscsi_task *task)
+ }
+ 
+ /*
+- * session frwd lock must be held and if not called for a task that is still
+- * pending or from the xmit thread, then xmit thread must be suspended
++ * session back and frwd lock must be held and if not called for a task that
++ * is still pending or from the xmit thread, then xmit thread must be suspended
+  */
+-static void fail_scsi_task(struct iscsi_task *task, int err)
++static void __fail_scsi_task(struct iscsi_task *task, int err)
+ {
+ 	struct iscsi_conn *conn = task->conn;
+ 	struct scsi_cmnd *sc;
+ 	int state;
+ 
+-	spin_lock_bh(&conn->session->back_lock);
+-	if (cleanup_queued_task(task)) {
+-		spin_unlock_bh(&conn->session->back_lock);
++	if (cleanup_queued_task(task))
+ 		return;
+-	}
+ 
+ 	if (task->state == ISCSI_TASK_PENDING) {
+ 		/*
+@@ -632,7 +631,15 @@ static void fail_scsi_task(struct iscsi_task *task, int err)
+ 	sc->result = err << 16;
+ 	scsi_set_resid(sc, scsi_bufflen(sc));
+ 	iscsi_complete_task(task, state);
+-	spin_unlock_bh(&conn->session->back_lock);
++}
++
++static void fail_scsi_task(struct iscsi_task *task, int err)
++{
++	struct iscsi_session *session = task->conn->session;
++
++	spin_lock_bh(&session->back_lock);
++	__fail_scsi_task(task, err);
++	spin_unlock_bh(&session->back_lock);
+ }
+ 
+ static int iscsi_prep_mgmt_task(struct iscsi_conn *conn,
+@@ -1450,8 +1457,17 @@ static int iscsi_xmit_task(struct iscsi_conn *conn, struct iscsi_task *task,
+ 	spin_lock_bh(&conn->session->back_lock);
+ 
+ 	if (!conn->task) {
+-		/* Take a ref so we can access it after xmit_task() */
+-		__iscsi_get_task(task);
++		/*
++		 * Take a ref so we can access it after xmit_task().
++		 *
++		 * This should never fail because the failure paths will have
++		 * stopped the xmit thread.
++		 */
++		if (!iscsi_get_task(task)) {
++			spin_unlock_bh(&conn->session->back_lock);
++			WARN_ON_ONCE(1);
++			return 0;
++		}
+ 	} else {
+ 		/* Already have a ref from when we failed to send it last call */
+ 		conn->task = NULL;
+@@ -1493,7 +1509,7 @@ static int iscsi_xmit_task(struct iscsi_conn *conn, struct iscsi_task *task,
+ 		 * get an extra ref that is released next time we access it
+ 		 * as conn->task above.
+ 		 */
+-		__iscsi_get_task(task);
++		iscsi_get_task(task);
+ 		conn->task = task;
+ 	}
+ 
+@@ -1912,6 +1928,7 @@ static void fail_scsi_tasks(struct iscsi_conn *conn, u64 lun, int error)
+ 	struct iscsi_task *task;
+ 	int i;
+ 
++restart_cmd_loop:
+ 	spin_lock_bh(&session->back_lock);
+ 	for (i = 0; i < session->cmds_max; i++) {
+ 		task = session->cmds[i];
+@@ -1920,22 +1937,25 @@ static void fail_scsi_tasks(struct iscsi_conn *conn, u64 lun, int error)
+ 
+ 		if (lun != -1 && lun != task->sc->device->lun)
+ 			continue;
+-
+-		__iscsi_get_task(task);
+-		spin_unlock_bh(&session->back_lock);
++		/*
++		 * The cmd is completing but if this is called from an eh
++		 * callout path then when we return scsi-ml owns the cmd. Wait
++		 * for the completion path to finish freeing the cmd.
++		 */
++		if (!iscsi_get_task(task)) {
++			spin_unlock_bh(&session->back_lock);
++			spin_unlock_bh(&session->frwd_lock);
++			udelay(ISCSI_CMD_COMPL_WAIT);
++			spin_lock_bh(&session->frwd_lock);
++			goto restart_cmd_loop;
++		}
+ 
+ 		ISCSI_DBG_SESSION(session,
+ 				  "failing sc %p itt 0x%x state %d\n",
+ 				  task->sc, task->itt, task->state);
+-		fail_scsi_task(task, error);
+-
+-		spin_unlock_bh(&session->frwd_lock);
+-		iscsi_put_task(task);
+-		spin_lock_bh(&session->frwd_lock);
+-
+-		spin_lock_bh(&session->back_lock);
++		__fail_scsi_task(task, error);
++		__iscsi_put_task(task);
+ 	}
+-
+ 	spin_unlock_bh(&session->back_lock);
+ }
+ 
+@@ -2040,7 +2060,16 @@ enum blk_eh_timer_return iscsi_eh_cmd_timed_out(struct scsi_cmnd *sc)
+ 		spin_unlock(&session->back_lock);
+ 		goto done;
+ 	}
+-	__iscsi_get_task(task);
++	if (!iscsi_get_task(task)) {
++		/*
++		 * Racing with the completion path right now, so give it more
++		 * time so that path can complete it like normal.
++		 */
++		rc = BLK_EH_RESET_TIMER;
++		task = NULL;
++		spin_unlock(&session->back_lock);
++		goto done;
++	}
+ 	spin_unlock(&session->back_lock);
+ 
+ 	if (session->state != ISCSI_STATE_LOGGED_IN) {
+@@ -2289,6 +2318,7 @@ int iscsi_eh_abort(struct scsi_cmnd *sc)
+ 
+ 	ISCSI_DBG_EH(session, "aborting sc %p\n", sc);
+ 
++completion_check:
+ 	mutex_lock(&session->eh_mutex);
+ 	spin_lock_bh(&session->frwd_lock);
+ 	/*
+@@ -2328,13 +2358,20 @@ int iscsi_eh_abort(struct scsi_cmnd *sc)
+ 		return SUCCESS;
+ 	}
+ 
++	if (!iscsi_get_task(task)) {
++		spin_unlock(&session->back_lock);
++		spin_unlock_bh(&session->frwd_lock);
++		mutex_unlock(&session->eh_mutex);
++		/* We are just about to call iscsi_free_task so wait for it. */
++		udelay(ISCSI_CMD_COMPL_WAIT);
++		goto completion_check;
++	}
++
++	ISCSI_DBG_EH(session, "aborting [sc %p itt 0x%x]\n", sc, task->itt);
+ 	conn = session->leadconn;
+ 	iscsi_get_conn(conn->cls_conn);
+ 	conn->eh_abort_cnt++;
+ 	age = session->age;
+-
+-	ISCSI_DBG_EH(session, "aborting [sc %p itt 0x%x]\n", sc, task->itt);
+-	__iscsi_get_task(task);
+ 	spin_unlock(&session->back_lock);
+ 
+ 	if (task->state == ISCSI_TASK_PENDING) {
+diff --git a/drivers/scsi/libiscsi_tcp.c b/drivers/scsi/libiscsi_tcp.c
+index 883005757ddb..c182aa83f2c9 100644
+--- a/drivers/scsi/libiscsi_tcp.c
++++ b/drivers/scsi/libiscsi_tcp.c
+@@ -558,7 +558,11 @@ static int iscsi_tcp_r2t_rsp(struct iscsi_conn *conn, struct iscsi_hdr *hdr)
+ 		return 0;
+ 	}
+ 	task->last_xfer = jiffies;
+-	__iscsi_get_task(task);
++	if (!iscsi_get_task(task)) {
++		spin_unlock(&session->back_lock);
++		/* Let the path that got the early rsp complete it */
++		return 0;
++	}
+ 
+ 	tcp_conn = conn->dd_data;
+ 	rhdr = (struct iscsi_r2t_rsp *)tcp_conn->in.hdr;
+diff --git a/include/scsi/libiscsi.h b/include/scsi/libiscsi.h
+index 5a10e5acfad2..ec15e820f62b 100644
+--- a/include/scsi/libiscsi.h
++++ b/include/scsi/libiscsi.h
+@@ -482,7 +482,7 @@ extern struct iscsi_task *iscsi_itt_to_task(struct iscsi_conn *, itt_t);
+ extern void iscsi_requeue_task(struct iscsi_task *task);
+ extern void iscsi_put_task(struct iscsi_task *task);
+ extern void __iscsi_put_task(struct iscsi_task *task);
+-extern void __iscsi_get_task(struct iscsi_task *task);
++extern bool iscsi_get_task(struct iscsi_task *task);
+ extern void iscsi_complete_scsi_task(struct iscsi_task *task,
+ 				     uint32_t exp_cmdsn, uint32_t max_cmdsn);
+ 
+
