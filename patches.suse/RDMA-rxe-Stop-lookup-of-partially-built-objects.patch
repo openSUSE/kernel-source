@@ -1,0 +1,422 @@
+From: Bob Pearson <rpearsonhpe@gmail.com>
+Date: Sun, 12 Jun 2022 17:34:34 -0500
+Subject: RDMA/rxe: Stop lookup of partially built objects
+Patch-mainline: v6.0-rc1
+Git-commit: 215d0a755e1bcd92cbe6a71a21194ce7c82ec106
+References: jsc#PED-1111
+
+Currently the rdma_rxe driver has a security weakness due to giving
+objects which are partially initialized indices allowing external actors
+to gain access to them by sending packets which refer to their
+index (e.g. qpn, rkey, etc) causing unpredictable results.
+
+This patch adds a new API rxe_finalize(obj) which enables looking up pool
+objects from indices using rxe_pool_get_index() for AH, QP, MR, and
+MW. They are added in create verbs only after the objects are fully
+initialized.
+
+It also adds wait for completion to destroy/dealloc verbs to assure that
+all references have been dropped before returning to rdma_core by
+implementing a new rxe_pool API rxe_cleanup() which drops a reference to
+the object and then waits for all other references to be dropped.  When
+the last reference is dropped the object is completed by kref.  After that
+it cleans up the object and if locally allocated frees the memory. In the
+special case of address handle objects the delay is implemented separately
+if the destroy_ah call is not sleepable.
+
+Combined with deferring cleanup code to type specific cleanup routines
+this allows all pending activity referring to objects to complete before
+returning to rdma_core.
+
+Link: https://lore.kernel.org/r/20220612223434.31462-2-rpearsonhpe@gmail.com
+Signed-off-by: Bob Pearson <rpearsonhpe@gmail.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/sw/rxe/rxe_mr.c    |    2 
+ drivers/infiniband/sw/rxe/rxe_mw.c    |    4 +
+ drivers/infiniband/sw/rxe/rxe_pool.c  |   98 ++++++++++++++++++++++++++++++++--
+ drivers/infiniband/sw/rxe/rxe_pool.h  |   18 ++++--
+ drivers/infiniband/sw/rxe/rxe_verbs.c |   39 ++++++++-----
+ 5 files changed, 135 insertions(+), 26 deletions(-)
+
+--- a/drivers/infiniband/sw/rxe/rxe_mr.c
++++ b/drivers/infiniband/sw/rxe/rxe_mr.c
+@@ -687,7 +687,7 @@ int rxe_dereg_mr(struct ib_mr *ibmr, str
+ 	if (atomic_read(&mr->num_mw) > 0)
+ 		return -EINVAL;
+ 
+-	rxe_put(mr);
++	rxe_cleanup(mr);
+ 
+ 	return 0;
+ }
+--- a/drivers/infiniband/sw/rxe/rxe_mw.c
++++ b/drivers/infiniband/sw/rxe/rxe_mw.c
+@@ -33,6 +33,8 @@ int rxe_alloc_mw(struct ib_mw *ibmw, str
+ 			RXE_MW_STATE_FREE : RXE_MW_STATE_VALID;
+ 	spin_lock_init(&mw->lock);
+ 
++	rxe_finalize(mw);
++
+ 	return 0;
+ }
+ 
+@@ -40,7 +42,7 @@ int rxe_dealloc_mw(struct ib_mw *ibmw)
+ {
+ 	struct rxe_mw *mw = to_rmw(ibmw);
+ 
+-	rxe_put(mw);
++	rxe_cleanup(mw);
+ 
+ 	return 0;
+ }
+--- a/drivers/infiniband/sw/rxe/rxe_pool.c
++++ b/drivers/infiniband/sw/rxe/rxe_pool.c
+@@ -6,6 +6,7 @@
+ 
+ #include "rxe.h"
+ 
++#define RXE_POOL_TIMEOUT	(200)
+ #define RXE_POOL_ALIGN		(16)
+ 
+ static const struct rxe_type_info {
+@@ -136,8 +137,12 @@ void *rxe_alloc(struct rxe_pool *pool)
+ 	elem->pool = pool;
+ 	elem->obj = obj;
+ 	kref_init(&elem->ref_cnt);
++	init_completion(&elem->complete);
+ 
+-	err = xa_alloc_cyclic(&pool->xa, &elem->index, elem, pool->limit,
++	/* allocate index in array but leave pointer as NULL so it
++	 * can't be looked up until rxe_finalize() is called
++	 */
++	err = xa_alloc_cyclic(&pool->xa, &elem->index, NULL, pool->limit,
+ 			      &pool->next, GFP_KERNEL);
+ 	if (err < 0)
+ 		goto err_free;
+@@ -151,9 +156,11 @@ err_cnt:
+ 	return NULL;
+ }
+ 
+-int __rxe_add_to_pool(struct rxe_pool *pool, struct rxe_pool_elem *elem)
++int __rxe_add_to_pool(struct rxe_pool *pool, struct rxe_pool_elem *elem,
++				bool sleepable)
+ {
+ 	int err;
++	gfp_t gfp_flags;
+ 
+ 	if (WARN_ON(pool->type == RXE_TYPE_MR))
+ 		return -EINVAL;
+@@ -164,9 +171,18 @@ int __rxe_add_to_pool(struct rxe_pool *p
+ 	elem->pool = pool;
+ 	elem->obj = (u8 *)elem - pool->elem_offset;
+ 	kref_init(&elem->ref_cnt);
++	init_completion(&elem->complete);
+ 
+-	err = xa_alloc_cyclic(&pool->xa, &elem->index, elem, pool->limit,
+-			      &pool->next, GFP_KERNEL);
++	/* AH objects are unique in that the create_ah verb
++	 * can be called in atomic context. If the create_ah
++	 * call is not sleepable use GFP_ATOMIC.
++	 */
++	gfp_flags = sleepable ? GFP_KERNEL : GFP_ATOMIC;
++
++	if (sleepable)
++		might_sleep();
++	err = xa_alloc_cyclic(&pool->xa, &elem->index, NULL, pool->limit,
++			      &pool->next, gfp_flags);
+ 	if (err < 0)
+ 		goto err_cnt;
+ 
+@@ -198,9 +214,67 @@ void *rxe_pool_get_index(struct rxe_pool
+ static void rxe_elem_release(struct kref *kref)
+ {
+ 	struct rxe_pool_elem *elem = container_of(kref, typeof(*elem), ref_cnt);
++
++	complete(&elem->complete);
++}
++
++int __rxe_cleanup(struct rxe_pool_elem *elem, bool sleepable)
++{
+ 	struct rxe_pool *pool = elem->pool;
++	struct xarray *xa = &pool->xa;
++	static int timeout = RXE_POOL_TIMEOUT;
++	unsigned long flags;
++	int ret, err = 0;
++	void *xa_ret;
++
++	if (sleepable)
++		might_sleep();
+ 
+-	xa_erase(&pool->xa, elem->index);
++	/* erase xarray entry to prevent looking up
++	 * the pool elem from its index
++	 */
++	xa_lock_irqsave(xa, flags);
++	xa_ret = __xa_erase(xa, elem->index);
++	xa_unlock_irqrestore(xa, flags);
++	WARN_ON(xa_err(xa_ret));
++
++	/* if this is the last call to rxe_put complete the
++	 * object. It is safe to touch obj->elem after this since
++	 * it is freed below
++	 */
++	__rxe_put(elem);
++
++	/* wait until all references to the object have been
++	 * dropped before final object specific cleanup and
++	 * return to rdma-core
++	 */
++	if (sleepable) {
++		if (!completion_done(&elem->complete) && timeout) {
++			ret = wait_for_completion_timeout(&elem->complete,
++					timeout);
++
++			/* Shouldn't happen. There are still references to
++			 * the object but, rather than deadlock, free the
++			 * object or pass back to rdma-core.
++			 */
++			if (WARN_ON(!ret))
++				err = -EINVAL;
++		}
++	} else {
++		unsigned long until = jiffies + timeout;
++
++		/* AH objects are unique in that the destroy_ah verb
++		 * can be called in atomic context. This delay
++		 * replaces the wait_for_completion call above
++		 * when the destroy_ah call is not sleepable
++		 */
++		while (!completion_done(&elem->complete) &&
++				time_before(jiffies, until))
++			mdelay(1);
++
++		if (WARN_ON(!completion_done(&elem->complete)))
++			err = -EINVAL;
++	}
+ 
+ 	if (pool->cleanup)
+ 		pool->cleanup(elem);
+@@ -209,6 +283,8 @@ static void rxe_elem_release(struct kref
+ 		kfree(elem->obj);
+ 
+ 	atomic_dec(&pool->num_elem);
++
++	return err;
+ }
+ 
+ int __rxe_get(struct rxe_pool_elem *elem)
+@@ -220,3 +296,15 @@ int __rxe_put(struct rxe_pool_elem *elem
+ {
+ 	return kref_put(&elem->ref_cnt, rxe_elem_release);
+ }
++
++void __rxe_finalize(struct rxe_pool_elem *elem)
++{
++	struct xarray *xa = &elem->pool->xa;
++	unsigned long flags;
++	void *ret;
++
++	xa_lock_irqsave(xa, flags);
++	ret = __xa_store(&elem->pool->xa, elem->index, elem, GFP_KERNEL);
++	xa_unlock_irqrestore(xa, flags);
++	WARN_ON(xa_err(ret));
++}
+--- a/drivers/infiniband/sw/rxe/rxe_pool.h
++++ b/drivers/infiniband/sw/rxe/rxe_pool.h
+@@ -24,6 +24,7 @@ struct rxe_pool_elem {
+ 	void			*obj;
+ 	struct kref		ref_cnt;
+ 	struct list_head	list;
++	struct completion	complete;
+ 	u32			index;
+ };
+ 
+@@ -57,21 +58,28 @@ void rxe_pool_cleanup(struct rxe_pool *p
+ void *rxe_alloc(struct rxe_pool *pool);
+ 
+ /* connect already allocated object to pool */
+-int __rxe_add_to_pool(struct rxe_pool *pool, struct rxe_pool_elem *elem);
+-
+-#define rxe_add_to_pool(pool, obj) __rxe_add_to_pool(pool, &(obj)->elem)
++int __rxe_add_to_pool(struct rxe_pool *pool, struct rxe_pool_elem *elem,
++				bool sleepable);
++#define rxe_add_to_pool(pool, obj) __rxe_add_to_pool(pool, &(obj)->elem, true)
++#define rxe_add_to_pool_ah(pool, obj, sleepable) __rxe_add_to_pool(pool, \
++				&(obj)->elem, sleepable)
+ 
+ /* lookup an indexed object from index. takes a reference on object */
+ void *rxe_pool_get_index(struct rxe_pool *pool, u32 index);
+ 
+ int __rxe_get(struct rxe_pool_elem *elem);
+-
+ #define rxe_get(obj) __rxe_get(&(obj)->elem)
+ 
+ int __rxe_put(struct rxe_pool_elem *elem);
+-
+ #define rxe_put(obj) __rxe_put(&(obj)->elem)
+ 
++int __rxe_cleanup(struct rxe_pool_elem *elem, bool sleepable);
++#define rxe_cleanup(obj) __rxe_cleanup(&(obj)->elem, true)
++#define rxe_cleanup_ah(obj, sleepable) __rxe_cleanup(&(obj)->elem, sleepable)
++
+ #define rxe_read(obj) kref_read(&(obj)->elem.ref_cnt)
+ 
++void __rxe_finalize(struct rxe_pool_elem *elem);
++#define rxe_finalize(obj) __rxe_finalize(&(obj)->elem)
++
+ #endif /* RXE_POOL_H */
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.c
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.c
+@@ -115,7 +115,7 @@ static void rxe_dealloc_ucontext(struct
+ {
+ 	struct rxe_ucontext *uc = to_ruc(ibuc);
+ 
+-	rxe_put(uc);
++	rxe_cleanup(uc);
+ }
+ 
+ static int rxe_port_immutable(struct ib_device *dev, u32 port_num,
+@@ -149,7 +149,7 @@ static int rxe_dealloc_pd(struct ib_pd *
+ {
+ 	struct rxe_pd *pd = to_rpd(ibpd);
+ 
+-	rxe_put(pd);
++	rxe_cleanup(pd);
+ 	return 0;
+ }
+ 
+@@ -176,7 +176,8 @@ static int rxe_create_ah(struct ib_ah *i
+ 	if (err)
+ 		return err;
+ 
+-	err = rxe_add_to_pool(&rxe->ah_pool, ah);
++	err = rxe_add_to_pool_ah(&rxe->ah_pool, ah,
++			init_attr->flags & RDMA_CREATE_AH_SLEEPABLE);
+ 	if (err)
+ 		return err;
+ 
+@@ -188,7 +189,7 @@ static int rxe_create_ah(struct ib_ah *i
+ 		err = copy_to_user(&uresp->ah_num, &ah->ah_num,
+ 					 sizeof(uresp->ah_num));
+ 		if (err) {
+-			rxe_put(ah);
++			rxe_cleanup(ah);
+ 			return -EFAULT;
+ 		}
+ 	} else if (ah->is_user) {
+@@ -197,6 +198,8 @@ static int rxe_create_ah(struct ib_ah *i
+ 	}
+ 
+ 	rxe_init_av(init_attr->ah_attr, &ah->av);
++	rxe_finalize(ah);
++
+ 	return 0;
+ }
+ 
+@@ -228,7 +231,8 @@ static int rxe_destroy_ah(struct ib_ah *
+ {
+ 	struct rxe_ah *ah = to_rah(ibah);
+ 
+-	rxe_put(ah);
++	rxe_cleanup_ah(ah, flags & RDMA_DESTROY_AH_SLEEPABLE);
++
+ 	return 0;
+ }
+ 
+@@ -308,12 +312,13 @@ static int rxe_create_srq(struct ib_srq
+ 
+ 	err = rxe_srq_from_init(rxe, srq, init, udata, uresp);
+ 	if (err)
+-		goto err_put;
++		goto err_cleanup;
+ 
+ 	return 0;
+ 
+-err_put:
+-	rxe_put(srq);
++err_cleanup:
++	rxe_cleanup(srq);
++
+ 	return err;
+ }
+ 
+@@ -362,7 +367,7 @@ static int rxe_destroy_srq(struct ib_srq
+ {
+ 	struct rxe_srq *srq = to_rsrq(ibsrq);
+ 
+-	rxe_put(srq);
++	rxe_cleanup(srq);
+ 	return 0;
+ }
+ 
+@@ -429,10 +434,11 @@ static int rxe_create_qp(struct ib_qp *i
+ 	if (err)
+ 		goto qp_init;
+ 
++	rxe_finalize(qp);
+ 	return 0;
+ 
+ qp_init:
+-	rxe_put(qp);
++	rxe_cleanup(qp);
+ 	return err;
+ }
+ 
+@@ -485,7 +491,7 @@ static int rxe_destroy_qp(struct ib_qp *
+ 	if (ret)
+ 		return ret;
+ 
+-	rxe_put(qp);
++	rxe_cleanup(qp);
+ 	return 0;
+ }
+ 
+@@ -803,7 +809,7 @@ static int rxe_destroy_cq(struct ib_cq *
+ 
+ 	rxe_cq_disable(cq);
+ 
+-	rxe_put(cq);
++	rxe_cleanup(cq);
+ 	return 0;
+ }
+ 
+@@ -898,6 +904,7 @@ static struct ib_mr *rxe_get_dma_mr(stru
+ 
+ 	rxe_get(pd);
+ 	rxe_mr_init_dma(pd, access, mr);
++	rxe_finalize(mr);
+ 
+ 	return &mr->ibmr;
+ }
+@@ -926,11 +933,13 @@ static struct ib_mr *rxe_reg_user_mr(str
+ 	if (err)
+ 		goto err3;
+ 
++	rxe_finalize(mr);
++
+ 	return &mr->ibmr;
+ 
+ err3:
+ 	rxe_put(pd);
+-	rxe_put(mr);
++	rxe_cleanup(mr);
+ err2:
+ 	return ERR_PTR(err);
+ }
+@@ -958,11 +967,13 @@ static struct ib_mr *rxe_alloc_mr(struct
+ 	if (err)
+ 		goto err2;
+ 
++	rxe_finalize(mr);
++
+ 	return &mr->ibmr;
+ 
+ err2:
+ 	rxe_put(pd);
+-	rxe_put(mr);
++	rxe_cleanup(mr);
+ err1:
+ 	return ERR_PTR(err);
+ }
