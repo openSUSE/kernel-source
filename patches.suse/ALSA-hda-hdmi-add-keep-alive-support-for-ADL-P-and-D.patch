@@ -1,0 +1,314 @@
+From 15175a4f2bbbcbadb1a40098b6dcff0467300e99 Mon Sep 17 00:00:00 2001
+From: Kai Vehmanen <kai.vehmanen@linux.intel.com>
+Date: Wed, 16 Feb 2022 19:24:05 +0200
+Subject: [PATCH] ALSA: hda/hdmi: add keep-alive support for ADL-P and DG2
+Git-commit: 15175a4f2bbbcbadb1a40098b6dcff0467300e99
+Patch-mainline: v5.18-rc1
+References: jsc#PED-850
+
+Implement HDA keep alive (KAE) support for Intel display codecs. When no
+audio stream is active, the display codec will provide a continuous clock
+and a valid but silent audio stream to any connected HDMI/DP receiver.
+Without this, upon starting a new playback stream, initial samples may be
+lost as many receivers require time to initialize for new clock.
+
+This is a new feature in Intel AlderLake-P display codec implementation
+and replaces the Intel i915 silent-stream extension that has been used
+on older hardware. Main benefit of the new method is that codec no longer
+needs to be kept in D0 power state.
+
+This patch depends on commit 112a87c48e83 ("drm/i915/display: program
+audio CDCLK-TS for keepalives").
+
+[ a minor coding-style fix by tiwai ]
+
+Signed-off-by: Kai Vehmanen <kai.vehmanen@linux.intel.com>
+Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Reviewed-by: Jyri Sarha <jyri.sarha@intel.com>
+Link: https://lore.kernel.org/r/20220216172405.3994959-1-kai.vehmanen@linux.intel.com
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ sound/pci/hda/Kconfig      |   19 ++---
+ sound/pci/hda/patch_hdmi.c |  156 +++++++++++++++++++++++++++++++++------------
+ 2 files changed, 126 insertions(+), 49 deletions(-)
+
+--- a/sound/pci/hda/Kconfig
++++ b/sound/pci/hda/Kconfig
+@@ -285,15 +285,16 @@ config SND_HDA_INTEL_HDMI_SILENT_STREAM
+ 	bool "Enable Silent Stream always for HDMI"
+ 	depends on SND_HDA_INTEL
+ 	help
+-	  Intel hardware has a feature called 'silent stream', that
+-	  keeps external HDMI receiver's analog circuitry powered on
+-	  avoiding 2-3 sec silence during playback start. This mechanism
+-	  relies on setting channel_id as 0xf, sending info packet and
+-	  preventing codec D3 entry (increasing  platform static power
+-	  consumption when HDMI receiver is plugged-in). 2-3 sec silence
+-	  at the playback start is expected whenever there is format change.
+-	  (default is 2 channel format).
+-	  Say Y to enable Silent Stream feature.
++	  Say Y to enable HD-Audio Keep Alive (KAE) aka Silent Stream
++	  for HDMI on hardware that supports the feature.
++
++	  When enabled, the HDMI/DisplayPort codec will continue to provide
++	  a continuous clock and a valid but silent data stream to
++	  any connected external receiver. This allows to avoid gaps
++	  at start of playback. Many receivers require multiple seconds
++	  to start playing audio after the clock has been stopped.
++	  This feature can impact power consumption as resources
++	  are kept reserved both at transmitter and receiver.
+ 
+ endif
+ 
+--- a/sound/pci/hda/patch_hdmi.c
++++ b/sound/pci/hda/patch_hdmi.c
+@@ -120,6 +120,12 @@ struct hdmi_pcm {
+ 	struct snd_kcontrol *eld_ctl;
+ };
+ 
++enum {
++	SILENT_STREAM_OFF = 0,
++	SILENT_STREAM_KAE,	/* use standard HDA Keep-Alive */
++	SILENT_STREAM_I915,	/* Intel i915 extension */
++};
++
+ struct hdmi_spec {
+ 	struct hda_codec *codec;
+ 	int num_cvts;
+@@ -179,7 +185,7 @@ struct hdmi_spec {
+ 	hda_nid_t vendor_nid;
+ 	const int *port_map;
+ 	int port_num;
+-	bool send_silent_stream; /* Flag to enable silent stream feature */
++	int silent_stream_type;
+ };
+ 
+ #ifdef CONFIG_SND_HDA_COMPONENT
+@@ -1665,18 +1671,71 @@ static void hdmi_present_sense_via_verbs
+ #define I915_SILENT_FORMAT_BITS	16
+ #define I915_SILENT_FMT_MASK		0xf
+ 
++static void silent_stream_enable_i915(struct hda_codec *codec,
++				      struct hdmi_spec_per_pin *per_pin)
++{
++	unsigned int format;
++
++	snd_hdac_sync_audio_rate(&codec->core, per_pin->pin_nid,
++				 per_pin->dev_id, I915_SILENT_RATE);
++
++	/* trigger silent stream generation in hw */
++	format = snd_hdac_calc_stream_format(I915_SILENT_RATE, I915_SILENT_CHANNELS,
++					     I915_SILENT_FORMAT, I915_SILENT_FORMAT_BITS, 0);
++	snd_hda_codec_setup_stream(codec, per_pin->cvt_nid,
++				   I915_SILENT_FMT_MASK, I915_SILENT_FMT_MASK, format);
++	usleep_range(100, 200);
++	snd_hda_codec_setup_stream(codec, per_pin->cvt_nid, I915_SILENT_FMT_MASK, 0, format);
++
++	per_pin->channels = I915_SILENT_CHANNELS;
++	hdmi_setup_audio_infoframe(codec, per_pin, per_pin->non_pcm);
++}
++
++static void silent_stream_set_kae(struct hda_codec *codec,
++				  struct hdmi_spec_per_pin *per_pin,
++				  bool enable)
++{
++	unsigned int param;
++
++	codec_dbg(codec, "HDMI: KAE %d cvt-NID=0x%x\n", enable, per_pin->cvt_nid);
++
++	param = snd_hda_codec_read(codec, per_pin->cvt_nid, 0, AC_VERB_GET_DIGI_CONVERT_1, 0);
++	param = (param >> 16) & 0xff;
++
++	if (enable)
++		param |= AC_DIG3_KAE;
++	else
++		param &= ~AC_DIG3_KAE;
++
++	snd_hda_codec_write(codec, per_pin->cvt_nid, 0, AC_VERB_SET_DIGI_CONVERT_3, param);
++}
++
+ static void silent_stream_enable(struct hda_codec *codec,
+ 				 struct hdmi_spec_per_pin *per_pin)
+ {
+ 	struct hdmi_spec *spec = codec->spec;
+ 	struct hdmi_spec_per_cvt *per_cvt;
+ 	int cvt_idx, pin_idx, err;
+-	unsigned int format;
++	int keep_power = 0;
++
++	/*
++	 * Power-up will call hdmi_present_sense, so the PM calls
++	 * have to be done without mutex held.
++	 */
++
++	err = snd_hda_power_up_pm(codec);
++	if (err < 0 && err != -EACCES) {
++		codec_err(codec,
++			  "Failed to power up codec for silent stream enable ret=[%d]\n", err);
++		snd_hda_power_down_pm(codec);
++		return;
++	}
+ 
+ 	mutex_lock(&per_pin->lock);
+ 
+ 	if (per_pin->setup) {
+ 		codec_dbg(codec, "hdmi: PCM already open, no silent stream\n");
++		err = -EBUSY;
+ 		goto unlock_out;
+ 	}
+ 
+@@ -1703,22 +1762,23 @@ static void silent_stream_enable(struct
+ 	/* configure unused pins to choose other converters */
+ 	pin_cvt_fixup(codec, per_pin, 0);
+ 
+-	snd_hdac_sync_audio_rate(&codec->core, per_pin->pin_nid,
+-				 per_pin->dev_id, I915_SILENT_RATE);
+-
+-	/* trigger silent stream generation in hw */
+-	format = snd_hdac_calc_stream_format(I915_SILENT_RATE, I915_SILENT_CHANNELS,
+-					     I915_SILENT_FORMAT, I915_SILENT_FORMAT_BITS, 0);
+-	snd_hda_codec_setup_stream(codec, per_pin->cvt_nid,
+-				   I915_SILENT_FMT_MASK, I915_SILENT_FMT_MASK, format);
+-	usleep_range(100, 200);
+-	snd_hda_codec_setup_stream(codec, per_pin->cvt_nid, I915_SILENT_FMT_MASK, 0, format);
+-
+-	per_pin->channels = I915_SILENT_CHANNELS;
+-	hdmi_setup_audio_infoframe(codec, per_pin, per_pin->non_pcm);
++	switch (spec->silent_stream_type) {
++	case SILENT_STREAM_KAE:
++		silent_stream_set_kae(codec, per_pin, true);
++		break;
++	case SILENT_STREAM_I915:
++		silent_stream_enable_i915(codec, per_pin);
++		keep_power = 1;
++		break;
++	default:
++		break;
++	}
+ 
+  unlock_out:
+ 	mutex_unlock(&per_pin->lock);
++
++	if (err || !keep_power)
++		snd_hda_power_down_pm(codec);
+ }
+ 
+ static void silent_stream_disable(struct hda_codec *codec,
+@@ -1726,7 +1786,16 @@ static void silent_stream_disable(struct
+ {
+ 	struct hdmi_spec *spec = codec->spec;
+ 	struct hdmi_spec_per_cvt *per_cvt;
+-	int cvt_idx;
++	int cvt_idx, err;
++
++	err = snd_hda_power_up_pm(codec);
++	if (err < 0 && err != -EACCES) {
++		codec_err(codec,
++			  "Failed to power up codec for silent stream disable ret=[%d]\n",
++			  err);
++		snd_hda_power_down_pm(codec);
++		return;
++	}
+ 
+ 	mutex_lock(&per_pin->lock);
+ 	if (!per_pin->silent_stream)
+@@ -1741,11 +1810,20 @@ static void silent_stream_disable(struct
+ 		per_cvt->assigned = 0;
+ 	}
+ 
++	if (spec->silent_stream_type == SILENT_STREAM_I915) {
++		/* release ref taken in silent_stream_enable() */
++		snd_hda_power_down_pm(codec);
++	} else if (spec->silent_stream_type == SILENT_STREAM_KAE) {
++		silent_stream_set_kae(codec, per_pin, false);
++	}
++
+ 	per_pin->cvt_nid = 0;
+ 	per_pin->silent_stream = false;
+ 
+  unlock_out:
+ 	mutex_unlock(&per_pin->lock);
++
++	snd_hda_power_down_pm(codec);
+ }
+ 
+ /* update ELD and jack state via audio component */
+@@ -1767,29 +1845,11 @@ static void sync_eld_via_acomp(struct hd
+ 	monitor_next = per_pin->sink_eld.monitor_present;
+ 	mutex_unlock(&per_pin->lock);
+ 
+-	/*
+-	 * Power-up will call hdmi_present_sense, so the PM calls
+-	 * have to be done without mutex held.
+-	 */
+-
+-	if (spec->send_silent_stream) {
+-		int pm_ret;
+-
+-		if (!monitor_prev && monitor_next) {
+-			pm_ret = snd_hda_power_up_pm(codec);
+-			if (pm_ret < 0)
+-				codec_err(codec,
+-				"Monitor plugged-in, Failed to power up codec ret=[%d]\n",
+-				pm_ret);
++	if (spec->silent_stream_type) {
++		if (!monitor_prev && monitor_next)
+ 			silent_stream_enable(codec, per_pin);
+-		} else if (monitor_prev && !monitor_next) {
++		else if (monitor_prev && !monitor_next)
+ 			silent_stream_disable(codec, per_pin);
+-			pm_ret = snd_hda_power_down_pm(codec);
+-			if (pm_ret < 0)
+-				codec_err(codec,
+-				"Monitor plugged-out, Failed to power down codec ret=[%d]\n",
+-				pm_ret);
+-		}
+ 	}
+ }
+ 
+@@ -2982,7 +3042,7 @@ static int intel_hsw_common_init(struct
+ 	 * module param or Kconfig option
+ 	 */
+ 	if (send_silent_stream)
+-		spec->send_silent_stream = true;
++		spec->silent_stream_type = SILENT_STREAM_I915;
+ 
+ 	return parse_intel_hdmi(codec);
+ }
+@@ -3035,6 +3095,22 @@ static int patch_i915_tgl_hdmi(struct hd
+ 	return ret;
+ }
+ 
++static int patch_i915_adlp_hdmi(struct hda_codec *codec)
++{
++	struct hdmi_spec *spec;
++	int res;
++
++	res = patch_i915_tgl_hdmi(codec);
++	if (!res) {
++		spec = codec->spec;
++
++		if (spec->silent_stream_type)
++			spec->silent_stream_type = SILENT_STREAM_KAE;
++	}
++
++	return res;
++}
++
+ /* Intel Baytrail and Braswell; with eld notifier */
+ static int patch_i915_byt_hdmi(struct hda_codec *codec)
+ {
+@@ -4391,10 +4467,10 @@ HDA_CODEC_ENTRY(0x80862814, "DG1 HDMI",
+ HDA_CODEC_ENTRY(0x80862815, "Alderlake HDMI",	patch_i915_tgl_hdmi),
+ HDA_CODEC_ENTRY(0x80862816, "Rocketlake HDMI",	patch_i915_tgl_hdmi),
+ HDA_CODEC_ENTRY(0x80862818, "Raptorlake HDMI",	patch_i915_tgl_hdmi),
+-HDA_CODEC_ENTRY(0x80862819, "DG2 HDMI",	patch_i915_tgl_hdmi),
++HDA_CODEC_ENTRY(0x80862819, "DG2 HDMI",	patch_i915_adlp_hdmi),
+ HDA_CODEC_ENTRY(0x8086281a, "Jasperlake HDMI",	patch_i915_icl_hdmi),
+ HDA_CODEC_ENTRY(0x8086281b, "Elkhartlake HDMI",	patch_i915_icl_hdmi),
+-HDA_CODEC_ENTRY(0x8086281c, "Alderlake-P HDMI", patch_i915_tgl_hdmi),
++HDA_CODEC_ENTRY(0x8086281c, "Alderlake-P HDMI", patch_i915_adlp_hdmi),
+ HDA_CODEC_ENTRY(0x80862880, "CedarTrail HDMI",	patch_generic_hdmi),
+ HDA_CODEC_ENTRY(0x80862882, "Valleyview2 HDMI",	patch_i915_byt_hdmi),
+ HDA_CODEC_ENTRY(0x80862883, "Braswell HDMI",	patch_i915_byt_hdmi),
