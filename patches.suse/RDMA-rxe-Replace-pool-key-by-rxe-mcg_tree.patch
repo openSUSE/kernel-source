@@ -1,0 +1,421 @@
+From: Bob Pearson <rpearsonhpe@gmail.com>
+Date: Tue, 8 Feb 2022 15:16:39 -0600
+Subject: RDMA/rxe: Replace pool key by rxe->mcg_tree
+Patch-mainline: v5.18-rc1
+Git-commit: 8a0a5fe0c462438a8c423ebaa0fbb7af5055a155
+References: jsc#PED-1111
+
+Continuing to decouple mcg from rxe pools. Create red-black tree code in
+rxe_mcast.c to hold mcg index. Replace pool key calls by calls to local
+red-black routines.
+
+Link: https://lore.kernel.org/r/20220208211644.123457-6-rpearsonhpe@gmail.com
+Signed-off-by: Bob Pearson <rpearsonhpe@gmail.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/sw/rxe/rxe.c       |    2 
+ drivers/infiniband/sw/rxe/rxe_loc.h   |    3 
+ drivers/infiniband/sw/rxe/rxe_mcast.c |  262 ++++++++++++++++++++++++++--------
+ drivers/infiniband/sw/rxe/rxe_recv.c  |    4 
+ drivers/infiniband/sw/rxe/rxe_verbs.h |    6 
+ 5 files changed, 213 insertions(+), 64 deletions(-)
+
+--- a/drivers/infiniband/sw/rxe/rxe.c
++++ b/drivers/infiniband/sw/rxe/rxe.c
+@@ -203,7 +203,9 @@ static int rxe_init(struct rxe_dev *rxe)
+ 	spin_lock_init(&rxe->pending_lock);
+ 	INIT_LIST_HEAD(&rxe->pending_mmaps);
+ 
++	/* init multicast support */
+ 	spin_lock_init(&rxe->mcg_lock);
++	rxe->mcg_tree = RB_ROOT;
+ 
+ 	mutex_init(&rxe->usdev_lock);
+ 
+--- a/drivers/infiniband/sw/rxe/rxe_loc.h
++++ b/drivers/infiniband/sw/rxe/rxe_loc.h
+@@ -40,9 +40,10 @@ void rxe_cq_disable(struct rxe_cq *cq);
+ void rxe_cq_cleanup(struct rxe_pool_elem *arg);
+ 
+ /* rxe_mcast.c */
+-void rxe_mc_cleanup(struct rxe_pool_elem *arg);
++struct rxe_mcg *rxe_lookup_mcg(struct rxe_dev *rxe, union ib_gid *mgid);
+ int rxe_attach_mcast(struct ib_qp *ibqp, union ib_gid *mgid, u16 mlid);
+ int rxe_detach_mcast(struct ib_qp *ibqp, union ib_gid *mgid, u16 mlid);
++void rxe_mc_cleanup(struct rxe_pool_elem *elem);
+ 
+ /* rxe_mmap.c */
+ struct rxe_mmap_info {
+--- a/drivers/infiniband/sw/rxe/rxe_mcast.c
++++ b/drivers/infiniband/sw/rxe/rxe_mcast.c
+@@ -25,57 +25,229 @@ static int rxe_mcast_delete(struct rxe_d
+ 	return dev_mc_del(rxe->ndev, ll_addr);
+ }
+ 
+-/* caller should hold rxe->mcg_lock */
+-static struct rxe_mcg *__rxe_create_mcg(struct rxe_dev *rxe,
+-					struct rxe_pool *pool,
++/**
++ * __rxe_insert_mcg - insert an mcg into red-black tree (rxe->mcg_tree)
++ * @mcg: mcg object with an embedded red-black tree node
++ *
++ * Context: caller must hold a reference to mcg and rxe->mcg_lock and
++ * is responsible to avoid adding the same mcg twice to the tree.
++ */
++static void __rxe_insert_mcg(struct rxe_mcg *mcg)
++{
++	struct rb_root *tree = &mcg->rxe->mcg_tree;
++	struct rb_node **link = &tree->rb_node;
++	struct rb_node *node = NULL;
++	struct rxe_mcg *tmp;
++	int cmp;
++
++	while (*link) {
++		node = *link;
++		tmp = rb_entry(node, struct rxe_mcg, node);
++
++		cmp = memcmp(&tmp->mgid, &mcg->mgid, sizeof(mcg->mgid));
++		if (cmp > 0)
++			link = &(*link)->rb_left;
++		else
++			link = &(*link)->rb_right;
++	}
++
++	rb_link_node(&mcg->node, node, link);
++	rb_insert_color(&mcg->node, tree);
++}
++
++/**
++ * __rxe_remove_mcg - remove an mcg from red-black tree holding lock
++ * @mcg: mcast group object with an embedded red-black tree node
++ *
++ * Context: caller must hold a reference to mcg and rxe->mcg_lock
++ */
++static void __rxe_remove_mcg(struct rxe_mcg *mcg)
++{
++	rb_erase(&mcg->node, &mcg->rxe->mcg_tree);
++}
++
++/**
++ * __rxe_lookup_mcg - lookup mcg in rxe->mcg_tree while holding lock
++ * @rxe: rxe device object
++ * @mgid: multicast IP address
++ *
++ * Context: caller must hold rxe->mcg_lock
++ * Returns: mcg on success and takes a ref to mcg else NULL
++ */
++static struct rxe_mcg *__rxe_lookup_mcg(struct rxe_dev *rxe,
+ 					union ib_gid *mgid)
+ {
++	struct rb_root *tree = &rxe->mcg_tree;
+ 	struct rxe_mcg *mcg;
+-	int err;
++	struct rb_node *node;
++	int cmp;
+ 
+-	mcg = rxe_alloc_locked(pool);
+-	if (!mcg)
+-		return ERR_PTR(-ENOMEM);
++	node = tree->rb_node;
+ 
+-	err = rxe_mcast_add(rxe, mgid);
+-	if (unlikely(err)) {
+-		rxe_drop_ref(mcg);
+-		return ERR_PTR(err);
++	while (node) {
++		mcg = rb_entry(node, struct rxe_mcg, node);
++
++		cmp = memcmp(&mcg->mgid, mgid, sizeof(*mgid));
++
++		if (cmp > 0)
++			node = node->rb_left;
++		else if (cmp < 0)
++			node = node->rb_right;
++		else
++			break;
++	}
++
++	if (node) {
++		rxe_add_ref(mcg);
++		return mcg;
+ 	}
+ 
++	return NULL;
++}
++
++/**
++ * rxe_lookup_mcg - lookup up mcg in red-back tree
++ * @rxe: rxe device object
++ * @mgid: multicast IP address
++ *
++ * Returns: mcg if found else NULL
++ */
++struct rxe_mcg *rxe_lookup_mcg(struct rxe_dev *rxe, union ib_gid *mgid)
++{
++	struct rxe_mcg *mcg;
++	unsigned long flags;
++
++	spin_lock_irqsave(&rxe->mcg_lock, flags);
++	mcg = __rxe_lookup_mcg(rxe, mgid);
++	spin_unlock_irqrestore(&rxe->mcg_lock, flags);
++
++	return mcg;
++}
++
++/**
++ * __rxe_init_mcg - initialize a new mcg
++ * @rxe: rxe device
++ * @mgid: multicast address as a gid
++ * @mcg: new mcg object
++ *
++ * Context: caller should hold rxe->mcg lock
++ * Returns: 0 on success else an error
++ */
++static int __rxe_init_mcg(struct rxe_dev *rxe, union ib_gid *mgid,
++			  struct rxe_mcg *mcg)
++{
++	int err;
++
++	err = rxe_mcast_add(rxe, mgid);
++	if (unlikely(err))
++		return err;
++
++	memcpy(&mcg->mgid, mgid, sizeof(mcg->mgid));
+ 	INIT_LIST_HEAD(&mcg->qp_list);
+ 	mcg->rxe = rxe;
+ 
+-	/* rxe_alloc_locked takes a ref on mcg but that will be
++	/* caller holds a ref on mcg but that will be
+ 	 * dropped when mcg goes out of scope. We need to take a ref
+ 	 * on the pointer that will be saved in the red-black tree
+-	 * by rxe_add_key and used to lookup mcg from mgid later.
+-	 * Adding key makes object visible to outside so this should
++	 * by __rxe_insert_mcg and used to lookup mcg from mgid later.
++	 * Inserting mcg makes it visible to outside so this should
+ 	 * be done last after the object is ready.
+ 	 */
+ 	rxe_add_ref(mcg);
+-	rxe_add_key_locked(mcg, mgid);
++	__rxe_insert_mcg(mcg);
+ 
+-	return mcg;
++	return 0;
+ }
+ 
+-static struct rxe_mcg *rxe_get_mcg(struct rxe_dev *rxe,
+-					 union ib_gid *mgid)
++/**
++ * rxe_get_mcg - lookup or allocate a mcg
++ * @rxe: rxe device object
++ * @mgid: multicast IP address as a gid
++ *
++ * Returns: mcg on success else ERR_PTR(error)
++ */
++static struct rxe_mcg *rxe_get_mcg(struct rxe_dev *rxe, union ib_gid *mgid)
+ {
+-	struct rxe_mcg *mcg;
+ 	struct rxe_pool *pool = &rxe->mc_grp_pool;
++	struct rxe_mcg *mcg, *tmp;
+ 	unsigned long flags;
++	int err;
+ 
+-	if (rxe->attr.max_mcast_qp_attach == 0)
++	if (rxe->attr.max_mcast_grp == 0)
+ 		return ERR_PTR(-EINVAL);
+ 
+-	spin_lock_irqsave(&rxe->mcg_lock, flags);
+-	mcg = rxe_pool_get_key_locked(pool, mgid);
++	/* check to see if mcg already exists */
++	mcg = rxe_lookup_mcg(rxe, mgid);
++	if (mcg)
++		return mcg;
++
++	/* speculative alloc of new mcg */
++	mcg = rxe_alloc(pool);
+ 	if (!mcg)
+-		mcg = __rxe_create_mcg(rxe, pool, mgid);
+-	spin_unlock_irqrestore(&rxe->mcg_lock, flags);
++		return ERR_PTR(-ENOMEM);
++
++	spin_lock_irqsave(&rxe->mcg_lock, flags);
++	/* re-check to see if someone else just added it */
++	tmp = __rxe_lookup_mcg(rxe, mgid);
++	if (tmp) {
++		rxe_drop_ref(mcg);
++		mcg = tmp;
++		goto out;
++	}
++
++	if (atomic_inc_return(&rxe->mcg_num) > rxe->attr.max_mcast_grp) {
++		err = -ENOMEM;
++		goto err_dec;
++	}
+ 
++	err = __rxe_init_mcg(rxe, mgid, mcg);
++	if (err)
++		goto err_dec;
++out:
++	spin_unlock_irqrestore(&rxe->mcg_lock, flags);
+ 	return mcg;
++
++err_dec:
++	atomic_dec(&rxe->mcg_num);
++	spin_unlock_irqrestore(&rxe->mcg_lock, flags);
++	rxe_drop_ref(mcg);
++	return ERR_PTR(err);
++}
++
++/**
++ * __rxe_destroy_mcg - destroy mcg object holding rxe->mcg_lock
++ * @mcg: the mcg object
++ *
++ * Context: caller is holding rxe->mcg_lock
++ * no qp's are attached to mcg
++ */
++static void __rxe_destroy_mcg(struct rxe_mcg *mcg)
++{
++	/* remove mcg from red-black tree then drop ref */
++	__rxe_remove_mcg(mcg);
++	rxe_drop_ref(mcg);
++
++	rxe_mcast_delete(mcg->rxe, &mcg->mgid);
++}
++
++/**
++ * rxe_destroy_mcg - destroy mcg object
++ * @mcg: the mcg object
++ *
++ * Context: no qp's are attached to mcg
++ */
++static void rxe_destroy_mcg(struct rxe_mcg *mcg)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&mcg->rxe->mcg_lock, flags);
++	__rxe_destroy_mcg(mcg);
++	spin_unlock_irqrestore(&mcg->rxe->mcg_lock, flags);
++}
++
++void rxe_mc_cleanup(struct rxe_pool_elem *elem)
++{
++	/* nothing left to do for now */
+ }
+ 
+ static int rxe_attach_mcg(struct rxe_dev *rxe, struct rxe_qp *qp,
+@@ -131,31 +303,6 @@ out:
+ 	return err;
+ }
+ 
+-/* caller should be holding rxe->mcg_lock */
+-static void __rxe_destroy_mcg(struct rxe_mcg *mcg)
+-{
+-	/* first remove mcg from red-black tree then drop ref */
+-	rxe_drop_key_locked(mcg);
+-	rxe_drop_ref(mcg);
+-
+-	rxe_mcast_delete(mcg->rxe, &mcg->mgid);
+-}
+-
+-static void rxe_destroy_mcg(struct rxe_mcg *mcg)
+-{
+-	struct rxe_dev *rxe = mcg->rxe;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&rxe->mcg_lock, flags);
+-	__rxe_destroy_mcg(mcg);
+-	spin_unlock_irqrestore(&rxe->mcg_lock, flags);
+-}
+-
+-void rxe_mc_cleanup(struct rxe_pool_elem *elem)
+-{
+-	/* nothing left to do for now */
+-}
+-
+ static int rxe_detach_mcg(struct rxe_dev *rxe, struct rxe_qp *qp,
+ 				   union ib_gid *mgid)
+ {
+@@ -164,17 +311,16 @@ static int rxe_detach_mcg(struct rxe_dev
+ 	unsigned long flags;
+ 	int err;
+ 
+-	spin_lock_irqsave(&rxe->mcg_lock, flags);
+-	mcg = rxe_pool_get_key_locked(&rxe->mc_grp_pool, mgid);
+-	if (!mcg) {
+-		/* we didn't find the mcast group for mgid */
+-		err = -EINVAL;
+-		goto out_unlock;
+-	}
++	mcg = rxe_lookup_mcg(rxe, mgid);
++	if (!mcg)
++		return -EINVAL;
+ 
++	spin_lock_irqsave(&rxe->mcg_lock, flags);
+ 	list_for_each_entry_safe(mca, tmp, &mcg->qp_list, qp_list) {
+ 		if (mca->qp == qp) {
+ 			list_del(&mca->qp_list);
++			atomic_dec(&qp->mcg_num);
++			rxe_drop_ref(qp);
+ 
+ 			/* if the number of qp's attached to the
+ 			 * mcast group falls to zero go ahead and
+@@ -185,10 +331,8 @@ static int rxe_detach_mcg(struct rxe_dev
+ 			if (atomic_dec_return(&mcg->qp_num) <= 0)
+ 				__rxe_destroy_mcg(mcg);
+ 
+-			atomic_dec(&qp->mcg_num);
+-
+ 			/* drop the ref from get key. This will free the
+-			 * object if num_qp is zero.
++			 * object if qp_num is zero.
+ 			 */
+ 			rxe_drop_ref(mcg);
+ 			kfree(mca);
+--- a/drivers/infiniband/sw/rxe/rxe_recv.c
++++ b/drivers/infiniband/sw/rxe/rxe_recv.c
+@@ -246,7 +246,7 @@ static void rxe_rcv_mcast_pkt(struct rxe
+ 		memcpy(&dgid, &ipv6_hdr(skb)->daddr, sizeof(dgid));
+ 
+ 	/* lookup mcast group corresponding to mgid, takes a ref */
+-	mcg = rxe_pool_get_key(&rxe->mc_grp_pool, &dgid);
++	mcg = rxe_lookup_mcg(rxe, &dgid);
+ 	if (!mcg)
+ 		goto drop;	/* mcast group not registered */
+ 
+@@ -300,7 +300,7 @@ static void rxe_rcv_mcast_pkt(struct rxe
+ 
+ 	spin_unlock_bh(&rxe->mcg_lock);
+ 
+-	rxe_drop_ref(mcg);	/* drop ref from rxe_pool_get_key. */
++	rxe_drop_ref(mcg);
+ 
+ 	if (likely(!skb))
+ 		return;
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.h
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.h
+@@ -353,6 +353,7 @@ struct rxe_mw {
+ 
+ struct rxe_mcg {
+ 	struct rxe_pool_elem	elem;
++	struct rb_node		node;
+ 	struct rxe_dev		*rxe;
+ 	struct list_head	qp_list;
+ 	union ib_gid		mgid;
+@@ -396,7 +397,10 @@ struct rxe_dev {
+ 	struct rxe_pool		mw_pool;
+ 	struct rxe_pool		mc_grp_pool;
+ 
++	/* multicast support */
+ 	spinlock_t		mcg_lock;
++	struct rb_root		mcg_tree;
++	atomic_t		mcg_num;
+ 
+ 	spinlock_t		pending_lock; /* guard pending_mmaps */
+ 	struct list_head	pending_mmaps;
+@@ -477,6 +481,4 @@ static inline struct rxe_pd *rxe_mw_pd(s
+ 
+ int rxe_register_device(struct rxe_dev *rxe, const char *ibdev_name);
+ 
+-void rxe_mc_cleanup(struct rxe_pool_elem *elem);
+-
+ #endif /* RXE_VERBS_H */

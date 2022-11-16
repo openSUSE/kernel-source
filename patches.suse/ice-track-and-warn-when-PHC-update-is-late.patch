@@ -1,0 +1,141 @@
+From: Jacob Keller <jacob.e.keller@intel.com>
+Date: Wed, 27 Jul 2022 16:16:00 -0700
+Subject: ice: track and warn when PHC update is late
+Patch-mainline: v6.1-rc1
+Git-commit: cd25507a31e18321644833eab0e739cc74eba3b5
+References: jsc#PED-376
+
+The ice driver requires a cached copy of the PHC time in order to perform
+timestamp extension on Tx and Rx hardware timestamp values. This cached PHC
+time must always be updated at least once every 2 seconds. Otherwise, the
+math used to perform the extension would produce invalid results.
+
+The updates are supposed to occur periodically in the PTP kthread work
+item, which is scheduled to run every half second. Thus, we do not expect
+an update to be delayed for so long. However, there are error conditions
+which can cause the update to be delayed.
+
+Track this situation by using jiffies to determine approximately how long
+ago the last update occurred. Add a new statistic and a dev_warn when we
+have failed to update the cached PHC time. This makes the error case more
+obvious.
+
+Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+Tested-by: Gurucharan <gurucharanx.g@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_ethtool.c |    2 +
+ drivers/net/ethernet/intel/ice/ice_ptp.c     |   28 ++++++++++++++++++++++++---
+ drivers/net/ethernet/intel/ice/ice_ptp.h     |    7 ++++++
+ 3 files changed, 34 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@ -139,6 +139,8 @@ static const struct ice_stats ice_gstrin
+ 	ICE_PF_STAT("tx_hwtstamp_skipped", ptp.tx_hwtstamp_skipped),
+ 	ICE_PF_STAT("tx_hwtstamp_timeouts", ptp.tx_hwtstamp_timeouts),
+ 	ICE_PF_STAT("tx_hwtstamp_flushed", ptp.tx_hwtstamp_flushed),
++	ICE_PF_STAT("tx_hwtstamp_discarded", ptp.tx_hwtstamp_discarded),
++	ICE_PF_STAT("late_cached_phc_updates", ptp.late_cached_phc_updates),
+ };
+ 
+ static const u32 ice_regs_dump_list[] = {
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@ -507,17 +507,30 @@ ice_ptp_read_src_clk_reg(struct ice_pf *
+  */
+ static int ice_ptp_update_cached_phctime(struct ice_pf *pf)
+ {
++	struct device *dev = ice_pf_to_dev(pf);
++	unsigned long update_before;
+ 	u64 systime;
+ 	int i;
+ 
+ 	if (test_and_set_bit(ICE_CFG_BUSY, pf->state))
+ 		return -EAGAIN;
+ 
++	update_before = pf->ptp.cached_phc_jiffies + msecs_to_jiffies(2000);
++	if (pf->ptp.cached_phc_time &&
++	    time_is_before_jiffies(update_before)) {
++		unsigned long time_taken = jiffies - pf->ptp.cached_phc_jiffies;
++
++		dev_warn(dev, "%u msecs passed between update to cached PHC time\n",
++			 jiffies_to_msecs(time_taken));
++		pf->ptp.late_cached_phc_updates++;
++	}
++
+ 	/* Read the current PHC time */
+ 	systime = ice_ptp_read_src_clk_reg(pf, NULL);
+ 
+ 	/* Update the cached PHC time stored in the PF structure */
+ 	WRITE_ONCE(pf->ptp.cached_phc_time, systime);
++	WRITE_ONCE(pf->ptp.cached_phc_jiffies, jiffies);
+ 
+ 	ice_for_each_vsi(pf, i) {
+ 		struct ice_vsi *vsi = pf->vsi[i];
+@@ -636,6 +649,14 @@ static u64 ice_ptp_extend_32b_ts(u64 cac
+ static u64 ice_ptp_extend_40b_ts(struct ice_pf *pf, u64 in_tstamp)
+ {
+ 	const u64 mask = GENMASK_ULL(31, 0);
++	unsigned long discard_time;
++
++	/* Discard the hardware timestamp if the cached PHC time is too old */
++	discard_time = pf->ptp.cached_phc_jiffies + msecs_to_jiffies(2000);
++	if (time_is_before_jiffies(discard_time)) {
++		pf->ptp.tx_hwtstamp_discarded++;
++		return 0;
++	}
+ 
+ 	return ice_ptp_extend_32b_ts(pf->ptp.cached_phc_time,
+ 				     (in_tstamp >> 8) & mask);
+@@ -2108,9 +2129,10 @@ static void ice_ptp_tx_tstamp_work(struc
+ 
+ 		/* Extend the timestamp using cached PHC time */
+ 		tstamp = ice_ptp_extend_40b_ts(pf, raw_tstamp);
+-		shhwtstamps.hwtstamp = ns_to_ktime(tstamp);
+-
+-		ice_trace(tx_tstamp_complete, skb, idx);
++		if (tstamp) {
++			shhwtstamps.hwtstamp = ns_to_ktime(tstamp);
++			ice_trace(tx_tstamp_complete, skb, idx);
++		}
+ 
+ 		skb_tstamp_tx(skb, &shhwtstamps);
+ 		dev_kfree_skb_any(skb);
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.h
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.h
+@@ -163,6 +163,7 @@ struct ice_ptp_port {
+  * @work: delayed work function for periodic tasks
+  * @extts_work: work function for handling external Tx timestamps
+  * @cached_phc_time: a cached copy of the PHC time for timestamp extension
++ * @cached_phc_jiffies: jiffies when cached_phc_time was last updated
+  * @ext_ts_chan: the external timestamp channel in use
+  * @ext_ts_irq: the external timestamp IRQ in use
+  * @kworker: kwork thread for handling periodic work
+@@ -174,12 +175,16 @@ struct ice_ptp_port {
+  * @tx_hwtstamp_skipped: number of Tx time stamp requests skipped
+  * @tx_hwtstamp_timeouts: number of Tx skbs discarded with no time stamp
+  * @tx_hwtstamp_flushed: number of Tx skbs flushed due to interface closed
++ * @tx_hwtstamp_discarded: number of Tx skbs discarded due to cached PHC time
++ *                         being too old to correctly extend timestamp
++ * @late_cached_phc_updates: number of times cached PHC update is late
+  */
+ struct ice_ptp {
+ 	struct ice_ptp_port port;
+ 	struct kthread_delayed_work work;
+ 	struct kthread_work extts_work;
+ 	u64 cached_phc_time;
++	unsigned long cached_phc_jiffies;
+ 	u8 ext_ts_chan;
+ 	u8 ext_ts_irq;
+ 	struct kthread_worker *kworker;
+@@ -191,6 +196,8 @@ struct ice_ptp {
+ 	u32 tx_hwtstamp_skipped;
+ 	u32 tx_hwtstamp_timeouts;
+ 	u32 tx_hwtstamp_flushed;
++	u32 tx_hwtstamp_discarded;
++	u32 late_cached_phc_updates;
+ };
+ 
+ #define __ptp_port_to_ptp(p) \

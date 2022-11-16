@@ -1,0 +1,326 @@
+From: Lior Nahmanson <liorna@nvidia.com>
+Date: Mon, 5 Sep 2022 22:21:22 -0700
+Subject: net/mlx5e: Implement MACsec Tx data path using MACsec
+ skb_metadata_dst
+Patch-mainline: v6.1-rc1
+Git-commit: 9515978eee0b933e37947637d138f1942b3e4b0c
+References: jsc#PED-1549
+
+MACsec driver marks Tx packets for device offload using a dedicated
+skb_metadata_dst which holds a 64 bits SCI number.
+A previously set rule will match on this number so the correct SA is used
+for the MACsec operation.
+As device driver can only provide 32 bits of metadata to flow tables,
+need to used a mapping from 64 bit to 32 bits marker or id,
+which is can be achieved by provide a 32 bit unique flow id in the
+control path, and used a hash table to map 64 bit to the unique id in the
+datapath.
+
+Signed-off-by: Lior Nahmanson <liorna@nvidia.com>
+Reviewed-by: Raed Salem <raeds@nvidia.com>
+Signed-off-by: Raed Salem <raeds@nvidia.com>
+Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/en_accel.h  |   15 +
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/macsec.c    |   83 ++++++++++-
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/macsec.h    |   14 +
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/macsec_fs.c |    9 -
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/macsec_fs.h |    3 
+ drivers/net/ethernet/mellanox/mlx5/core/en_tx.c              |    3 
+ 6 files changed, 119 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/en_accel.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/en_accel.h
+@@ -39,6 +39,7 @@
+ #include "en_accel/ipsec_rxtx.h"
+ #include "en_accel/ktls.h"
+ #include "en_accel/ktls_txrx.h"
++#include <en_accel/macsec.h>
+ #include "en.h"
+ #include "en/txrx.h"
+ 
+@@ -137,6 +138,15 @@ static inline bool mlx5e_accel_tx_begin(
+ 	}
+ #endif
+ 
++#ifdef CONFIG_MLX5_EN_MACSEC
++	if (unlikely(mlx5e_macsec_skb_is_offload(skb))) {
++		struct mlx5e_priv *priv = netdev_priv(dev);
++
++		if (unlikely(!mlx5e_macsec_handle_tx_skb(priv->macsec, skb)))
++			return false;
++	}
++#endif
++
+ 	return true;
+ }
+ 
+@@ -163,6 +173,11 @@ static inline void mlx5e_accel_tx_eseg(s
+ 		mlx5e_ipsec_tx_build_eseg(priv, skb, eseg);
+ #endif
+ 
++#ifdef CONFIG_MLX5_EN_MACSEC
++	if (unlikely(mlx5e_macsec_skb_is_offload(skb)))
++		mlx5e_macsec_tx_build_eseg(priv->macsec, skb, eseg);
++#endif
++
+ #if IS_ENABLED(CONFIG_GENEVE)
+ 	if (skb->encapsulation && skb->ip_summed == CHECKSUM_PARTIAL)
+ 		mlx5e_tx_tunnel_accel(skb, eseg, ihs);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/macsec.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/macsec.c
+@@ -20,7 +20,18 @@ struct mlx5e_macsec_sa {
+ 	u32 next_pn;
+ 	sci_t sci;
+ 
++	struct rhash_head hash;
++	u32 fs_id;
+ 	struct mlx5e_macsec_tx_rule *tx_rule;
++	struct rcu_head rcu_head;
++};
++
++static const struct rhashtable_params rhash_sci = {
++	.key_len = sizeof_field(struct mlx5e_macsec_sa, sci),
++	.key_offset = offsetof(struct mlx5e_macsec_sa, sci),
++	.head_offset = offsetof(struct mlx5e_macsec_sa, hash),
++	.automatic_shrinking = true,
++	.min_size = 1,
+ };
+ 
+ struct mlx5e_macsec {
+@@ -31,6 +42,9 @@ struct mlx5e_macsec {
+ 	/* Global PD for MACsec object ASO context */
+ 	u32 aso_pdn;
+ 
++	/* Tx sci -> fs id mapping handling */
++	struct rhashtable sci_hash;      /* sci -> mlx5e_macsec_sa */
++
+ 	struct mlx5_core_dev *mdev;
+ };
+ 
+@@ -96,6 +110,11 @@ static void mlx5e_macsec_destroy_object(
+ 
+ static void mlx5e_macsec_cleanup_sa(struct mlx5e_macsec *macsec, struct mlx5e_macsec_sa *sa)
+ {
++	if (sa->fs_id) {
++		/* Make sure ongoing datapath readers sees a valid SA */
++		rhashtable_remove_fast(&macsec->sci_hash, &sa->hash, rhash_sci);
++		sa->fs_id = 0;
++	}
+ 
+ 	if (!sa->tx_rule)
+ 		return;
+@@ -131,14 +150,19 @@ static int mlx5e_macsec_init_sa(struct m
+ 	rule_attrs.macsec_obj_id = sa->macsec_obj_id;
+ 	rule_attrs.action = MLX5_ACCEL_MACSEC_ACTION_ENCRYPT;
+ 
+-	tx_rule = mlx5e_macsec_fs_add_rule(macsec->macsec_fs, ctx, &rule_attrs);
++	tx_rule = mlx5e_macsec_fs_add_rule(macsec->macsec_fs, ctx, &rule_attrs, &sa->fs_id);
+ 	if (IS_ERR_OR_NULL(tx_rule))
+ 		goto destroy_macsec_object;
+ 
+-	sa->tx_rule = tx_rule;
++	err = rhashtable_insert_fast(&macsec->sci_hash, &sa->hash, rhash_sci);
++	if (err)
++		goto destroy_macsec_rule;
+ 
++	sa->tx_rule = tx_rule;
+ 	return 0;
+ 
++destroy_macsec_rule:
++	mlx5e_macsec_fs_del_rule(macsec->macsec_fs, tx_rule, MLX5_ACCEL_MACSEC_ACTION_ENCRYPT);
+ destroy_macsec_object:
+ 	mlx5e_macsec_destroy_object(mdev, sa->macsec_obj_id);
+ 
+@@ -295,7 +319,7 @@ static int mlx5e_macsec_del_txsa(struct
+ 
+ 	mlx5e_macsec_cleanup_sa(macsec, tx_sa);
+ 	mlx5_destroy_encryption_key(macsec->mdev, tx_sa->enc_key_id);
+-	kfree(tx_sa);
++	kfree_rcu(tx_sa);
+ 	macsec->tx_sa[assoc_num] = NULL;
+ 
+ out:
+@@ -304,6 +328,20 @@ out:
+ 	return err;
+ }
+ 
++static u32 mlx5e_macsec_get_sa_from_hashtable(struct rhashtable *sci_hash, sci_t *sci)
++{
++	struct mlx5e_macsec_sa *macsec_sa;
++	u32 fs_id = 0;
++
++	rcu_read_lock();
++	macsec_sa = rhashtable_lookup(sci_hash, sci, rhash_sci);
++	if (macsec_sa)
++		fs_id = macsec_sa->fs_id;
++	rcu_read_unlock();
++
++	return fs_id;
++}
++
+ static bool mlx5e_is_macsec_device(const struct mlx5_core_dev *mdev)
+ {
+ 	if (!(MLX5_CAP_GEN_64(mdev, general_obj_types) &
+@@ -341,6 +379,36 @@ static const struct macsec_ops macsec_of
+ 	.mdo_del_txsa = mlx5e_macsec_del_txsa,
+ };
+ 
++bool mlx5e_macsec_handle_tx_skb(struct mlx5e_macsec *macsec, struct sk_buff *skb)
++{
++	struct metadata_dst *md_dst = skb_metadata_dst(skb);
++	u32 fs_id;
++
++	fs_id = mlx5e_macsec_get_sa_from_hashtable(&macsec->sci_hash, &md_dst->u.macsec_info.sci);
++	if (!fs_id)
++		goto err_out;
++
++	return true;
++
++err_out:
++	dev_kfree_skb_any(skb);
++	return false;
++}
++
++void mlx5e_macsec_tx_build_eseg(struct mlx5e_macsec *macsec,
++				struct sk_buff *skb,
++				struct mlx5_wqe_eth_seg *eseg)
++{
++	struct metadata_dst *md_dst = skb_metadata_dst(skb);
++	u32 fs_id;
++
++	fs_id = mlx5e_macsec_get_sa_from_hashtable(&macsec->sci_hash, &md_dst->u.macsec_info.sci);
++	if (!fs_id)
++		return;
++
++	eseg->flow_table_metadata = cpu_to_be32(MLX5_ETH_WQE_FT_META_MACSEC | fs_id << 2);
++}
++
+ void mlx5e_macsec_build_netdev(struct mlx5e_priv *priv)
+ {
+ 	struct net_device *netdev = priv->netdev;
+@@ -381,6 +449,13 @@ int mlx5e_macsec_init(struct mlx5e_priv
+ 		goto err_pd;
+ 	}
+ 
++	err = rhashtable_init(&macsec->sci_hash, &rhash_sci);
++	if (err) {
++		mlx5_core_err(mdev, "MACsec offload: Failed to init SCI hash table, err=%d\n",
++			      err);
++		goto err_out;
++	}
++
+ 	priv->macsec = macsec;
+ 
+ 	macsec->mdev = mdev;
+@@ -416,6 +491,8 @@ void mlx5e_macsec_cleanup(struct mlx5e_p
+ 
+ 	mlx5_core_dealloc_pd(priv->mdev, macsec->aso_pdn);
+ 
++	rhashtable_destroy(&macsec->sci_hash);
++
+ 	mutex_destroy(&macsec->lock);
+ 
+ 	kfree(macsec);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/macsec.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/macsec.h
+@@ -8,18 +8,32 @@
+ 
+ #include <linux/mlx5/driver.h>
+ #include <net/macsec.h>
++#include <net/dst_metadata.h>
+ 
+ struct mlx5e_priv;
++struct mlx5e_macsec;
+ 
+ void mlx5e_macsec_build_netdev(struct mlx5e_priv *priv);
+ int mlx5e_macsec_init(struct mlx5e_priv *priv);
+ void mlx5e_macsec_cleanup(struct mlx5e_priv *priv);
++bool mlx5e_macsec_handle_tx_skb(struct mlx5e_macsec *macsec, struct sk_buff *skb);
++void mlx5e_macsec_tx_build_eseg(struct mlx5e_macsec *macsec,
++				struct sk_buff *skb,
++				struct mlx5_wqe_eth_seg *eseg);
++
++static inline bool mlx5e_macsec_skb_is_offload(struct sk_buff *skb)
++{
++	struct metadata_dst *md_dst = skb_metadata_dst(skb);
++
++	return md_dst && (md_dst->type == METADATA_MACSEC);
++}
+ 
+ #else
+ 
+ static inline void mlx5e_macsec_build_netdev(struct mlx5e_priv *priv) {}
+ static inline int mlx5e_macsec_init(struct mlx5e_priv *priv) { return 0; }
+ static inline void mlx5e_macsec_cleanup(struct mlx5e_priv *priv) {}
++static inline bool mlx5e_macsec_skb_is_offload(struct sk_buff *skb) { return false; }
+ 
+ #endif  /* CONFIG_MLX5_EN_MACSEC */
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/macsec_fs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/macsec_fs.c
+@@ -464,7 +464,8 @@ static void macsec_fs_tx_del_rule(struct
+ static struct mlx5e_macsec_tx_rule *
+ macsec_fs_tx_add_rule(struct mlx5e_macsec_fs *macsec_fs,
+ 		      const struct macsec_context *macsec_ctx,
+-		      struct mlx5_macsec_rule_attrs *attrs)
++		      struct mlx5_macsec_rule_attrs *attrs,
++		      u32 *sa_fs_id)
+ {
+ 	char reformatbf[MLX5_MACSEC_TAG_LEN + MACSEC_SCI_LEN];
+ 	struct mlx5_pkt_reformat_params reformat_params = {};
+@@ -518,6 +519,7 @@ macsec_fs_tx_add_rule(struct mlx5e_macse
+ 	}
+ 
+ 	tx_rule->fs_id = fs_id;
++	*sa_fs_id = fs_id;
+ 
+ 	flow_act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+ 			  MLX5_FLOW_CONTEXT_ACTION_CRYPTO_ENCRYPT |
+@@ -626,10 +628,11 @@ err_encrypt_counter:
+ struct mlx5e_macsec_tx_rule *
+ mlx5e_macsec_fs_add_rule(struct mlx5e_macsec_fs *macsec_fs,
+ 			 const struct macsec_context *macsec_ctx,
+-			 struct mlx5_macsec_rule_attrs *attrs)
++			 struct mlx5_macsec_rule_attrs *attrs,
++			 u32 *sa_fs_id)
+ {
+ 	if (attrs->action == MLX5_ACCEL_MACSEC_ACTION_ENCRYPT)
+-		return macsec_fs_tx_add_rule(macsec_fs, macsec_ctx, attrs);
++		return macsec_fs_tx_add_rule(macsec_fs, macsec_ctx, attrs, sa_fs_id);
+ 
+ 	return NULL;
+ }
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/macsec_fs.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/macsec_fs.h
+@@ -30,7 +30,8 @@ mlx5e_macsec_fs_init(struct mlx5_core_de
+ struct mlx5e_macsec_tx_rule *
+ mlx5e_macsec_fs_add_rule(struct mlx5e_macsec_fs *macsec_fs,
+ 			 const struct macsec_context *ctx,
+-			 struct mlx5_macsec_rule_attrs *attrs);
++			 struct mlx5_macsec_rule_attrs *attrs,
++			 u32 *sa_fs_id);
+ 
+ void mlx5e_macsec_fs_del_rule(struct mlx5e_macsec_fs *macsec_fs,
+ 			      struct mlx5e_macsec_tx_rule *macsec_rule,
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@ -39,6 +39,7 @@
+ #include "ipoib/ipoib.h"
+ #include "en_accel/en_accel.h"
+ #include "en_accel/ipsec_rxtx.h"
++#include "en_accel/macsec.h"
+ #include "en/ptp.h"
+ 
+ static void mlx5e_dma_unmap_wqe_err(struct mlx5e_txqsq *sq, u8 num_dma)
+@@ -436,7 +437,7 @@ err_drop:
+ static bool mlx5e_tx_skb_supports_mpwqe(struct sk_buff *skb, struct mlx5e_tx_attr *attr)
+ {
+ 	return !skb_is_nonlinear(skb) && !skb_vlan_tag_present(skb) && !attr->ihs &&
+-	       !attr->insz;
++	       !attr->insz && !mlx5e_macsec_skb_is_offload(skb);
+ }
+ 
+ static bool mlx5e_tx_mpwqe_same_eseg(struct mlx5e_txqsq *sq, struct mlx5_wqe_eth_seg *eseg)
