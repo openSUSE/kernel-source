@@ -1,0 +1,189 @@
+From: Maxim Mikityanskiy <maximmi@nvidia.com>
+Date: Sat, 1 Oct 2022 21:56:26 -0700
+Subject: net/mlx5e: xsk: Optimize for unaligned mode with 3072-byte frames
+Patch-mainline: v6.1-rc1
+Git-commit: c2c9e31dfa4f23045f72f613c5809d5b030cd27f
+References: jsc#PED-1549
+
+When XSK frame size is 3072 (or another power of two multiplied by 3),
+KLM mechanism for NIC virtual memory page mapping can be optimized by
+replacing it with KSM.
+
+Before this change, two KLM entries were needed to map an XSK frame that
+is not a power of two: one entry maps the UMEM memory up to the frame
+length, the other maps the rest of the stride to the garbage page.
+
+When the frame length divided by 3 is a power of two, it can be mapped
+using 3 KSM entries, and the fourth will map the rest of the stride to
+the garbage page. All 4 KSM entries are of the same size, which allows
+for a much faster lookup.
+
+Frame size 3072 is useful in certain use cases, because it allows
+packing 4 frames into 3 pages. Generally speaking, other frame sizes
+equal to PAGE_SIZE minus a power of two can be optimized in a similar
+way, but it will require many more KSMs per frame, which slows down UMRs
+a little bit, but more importantly may hit the limit for the maximum
+number of KSM entries.
+
+Signed-off-by: Maxim Mikityanskiy <maximmi@nvidia.com>
+Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en.h        |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/en/params.c |   20 +++++++++++++++-
+ drivers/net/ethernet/mellanox/mlx5/core/en/xsk/rx.c |   25 ++++++++++++++++++++
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c   |   18 ++++++++++++--
+ 4 files changed, 61 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -681,6 +681,7 @@ enum mlx5e_mpwrq_umr_mode {
+ 	MLX5E_MPWRQ_UMR_MODE_ALIGNED,
+ 	MLX5E_MPWRQ_UMR_MODE_UNALIGNED,
+ 	MLX5E_MPWRQ_UMR_MODE_OVERSIZED,
++	MLX5E_MPWRQ_UMR_MODE_TRIPLE,
+ };
+ 
+ struct mlx5e_rq {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/params.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/params.c
+@@ -56,8 +56,16 @@ mlx5e_mpwrq_umr_mode(struct mlx5_core_de
+ 	 * stride is mapped to a garbage page, resulting in two mappings of
+ 	 * different sizes per frame.
+ 	 */
+-	if (oversized)
++	if (oversized) {
++		/* An optimization for frame sizes equal to 3 * power_of_two.
++		 * 3 KSMs point to the frame, and one KSM points to the garbage
++		 * page, which works faster than KLM.
++		 */
++		if (xsk->chunk_size % 3 == 0 && is_power_of_2(xsk->chunk_size / 3))
++			return MLX5E_MPWRQ_UMR_MODE_TRIPLE;
++
+ 		return MLX5E_MPWRQ_UMR_MODE_OVERSIZED;
++	}
+ 
+ 	/* XSK frames can start at arbitrary unaligned locations, but they all
+ 	 * have the same size which is a power of two. It allows to optimize to
+@@ -82,6 +90,8 @@ u8 mlx5e_mpwrq_umr_entry_size(enum mlx5e
+ 		return sizeof(struct mlx5_ksm);
+ 	case MLX5E_MPWRQ_UMR_MODE_OVERSIZED:
+ 		return sizeof(struct mlx5_klm) * 2;
++	case MLX5E_MPWRQ_UMR_MODE_TRIPLE:
++		return sizeof(struct mlx5_ksm) * 4;
+ 	}
+ 	WARN_ONCE(1, "MPWRQ UMR mode %d is not known\n", mode);
+ 	return 0;
+@@ -179,6 +189,9 @@ u32 mlx5e_mpwrq_max_num_entries(struct m
+ 	case MLX5E_MPWRQ_UMR_MODE_OVERSIZED:
+ 		/* Each entry is two KLMs. */
+ 		return klm_limit / 2;
++	case MLX5E_MPWRQ_UMR_MODE_TRIPLE:
++		/* Each entry is four KSMs. */
++		return klm_limit / 4;
+ 	}
+ 	WARN_ONCE(1, "MPWRQ UMR mode %d is not known\n", umr_mode);
+ 	return 0;
+@@ -1121,6 +1134,11 @@ static u8 mlx5e_build_icosq_log_wq_sz(st
+ 			xsk.chunk_size -= 1;
+ 			max_xsk_wqebbs = max(max_xsk_wqebbs,
+ 				mlx5e_mpwrq_total_umr_wqebbs(mdev, params, &xsk));
++
++			/* XSK unaligned mode, frame size is a triple power of two. */
++			xsk.chunk_size = (1 << frame_shift) / 4 * 3;
++			max_xsk_wqebbs = max(max_xsk_wqebbs,
++				mlx5e_mpwrq_total_umr_wqebbs(mdev, params, &xsk));
+ 		}
+ 
+ 		wqebbs += max_xsk_wqebbs;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/rx.c
+@@ -58,6 +58,29 @@ int mlx5e_xsk_alloc_rx_mpwqe(struct mlx5
+ 				.va = cpu_to_be64(addr),
+ 			};
+ 		}
++	} else if (likely(rq->mpwqe.umr_mode == MLX5E_MPWRQ_UMR_MODE_TRIPLE)) {
++		u32 mapping_size = 1 << (rq->mpwqe.page_shift - 2);
++
++		for (i = 0; i < batch; i++) {
++			dma_addr_t addr = xsk_buff_xdp_get_frame_dma(wi->alloc_units[i].xsk);
++
++			umr_wqe->inline_ksms[i << 2] = (struct mlx5_ksm) {
++				.key = rq->mkey_be,
++				.va = cpu_to_be64(addr),
++			};
++			umr_wqe->inline_ksms[(i << 2) + 1] = (struct mlx5_ksm) {
++				.key = rq->mkey_be,
++				.va = cpu_to_be64(addr + mapping_size),
++			};
++			umr_wqe->inline_ksms[(i << 2) + 2] = (struct mlx5_ksm) {
++				.key = rq->mkey_be,
++				.va = cpu_to_be64(addr + mapping_size * 2),
++			};
++			umr_wqe->inline_ksms[(i << 2) + 3] = (struct mlx5_ksm) {
++				.key = rq->mkey_be,
++				.va = cpu_to_be64(rq->wqe_overflow.addr),
++			};
++		}
+ 	} else {
+ 		__be32 pad_size = cpu_to_be32((1 << rq->mpwqe.page_shift) -
+ 					      rq->xsk_pool->chunk_size);
+@@ -91,6 +114,8 @@ int mlx5e_xsk_alloc_rx_mpwqe(struct mlx5
+ 		offset = offset * sizeof(struct mlx5_mtt) / MLX5_OCTWORD;
+ 	else if (unlikely(rq->mpwqe.umr_mode == MLX5E_MPWRQ_UMR_MODE_OVERSIZED))
+ 		offset = offset * sizeof(struct mlx5_klm) * 2 / MLX5_OCTWORD;
++	else if (unlikely(rq->mpwqe.umr_mode == MLX5E_MPWRQ_UMR_MODE_TRIPLE))
++		offset = offset * sizeof(struct mlx5_ksm) * 4 / MLX5_OCTWORD;
+ 	umr_wqe->uctrl.xlt_offset = cpu_to_be16(offset);
+ 
+ 	icosq->db.wqe_info[pi] = (struct mlx5e_icosq_wqe_info) {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -301,6 +301,8 @@ static u8 mlx5e_mpwrq_access_mode(enum m
+ 		return MLX5_MKC_ACCESS_MODE_KSM;
+ 	case MLX5E_MPWRQ_UMR_MODE_OVERSIZED:
+ 		return MLX5_MKC_ACCESS_MODE_KLMS;
++	case MLX5E_MPWRQ_UMR_MODE_TRIPLE:
++		return MLX5_MKC_ACCESS_MODE_KSM;
+ 	}
+ 	WARN_ONCE(1, "MPWRQ UMR mode %d is not known\n", umr_mode);
+ 	return 0;
+@@ -322,7 +324,8 @@ static int mlx5e_create_umr_mkey(struct
+ 	int err;
+ 	int i;
+ 
+-	if (umr_mode == MLX5E_MPWRQ_UMR_MODE_UNALIGNED &&
++	if ((umr_mode == MLX5E_MPWRQ_UMR_MODE_UNALIGNED ||
++	     umr_mode == MLX5E_MPWRQ_UMR_MODE_TRIPLE) &&
+ 	    !MLX5_CAP_GEN(mdev, fixed_buffer_size)) {
+ 		mlx5_core_warn(mdev, "Unaligned AF_XDP requires fixed_buffer_size capability\n");
+ 		return -EINVAL;
+@@ -351,7 +354,9 @@ static int mlx5e_create_umr_mkey(struct
+ 	MLX5_SET(mkc, mkc, pd, mdev->mlx5e_res.hw_objs.pdn);
+ 	MLX5_SET64(mkc, mkc, len, npages << page_shift);
+ 	MLX5_SET(mkc, mkc, translations_octword_size, octwords);
+-	if (umr_mode != MLX5E_MPWRQ_UMR_MODE_OVERSIZED)
++	if (umr_mode == MLX5E_MPWRQ_UMR_MODE_TRIPLE)
++		MLX5_SET(mkc, mkc, log_page_size, page_shift - 2);
++	else if (umr_mode != MLX5E_MPWRQ_UMR_MODE_OVERSIZED)
+ 		MLX5_SET(mkc, mkc, log_page_size, page_shift);
+ 	MLX5_SET(create_mkey_in, in, translations_octword_actual_size, octwords);
+ 
+@@ -392,6 +397,15 @@ static int mlx5e_create_umr_mkey(struct
+ 				.ptag = cpu_to_be64(filler_addr),
+ 			};
+ 		break;
++	case MLX5E_MPWRQ_UMR_MODE_TRIPLE:
++		ksm = MLX5_ADDR_OF(create_mkey_in, in, klm_pas_mtt);
++		for (i = 0; i < npages * 4; i++) {
++			ksm[i] = (struct mlx5_ksm) {
++				.key = cpu_to_be32(mdev->mlx5e_res.hw_objs.mkey),
++				.va = cpu_to_be64(filler_addr),
++			};
++		}
++		break;
+ 	}
+ 
+ 	err = mlx5_core_create_mkey(mdev, umr_mkey, in, inlen);
