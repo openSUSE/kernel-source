@@ -1,0 +1,138 @@
+From: Martin KaFai Lau <kafai@fb.com>
+Date: Thu, 1 Jul 2021 13:06:06 -0700
+Subject: tcp: seq_file: Replace listening_hash with lhash2
+Patch-mainline: v5.15-rc1
+Git-commit: 05c0b35709c58b83d4dc515d2ac52e9c0f197d03
+References: jsc#PED-1368
+
+This patch moves the tcp seq_file iteration on listeners
+from the port only listening_hash to the port+addr lhash2.
+
+When iterating from the bpf iter, the next patch will need to
+lock the socket such that the bpf iter can call setsockopt (e.g. to
+change the TCP_CONGESTION).  To avoid locking the bucket and then locking
+the sock, the bpf iter will first batch some sockets from the same bucket
+and then unlock the bucket.  If the bucket size is small (which
+usually is), it is easier to batch the whole bucket such that it is less
+likely to miss a setsockopt on a socket due to changes in the bucket.
+
+However, the port only listening_hash could have many listeners
+hashed to a bucket (e.g. many individual VIP(s):443 and also
+multiple by the number of SO_REUSEPORT).  We have seen bucket size in
+tens of thousands range.  Also, the chance of having changes
+in some popular port buckets (e.g. 443) is also high.
+
+The port+addr lhash2 was introduced to solve this large listener bucket
+issue.  Also, the listening_hash usage has already been replaced with
+lhash2 in the fast path inet[6]_lookup_listener().  This patch follows
+the same direction on moving to lhash2 and iterates the lhash2
+instead of listening_hash.
+
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Acked-by: Kuniyuki Iwashima <kuniyu@amazon.co.jp>
+Acked-by: Yonghong Song <yhs@fb.com>
+Link: https://lore.kernel.org/bpf/20210701200606.1035783-1-kafai@fb.com
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/net/inet_hashtables.h |    6 ++++++
+ net/ipv4/tcp_ipv4.c           |   35 ++++++++++++++++++-----------------
+ 2 files changed, 24 insertions(+), 17 deletions(-)
+
+--- a/include/net/inet_hashtables.h
++++ b/include/net/inet_hashtables.h
+@@ -160,6 +160,12 @@ struct inet_hashinfo {
+ 					____cacheline_aligned_in_smp;
+ };
+ 
++#define inet_lhash2_for_each_icsk_continue(__icsk) \
++	hlist_for_each_entry_continue(__icsk, icsk_listen_portaddr_node)
++
++#define inet_lhash2_for_each_icsk(__icsk, list) \
++	hlist_for_each_entry(__icsk, list, icsk_listen_portaddr_node)
++
+ #define inet_lhash2_for_each_icsk_rcu(__icsk, list) \
+ 	hlist_for_each_entry_rcu(__icsk, list, icsk_listen_portaddr_node)
+ 
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -2296,21 +2296,22 @@ static void *listening_get_first(struct
+ 	struct tcp_iter_state *st = seq->private;
+ 
+ 	st->offset = 0;
+-	for (; st->bucket < INET_LHTABLE_SIZE; st->bucket++) {
+-		struct inet_listen_hashbucket *ilb;
+-		struct hlist_nulls_node *node;
++	for (; st->bucket <= tcp_hashinfo.lhash2_mask; st->bucket++) {
++		struct inet_listen_hashbucket *ilb2;
++		struct inet_connection_sock *icsk;
+ 		struct sock *sk;
+ 
+-		ilb = &tcp_hashinfo.listening_hash[st->bucket];
+-		if (hlist_nulls_empty(&ilb->nulls_head))
++		ilb2 = &tcp_hashinfo.lhash2[st->bucket];
++		if (hlist_empty(&ilb2->head))
+ 			continue;
+ 
+-		spin_lock(&ilb->lock);
+-		sk_nulls_for_each(sk, node, &ilb->nulls_head) {
++		spin_lock(&ilb2->lock);
++		inet_lhash2_for_each_icsk(icsk, &ilb2->head) {
++			sk = (struct sock *)icsk;
+ 			if (seq_sk_match(seq, sk))
+ 				return sk;
+ 		}
+-		spin_unlock(&ilb->lock);
++		spin_unlock(&ilb2->lock);
+ 	}
+ 
+ 	return NULL;
+@@ -2324,22 +2325,22 @@ static void *listening_get_first(struct
+ static void *listening_get_next(struct seq_file *seq, void *cur)
+ {
+ 	struct tcp_iter_state *st = seq->private;
+-	struct inet_listen_hashbucket *ilb;
+-	struct hlist_nulls_node *node;
++	struct inet_listen_hashbucket *ilb2;
++	struct inet_connection_sock *icsk;
+ 	struct sock *sk = cur;
+ 
+ 	++st->num;
+ 	++st->offset;
+ 
+-	sk = sk_nulls_next(sk);
+-
+-	sk_nulls_for_each_from(sk, node) {
++	icsk = inet_csk(sk);
++	inet_lhash2_for_each_icsk_continue(icsk) {
++		sk = (struct sock *)icsk;
+ 		if (seq_sk_match(seq, sk))
+ 			return sk;
+ 	}
+ 
+-	ilb = &tcp_hashinfo.listening_hash[st->bucket];
+-	spin_unlock(&ilb->lock);
++	ilb2 = &tcp_hashinfo.lhash2[st->bucket];
++	spin_unlock(&ilb2->lock);
+ 	++st->bucket;
+ 	return listening_get_first(seq);
+ }
+@@ -2456,7 +2457,7 @@ static void *tcp_seek_last_pos(struct se
+ 
+ 	switch (st->state) {
+ 	case TCP_SEQ_STATE_LISTENING:
+-		if (st->bucket >= INET_LHTABLE_SIZE)
++		if (st->bucket > tcp_hashinfo.lhash2_mask)
+ 			break;
+ 		st->state = TCP_SEQ_STATE_LISTENING;
+ 		rc = listening_get_first(seq);
+@@ -2541,7 +2542,7 @@ void tcp_seq_stop(struct seq_file *seq,
+ 	switch (st->state) {
+ 	case TCP_SEQ_STATE_LISTENING:
+ 		if (v != SEQ_START_TOKEN)
+-			spin_unlock(&tcp_hashinfo.listening_hash[st->bucket].lock);
++			spin_unlock(&tcp_hashinfo.lhash2[st->bucket].lock);
+ 		break;
+ 	case TCP_SEQ_STATE_ESTABLISHED:
+ 		if (v)

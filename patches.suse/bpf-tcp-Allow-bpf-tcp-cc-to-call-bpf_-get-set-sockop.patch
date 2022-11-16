@@ -1,0 +1,188 @@
+From: Martin KaFai Lau <kafai@fb.com>
+Date: Tue, 24 Aug 2021 10:30:07 -0700
+Subject: bpf: tcp: Allow bpf-tcp-cc to call bpf_(get|set)sockopt
+Patch-mainline: v5.15-rc1
+Git-commit: eb18b49ea758ec052ac2a12c6bb204e1e877ec31
+References: jsc#PED-1368
+
+This patch allows the bpf-tcp-cc to call bpf_setsockopt.  One use
+case is to allow a bpf-tcp-cc switching to another cc during init().
+For example, when the tcp flow is not ecn ready, the bpf_dctcp
+can switch to another cc by calling setsockopt(TCP_CONGESTION).
+
+During setsockopt(TCP_CONGESTION), the new tcp-cc's init() will be
+called and this could cause a recursion but it is stopped by the
+current trampoline's logic (in the prog->active counter).
+
+While retiring a bpf-tcp-cc (e.g. in tcp_v[46]_destroy_sock()),
+the tcp stack calls bpf-tcp-cc's release().  To avoid the retiring
+bpf-tcp-cc making further changes to the sk, bpf_setsockopt is not
+available to the bpf-tcp-cc's release().  This will avoid release()
+making setsockopt() call that will potentially allocate new resources.
+
+Although the bpf-tcp-cc already has a more powerful way to read tcp_sock
+from the PTR_TO_BTF_ID, it is usually expected that bpf_getsockopt and
+bpf_setsockopt are available together.  Thus, bpf_getsockopt() is also
+added to all tcp_congestion_ops except release().
+
+When the old bpf-tcp-cc is calling setsockopt(TCP_CONGESTION)
+to switch to a new cc, the old bpf-tcp-cc will be released by
+bpf_struct_ops_put().  Thus, this patch also puts the bpf_struct_ops_map
+after a rcu grace period because the trampoline's image cannot be freed
+while the old bpf-tcp-cc is still running.
+
+bpf-tcp-cc can only access icsk_ca_priv as SCALAR.  All kernel's
+tcp-cc is also accessing the icsk_ca_priv as SCALAR.   The size
+of icsk_ca_priv has already been raised a few times to avoid
+extra kmalloc and memory referencing.  The only exception is the
+kernel's tcp_cdg.c that stores a kmalloc()-ed pointer in icsk_ca_priv.
+To avoid the old bpf-tcp-cc accidentally overriding this tcp_cdg's pointer
+value stored in icsk_ca_priv after switching and without over-complicating
+the bpf's verifier for this one exception in tcp_cdg, this patch does not
+allow switching to tcp_cdg.  If there is a need, bpf_tcp_cdg can be
+implemented and then use the bpf_sk_storage as the extended storage.
+
+bpf_sk_setsockopt proto has only been recently added and used
+in bpf-sockopt and bpf-iter-tcp, so impose the tcp_cdg limitation in the
+same proto instead of adding a new proto specifically for bpf-tcp-cc.
+
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210824173007.3976921-1-kafai@fb.com
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ kernel/bpf/bpf_struct_ops.c |   22 +++++++++++++++++++++-
+ net/core/filter.c           |    6 ++++++
+ net/ipv4/bpf_tcp_ca.c       |   41 ++++++++++++++++++++++++++++++++++++++---
+ 3 files changed, 65 insertions(+), 4 deletions(-)
+
+--- a/kernel/bpf/bpf_struct_ops.c
++++ b/kernel/bpf/bpf_struct_ops.c
+@@ -28,6 +28,7 @@ struct bpf_struct_ops_value {
+ 
+ struct bpf_struct_ops_map {
+ 	struct bpf_map map;
++	struct rcu_head rcu;
+ 	const struct bpf_struct_ops *st_ops;
+ 	/* protect map_update */
+ 	struct mutex lock;
+@@ -622,6 +623,14 @@ bool bpf_struct_ops_get(const void *kdat
+ 	return refcount_inc_not_zero(&kvalue->refcnt);
+ }
+ 
++static void bpf_struct_ops_put_rcu(struct rcu_head *head)
++{
++	struct bpf_struct_ops_map *st_map;
++
++	st_map = container_of(head, struct bpf_struct_ops_map, rcu);
++	bpf_map_put(&st_map->map);
++}
++
+ void bpf_struct_ops_put(const void *kdata)
+ {
+ 	struct bpf_struct_ops_value *kvalue;
+@@ -632,6 +641,17 @@ void bpf_struct_ops_put(const void *kdat
+ 
+ 		st_map = container_of(kvalue, struct bpf_struct_ops_map,
+ 				      kvalue);
+-		bpf_map_put(&st_map->map);
++		/* The struct_ops's function may switch to another struct_ops.
++		 *
++		 * For example, bpf_tcp_cc_x->init() may switch to
++		 * another tcp_cc_y by calling
++		 * setsockopt(TCP_CONGESTION, "tcp_cc_y").
++		 * During the switch,  bpf_struct_ops_put(tcp_cc_x) is called
++		 * and its map->refcnt may reach 0 which then free its
++		 * trampoline image while tcp_cc_x is still running.
++		 *
++		 * Thus, a rcu grace period is needed here.
++		 */
++		call_rcu(&st_map->rcu, bpf_struct_ops_put_rcu);
+ 	}
+ }
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -5068,6 +5068,12 @@ err_clear:
+ BPF_CALL_5(bpf_sk_setsockopt, struct sock *, sk, int, level,
+ 	   int, optname, char *, optval, int, optlen)
+ {
++	if (level == SOL_TCP && optname == TCP_CONGESTION) {
++		if (optlen >= sizeof("cdg") - 1 &&
++		    !strncmp("cdg", optval, optlen))
++			return -ENOTSUPP;
++	}
++
+ 	return _bpf_setsockopt(sk, level, optname, optval, optlen);
+ }
+ 
+--- a/net/ipv4/bpf_tcp_ca.c
++++ b/net/ipv4/bpf_tcp_ca.c
+@@ -10,6 +10,9 @@
+ #include <net/tcp.h>
+ #include <net/bpf_sk_storage.h>
+ 
++/* "extern" is to avoid sparse warning.  It is only used in bpf_struct_ops.c. */
++extern struct bpf_struct_ops bpf_tcp_congestion_ops;
++
+ static u32 optional_ops[] = {
+ 	offsetof(struct tcp_congestion_ops, init),
+ 	offsetof(struct tcp_congestion_ops, release),
+@@ -163,6 +166,19 @@ static const struct bpf_func_proto bpf_t
+ 	.arg2_type	= ARG_ANYTHING,
+ };
+ 
++static u32 prog_ops_moff(const struct bpf_prog *prog)
++{
++	const struct btf_member *m;
++	const struct btf_type *t;
++	u32 midx;
++
++	midx = prog->expected_attach_type;
++	t = bpf_tcp_congestion_ops.type;
++	m = &btf_type_member(t)[midx];
++
++	return btf_member_bit_offset(t, m) / 8;
++}
++
+ static const struct bpf_func_proto *
+ bpf_tcp_ca_get_func_proto(enum bpf_func_id func_id,
+ 			  const struct bpf_prog *prog)
+@@ -174,6 +190,28 @@ bpf_tcp_ca_get_func_proto(enum bpf_func_
+ 		return &bpf_sk_storage_get_proto;
+ 	case BPF_FUNC_sk_storage_delete:
+ 		return &bpf_sk_storage_delete_proto;
++	case BPF_FUNC_setsockopt:
++		/* Does not allow release() to call setsockopt.
++		 * release() is called when the current bpf-tcp-cc
++		 * is retiring.  It is not allowed to call
++		 * setsockopt() to make further changes which
++		 * may potentially allocate new resources.
++		 */
++		if (prog_ops_moff(prog) !=
++		    offsetof(struct tcp_congestion_ops, release))
++			return &bpf_sk_setsockopt_proto;
++		return NULL;
++	case BPF_FUNC_getsockopt:
++		/* Since get/setsockopt is usually expected to
++		 * be available together, disable getsockopt for
++		 * release also to avoid usage surprise.
++		 * The bpf-tcp-cc already has a more powerful way
++		 * to read tcp_sock from the PTR_TO_BTF_ID.
++		 */
++		if (prog_ops_moff(prog) !=
++		    offsetof(struct tcp_congestion_ops, release))
++			return &bpf_sk_getsockopt_proto;
++		return NULL;
+ 	default:
+ 		return bpf_base_func_proto(func_id);
+ 	}
+@@ -286,9 +324,6 @@ static void bpf_tcp_ca_unreg(void *kdata
+ 	tcp_unregister_congestion_control(kdata);
+ }
+ 
+-/* Avoid sparse warning.  It is only used in bpf_struct_ops.c. */
+-extern struct bpf_struct_ops bpf_tcp_congestion_ops;
+-
+ struct bpf_struct_ops bpf_tcp_congestion_ops = {
+ 	.verifier_ops = &bpf_tcp_ca_verifier_ops,
+ 	.reg = bpf_tcp_ca_reg,
