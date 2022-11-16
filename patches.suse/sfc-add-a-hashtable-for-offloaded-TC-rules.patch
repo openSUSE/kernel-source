@@ -1,0 +1,243 @@
+From: Edward Cree <ecree.xilinx@gmail.com>
+Date: Mon, 26 Sep 2022 19:57:34 +0100
+Subject: sfc: add a hashtable for offloaded TC rules
+Patch-mainline: v6.1-rc1
+Git-commit: f54a28a211664017531aebc997bf3c6a279e0d6f
+References: jsc#PED-1565
+
+Nothing inserts into this table yet, but we have code to remove rules
+ on FLOW_CLS_DESTROY or at driver teardown time, in both cases also
+ attempting to remove the corresponding hardware rules.
+
+Signed-off-by: Edward Cree <ecree.xilinx@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/sfc/ef100_rep.c |    2 
+ drivers/net/ethernet/sfc/ef100_rep.h |    1 
+ drivers/net/ethernet/sfc/tc.c        |  115 ++++++++++++++++++++++++++++++++++-
+ drivers/net/ethernet/sfc/tc.h        |    7 ++
+ 4 files changed, 123 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/sfc/ef100_rep.c
++++ b/drivers/net/ethernet/sfc/ef100_rep.c
+@@ -135,7 +135,7 @@ static void efx_ef100_rep_get_stats64(st
+ 	stats->tx_errors = atomic64_read(&efv->stats.tx_errors);
+ }
+ 
+-static const struct net_device_ops efx_ef100_rep_netdev_ops = {
++const struct net_device_ops efx_ef100_rep_netdev_ops = {
+ 	.ndo_open		= efx_ef100_rep_open,
+ 	.ndo_stop		= efx_ef100_rep_close,
+ 	.ndo_start_xmit		= efx_ef100_rep_xmit,
+--- a/drivers/net/ethernet/sfc/ef100_rep.h
++++ b/drivers/net/ethernet/sfc/ef100_rep.h
+@@ -66,4 +66,5 @@ void efx_ef100_rep_rx_packet(struct efx_
+  * Caller must hold rcu_read_lock().
+  */
+ struct efx_rep *efx_ef100_find_rep_by_mport(struct efx_nic *efx, u16 mport);
++extern const struct net_device_ops efx_ef100_rep_netdev_ops;
+ #endif /* EF100_REP_H */
+--- a/drivers/net/ethernet/sfc/tc.c
++++ b/drivers/net/ethernet/sfc/tc.c
+@@ -15,6 +15,39 @@
+ #include "ef100_rep.h"
+ #include "efx.h"
+ 
++#define EFX_EFV_PF	NULL
++/* Look up the representor information (efv) for a device.
++ * May return NULL for the PF (us), or an error pointer for a device that
++ * isn't supported as a TC offload endpoint
++ */
++static struct efx_rep *efx_tc_flower_lookup_efv(struct efx_nic *efx,
++						struct net_device *dev)
++{
++	struct efx_rep *efv;
++
++	if (!dev)
++		return ERR_PTR(-EOPNOTSUPP);
++	/* Is it us (the PF)? */
++	if (dev == efx->net_dev)
++		return EFX_EFV_PF;
++	/* Is it an efx vfrep at all? */
++	if (dev->netdev_ops != &efx_ef100_rep_netdev_ops)
++		return ERR_PTR(-EOPNOTSUPP);
++	/* Is it ours?  We don't support TC rules that include another
++	 * EF100's netdevices (not even on another port of the same NIC).
++	 */
++	efv = netdev_priv(dev);
++	if (efv->parent != efx)
++		return ERR_PTR(-EOPNOTSUPP);
++	return efv;
++}
++
++static const struct rhashtable_params efx_tc_match_action_ht_params = {
++	.key_len	= sizeof(unsigned long),
++	.key_offset	= offsetof(struct efx_tc_flow_rule, cookie),
++	.head_offset	= offsetof(struct efx_tc_flow_rule, linkage),
++};
++
+ static void efx_tc_free_action_set(struct efx_nic *efx,
+ 				   struct efx_tc_action_set *act, bool in_hw)
+ {
+@@ -59,10 +92,74 @@ static void efx_tc_delete_rule(struct ef
+ 	rule->fw_id = MC_CMD_MAE_ACTION_RULE_INSERT_OUT_ACTION_RULE_ID_NULL;
+ }
+ 
++static void efx_tc_flow_free(void *ptr, void *arg)
++{
++	struct efx_tc_flow_rule *rule = ptr;
++	struct efx_nic *efx = arg;
++
++	netif_err(efx, drv, efx->net_dev,
++		  "tc rule %lx still present at teardown, removing\n",
++		  rule->cookie);
++
++	efx_mae_delete_rule(efx, rule->fw_id);
++
++	/* Release entries in subsidiary tables */
++	efx_tc_free_action_set_list(efx, &rule->acts, true);
++
++	kfree(rule);
++}
++
++static int efx_tc_flower_destroy(struct efx_nic *efx,
++				 struct net_device *net_dev,
++				 struct flow_cls_offload *tc)
++{
++	struct netlink_ext_ack *extack = tc->common.extack;
++	struct efx_tc_flow_rule *rule;
++
++	rule = rhashtable_lookup_fast(&efx->tc->match_action_ht, &tc->cookie,
++				      efx_tc_match_action_ht_params);
++	if (!rule) {
++		/* Only log a message if we're the ingress device.  Otherwise
++		 * it's a foreign filter and we might just not have been
++		 * interested (e.g. we might not have been the egress device
++		 * either).
++		 */
++		if (!IS_ERR(efx_tc_flower_lookup_efv(efx, net_dev)))
++			netif_warn(efx, drv, efx->net_dev,
++				   "Filter %lx not found to remove\n", tc->cookie);
++		NL_SET_ERR_MSG_MOD(extack, "Flow cookie not found in offloaded rules");
++		return -ENOENT;
++	}
++
++	/* Remove it from HW */
++	efx_tc_delete_rule(efx, rule);
++	/* Delete it from SW */
++	rhashtable_remove_fast(&efx->tc->match_action_ht, &rule->linkage,
++			       efx_tc_match_action_ht_params);
++	netif_dbg(efx, drv, efx->net_dev, "Removed filter %lx\n", rule->cookie);
++	kfree(rule);
++	return 0;
++}
++
+ int efx_tc_flower(struct efx_nic *efx, struct net_device *net_dev,
+ 		  struct flow_cls_offload *tc, struct efx_rep *efv)
+ {
+-	return -EOPNOTSUPP;
++	int rc;
++
++	if (!efx->tc)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&efx->tc->mutex);
++	switch (tc->command) {
++	case FLOW_CLS_DESTROY:
++		rc = efx_tc_flower_destroy(efx, net_dev, tc);
++		break;
++	default:
++		rc = -EOPNOTSUPP;
++		break;
++	}
++	mutex_unlock(&efx->tc->mutex);
++	return rc;
+ }
+ 
+ static int efx_tc_configure_default_rule(struct efx_nic *efx, u32 ing_port,
+@@ -239,6 +336,8 @@ void efx_fini_tc(struct efx_nic *efx)
+ 
+ int efx_init_struct_tc(struct efx_nic *efx)
+ {
++	int rc;
++
+ 	if (efx->type->is_vf)
+ 		return 0;
+ 
+@@ -247,6 +346,10 @@ int efx_init_struct_tc(struct efx_nic *e
+ 		return -ENOMEM;
+ 	INIT_LIST_HEAD(&efx->tc->block_list);
+ 
++	mutex_init(&efx->tc->mutex);
++	rc = rhashtable_init(&efx->tc->match_action_ht, &efx_tc_match_action_ht_params);
++	if (rc < 0)
++		goto fail_match_action_ht;
+ 	efx->tc->reps_filter_uc = -1;
+ 	efx->tc->reps_filter_mc = -1;
+ 	INIT_LIST_HEAD(&efx->tc->dflt.pf.acts.list);
+@@ -254,6 +357,11 @@ int efx_init_struct_tc(struct efx_nic *e
+ 	INIT_LIST_HEAD(&efx->tc->dflt.wire.acts.list);
+ 	efx->tc->dflt.wire.fw_id = MC_CMD_MAE_ACTION_RULE_INSERT_OUT_ACTION_RULE_ID_NULL;
+ 	return 0;
++fail_match_action_ht:
++	mutex_destroy(&efx->tc->mutex);
++	kfree(efx->tc);
++	efx->tc = NULL;
++	return rc;
+ }
+ 
+ void efx_fini_struct_tc(struct efx_nic *efx)
+@@ -261,10 +369,15 @@ void efx_fini_struct_tc(struct efx_nic *
+ 	if (!efx->tc)
+ 		return;
+ 
++	mutex_lock(&efx->tc->mutex);
+ 	EFX_WARN_ON_PARANOID(efx->tc->dflt.pf.fw_id !=
+ 			     MC_CMD_MAE_ACTION_RULE_INSERT_OUT_ACTION_RULE_ID_NULL);
+ 	EFX_WARN_ON_PARANOID(efx->tc->dflt.wire.fw_id !=
+ 			     MC_CMD_MAE_ACTION_RULE_INSERT_OUT_ACTION_RULE_ID_NULL);
++	rhashtable_free_and_destroy(&efx->tc->match_action_ht, efx_tc_flow_free,
++				    efx);
++	mutex_unlock(&efx->tc->mutex);
++	mutex_destroy(&efx->tc->mutex);
+ 	kfree(efx->tc);
+ 	efx->tc = NULL;
+ }
+--- a/drivers/net/ethernet/sfc/tc.h
++++ b/drivers/net/ethernet/sfc/tc.h
+@@ -12,6 +12,7 @@
+ #ifndef EFX_TC_H
+ #define EFX_TC_H
+ #include <net/flow_offload.h>
++#include <linux/rhashtable.h>
+ #include "net_driver.h"
+ 
+ /* Error reporting: convenience macros.  For indicating why a given filter
+@@ -55,6 +56,8 @@ struct efx_tc_action_set_list {
+ };
+ 
+ struct efx_tc_flow_rule {
++	unsigned long cookie;
++	struct rhash_head linkage;
+ 	struct efx_tc_match match;
+ 	struct efx_tc_action_set_list acts;
+ 	u32 fw_id;
+@@ -69,6 +72,8 @@ enum efx_tc_rule_prios {
+  * struct efx_tc_state - control plane data for TC offload
+  *
+  * @block_list: List of &struct efx_tc_block_binding
++ * @mutex: Used to serialise operations on TC hashtables
++ * @match_action_ht: Hashtable of TC match-action rules
+  * @reps_mport_id: MAE port allocated for representor RX
+  * @reps_filter_uc: VNIC filter for representor unicast RX (promisc)
+  * @reps_filter_mc: VNIC filter for representor multicast RX (allmulti)
+@@ -81,6 +86,8 @@ enum efx_tc_rule_prios {
+  */
+ struct efx_tc_state {
+ 	struct list_head block_list;
++	struct mutex mutex;
++	struct rhashtable match_action_ht;
+ 	u32 reps_mport_id, reps_mport_vport_id;
+ 	s32 reps_filter_uc, reps_filter_mc;
+ 	struct {

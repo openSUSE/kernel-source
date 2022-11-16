@@ -1,0 +1,163 @@
+From: Cong Wang <cong.wang@bytedance.com>
+Date: Sun, 4 Jul 2021 12:02:48 -0700
+Subject: af_unix: Implement unix_dgram_bpf_recvmsg()
+Patch-mainline: v5.15-rc1
+Git-commit: 9825d866ce0d11009513e06824885340062c166b
+References: jsc#PED-1368
+
+We have to implement unix_dgram_bpf_recvmsg() to replace the
+original ->recvmsg() to retrieve skmsg from ingress_msg.
+
+AF_UNIX is again special here because the lack of
+sk_prot->recvmsg(). I simply add a special case inside
+unix_dgram_recvmsg() to call sk->sk_prot->recvmsg() directly.
+
+Signed-off-by: Cong Wang <cong.wang@bytedance.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210704190252.11866-8-xiyou.wangcong@gmail.com
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/net/af_unix.h |    2 +
+ net/unix/af_unix.c    |   19 ++++++++++--
+ net/unix/unix_bpf.c   |   75 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 93 insertions(+), 3 deletions(-)
+
+--- a/include/net/af_unix.h
++++ b/include/net/af_unix.h
+@@ -82,6 +82,8 @@ static inline struct unix_sock *unix_sk(
+ long unix_inq_len(struct sock *sk);
+ long unix_outq_len(struct sock *sk);
+ 
++int __unix_dgram_recvmsg(struct sock *sk, struct msghdr *msg, size_t size,
++			 int flags);
+ #ifdef CONFIG_SYSCTL
+ int unix_sysctl_register(struct net *net);
+ void unix_sysctl_unregister(struct net *net);
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -2145,11 +2145,11 @@ static void unix_copy_addr(struct msghdr
+ 	}
+ }
+ 
+-static int unix_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
+-			      size_t size, int flags)
++int __unix_dgram_recvmsg(struct sock *sk, struct msghdr *msg, size_t size,
++			 int flags)
+ {
+ 	struct scm_cookie scm;
+-	struct sock *sk = sock->sk;
++	struct socket *sock = sk->sk_socket;
+ 	struct unix_sock *u = unix_sk(sk);
+ 	struct sk_buff *skb, *last;
+ 	long timeo;
+@@ -2252,6 +2252,19 @@ out:
+ 	return err;
+ }
+ 
++static int unix_dgram_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
++			      int flags)
++{
++	struct sock *sk = sock->sk;
++
++#ifdef CONFIG_BPF_SYSCALL
++	if (sk->sk_prot != &unix_proto)
++		return sk->sk_prot->recvmsg(sk, msg, size, flags & MSG_DONTWAIT,
++					    flags & ~MSG_DONTWAIT, NULL);
++#endif
++	return __unix_dgram_recvmsg(sk, msg, size, flags);
++}
++
+ static int unix_read_sock(struct sock *sk, read_descriptor_t *desc,
+ 			  sk_read_actor_t recv_actor)
+ {
+--- a/net/unix/unix_bpf.c
++++ b/net/unix/unix_bpf.c
+@@ -6,6 +6,80 @@
+ #include <net/sock.h>
+ #include <net/af_unix.h>
+ 
++#define unix_sk_has_data(__sk, __psock)					\
++		({	!skb_queue_empty(&__sk->sk_receive_queue) ||	\
++			!skb_queue_empty(&__psock->ingress_skb) ||	\
++			!list_empty(&__psock->ingress_msg);		\
++		})
++
++static int unix_msg_wait_data(struct sock *sk, struct sk_psock *psock,
++			      long timeo)
++{
++	DEFINE_WAIT_FUNC(wait, woken_wake_function);
++	struct unix_sock *u = unix_sk(sk);
++	int ret = 0;
++
++	if (sk->sk_shutdown & RCV_SHUTDOWN)
++		return 1;
++
++	if (!timeo)
++		return ret;
++
++	add_wait_queue(sk_sleep(sk), &wait);
++	sk_set_bit(SOCKWQ_ASYNC_WAITDATA, sk);
++	if (!unix_sk_has_data(sk, psock)) {
++		mutex_unlock(&u->iolock);
++		wait_woken(&wait, TASK_INTERRUPTIBLE, timeo);
++		mutex_lock(&u->iolock);
++		ret = unix_sk_has_data(sk, psock);
++	}
++	sk_clear_bit(SOCKWQ_ASYNC_WAITDATA, sk);
++	remove_wait_queue(sk_sleep(sk), &wait);
++	return ret;
++}
++
++static int unix_dgram_bpf_recvmsg(struct sock *sk, struct msghdr *msg,
++				  size_t len, int nonblock, int flags,
++				  int *addr_len)
++{
++	struct unix_sock *u = unix_sk(sk);
++	struct sk_psock *psock;
++	int copied, ret;
++
++	psock = sk_psock_get(sk);
++	if (unlikely(!psock))
++		return __unix_dgram_recvmsg(sk, msg, len, flags);
++
++	mutex_lock(&u->iolock);
++	if (!skb_queue_empty(&sk->sk_receive_queue) &&
++	    sk_psock_queue_empty(psock)) {
++		ret = __unix_dgram_recvmsg(sk, msg, len, flags);
++		goto out;
++	}
++
++msg_bytes_ready:
++	copied = sk_msg_recvmsg(sk, psock, msg, len, flags);
++	if (!copied) {
++		long timeo;
++		int data;
++
++		timeo = sock_rcvtimeo(sk, nonblock);
++		data = unix_msg_wait_data(sk, psock, timeo);
++		if (data) {
++			if (!sk_psock_queue_empty(psock))
++				goto msg_bytes_ready;
++			ret = __unix_dgram_recvmsg(sk, msg, len, flags);
++			goto out;
++		}
++		copied = -EAGAIN;
++	}
++	ret = copied;
++out:
++	mutex_unlock(&u->iolock);
++	sk_psock_put(sk, psock);
++	return ret;
++}
++
+ static struct proto *unix_prot_saved __read_mostly;
+ static DEFINE_SPINLOCK(unix_prot_lock);
+ static struct proto unix_bpf_prot;
+@@ -14,6 +88,7 @@ static void unix_bpf_rebuild_protos(stru
+ {
+ 	*prot        = *base;
+ 	prot->close  = sock_map_close;
++	prot->recvmsg = unix_dgram_bpf_recvmsg;
+ }
+ 
+ static void unix_bpf_check_needs_rebuild(struct proto *ops)
