@@ -1,0 +1,177 @@
+From: Jens Axboe <axboe@kernel.dk>
+Date: Sat, 9 Oct 2021 13:10:39 -0600
+Subject: [PATCH] block: improve batched tag allocation
+Git-commit: 349302da83529539040d2516de1deec1e09f491c
+Patch-mainline: v5.16-rc1
+References: jsc#PED-1183
+
+Add a blk_mq_get_tags() helper, which uses the new sbitmap API for
+allocating a batch of tags all at once. This both simplifies the block
+code for batched allocation, and it is also more efficient than just
+doing repeated calls into __sbitmap_queue_get().
+
+This reduces the sbitmap overhead in peak runs from ~3% to ~1% and
+yields a performanc increase from 6.6M IOPS to 6.8M IOPS for a single
+CPU core.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq-tag.c | 15 ++++++++
+ block/blk-mq-tag.h |  2 ++
+ block/blk-mq.c     | 87 +++++++++++++++++++++++++++++-----------------
+ 3 files changed, 73 insertions(+), 31 deletions(-)
+
+diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
+index 72a2724a4eee..c43b97201161 100644
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@ -86,6 +86,21 @@ static int __blk_mq_get_tag(struct blk_mq_alloc_data *data,
+ 		return __sbitmap_queue_get(bt);
+ }
+ 
++unsigned long blk_mq_get_tags(struct blk_mq_alloc_data *data, int nr_tags,
++			      unsigned int *offset)
++{
++	struct blk_mq_tags *tags = blk_mq_tags_from_data(data);
++	struct sbitmap_queue *bt = &tags->bitmap_tags;
++	unsigned long ret;
++
++	if (data->shallow_depth ||data->flags & BLK_MQ_REQ_RESERVED ||
++	    data->hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED)
++		return 0;
++	ret = __sbitmap_queue_get_batch(bt, nr_tags, offset);
++	*offset += tags->nr_reserved_tags;
++	return ret;
++}
++
+ unsigned int blk_mq_get_tag(struct blk_mq_alloc_data *data)
+ {
+ 	struct blk_mq_tags *tags = blk_mq_tags_from_data(data);
+diff --git a/block/blk-mq-tag.h b/block/blk-mq-tag.h
+index d8ce89fa1686..71c2f7d8e9b7 100644
+--- a/block/blk-mq-tag.h
++++ b/block/blk-mq-tag.h
+@@ -38,6 +38,8 @@ extern int blk_mq_init_bitmaps(struct sbitmap_queue *bitmap_tags,
+ 			       int node, int alloc_policy);
+ 
+ extern unsigned int blk_mq_get_tag(struct blk_mq_alloc_data *data);
++unsigned long blk_mq_get_tags(struct blk_mq_alloc_data *data, int nr_tags,
++			      unsigned int *offset);
+ extern void blk_mq_put_tag(struct blk_mq_tags *tags, struct blk_mq_ctx *ctx,
+ 			   unsigned int tag);
+ extern int blk_mq_tag_update_depth(struct blk_mq_hw_ctx *hctx,
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 568773de9a7f..97b911866de1 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -354,6 +354,38 @@ static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
+ 	return rq;
+ }
+ 
++static inline struct request *
++__blk_mq_alloc_requests_batch(struct blk_mq_alloc_data *data,
++		u64 alloc_time_ns)
++{
++	unsigned int tag, tag_offset;
++	struct request *rq;
++	unsigned long tags;
++	int i, nr = 0;
++
++	tags = blk_mq_get_tags(data, data->nr_tags, &tag_offset);
++	if (unlikely(!tags))
++		return NULL;
++
++	for (i = 0; tags; i++) {
++		if (!(tags & (1UL << i)))
++			continue;
++		tag = tag_offset + i;
++		tags &= ~(1UL << i);
++		rq = blk_mq_rq_ctx_init(data, tag, alloc_time_ns);
++		rq->rq_next = *data->cached_rq;
++		*data->cached_rq = rq;
++	}
++	data->nr_tags -= nr;
++
++	if (!data->cached_rq)
++		return NULL;
++
++	rq = *data->cached_rq;
++	*data->cached_rq = rq->rq_next;
++	return rq;
++}
++
+ static struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)
+ {
+ 	struct request_queue *q = data->q;
+@@ -388,43 +420,36 @@ static struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)
+ 	if (!e)
+ 		blk_mq_tag_busy(data->hctx);
+ 
++	/*
++	 * Try batched alloc if we want more than 1 tag.
++	 */
++	if (data->nr_tags > 1) {
++		rq = __blk_mq_alloc_requests_batch(data, alloc_time_ns);
++		if (rq)
++			return rq;
++		data->nr_tags = 1;
++	}
++
+ 	/*
+ 	 * Waiting allocations only fail because of an inactive hctx.  In that
+ 	 * case just retry the hctx assignment and tag allocation as CPU hotplug
+ 	 * should have migrated us to an online CPU by now.
+ 	 */
+-	do {
+-		tag = blk_mq_get_tag(data);
+-		if (tag == BLK_MQ_NO_TAG) {
+-			if (data->flags & BLK_MQ_REQ_NOWAIT)
+-				break;
+-			/*
+-			 * Give up the CPU and sleep for a random short time to
+-			 * ensure that thread using a realtime scheduling class
+-			 * are migrated off the CPU, and thus off the hctx that
+-			 * is going away.
+-			 */
+-			msleep(3);
+-			goto retry;
+-		}
+-
+-		rq = blk_mq_rq_ctx_init(data, tag, alloc_time_ns);
+-		if (!--data->nr_tags || e ||
+-		    (data->hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED))
+-			return rq;
+-
+-		/* link into the cached list */
+-		rq->rq_next = *data->cached_rq;
+-		*data->cached_rq = rq;
+-		data->flags |= BLK_MQ_REQ_NOWAIT;
+-	} while (1);
+-
+-	if (!data->cached_rq)
+-		return NULL;
++	tag = blk_mq_get_tag(data);
++	if (tag == BLK_MQ_NO_TAG) {
++		if (data->flags & BLK_MQ_REQ_NOWAIT)
++			return NULL;
++		/*
++		 * Give up the CPU and sleep for a random short time to
++		 * ensure that thread using a realtime scheduling class
++		 * are migrated off the CPU, and thus off the hctx that
++		 * is going away.
++		 */
++		msleep(3);
++		goto retry;
++	}
+ 
+-	rq = *data->cached_rq;
+-	*data->cached_rq = rq->rq_next;
+-	return rq;
++	return blk_mq_rq_ctx_init(data, tag, alloc_time_ns);
+ }
+ 
+ struct request *blk_mq_alloc_request(struct request_queue *q, unsigned int op,
+-- 
+2.35.3
+
