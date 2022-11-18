@@ -1,0 +1,498 @@
+From: Joanne Koong <joannekoong@fb.com>
+Date: Wed, 27 Oct 2021 16:45:00 -0700
+Subject: bpf: Add bloom filter map implementation
+Patch-mainline: v5.16-rc1
+Git-commit: 9330986c03006ab1d33d243b7cfe598a7a3c1baa
+References: jsc#PED-1368
+
+This patch adds the kernel-side changes for the implementation of
+a bpf bloom filter map.
+
+The bloom filter map supports peek (determining whether an element
+is present in the map) and push (adding an element to the map)
+operations.These operations are exposed to userspace applications
+through the already existing syscalls in the following way:
+
+BPF_MAP_LOOKUP_ELEM -> peek
+BPF_MAP_UPDATE_ELEM -> push
+
+The bloom filter map does not have keys, only values. In light of
+this, the bloom filter map's API matches that of queue stack maps:
+user applications use BPF_MAP_LOOKUP_ELEM/BPF_MAP_UPDATE_ELEM
+which correspond internally to bpf_map_peek_elem/bpf_map_push_elem,
+and bpf programs must use the bpf_map_peek_elem and bpf_map_push_elem
+APIs to query or add an element to the bloom filter map. When the
+bloom filter map is created, it must be created with a key_size of 0.
+
+For updates, the user will pass in the element to add to the map
+as the value, with a NULL key. For lookups, the user will pass in the
+element to query in the map as the value, with a NULL key. In the
+verifier layer, this requires us to modify the argument type of
+a bloom filter's BPF_FUNC_map_peek_elem call to ARG_PTR_TO_MAP_VALUE;
+as well, in the syscall layer, we need to copy over the user value
+so that in bpf_map_peek_elem, we know which specific value to query.
+
+A few things to please take note of:
+ * If there are any concurrent lookups + updates, the user is
+responsible for synchronizing this to ensure no false negative lookups
+occur.
+ * The number of hashes to use for the bloom filter is configurable from
+userspace. If no number is specified, the default used will be 5 hash
+functions. The benchmarks later in this patchset can help compare the
+performance of using different number of hashes on different entry
+sizes. In general, using more hashes decreases both the false positive
+rate and the speed of a lookup.
+ * Deleting an element in the bloom filter map is not supported.
+ * The bloom filter map may be used as an inner map.
+ * The "max_entries" size that is specified at map creation time is used
+to approximate a reasonable bitmap size for the bloom filter, and is not
+otherwise strictly enforced. If the user wishes to insert more entries
+into the bloom filter than "max_entries", they may do so but they should
+be aware that this may lead to a higher false positive rate.
+
+Signed-off-by: Joanne Koong <joannekoong@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20211027234504.30744-2-joannekoong@fb.com
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/linux/bpf.h            |    1 
+ include/linux/bpf_types.h      |    1 
+ include/uapi/linux/bpf.h       |    9 +
+ kernel/bpf/Makefile            |    2 
+ kernel/bpf/bloom_filter.c      |  195 +++++++++++++++++++++++++++++++++++++++++
+ kernel/bpf/syscall.c           |   24 ++++-
+ kernel/bpf/verifier.c          |   19 +++
+ tools/include/uapi/linux/bpf.h |    9 +
+ 8 files changed, 253 insertions(+), 7 deletions(-)
+ create mode 100644 kernel/bpf/bloom_filter.c
+
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -169,6 +169,7 @@ struct bpf_map {
+ 	u32 value_size;
+ 	u32 max_entries;
+ 	u32 map_flags;
++	u64 map_extra; /* any per-map-type extra fields */
+ 	int spin_lock_off; /* >=0 valid offset, <0 error */
+ 	int timer_off; /* >=0 valid offset, <0 error */
+ 	u32 id;
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@ -125,6 +125,7 @@ BPF_MAP_TYPE(BPF_MAP_TYPE_STACK, stack_m
+ BPF_MAP_TYPE(BPF_MAP_TYPE_STRUCT_OPS, bpf_struct_ops_map_ops)
+ #endif
+ BPF_MAP_TYPE(BPF_MAP_TYPE_RINGBUF, ringbuf_map_ops)
++BPF_MAP_TYPE(BPF_MAP_TYPE_BLOOM_FILTER, bloom_filter_map_ops)
+ 
+ BPF_LINK_TYPE(BPF_LINK_TYPE_RAW_TRACEPOINT, raw_tracepoint)
+ BPF_LINK_TYPE(BPF_LINK_TYPE_TRACING, tracing)
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -906,6 +906,7 @@ enum bpf_map_type {
+ 	BPF_MAP_TYPE_RINGBUF,
+ 	BPF_MAP_TYPE_INODE_STORAGE,
+ 	BPF_MAP_TYPE_TASK_STORAGE,
++	BPF_MAP_TYPE_BLOOM_FILTER,
+ };
+ 
+ /* Note that tracing related programs such as
+@@ -1274,6 +1275,13 @@ union bpf_attr {
+ 						   * struct stored as the
+ 						   * map value
+ 						   */
++		/* Any per-map-type extra fields
++		 *
++		 * BPF_MAP_TYPE_BLOOM_FILTER - the lowest 4 bits indicate the
++		 * number of hash functions (if 0, the bloom filter will default
++		 * to using 5 hash functions).
++		 */
++		__u64	map_extra;
+ 	};
+ 
+ 	struct { /* anonymous struct used by BPF_MAP_*_ELEM commands */
+@@ -5638,6 +5646,7 @@ struct bpf_map_info {
+ 	__u32 btf_id;
+ 	__u32 btf_key_type_id;
+ 	__u32 btf_value_type_id;
++	__u64 map_extra;
+ } __attribute__((aligned(8)));
+ 
+ struct bpf_btf_info {
+--- a/kernel/bpf/Makefile
++++ b/kernel/bpf/Makefile
+@@ -7,7 +7,7 @@ endif
+ CFLAGS_core.o += $(call cc-disable-warning, override-init) $(cflags-nogcse-yy)
+ 
+ obj-$(CONFIG_BPF_SYSCALL) += syscall.o verifier.o inode.o helpers.o tnum.o bpf_iter.o map_iter.o task_iter.o prog_iter.o
+-obj-$(CONFIG_BPF_SYSCALL) += hashtab.o arraymap.o percpu_freelist.o bpf_lru_list.o lpm_trie.o map_in_map.o
++obj-$(CONFIG_BPF_SYSCALL) += hashtab.o arraymap.o percpu_freelist.o bpf_lru_list.o lpm_trie.o map_in_map.o bloom_filter.o
+ obj-$(CONFIG_BPF_SYSCALL) += local_storage.o queue_stack_maps.o ringbuf.o
+ obj-$(CONFIG_BPF_SYSCALL) += bpf_local_storage.o bpf_task_storage.o
+ obj-${CONFIG_BPF_LSM}	  += bpf_inode_storage.o
+--- /dev/null
++++ b/kernel/bpf/bloom_filter.c
+@@ -0,0 +1,195 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2021 Facebook */
++
++#include <linux/bitmap.h>
++#include <linux/bpf.h>
++#include <linux/btf.h>
++#include <linux/err.h>
++#include <linux/jhash.h>
++#include <linux/random.h>
++
++#define BLOOM_CREATE_FLAG_MASK \
++	(BPF_F_NUMA_NODE | BPF_F_ZERO_SEED | BPF_F_ACCESS_MASK)
++
++struct bpf_bloom_filter {
++	struct bpf_map map;
++	u32 bitset_mask;
++	u32 hash_seed;
++	/* If the size of the values in the bloom filter is u32 aligned,
++	 * then it is more performant to use jhash2 as the underlying hash
++	 * function, else we use jhash. This tracks the number of u32s
++	 * in an u32-aligned value size. If the value size is not u32 aligned,
++	 * this will be 0.
++	 */
++	u32 aligned_u32_count;
++	u32 nr_hash_funcs;
++	unsigned long bitset[];
++};
++
++static u32 hash(struct bpf_bloom_filter *bloom, void *value,
++		u32 value_size, u32 index)
++{
++	u32 h;
++
++	if (bloom->aligned_u32_count)
++		h = jhash2(value, bloom->aligned_u32_count,
++			   bloom->hash_seed + index);
++	else
++		h = jhash(value, value_size, bloom->hash_seed + index);
++
++	return h & bloom->bitset_mask;
++}
++
++static int peek_elem(struct bpf_map *map, void *value)
++{
++	struct bpf_bloom_filter *bloom =
++		container_of(map, struct bpf_bloom_filter, map);
++	u32 i, h;
++
++	for (i = 0; i < bloom->nr_hash_funcs; i++) {
++		h = hash(bloom, value, map->value_size, i);
++		if (!test_bit(h, bloom->bitset))
++			return -ENOENT;
++	}
++
++	return 0;
++}
++
++static int push_elem(struct bpf_map *map, void *value, u64 flags)
++{
++	struct bpf_bloom_filter *bloom =
++		container_of(map, struct bpf_bloom_filter, map);
++	u32 i, h;
++
++	if (flags != BPF_ANY)
++		return -EINVAL;
++
++	for (i = 0; i < bloom->nr_hash_funcs; i++) {
++		h = hash(bloom, value, map->value_size, i);
++		set_bit(h, bloom->bitset);
++	}
++
++	return 0;
++}
++
++static int pop_elem(struct bpf_map *map, void *value)
++{
++	return -EOPNOTSUPP;
++}
++
++static struct bpf_map *map_alloc(union bpf_attr *attr)
++{
++	u32 bitset_bytes, bitset_mask, nr_hash_funcs, nr_bits;
++	int numa_node = bpf_map_attr_numa_node(attr);
++	struct bpf_bloom_filter *bloom;
++
++	if (!bpf_capable())
++		return ERR_PTR(-EPERM);
++
++	if (attr->key_size != 0 || attr->value_size == 0 ||
++	    attr->max_entries == 0 ||
++	    attr->map_flags & ~BLOOM_CREATE_FLAG_MASK ||
++	    !bpf_map_flags_access_ok(attr->map_flags) ||
++	    (attr->map_extra & ~0xF))
++		return ERR_PTR(-EINVAL);
++
++	/* The lower 4 bits of map_extra specify the number of hash functions */
++	nr_hash_funcs = attr->map_extra & 0xF;
++	if (nr_hash_funcs == 0)
++		/* Default to using 5 hash functions if unspecified */
++		nr_hash_funcs = 5;
++
++	/* For the bloom filter, the optimal bit array size that minimizes the
++	 * false positive probability is n * k / ln(2) where n is the number of
++	 * expected entries in the bloom filter and k is the number of hash
++	 * functions. We use 7 / 5 to approximate 1 / ln(2).
++	 *
++	 * We round this up to the nearest power of two to enable more efficient
++	 * hashing using bitmasks. The bitmask will be the bit array size - 1.
++	 *
++	 * If this overflows a u32, the bit array size will have 2^32 (4
++	 * GB) bits.
++	 */
++	if (check_mul_overflow(attr->max_entries, nr_hash_funcs, &nr_bits) ||
++	    check_mul_overflow(nr_bits / 5, (u32)7, &nr_bits) ||
++	    nr_bits > (1UL << 31)) {
++		/* The bit array size is 2^32 bits but to avoid overflowing the
++		 * u32, we use U32_MAX, which will round up to the equivalent
++		 * number of bytes
++		 */
++		bitset_bytes = BITS_TO_BYTES(U32_MAX);
++		bitset_mask = U32_MAX;
++	} else {
++		if (nr_bits <= BITS_PER_LONG)
++			nr_bits = BITS_PER_LONG;
++		else
++			nr_bits = roundup_pow_of_two(nr_bits);
++		bitset_bytes = BITS_TO_BYTES(nr_bits);
++		bitset_mask = nr_bits - 1;
++	}
++
++	bitset_bytes = roundup(bitset_bytes, sizeof(unsigned long));
++	bloom = bpf_map_area_alloc(sizeof(*bloom) + bitset_bytes, numa_node);
++
++	if (!bloom)
++		return ERR_PTR(-ENOMEM);
++
++	bpf_map_init_from_attr(&bloom->map, attr);
++
++	bloom->nr_hash_funcs = nr_hash_funcs;
++	bloom->bitset_mask = bitset_mask;
++
++	/* Check whether the value size is u32-aligned */
++	if ((attr->value_size & (sizeof(u32) - 1)) == 0)
++		bloom->aligned_u32_count =
++			attr->value_size / sizeof(u32);
++
++	if (!(attr->map_flags & BPF_F_ZERO_SEED))
++		bloom->hash_seed = get_random_int();
++
++	return &bloom->map;
++}
++
++static void map_free(struct bpf_map *map)
++{
++	struct bpf_bloom_filter *bloom =
++		container_of(map, struct bpf_bloom_filter, map);
++
++	bpf_map_area_free(bloom);
++}
++
++static void *lookup_elem(struct bpf_map *map, void *key)
++{
++	/* The eBPF program should use map_peek_elem instead */
++	return ERR_PTR(-EINVAL);
++}
++
++static int update_elem(struct bpf_map *map, void *key,
++		       void *value, u64 flags)
++{
++	/* The eBPF program should use map_push_elem instead */
++	return -EINVAL;
++}
++
++static int check_btf(const struct bpf_map *map, const struct btf *btf,
++		     const struct btf_type *key_type,
++		     const struct btf_type *value_type)
++{
++	/* Bloom filter maps are keyless */
++	return btf_type_is_void(key_type) ? 0 : -EINVAL;
++}
++
++static int bpf_bloom_btf_id;
++const struct bpf_map_ops bloom_filter_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
++	.map_alloc = map_alloc,
++	.map_free = map_free,
++	.map_push_elem = push_elem,
++	.map_peek_elem = peek_elem,
++	.map_pop_elem = pop_elem,
++	.map_lookup_elem = lookup_elem,
++	.map_update_elem = update_elem,
++	.map_check_btf = check_btf,
++	.map_btf_name = "bpf_bloom_filter",
++	.map_btf_id = &bpf_bloom_btf_id,
++};
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -199,7 +199,8 @@ static int bpf_map_update_value(struct b
+ 		err = bpf_fd_reuseport_array_update_elem(map, key, value,
+ 							 flags);
+ 	} else if (map->map_type == BPF_MAP_TYPE_QUEUE ||
+-		   map->map_type == BPF_MAP_TYPE_STACK) {
++		   map->map_type == BPF_MAP_TYPE_STACK ||
++		   map->map_type == BPF_MAP_TYPE_BLOOM_FILTER) {
+ 		err = map->ops->map_push_elem(map, value, flags);
+ 	} else {
+ 		rcu_read_lock();
+@@ -238,7 +239,8 @@ static int bpf_map_copy_value(struct bpf
+ 	} else if (map->map_type == BPF_MAP_TYPE_REUSEPORT_SOCKARRAY) {
+ 		err = bpf_fd_reuseport_array_lookup_elem(map, key, value);
+ 	} else if (map->map_type == BPF_MAP_TYPE_QUEUE ||
+-		   map->map_type == BPF_MAP_TYPE_STACK) {
++		   map->map_type == BPF_MAP_TYPE_STACK ||
++		   map->map_type == BPF_MAP_TYPE_BLOOM_FILTER) {
+ 		err = map->ops->map_peek_elem(map, value);
+ 	} else if (map->map_type == BPF_MAP_TYPE_STRUCT_OPS) {
+ 		/* struct_ops map requires directly updating "value" */
+@@ -348,6 +350,7 @@ void bpf_map_init_from_attr(struct bpf_m
+ 	map->max_entries = attr->max_entries;
+ 	map->map_flags = bpf_map_flags_retain_permanent(attr->map_flags);
+ 	map->numa_node = bpf_map_attr_numa_node(attr);
++	map->map_extra = attr->map_extra;
+ }
+ 
+ static int bpf_map_alloc_id(struct bpf_map *map)
+@@ -555,6 +558,7 @@ static void bpf_map_show_fdinfo(struct s
+ 		   "value_size:\t%u\n"
+ 		   "max_entries:\t%u\n"
+ 		   "map_flags:\t%#x\n"
++		   "map_extra:\t%#llx\n"
+ 		   "memlock:\t%lu\n"
+ 		   "map_id:\t%u\n"
+ 		   "frozen:\t%u\n",
+@@ -563,6 +567,7 @@ static void bpf_map_show_fdinfo(struct s
+ 		   map->value_size,
+ 		   map->max_entries,
+ 		   map->map_flags,
++		   (unsigned long long)map->map_extra,
+ 		   bpf_map_memory_footprint(map),
+ 		   map->id,
+ 		   READ_ONCE(map->frozen));
+@@ -812,7 +817,7 @@ static int map_check_btf(struct bpf_map
+ 	return ret;
+ }
+ 
+-#define BPF_MAP_CREATE_LAST_FIELD btf_vmlinux_value_type_id
++#define BPF_MAP_CREATE_LAST_FIELD map_extra
+ /* called via syscall */
+ static int map_create(union bpf_attr *attr)
+ {
+@@ -833,6 +838,10 @@ static int map_create(union bpf_attr *at
+ 		return -EINVAL;
+ 	}
+ 
++	if (attr->map_type != BPF_MAP_TYPE_BLOOM_FILTER &&
++	    attr->map_extra != 0)
++		return -EINVAL;
++
+ 	f_flags = bpf_get_file_flag(attr->map_flags);
+ 	if (f_flags < 0)
+ 		return f_flags;
+@@ -1082,6 +1091,14 @@ static int map_lookup_elem(union bpf_att
+ 	if (!value)
+ 		goto free_key;
+ 
++	if (map->map_type == BPF_MAP_TYPE_BLOOM_FILTER) {
++		if (copy_from_user(value, uvalue, value_size))
++			err = -EFAULT;
++		else
++			err = bpf_map_copy_value(map, key, value, attr->flags);
++		goto free_value;
++	}
++
+ 	err = bpf_map_copy_value(map, key, value, attr->flags);
+ 	if (err)
+ 		goto free_value;
+@@ -3884,6 +3901,7 @@ static int bpf_map_get_info_by_fd(struct
+ 	info.value_size = map->value_size;
+ 	info.max_entries = map->max_entries;
+ 	info.map_flags = map->map_flags;
++	info.map_extra = map->map_extra;
+ 	memcpy(info.name, map->name, sizeof(map->name));
+ 
+ 	if (map->btf) {
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -5002,7 +5002,10 @@ static int resolve_map_arg_type(struct b
+ 			return -EINVAL;
+ 		}
+ 		break;
+-
++	case BPF_MAP_TYPE_BLOOM_FILTER:
++		if (meta->func_id == BPF_FUNC_map_peek_elem)
++			*arg_type = ARG_PTR_TO_MAP_VALUE;
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -5577,6 +5580,11 @@ static int check_map_func_compatibility(
+ 		    func_id != BPF_FUNC_task_storage_delete)
+ 			goto error;
+ 		break;
++	case BPF_MAP_TYPE_BLOOM_FILTER:
++		if (func_id != BPF_FUNC_map_peek_elem &&
++		    func_id != BPF_FUNC_map_push_elem)
++			goto error;
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -5644,13 +5652,18 @@ static int check_map_func_compatibility(
+ 		    map->map_type != BPF_MAP_TYPE_SOCKHASH)
+ 			goto error;
+ 		break;
+-	case BPF_FUNC_map_peek_elem:
+ 	case BPF_FUNC_map_pop_elem:
+-	case BPF_FUNC_map_push_elem:
+ 		if (map->map_type != BPF_MAP_TYPE_QUEUE &&
+ 		    map->map_type != BPF_MAP_TYPE_STACK)
+ 			goto error;
+ 		break;
++	case BPF_FUNC_map_peek_elem:
++	case BPF_FUNC_map_push_elem:
++		if (map->map_type != BPF_MAP_TYPE_QUEUE &&
++		    map->map_type != BPF_MAP_TYPE_STACK &&
++		    map->map_type != BPF_MAP_TYPE_BLOOM_FILTER)
++			goto error;
++		break;
+ 	case BPF_FUNC_sk_storage_get:
+ 	case BPF_FUNC_sk_storage_delete:
+ 		if (map->map_type != BPF_MAP_TYPE_SK_STORAGE)
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -909,6 +909,7 @@ enum bpf_map_type {
+ 	BPF_MAP_TYPE_RINGBUF,
+ 	BPF_MAP_TYPE_INODE_STORAGE,
+ 	BPF_MAP_TYPE_TASK_STORAGE,
++	BPF_MAP_TYPE_BLOOM_FILTER,
+ };
+ 
+ /* Note that tracing related programs such as
+@@ -1277,6 +1278,13 @@ union bpf_attr {
+ 						   * struct stored as the
+ 						   * map value
+ 						   */
++		/* Any per-map-type extra fields
++		 *
++		 * BPF_MAP_TYPE_BLOOM_FILTER - the lowest 4 bits indicate the
++		 * number of hash functions (if 0, the bloom filter will default
++		 * to using 5 hash functions).
++		 */
++		__u64	map_extra;
+ 	};
+ 
+ 	struct { /* anonymous struct used by BPF_MAP_*_ELEM commands */
+@@ -5641,6 +5649,7 @@ struct bpf_map_info {
+ 	__u32 btf_id;
+ 	__u32 btf_key_type_id;
+ 	__u32 btf_value_type_id;
++	__u64 map_extra;
+ } __attribute__((aligned(8)));
+ 
+ struct bpf_btf_info {

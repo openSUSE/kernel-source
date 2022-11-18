@@ -1,0 +1,264 @@
+From: Song Liu <songliubraving@fb.com>
+Date: Fri, 10 Sep 2021 11:33:50 -0700
+Subject: perf: Enable branch record for software events
+Patch-mainline: v5.16-rc1
+Git-commit: c22ac2a3d4bd83411ebf0b1726e9e5fc4f5e7ebf
+References: jsc#PED-1368
+
+The typical way to access branch record (e.g. Intel LBR) is via hardware
+perf_event. For CPUs with FREEZE_LBRS_ON_PMI support, PMI could capture
+reliable LBR. On the other hand, LBR could also be useful in non-PMI
+scenario. For example, in kretprobe or bpf fexit program, LBR could
+provide a lot of information on what happened with the function. Add API
+to use branch record for software use.
+
+Note that, when the software event triggers, it is necessary to stop the
+branch record hardware asap. Therefore, static_call is used to remove some
+branch instructions in this process.
+
+Suggested-by: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: John Fastabend <john.fastabend@gmail.com>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/bpf/20210910183352.3151445-2-songliubraving@fb.com
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ arch/x86/events/intel/core.c |   67 +++++++++++++++++++++++++++++++++++++++----
+ arch/x86/events/intel/ds.c   |    2 -
+ arch/x86/events/intel/lbr.c  |   20 +++---------
+ arch/x86/events/perf_event.h |   19 ++++++++++++
+ include/linux/perf_event.h   |   23 ++++++++++++++
+ kernel/events/core.c         |    2 +
+ 6 files changed, 111 insertions(+), 22 deletions(-)
+
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@ -2145,19 +2145,19 @@ static __initconst const u64 knl_hw_cach
+  * However, there are some cases which may change PEBS status, e.g. PMI
+  * throttle. The PEBS_ENABLE should be updated where the status changes.
+  */
+-static void __intel_pmu_disable_all(void)
++static __always_inline void __intel_pmu_disable_all(bool bts)
+ {
+ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+ 
+ 	wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL, 0);
+ 
+-	if (test_bit(INTEL_PMC_IDX_FIXED_BTS, cpuc->active_mask))
++	if (bts && test_bit(INTEL_PMC_IDX_FIXED_BTS, cpuc->active_mask))
+ 		intel_pmu_disable_bts();
+ }
+ 
+-static void intel_pmu_disable_all(void)
++static __always_inline void intel_pmu_disable_all(void)
+ {
+-	__intel_pmu_disable_all();
++	__intel_pmu_disable_all(true);
+ 	intel_pmu_pebs_disable_all();
+ 	intel_pmu_lbr_disable_all();
+ }
+@@ -2188,6 +2188,49 @@ static void intel_pmu_enable_all(int add
+ 	__intel_pmu_enable_all(added, false);
+ }
+ 
++static noinline int
++__intel_pmu_snapshot_branch_stack(struct perf_branch_entry *entries,
++				  unsigned int cnt, unsigned long flags)
++{
++	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++
++	intel_pmu_lbr_read();
++	cnt = min_t(unsigned int, cnt, x86_pmu.lbr_nr);
++
++	memcpy(entries, cpuc->lbr_entries, sizeof(struct perf_branch_entry) * cnt);
++	intel_pmu_enable_all(0);
++	local_irq_restore(flags);
++	return cnt;
++}
++
++static int
++intel_pmu_snapshot_branch_stack(struct perf_branch_entry *entries, unsigned int cnt)
++{
++	unsigned long flags;
++
++	/* must not have branches... */
++	local_irq_save(flags);
++	__intel_pmu_disable_all(false); /* we don't care about BTS */
++	__intel_pmu_pebs_disable_all();
++	__intel_pmu_lbr_disable();
++	/*            ... until here */
++	return __intel_pmu_snapshot_branch_stack(entries, cnt, flags);
++}
++
++static int
++intel_pmu_snapshot_arch_branch_stack(struct perf_branch_entry *entries, unsigned int cnt)
++{
++	unsigned long flags;
++
++	/* must not have branches... */
++	local_irq_save(flags);
++	__intel_pmu_disable_all(false); /* we don't care about BTS */
++	__intel_pmu_pebs_disable_all();
++	__intel_pmu_arch_lbr_disable();
++	/*            ... until here */
++	return __intel_pmu_snapshot_branch_stack(entries, cnt, flags);
++}
++
+ /*
+  * Workaround for:
+  *   Intel Errata AAK100 (model 26)
+@@ -2931,7 +2974,7 @@ static int intel_pmu_handle_irq(struct p
+ 		apic_write(APIC_LVTPC, APIC_DM_NMI);
+ 	intel_bts_disable_local();
+ 	cpuc->enabled = 0;
+-	__intel_pmu_disable_all();
++	__intel_pmu_disable_all(true);
+ 	handled = intel_pmu_drain_bts_buffer();
+ 	handled += intel_bts_interrupt();
+ 	status = intel_pmu_get_status();
+@@ -6285,9 +6328,21 @@ __init int intel_pmu_init(void)
+ 			x86_pmu.lbr_nr = 0;
+ 	}
+ 
+-	if (x86_pmu.lbr_nr)
++	if (x86_pmu.lbr_nr) {
+ 		pr_cont("%d-deep LBR, ", x86_pmu.lbr_nr);
+ 
++		/* only support branch_stack snapshot for perfmon >= v2 */
++		if (x86_pmu.disable_all == intel_pmu_disable_all) {
++			if (boot_cpu_has(X86_FEATURE_ARCH_LBR)) {
++				static_call_update(perf_snapshot_branch_stack,
++						   intel_pmu_snapshot_arch_branch_stack);
++			} else {
++				static_call_update(perf_snapshot_branch_stack,
++						   intel_pmu_snapshot_branch_stack);
++			}
++		}
++	}
++
+ 	intel_pmu_check_extra_regs(x86_pmu.extra_regs);
+ 
+ 	/* Support full width counters using alternative MSR range */
+--- a/arch/x86/events/intel/ds.c
++++ b/arch/x86/events/intel/ds.c
+@@ -1302,7 +1302,7 @@ void intel_pmu_pebs_disable_all(void)
+ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+ 
+ 	if (cpuc->pebs_enabled)
+-		wrmsrl(MSR_IA32_PEBS_ENABLE, 0);
++		__intel_pmu_pebs_disable_all();
+ }
+ 
+ static int intel_pmu_pebs_fixup_ip(struct pt_regs *regs)
+--- a/arch/x86/events/intel/lbr.c
++++ b/arch/x86/events/intel/lbr.c
+@@ -228,20 +228,6 @@ static void __intel_pmu_lbr_enable(bool
+ 		wrmsrl(MSR_ARCH_LBR_CTL, lbr_select | ARCH_LBR_CTL_LBREN);
+ }
+ 
+-static void __intel_pmu_lbr_disable(void)
+-{
+-	u64 debugctl;
+-
+-	if (static_cpu_has(X86_FEATURE_ARCH_LBR)) {
+-		wrmsrl(MSR_ARCH_LBR_CTL, 0);
+-		return;
+-	}
+-
+-	rdmsrl(MSR_IA32_DEBUGCTLMSR, debugctl);
+-	debugctl &= ~(DEBUGCTLMSR_LBR | DEBUGCTLMSR_FREEZE_LBRS_ON_PMI);
+-	wrmsrl(MSR_IA32_DEBUGCTLMSR, debugctl);
+-}
+-
+ void intel_pmu_lbr_reset_32(void)
+ {
+ 	int i;
+@@ -779,8 +765,12 @@ void intel_pmu_lbr_disable_all(void)
+ {
+ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+ 
+-	if (cpuc->lbr_users && !vlbr_exclude_host())
++	if (cpuc->lbr_users && !vlbr_exclude_host()) {
++		if (static_cpu_has(X86_FEATURE_ARCH_LBR))
++			return __intel_pmu_arch_lbr_disable();
++
+ 		__intel_pmu_lbr_disable();
++	}
+ }
+ 
+ void intel_pmu_lbr_read_32(struct cpu_hw_events *cpuc)
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -1241,6 +1241,25 @@ static inline bool intel_pmu_has_bts(str
+ 	return intel_pmu_has_bts_period(event, hwc->sample_period);
+ }
+ 
++static __always_inline void __intel_pmu_pebs_disable_all(void)
++{
++	wrmsrl(MSR_IA32_PEBS_ENABLE, 0);
++}
++
++static __always_inline void __intel_pmu_arch_lbr_disable(void)
++{
++	wrmsrl(MSR_ARCH_LBR_CTL, 0);
++}
++
++static __always_inline void __intel_pmu_lbr_disable(void)
++{
++	u64 debugctl;
++
++	rdmsrl(MSR_IA32_DEBUGCTLMSR, debugctl);
++	debugctl &= ~(DEBUGCTLMSR_LBR | DEBUGCTLMSR_FREEZE_LBRS_ON_PMI);
++	wrmsrl(MSR_IA32_DEBUGCTLMSR, debugctl);
++}
++
+ int intel_pmu_save_and_restart(struct perf_event *event);
+ 
+ struct event_constraint *
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -57,6 +57,7 @@ struct perf_guest_info_callbacks {
+ #include <linux/cgroup.h>
+ #include <linux/refcount.h>
+ #include <linux/security.h>
++#include <linux/static_call.h>
+ #include <asm/local.h>
+ 
+ struct perf_callchain_entry {
+@@ -1614,4 +1615,26 @@ extern void __weak arch_perf_update_user
+ extern __weak u64 arch_perf_get_page_size(struct mm_struct *mm, unsigned long addr);
+ #endif
+ 
++/*
++ * Snapshot branch stack on software events.
++ *
++ * Branch stack can be very useful in understanding software events. For
++ * example, when a long function, e.g. sys_perf_event_open, returns an
++ * errno, it is not obvious why the function failed. Branch stack could
++ * provide very helpful information in this type of scenarios.
++ *
++ * On software event, it is necessary to stop the hardware branch recorder
++ * fast. Otherwise, the hardware register/buffer will be flushed with
++ * entries of the triggering event. Therefore, static call is used to
++ * stop the hardware recorder.
++ */
++
++/*
++ * cnt is the number of entries allocated for entries.
++ * Return number of entries copied to .
++ */
++typedef int (perf_snapshot_branch_stack_t)(struct perf_branch_entry *entries,
++					   unsigned int cnt);
++DECLARE_STATIC_CALL(perf_snapshot_branch_stack, perf_snapshot_branch_stack_t);
++
+ #endif /* _LINUX_PERF_EVENT_H */
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -13463,3 +13463,5 @@ struct cgroup_subsys perf_event_cgrp_sub
+ 	.threaded	= true,
+ };
+ #endif /* CONFIG_CGROUP_PERF */
++
++DEFINE_STATIC_CALL_RET0(perf_snapshot_branch_stack, perf_snapshot_branch_stack_t);
