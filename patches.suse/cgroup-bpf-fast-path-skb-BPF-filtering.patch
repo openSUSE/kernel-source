@@ -1,0 +1,217 @@
+From: Pavel Begunkov <asml.silence@gmail.com>
+Date: Thu, 27 Jan 2022 14:09:13 +0000
+Subject: cgroup/bpf: fast path skb BPF filtering
+Patch-mainline: v5.18-rc1
+Git-commit: 46531a30364bd483bfa1b041c15d42a196e77e93
+References: jsc#PED-1368
+
+Even though there is a static key protecting from overhead from
+cgroup-bpf skb filtering when there is nothing attached, in many cases
+it's not enough as registering a filter for one type will ruin the fast
+path for all others. It's observed in production servers I've looked
+at but also in laptops, where registration is done during init by
+systemd or something else.
+
+Add a per-socket fast path check guarding from such overhead. This
+affects both receive and transmit paths of TCP, UDP and other
+protocols. It showed ~1% tx/s improvement in small payload UDP
+send benchmarks using a real NIC and in a server environment and the
+number jumps to 2-3% for preemtible kernels.
+
+Reviewed-by: Stanislav Fomichev <sdf@google.com>
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/r/d8c58857113185a764927a46f4b5a058d36d3ec3.1643292455.git.asml.silence@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/linux/bpf-cgroup.h |   24 ++++++++++++++++++++----
+ include/linux/bpf.h        |   13 +++++++++++++
+ kernel/bpf/cgroup.c        |   30 ------------------------------
+ kernel/bpf/core.c          |   16 ++++------------
+ 4 files changed, 37 insertions(+), 46 deletions(-)
+
+--- a/include/linux/bpf-cgroup.h
++++ b/include/linux/bpf-cgroup.h
+@@ -8,6 +8,7 @@
+ #include <linux/jump_label.h>
+ #include <linux/percpu.h>
+ #include <linux/rbtree.h>
++#include <net/sock.h>
+ #include <uapi/linux/bpf.h>
+ 
+ struct sock;
+@@ -185,11 +186,23 @@ int bpf_percpu_cgroup_storage_copy(struc
+ int bpf_percpu_cgroup_storage_update(struct bpf_map *map, void *key,
+ 				     void *value, u64 flags);
+ 
++/* Opportunistic check to see whether we have any BPF program attached*/
++static inline bool cgroup_bpf_sock_enabled(struct sock *sk,
++					   enum cgroup_bpf_attach_type type)
++{
++	struct cgroup *cgrp = sock_cgroup_ptr(&sk->sk_cgrp_data);
++	struct bpf_prog_array *array;
++
++	array = rcu_access_pointer(cgrp->bpf.effective[type]);
++	return array != &bpf_empty_prog_array.hdr;
++}
++
+ /* Wrappers for __cgroup_bpf_run_filter_skb() guarded by cgroup_bpf_enabled. */
+ #define BPF_CGROUP_RUN_PROG_INET_INGRESS(sk, skb)			      \
+ ({									      \
+ 	int __ret = 0;							      \
+-	if (cgroup_bpf_enabled(CGROUP_INET_INGRESS))		      \
++	if (cgroup_bpf_enabled(CGROUP_INET_INGRESS) &&			      \
++	    cgroup_bpf_sock_enabled(sk, CGROUP_INET_INGRESS))		      \
+ 		__ret = __cgroup_bpf_run_filter_skb(sk, skb,		      \
+ 						    CGROUP_INET_INGRESS); \
+ 									      \
+@@ -201,7 +214,8 @@ int bpf_percpu_cgroup_storage_update(str
+ 	int __ret = 0;							       \
+ 	if (cgroup_bpf_enabled(CGROUP_INET_EGRESS) && sk && sk == skb->sk) { \
+ 		typeof(sk) __sk = sk_to_full_sk(sk);			       \
+-		if (sk_fullsock(__sk))					       \
++		if (sk_fullsock(__sk) &&				       \
++		    cgroup_bpf_sock_enabled(__sk, CGROUP_INET_EGRESS))	       \
+ 			__ret = __cgroup_bpf_run_filter_skb(__sk, skb,	       \
+ 						      CGROUP_INET_EGRESS); \
+ 	}								       \
+@@ -367,7 +381,8 @@ int bpf_percpu_cgroup_storage_update(str
+ 				       kernel_optval)			       \
+ ({									       \
+ 	int __ret = 0;							       \
+-	if (cgroup_bpf_enabled(CGROUP_SETSOCKOPT))			       \
++	if (cgroup_bpf_enabled(CGROUP_SETSOCKOPT) &&			       \
++	    cgroup_bpf_sock_enabled(sock, CGROUP_SETSOCKOPT))		       \
+ 		__ret = __cgroup_bpf_run_filter_setsockopt(sock, level,	       \
+ 							   optname, optval,    \
+ 							   optlen,	       \
+@@ -387,7 +402,8 @@ int bpf_percpu_cgroup_storage_update(str
+ 				       max_optlen, retval)		       \
+ ({									       \
+ 	int __ret = retval;						       \
+-	if (cgroup_bpf_enabled(CGROUP_GETSOCKOPT))			       \
++	if (cgroup_bpf_enabled(CGROUP_GETSOCKOPT) &&			       \
++	    cgroup_bpf_sock_enabled(sock, CGROUP_GETSOCKOPT))		       \
+ 		if (!(sock)->sk_prot->bpf_bypass_getsockopt ||		       \
+ 		    !INDIRECT_CALL_INET_1((sock)->sk_prot->bpf_bypass_getsockopt, \
+ 					tcp_bpf_bypass_getsockopt,	       \
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1233,6 +1233,19 @@ struct bpf_prog_array {
+ 	struct bpf_prog_array_item items[];
+ };
+ 
++struct bpf_empty_prog_array {
++	struct bpf_prog_array hdr;
++	struct bpf_prog *null_prog;
++};
++
++/* to avoid allocating empty bpf_prog_array for cgroups that
++ * don't have bpf program attached use one global 'bpf_empty_prog_array'
++ * It will not be modified the caller of bpf_prog_array_alloc()
++ * (since caller requested prog_cnt == 0)
++ * that pointer should be 'freed' by bpf_prog_array_free()
++ */
++extern struct bpf_empty_prog_array bpf_empty_prog_array;
++
+ struct bpf_prog_array *bpf_prog_array_alloc(u32 prog_cnt, gfp_t flags);
+ void bpf_prog_array_free(struct bpf_prog_array *progs);
+ int bpf_prog_array_length(struct bpf_prog_array *progs);
+--- a/kernel/bpf/cgroup.c
++++ b/kernel/bpf/cgroup.c
+@@ -1348,20 +1348,6 @@ int __cgroup_bpf_run_filter_sysctl(struc
+ }
+ 
+ #ifdef CONFIG_NET
+-static bool __cgroup_bpf_prog_array_is_empty(struct cgroup *cgrp,
+-					     enum cgroup_bpf_attach_type attach_type)
+-{
+-	struct bpf_prog_array *prog_array;
+-	bool empty;
+-
+-	rcu_read_lock();
+-	prog_array = rcu_dereference(cgrp->bpf.effective[attach_type]);
+-	empty = bpf_prog_array_is_empty(prog_array);
+-	rcu_read_unlock();
+-
+-	return empty;
+-}
+-
+ static int sockopt_alloc_buf(struct bpf_sockopt_kern *ctx, int max_optlen,
+ 			     struct bpf_sockopt_buf *buf)
+ {
+@@ -1420,19 +1406,11 @@ int __cgroup_bpf_run_filter_setsockopt(s
+ 	};
+ 	int ret, max_optlen;
+ 
+-	/* Opportunistic check to see whether we have any BPF program
+-	 * attached to the hook so we don't waste time allocating
+-	 * memory and locking the socket.
+-	 */
+-	if (__cgroup_bpf_prog_array_is_empty(cgrp, CGROUP_SETSOCKOPT))
+-		return 0;
+-
+ 	/* Allocate a bit more than the initial user buffer for
+ 	 * BPF program. The canonical use case is overriding
+ 	 * TCP_CONGESTION(nv) to TCP_CONGESTION(cubic).
+ 	 */
+ 	max_optlen = max_t(int, 16, *optlen);
+-
+ 	max_optlen = sockopt_alloc_buf(&ctx, max_optlen, &buf);
+ 	if (max_optlen < 0)
+ 		return max_optlen;
+@@ -1514,15 +1492,7 @@ int __cgroup_bpf_run_filter_getsockopt(s
+ 	};
+ 	int ret;
+ 
+-	/* Opportunistic check to see whether we have any BPF program
+-	 * attached to the hook so we don't waste time allocating
+-	 * memory and locking the socket.
+-	 */
+-	if (__cgroup_bpf_prog_array_is_empty(cgrp, CGROUP_GETSOCKOPT))
+-		return retval;
+-
+ 	ctx.optlen = max_optlen;
+-
+ 	max_optlen = sockopt_alloc_buf(&ctx, max_optlen, &buf);
+ 	if (max_optlen < 0)
+ 		return max_optlen;
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -1968,18 +1968,10 @@ static struct bpf_prog_dummy {
+ 	},
+ };
+ 
+-/* to avoid allocating empty bpf_prog_array for cgroups that
+- * don't have bpf program attached use one global 'empty_prog_array'
+- * It will not be modified the caller of bpf_prog_array_alloc()
+- * (since caller requested prog_cnt == 0)
+- * that pointer should be 'freed' by bpf_prog_array_free()
+- */
+-static struct {
+-	struct bpf_prog_array hdr;
+-	struct bpf_prog *null_prog;
+-} empty_prog_array = {
++struct bpf_empty_prog_array bpf_empty_prog_array = {
+ 	.null_prog = NULL,
+ };
++EXPORT_SYMBOL(bpf_empty_prog_array);
+ 
+ struct bpf_prog_array *bpf_prog_array_alloc(u32 prog_cnt, gfp_t flags)
+ {
+@@ -1989,12 +1981,12 @@ struct bpf_prog_array *bpf_prog_array_al
+ 			       (prog_cnt + 1),
+ 			       flags);
+ 
+-	return &empty_prog_array.hdr;
++	return &bpf_empty_prog_array.hdr;
+ }
+ 
+ void bpf_prog_array_free(struct bpf_prog_array *progs)
+ {
+-	if (!progs || progs == &empty_prog_array.hdr)
++	if (!progs || progs == &bpf_empty_prog_array.hdr)
+ 		return;
+ 	kfree_rcu(progs, rcu);
+ }
