@@ -1,0 +1,166 @@
+From: Niklas Schnelle <schnelle@linux.ibm.com>
+Date: Thu, 1 Jul 2021 15:49:11 +0200
+Subject: s390/pci: implement reset_slot for hotplug slot
+Git-commit: da995d538d3a17610d89fea0f5813cf7921b3c2c
+Patch-mainline: v5.16-rc1
+References: jsc#PED-592
+
+This is done by adding a zpci_hot_reset_device() call which does a low
+level reset of the PCI function without changing its higher level
+function state. This way it can be used while the zPCI function is bound
+to a driver and with DMA tables being controlled either through the
+IOMMU or DMA APIs which is prohibited when using zpci_disable_device()
+as that drop existing DMA translations.
+
+As this reset, unlike a normal FLR, also calls zpci_clear_irq() we need
+to implement arch_restore_msi_irqs() and make sure we re-enable IRQs for
+the PCI function if they were previously disabled.
+
+Reviewed-by: Pierre Morel <pmorel@linux.ibm.com>
+Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ arch/s390/include/asm/pci.h        |    1 
+ arch/s390/pci/pci.c                |   59 +++++++++++++++++++++++++++++++++++++
+ arch/s390/pci/pci_irq.c            |    9 +++++
+ drivers/pci/hotplug/s390_pci_hpc.c |   24 +++++++++++++++
+ 4 files changed, 93 insertions(+)
+
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -210,6 +210,7 @@ int zpci_deconfigure_device(struct zpci_
+ void zpci_device_reserved(struct zpci_dev *zdev);
+ bool zpci_is_device_configured(struct zpci_dev *zdev);
+ 
++int zpci_hot_reset_device(struct zpci_dev *zdev);
+ int zpci_register_ioat(struct zpci_dev *, u8, u64, u64, u64);
+ int zpci_unregister_ioat(struct zpci_dev *, u8);
+ void zpci_remove_reserved_devices(void);
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@ -724,6 +724,65 @@ int zpci_disable_device(struct zpci_dev
+ }
+ 
+ /**
++ * zpci_hot_reset_device - perform a reset of the given zPCI function
++ * @zdev: the slot which should be reset
++ *
++ * Performs a low level reset of the zPCI function. The reset is low level in
++ * the sense that the zPCI function can be reset without detaching it from the
++ * common PCI subsystem. The reset may be performed while under control of
++ * either DMA or IOMMU APIs in which case the existing DMA/IOMMU translation
++ * table is reinstated at the end of the reset.
++ *
++ * After the reset the functions internal state is reset to an initial state
++ * equivalent to its state during boot when first probing a driver.
++ * Consequently after reset the PCI function requires re-initialization via the
++ * common PCI code including re-enabling IRQs via pci_alloc_irq_vectors()
++ * and enabling the function via e.g.pci_enablde_device_flags().The caller
++ * must guard against concurrent reset attempts.
++ *
++ * In most cases this function should not be called directly but through
++ * pci_reset_function() or pci_reset_bus() which handle the save/restore and
++ * locking.
++ *
++ * Return: 0 on success and an error value otherwise
++ */
++int zpci_hot_reset_device(struct zpci_dev *zdev)
++{
++	int rc;
++
++	zpci_dbg(3, "rst fid:%x, fh:%x\n", zdev->fid, zdev->fh);
++	if (zdev_enabled(zdev)) {
++		/* Disables device access, DMAs and IRQs (reset state) */
++		rc = zpci_disable_device(zdev);
++		/*
++		 * Due to a z/VM vs LPAR inconsistency in the error state the
++		 * FH may indicate an enabled device but disable says the
++		 * device is already disabled don't treat it as an error here.
++		 */
++		if (rc == -EINVAL)
++			rc = 0;
++		if (rc)
++			return rc;
++	}
++
++	rc = zpci_enable_device(zdev);
++	if (rc)
++		return rc;
++
++	if (zdev->dma_table)
++		rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
++					(u64)zdev->dma_table);
++	else
++		rc = zpci_dma_init_device(zdev);
++	if (rc) {
++		zpci_disable_device(zdev);
++		return rc;
++	}
++
++	return 0;
++}
++
++/**
+  * zpci_create_device() - Create a new zpci_dev and add it to the zbus
+  * @fid: Function ID of the device to be created
+  * @fh: Current Function Handle of the device to be created
+--- a/arch/s390/pci/pci_irq.c
++++ b/arch/s390/pci/pci_irq.c
+@@ -387,6 +387,15 @@ void arch_teardown_msi_irqs(struct pci_d
+ 		airq_iv_free(zpci_ibv[0], zdev->msi_first_bit, zdev->msi_nr_irqs);
+ }
+ 
++void arch_restore_msi_irqs(struct pci_dev *pdev)
++{
++	struct zpci_dev *zdev = to_zpci(pdev);
++
++	if (!zdev->irqs_registered)
++		zpci_set_irq(zdev);
++	default_restore_msi_irqs(pdev);
++}
++
+ static struct airq_struct zpci_airq = {
+ 	.handler = zpci_floating_irq_handler,
+ 	.isc = PCI_ISC,
+--- a/drivers/pci/hotplug/s390_pci_hpc.c
++++ b/drivers/pci/hotplug/s390_pci_hpc.c
+@@ -57,6 +57,29 @@ static int disable_slot(struct hotplug_s
+ 	return zpci_deconfigure_device(zdev);
+ }
+ 
++static int reset_slot(struct hotplug_slot *hotplug_slot, bool probe)
++{
++	struct zpci_dev *zdev = container_of(hotplug_slot, struct zpci_dev,
++					     hotplug_slot);
++
++	if (zdev->state != ZPCI_FN_STATE_CONFIGURED)
++		return -EIO;
++	/*
++	 * We can't take the zdev->lock as reset_slot may be called during
++	 * probing and/or device removal which already happens under the
++	 * zdev->lock. Instead the user should use the higher level
++	 * pci_reset_function() or pci_bus_reset() which hold the PCI device
++	 * lock preventing concurrent removal. If not using these functions
++	 * holding the PCI device lock is required.
++	 */
++
++	/* As long as the function is configured we can reset */
++	if (probe)
++		return 0;
++
++	return zpci_hot_reset_device(zdev);
++}
++
+ static int get_power_status(struct hotplug_slot *hotplug_slot, u8 *value)
+ {
+ 	struct zpci_dev *zdev = container_of(hotplug_slot, struct zpci_dev,
+@@ -76,6 +99,7 @@ static int get_adapter_status(struct hot
+ static const struct hotplug_slot_ops s390_hotplug_slot_ops = {
+ 	.enable_slot =		enable_slot,
+ 	.disable_slot =		disable_slot,
++	.reset_slot =		reset_slot,
+ 	.get_power_status =	get_power_status,
+ 	.get_adapter_status =	get_adapter_status,
+ };
