@@ -1,0 +1,339 @@
+From: KP Singh <kpsingh@kernel.org>
+Date: Fri, 24 Dec 2021 15:29:15 +0000
+Subject: bpf: Allow bpf_local_storage to be used by sleepable programs
+Patch-mainline: v5.17-rc1
+Git-commit: 0fe4b381a59ebc53522fce579b281a67a9e1bee6
+References: jsc#PED-1368
+
+Other maps like hashmaps are already available to sleepable programs.
+Sleepable BPF programs run under trace RCU. Allow task, sk and inode
+storage to be used from sleepable programs. This allows sleepable and
+non-sleepable programs to provide shareable annotations on kernel
+objects.
+
+Sleepable programs run in trace RCU where as non-sleepable programs run
+in a normal RCU critical section i.e.  __bpf_prog_enter{_sleepable}
+and __bpf_prog_exit{_sleepable}) (rcu_read_lock or rcu_read_lock_trace).
+
+In order to make the local storage maps accessible to both sleepable
+and non-sleepable programs, one needs to call both
+call_rcu_tasks_trace and call_rcu to wait for both trace and classical
+RCU grace periods to expire before freeing memory.
+
+Paul's work on call_rcu_tasks_trace allows us to have per CPU queueing
+for call_rcu_tasks_trace. This behaviour can be achieved by setting
+rcupdate.rcu_task_enqueue_lim=<num_cpus> boot parameter.
+
+In light of these new performance changes and to keep the local storage
+code simple, avoid adding a new flag for sleepable maps / local storage
+to select the RCU synchronization (trace / classical).
+
+Also, update the dereferencing of the pointers to use
+rcu_derference_check (with either the trace or normal RCU locks held)
+with a common bpf_rcu_lock_held helper method.
+
+Signed-off-by: KP Singh <kpsingh@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20211224152916.1550677-2-kpsingh@kernel.org
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/linux/bpf_local_storage.h |    5 +++
+ kernel/bpf/bpf_inode_storage.c    |    6 +++-
+ kernel/bpf/bpf_local_storage.c    |   50 ++++++++++++++++++++++++++++----------
+ kernel/bpf/bpf_task_storage.c     |    6 +++-
+ kernel/bpf/verifier.c             |    3 ++
+ net/core/bpf_sk_storage.c         |    8 +++++-
+ 6 files changed, 62 insertions(+), 16 deletions(-)
+
+--- a/include/linux/bpf_local_storage.h
++++ b/include/linux/bpf_local_storage.h
+@@ -17,6 +17,9 @@
+ 
+ #define BPF_LOCAL_STORAGE_CACHE_SIZE	16
+ 
++#define bpf_rcu_lock_held()                                                    \
++	(rcu_read_lock_held() || rcu_read_lock_trace_held() ||                 \
++	 rcu_read_lock_bh_held())
+ struct bpf_local_storage_map_bucket {
+ 	struct hlist_head list;
+ 	raw_spinlock_t lock;
+@@ -162,4 +165,6 @@ struct bpf_local_storage_data *
+ bpf_local_storage_update(void *owner, struct bpf_local_storage_map *smap,
+ 			 void *value, u64 map_flags);
+ 
++void bpf_local_storage_free_rcu(struct rcu_head *rcu);
++
+ #endif /* _BPF_LOCAL_STORAGE_H */
+--- a/kernel/bpf/bpf_inode_storage.c
++++ b/kernel/bpf/bpf_inode_storage.c
+@@ -17,6 +17,7 @@
+ #include <linux/bpf_lsm.h>
+ #include <linux/btf_ids.h>
+ #include <linux/fdtable.h>
++#include <linux/rcupdate_trace.h>
+ 
+ DEFINE_BPF_STORAGE_CACHE(inode_cache);
+ 
+@@ -44,7 +45,8 @@ static struct bpf_local_storage_data *in
+ 	if (!bsb)
+ 		return NULL;
+ 
+-	inode_storage = rcu_dereference(bsb->storage);
++	inode_storage =
++		rcu_dereference_check(bsb->storage, bpf_rcu_lock_held());
+ 	if (!inode_storage)
+ 		return NULL;
+ 
+@@ -172,6 +174,7 @@ BPF_CALL_4(bpf_inode_storage_get, struct
+ {
+ 	struct bpf_local_storage_data *sdata;
+ 
++	WARN_ON_ONCE(!bpf_rcu_lock_held());
+ 	if (flags & ~(BPF_LOCAL_STORAGE_GET_F_CREATE))
+ 		return (unsigned long)NULL;
+ 
+@@ -204,6 +207,7 @@ BPF_CALL_4(bpf_inode_storage_get, struct
+ BPF_CALL_2(bpf_inode_storage_delete,
+ 	   struct bpf_map *, map, struct inode *, inode)
+ {
++	WARN_ON_ONCE(!bpf_rcu_lock_held());
+ 	if (!inode)
+ 		return -EINVAL;
+ 
+--- a/kernel/bpf/bpf_local_storage.c
++++ b/kernel/bpf/bpf_local_storage.c
+@@ -11,6 +11,9 @@
+ #include <net/sock.h>
+ #include <uapi/linux/sock_diag.h>
+ #include <uapi/linux/btf.h>
++#include <linux/rcupdate.h>
++#include <linux/rcupdate_trace.h>
++#include <linux/rcupdate_wait.h>
+ 
+ #define BPF_LOCAL_STORAGE_CREATE_FLAG_MASK (BPF_F_NO_PREALLOC | BPF_F_CLONE)
+ 
+@@ -81,6 +84,22 @@ bpf_selem_alloc(struct bpf_local_storage
+ 	return NULL;
+ }
+ 
++void bpf_local_storage_free_rcu(struct rcu_head *rcu)
++{
++	struct bpf_local_storage *local_storage;
++
++	local_storage = container_of(rcu, struct bpf_local_storage, rcu);
++	kfree_rcu(local_storage, rcu);
++}
++
++static void bpf_selem_free_rcu(struct rcu_head *rcu)
++{
++	struct bpf_local_storage_elem *selem;
++
++	selem = container_of(rcu, struct bpf_local_storage_elem, rcu);
++	kfree_rcu(selem, rcu);
++}
++
+ /* local_storage->lock must be held and selem->local_storage == local_storage.
+  * The caller must ensure selem->smap is still valid to be
+  * dereferenced for its smap->elem_size and smap->cache_idx.
+@@ -93,7 +112,7 @@ bool bpf_selem_unlink_storage_nolock(str
+ 	bool free_local_storage;
+ 	void *owner;
+ 
+-	smap = rcu_dereference(SDATA(selem)->smap);
++	smap = rcu_dereference_check(SDATA(selem)->smap, bpf_rcu_lock_held());
+ 	owner = local_storage->owner;
+ 
+ 	/* All uncharging on the owner must be done first.
+@@ -118,12 +137,12 @@ bool bpf_selem_unlink_storage_nolock(str
+ 		 *
+ 		 * Although the unlock will be done under
+ 		 * rcu_read_lock(),  it is more intutivie to
+-		 * read if kfree_rcu(local_storage, rcu) is done
++		 * read if the freeing of the storage is done
+ 		 * after the raw_spin_unlock_bh(&local_storage->lock).
+ 		 *
+ 		 * Hence, a "bool free_local_storage" is returned
+-		 * to the caller which then calls the kfree_rcu()
+-		 * after unlock.
++		 * to the caller which then calls then frees the storage after
++		 * all the RCU grace periods have expired.
+ 		 */
+ 	}
+ 	hlist_del_init_rcu(&selem->snode);
+@@ -131,8 +150,7 @@ bool bpf_selem_unlink_storage_nolock(str
+ 	    SDATA(selem))
+ 		RCU_INIT_POINTER(local_storage->cache[smap->cache_idx], NULL);
+ 
+-	kfree_rcu(selem, rcu);
+-
++	call_rcu_tasks_trace(&selem->rcu, bpf_selem_free_rcu);
+ 	return free_local_storage;
+ }
+ 
+@@ -146,7 +164,8 @@ static void __bpf_selem_unlink_storage(s
+ 		/* selem has already been unlinked from sk */
+ 		return;
+ 
+-	local_storage = rcu_dereference(selem->local_storage);
++	local_storage = rcu_dereference_check(selem->local_storage,
++					      bpf_rcu_lock_held());
+ 	raw_spin_lock_irqsave(&local_storage->lock, flags);
+ 	if (likely(selem_linked_to_storage(selem)))
+ 		free_local_storage = bpf_selem_unlink_storage_nolock(
+@@ -154,7 +173,8 @@ static void __bpf_selem_unlink_storage(s
+ 	raw_spin_unlock_irqrestore(&local_storage->lock, flags);
+ 
+ 	if (free_local_storage)
+-		kfree_rcu(local_storage, rcu);
++		call_rcu_tasks_trace(&local_storage->rcu,
++				     bpf_local_storage_free_rcu);
+ }
+ 
+ void bpf_selem_link_storage_nolock(struct bpf_local_storage *local_storage,
+@@ -174,7 +194,7 @@ void bpf_selem_unlink_map(struct bpf_loc
+ 		/* selem has already be unlinked from smap */
+ 		return;
+ 
+-	smap = rcu_dereference(SDATA(selem)->smap);
++	smap = rcu_dereference_check(SDATA(selem)->smap, bpf_rcu_lock_held());
+ 	b = select_bucket(smap, selem);
+ 	raw_spin_lock_irqsave(&b->lock, flags);
+ 	if (likely(selem_linked_to_map(selem)))
+@@ -213,12 +233,14 @@ bpf_local_storage_lookup(struct bpf_loca
+ 	struct bpf_local_storage_elem *selem;
+ 
+ 	/* Fast path (cache hit) */
+-	sdata = rcu_dereference(local_storage->cache[smap->cache_idx]);
++	sdata = rcu_dereference_check(local_storage->cache[smap->cache_idx],
++				      bpf_rcu_lock_held());
+ 	if (sdata && rcu_access_pointer(sdata->smap) == smap)
+ 		return sdata;
+ 
+ 	/* Slow path (cache miss) */
+-	hlist_for_each_entry_rcu(selem, &local_storage->list, snode)
++	hlist_for_each_entry_rcu(selem, &local_storage->list, snode,
++				  rcu_read_lock_trace_held())
+ 		if (rcu_access_pointer(SDATA(selem)->smap) == smap)
+ 			break;
+ 
+@@ -306,7 +328,8 @@ int bpf_local_storage_alloc(void *owner,
+ 		 * bucket->list, first_selem can be freed immediately
+ 		 * (instead of kfree_rcu) because
+ 		 * bpf_local_storage_map_free() does a
+-		 * synchronize_rcu() before walking the bucket->list.
++		 * synchronize_rcu_mult (waiting for both sleepable and
++		 * normal programs) before walking the bucket->list.
+ 		 * Hence, no one is accessing selem from the
+ 		 * bucket->list under rcu_read_lock().
+ 		 */
+@@ -342,7 +365,8 @@ bpf_local_storage_update(void *owner, st
+ 		     !map_value_has_spin_lock(&smap->map)))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	local_storage = rcu_dereference(*owner_storage(smap, owner));
++	local_storage = rcu_dereference_check(*owner_storage(smap, owner),
++					      bpf_rcu_lock_held());
+ 	if (!local_storage || hlist_empty(&local_storage->list)) {
+ 		/* Very first elem for the owner */
+ 		err = check_flags(NULL, map_flags);
+--- a/kernel/bpf/bpf_task_storage.c
++++ b/kernel/bpf/bpf_task_storage.c
+@@ -17,6 +17,7 @@
+ #include <uapi/linux/btf.h>
+ #include <linux/btf_ids.h>
+ #include <linux/fdtable.h>
++#include <linux/rcupdate_trace.h>
+ 
+ DEFINE_BPF_STORAGE_CACHE(task_cache);
+ 
+@@ -59,7 +60,8 @@ task_storage_lookup(struct task_struct *
+ 	struct bpf_local_storage *task_storage;
+ 	struct bpf_local_storage_map *smap;
+ 
+-	task_storage = rcu_dereference(task->bpf_storage);
++	task_storage =
++		rcu_dereference_check(task->bpf_storage, bpf_rcu_lock_held());
+ 	if (!task_storage)
+ 		return NULL;
+ 
+@@ -229,6 +231,7 @@ BPF_CALL_4(bpf_task_storage_get, struct
+ {
+ 	struct bpf_local_storage_data *sdata;
+ 
++	WARN_ON_ONCE(!bpf_rcu_lock_held());
+ 	if (flags & ~(BPF_LOCAL_STORAGE_GET_F_CREATE))
+ 		return (unsigned long)NULL;
+ 
+@@ -260,6 +263,7 @@ BPF_CALL_2(bpf_task_storage_delete, stru
+ {
+ 	int ret;
+ 
++	WARN_ON_ONCE(!bpf_rcu_lock_held());
+ 	if (!task)
+ 		return -EINVAL;
+ 
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -11897,6 +11897,9 @@ static int check_map_prog_compatibility(
+ 			}
+ 			break;
+ 		case BPF_MAP_TYPE_RINGBUF:
++		case BPF_MAP_TYPE_INODE_STORAGE:
++		case BPF_MAP_TYPE_SK_STORAGE:
++		case BPF_MAP_TYPE_TASK_STORAGE:
+ 			break;
+ 		default:
+ 			verbose(env,
+--- a/net/core/bpf_sk_storage.c
++++ b/net/core/bpf_sk_storage.c
+@@ -13,6 +13,7 @@
+ #include <net/sock.h>
+ #include <uapi/linux/sock_diag.h>
+ #include <uapi/linux/btf.h>
++#include <linux/rcupdate_trace.h>
+ 
+ DEFINE_BPF_STORAGE_CACHE(sk_cache);
+ 
+@@ -22,7 +23,8 @@ bpf_sk_storage_lookup(struct sock *sk, s
+ 	struct bpf_local_storage *sk_storage;
+ 	struct bpf_local_storage_map *smap;
+ 
+-	sk_storage = rcu_dereference(sk->sk_bpf_storage);
++	sk_storage =
++		rcu_dereference_check(sk->sk_bpf_storage, bpf_rcu_lock_held());
+ 	if (!sk_storage)
+ 		return NULL;
+ 
+@@ -258,6 +260,7 @@ BPF_CALL_4(bpf_sk_storage_get, struct bp
+ {
+ 	struct bpf_local_storage_data *sdata;
+ 
++	WARN_ON_ONCE(!bpf_rcu_lock_held());
+ 	if (!sk || !sk_fullsock(sk) || flags > BPF_SK_STORAGE_GET_F_CREATE)
+ 		return (unsigned long)NULL;
+ 
+@@ -288,6 +291,7 @@ BPF_CALL_4(bpf_sk_storage_get, struct bp
+ 
+ BPF_CALL_2(bpf_sk_storage_delete, struct bpf_map *, map, struct sock *, sk)
+ {
++	WARN_ON_ONCE(!bpf_rcu_lock_held());
+ 	if (!sk || !sk_fullsock(sk))
+ 		return -EINVAL;
+ 
+@@ -416,6 +420,7 @@ static bool bpf_sk_storage_tracing_allow
+ BPF_CALL_4(bpf_sk_storage_get_tracing, struct bpf_map *, map, struct sock *, sk,
+ 	   void *, value, u64, flags)
+ {
++	WARN_ON_ONCE(!bpf_rcu_lock_held());
+ 	if (in_hardirq() || in_nmi())
+ 		return (unsigned long)NULL;
+ 
+@@ -425,6 +430,7 @@ BPF_CALL_4(bpf_sk_storage_get_tracing, s
+ BPF_CALL_2(bpf_sk_storage_delete_tracing, struct bpf_map *, map,
+ 	   struct sock *, sk)
+ {
++	WARN_ON_ONCE(!bpf_rcu_lock_held());
+ 	if (in_hardirq() || in_nmi())
+ 		return -EPERM;
+ 
