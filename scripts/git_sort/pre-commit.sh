@@ -17,6 +17,8 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
 # USA.
 
+exit 0
+
 _libdir=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 
 sorted_section_changed () {
