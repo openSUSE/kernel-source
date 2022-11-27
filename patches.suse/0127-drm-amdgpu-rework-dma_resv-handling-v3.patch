@@ -1,0 +1,290 @@
+From 15e65338f687fc44bdbb1b57e4a587ca0673b1a2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 9 Jun 2021 13:51:36 +0200
+Subject: drm/amdgpu: rework dma_resv handling v3
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 8c505bdc9c8b955223b054e34a0be9c3d841cd20
+Patch-mainline: v5.15-rc1
+References: jsc#PED-1166 jsc#PED-1168 jsc#PED-1170 jsc#PED-1218 jsc#PED-1220 jsc#PED-1222 jsc#PED-1223 jsc#PED-1225
+
+Drop the workaround and instead implement a better solution.
+
+Basically we are now chaining all submissions using a dma_fence_chain
+container and adding them as exclusive fence to the dma_resv object.
+
+This way other drivers can still sync to the single exclusive fence
+while amdgpu only sync to fences from different processes.
+
+v3: add the shared fence first before the exclusive one
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210614174536.5188-2-christian.koenig@amd.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.h |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c      | 62 ++++++++++++++++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c | 65 ---------------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c     |  3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c  |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.h  |  1 -
+ 6 files changed, 55 insertions(+), 79 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.h
+index a130e766cbdb..c905a4cfc173 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.h
+@@ -34,6 +34,7 @@ struct amdgpu_fpriv;
+ struct amdgpu_bo_list_entry {
+ 	struct ttm_validate_buffer	tv;
+ 	struct amdgpu_bo_va		*bo_va;
++	struct dma_fence_chain		*chain;
+ 	uint32_t			priority;
+ 	struct page			**user_pages;
+ 	bool				user_invalidated;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 65f715768a15..a152363b0254 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -572,6 +572,20 @@ static int amdgpu_cs_parser_bos(struct amdgpu_cs_parser *p,
+ 		goto out;
+ 	}
+ 
++	amdgpu_bo_list_for_each_entry(e, p->bo_list) {
++		struct amdgpu_bo *bo = ttm_to_amdgpu_bo(e->tv.bo);
++
++		e->bo_va = amdgpu_vm_bo_find(vm, bo);
++
++		if (bo->tbo.base.dma_buf && !amdgpu_bo_explicit_sync(bo)) {
++			e->chain = dma_fence_chain_alloc();
++			if (!e->chain) {
++				r = -ENOMEM;
++				goto error_validate;
++			}
++		}
++	}
++
+ 	amdgpu_cs_get_threshold_for_moves(p->adev, &p->bytes_moved_threshold,
+ 					  &p->bytes_moved_vis_threshold);
+ 	p->bytes_moved = 0;
+@@ -599,15 +613,6 @@ static int amdgpu_cs_parser_bos(struct amdgpu_cs_parser *p,
+ 	gws = p->bo_list->gws_obj;
+ 	oa = p->bo_list->oa_obj;
+ 
+-	amdgpu_bo_list_for_each_entry(e, p->bo_list) {
+-		struct amdgpu_bo *bo = ttm_to_amdgpu_bo(e->tv.bo);
+-
+-		/* Make sure we use the exclusive slot for shared BOs */
+-		if (bo->prime_shared_count)
+-			e->tv.num_shared = 0;
+-		e->bo_va = amdgpu_vm_bo_find(vm, bo);
+-	}
+-
+ 	if (gds) {
+ 		p->job->gds_base = amdgpu_bo_gpu_offset(gds) >> PAGE_SHIFT;
+ 		p->job->gds_size = amdgpu_bo_size(gds) >> PAGE_SHIFT;
+@@ -629,8 +634,13 @@ static int amdgpu_cs_parser_bos(struct amdgpu_cs_parser *p,
+ 	}
+ 
+ error_validate:
+-	if (r)
++	if (r) {
++		amdgpu_bo_list_for_each_entry(e, p->bo_list) {
++			dma_fence_chain_free(e->chain);
++			e->chain = NULL;
++		}
+ 		ttm_eu_backoff_reservation(&p->ticket, &p->validated);
++	}
+ out:
+ 	return r;
+ }
+@@ -670,9 +680,17 @@ static void amdgpu_cs_parser_fini(struct amdgpu_cs_parser *parser, int error,
+ {
+ 	unsigned i;
+ 
+-	if (error && backoff)
++	if (error && backoff) {
++		struct amdgpu_bo_list_entry *e;
++
++		amdgpu_bo_list_for_each_entry(e, parser->bo_list) {
++			dma_fence_chain_free(e->chain);
++			e->chain = NULL;
++		}
++
+ 		ttm_eu_backoff_reservation(&parser->ticket,
+ 					   &parser->validated);
++	}
+ 
+ 	for (i = 0; i < parser->num_post_deps; i++) {
+ 		drm_syncobj_put(parser->post_deps[i].syncobj);
+@@ -1245,6 +1263,28 @@ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
+ 
+ 	amdgpu_vm_move_to_lru_tail(p->adev, &fpriv->vm);
+ 
++	amdgpu_bo_list_for_each_entry(e, p->bo_list) {
++		struct dma_resv *resv = e->tv.bo->base.resv;
++		struct dma_fence_chain *chain = e->chain;
++
++		if (!chain)
++			continue;
++
++		/*
++		 * Work around dma_resv shortcommings by wrapping up the
++		 * submission in a dma_fence_chain and add it as exclusive
++		 * fence, but first add the submission as shared fence to make
++		 * sure that shared fences never signal before the exclusive
++		 * one.
++		 */
++		dma_fence_chain_init(chain, dma_resv_excl_fence(resv),
++				     dma_fence_get(p->fence), 1);
++
++		dma_resv_add_shared_fence(resv, p->fence);
++		rcu_assign_pointer(resv->fence_excl, &chain->base);
++		e->chain = NULL;
++	}
++
+ 	ttm_eu_fence_buffer_objects(&p->ticket, &p->validated, p->fence);
+ 	mutex_unlock(&p->adev->notifier_lock);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+index a9475b207510..ae6ab93c868b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+@@ -42,48 +42,6 @@
+ #include <linux/pci-p2pdma.h>
+ #include <linux/pm_runtime.h>
+ 
+-static int
+-__dma_resv_make_exclusive(struct dma_resv *obj)
+-{
+-	struct dma_fence **fences;
+-	unsigned int count;
+-	int r;
+-
+-	if (!dma_resv_shared_list(obj)) /* no shared fences to convert */
+-		return 0;
+-
+-	r = dma_resv_get_fences(obj, NULL, &count, &fences);
+-	if (r)
+-		return r;
+-
+-	if (count == 0) {
+-		/* Now that was unexpected. */
+-	} else if (count == 1) {
+-		dma_resv_add_excl_fence(obj, fences[0]);
+-		dma_fence_put(fences[0]);
+-		kfree(fences);
+-	} else {
+-		struct dma_fence_array *array;
+-
+-		array = dma_fence_array_create(count, fences,
+-					       dma_fence_context_alloc(1), 0,
+-					       false);
+-		if (!array)
+-			goto err_fences_put;
+-
+-		dma_resv_add_excl_fence(obj, &array->base);
+-		dma_fence_put(&array->base);
+-	}
+-
+-	return 0;
+-
+-err_fences_put:
+-	while (count--)
+-		dma_fence_put(fences[count]);
+-	kfree(fences);
+-	return -ENOMEM;
+-}
+-
+ /**
+  * amdgpu_dma_buf_attach - &dma_buf_ops.attach implementation
+  *
+@@ -110,24 +68,6 @@ static int amdgpu_dma_buf_attach(struct dma_buf *dmabuf,
+ 	if (r < 0)
+ 		goto out;
+ 
+-	r = amdgpu_bo_reserve(bo, false);
+-	if (unlikely(r != 0))
+-		goto out;
+-
+-	/*
+-	 * We only create shared fences for internal use, but importers
+-	 * of the dmabuf rely on exclusive fences for implicitly
+-	 * tracking write hazards. As any of the current fences may
+-	 * correspond to a write, we need to convert all existing
+-	 * fences on the reservation object into a single exclusive
+-	 * fence.
+-	 */
+-	r = __dma_resv_make_exclusive(bo->tbo.base.resv);
+-	if (r)
+-		goto out;
+-
+-	bo->prime_shared_count++;
+-	amdgpu_bo_unreserve(bo);
+ 	return 0;
+ 
+ out:
+@@ -150,9 +90,6 @@ static void amdgpu_dma_buf_detach(struct dma_buf *dmabuf,
+ 	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+ 
+-	if (attach->dev->driver != adev->dev->driver && bo->prime_shared_count)
+-		bo->prime_shared_count--;
+-
+ 	pm_runtime_mark_last_busy(adev_to_drm(adev)->dev);
+ 	pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
+ }
+@@ -418,8 +355,6 @@ amdgpu_dma_buf_create_obj(struct drm_device *dev, struct dma_buf *dma_buf)
+ 	bo = gem_to_amdgpu_bo(gobj);
+ 	bo->allowed_domains = AMDGPU_GEM_DOMAIN_GTT;
+ 	bo->preferred_domains = AMDGPU_GEM_DOMAIN_GTT;
+-	if (dma_buf->ops != &amdgpu_dmabuf_ops)
+-		bo->prime_shared_count = 1;
+ 
+ 	dma_resv_unlock(resv);
+ 	return gobj;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index 854fc497844b..611fd10c3410 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -838,7 +838,8 @@ int amdgpu_gem_op_ioctl(struct drm_device *dev, void *data,
+ 		break;
+ 	}
+ 	case AMDGPU_GEM_OP_SET_PLACEMENT:
+-		if (robj->prime_shared_count && (args->value & AMDGPU_GEM_DOMAIN_VRAM)) {
++		if (robj->tbo.base.import_attach &&
++		    args->value & AMDGPU_GEM_DOMAIN_VRAM) {
+ 			r = -EINVAL;
+ 			amdgpu_bo_unreserve(robj);
+ 			break;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 92c8e6e7f346..18b7bbddbe61 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -913,7 +913,7 @@ int amdgpu_bo_pin_restricted(struct amdgpu_bo *bo, u32 domain,
+ 		return -EINVAL;
+ 
+ 	/* A shared bo cannot be migrated to VRAM */
+-	if (bo->prime_shared_count || bo->tbo.base.import_attach) {
++	if (bo->tbo.base.import_attach) {
+ 		if (domain & AMDGPU_GEM_DOMAIN_GTT)
+ 			domain = AMDGPU_GEM_DOMAIN_GTT;
+ 		else
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+index 38c834d0f930..e72f329e7f18 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+@@ -100,7 +100,6 @@ struct amdgpu_bo {
+ 	struct ttm_buffer_object	tbo;
+ 	struct ttm_bo_kmap_obj		kmap;
+ 	u64				flags;
+-	unsigned			prime_shared_count;
+ 	/* per VM structure for page tables and with virtual addresses */
+ 	struct amdgpu_vm_bo_base	*vm_bo;
+ 	/* Constant after initialization */
+-- 
+2.38.1
+
