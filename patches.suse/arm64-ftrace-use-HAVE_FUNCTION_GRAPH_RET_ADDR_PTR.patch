@@ -1,0 +1,239 @@
+From: Mark Rutland <mark.rutland@arm.com>
+Date: Fri, 29 Oct 2021 17:22:45 +0100
+Subject: arm64: ftrace: use HAVE_FUNCTION_GRAPH_RET_ADDR_PTR
+Patch-mainline: v5.16-rc3
+Git-commit: c6d3cd32fd0064af7611d00877a67e6993bf220b
+References: jsc#PED-1368
+
+When CONFIG_FUNCTION_GRAPH_TRACER is selected and the function graph
+tracer is in use, unwind_frame() may erroneously associate a traced
+function with an incorrect return address. This can happen when starting
+an unwind from a pt_regs, or when unwinding across an exception
+boundary.
+
+This can be seen when recording with perf while the function graph
+tracer is in use. For example:
+
+| # echo function_graph > /sys/kernel/debug/tracing/current_tracer
+| # perf record -g -e raw_syscalls:sys_enter:k /bin/true
+| # perf report
+
+... reports the callchain erroneously as:
+
+| el0t_64_sync
+| el0t_64_sync_handler
+| el0_svc_common.constprop.0
+| perf_callchain
+| get_perf_callchain
+| syscall_trace_enter
+| syscall_trace_enter
+
+... whereas when the function graph tracer is not in use, it reports:
+
+| el0t_64_sync
+| el0t_64_sync_handler
+| el0_svc
+| do_el0_svc
+| el0_svc_common.constprop.0
+| syscall_trace_enter
+| syscall_trace_enter
+
+The underlying problem is that ftrace_graph_get_ret_stack() takes an
+index offset from the most recent entry added to the fgraph return
+stack. We start an unwind at offset 0, and increment the offset each
+time we encounter a rewritten return address (i.e. when we see
+`return_to_handler`). This is broken in two cases:
+
+1) Between creating a pt_regs and starting the unwind, function calls
+   may place entries on the stack, leaving an arbitrary offset which we
+   can only determine by performing a full unwind from the caller of the
+   unwind code (and relying on none of the unwind code being
+   instrumented).
+
+   This can result in erroneous entries being reported in a backtrace
+   recorded by perf or kfence when the function graph tracer is in use.
+   Currently show_regs() is unaffected as dump_backtrace() performs an
+   initial unwind.
+
+2) When unwinding across an exception boundary (whether continuing an
+   unwind or starting a new unwind from regs), we currently always skip
+   the LR of the interrupted context. Where this was live and contained
+   a rewritten address, we won't consume the corresponding fgraph ret
+   stack entry, leaving subsequent entries off-by-one.
+
+   This can result in erroneous entries being reported in a backtrace
+   performed by any in-kernel unwinder when that backtrace crosses an
+   exception boundary, with entries after the boundary being reported
+   incorrectly. This includes perf, kfence, show_regs(), panic(), etc.
+
+To fix this, we need to be able to uniquely identify each rewritten
+return address such that we can map this back to the original return
+address. We can use HAVE_FUNCTION_GRAPH_RET_ADDR_PTR to associate
+each rewritten return address with a unique location on the stack. As
+the return address is passed in the LR (and so is not guaranteed a
+unique location in memory), we use the FP upon entry to the function
+(i.e. the address of the caller's frame record) as the return address
+pointer. Any nested call will have a different FP value as the caller
+must create its own frame record and update FP to point to this.
+
+Since ftrace_graph_ret_addr() requires the return address with the PAC
+stripped, the stripping of the PAC is moved before the fixup of the
+rewritten address. As we would unconditionally strip the PAC, moving
+this earlier is not harmful, and we can avoid a redundant strip in the
+return address fixup code.
+
+I've tested this with the perf case above, the ftrace selftests, and
+a number of ad-hoc unwinder tests. The tests all pass, and I have seen
+no unexpected behaviour as a result of this change. I've tested with
+pointer authentication under QEMU TCG where magic-sysrq+l correctly
+recovers the original return addresses.
+
+Note that this doesn't fix the issue of skipping a live LR at an
+exception boundary, which is a more general problem and requires more
+substantial rework. Were we to consume the LR in all cases this would
+result in warnings where the interrupted context's LR contains
+`return_to_handler`, but the FP has been altered, e.g.
+
+| func:
+|	<--- ftrace entry ---> 	// logs FP & LR, rewrites LR
+| 	STP	FP, LR, [SP, #-16]!
+| 	MOV	FP, SP
+| 	<--- INTERRUPT --->
+
+... as ftrace_graph_get_ret_stack() fill not find a matching entry,
+triggering the WARN_ON_ONCE() in unwind_frame().
+
+Link: https://lore.kernel.org/r/20211025164925.GB2001@C02TD0UTHF1T.local
+Link: https://lore.kernel.org/r/20211027132529.30027-1-mark.rutland@arm.com
+Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Madhavan T. Venkataraman <madvenka@linux.microsoft.com>
+Cc: Mark Brown <broonie@kernel.org>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Will Deacon <will@kernel.org>
+Reviewed-by: Mark Brown <broonie@kernel.org>
+Link: https://lore.kernel.org/r/20211029162245.39761-1-mark.rutland@arm.com
+Signed-off-by: Will Deacon <will@kernel.org>
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ arch/arm64/include/asm/ftrace.h     |   11 +++++++++++
+ arch/arm64/include/asm/stacktrace.h |    6 ------
+ arch/arm64/kernel/ftrace.c          |    6 +++---
+ arch/arm64/kernel/stacktrace.c      |   18 ++++++++----------
+ 4 files changed, 22 insertions(+), 19 deletions(-)
+
+--- a/arch/arm64/include/asm/ftrace.h
++++ b/arch/arm64/include/asm/ftrace.h
+@@ -12,6 +12,17 @@
+ 
+ #define HAVE_FUNCTION_GRAPH_FP_TEST
+ 
++/*
++ * HAVE_FUNCTION_GRAPH_RET_ADDR_PTR means that the architecture can provide a
++ * "return address pointer" which can be used to uniquely identify a return
++ * address which has been overwritten.
++ *
++ * On arm64 we use the address of the caller's frame record, which remains the
++ * same for the lifetime of the instrumented function, unlike the return
++ * address in the LR.
++ */
++#define HAVE_FUNCTION_GRAPH_RET_ADDR_PTR
++
+ #ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
+ #define ARCH_SUPPORTS_FTRACE_OPS 1
+ #else
+--- a/arch/arm64/include/asm/stacktrace.h
++++ b/arch/arm64/include/asm/stacktrace.h
+@@ -47,9 +47,6 @@ struct stack_info {
+  * @prev_type:   The type of stack this frame record was on, or a synthetic
+  *               value of STACK_TYPE_UNKNOWN. This is used to detect a
+  *               transition from one stack to another.
+- *
+- * @graph:       When FUNCTION_GRAPH_TRACER is selected, holds the index of a
+- *               replacement lr value in the ftrace graph stack.
+  */
+ struct stackframe {
+ 	unsigned long fp;
+@@ -57,9 +54,6 @@ struct stackframe {
+ 	DECLARE_BITMAP(stacks_done, __NR_STACK_TYPES);
+ 	unsigned long prev_fp;
+ 	enum stack_type prev_type;
+-#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+-	int graph;
+-#endif
+ #ifdef CONFIG_KRETPROBES
+ 	struct llist_node *kr_cur;
+ #endif
+--- a/arch/arm64/kernel/ftrace.c
++++ b/arch/arm64/kernel/ftrace.c
+@@ -249,8 +249,6 @@ int __init ftrace_dyn_arch_init(void)
+  * on the way back to parent. For this purpose, this function is called
+  * in _mcount() or ftrace_caller() to replace return address (*parent) on
+  * the call stack to return_to_handler.
+- *
+- * Note that @frame_pointer is used only for sanity check later.
+  */
+ void prepare_ftrace_return(unsigned long self_addr, unsigned long *parent,
+ 			   unsigned long frame_pointer)
+@@ -268,8 +266,10 @@ void prepare_ftrace_return(unsigned long
+ 	 */
+ 	old = *parent;
+ 
+-	if (!function_graph_enter(old, self_addr, frame_pointer, NULL))
++	if (!function_graph_enter(old, self_addr, frame_pointer,
++	    (void *)frame_pointer)) {
+ 		*parent = return_hooker;
++	}
+ }
+ 
+ #ifdef CONFIG_DYNAMIC_FTRACE
+--- a/arch/arm64/kernel/stacktrace.c
++++ b/arch/arm64/kernel/stacktrace.c
+@@ -38,9 +38,6 @@ void start_backtrace(struct stackframe *
+ {
+ 	frame->fp = fp;
+ 	frame->pc = pc;
+-#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+-	frame->graph = 0;
+-#endif
+ #ifdef CONFIG_KRETPROBES
+ 	frame->kr_cur = NULL;
+ #endif
+@@ -116,20 +113,23 @@ int notrace unwind_frame(struct task_str
+ 	frame->prev_fp = fp;
+ 	frame->prev_type = info.type;
+ 
++	frame->pc = ptrauth_strip_insn_pac(frame->pc);
++
+ #ifdef CONFIG_FUNCTION_GRAPH_TRACER
+ 	if (tsk->ret_stack &&
+-		(ptrauth_strip_insn_pac(frame->pc) == (unsigned long)return_to_handler)) {
+-		struct ftrace_ret_stack *ret_stack;
++		(frame->pc == (unsigned long)return_to_handler)) {
++		unsigned long orig_pc;
+ 		/*
+ 		 * This is a case where function graph tracer has
+ 		 * modified a return address (LR) in a stack frame
+ 		 * to hook a function return.
+ 		 * So replace it to an original value.
+ 		 */
+-		ret_stack = ftrace_graph_get_ret_stack(tsk, frame->graph++);
+-		if (WARN_ON_ONCE(!ret_stack))
++		orig_pc = ftrace_graph_ret_addr(tsk, NULL, frame->pc,
++						(void *)frame->fp);
++		if (WARN_ON_ONCE(frame->pc == orig_pc))
+ 			return -EINVAL;
+-		frame->pc = ret_stack->ret;
++		frame->pc = orig_pc;
+ 	}
+ #endif /* CONFIG_FUNCTION_GRAPH_TRACER */
+ #ifdef CONFIG_KRETPROBES
+@@ -137,8 +137,6 @@ int notrace unwind_frame(struct task_str
+ 		frame->pc = kretprobe_find_ret_addr(tsk, (void *)frame->fp, &frame->kr_cur);
+ #endif
+ 
+-	frame->pc = ptrauth_strip_insn_pac(frame->pc);
+-
+ 	return 0;
+ }
+ NOKPROBE_SYMBOL(unwind_frame);
