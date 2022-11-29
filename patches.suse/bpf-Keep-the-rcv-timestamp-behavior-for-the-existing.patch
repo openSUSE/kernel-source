@@ -1,0 +1,225 @@
+From: Martin KaFai Lau <kafai@fb.com>
+Date: Wed, 2 Mar 2022 11:56:28 -0800
+Subject: bpf: Keep the (rcv) timestamp behavior for the existing
+ tc-bpf@ingress
+Patch-mainline: v5.18-rc1
+Git-commit: 7449197d600d30d038b1ce6285ab4747096eac7f
+References: jsc#PED-1368
+
+The current tc-bpf@ingress reads and writes the __sk_buff->tstamp
+as a (rcv) timestamp which currently could either be 0 (not available)
+or ktime_get_real().  This patch is to backward compatible with the
+(rcv) timestamp expectation at ingress.  If the skb->tstamp has
+the delivery_time, the bpf insn rewrite will read 0 for tc-bpf
+running at ingress as it is not available.  When writing at ingress,
+it will also clear the skb->mono_delivery_time bit.
+
+/* BPF_READ: a = __sk_buff->tstamp */
+if (!skb->tc_at_ingress || !skb->mono_delivery_time)
+	a = skb->tstamp;
+else
+	a = 0
+
+/* BPF_WRITE: __sk_buff->tstamp = a */
+if (skb->tc_at_ingress)
+	skb->mono_delivery_time = 0;
+skb->tstamp = a;
+
+[ A note on the BPF_CGROUP_INET_INGRESS which can also access
+  skb->tstamp.  At that point, the skb is delivered locally
+  and skb_clear_delivery_time() has already been done,
+  so the skb->tstamp will only have the (rcv) timestamp. ]
+
+If the tc-bpf@egress writes 0 to skb->tstamp, the skb->mono_delivery_time
+has to be cleared also.  It could be done together during
+convert_ctx_access().  However, the latter patch will also expose
+the skb->mono_delivery_time bit as __sk_buff->delivery_time_type.
+Changing the delivery_time_type in the background may surprise
+the user, e.g. the 2nd read on __sk_buff->delivery_time_type
+may need a READ_ONCE() to avoid compiler optimization.  Thus,
+in expecting the needs in the latter patch, this patch does a
+check on !skb->tstamp after running the tc-bpf and clears the
+skb->mono_delivery_time bit if needed.  The earlier discussion
+on v4 [0].
+
+The bpf insn rewrite requires the skb's mono_delivery_time bit and
+tc_at_ingress bit.  They are moved up in sk_buff so that bpf rewrite
+can be done at a fixed offset.  tc_skip_classify is moved together with
+tc_at_ingress.  To get one bit for mono_delivery_time, csum_not_inet is
+moved down and this bit is currently used by sctp.
+
+[0]: https://lore.kernel.org/bpf/20220217015043.khqwqklx45c4m4se@kafai-mbp.dhcp.thefacebook.com/
+
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/linux/skbuff.h |   18 ++++++++----
+ net/core/filter.c      |   71 ++++++++++++++++++++++++++++++++++++++++++-------
+ net/sched/act_bpf.c    |    2 +
+ net/sched/cls_bpf.c    |    2 +
+ 4 files changed, 77 insertions(+), 16 deletions(-)
+
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -844,8 +844,12 @@ struct sk_buff {
+ 	__u8			vlan_present:1;	/* See PKT_VLAN_PRESENT_BIT */
+ 	__u8			csum_complete_sw:1;
+ 	__u8			csum_level:2;
+-	__u8			csum_not_inet:1;
+ 	__u8			dst_pending_confirm:1;
++	__u8			mono_delivery_time:1;
++#ifdef CONFIG_NET_CLS_ACT
++	__u8			tc_skip_classify:1;
++	__u8			tc_at_ingress:1;
++#endif
+ #ifdef CONFIG_IPV6_NDISC_NODETYPE
+ 	__u8			ndisc_nodetype:2;
+ #endif
+@@ -857,10 +861,6 @@ struct sk_buff {
+ 	__u8			offload_fwd_mark:1;
+ 	__u8			offload_l3_fwd_mark:1;
+ #endif
+-#ifdef CONFIG_NET_CLS_ACT
+-	__u8			tc_skip_classify:1;
+-	__u8			tc_at_ingress:1;
+-#endif
+ 	__u8			redirected:1;
+ #ifdef CONFIG_NET_REDIRECT
+ 	__u8			from_ingress:1;
+@@ -869,7 +869,7 @@ struct sk_buff {
+ 	__u8			decrypted:1;
+ #endif
+ 	__u8			slow_gro:1;
+-	__u8			mono_delivery_time:1;
++	__u8			csum_not_inet:1;
+ 
+ #ifdef CONFIG_NET_SCHED
+ 	__u16			tc_index;	/* traffic control index */
+@@ -949,10 +949,16 @@ struct sk_buff {
+ /* if you move pkt_vlan_present around you also must adapt these constants */
+ #ifdef __BIG_ENDIAN_BITFIELD
+ #define PKT_VLAN_PRESENT_BIT	7
++#define TC_AT_INGRESS_MASK		(1 << 0)
++#define SKB_MONO_DELIVERY_TIME_MASK	(1 << 2)
+ #else
+ #define PKT_VLAN_PRESENT_BIT	0
++#define TC_AT_INGRESS_MASK		(1 << 7)
++#define SKB_MONO_DELIVERY_TIME_MASK	(1 << 5)
+ #endif
+ #define PKT_VLAN_PRESENT_OFFSET	offsetof(struct sk_buff, __pkt_vlan_present_offset)
++#define TC_AT_INGRESS_OFFSET offsetof(struct sk_buff, __pkt_vlan_present_offset)
++#define SKB_MONO_DELIVERY_TIME_OFFSET offsetof(struct sk_buff, __pkt_vlan_present_offset)
+ 
+ #ifdef __KERNEL__
+ /*
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -8859,6 +8859,65 @@ static struct bpf_insn *bpf_convert_shin
+ 	return insn;
+ }
+ 
++static struct bpf_insn *bpf_convert_tstamp_read(const struct bpf_insn *si,
++						struct bpf_insn *insn)
++{
++	__u8 value_reg = si->dst_reg;
++	__u8 skb_reg = si->src_reg;
++
++#ifdef CONFIG_NET_CLS_ACT
++	__u8 tmp_reg = BPF_REG_AX;
++
++	*insn++ = BPF_LDX_MEM(BPF_B, tmp_reg, skb_reg, TC_AT_INGRESS_OFFSET);
++	*insn++ = BPF_ALU32_IMM(BPF_AND, tmp_reg, TC_AT_INGRESS_MASK);
++	*insn++ = BPF_JMP32_IMM(BPF_JEQ, tmp_reg, 0, 5);
++	/* @ingress, read __sk_buff->tstamp as the (rcv) timestamp,
++	 * so check the skb->mono_delivery_time.
++	 */
++	*insn++ = BPF_LDX_MEM(BPF_B, tmp_reg, skb_reg,
++			      SKB_MONO_DELIVERY_TIME_OFFSET);
++	*insn++ = BPF_ALU32_IMM(BPF_AND, tmp_reg,
++				SKB_MONO_DELIVERY_TIME_MASK);
++	*insn++ = BPF_JMP32_IMM(BPF_JEQ, tmp_reg, 0, 2);
++	/* skb->mono_delivery_time is set, read 0 as the (rcv) timestamp. */
++	*insn++ = BPF_MOV64_IMM(value_reg, 0);
++	*insn++ = BPF_JMP_A(1);
++#endif
++
++	*insn++ = BPF_LDX_MEM(BPF_DW, value_reg, skb_reg,
++			      offsetof(struct sk_buff, tstamp));
++	return insn;
++}
++
++static struct bpf_insn *bpf_convert_tstamp_write(const struct bpf_insn *si,
++						 struct bpf_insn *insn)
++{
++	__u8 value_reg = si->src_reg;
++	__u8 skb_reg = si->dst_reg;
++
++#ifdef CONFIG_NET_CLS_ACT
++	__u8 tmp_reg = BPF_REG_AX;
++
++	*insn++ = BPF_LDX_MEM(BPF_B, tmp_reg, skb_reg, TC_AT_INGRESS_OFFSET);
++	*insn++ = BPF_ALU32_IMM(BPF_AND, tmp_reg, TC_AT_INGRESS_MASK);
++	*insn++ = BPF_JMP32_IMM(BPF_JEQ, tmp_reg, 0, 3);
++	/* Writing __sk_buff->tstamp at ingress as the (rcv) timestamp.
++	 * Clear the skb->mono_delivery_time.
++	 */
++	*insn++ = BPF_LDX_MEM(BPF_B, tmp_reg, skb_reg,
++			      SKB_MONO_DELIVERY_TIME_OFFSET);
++	*insn++ = BPF_ALU32_IMM(BPF_AND, tmp_reg,
++				~SKB_MONO_DELIVERY_TIME_MASK);
++	*insn++ = BPF_STX_MEM(BPF_B, skb_reg, tmp_reg,
++			      SKB_MONO_DELIVERY_TIME_OFFSET);
++#endif
++
++	/* skb->tstamp = tstamp */
++	*insn++ = BPF_STX_MEM(BPF_DW, skb_reg, value_reg,
++			      offsetof(struct sk_buff, tstamp));
++	return insn;
++}
++
+ static u32 bpf_convert_ctx_access(enum bpf_access_type type,
+ 				  const struct bpf_insn *si,
+ 				  struct bpf_insn *insn_buf,
+@@ -9167,17 +9226,9 @@ static u32 bpf_convert_ctx_access(enum b
+ 		BUILD_BUG_ON(sizeof_field(struct sk_buff, tstamp) != 8);
+ 
+ 		if (type == BPF_WRITE)
+-			*insn++ = BPF_STX_MEM(BPF_DW,
+-					      si->dst_reg, si->src_reg,
+-					      bpf_target_off(struct sk_buff,
+-							     tstamp, 8,
+-							     target_size));
++			insn = bpf_convert_tstamp_write(si, insn);
+ 		else
+-			*insn++ = BPF_LDX_MEM(BPF_DW,
+-					      si->dst_reg, si->src_reg,
+-					      bpf_target_off(struct sk_buff,
+-							     tstamp, 8,
+-							     target_size));
++			insn = bpf_convert_tstamp_read(si, insn);
+ 		break;
+ 
+ 	case offsetof(struct __sk_buff, gso_segs):
+--- a/net/sched/act_bpf.c
++++ b/net/sched/act_bpf.c
+@@ -53,6 +53,8 @@ static int tcf_bpf_act(struct sk_buff *s
+ 		bpf_compute_data_pointers(skb);
+ 		filter_res = bpf_prog_run(filter, skb);
+ 	}
++	if (unlikely(!skb->tstamp && skb->mono_delivery_time))
++		skb->mono_delivery_time = 0;
+ 	if (skb_sk_is_prefetched(skb) && filter_res != TC_ACT_OK)
+ 		skb_orphan(skb);
+ 
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@ -102,6 +102,8 @@ static int cls_bpf_classify(struct sk_bu
+ 			bpf_compute_data_pointers(skb);
+ 			filter_res = bpf_prog_run(prog->filter, skb);
+ 		}
++		if (unlikely(!skb->tstamp && skb->mono_delivery_time))
++			skb->mono_delivery_time = 0;
+ 
+ 		if (prog->exts_integrated) {
+ 			res->class   = 0;
