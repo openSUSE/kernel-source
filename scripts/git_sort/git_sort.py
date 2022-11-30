@@ -261,6 +261,7 @@ remotes = (
     Head(RepoURL("bpf/bpf.git")),
     Head(RepoURL("bpf/bpf-next.git")),
     Head(RepoURL("linusw/linux-gpio.git"), "for-next"),
+    Head(RepoURL("soc/soc.git"), "for-next"),
 )
 
 
