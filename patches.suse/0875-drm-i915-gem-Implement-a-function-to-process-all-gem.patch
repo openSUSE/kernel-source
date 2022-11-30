@@ -1,0 +1,166 @@
+From a965f8d0f4602e6781088859a34b96744fea3352 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Thomas=20Hellstr=C3=B6m?= <thomas.hellstrom@linux.intel.com>
+Date: Wed, 22 Sep 2021 08:25:20 +0200
+Subject: drm/i915/gem: Implement a function to process all gem objects of a
+ region
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: d80ee88e0769e2e05afeb5d04b4dc43fc107b0d5
+Patch-mainline: v5.16-rc1
+References: jsc#PED-1166 jsc#PED-1168 jsc#PED-1170 jsc#PED-1218 jsc#PED-1220 jsc#PED-1222 jsc#PED-1223 jsc#PED-1225
+
+An upcoming common pattern is to traverse the region object list and
+perform certain actions on all objects in a region. It's a little tricky
+to get the list locking right, in particular since a gem object may
+change region unless it's pinned or the object lock is held.
+
+Define a function that does this for us and that takes an argument that
+defines the action to be performed on each object.
+
+v3:
+- Improve structure documentation a bit (Matthew Auld)
+
+Signed-off-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Reviewed-by: Matthew Auld <matthew.auld@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210922062527.865433-3-thomas.hellstrom@linux.intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/i915/gem/i915_gem_region.c | 70 ++++++++++++++++++++++
+ drivers/gpu/drm/i915/gem/i915_gem_region.h | 37 ++++++++++++
+ 2 files changed, 107 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_region.c b/drivers/gpu/drm/i915/gem/i915_gem_region.c
+index 1f557b2178ed..a016ccec36f3 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_region.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_region.c
+@@ -80,3 +80,73 @@ i915_gem_object_create_region(struct intel_memory_region *mem,
+ 	i915_gem_object_free(obj);
+ 	return ERR_PTR(err);
+ }
++
++/**
++ * i915_gem_process_region - Iterate over all objects of a region using ops
++ * to process and optionally skip objects
++ * @mr: The memory region
++ * @apply: ops and private data
++ *
++ * This function can be used to iterate over the regions object list,
++ * checking whether to skip objects, and, if not, lock the objects and
++ * process them using the supplied ops. Note that this function temporarily
++ * removes objects from the region list while iterating, so that if run
++ * concurrently with itself may not iterate over all objects.
++ *
++ * Return: 0 if successful, negative error code on failure.
++ */
++int i915_gem_process_region(struct intel_memory_region *mr,
++			    struct i915_gem_apply_to_region *apply)
++{
++	const struct i915_gem_apply_to_region_ops *ops = apply->ops;
++	struct drm_i915_gem_object *obj;
++	struct list_head still_in_list;
++	int ret = 0;
++
++	/*
++	 * In the future, a non-NULL apply->ww could mean the caller is
++	 * already in a locking transaction and provides its own context.
++	 */
++	GEM_WARN_ON(apply->ww);
++
++	INIT_LIST_HEAD(&still_in_list);
++	mutex_lock(&mr->objects.lock);
++	for (;;) {
++		struct i915_gem_ww_ctx ww;
++
++		obj = list_first_entry_or_null(&mr->objects.list, typeof(*obj),
++					       mm.region_link);
++		if (!obj)
++			break;
++
++		list_move_tail(&obj->mm.region_link, &still_in_list);
++		if (!kref_get_unless_zero(&obj->base.refcount))
++			continue;
++
++		/*
++		 * Note: Someone else might be migrating the object at this
++		 * point. The object's region is not stable until we lock
++		 * the object.
++		 */
++		mutex_unlock(&mr->objects.lock);
++		apply->ww = &ww;
++		for_i915_gem_ww(&ww, ret, apply->interruptible) {
++			ret = i915_gem_object_lock(obj, apply->ww);
++			if (ret)
++				continue;
++
++			if (obj->mm.region == mr)
++				ret = ops->process_obj(apply, obj);
++			/* Implicit object unlock */
++		}
++
++		i915_gem_object_put(obj);
++		mutex_lock(&mr->objects.lock);
++		if (ret)
++			break;
++	}
++	list_splice_tail(&still_in_list, &mr->objects.list);
++	mutex_unlock(&mr->objects.lock);
++
++	return ret;
++}
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_region.h b/drivers/gpu/drm/i915/gem/i915_gem_region.h
+index 1008e580a89a..fcaa12d657d4 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_region.h
++++ b/drivers/gpu/drm/i915/gem/i915_gem_region.h
+@@ -12,6 +12,41 @@ struct intel_memory_region;
+ struct drm_i915_gem_object;
+ struct sg_table;
+ 
++struct i915_gem_apply_to_region;
++
++/**
++ * struct i915_gem_apply_to_region_ops - ops to use when iterating over all
++ * region objects.
++ */
++struct i915_gem_apply_to_region_ops {
++	/**
++	 * process_obj - Process the current object
++	 * @apply: Embed this for private data.
++	 * @obj: The current object.
++	 *
++	 * Note that if this function is part of a ww transaction, and
++	 * if returns -EDEADLK for one of the objects, it may be
++	 * rerun for that same object in the same pass.
++	 */
++	int (*process_obj)(struct i915_gem_apply_to_region *apply,
++			   struct drm_i915_gem_object *obj);
++};
++
++/**
++ * struct i915_gem_apply_to_region - Argument to the struct
++ * i915_gem_apply_to_region_ops functions.
++ * @ops: The ops for the operation.
++ * @ww: Locking context used for the transaction.
++ * @interruptible: Whether to perform object locking interruptible.
++ *
++ * This structure is intended to be embedded in a private struct if needed
++ */
++struct i915_gem_apply_to_region {
++	const struct i915_gem_apply_to_region_ops *ops;
++	struct i915_gem_ww_ctx *ww;
++	u32 interruptible:1;
++};
++
+ void i915_gem_object_init_memory_region(struct drm_i915_gem_object *obj,
+ 					struct intel_memory_region *mem);
+ void i915_gem_object_release_memory_region(struct drm_i915_gem_object *obj);
+@@ -22,4 +57,6 @@ i915_gem_object_create_region(struct intel_memory_region *mem,
+ 			      resource_size_t page_size,
+ 			      unsigned int flags);
+ 
++int i915_gem_process_region(struct intel_memory_region *mr,
++			    struct i915_gem_apply_to_region *apply);
+ #endif
+-- 
+2.38.1
+
