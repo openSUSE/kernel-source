@@ -1,0 +1,159 @@
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Mon, 25 Apr 2022 03:18:52 +0530
+Subject: bpf: Prevent escaping of kptr loaded from maps
+Patch-mainline: v5.19-rc1
+Git-commit: 6efe152d4061a83a2c5db6a0e5b58f9345c9742f
+References: jsc#PED-1368
+
+While we can guarantee that even for unreferenced kptr, the object
+pointer points to being freed etc. can be handled by the verifier's
+exception handling (normal load patching to PROBE_MEM loads), we still
+cannot allow the user to pass these pointers to BPF helpers and kfunc,
+because the same exception handling won't be done for accesses inside
+the kernel. The same is true if a referenced pointer is loaded using
+normal load instruction. Since the reference is not guaranteed to be
+held while the pointer is used, it must be marked as untrusted.
+
+Hence introduce a new type flag, PTR_UNTRUSTED, which is used to mark
+all registers loading unreferenced and referenced kptr from BPF maps,
+and ensure they can never escape the BPF program and into the kernel by
+way of calling stable/unstable helpers.
+
+In check_ptr_to_btf_access, the !type_may_be_null check to reject type
+flags is still correct, as apart from PTR_MAYBE_NULL, only MEM_USER,
+MEM_PERCPU, and PTR_UNTRUSTED may be set for PTR_TO_BTF_ID. The first
+two are checked inside the function and rejected using a proper error
+message, but we still want to allow dereference of untrusted case.
+
+Also, we make sure to inherit PTR_UNTRUSTED when chain of pointers are
+walked, so that this flag is never dropped once it has been set on a
+PTR_TO_BTF_ID (i.e. trusted to untrusted transition can only be in one
+direction).
+
+In convert_ctx_accesses, extend the switch case to consider untrusted
+PTR_TO_BTF_ID in addition to normal PTR_TO_BTF_ID for PROBE_MEM
+conversion for BPF_LDX.
+
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20220424214901.2743946-5-memxor@gmail.com
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/linux/bpf.h   |   10 +++++++++-
+ kernel/bpf/verifier.c |   35 ++++++++++++++++++++++++++++-------
+ 2 files changed, 37 insertions(+), 8 deletions(-)
+
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -375,7 +375,15 @@ enum bpf_type_flag {
+ 	/* Indicates that the argument will be released. */
+ 	OBJ_RELEASE		= BIT(5 + BPF_BASE_TYPE_BITS),
+ 
+-	__BPF_TYPE_LAST_FLAG	= OBJ_RELEASE,
++	/* PTR is not trusted. This is only used with PTR_TO_BTF_ID, to mark
++	 * unreferenced and referenced kptr loaded from map value using a load
++	 * instruction, so that they can only be dereferenced but not escape the
++	 * BPF program into the kernel (i.e. cannot be passed as arguments to
++	 * kfunc or bpf helpers).
++	 */
++	PTR_UNTRUSTED		= BIT(6 + BPF_BASE_TYPE_BITS),
++
++	__BPF_TYPE_LAST_FLAG	= PTR_UNTRUSTED,
+ };
+ 
+ /* Max number of base types. */
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -567,6 +567,8 @@ static const char *reg_type_str(struct b
+ 		strncpy(prefix, "user_", 32);
+ 	if (type & MEM_PERCPU)
+ 		strncpy(prefix, "percpu_", 32);
++	if (type & PTR_UNTRUSTED)
++		strncpy(prefix, "untrusted_", 32);
+ 
+ 	snprintf(env->type_str_buf, TYPE_STR_BUF_LEN, "%s%s%s",
+ 		 prefix, str[base_type(type)], postfix);
+@@ -3504,9 +3506,14 @@ static int map_kptr_match_type(struct bp
+ 			       struct bpf_reg_state *reg, u32 regno)
+ {
+ 	const char *targ_name = kernel_type_name(off_desc->kptr.btf, off_desc->kptr.btf_id);
++	int perm_flags = PTR_MAYBE_NULL;
+ 	const char *reg_name = "";
+ 
+-	if (base_type(reg->type) != PTR_TO_BTF_ID || type_flag(reg->type) != PTR_MAYBE_NULL)
++	/* Only unreferenced case accepts untrusted pointers */
++	if (off_desc->type == BPF_KPTR_UNREF)
++		perm_flags |= PTR_UNTRUSTED;
++
++	if (base_type(reg->type) != PTR_TO_BTF_ID || (type_flag(reg->type) & ~perm_flags))
+ 		goto bad_type;
+ 
+ 	if (!btf_is_kernel(reg->btf)) {
+@@ -3553,7 +3560,12 @@ static int map_kptr_match_type(struct bp
+ bad_type:
+ 	verbose(env, "invalid kptr access, R%d type=%s%s ", regno,
+ 		reg_type_str(env, reg->type), reg_name);
+-	verbose(env, "expected=%s%s\n", reg_type_str(env, PTR_TO_BTF_ID), targ_name);
++	verbose(env, "expected=%s%s", reg_type_str(env, PTR_TO_BTF_ID), targ_name);
++	if (off_desc->type == BPF_KPTR_UNREF)
++		verbose(env, " or %s%s\n", reg_type_str(env, PTR_TO_BTF_ID | PTR_UNTRUSTED),
++			targ_name);
++	else
++		verbose(env, "\n");
+ 	return -EINVAL;
+ }
+ 
+@@ -3577,9 +3589,11 @@ static int check_map_kptr_access(struct
+ 		return -EACCES;
+ 	}
+ 
+-	/* We cannot directly access kptr_ref */
+-	if (off_desc->type == BPF_KPTR_REF) {
+-		verbose(env, "accessing referenced kptr disallowed\n");
++	/* We only allow loading referenced kptr, since it will be marked as
++	 * untrusted, similar to unreferenced kptr.
++	 */
++	if (class != BPF_LDX && off_desc->type == BPF_KPTR_REF) {
++		verbose(env, "store to referenced kptr disallowed\n");
+ 		return -EACCES;
+ 	}
+ 
+@@ -3589,7 +3603,7 @@ static int check_map_kptr_access(struct
+ 		 * value from map as PTR_TO_BTF_ID, with the correct type.
+ 		 */
+ 		mark_btf_ld_reg(env, cur_regs(env), value_regno, PTR_TO_BTF_ID, off_desc->kptr.btf,
+-				off_desc->kptr.btf_id, PTR_MAYBE_NULL);
++				off_desc->kptr.btf_id, PTR_MAYBE_NULL | PTR_UNTRUSTED);
+ 		/* For mark_ptr_or_null_reg */
+ 		val_reg->id = ++env->id_gen;
+ 	} else if (class == BPF_STX) {
+@@ -4358,6 +4372,12 @@ static int check_ptr_to_btf_access(struc
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/* If this is an untrusted pointer, all pointers formed by walking it
++	 * also inherit the untrusted flag.
++	 */
++	if (type_flag(reg->type) & PTR_UNTRUSTED)
++		flag |= PTR_UNTRUSTED;
++
+ 	if (atype == BPF_READ && value_regno >= 0)
+ 		mark_btf_ld_reg(env, regs, value_regno, ret, reg->btf, btf_id, flag);
+ 
+@@ -13076,7 +13096,7 @@ static int convert_ctx_accesses(struct b
+ 		if (!ctx_access)
+ 			continue;
+ 
+-		switch (env->insn_aux_data[i + delta].ptr_type) {
++		switch ((int)env->insn_aux_data[i + delta].ptr_type) {
+ 		case PTR_TO_CTX:
+ 			if (!ops->convert_ctx_access)
+ 				continue;
+@@ -13093,6 +13113,7 @@ static int convert_ctx_accesses(struct b
+ 			convert_ctx_access = bpf_xdp_sock_convert_ctx_access;
+ 			break;
+ 		case PTR_TO_BTF_ID:
++		case PTR_TO_BTF_ID | PTR_UNTRUSTED:
+ 			if (type == BPF_READ) {
+ 				insn->code = BPF_LDX | BPF_PROBE_MEM |
+ 					BPF_SIZE((insn)->code);
