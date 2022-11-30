@@ -1,0 +1,243 @@
+From 937612c9622b116bafb2bf32e27d3788c5937271 Mon Sep 17 00:00:00 2001
+From: Matthew Brost <matthew.brost@intel.com>
+Date: Thu, 14 Oct 2021 10:19:53 -0700
+Subject: drm/i915/guc: Insert submit fences between requests in parent-child
+ relationship
+Git-commit: bc955204919ea8152b7443e7d48a48cc18dea448
+Patch-mainline: v5.16-rc1
+References: jsc#PED-1166 jsc#PED-1168 jsc#PED-1170 jsc#PED-1218 jsc#PED-1220 jsc#PED-1222 jsc#PED-1223 jsc#PED-1225
+
+The GuC must receive requests in the order submitted for contexts in a
+parent-child relationship to function correctly. To ensure this, insert
+a submit fence between the current request and last request submitted
+for requests / contexts in a parent child relationship. This is
+conceptually similar to a single timeline.
+
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Cc: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: John Harrison <John.C.Harrison@Intel.com>
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20211014172005.27155-14-matthew.brost@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/i915/gt/intel_context.h       |   5 +
+ drivers/gpu/drm/i915/gt/intel_context_types.h |   6 +
+ .../gpu/drm/i915/gt/uc/intel_guc_submission.c |   5 +-
+ drivers/gpu/drm/i915/i915_request.c           | 120 ++++++++++++++----
+ 4 files changed, 108 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_context.h b/drivers/gpu/drm/i915/gt/intel_context.h
+index 9f0995150a7a..edf12caaade3 100644
+--- a/drivers/gpu/drm/i915/gt/intel_context.h
++++ b/drivers/gpu/drm/i915/gt/intel_context.h
+@@ -77,6 +77,11 @@ intel_context_to_parent(struct intel_context *ce)
+ 	}
+ }
+ 
++static inline bool intel_context_is_parallel(struct intel_context *ce)
++{
++	return intel_context_is_child(ce) || intel_context_is_parent(ce);
++}
++
+ void intel_context_bind_parent_child(struct intel_context *parent,
+ 				     struct intel_context *child);
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_context_types.h b/drivers/gpu/drm/i915/gt/intel_context_types.h
+index 48decb5ee954..8309d1141d0a 100644
+--- a/drivers/gpu/drm/i915/gt/intel_context_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_context_types.h
+@@ -237,6 +237,12 @@ struct intel_context {
+ 		};
+ 		/** @parent: pointer to parent if child */
+ 		struct intel_context *parent;
++		/**
++		 * @last_rq: last request submitted on a parallel context, used
++		 * to insert submit fences between requests in the parallel
++		 * context
++		 */
++		struct i915_request *last_rq;
+ 		/** @number_children: number of children if parent */
+ 		u8 number_children;
+ 		/** @guc: GuC specific members for parallel submission */
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+index 71ae5eb69849..ebb64fb50396 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+@@ -684,8 +684,7 @@ static inline int rq_prio(const struct i915_request *rq)
+ 
+ static bool is_multi_lrc_rq(struct i915_request *rq)
+ {
+-	return intel_context_is_child(rq->context) ||
+-		intel_context_is_parent(rq->context);
++	return intel_context_is_parallel(rq->context);
+ }
+ 
+ static bool can_merge_rq(struct i915_request *rq,
+@@ -2873,6 +2872,8 @@ static void guc_parent_context_unpin(struct intel_context *ce)
+ 	GEM_BUG_ON(!intel_context_is_parent(ce));
+ 	GEM_BUG_ON(!intel_engine_is_virtual(ce->engine));
+ 
++	if (ce->parallel.last_rq)
++		i915_request_put(ce->parallel.last_rq);
+ 	unpin_guc_id(guc, ce);
+ 	lrc_unpin(ce);
+ }
+diff --git a/drivers/gpu/drm/i915/i915_request.c b/drivers/gpu/drm/i915/i915_request.c
+index ed64fa9defdf..d29e46a001b4 100644
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -1549,36 +1549,62 @@ i915_request_await_object(struct i915_request *to,
+ 	return ret;
+ }
+ 
++static inline bool is_parallel_rq(struct i915_request *rq)
++{
++	return intel_context_is_parallel(rq->context);
++}
++
++static inline struct intel_context *request_to_parent(struct i915_request *rq)
++{
++	return intel_context_to_parent(rq->context);
++}
++
+ static struct i915_request *
+-__i915_request_add_to_timeline(struct i915_request *rq)
++__i915_request_ensure_parallel_ordering(struct i915_request *rq,
++					struct intel_timeline *timeline)
+ {
+-	struct intel_timeline *timeline = i915_request_timeline(rq);
+ 	struct i915_request *prev;
+ 
+-	/*
+-	 * Dependency tracking and request ordering along the timeline
+-	 * is special cased so that we can eliminate redundant ordering
+-	 * operations while building the request (we know that the timeline
+-	 * itself is ordered, and here we guarantee it).
+-	 *
+-	 * As we know we will need to emit tracking along the timeline,
+-	 * we embed the hooks into our request struct -- at the cost of
+-	 * having to have specialised no-allocation interfaces (which will
+-	 * be beneficial elsewhere).
+-	 *
+-	 * A second benefit to open-coding i915_request_await_request is
+-	 * that we can apply a slight variant of the rules specialised
+-	 * for timelines that jump between engines (such as virtual engines).
+-	 * If we consider the case of virtual engine, we must emit a dma-fence
+-	 * to prevent scheduling of the second request until the first is
+-	 * complete (to maximise our greedy late load balancing) and this
+-	 * precludes optimising to use semaphores serialisation of a single
+-	 * timeline across engines.
+-	 */
++	GEM_BUG_ON(!is_parallel_rq(rq));
++
++	prev = request_to_parent(rq)->parallel.last_rq;
++	if (prev) {
++		if (!__i915_request_is_complete(prev)) {
++			i915_sw_fence_await_sw_fence(&rq->submit,
++						     &prev->submit,
++						     &rq->submitq);
++
++			if (rq->engine->sched_engine->schedule)
++				__i915_sched_node_add_dependency(&rq->sched,
++								 &prev->sched,
++								 &rq->dep,
++								 0);
++		}
++		i915_request_put(prev);
++	}
++
++	request_to_parent(rq)->parallel.last_rq = i915_request_get(rq);
++
++	return to_request(__i915_active_fence_set(&timeline->last_request,
++						  &rq->fence));
++}
++
++static struct i915_request *
++__i915_request_ensure_ordering(struct i915_request *rq,
++			       struct intel_timeline *timeline)
++{
++	struct i915_request *prev;
++
++	GEM_BUG_ON(is_parallel_rq(rq));
++
+ 	prev = to_request(__i915_active_fence_set(&timeline->last_request,
+ 						  &rq->fence));
++
+ 	if (prev && !__i915_request_is_complete(prev)) {
+ 		bool uses_guc = intel_engine_uses_guc(rq->engine);
++		bool pow2 = is_power_of_2(READ_ONCE(prev->engine)->mask |
++					  rq->engine->mask);
++		bool same_context = prev->context == rq->context;
+ 
+ 		/*
+ 		 * The requests are supposed to be kept in order. However,
+@@ -1586,13 +1612,11 @@ __i915_request_add_to_timeline(struct i915_request *rq)
+ 		 * is used as a barrier for external modification to this
+ 		 * context.
+ 		 */
+-		GEM_BUG_ON(prev->context == rq->context &&
++		GEM_BUG_ON(same_context &&
+ 			   i915_seqno_passed(prev->fence.seqno,
+ 					     rq->fence.seqno));
+ 
+-		if ((!uses_guc &&
+-		     is_power_of_2(READ_ONCE(prev->engine)->mask | rq->engine->mask)) ||
+-		    (uses_guc && prev->context == rq->context))
++		if ((same_context && uses_guc) || (!uses_guc && pow2))
+ 			i915_sw_fence_await_sw_fence(&rq->submit,
+ 						     &prev->submit,
+ 						     &rq->submitq);
+@@ -1607,6 +1631,50 @@ __i915_request_add_to_timeline(struct i915_request *rq)
+ 							 0);
+ 	}
+ 
++	return prev;
++}
++
++static struct i915_request *
++__i915_request_add_to_timeline(struct i915_request *rq)
++{
++	struct intel_timeline *timeline = i915_request_timeline(rq);
++	struct i915_request *prev;
++
++	/*
++	 * Dependency tracking and request ordering along the timeline
++	 * is special cased so that we can eliminate redundant ordering
++	 * operations while building the request (we know that the timeline
++	 * itself is ordered, and here we guarantee it).
++	 *
++	 * As we know we will need to emit tracking along the timeline,
++	 * we embed the hooks into our request struct -- at the cost of
++	 * having to have specialised no-allocation interfaces (which will
++	 * be beneficial elsewhere).
++	 *
++	 * A second benefit to open-coding i915_request_await_request is
++	 * that we can apply a slight variant of the rules specialised
++	 * for timelines that jump between engines (such as virtual engines).
++	 * If we consider the case of virtual engine, we must emit a dma-fence
++	 * to prevent scheduling of the second request until the first is
++	 * complete (to maximise our greedy late load balancing) and this
++	 * precludes optimising to use semaphores serialisation of a single
++	 * timeline across engines.
++	 *
++	 * We do not order parallel submission requests on the timeline as each
++	 * parallel submission context has its own timeline and the ordering
++	 * rules for parallel requests are that they must be submitted in the
++	 * order received from the execbuf IOCTL. So rather than using the
++	 * timeline we store a pointer to last request submitted in the
++	 * relationship in the gem context and insert a submission fence
++	 * between that request and request passed into this function or
++	 * alternatively we use completion fence if gem context has a single
++	 * timeline and this is the first submission of an execbuf IOCTL.
++	 */
++	if (likely(!is_parallel_rq(rq)))
++		prev = __i915_request_ensure_ordering(rq, timeline);
++	else
++		prev = __i915_request_ensure_parallel_ordering(rq, timeline);
++
+ 	/*
+ 	 * Make sure that no request gazumped us - if it was allocated after
+ 	 * our i915_request_alloc() and called __i915_request_add() before
+-- 
+2.38.1
+
