@@ -1,0 +1,200 @@
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 8 Oct 2021 05:59:37 -0600
+Subject: [PATCH] nvme: add support for batched completion of polled IO
+Git-commit: c234a65392062504acf04afe0ae404cca61a8e1a
+Patch-mainline: v5.16-rc1
+References: jsc#PED-1183
+
+Take advantage of struct io_comp_batch, if passed in to the nvme poll
+handler. If it's set, rather than complete each request individually
+inline, store them in the io_comp_batch list. We only do so for requests
+that will complete successfully, anything else will be completed inline as
+before.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/nvme/host/core.c | 17 ++++++++++++++---
+ drivers/nvme/host/nvme.h | 14 ++++++++++++++
+ drivers/nvme/host/pci.c  | 32 +++++++++++++++++++++++---------
+ 3 files changed, 51 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index ae15cb714596..3109bdf137e4 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -346,15 +346,19 @@ static inline enum nvme_disposition nvme_decide_disposition(struct request *req)
+ 	return RETRY;
+ }
+ 
+-static inline void nvme_end_req(struct request *req)
++static inline void nvme_end_req_zoned(struct request *req)
+ {
+-	blk_status_t status = nvme_error_status(nvme_req(req)->status);
+-
+ 	if (IS_ENABLED(CONFIG_BLK_DEV_ZONED) &&
+ 	    req_op(req) == REQ_OP_ZONE_APPEND)
+ 		req->__sector = nvme_lba_to_sect(req->q->queuedata,
+ 			le64_to_cpu(nvme_req(req)->result.u64));
++}
++
++static inline void nvme_end_req(struct request *req)
++{
++	blk_status_t status = nvme_error_status(nvme_req(req)->status);
+ 
++	nvme_end_req_zoned(req);
+ 	nvme_trace_bio_complete(req);
+ 	blk_mq_end_request(req, status);
+ }
+@@ -381,6 +385,13 @@ void nvme_complete_rq(struct request *req)
+ }
+ EXPORT_SYMBOL_GPL(nvme_complete_rq);
+ 
++void nvme_complete_batch_req(struct request *req)
++{
++	nvme_cleanup_cmd(req);
++	nvme_end_req_zoned(req);
++}
++EXPORT_SYMBOL_GPL(nvme_complete_batch_req);
++
+ /*
+  * Called to unwind from ->queue_rq on a failed command submission so that the
+  * multipathing code gets called to potentially failover to another path.
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index ed79a6c7e804..ef2467b93adb 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -638,6 +638,20 @@ static inline bool nvme_is_aen_req(u16 qid, __u16 command_id)
+ }
+ 
+ void nvme_complete_rq(struct request *req);
++void nvme_complete_batch_req(struct request *req);
++
++static __always_inline void nvme_complete_batch(struct io_comp_batch *iob,
++						void (*fn)(struct request *rq))
++{
++	struct request *req;
++
++	rq_list_for_each(&iob->req_list, req) {
++		fn(req);
++		nvme_complete_batch_req(req);
++	}
++	blk_mq_end_request_batch(iob);
++}
++
+ blk_status_t nvme_host_path_error(struct request *req);
+ bool nvme_cancel_request(struct request *req, void *data, bool reserved);
+ void nvme_cancel_tagset(struct nvme_ctrl *ctrl);
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index bb0482dfab3c..83d3503d5b88 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -959,7 +959,7 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	return ret;
+ }
+ 
+-static void nvme_pci_complete_rq(struct request *req)
++static __always_inline void nvme_pci_unmap_rq(struct request *req)
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 	struct nvme_dev *dev = iod->nvmeq->dev;
+@@ -969,9 +969,19 @@ static void nvme_pci_complete_rq(struct request *req)
+ 			       rq_integrity_vec(req)->bv_len, rq_data_dir(req));
+ 	if (blk_rq_nr_phys_segments(req))
+ 		nvme_unmap_data(dev, req);
++}
++
++static void nvme_pci_complete_rq(struct request *req)
++{
++	nvme_pci_unmap_rq(req);
+ 	nvme_complete_rq(req);
+ }
+ 
++static void nvme_pci_complete_batch(struct io_comp_batch *iob)
++{
++	nvme_complete_batch(iob, nvme_pci_unmap_rq);
++}
++
+ /* We read the CQE phase first to check if the rest of the entry is valid */
+ static inline bool nvme_cqe_pending(struct nvme_queue *nvmeq)
+ {
+@@ -996,7 +1006,8 @@ static inline struct blk_mq_tags *nvme_queue_tagset(struct nvme_queue *nvmeq)
+ 	return nvmeq->dev->tagset.tags[nvmeq->qid - 1];
+ }
+ 
+-static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
++static inline void nvme_handle_cqe(struct nvme_queue *nvmeq,
++				   struct io_comp_batch *iob, u16 idx)
+ {
+ 	struct nvme_completion *cqe = &nvmeq->cqes[idx];
+ 	__u16 command_id = READ_ONCE(cqe->command_id);
+@@ -1023,7 +1034,9 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
+ 	}
+ 
+ 	trace_nvme_sq(req, cqe->sq_head, nvmeq->sq_tail);
+-	if (!nvme_try_complete_req(req, cqe->status, cqe->result))
++	if (!nvme_try_complete_req(req, cqe->status, cqe->result) &&
++	    !blk_mq_add_to_batch(req, iob, nvme_req(req)->status,
++					nvme_pci_complete_batch))
+ 		nvme_pci_complete_rq(req);
+ }
+ 
+@@ -1039,7 +1052,8 @@ static inline void nvme_update_cq_head(struct nvme_queue *nvmeq)
+ 	}
+ }
+ 
+-static inline int nvme_process_cq(struct nvme_queue *nvmeq)
++static inline int nvme_poll_cq(struct nvme_queue *nvmeq,
++			       struct io_comp_batch *iob)
+ {
+ 	int found = 0;
+ 
+@@ -1050,7 +1064,7 @@ static inline int nvme_process_cq(struct nvme_queue *nvmeq)
+ 		 * the cqe requires a full read memory barrier
+ 		 */
+ 		dma_rmb();
+-		nvme_handle_cqe(nvmeq, nvmeq->cq_head);
++		nvme_handle_cqe(nvmeq, iob, nvmeq->cq_head);
+ 		nvme_update_cq_head(nvmeq);
+ 	}
+ 
+@@ -1063,7 +1077,7 @@ static irqreturn_t nvme_irq(int irq, void *data)
+ {
+ 	struct nvme_queue *nvmeq = data;
+ 
+-	if (nvme_process_cq(nvmeq))
++	if (nvme_poll_cq(nvmeq, NULL))
+ 		return IRQ_HANDLED;
+ 	return IRQ_NONE;
+ }
+@@ -1088,7 +1102,7 @@ static void nvme_poll_irqdisable(struct nvme_queue *nvmeq)
+ 	WARN_ON_ONCE(test_bit(NVMEQ_POLLED, &nvmeq->flags));
+ 
+ 	disable_irq(pci_irq_vector(pdev, nvmeq->cq_vector));
+-	nvme_process_cq(nvmeq);
++	nvme_poll_cq(nvmeq, NULL);
+ 	enable_irq(pci_irq_vector(pdev, nvmeq->cq_vector));
+ }
+ 
+@@ -1101,7 +1115,7 @@ static int nvme_poll(struct blk_mq_hw_ctx *hctx, struct io_comp_batch *iob)
+ 		return 0;
+ 
+ 	spin_lock(&nvmeq->cq_poll_lock);
+-	found = nvme_process_cq(nvmeq);
++	found = nvme_poll_cq(nvmeq, iob);
+ 	spin_unlock(&nvmeq->cq_poll_lock);
+ 
+ 	return found;
+@@ -1434,7 +1448,7 @@ static void nvme_reap_pending_cqes(struct nvme_dev *dev)
+ 
+ 	for (i = dev->ctrl.queue_count - 1; i > 0; i--) {
+ 		spin_lock(&dev->queues[i].cq_poll_lock);
+-		nvme_process_cq(&dev->queues[i]);
++		nvme_poll_cq(&dev->queues[i], NULL);
+ 		spin_unlock(&dev->queues[i].cq_poll_lock);
+ 	}
+ }
+-- 
+2.35.3
+

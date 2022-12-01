@@ -1,0 +1,260 @@
+From: Sreekanth Reddy <sreekanth.reddy@broadcom.com>
+Date: Sat, 9 Jul 2022 01:20:20 +0530
+Subject: scsi: mpi3mr: Reduce VD queue depth on detecting throttling
+Git-commit: cf1ce8b715240e3e4a86162788958444e9208472
+Patch-mainline: v6.0-rc1
+References: jsc#PED-1446
+
+Reduce the VD queue depth on detecting the throttling condition.
+
+[mkp: incorporate fix for pointer cast issue reported by the test
+robot and Guenter Roeck]
+
+Link: https://lore.kernel.org/r/20220708195020.8323-3-sreekanth.reddy@broadcom.com
+Signed-off-by: Sreekanth Reddy <sreekanth.reddy@broadcom.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Lee Duncan <lduncan@suse.com>
+---
+ drivers/scsi/mpi3mr/mpi3mr.h    |  10 ++++
+ drivers/scsi/mpi3mr/mpi3mr_fw.c |   4 ++
+ drivers/scsi/mpi3mr/mpi3mr_os.c | 122 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 136 insertions(+)
+
+diff --git a/drivers/scsi/mpi3mr/mpi3mr.h b/drivers/scsi/mpi3mr/mpi3mr.h
+index 6bb3311b8620..0935b2e80662 100644
+--- a/drivers/scsi/mpi3mr/mpi3mr.h
++++ b/drivers/scsi/mpi3mr/mpi3mr.h
+@@ -436,6 +436,10 @@ struct mpi3mr_intr_info {
+  * struct mpi3mr_throttle_group_info - Throttle group info
+  *
+  * @io_divert: Flag indicates io divert is on or off for the TG
++ * @need_qd_reduction: Flag to indicate QD reduction is needed
++ * @qd_reduction: Queue Depth reduction in units of 10%
++ * @fw_qd: QueueDepth value reported by the firmware
++ * @modified_qd: Modified QueueDepth value due to throttling
+  * @id: Throttle Group ID.
+  * @high: High limit to turn on throttling in 512 byte blocks
+  * @low: Low limit to turn off throttling in 512 byte blocks
+@@ -443,6 +447,10 @@ struct mpi3mr_intr_info {
+  */
+ struct mpi3mr_throttle_group_info {
+ 	u8 io_divert;
++	u8 need_qd_reduction;
++	u8 qd_reduction;
++	u16 fw_qd;
++	u16 modified_qd;
+ 	u16 id;
+ 	u32 high;
+ 	u32 low;
+@@ -486,6 +494,7 @@ struct tgt_dev_pcie {
+  * cached from firmware given data
+  *
+  * @state: State of the VD
++ * @tg_qd_reduction: Queue Depth reduction in units of 10%
+  * @tg_id: VDs throttle group ID
+  * @high: High limit to turn on throttling in 512 byte blocks
+  * @low: Low limit to turn off throttling in 512 byte blocks
+@@ -493,6 +502,7 @@ struct tgt_dev_pcie {
+  */
+ struct tgt_dev_vd {
+ 	u8 state;
++	u8 tg_qd_reduction;
+ 	u16 tg_id;
+ 	u32 tg_high;
+ 	u32 tg_low;
+diff --git a/drivers/scsi/mpi3mr/mpi3mr_fw.c b/drivers/scsi/mpi3mr/mpi3mr_fw.c
+index ab79374bb6e1..6e39f7969e63 100644
+--- a/drivers/scsi/mpi3mr/mpi3mr_fw.c
++++ b/drivers/scsi/mpi3mr/mpi3mr_fw.c
+@@ -4077,9 +4077,13 @@ void mpi3mr_memset_buffers(struct mpi3mr_ioc *mrioc)
+ 		tg = mrioc->throttle_groups;
+ 		for (i = 0; i < mrioc->num_io_throttle_group; i++, tg++) {
+ 			tg->id = 0;
++			tg->fw_qd = 0;
++			tg->modified_qd = 0;
+ 			tg->io_divert = 0;
++			tg->need_qd_reduction = 0;
+ 			tg->high = 0;
+ 			tg->low = 0;
++			tg->qd_reduction = 0;
+ 			atomic_set(&tg->pend_large_data_sz, 0);
+ 		}
+ 	}
+diff --git a/drivers/scsi/mpi3mr/mpi3mr_os.c b/drivers/scsi/mpi3mr/mpi3mr_os.c
+index e1ccb5fcd68a..4102636df4fc 100644
+--- a/drivers/scsi/mpi3mr/mpi3mr_os.c
++++ b/drivers/scsi/mpi3mr/mpi3mr_os.c
+@@ -38,6 +38,8 @@ MODULE_PARM_DESC(logging_level,
+ static void mpi3mr_send_event_ack(struct mpi3mr_ioc *mrioc, u8 event,
+ 	struct mpi3mr_drv_cmd *cmdparam, u32 event_ctx);
+ 
++#define MPI3MR_DRIVER_EVENT_TG_QD_REDUCTION	(0xFFFF)
++
+ /**
+  * mpi3mr_host_tag_for_scmd - Get host tag for a scmd
+  * @mrioc: Adapter instance reference
+@@ -354,6 +356,50 @@ void mpi3mr_cleanup_fwevt_list(struct mpi3mr_ioc *mrioc)
+ 	}
+ }
+ 
++/**
++ * mpi3mr_queue_qd_reduction_event - Queue TG QD reduction event
++ * @mrioc: Adapter instance reference
++ * @tg: Throttle group information pointer
++ *
++ * Accessor to queue on synthetically generated driver event to
++ * the event worker thread, the driver event will be used to
++ * reduce the QD of all VDs in the TG from the worker thread.
++ *
++ * Return: None.
++ */
++static void mpi3mr_queue_qd_reduction_event(struct mpi3mr_ioc *mrioc,
++	struct mpi3mr_throttle_group_info *tg)
++{
++	struct mpi3mr_fwevt *fwevt;
++	u16 sz = sizeof(struct mpi3mr_throttle_group_info *);
++
++	/*
++	 * If the QD reduction event is already queued due to throttle and if
++	 * the QD is not restored through device info change event
++	 * then dont queue further reduction events
++	 */
++	if (tg->fw_qd != tg->modified_qd)
++		return;
++
++	fwevt = mpi3mr_alloc_fwevt(sz);
++	if (!fwevt) {
++		ioc_warn(mrioc, "failed to queue TG QD reduction event\n");
++		return;
++	}
++	*(struct mpi3mr_throttle_group_info **)fwevt->event_data = tg;
++	fwevt->mrioc = mrioc;
++	fwevt->event_id = MPI3MR_DRIVER_EVENT_TG_QD_REDUCTION;
++	fwevt->send_ack = 0;
++	fwevt->process_evt = 1;
++	fwevt->evt_ctx = 0;
++	fwevt->event_data_size = sz;
++	tg->modified_qd = max_t(u16, (tg->fw_qd * tg->qd_reduction) / 10, 8);
++
++	dprint_event_bh(mrioc, "qd reduction event queued for tg_id(%d)\n",
++	    tg->id);
++	mpi3mr_fwevt_add_to_list(mrioc, fwevt);
++}
++
+ /**
+  * mpi3mr_invalidate_devhandles -Invalidate device handles
+  * @mrioc: Adapter instance reference
+@@ -880,6 +926,7 @@ static int mpi3mr_change_queue_depth(struct scsi_device *sdev,
+ 	else if (!q_depth)
+ 		q_depth = MPI3MR_DEFAULT_SDEV_QD;
+ 	retval = scsi_change_queue_depth(sdev, q_depth);
++	sdev->max_queue_depth = sdev->queue_depth;
+ 
+ 	return retval;
+ }
+@@ -1100,6 +1147,11 @@ static void mpi3mr_update_tgtdev(struct mpi3mr_ioc *mrioc,
+ 			tg->id = vdinf_io_throttle_group;
+ 			tg->high = tgtdev->dev_spec.vd_inf.tg_high;
+ 			tg->low = tgtdev->dev_spec.vd_inf.tg_low;
++			tg->qd_reduction =
++			    tgtdev->dev_spec.vd_inf.tg_qd_reduction;
++			if (is_added == true)
++				tg->fw_qd = tgtdev->q_depth;
++			tg->modified_qd = tgtdev->q_depth;
+ 		}
+ 		tgtdev->dev_spec.vd_inf.tg = tg;
+ 		if (scsi_tgt_priv_data)
+@@ -1493,6 +1545,60 @@ static void mpi3mr_logdata_evt_bh(struct mpi3mr_ioc *mrioc,
+ 	    fwevt->event_data_size);
+ }
+ 
++/**
++ * mpi3mr_update_sdev_qd - Update SCSI device queue depath
++ * @sdev: SCSI device reference
++ * @data: Queue depth reference
++ *
++ * This is an iterator function called for each SCSI device in a
++ * target to update the QD of each SCSI device.
++ *
++ * Return: Nothing.
++ */
++static void mpi3mr_update_sdev_qd(struct scsi_device *sdev, void *data)
++{
++	u16 *q_depth = (u16 *)data;
++
++	scsi_change_queue_depth(sdev, (int)*q_depth);
++	sdev->max_queue_depth = sdev->queue_depth;
++}
++
++/**
++ * mpi3mr_set_qd_for_all_vd_in_tg -set QD for TG VDs
++ * @mrioc: Adapter instance reference
++ * @tg: Throttle group information pointer
++ *
++ * Accessor to reduce QD for each device associated with the
++ * given throttle group.
++ *
++ * Return: None.
++ */
++static void mpi3mr_set_qd_for_all_vd_in_tg(struct mpi3mr_ioc *mrioc,
++	struct mpi3mr_throttle_group_info *tg)
++{
++	unsigned long flags;
++	struct mpi3mr_tgt_dev *tgtdev;
++	struct mpi3mr_stgt_priv_data *tgt_priv;
++
++
++	spin_lock_irqsave(&mrioc->tgtdev_lock, flags);
++	list_for_each_entry(tgtdev, &mrioc->tgtdev_list, list) {
++		if (tgtdev->starget && tgtdev->starget->hostdata) {
++			tgt_priv = tgtdev->starget->hostdata;
++			if (tgt_priv->throttle_group == tg) {
++				dprint_event_bh(mrioc,
++				    "updating qd due to throttling for persist_id(%d) original_qd(%d), reduced_qd (%d)\n",
++				    tgt_priv->perst_id, tgtdev->q_depth,
++				    tg->modified_qd);
++				starget_for_each_device(tgtdev->starget,
++				    (void *)&tg->modified_qd,
++				    mpi3mr_update_sdev_qd);
++			}
++		}
++	}
++	spin_unlock_irqrestore(&mrioc->tgtdev_lock, flags);
++}
++
+ /**
+  * mpi3mr_fwevt_bh - Firmware event bottomhalf handler
+  * @mrioc: Adapter instance reference
+@@ -1550,6 +1656,20 @@ static void mpi3mr_fwevt_bh(struct mpi3mr_ioc *mrioc,
+ 		mpi3mr_logdata_evt_bh(mrioc, fwevt);
+ 		break;
+ 	}
++	case MPI3MR_DRIVER_EVENT_TG_QD_REDUCTION:
++	{
++		struct mpi3mr_throttle_group_info *tg;
++
++		tg = *(struct mpi3mr_throttle_group_info **)fwevt->event_data;
++		dprint_event_bh(mrioc,
++		    "qd reduction event processed for tg_id(%d) reduction_needed(%d)\n",
++		    tg->id, tg->need_qd_reduction);
++		if (tg->need_qd_reduction) {
++			mpi3mr_set_qd_for_all_vd_in_tg(mrioc, tg);
++			tg->need_qd_reduction = 0;
++		}
++		break;
++	}
+ 	default:
+ 		break;
+ 	}
+@@ -4234,8 +4354,10 @@ static int mpi3mr_qcmd(struct Scsi_Host *shost,
+ 			    mrioc->io_throttle_high) ||
+ 			    (tg_pend_data_len >= tg->high))) {
+ 				tg->io_divert = 1;
++				tg->need_qd_reduction = 1;
+ 				mpi3mr_set_io_divert_for_all_vd_in_tg(mrioc,
+ 				    tg, 1);
++				mpi3mr_queue_qd_reduction_event(mrioc, tg);
+ 			}
+ 		} else {
+ 			ioc_pend_data_len = atomic_add_return(data_len_blks,
+

@@ -1,0 +1,372 @@
+From: Niklas Schnelle <schnelle@linux.ibm.com>
+Date: Wed, 7 Jul 2021 11:00:01 +0200
+Subject: s390/pci: implement minimal PCI error recovery
+Git-commit: 4cdf2f4e24ff0d345fc36ef6d6aec059333a261e
+Patch-mainline: v5.16-rc1
+References: jsc#PED-592
+
+When the platform detects an error on a PCI function or a service action
+has been performed it is put in the error state and an error event
+notification is provided to the OS.
+
+Currently we treat all error event notifications the same and simply set
+pdev->error_state = pci_channel_io_perm_failure requiring user
+intervention such as use of the recover attribute to get the device
+usable again. Despite requiring a manual step this also has the
+disadvantage that the device is completely torn down and recreated
+resulting in higher level devices such as a block or network device
+being recreated. In case of a block device this also means that it may
+need to be removed and added to a software raid even if that could
+otherwise survive with a temporary degradation.
+
+This is of course not ideal more so since an error notification with PEC
+0x3A indicates that the platform already performed error recovery
+successfully or that the error state was caused by a service action that
+is now finished.
+
+At least in this case we can assume that the error state can be reset
+and the function made usable again. So as not to have the disadvantage
+of a full tear down and recreation we need to coordinate this recovery
+with the driver. Thankfully there is already a well defined recovery
+flow for this described in Documentation/PCI/pci-error-recovery.rst.
+
+The implementation of this is somewhat straight forward and simplified
+by the fact that our recovery flow is defined per PCI function. As
+a reset we use the newly introduced zpci_hot_reset_device() which also
+takes the PCI function out of the error state.
+
+Reviewed-by: Pierre Morel <pmorel@linux.ibm.com>
+Acked-by: Matthew Rosato <mjrosato@linux.ibm.com>
+Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ arch/s390/include/asm/pci.h |    4 
+ arch/s390/pci/pci.c         |   53 ++++++++++
+ arch/s390/pci/pci_event.c   |  224 +++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 277 insertions(+), 4 deletions(-)
+
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -296,8 +296,10 @@ void zpci_debug_exit(void);
+ void zpci_debug_init_device(struct zpci_dev *, const char *);
+ void zpci_debug_exit_device(struct zpci_dev *);
+ 
+-/* Error reporting */
++/* Error handling */
+ int zpci_report_error(struct pci_dev *, struct zpci_report_error_header *);
++int zpci_clear_error_state(struct zpci_dev *zdev);
++int zpci_reset_load_store_blocked(struct zpci_dev *zdev);
+ 
+ #ifdef CONFIG_NUMA
+ 
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@ -990,6 +990,59 @@ int zpci_report_error(struct pci_dev *pd
+ }
+ EXPORT_SYMBOL(zpci_report_error);
+ 
++/**
++ * zpci_clear_error_state() - Clears the zPCI error state of the device
++ * @zdev: The zdev for which the zPCI error state should be reset
++ *
++ * Clear the zPCI error state of the device. If clearing the zPCI error state
++ * fails the device is left in the error state. In this case it may make sense
++ * to call zpci_io_perm_failure() on the associated pdev if it exists.
++ *
++ * Returns: 0 on success, -EIO otherwise
++ */
++int zpci_clear_error_state(struct zpci_dev *zdev)
++{
++	u64 req = ZPCI_CREATE_REQ(zdev->fh, 0, ZPCI_MOD_FC_RESET_ERROR);
++	struct zpci_fib fib = {0};
++	u8 status;
++	int cc;
++
++	cc = zpci_mod_fc(req, &fib, &status);
++	if (cc) {
++		zpci_dbg(3, "ces fid:%x, cc:%d, status:%x\n", zdev->fid, cc, status);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++/**
++ * zpci_reset_load_store_blocked() - Re-enables L/S from error state
++ * @zdev: The zdev for which to unblock load/store access
++ *
++ * Re-enables load/store access for a PCI function in the error state while
++ * keeping DMA blocked. In this state drivers can poke MMIO space to determine
++ * if error recovery is possible while catching any rogue DMA access from the
++ * device.
++ *
++ * Returns: 0 on success, -EIO otherwise
++ */
++int zpci_reset_load_store_blocked(struct zpci_dev *zdev)
++{
++	u64 req = ZPCI_CREATE_REQ(zdev->fh, 0, ZPCI_MOD_FC_RESET_BLOCK);
++	struct zpci_fib fib = {0};
++	u8 status;
++	int cc;
++
++	cc = zpci_mod_fc(req, &fib, &status);
++	if (cc) {
++		zpci_dbg(3, "rls fid:%x, cc:%d, status:%x\n", zdev->fid, cc, status);
++		return -EIO;
++	}
++
++	return 0;
++}
++
+ static int zpci_mem_init(void)
+ {
+ 	BUILD_BUG_ON(!is_power_of_2(__alignof__(struct zpci_fmb)) ||
+--- a/arch/s390/pci/pci_event.c
++++ b/arch/s390/pci/pci_event.c
+@@ -47,16 +47,221 @@ struct zpci_ccdf_avail {
+ 	u16 pec;			/* PCI event code */
+ } __packed;
+ 
++static inline bool ers_result_indicates_abort(pci_ers_result_t ers_res)
++{
++	switch (ers_res) {
++	case PCI_ERS_RESULT_CAN_RECOVER:
++	case PCI_ERS_RESULT_RECOVERED:
++	case PCI_ERS_RESULT_NEED_RESET:
++		return false;
++	default:
++		return true;
++	}
++}
++
++static bool is_passed_through(struct zpci_dev *zdev)
++{
++	return zdev->s390_domain;
++}
++
++static bool is_driver_supported(struct pci_driver *driver)
++{
++	if (!driver || !driver->err_handler)
++		return false;
++	if (!driver->err_handler->error_detected)
++		return false;
++	if (!driver->err_handler->slot_reset)
++		return false;
++	if (!driver->err_handler->resume)
++		return false;
++	return true;
++}
++
++static pci_ers_result_t zpci_event_notify_error_detected(struct pci_dev *pdev,
++							 struct pci_driver *driver)
++{
++	pci_ers_result_t ers_res = PCI_ERS_RESULT_DISCONNECT;
++
++	ers_res = driver->err_handler->error_detected(pdev,  pdev->error_state);
++	if (ers_result_indicates_abort(ers_res))
++		pr_info("%s: Automatic recovery failed after initial reporting\n", pci_name(pdev));
++	else if (ers_res == PCI_ERS_RESULT_NEED_RESET)
++		pr_debug("%s: Driver needs reset to recover\n", pci_name(pdev));
++
++	return ers_res;
++}
++
++static pci_ers_result_t zpci_event_do_error_state_clear(struct pci_dev *pdev,
++							struct pci_driver *driver)
++{
++	pci_ers_result_t ers_res = PCI_ERS_RESULT_DISCONNECT;
++	struct zpci_dev *zdev = to_zpci(pdev);
++	int rc;
++
++	pr_info("%s: Unblocking device access for examination\n", pci_name(pdev));
++	rc = zpci_reset_load_store_blocked(zdev);
++	if (rc) {
++		pr_err("%s: Unblocking device access failed\n", pci_name(pdev));
++		/* Let's try a full reset instead */
++		return PCI_ERS_RESULT_NEED_RESET;
++	}
++
++	if (driver->err_handler->mmio_enabled) {
++		ers_res = driver->err_handler->mmio_enabled(pdev);
++		if (ers_result_indicates_abort(ers_res)) {
++			pr_info("%s: Automatic recovery failed after MMIO re-enable\n",
++				pci_name(pdev));
++			return ers_res;
++		} else if (ers_res == PCI_ERS_RESULT_NEED_RESET) {
++			pr_debug("%s: Driver needs reset to recover\n", pci_name(pdev));
++			return ers_res;
++		}
++	}
++
++	pr_debug("%s: Unblocking DMA\n", pci_name(pdev));
++	rc = zpci_clear_error_state(zdev);
++	if (!rc) {
++		pdev->error_state = pci_channel_io_normal;
++	} else {
++		pr_err("%s: Unblocking DMA failed\n", pci_name(pdev));
++		/* Let's try a full reset instead */
++		return PCI_ERS_RESULT_NEED_RESET;
++	}
++
++	return ers_res;
++}
++
++static pci_ers_result_t zpci_event_do_reset(struct pci_dev *pdev,
++					    struct pci_driver *driver)
++{
++	pci_ers_result_t ers_res = PCI_ERS_RESULT_DISCONNECT;
++
++	pr_info("%s: Initiating reset\n", pci_name(pdev));
++	if (zpci_hot_reset_device(to_zpci(pdev))) {
++		pr_err("%s: The reset request failed\n", pci_name(pdev));
++		return ers_res;
++	}
++	pdev->error_state = pci_channel_io_normal;
++	ers_res = driver->err_handler->slot_reset(pdev);
++	if (ers_result_indicates_abort(ers_res)) {
++		pr_info("%s: Automatic recovery failed after slot reset\n", pci_name(pdev));
++		return ers_res;
++	}
++
++	return ers_res;
++}
++
++/* zpci_event_attempt_error_recovery - Try to recover the given PCI function
++ * @pdev: PCI function to recover currently in the error state
++ *
++ * We follow the scheme outlined in Documentation/PCI/pci-error-recovery.rst.
++ * With the simplification that recovery always happens per function
++ * and the platform determines which functions are affected for
++ * multi-function devices.
++ */
++static pci_ers_result_t zpci_event_attempt_error_recovery(struct pci_dev *pdev)
++{
++	pci_ers_result_t ers_res = PCI_ERS_RESULT_DISCONNECT;
++	struct pci_driver *driver;
++
++	/*
++	 * Ensure that the PCI function is not removed concurrently, no driver
++	 * is unbound or probed and that userspace can't access its
++	 * configuration space while we perform recovery.
++	 */
++	pci_dev_lock(pdev);
++	if (pdev->error_state == pci_channel_io_perm_failure) {
++		ers_res = PCI_ERS_RESULT_DISCONNECT;
++		goto out_unlock;
++	}
++	pdev->error_state = pci_channel_io_frozen;
++
++	if (is_passed_through(to_zpci(pdev))) {
++		pr_info("%s: Cannot be recovered in the host because it is a pass-through device\n",
++			pci_name(pdev));
++		goto out_unlock;
++	}
++
++	driver = to_pci_driver(pdev->dev.driver);
++	if (!is_driver_supported(driver)) {
++		if (!driver)
++			pr_info("%s: Cannot be recovered because no driver is bound to the device\n",
++				pci_name(pdev));
++		else
++			pr_info("%s: The %s driver bound to the device does not support error recovery\n",
++				pci_name(pdev),
++				driver->name);
++		goto out_unlock;
++	}
++
++	ers_res = zpci_event_notify_error_detected(pdev, driver);
++	if (ers_result_indicates_abort(ers_res))
++		goto out_unlock;
++
++	if (ers_res == PCI_ERS_RESULT_CAN_RECOVER) {
++		ers_res = zpci_event_do_error_state_clear(pdev, driver);
++		if (ers_result_indicates_abort(ers_res))
++			goto out_unlock;
++	}
++
++	if (ers_res == PCI_ERS_RESULT_NEED_RESET)
++		ers_res = zpci_event_do_reset(pdev, driver);
++
++	if (ers_res != PCI_ERS_RESULT_RECOVERED) {
++		pr_err("%s: Automatic recovery failed; operator intervention is required\n",
++		       pci_name(pdev));
++		goto out_unlock;
++	}
++
++	pr_info("%s: The device is ready to resume operations\n", pci_name(pdev));
++	if (driver->err_handler->resume)
++		driver->err_handler->resume(pdev);
++out_unlock:
++	pci_dev_unlock(pdev);
++
++	return ers_res;
++}
++
++/* zpci_event_io_failure - Report PCI channel failure state to driver
++ * @pdev: PCI function for which to report
++ * @es: PCI channel failure state to report
++ */
++static void zpci_event_io_failure(struct pci_dev *pdev, pci_channel_state_t es)
++{
++	struct pci_driver *driver;
++
++	pci_dev_lock(pdev);
++	pdev->error_state = es;
++	/**
++	 * While vfio-pci's error_detected callback notifies user-space QEMU
++	 * reacts to this by freezing the guest. In an s390 environment PCI
++	 * errors are rarely fatal so this is overkill. Instead in the future
++	 * we will inject the error event and let the guest recover the device
++	 * itself.
++	 */
++	if (is_passed_through(to_zpci(pdev)))
++		goto out;
++	driver = to_pci_driver(pdev->dev.driver);
++	if (driver && driver->err_handler && driver->err_handler->error_detected)
++		driver->err_handler->error_detected(pdev, pdev->error_state);
++out:
++	pci_dev_unlock(pdev);
++}
++
+ static void __zpci_event_error(struct zpci_ccdf_err *ccdf)
+ {
+ 	struct zpci_dev *zdev = get_zdev_by_fid(ccdf->fid);
+ 	struct pci_dev *pdev = NULL;
++	pci_ers_result_t ers_res;
+ 
+ 	zpci_err("error CCDF:\n");
+ 	zpci_err_hex(ccdf, sizeof(*ccdf));
+ 
+-	if (zdev)
+-		pdev = pci_get_slot(zdev->zbus->bus, zdev->devfn);
++	if (zdev) {
++		zpci_update_fh(zdev, ccdf->fh);
++		if (zdev->zbus->bus)
++			pdev = pci_get_slot(zdev->zbus->bus, zdev->devfn);
++	}
+ 
+ 	pr_err("%s: Event 0x%x reports an error for PCI function 0x%x\n",
+ 	       pdev ? pci_name(pdev) : "n/a", ccdf->pec, ccdf->fid);
+@@ -64,7 +269,20 @@ static void __zpci_event_error(struct zp
+ 	if (!pdev)
+ 		return;
+ 
+-	pdev->error_state = pci_channel_io_perm_failure;
++	switch (ccdf->pec) {
++	case 0x003a: /* Service Action or Error Recovery Successful */
++		ers_res = zpci_event_attempt_error_recovery(pdev);
++		if (ers_res != PCI_ERS_RESULT_RECOVERED)
++			zpci_event_io_failure(pdev, pci_channel_io_perm_failure);
++		break;
++	default:
++		/*
++		 * Mark as frozen not permanently failed because the device
++		 * could be subsequently recovered by the platform.
++		 */
++		zpci_event_io_failure(pdev, pci_channel_io_frozen);
++		break;
++	}
+ 	pci_dev_put(pdev);
+ }
+ 

@@ -1,0 +1,349 @@
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Tue, 14 Dec 2021 11:59:03 -0800
+Subject: libbpf: Auto-bump RLIMIT_MEMLOCK if kernel needs it for BPF
+Patch-mainline: v5.17-rc1
+Git-commit: e542f2c4cd16d49392abf3349341d58153d3c603
+References: jsc#PED-1368
+
+The need to increase RLIMIT_MEMLOCK to do anything useful with BPF is
+one of the first extremely frustrating gotchas that all new BPF users go
+through and in some cases have to learn it a very hard way.
+
+Luckily, starting with upstream Linux kernel version 5.11, BPF subsystem
+dropped the dependency on memlock and uses memcg-based memory accounting
+instead. Unfortunately, detecting memcg-based BPF memory accounting is
+far from trivial (as can be evidenced by this patch), so in practice
+most BPF applications still do unconditional RLIMIT_MEMLOCK increase.
+
+As we move towards libbpf 1.0, it would be good to allow users to forget
+about RLIMIT_MEMLOCK vs memcg and let libbpf do the sensible adjustment
+automatically. This patch paves the way forward in this matter. Libbpf
+will do feature detection of memcg-based accounting, and if detected,
+will do nothing. But if the kernel is too old, just like BCC, libbpf
+will automatically increase RLIMIT_MEMLOCK on behalf of user
+application ([0]).
+
+As this is technically a breaking change, during the transition period
+applications have to opt into libbpf 1.0 mode by setting
+LIBBPF_STRICT_AUTO_RLIMIT_MEMLOCK bit when calling
+libbpf_set_strict_mode().
+
+Libbpf allows to control the exact amount of set RLIMIT_MEMLOCK limit
+with libbpf_set_memlock_rlim_max() API. Passing 0 will make libbpf do
+nothing with RLIMIT_MEMLOCK. libbpf_set_memlock_rlim_max() has to be
+called before the first bpf_prog_load(), bpf_btf_load(), or
+bpf_object__load() call, otherwise it has no effect and will return
+-EBUSY.
+
+  [0] Closes: https://github.com/libbpf/libbpf/issues/369
+
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20211214195904.1785155-2-andrii@kernel.org
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ tools/lib/bpf/bpf.c             |   81 ++++++++++++++++++++++++++++++++++++++++
+ tools/lib/bpf/bpf.h             |    2 
+ tools/lib/bpf/libbpf.c          |   47 ++++-------------------
+ tools/lib/bpf/libbpf.map        |    1 
+ tools/lib/bpf/libbpf_internal.h |   39 +++++++++++++++++++
+ tools/lib/bpf/libbpf_legacy.h   |   12 +++++
+ 6 files changed, 143 insertions(+), 39 deletions(-)
+
+--- a/tools/lib/bpf/bpf.c
++++ b/tools/lib/bpf/bpf.c
+@@ -28,7 +28,9 @@
+ #include <asm/unistd.h>
+ #include <errno.h>
+ #include <linux/bpf.h>
++#include <linux/filter.h>
+ #include <limits.h>
++#include <sys/resource.h>
+ #include "bpf.h"
+ #include "libbpf.h"
+ #include "libbpf_internal.h"
+@@ -94,6 +96,77 @@ static inline int sys_bpf_prog_load(unio
+ 	return fd;
+ }
+ 
++/* Probe whether kernel switched from memlock-based (RLIMIT_MEMLOCK) to
++ * memcg-based memory accounting for BPF maps and progs. This was done in [0].
++ * We use the support for bpf_ktime_get_coarse_ns() helper, which was added in
++ * the same 5.11 Linux release ([1]), to detect memcg-based accounting for BPF.
++ *
++ *   [0] https://lore.kernel.org/bpf/20201201215900.3569844-1-guro@fb.com/
++ *   [1] d05512618056 ("bpf: Add bpf_ktime_get_coarse_ns helper")
++ */
++int probe_memcg_account(void)
++{
++	const size_t prog_load_attr_sz = offsetofend(union bpf_attr, attach_btf_obj_fd);
++	struct bpf_insn insns[] = {
++		BPF_EMIT_CALL(BPF_FUNC_ktime_get_coarse_ns),
++		BPF_EXIT_INSN(),
++	};
++	size_t insn_cnt = sizeof(insns) / sizeof(insns[0]);
++	union bpf_attr attr;
++	int prog_fd;
++
++	/* attempt loading freplace trying to use custom BTF */
++	memset(&attr, 0, prog_load_attr_sz);
++	attr.prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
++	attr.insns = ptr_to_u64(insns);
++	attr.insn_cnt = insn_cnt;
++	attr.license = ptr_to_u64("GPL");
++
++	prog_fd = sys_bpf_fd(BPF_PROG_LOAD, &attr, prog_load_attr_sz);
++	if (prog_fd >= 0) {
++		close(prog_fd);
++		return 1;
++	}
++	return 0;
++}
++
++static bool memlock_bumped;
++static rlim_t memlock_rlim = RLIM_INFINITY;
++
++int libbpf_set_memlock_rlim(size_t memlock_bytes)
++{
++	if (memlock_bumped)
++		return libbpf_err(-EBUSY);
++
++	memlock_rlim = memlock_bytes;
++	return 0;
++}
++
++int bump_rlimit_memlock(void)
++{
++	struct rlimit rlim;
++
++	/* this the default in libbpf 1.0, but for now user has to opt-in explicitly */
++	if (!(libbpf_mode & LIBBPF_STRICT_AUTO_RLIMIT_MEMLOCK))
++		return 0;
++
++	/* if kernel supports memcg-based accounting, skip bumping RLIMIT_MEMLOCK */
++	if (memlock_bumped || kernel_supports(NULL, FEAT_MEMCG_ACCOUNT))
++		return 0;
++
++	memlock_bumped = true;
++
++	/* zero memlock_rlim_max disables auto-bumping RLIMIT_MEMLOCK */
++	if (memlock_rlim == 0)
++		return 0;
++
++	rlim.rlim_cur = rlim.rlim_max = memlock_rlim;
++	if (setrlimit(RLIMIT_MEMLOCK, &rlim))
++		return -errno;
++
++	return 0;
++}
++
+ int bpf_map_create(enum bpf_map_type map_type,
+ 		   const char *map_name,
+ 		   __u32 key_size,
+@@ -105,6 +178,8 @@ int bpf_map_create(enum bpf_map_type map
+ 	union bpf_attr attr;
+ 	int fd;
+ 
++	bump_rlimit_memlock();
++
+ 	memset(&attr, 0, attr_sz);
+ 
+ 	if (!OPTS_VALID(opts, bpf_map_create_opts))
+@@ -251,6 +326,8 @@ int bpf_prog_load_v0_6_0(enum bpf_prog_t
+ 	union bpf_attr attr;
+ 	char *log_buf;
+ 
++	bump_rlimit_memlock();
++
+ 	if (!OPTS_VALID(opts, bpf_prog_load_opts))
+ 		return libbpf_err(-EINVAL);
+ 
+@@ -456,6 +533,8 @@ int bpf_verify_program(enum bpf_prog_typ
+ 	union bpf_attr attr;
+ 	int fd;
+ 
++	bump_rlimit_memlock();
++
+ 	memset(&attr, 0, sizeof(attr));
+ 	attr.prog_type = type;
+ 	attr.insn_cnt = (__u32)insns_cnt;
+@@ -1056,6 +1135,8 @@ int bpf_btf_load(const void *btf_data, s
+ 	__u32 log_level;
+ 	int fd;
+ 
++	bump_rlimit_memlock();
++
+ 	memset(&attr, 0, attr_sz);
+ 
+ 	if (!OPTS_VALID(opts, bpf_btf_load_opts))
+--- a/tools/lib/bpf/bpf.h
++++ b/tools/lib/bpf/bpf.h
+@@ -35,6 +35,8 @@
+ extern "C" {
+ #endif
+ 
++int libbpf_set_memlock_rlim(size_t memlock_bytes);
++
+ struct bpf_map_create_opts {
+ 	size_t sz; /* size of this struct for forward/backward compatibility */
+ 
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -187,42 +187,6 @@ const char *libbpf_version_string(void)
+ #undef __S
+ }
+ 
+-enum kern_feature_id {
+-	/* v4.14: kernel support for program & map names. */
+-	FEAT_PROG_NAME,
+-	/* v5.2: kernel support for global data sections. */
+-	FEAT_GLOBAL_DATA,
+-	/* BTF support */
+-	FEAT_BTF,
+-	/* BTF_KIND_FUNC and BTF_KIND_FUNC_PROTO support */
+-	FEAT_BTF_FUNC,
+-	/* BTF_KIND_VAR and BTF_KIND_DATASEC support */
+-	FEAT_BTF_DATASEC,
+-	/* BTF_FUNC_GLOBAL is supported */
+-	FEAT_BTF_GLOBAL_FUNC,
+-	/* BPF_F_MMAPABLE is supported for arrays */
+-	FEAT_ARRAY_MMAP,
+-	/* kernel support for expected_attach_type in BPF_PROG_LOAD */
+-	FEAT_EXP_ATTACH_TYPE,
+-	/* bpf_probe_read_{kernel,user}[_str] helpers */
+-	FEAT_PROBE_READ_KERN,
+-	/* BPF_PROG_BIND_MAP is supported */
+-	FEAT_PROG_BIND_MAP,
+-	/* Kernel support for module BTFs */
+-	FEAT_MODULE_BTF,
+-	/* BTF_KIND_FLOAT support */
+-	FEAT_BTF_FLOAT,
+-	/* BPF perf link support */
+-	FEAT_PERF_LINK,
+-	/* BTF_KIND_DECL_TAG support */
+-	FEAT_BTF_DECL_TAG,
+-	/* BTF_KIND_TYPE_TAG support */
+-	FEAT_BTF_TYPE_TAG,
+-	__FEAT_CNT,
+-};
+-
+-static bool kernel_supports(const struct bpf_object *obj, enum kern_feature_id feat_id);
+-
+ enum reloc_type {
+ 	RELO_LD64,
+ 	RELO_CALL,
+@@ -4352,6 +4316,10 @@ bpf_object__probe_loading(struct bpf_obj
+ 	if (obj->gen_loader)
+ 		return 0;
+ 
++	ret = bump_rlimit_memlock();
++	if (ret)
++		pr_warn("Failed to bump RLIMIT_MEMLOCK (err = %d), you might need to do it explicitly!\n", ret);
++
+ 	/* make sure basic loading works */
+ 	ret = bpf_prog_load(BPF_PROG_TYPE_SOCKET_FILTER, NULL, "GPL", insns, insn_cnt, NULL);
+ 	if (ret < 0)
+@@ -4718,14 +4686,17 @@ static struct kern_feature_desc {
+ 	[FEAT_BTF_TYPE_TAG] = {
+ 		"BTF_KIND_TYPE_TAG support", probe_kern_btf_type_tag,
+ 	},
++	[FEAT_MEMCG_ACCOUNT] = {
++		"memcg-based memory accounting", probe_memcg_account,
++	},
+ };
+ 
+-static bool kernel_supports(const struct bpf_object *obj, enum kern_feature_id feat_id)
++bool kernel_supports(const struct bpf_object *obj, enum kern_feature_id feat_id)
+ {
+ 	struct kern_feature_desc *feat = &feature_probes[feat_id];
+ 	int ret;
+ 
+-	if (obj->gen_loader)
++	if (obj && obj->gen_loader)
+ 		/* To generate loader program assume the latest kernel
+ 		 * to avoid doing extra prog_load, map_create syscalls.
+ 		 */
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@ -427,4 +427,5 @@ LIBBPF_0.7.0 {
+ 		bpf_program__log_level;
+ 		bpf_program__set_log_buf;
+ 		bpf_program__set_log_level;
++		libbpf_set_memlock_rlim_max;
+ };
+--- a/tools/lib/bpf/libbpf_internal.h
++++ b/tools/lib/bpf/libbpf_internal.h
+@@ -291,6 +291,45 @@ static inline bool libbpf_validate_opts(
+ 					(opts)->sz - __off);		      \
+ })
+ 
++enum kern_feature_id {
++	/* v4.14: kernel support for program & map names. */
++	FEAT_PROG_NAME,
++	/* v5.2: kernel support for global data sections. */
++	FEAT_GLOBAL_DATA,
++	/* BTF support */
++	FEAT_BTF,
++	/* BTF_KIND_FUNC and BTF_KIND_FUNC_PROTO support */
++	FEAT_BTF_FUNC,
++	/* BTF_KIND_VAR and BTF_KIND_DATASEC support */
++	FEAT_BTF_DATASEC,
++	/* BTF_FUNC_GLOBAL is supported */
++	FEAT_BTF_GLOBAL_FUNC,
++	/* BPF_F_MMAPABLE is supported for arrays */
++	FEAT_ARRAY_MMAP,
++	/* kernel support for expected_attach_type in BPF_PROG_LOAD */
++	FEAT_EXP_ATTACH_TYPE,
++	/* bpf_probe_read_{kernel,user}[_str] helpers */
++	FEAT_PROBE_READ_KERN,
++	/* BPF_PROG_BIND_MAP is supported */
++	FEAT_PROG_BIND_MAP,
++	/* Kernel support for module BTFs */
++	FEAT_MODULE_BTF,
++	/* BTF_KIND_FLOAT support */
++	FEAT_BTF_FLOAT,
++	/* BPF perf link support */
++	FEAT_PERF_LINK,
++	/* BTF_KIND_DECL_TAG support */
++	FEAT_BTF_DECL_TAG,
++	/* BTF_KIND_TYPE_TAG support */
++	FEAT_BTF_TYPE_TAG,
++	/* memcg-based accounting for BPF maps and progs */
++	FEAT_MEMCG_ACCOUNT,
++	__FEAT_CNT,
++};
++
++int probe_memcg_account(void);
++bool kernel_supports(const struct bpf_object *obj, enum kern_feature_id feat_id);
++int bump_rlimit_memlock(void);
+ 
+ int parse_cpu_mask_str(const char *s, bool **mask, int *mask_sz);
+ int parse_cpu_mask_file(const char *fcpu, bool **mask, int *mask_sz);
+--- a/tools/lib/bpf/libbpf_legacy.h
++++ b/tools/lib/bpf/libbpf_legacy.h
+@@ -45,7 +45,6 @@ enum libbpf_strict_mode {
+ 	 * (positive) error code.
+ 	 */
+ 	LIBBPF_STRICT_DIRECT_ERRS = 0x02,
+-
+ 	/*
+ 	 * Enforce strict BPF program section (SEC()) names.
+ 	 * E.g., while prefiously SEC("xdp_whatever") or SEC("perf_event_blah") were
+@@ -63,6 +62,17 @@ enum libbpf_strict_mode {
+ 	 * Clients can maintain it on their own if it is valuable for them.
+ 	 */
+ 	LIBBPF_STRICT_NO_OBJECT_LIST = 0x08,
++	/*
++	 * Automatically bump RLIMIT_MEMLOCK using setrlimit() before the
++	 * first BPF program or map creation operation. This is done only if
++	 * kernel is too old to support memcg-based memory accounting for BPF
++	 * subsystem. By default, RLIMIT_MEMLOCK limit is set to RLIM_INFINITY,
++	 * but it can be overriden with libbpf_set_memlock_rlim_max() API.
++	 * Note that libbpf_set_memlock_rlim_max() needs to be called before
++	 * the very first bpf_prog_load(), bpf_map_create() or bpf_object__load()
++	 * operation.
++	 */
++	LIBBPF_STRICT_AUTO_RLIMIT_MEMLOCK = 0x10,
+ 
+ 	__LIBBPF_STRICT_LAST,
+ };

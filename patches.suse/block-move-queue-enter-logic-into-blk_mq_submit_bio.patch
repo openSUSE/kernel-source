@@ -1,0 +1,253 @@
+From: Jens Axboe <axboe@kernel.dk>
+Date: Wed, 3 Nov 2021 05:47:09 -0600
+Subject: [PATCH] block: move queue enter logic into blk_mq_submit_bio()
+Git-commit: 900e080752025f0016128f07c9ed4c50eba3654b
+Patch-mainline: v5.16-rc1
+References: jsc#PED-1183
+
+Retain the old logic for the fops based submit, but for our internal
+blk_mq_submit_bio(), move the queue entering logic into the core
+function itself.
+
+We need to be a bit careful if going into the scheduler, as a scheduler
+or queue mappings can arbitrarily change before we have entered the queue.
+Have the bio scheduler mapping do that separately, it's a very cheap
+operation compared to actually doing merging locking and lookups.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+[axboe: update to check merge post submit_bio_checks() doing remap...]
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-core.c     | 25 +++++++++---------
+ block/blk-mq-sched.c | 13 +++++++---
+ block/blk-mq.c       | 60 ++++++++++++++++++++++++++++++--------------
+ block/blk.h          |  1 +
+ 4 files changed, 65 insertions(+), 34 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 9ca3ddd154d4..4366056e14c4 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -744,7 +744,7 @@ static inline blk_status_t blk_check_zone_append(struct request_queue *q,
+ 	return BLK_STS_OK;
+ }
+ 
+-static noinline_for_stack bool submit_bio_checks(struct bio *bio)
++noinline_for_stack bool submit_bio_checks(struct bio *bio)
+ {
+ 	struct block_device *bdev = bio->bi_bdev;
+ 	struct request_queue *q = bdev_get_queue(bdev);
+@@ -862,22 +862,23 @@ static noinline_for_stack bool submit_bio_checks(struct bio *bio)
+ 	return false;
+ }
+ 
+-static void __submit_bio(struct bio *bio)
++static void __submit_bio_fops(struct gendisk *disk, struct bio *bio)
+ {
+-	struct gendisk *disk = bio->bi_bdev->bd_disk;
+-
+ 	if (unlikely(bio_queue_enter(bio) != 0))
+ 		return;
++	if (submit_bio_checks(bio) && blk_crypto_bio_prep(&bio))
++		disk->fops->submit_bio(bio);
++	blk_queue_exit(disk->queue);
++}
+ 
+-	if (!submit_bio_checks(bio) || !blk_crypto_bio_prep(&bio))
+-		goto queue_exit;
+-	if (!disk->fops->submit_bio) {
++static void __submit_bio(struct bio *bio)
++{
++	struct gendisk *disk = bio->bi_bdev->bd_disk;
++
++	if (!disk->fops->submit_bio)
+ 		blk_mq_submit_bio(bio);
+-		return;
+-	}
+-	disk->fops->submit_bio(bio);
+-queue_exit:
+-	blk_queue_exit(disk->queue);
++	else
++		__submit_bio_fops(disk, bio);
+ }
+ 
+ /*
+diff --git a/block/blk-mq-sched.c b/block/blk-mq-sched.c
+index 4a6789e4398b..4be652fa38e7 100644
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@ -370,15 +370,20 @@ bool blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio,
+ 	bool ret = false;
+ 	enum hctx_type type;
+ 
+-	if (e && e->type->ops.bio_merge)
+-		return e->type->ops.bio_merge(q, bio, nr_segs);
++	if (bio_queue_enter(bio))
++		return false;
++
++	if (e && e->type->ops.bio_merge) {
++		ret = e->type->ops.bio_merge(q, bio, nr_segs);
++		goto out_put;
++	}
+ 
+ 	ctx = blk_mq_get_ctx(q);
+ 	hctx = blk_mq_map_queue(q, bio->bi_opf, ctx);
+ 	type = hctx->type;
+ 	if (!(hctx->flags & BLK_MQ_F_SHOULD_MERGE) ||
+ 	    list_empty_careful(&ctx->rq_lists[type]))
+-		return false;
++		goto out_put;
+ 
+ 	/* default per sw-queue merge */
+ 	spin_lock(&ctx->lock);
+@@ -391,6 +396,8 @@ bool blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio,
+ 		ret = true;
+ 
+ 	spin_unlock(&ctx->lock);
++out_put:
++	blk_queue_exit(q);
+ 	return ret;
+ }
+ 
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index dcb413297a96..5fe40c85a308 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2478,9 +2478,23 @@ static inline unsigned short blk_plug_max_rq_count(struct blk_plug *plug)
+ 	return BLK_MAX_REQUEST_COUNT;
+ }
+ 
++static bool blk_attempt_bio_merge(struct request_queue *q, struct bio *bio,
++				  unsigned int nr_segs, bool *same_queue_rq)
++{
++	if (!blk_queue_nomerges(q) && bio_mergeable(bio)) {
++		if (blk_attempt_plug_merge(q, bio, nr_segs, same_queue_rq))
++			return true;
++		if (blk_mq_sched_bio_merge(q, bio, nr_segs))
++			return true;
++	}
++	return false;
++}
++
+ static struct request *blk_mq_get_new_requests(struct request_queue *q,
+ 					       struct blk_plug *plug,
+-					       struct bio *bio)
++					       struct bio *bio,
++					       unsigned int nsegs,
++					       bool *same_queue_rq)
+ {
+ 	struct blk_mq_alloc_data data = {
+ 		.q		= q,
+@@ -2489,6 +2503,15 @@ static struct request *blk_mq_get_new_requests(struct request_queue *q,
+ 	};
+ 	struct request *rq;
+ 
++	if (unlikely(bio_queue_enter(bio)))
++		return NULL;
++	if (unlikely(!submit_bio_checks(bio)))
++		goto put_exit;
++	if (blk_attempt_bio_merge(q, bio, nsegs, same_queue_rq))
++		goto put_exit;
++
++	rq_qos_throttle(q, bio);
++
+ 	if (plug) {
+ 		data.nr_tags = plug->nr_ios;
+ 		plug->nr_ios = 1;
+@@ -2502,25 +2525,34 @@ static struct request *blk_mq_get_new_requests(struct request_queue *q,
+ 	rq_qos_cleanup(q, bio);
+ 	if (bio->bi_opf & REQ_NOWAIT)
+ 		bio_wouldblock_error(bio);
++put_exit:
++	blk_queue_exit(q);
+ 	return NULL;
+ }
+ 
+ static inline struct request *blk_mq_get_request(struct request_queue *q,
+ 						 struct blk_plug *plug,
+-						 struct bio *bio)
++						 struct bio *bio,
++						 unsigned int nsegs,
++						 bool *same_queue_rq)
+ {
+ 	if (plug) {
+ 		struct request *rq;
+ 
+ 		rq = rq_list_peek(&plug->cached_rq);
+ 		if (rq) {
++			if (unlikely(!submit_bio_checks(bio)))
++				return NULL;
++			if (blk_attempt_bio_merge(q, bio, nsegs, same_queue_rq))
++				return NULL;
+ 			plug->cached_rq = rq_list_next(rq);
+ 			INIT_LIST_HEAD(&rq->queuelist);
++			rq_qos_throttle(q, bio);
+ 			return rq;
+ 		}
+ 	}
+ 
+-	return blk_mq_get_new_requests(q, plug, bio);
++	return blk_mq_get_new_requests(q, plug, bio, nsegs, same_queue_rq);
+ }
+ 
+ /**
+@@ -2546,26 +2578,20 @@ void blk_mq_submit_bio(struct bio *bio)
+ 	unsigned int nr_segs = 1;
+ 	blk_status_t ret;
+ 
++	if (unlikely(!blk_crypto_bio_prep(&bio)))
++		return;
++
+ 	blk_queue_bounce(q, &bio);
+ 	if (blk_may_split(q, bio))
+ 		__blk_queue_split(q, &bio, &nr_segs);
+ 
+ 	if (!bio_integrity_prep(bio))
+-		goto queue_exit;
+-
+-	if (!blk_queue_nomerges(q) && bio_mergeable(bio)) {
+-		if (blk_attempt_plug_merge(q, bio, nr_segs, &same_queue_rq))
+-			goto queue_exit;
+-		if (blk_mq_sched_bio_merge(q, bio, nr_segs))
+-			goto queue_exit;
+-	}
+-
+-	rq_qos_throttle(q, bio);
++		return;
+ 
+ 	plug = blk_mq_plug(q, bio);
+-	rq = blk_mq_get_request(q, plug, bio);
++	rq = blk_mq_get_request(q, plug, bio, nr_segs, &same_queue_rq);
+ 	if (unlikely(!rq))
+-		goto queue_exit;
++		return;
+ 
+ 	trace_block_getrq(bio);
+ 
+@@ -2646,10 +2672,6 @@ void blk_mq_submit_bio(struct bio *bio)
+ 		/* Default case. */
+ 		blk_mq_sched_insert_request(rq, false, true, true);
+ 	}
+-
+-	return;
+-queue_exit:
+-	blk_queue_exit(q);
+ }
+ 
+ static size_t order_to_size(unsigned int order)
+diff --git a/block/blk.h b/block/blk.h
+index 814d9632d43e..b4fed2033e48 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -56,6 +56,7 @@ void blk_freeze_queue(struct request_queue *q);
+ void __blk_mq_unfreeze_queue(struct request_queue *q, bool force_atomic);
+ void blk_queue_start_drain(struct request_queue *q);
+ int __bio_queue_enter(struct request_queue *q, struct bio *bio);
++bool submit_bio_checks(struct bio *bio);
+ 
+ static inline bool blk_try_enter_queue(struct request_queue *q, bool pm)
+ {
+-- 
+2.35.3
+
