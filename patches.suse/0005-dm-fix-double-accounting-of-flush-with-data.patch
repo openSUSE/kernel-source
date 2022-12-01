@@ -1,0 +1,149 @@
+From 8d394bc4adf588ca4a0650745167cb83f86c18c9 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Thu, 17 Feb 2022 23:39:57 -0500
+Subject: [PATCH] dm: fix double accounting of flush with data
+Git-commit: 8d394bc4adf588ca4a0650745167cb83f86c18c9
+Patch-mainline: v5.18-rc1
+References: git-fixes
+
+DM handles a flush with data by first issuing an empty flush and then
+once it completes the REQ_PREFLUSH flag is removed and the payload is
+issued.  The problem fixed by this commit is that both the empty flush
+bio and the data payload will account the full extent of the data
+payload.
+
+Fix this by factoring out dm_io_acct() and having it wrap all IO
+accounting to set the size of  bio with REQ_PREFLUSH to 0, account the
+IO, and then restore the original size.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/dm-stats.c |  6 ++++--
+ drivers/md/dm-stats.h |  2 +-
+ drivers/md/dm.c       | 47 ++++++++++++++++++++++++++++++-------------
+ 3 files changed, 38 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/md/dm-stats.c b/drivers/md/dm-stats.c
+index 35d368c418d0..80328f1d1083 100644
+--- a/drivers/md/dm-stats.c
++++ b/drivers/md/dm-stats.c
+@@ -621,13 +621,14 @@ static void __dm_stat_bio(struct dm_stat *s, int bi_rw,
+ 
+ void dm_stats_account_io(struct dm_stats *stats, unsigned long bi_rw,
+ 			 sector_t bi_sector, unsigned bi_sectors, bool end,
+-			 unsigned long duration_jiffies,
++			 unsigned long start_time,
+ 			 struct dm_stats_aux *stats_aux)
+ {
+ 	struct dm_stat *s;
+ 	sector_t end_sector;
+ 	struct dm_stats_last_position *last;
+ 	bool got_precise_time;
++	unsigned long duration_jiffies = 0;
+ 
+ 	if (unlikely(!bi_sectors))
+ 		return;
+@@ -647,7 +648,8 @@ void dm_stats_account_io(struct dm_stats *stats, unsigned long bi_rw,
+ 				       ));
+ 		WRITE_ONCE(last->last_sector, end_sector);
+ 		WRITE_ONCE(last->last_rw, bi_rw);
+-	}
++	} else
++		duration_jiffies = jiffies - start_time;
+ 
+ 	rcu_read_lock();
+ 
+diff --git a/drivers/md/dm-stats.h b/drivers/md/dm-stats.h
+index 2ddfae678f32..09fa579e2e24 100644
+--- a/drivers/md/dm-stats.h
++++ b/drivers/md/dm-stats.h
+@@ -32,7 +32,7 @@ int dm_stats_message(struct mapped_device *md, unsigned argc, char **argv,
+ 
+ void dm_stats_account_io(struct dm_stats *stats, unsigned long bi_rw,
+ 			 sector_t bi_sector, unsigned bi_sectors, bool end,
+-			 unsigned long duration_jiffies,
++			 unsigned long start_time,
+ 			 struct dm_stats_aux *aux);
+ 
+ static inline bool dm_stats_used(struct dm_stats *st)
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 18329b33e8cd..c72a271ea999 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -485,29 +485,48 @@ u64 dm_start_time_ns_from_clone(struct bio *bio)
+ }
+ EXPORT_SYMBOL_GPL(dm_start_time_ns_from_clone);
+ 
+-static void start_io_acct(struct dm_io *io)
++static bool bio_is_flush_with_data(struct bio *bio)
+ {
+-	struct mapped_device *md = io->md;
+-	struct bio *bio = io->orig_bio;
++	return ((bio->bi_opf & REQ_PREFLUSH) && bio->bi_iter.bi_size);
++}
++
++static void dm_io_acct(bool end, struct mapped_device *md, struct bio *bio,
++		       unsigned long start_time, struct dm_stats_aux *stats_aux)
++{
++	bool is_flush_with_data;
++	unsigned int bi_size;
++
++	/* If REQ_PREFLUSH set save any payload but do not account it */
++	is_flush_with_data = bio_is_flush_with_data(bio);
++	if (is_flush_with_data) {
++		bi_size = bio->bi_iter.bi_size;
++		bio->bi_iter.bi_size = 0;
++	}
++
++	if (!end)
++		bio_start_io_acct_time(bio, start_time);
++	else
++		bio_end_io_acct(bio, start_time);
+ 
+-	bio_start_io_acct_time(bio, io->start_time);
+ 	if (unlikely(dm_stats_used(&md->stats)))
+ 		dm_stats_account_io(&md->stats, bio_data_dir(bio),
+ 				    bio->bi_iter.bi_sector, bio_sectors(bio),
+-				    false, 0, &io->stats_aux);
++				    end, start_time, stats_aux);
++
++	/* Restore bio's payload so it does get accounted upon requeue */
++	if (is_flush_with_data)
++		bio->bi_iter.bi_size = bi_size;
++}
++
++static void start_io_acct(struct dm_io *io)
++{
++	dm_io_acct(false, io->md, io->orig_bio, io->start_time, &io->stats_aux);
+ }
+ 
+ static void end_io_acct(struct mapped_device *md, struct bio *bio,
+ 			unsigned long start_time, struct dm_stats_aux *stats_aux)
+ {
+-	unsigned long duration = jiffies - start_time;
+-
+-	bio_end_io_acct(bio, start_time);
+-
+-	if (unlikely(dm_stats_used(&md->stats)))
+-		dm_stats_account_io(&md->stats, bio_data_dir(bio),
+-				    bio->bi_iter.bi_sector, bio_sectors(bio),
+-				    true, duration, stats_aux);
++	dm_io_acct(true, md, bio, start_time, stats_aux);
+ }
+ 
+ static struct dm_io *alloc_io(struct mapped_device *md, struct bio *bio)
+@@ -834,7 +853,7 @@ void dm_io_dec_pending(struct dm_io *io, blk_status_t error)
+ 		if (io_error == BLK_STS_DM_REQUEUE)
+ 			return;
+ 
+-		if ((bio->bi_opf & REQ_PREFLUSH) && bio->bi_iter.bi_size) {
++		if (bio_is_flush_with_data(bio)) {
+ 			/*
+ 			 * Preflush done for flush with data, reissue
+ 			 * without REQ_PREFLUSH.
+-- 
+2.35.3
+
