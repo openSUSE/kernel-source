@@ -1,0 +1,149 @@
+From 1174852cd0c503063b52e99061b67bc50f085a43 Mon Sep 17 00:00:00 2001
+From: Philip Yang <Philip.Yang@amd.com>
+Date: Tue, 16 Nov 2021 11:45:32 -0500
+Subject: drm/amdkfd: process exit and retry fault race
+Git-commit: cda0817b41bdd509c37036c482a60230a5063772
+Patch-mainline: v5.16-rc3
+References: jsc#PED-1166 jsc#PED-1168 jsc#PED-1170 jsc#PED-1218 jsc#PED-1220 jsc#PED-1222 jsc#PED-1223 jsc#PED-1225
+
+kfd_process_wq_release drain retry fault to ensure no retry fault comes
+after removing kfd process from the hash table, otherwise svm page fault
+handler will fail to recover the fault and dump GPU vm fault log.
+
+Refactor deferred list work to get_task_mm and take mmap write lock
+to handle all ranges, and avoid mm is gone while inserting mmu notifier.
+
+Signed-off-by: Philip Yang <Philip.Yang@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_svm.c | 63 ++++++++++++++++------------
+ 1 file changed, 36 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+index 16137c4247bb..b553c34cc99b 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+@@ -1990,43 +1990,42 @@ static void svm_range_deferred_list_work(struct work_struct *work)
+ 	struct svm_range_list *svms;
+ 	struct svm_range *prange;
+ 	struct mm_struct *mm;
++	struct kfd_process *p;
+ 
+ 	svms = container_of(work, struct svm_range_list, deferred_list_work);
+ 	pr_debug("enter svms 0x%p\n", svms);
+ 
++	p = container_of(svms, struct kfd_process, svms);
++	/* Avoid mm is gone when inserting mmu notifier */
++	mm = get_task_mm(p->lead_thread);
++	if (!mm) {
++		pr_debug("svms 0x%p process mm gone\n", svms);
++		return;
++	}
++retry:
++	mmap_write_lock(mm);
++
++	/* Checking for the need to drain retry faults must be inside
++	 * mmap write lock to serialize with munmap notifiers.
++	 */
++	if (unlikely(READ_ONCE(svms->drain_pagefaults))) {
++		WRITE_ONCE(svms->drain_pagefaults, false);
++		mmap_write_unlock(mm);
++		svm_range_drain_retry_fault(svms);
++		goto retry;
++	}
++
+ 	spin_lock(&svms->deferred_list_lock);
+ 	while (!list_empty(&svms->deferred_range_list)) {
+ 		prange = list_first_entry(&svms->deferred_range_list,
+ 					  struct svm_range, deferred_list);
++		list_del_init(&prange->deferred_list);
+ 		spin_unlock(&svms->deferred_list_lock);
++
+ 		pr_debug("prange 0x%p [0x%lx 0x%lx] op %d\n", prange,
+ 			 prange->start, prange->last, prange->work_item.op);
+ 
+-		mm = prange->work_item.mm;
+-retry:
+-		mmap_write_lock(mm);
+ 		mutex_lock(&svms->lock);
+-
+-		/* Checking for the need to drain retry faults must be in
+-		 * mmap write lock to serialize with munmap notifiers.
+-		 *
+-		 * Remove from deferred_list must be inside mmap write lock,
+-		 * otherwise, svm_range_list_lock_and_flush_work may hold mmap
+-		 * write lock, and continue because deferred_list is empty, then
+-		 * deferred_list handle is blocked by mmap write lock.
+-		 */
+-		spin_lock(&svms->deferred_list_lock);
+-		if (unlikely(svms->drain_pagefaults)) {
+-			svms->drain_pagefaults = false;
+-			spin_unlock(&svms->deferred_list_lock);
+-			mutex_unlock(&svms->lock);
+-			mmap_write_unlock(mm);
+-			svm_range_drain_retry_fault(svms);
+-			goto retry;
+-		}
+-		list_del_init(&prange->deferred_list);
+-		spin_unlock(&svms->deferred_list_lock);
+-
+ 		mutex_lock(&prange->migrate_mutex);
+ 		while (!list_empty(&prange->child_list)) {
+ 			struct svm_range *pchild;
+@@ -2042,12 +2041,13 @@ static void svm_range_deferred_list_work(struct work_struct *work)
+ 
+ 		svm_range_handle_list_op(svms, prange);
+ 		mutex_unlock(&svms->lock);
+-		mmap_write_unlock(mm);
+ 
+ 		spin_lock(&svms->deferred_list_lock);
+ 	}
+ 	spin_unlock(&svms->deferred_list_lock);
+ 
++	mmap_write_unlock(mm);
++	mmput(mm);
+ 	pr_debug("exit svms 0x%p\n", svms);
+ }
+ 
+@@ -2600,7 +2600,7 @@ svm_range_restore_pages(struct amdgpu_device *adev, unsigned int pasid,
+ 	p = kfd_lookup_process_by_pasid(pasid);
+ 	if (!p) {
+ 		pr_debug("kfd process not founded pasid 0x%x\n", pasid);
+-		return -ESRCH;
++		return 0;
+ 	}
+ 	if (!p->xnack_enabled) {
+ 		pr_debug("XNACK not enabled for pasid 0x%x\n", pasid);
+@@ -2611,10 +2611,12 @@ svm_range_restore_pages(struct amdgpu_device *adev, unsigned int pasid,
+ 
+ 	pr_debug("restoring svms 0x%p fault address 0x%llx\n", svms, addr);
+ 
++	/* p->lead_thread is available as kfd_process_wq_release flush the work
++	 * before releasing task ref.
++	 */
+ 	mm = get_task_mm(p->lead_thread);
+ 	if (!mm) {
+ 		pr_debug("svms 0x%p failed to get mm\n", svms);
+-		r = -ESRCH;
+ 		goto out;
+ 	}
+ 
+@@ -2741,6 +2743,13 @@ void svm_range_list_fini(struct kfd_process *p)
+ 	/* Ensure list work is finished before process is destroyed */
+ 	flush_work(&p->svms.deferred_list_work);
+ 
++	/*
++	 * Ensure no retry fault comes in afterwards, as page fault handler will
++	 * not find kfd process and take mm lock to recover fault.
++	 */
++	svm_range_drain_retry_fault(&p->svms);
++
++
+ 	list_for_each_entry_safe(prange, next, &p->svms.list, list) {
+ 		svm_range_unlink(prange);
+ 		svm_range_remove_notifier(prange);
+-- 
+2.38.1
+
