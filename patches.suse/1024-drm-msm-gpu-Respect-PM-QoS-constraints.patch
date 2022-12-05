@@ -1,0 +1,282 @@
+From 183799a09ba1059c6d8f9f9601d6bd8e489dba08 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Sat, 20 Nov 2021 12:01:03 -0800
+Subject: drm/msm/gpu: Respect PM QoS constraints
+Git-commit: 7c0ffcd40b161f56a7cea585297d64aeaf4d44a9
+Patch-mainline: v5.17-rc1
+References: jsc#PED-1166 jsc#PED-1168 jsc#PED-1170 jsc#PED-1218 jsc#PED-1220 jsc#PED-1222 jsc#PED-1223 jsc#PED-1225
+
+Re-work the boost and idle clamping to use PM QoS requests instead, so
+they get aggreggated with other requests (such as cooling device).
+
+This does have the minor side-effect that devfreq sysfs min_freq/
+max_freq files now reflect the boost and idle clamping, as they show
+(despite what they are documented to show) the aggregated min/max freq.
+Fixing that in devfreq does not look straightforward after considering
+that OPPs can be dynamically added/removed.  However writes to the
+sysfs files still behave as expected.
+
+v2: Use 64b math to avoid potential 32b overflow
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Link: https://lore.kernel.org/r/20211120200103.1051459-3-robdclark@gmail.com
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/msm/msm_gpu.h         | 33 +++++++---
+ drivers/gpu/drm/msm/msm_gpu_devfreq.c | 89 +++++++++++++++------------
+ 2 files changed, 71 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/msm_gpu.h b/drivers/gpu/drm/msm/msm_gpu.h
+index 37b3ecb33cbd..445c6bfd4b6b 100644
+--- a/drivers/gpu/drm/msm/msm_gpu.h
++++ b/drivers/gpu/drm/msm/msm_gpu.h
+@@ -87,6 +87,21 @@ struct msm_gpu_devfreq {
+ 	/** devfreq: devfreq instance */
+ 	struct devfreq *devfreq;
+ 
++	/**
++	 * idle_constraint:
++	 *
++	 * A PM QoS constraint to limit max freq while the GPU is idle.
++	 */
++	struct dev_pm_qos_request idle_freq;
++
++	/**
++	 * boost_constraint:
++	 *
++	 * A PM QoS constraint to boost min freq for a period of time
++	 * until the boost expires.
++	 */
++	struct dev_pm_qos_request boost_freq;
++
+ 	/**
+ 	 * busy_cycles:
+ 	 *
+@@ -103,22 +118,19 @@ struct msm_gpu_devfreq {
+ 	ktime_t idle_time;
+ 
+ 	/**
+-	 * idle_freq:
++	 * idle_work:
+ 	 *
+-	 * Shadow frequency used while the GPU is idle.  From the PoV of
+-	 * the devfreq governor, we are continuing to sample busyness and
+-	 * adjust frequency while the GPU is idle, but we use this shadow
+-	 * value as the GPU is actually clamped to minimum frequency while
+-	 * it is inactive.
++	 * Used to delay clamping to idle freq on active->idle transition.
+ 	 */
+-	unsigned long idle_freq;
++	struct msm_hrtimer_work idle_work;
+ 
+ 	/**
+-	 * idle_work:
++	 * boost_work:
+ 	 *
+-	 * Used to delay clamping to idle freq on active->idle transition.
++	 * Used to reset the boost_constraint after the boost period has
++	 * elapsed
+ 	 */
+-	struct msm_hrtimer_work idle_work;
++	struct msm_hrtimer_work boost_work;
+ };
+ 
+ struct msm_gpu {
+@@ -522,6 +534,7 @@ void msm_devfreq_init(struct msm_gpu *gpu);
+ void msm_devfreq_cleanup(struct msm_gpu *gpu);
+ void msm_devfreq_resume(struct msm_gpu *gpu);
+ void msm_devfreq_suspend(struct msm_gpu *gpu);
++void msm_devfreq_boost(struct msm_gpu *gpu, unsigned factor);
+ void msm_devfreq_active(struct msm_gpu *gpu);
+ void msm_devfreq_idle(struct msm_gpu *gpu);
+ 
+diff --git a/drivers/gpu/drm/msm/msm_gpu_devfreq.c b/drivers/gpu/drm/msm/msm_gpu_devfreq.c
+index d232f74d2346..62405e980925 100644
+--- a/drivers/gpu/drm/msm/msm_gpu_devfreq.c
++++ b/drivers/gpu/drm/msm/msm_gpu_devfreq.c
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/devfreq.h>
+ #include <linux/devfreq_cooling.h>
++#include <linux/units.h>
+ 
+ /*
+  * Power Management:
+@@ -25,17 +26,6 @@ static int msm_devfreq_target(struct device *dev, unsigned long *freq,
+ 	 * to something that actually is in the opp table:
+ 	 */
+ 	opp = devfreq_recommended_opp(dev, freq, flags);
+-
+-	/*
+-	 * If the GPU is idle, devfreq is not aware, so just ignore
+-	 * it's requests
+-	 */
+-	if (gpu->devfreq.idle_freq) {
+-		gpu->devfreq.idle_freq = *freq;
+-		dev_pm_opp_put(opp);
+-		return 0;
+-	}
+-
+ 	if (IS_ERR(opp))
+ 		return PTR_ERR(opp);
+ 
+@@ -53,9 +43,6 @@ static int msm_devfreq_target(struct device *dev, unsigned long *freq,
+ 
+ static unsigned long get_freq(struct msm_gpu *gpu)
+ {
+-	if (gpu->devfreq.idle_freq)
+-		return gpu->devfreq.idle_freq;
+-
+ 	if (gpu->funcs->gpu_get_freq)
+ 		return gpu->funcs->gpu_get_freq(gpu);
+ 
+@@ -93,6 +80,7 @@ static struct devfreq_dev_profile msm_devfreq_profile = {
+ 	.get_cur_freq = msm_devfreq_get_cur_freq,
+ };
+ 
++static void msm_devfreq_boost_work(struct kthread_work *work);
+ static void msm_devfreq_idle_work(struct kthread_work *work);
+ 
+ void msm_devfreq_init(struct msm_gpu *gpu)
+@@ -103,6 +91,12 @@ void msm_devfreq_init(struct msm_gpu *gpu)
+ 	if (!gpu->funcs->gpu_busy)
+ 		return;
+ 
++	dev_pm_qos_add_request(&gpu->pdev->dev, &df->idle_freq,
++			       DEV_PM_QOS_MAX_FREQUENCY,
++			       PM_QOS_MAX_FREQUENCY_DEFAULT_VALUE);
++	dev_pm_qos_add_request(&gpu->pdev->dev, &df->boost_freq,
++			       DEV_PM_QOS_MIN_FREQUENCY, 0);
++
+ 	msm_devfreq_profile.initial_freq = gpu->fast_rate;
+ 
+ 	/*
+@@ -133,13 +127,19 @@ void msm_devfreq_init(struct msm_gpu *gpu)
+ 		gpu->cooling = NULL;
+ 	}
+ 
++	msm_hrtimer_work_init(&df->boost_work, gpu->worker, msm_devfreq_boost_work,
++			      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	msm_hrtimer_work_init(&df->idle_work, gpu->worker, msm_devfreq_idle_work,
+ 			      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ }
+ 
+ void msm_devfreq_cleanup(struct msm_gpu *gpu)
+ {
++	struct msm_gpu_devfreq *df = &gpu->devfreq;
++
+ 	devfreq_cooling_unregister(gpu->cooling);
++	dev_pm_qos_remove_request(&df->boost_freq);
++	dev_pm_qos_remove_request(&df->idle_freq);
+ }
+ 
+ void msm_devfreq_resume(struct msm_gpu *gpu)
+@@ -155,12 +155,40 @@ void msm_devfreq_suspend(struct msm_gpu *gpu)
+ 	devfreq_suspend_device(gpu->devfreq.devfreq);
+ }
+ 
++static void msm_devfreq_boost_work(struct kthread_work *work)
++{
++	struct msm_gpu_devfreq *df = container_of(work,
++			struct msm_gpu_devfreq, boost_work.work);
++
++	dev_pm_qos_update_request(&df->boost_freq, 0);
++}
++
++void msm_devfreq_boost(struct msm_gpu *gpu, unsigned factor)
++{
++	struct msm_gpu_devfreq *df = &gpu->devfreq;
++	uint64_t freq;
++
++	freq = get_freq(gpu);
++	freq *= factor;
++
++	/*
++	 * A nice little trap is that PM QoS operates in terms of KHz,
++	 * while devfreq operates in terms of Hz:
++	 */
++	do_div(freq, HZ_PER_KHZ);
++
++	dev_pm_qos_update_request(&df->boost_freq, freq);
++
++	msm_hrtimer_queue_work(&df->boost_work,
++			       ms_to_ktime(msm_devfreq_profile.polling_ms),
++			       HRTIMER_MODE_REL);
++}
++
+ void msm_devfreq_active(struct msm_gpu *gpu)
+ {
+ 	struct msm_gpu_devfreq *df = &gpu->devfreq;
+ 	struct devfreq_dev_status status;
+ 	unsigned int idle_time;
+-	unsigned long target_freq = df->idle_freq;
+ 
+ 	if (!df->devfreq)
+ 		return;
+@@ -170,12 +198,6 @@ void msm_devfreq_active(struct msm_gpu *gpu)
+ 	 */
+ 	hrtimer_cancel(&df->idle_work.timer);
+ 
+-	/*
+-	 * Hold devfreq lock to synchronize with get_dev_status()/
+-	 * target() callbacks
+-	 */
+-	mutex_lock(&df->devfreq->lock);
+-
+ 	idle_time = ktime_to_ms(ktime_sub(ktime_get(), df->idle_time));
+ 
+ 	/*
+@@ -184,20 +206,17 @@ void msm_devfreq_active(struct msm_gpu *gpu)
+ 	 * the governor to ramp up the freq.. so give some boost
+ 	 */
+ 	if (idle_time > msm_devfreq_profile.polling_ms) {
+-		target_freq *= 2;
++		msm_devfreq_boost(gpu, 2);
+ 	}
+ 
+-	df->idle_freq = 0;
+-
+-	msm_devfreq_target(&gpu->pdev->dev, &target_freq, 0);
++	dev_pm_qos_update_request(&df->idle_freq,
++				  PM_QOS_MAX_FREQUENCY_DEFAULT_VALUE);
+ 
+ 	/*
+ 	 * Reset the polling interval so we aren't inconsistent
+ 	 * about freq vs busy/total cycles
+ 	 */
+ 	msm_devfreq_get_dev_status(&gpu->pdev->dev, &status);
+-
+-	mutex_unlock(&df->devfreq->lock);
+ }
+ 
+ 
+@@ -206,23 +225,11 @@ static void msm_devfreq_idle_work(struct kthread_work *work)
+ 	struct msm_gpu_devfreq *df = container_of(work,
+ 			struct msm_gpu_devfreq, idle_work.work);
+ 	struct msm_gpu *gpu = container_of(df, struct msm_gpu, devfreq);
+-	unsigned long idle_freq, target_freq = 0;
+-
+-	/*
+-	 * Hold devfreq lock to synchronize with get_dev_status()/
+-	 * target() callbacks
+-	 */
+-	mutex_lock(&df->devfreq->lock);
+-
+-	idle_freq = get_freq(gpu);
+-
+-	if (gpu->clamp_to_idle)
+-		msm_devfreq_target(&gpu->pdev->dev, &target_freq, 0);
+ 
+ 	df->idle_time = ktime_get();
+-	df->idle_freq = idle_freq;
+ 
+-	mutex_unlock(&df->devfreq->lock);
++	if (gpu->clamp_to_idle)
++		dev_pm_qos_update_request(&df->idle_freq, 0);
+ }
+ 
+ void msm_devfreq_idle(struct msm_gpu *gpu)
+-- 
+2.38.1
+
