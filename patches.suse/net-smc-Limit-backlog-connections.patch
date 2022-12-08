@@ -1,0 +1,152 @@
+From: "D. Wythe" <alibuda@linux.alibaba.com>
+Date: Thu, 10 Feb 2022 17:11:35 +0800
+Subject: net/smc: Limit backlog connections
+Patch-mainline: v5.18-rc1
+Git-commit: 8270d9c21041470f58348248b9d9dcf3bf79592e
+References: jsc#PED-612
+
+Current implementation does not handling backlog semantics, one
+potential risk is that server will be flooded by infinite amount
+connections, even if client was SMC-incapable.
+
+This patch works to put a limit on backlog connections, referring to the
+TCP implementation, we divides SMC connections into two categories:
+
+1. Half SMC connection, which includes all TCP established while SMC not
+connections.
+
+2. Full SMC connection, which includes all SMC established connections.
+
+For half SMC connection, since all half SMC connections starts with TCP
+established, we can achieve our goal by put a limit before TCP
+established. Refer to the implementation of TCP, this limits will based
+on not only the half SMC connections but also the full connections,
+which is also a constraint on full SMC connections.
+
+For full SMC connections, although we know exactly where it starts, it's
+quite hard to put a limit before it. The easiest way is to block wait
+before receive SMC confirm CLC message, while it's under protection by
+smc_server_lgr_pending, a global lock, which leads this limit to the
+entire host instead of a single listen socket. Another way is to drop
+the full connections, but considering the cast of SMC connections, we
+prefer to keep full SMC connections.
+
+Even so, the limits of full SMC connections still exists, see commits
+about half SMC connection below.
+
+After this patch, the limits of backend connection shows like:
+
+For SMC:
+
+1. Client with SMC-capability can makes 2 * backlog full SMC connections
+   or 1 * backlog half SMC connections and 1 * backlog full SMC
+   connections at most.
+
+2. Client without SMC-capability can only makes 1 * backlog half TCP
+   connections and 1 * backlog full TCP connections.
+
+Signed-off-by: D. Wythe <alibuda@linux.alibaba.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Lee, Chun-Yi <jlee@suse.com>
+---
+ net/smc/af_smc.c |   45 +++++++++++++++++++++++++++++++++++++++++++++
+ net/smc/smc.h    |    6 +++++-
+ 2 files changed, 50 insertions(+), 1 deletion(-)
+
+--- a/net/smc/af_smc.c
++++ b/net/smc/af_smc.c
+@@ -73,6 +73,36 @@ static void smc_set_keepalive(struct soc
+ 	smc->clcsock->sk->sk_prot->keepalive(smc->clcsock->sk, val);
+ }
+ 
++static struct sock *smc_tcp_syn_recv_sock(const struct sock *sk,
++					  struct sk_buff *skb,
++					  struct request_sock *req,
++					  struct dst_entry *dst,
++					  struct request_sock *req_unhash,
++					  bool *own_req)
++{
++	struct smc_sock *smc;
++
++	smc = smc_clcsock_user_data(sk);
++
++	if (READ_ONCE(sk->sk_ack_backlog) + atomic_read(&smc->queued_smc_hs) >
++				sk->sk_max_ack_backlog)
++		goto drop;
++
++	if (sk_acceptq_is_full(&smc->sk)) {
++		NET_INC_STATS(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
++		goto drop;
++	}
++
++	/* passthrough to original syn recv sock fct */
++	return smc->ori_af_ops->syn_recv_sock(sk, skb, req, dst, req_unhash,
++					      own_req);
++
++drop:
++	dst_release(dst);
++	tcp_listendrop(sk);
++	return NULL;
++}
++
+ static struct smc_hashinfo smc_v4_hashinfo = {
+ 	.lock = __RW_LOCK_UNLOCKED(smc_v4_hashinfo.lock),
+ };
+@@ -1605,6 +1635,9 @@ static void smc_listen_out(struct smc_so
+ 	struct smc_sock *lsmc = new_smc->listen_smc;
+ 	struct sock *newsmcsk = &new_smc->sk;
+ 
++	if (tcp_sk(new_smc->clcsock->sk)->syn_smc)
++		atomic_dec(&lsmc->queued_smc_hs);
++
+ 	if (lsmc->sk.sk_state == SMC_LISTEN) {
+ 		lock_sock_nested(&lsmc->sk, SINGLE_DEPTH_NESTING);
+ 		smc_accept_enqueue(&lsmc->sk, newsmcsk);
+@@ -2210,6 +2243,9 @@ static void smc_tcp_listen_work(struct w
+ 		if (!new_smc)
+ 			continue;
+ 
++		if (tcp_sk(new_smc->clcsock->sk)->syn_smc)
++			atomic_inc(&lsmc->queued_smc_hs);
++
+ 		new_smc->listen_smc = lsmc;
+ 		new_smc->use_fallback = lsmc->use_fallback;
+ 		new_smc->fallback_rsn = lsmc->fallback_rsn;
+@@ -2276,6 +2312,15 @@ static int smc_listen(struct socket *soc
+ 	smc->clcsock->sk->sk_data_ready = smc_clcsock_data_ready;
+ 	smc->clcsock->sk->sk_user_data =
+ 		(void *)((uintptr_t)smc | SK_USER_DATA_NOCOPY);
++
++	/* save original ops */
++	smc->ori_af_ops = inet_csk(smc->clcsock->sk)->icsk_af_ops;
++
++	smc->af_ops = *smc->ori_af_ops;
++	smc->af_ops.syn_recv_sock = smc_tcp_syn_recv_sock;
++
++	inet_csk(smc->clcsock->sk)->icsk_af_ops = &smc->af_ops;
++
+ 	rc = kernel_listen(smc->clcsock, backlog);
+ 	if (rc) {
+ 		smc->clcsock->sk->sk_data_ready = smc->clcsk_data_ready;
+--- a/net/smc/smc.h
++++ b/net/smc/smc.h
+@@ -252,6 +252,10 @@ struct smc_sock {				/* smc sock contain
+ 	bool			use_fallback;	/* fallback to tcp */
+ 	int			fallback_rsn;	/* reason for fallback */
+ 	u32			peer_diagnosis; /* decline reason from peer */
++	atomic_t                queued_smc_hs;  /* queued smc handshakes */
++	struct inet_connection_sock_af_ops		af_ops;
++	const struct inet_connection_sock_af_ops	*ori_af_ops;
++						/* original af ops */
+ 	int			sockopt_defer_accept;
+ 						/* sockopt TCP_DEFER_ACCEPT
+ 						 * value
+@@ -276,7 +280,7 @@ static inline struct smc_sock *smc_sk(co
+ 	return (struct smc_sock *)sk;
+ }
+ 
+-static inline struct smc_sock *smc_clcsock_user_data(struct sock *clcsk)
++static inline struct smc_sock *smc_clcsock_user_data(const struct sock *clcsk)
+ {
+ 	return (struct smc_sock *)
+ 	       ((uintptr_t)clcsk->sk_user_data & ~SK_USER_DATA_NOCOPY);

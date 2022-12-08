@@ -1,0 +1,188 @@
+From: Wen Gu <guwen@linux.alibaba.com>
+Date: Thu, 13 Jan 2022 16:36:42 +0800
+Subject: net/smc: Resolve the race between SMC-R link access and clear
+Patch-mainline: v5.17-rc1
+Git-commit: 20c9398d3309d170300d67643b851fd26783af24
+References: jsc#PED-612
+
+We encountered some crashes caused by the race between SMC-R
+link access and link clear that triggered by abnormal link
+group termination, such as port error.
+
+Here is an example of this kind of crashes:
+
+ BUG: kernel NULL pointer dereference, address: 0000000000000000
+ Workqueue: smc_hs_wq smc_listen_work [smc]
+ RIP: 0010:smc_llc_flow_initiate+0x44/0x190 [smc]
+ Call Trace:
+  <TASK>
+  ? __smc_buf_create+0x75a/0x950 [smc]
+  smcr_lgr_reg_rmbs+0x2a/0xbf [smc]
+  smc_listen_work+0xf72/0x1230 [smc]
+  ? process_one_work+0x25c/0x600
+  process_one_work+0x25c/0x600
+  worker_thread+0x4f/0x3a0
+  ? process_one_work+0x600/0x600
+  kthread+0x15d/0x1a0
+  ? set_kthread_struct+0x40/0x40
+  ret_from_fork+0x1f/0x30
+  </TASK>
+
+smc_listen_work()                     __smc_lgr_terminate()
+---------------------------------------------------------------
+                                    | smc_lgr_free()
+                                    |  |- smcr_link_clear()
+                                    |      |- memset(lnk, 0)
+smc_listen_rdma_reg()               |
+ |- smcr_lgr_reg_rmbs()             |
+     |- smc_llc_flow_initiate()     |
+         |- access lnk->lgr (panic) |
+
+These crashes are similarly caused by clearing SMC-R link
+resources when some functions is still accessing to them.
+This patch tries to fix the issue by introducing reference
+count of SMC-R links and ensuring that the sensitive resources
+of links won't be cleared until reference count reaches zero.
+
+The operation to the SMC-R link reference count can be concluded
+as follows:
+
+object          [hold or initialized as 1]         [put]
+--------------------------------------------------------------------
+links           smcr_link_init()                   smcr_link_clear()
+connections     smc_conn_create()                  smc_conn_free()
+
+Through this way, the clear of SMC-R links is later than the
+free of all the smc connections above it, thus avoiding the
+unsafe reference to SMC-R links.
+
+Signed-off-by: Wen Gu <guwen@linux.alibaba.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Lee, Chun-Yi <jlee@suse.com>
+---
+ net/smc/smc_core.c |   52 ++++++++++++++++++++++++++++++++++++++++------------
+ net/smc/smc_core.h |    4 ++++
+ 2 files changed, 44 insertions(+), 12 deletions(-)
+
+--- a/net/smc/smc_core.c
++++ b/net/smc/smc_core.c
+@@ -748,6 +748,8 @@ int smcr_link_init(struct smc_link_group
+ 	}
+ 	get_device(&lnk->smcibdev->ibdev->dev);
+ 	atomic_inc(&lnk->smcibdev->lnk_cnt);
++	refcount_set(&lnk->refcnt, 1); /* link refcnt is set to 1 */
++	lnk->clearing = 0;
+ 	lnk->path_mtu = lnk->smcibdev->pattr[lnk->ibport - 1].active_mtu;
+ 	lnk->link_id = smcr_next_link_id(lgr);
+ 	lnk->lgr = lgr;
+@@ -998,8 +1000,12 @@ void smc_switch_link_and_count(struct sm
+ 			       struct smc_link *to_lnk)
+ {
+ 	atomic_dec(&conn->lnk->conn_cnt);
++	/* link_hold in smc_conn_create() */
++	smcr_link_put(conn->lnk);
+ 	conn->lnk = to_lnk;
+ 	atomic_inc(&conn->lnk->conn_cnt);
++	/* link_put in smc_conn_free() */
++	smcr_link_hold(conn->lnk);
+ }
+ 
+ struct smc_link *smc_switch_conns(struct smc_link_group *lgr,
+@@ -1162,6 +1168,8 @@ void smc_conn_free(struct smc_connection
+ 	if (!lgr->conns_num)
+ 		smc_lgr_schedule_free_work(lgr);
+ lgr_put:
++	if (!lgr->is_smcd)
++		smcr_link_put(conn->lnk); /* link_hold in smc_conn_create() */
+ 	smc_lgr_put(lgr); /* lgr_hold in smc_conn_create() */
+ }
+ 
+@@ -1218,22 +1226,11 @@ static void smcr_rtoken_clear_link(struc
+ 	}
+ }
+ 
+-/* must be called under lgr->llc_conf_mutex lock */
+-void smcr_link_clear(struct smc_link *lnk, bool log)
++static void __smcr_link_clear(struct smc_link *lnk)
+ {
+ 	struct smc_link_group *lgr = lnk->lgr;
+ 	struct smc_ib_device *smcibdev;
+ 
+-	if (!lgr || lnk->state == SMC_LNK_UNUSED)
+-		return;
+-	lnk->peer_qpn = 0;
+-	smc_llc_link_clear(lnk, log);
+-	smcr_buf_unmap_lgr(lnk);
+-	smcr_rtoken_clear_link(lnk);
+-	smc_ib_modify_qp_error(lnk);
+-	smc_wr_free_link(lnk);
+-	smc_ib_destroy_queue_pair(lnk);
+-	smc_ib_dealloc_protection_domain(lnk);
+ 	smc_wr_free_link_mem(lnk);
+ 	smc_ibdev_cnt_dec(lnk);
+ 	put_device(&lnk->smcibdev->ibdev->dev);
+@@ -1245,6 +1242,35 @@ void smcr_link_clear(struct smc_link *ln
+ 	smc_lgr_put(lgr); /* lgr_hold in smcr_link_init() */
+ }
+ 
++/* must be called under lgr->llc_conf_mutex lock */
++void smcr_link_clear(struct smc_link *lnk, bool log)
++{
++	if (!lnk->lgr || lnk->clearing ||
++	    lnk->state == SMC_LNK_UNUSED)
++		return;
++	lnk->clearing = 1;
++	lnk->peer_qpn = 0;
++	smc_llc_link_clear(lnk, log);
++	smcr_buf_unmap_lgr(lnk);
++	smcr_rtoken_clear_link(lnk);
++	smc_ib_modify_qp_error(lnk);
++	smc_wr_free_link(lnk);
++	smc_ib_destroy_queue_pair(lnk);
++	smc_ib_dealloc_protection_domain(lnk);
++	smcr_link_put(lnk); /* theoretically last link_put */
++}
++
++void smcr_link_hold(struct smc_link *lnk)
++{
++	refcount_inc(&lnk->refcnt);
++}
++
++void smcr_link_put(struct smc_link *lnk)
++{
++	if (refcount_dec_and_test(&lnk->refcnt))
++		__smcr_link_clear(lnk);
++}
++
+ static void smcr_buf_free(struct smc_link_group *lgr, bool is_rmb,
+ 			  struct smc_buf_desc *buf_desc)
+ {
+@@ -1893,6 +1919,8 @@ create:
+ 		}
+ 	}
+ 	smc_lgr_hold(conn->lgr); /* lgr_put in smc_conn_free() */
++	if (!conn->lgr->is_smcd)
++		smcr_link_hold(conn->lnk); /* link_put in smc_conn_free() */
+ 	conn->freed = 0;
+ 	conn->local_tx_ctrl.common.type = SMC_CDC_MSG_TYPE;
+ 	conn->local_tx_ctrl.len = SMC_WR_TX_SIZE;
+--- a/net/smc/smc_core.h
++++ b/net/smc/smc_core.h
+@@ -137,6 +137,8 @@ struct smc_link {
+ 	u8			peer_link_uid[SMC_LGR_ID_SIZE]; /* peer uid */
+ 	u8			link_idx;	/* index in lgr link array */
+ 	u8			link_is_asym;	/* is link asymmetric? */
++	u8			clearing : 1;	/* link is being cleared */
++	refcount_t		refcnt;		/* link reference count */
+ 	struct smc_link_group	*lgr;		/* parent link group */
+ 	struct work_struct	link_down_wrk;	/* wrk to bring link down */
+ 	char			ibname[IB_DEVICE_NAME_MAX]; /* ib device name */
+@@ -526,6 +528,8 @@ void smc_core_exit(void);
+ int smcr_link_init(struct smc_link_group *lgr, struct smc_link *lnk,
+ 		   u8 link_idx, struct smc_init_info *ini);
+ void smcr_link_clear(struct smc_link *lnk, bool log);
++void smcr_link_hold(struct smc_link *lnk);
++void smcr_link_put(struct smc_link *lnk);
+ void smc_switch_link_and_count(struct smc_connection *conn,
+ 			       struct smc_link *to_lnk);
+ int smcr_buf_map_lgr(struct smc_link *lnk);
