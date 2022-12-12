@@ -1,0 +1,181 @@
+From f9e95560476e5876de571c4e7d31803b0512f055 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Thu, 7 Apr 2022 18:53:56 -0400
+Subject: drm/amdkfd: Ignore bogus signals from MEC efficiently
+Git-commit: c3eb12dff0f9c6aa7f2916edaaec5545af5f379f
+Patch-mainline: v5.19-rc1
+References: jsc#PED-1166 jsc#PED-1168 jsc#PED-1170 jsc#PED-1218 jsc#PED-1220 jsc#PED-1222 jsc#PED-1223 jsc#PED-1225
+
+MEC firmware sometimes sends signal interrupts without a valid context ID
+on end of pipe events that don't intend to signal any HSA signals.
+This triggers the slow path in kfd_signal_event_interrupt that scans the
+entire event page for signaled events. Detect these signals in the top
+half interrupt handler to stop processing them as early as possible.
+
+Because we now always treat event ID 0 as invalid, reserve that ID during
+process initialization.
+
+v2: Update firmware version checks to support more GPUs
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Philip Yang <Philip.Yang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_events.c       | 22 ++++++++++---
+ .../gpu/drm/amd/amdkfd/kfd_int_process_v9.c   | 33 +++++++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h         |  2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c      | 10 ++++--
+ 4 files changed, 60 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_events.c b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+index 6e5e8d637f48..4df9c36146ba 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_events.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+@@ -238,12 +238,24 @@ static int create_other_event(struct kfd_process *p, struct kfd_event *ev, const
+ 	return 0;
+ }
+ 
+-void kfd_event_init_process(struct kfd_process *p)
++int kfd_event_init_process(struct kfd_process *p)
+ {
++	int id;
++
+ 	mutex_init(&p->event_mutex);
+ 	idr_init(&p->event_idr);
+ 	p->signal_page = NULL;
+-	p->signal_event_count = 0;
++	p->signal_event_count = 1;
++	/* Allocate event ID 0. It is used for a fast path to ignore bogus events
++	 * that are sent by the CP without a context ID
++	 */
++	id = idr_alloc(&p->event_idr, NULL, 0, 1, GFP_KERNEL);
++	if (id < 0) {
++		idr_destroy(&p->event_idr);
++		mutex_destroy(&p->event_mutex);
++		return id;
++	}
++	return 0;
+ }
+ 
+ static void destroy_event(struct kfd_process *p, struct kfd_event *ev)
+@@ -271,8 +283,10 @@ static void destroy_events(struct kfd_process *p)
+ 	uint32_t id;
+ 
+ 	idr_for_each_entry(&p->event_idr, ev, id)
+-		destroy_event(p, ev);
++		if (ev)
++			destroy_event(p, ev);
+ 	idr_destroy(&p->event_idr);
++	mutex_destroy(&p->event_mutex);
+ }
+ 
+ /*
+@@ -749,7 +763,7 @@ void kfd_signal_event_interrupt(u32 pasid, uint32_t partial_id,
+ 			 * iterate over the signal slots and lookup
+ 			 * only signaled events from the IDR.
+ 			 */
+-			for (id = 0; id < KFD_SIGNAL_EVENT_LIMIT; id++)
++			for (id = 1; id < KFD_SIGNAL_EVENT_LIMIT; id++)
+ 				if (READ_ONCE(slots[id]) != UNSIGNALED_EVENT_SLOT) {
+ 					ev = lookup_event_by_id(p, id);
+ 					set_event_from_interrupt(p, ev);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c b/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c
+index 03c29bdd89a1..f27fe022ef6f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c
+@@ -141,6 +141,25 @@ static void event_interrupt_poison_consumption(struct kfd_dev *dev,
+ 	}
+ }
+ 
++static bool context_id_expected(struct kfd_dev *dev)
++{
++	switch (KFD_GC_VERSION(dev)) {
++	case IP_VERSION(9, 0, 1):
++		return dev->mec_fw_version >= 0x817a;
++	case IP_VERSION(9, 1, 0):
++	case IP_VERSION(9, 2, 1):
++	case IP_VERSION(9, 2, 2):
++	case IP_VERSION(9, 3, 0):
++	case IP_VERSION(9, 4, 0):
++		return dev->mec_fw_version >= 0x17a;
++	default:
++		/* Other GFXv9 and later GPUs always sent valid context IDs
++		 * on legitimate events
++		 */
++		return KFD_GC_VERSION(dev) >= IP_VERSION(9, 4, 1);
++	}
++}
++
+ static bool event_interrupt_isr_v9(struct kfd_dev *dev,
+ 					const uint32_t *ih_ring_entry,
+ 					uint32_t *patched_ihre,
+@@ -206,6 +225,20 @@ static bool event_interrupt_isr_v9(struct kfd_dev *dev,
+ 	if (WARN_ONCE(pasid == 0, "Bug: No PASID in KFD interrupt"))
+ 		return false;
+ 
++	/* Workaround CP firmware sending bogus signals with 0 context_id.
++	 * Those can be safely ignored on hardware and firmware versions that
++	 * include a valid context_id on legitimate signals. This avoids the
++	 * slow path in kfd_signal_event_interrupt that scans all event slots
++	 * for signaled events.
++	 */
++	if (source_id == SOC15_INTSRC_CP_END_OF_PIPE) {
++		uint32_t context_id =
++			SOC15_CONTEXT_ID0_FROM_IH_ENTRY(ih_ring_entry);
++
++		if (context_id == 0 && context_id_expected(dev))
++			return false;
++	}
++
+ 	/* Interrupt types we care about: various signals and faults.
+ 	 * They will be forwarded to a work queue (see below).
+ 	 */
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index bfb3b5c288cb..1e1de0404a90 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -1295,7 +1295,7 @@ extern const struct kfd_event_interrupt_class event_interrupt_class_v9;
+ 
+ extern const struct kfd_device_global_init_class device_global_init_class_cik;
+ 
+-void kfd_event_init_process(struct kfd_process *p);
++int kfd_event_init_process(struct kfd_process *p);
+ void kfd_event_free_process(struct kfd_process *p);
+ int kfd_event_mmap(struct kfd_process *process, struct vm_area_struct *vma);
+ int kfd_wait_on_events(struct kfd_process *p,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 9e82d7aa67fa..cb8f4a459add 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -1370,12 +1370,16 @@ static struct kfd_process *create_process(const struct task_struct *thread)
+ 	INIT_DELAYED_WORK(&process->eviction_work, evict_process_worker);
+ 	INIT_DELAYED_WORK(&process->restore_work, restore_process_worker);
+ 	process->last_restore_timestamp = get_jiffies_64();
+-	kfd_event_init_process(process);
++	err = kfd_event_init_process(process);
++	if (err)
++		goto err_event_init;
+ 	process->is_32bit_user_mode = in_compat_syscall();
+ 
+ 	process->pasid = kfd_pasid_alloc();
+-	if (process->pasid == 0)
++	if (process->pasid == 0) {
++		err = -ENOSPC;
+ 		goto err_alloc_pasid;
++	}
+ 
+ 	err = pqm_init(&process->pqm, process);
+ 	if (err != 0)
+@@ -1424,6 +1428,8 @@ static struct kfd_process *create_process(const struct task_struct *thread)
+ err_process_pqm_init:
+ 	kfd_pasid_free(process->pasid);
+ err_alloc_pasid:
++	kfd_event_free_process(process);
++err_event_init:
+ 	mutex_destroy(&process->mutex);
+ 	kfree(process);
+ err_alloc_process:
+-- 
+2.38.1
+
