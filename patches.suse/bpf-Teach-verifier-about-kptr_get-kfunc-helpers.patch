@@ -1,0 +1,151 @@
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Mon, 25 Apr 2022 03:18:56 +0530
+Subject: bpf: Teach verifier about kptr_get kfunc helpers
+Patch-mainline: v5.19-rc1
+Git-commit: a1ef195996526da45bbc9710849254023df75aea
+References: jsc#PED-1368
+
+We introduce a new style of kfunc helpers, namely *_kptr_get, where they
+take pointer to the map value which points to a referenced kernel
+pointer contained in the map. Since this is referenced, only
+bpf_kptr_xchg from BPF side and xchg from kernel side is allowed to
+change the current value, and each pointer that resides in that location
+would be referenced, and RCU protected (this must be kept in mind while
+adding kernel types embeddable as reference kptr in BPF maps).
+
+This means that if do the load of the pointer value in an RCU read
+section, and find a live pointer, then as long as we hold RCU read lock,
+it won't be freed by a parallel xchg + release operation. This allows us
+to implement a safe refcount increment scheme. Hence, enforce that first
+argument of all such kfunc is a proper PTR_TO_MAP_VALUE pointing at the
+right offset to referenced pointer.
+
+For the rest of the arguments, they are subjected to typical kfunc
+argument checks, hence allowing some flexibility in passing more intent
+into how the reference should be taken.
+
+For instance, in case of struct nf_conn, it is not freed until RCU grace
+period ends, but can still be reused for another tuple once refcount has
+dropped to zero. Hence, a bpf_ct_kptr_get helper not only needs to call
+refcount_inc_not_zero, but also do a tuple match after incrementing the
+reference, and when it fails to match it, put the reference again and
+return NULL.
+
+This can be implemented easily if we allow passing additional parameters
+to the bpf_ct_kptr_get kfunc, like a struct bpf_sock_tuple * and a
+tuple__sz pair.
+
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20220424214901.2743946-9-memxor@gmail.com
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/linux/btf.h |    2 +
+ kernel/bpf/btf.c    |   58 +++++++++++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 55 insertions(+), 5 deletions(-)
+
+--- a/include/linux/btf.h
++++ b/include/linux/btf.h
+@@ -17,6 +17,7 @@ enum btf_kfunc_type {
+ 	BTF_KFUNC_TYPE_ACQUIRE,
+ 	BTF_KFUNC_TYPE_RELEASE,
+ 	BTF_KFUNC_TYPE_RET_NULL,
++	BTF_KFUNC_TYPE_KPTR_ACQUIRE,
+ 	BTF_KFUNC_TYPE_MAX,
+ };
+ 
+@@ -35,6 +36,7 @@ struct btf_kfunc_id_set {
+ 			struct btf_id_set *acquire_set;
+ 			struct btf_id_set *release_set;
+ 			struct btf_id_set *ret_null_set;
++			struct btf_id_set *kptr_acquire_set;
+ 		};
+ 		struct btf_id_set *sets[BTF_KFUNC_TYPE_MAX];
+ 	};
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@ -6089,11 +6089,11 @@ static int btf_check_func_arg_match(stru
+ 	struct bpf_verifier_log *log = &env->log;
+ 	u32 i, nargs, ref_id, ref_obj_id = 0;
+ 	bool is_kfunc = btf_is_kernel(btf);
++	bool rel = false, kptr_get = false;
+ 	const char *func_name, *ref_tname;
+ 	const struct btf_type *t, *ref_t;
+ 	const struct btf_param *args;
+ 	int ref_regno = 0, ret;
+-	bool rel = false;
+ 
+ 	t = btf_type_by_id(btf, func_id);
+ 	if (!t || !btf_type_is_func(t)) {
+@@ -6119,10 +6119,14 @@ static int btf_check_func_arg_match(stru
+ 		return -EINVAL;
+ 	}
+ 
+-	/* Only kfunc can be release func */
+-	if (is_kfunc)
++	if (is_kfunc) {
++		/* Only kfunc can be release func */
+ 		rel = btf_kfunc_id_set_contains(btf, resolve_prog_type(env->prog),
+ 						BTF_KFUNC_TYPE_RELEASE, func_id);
++		kptr_get = btf_kfunc_id_set_contains(btf, resolve_prog_type(env->prog),
++						     BTF_KFUNC_TYPE_KPTR_ACQUIRE, func_id);
++	}
++
+ 	/* check that BTF function arguments match actual types that the
+ 	 * verifier sees.
+ 	 */
+@@ -6154,8 +6158,52 @@ static int btf_check_func_arg_match(stru
+ 		if (ret < 0)
+ 			return ret;
+ 
+-		if (btf_get_prog_ctx_type(log, btf, t,
+-					  env->prog->type, i)) {
++		/* kptr_get is only true for kfunc */
++		if (i == 0 && kptr_get) {
++			struct bpf_map_value_off_desc *off_desc;
++
++			if (reg->type != PTR_TO_MAP_VALUE) {
++				bpf_log(log, "arg#0 expected pointer to map value\n");
++				return -EINVAL;
++			}
++
++			/* check_func_arg_reg_off allows var_off for
++			 * PTR_TO_MAP_VALUE, but we need fixed offset to find
++			 * off_desc.
++			 */
++			if (!tnum_is_const(reg->var_off)) {
++				bpf_log(log, "arg#0 must have constant offset\n");
++				return -EINVAL;
++			}
++
++			off_desc = bpf_map_kptr_off_contains(reg->map_ptr, reg->off + reg->var_off.value);
++			if (!off_desc || off_desc->type != BPF_KPTR_REF) {
++				bpf_log(log, "arg#0 no referenced kptr at map value offset=%llu\n",
++					reg->off + reg->var_off.value);
++				return -EINVAL;
++			}
++
++			if (!btf_type_is_ptr(ref_t)) {
++				bpf_log(log, "arg#0 BTF type must be a double pointer\n");
++				return -EINVAL;
++			}
++
++			ref_t = btf_type_skip_modifiers(btf, ref_t->type, &ref_id);
++			ref_tname = btf_name_by_offset(btf, ref_t->name_off);
++
++			if (!btf_type_is_struct(ref_t)) {
++				bpf_log(log, "kernel function %s args#%d pointer type %s %s is not supported\n",
++					func_name, i, btf_type_str(ref_t), ref_tname);
++				return -EINVAL;
++			}
++			if (!btf_struct_ids_match(log, btf, ref_id, 0, off_desc->kptr.btf,
++						  off_desc->kptr.btf_id)) {
++				bpf_log(log, "kernel function %s args#%d expected pointer to %s %s\n",
++					func_name, i, btf_type_str(ref_t), ref_tname);
++				return -EINVAL;
++			}
++			/* rest of the arguments can be anything, like normal kfunc */
++		} else if (btf_get_prog_ctx_type(log, btf, t, env->prog->type, i)) {
+ 			/* If function expects ctx type in BTF check that caller
+ 			 * is passing PTR_TO_CTX.
+ 			 */

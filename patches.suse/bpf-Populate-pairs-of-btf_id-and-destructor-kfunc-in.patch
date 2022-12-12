@@ -1,0 +1,218 @@
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Mon, 25 Apr 2022 03:18:54 +0530
+Subject: bpf: Populate pairs of btf_id and destructor kfunc in btf
+Patch-mainline: v5.19-rc1
+Git-commit: 5ce937d613a423ca3102f53d9f3daf4210c1b6e2
+References: jsc#PED-1368
+
+To support storing referenced PTR_TO_BTF_ID in maps, we require
+associating a specific BTF ID with a 'destructor' kfunc. This is because
+we need to release a live referenced pointer at a certain offset in map
+value from the map destruction path, otherwise we end up leaking
+resources.
+
+Hence, introduce support for passing an array of btf_id, kfunc_btf_id
+pairs that denote a BTF ID and its associated release function. Then,
+add an accessor 'btf_find_dtor_kfunc' which can be used to look up the
+destructor kfunc of a certain BTF ID. If found, we can use it to free
+the object from the map free path.
+
+The registration of these pairs also serve as a whitelist of structures
+which are allowed as referenced PTR_TO_BTF_ID in a BPF map, because
+without finding the destructor kfunc, we will bail and return an error.
+
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20220424214901.2743946-7-memxor@gmail.com
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/linux/btf.h |   17 ++++++++
+ kernel/bpf/btf.c    |  108 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 125 insertions(+)
+
+--- a/include/linux/btf.h
++++ b/include/linux/btf.h
+@@ -40,6 +40,11 @@ struct btf_kfunc_id_set {
+ 	};
+ };
+ 
++struct btf_id_dtor_kfunc {
++	u32 btf_id;
++	u32 kfunc_btf_id;
++};
++
+ extern const struct file_operations btf_fops;
+ 
+ void btf_get(struct btf *btf);
+@@ -346,6 +351,9 @@ bool btf_kfunc_id_set_contains(const str
+ 			       enum btf_kfunc_type type, u32 kfunc_btf_id);
+ int register_btf_kfunc_id_set(enum bpf_prog_type prog_type,
+ 			      const struct btf_kfunc_id_set *s);
++s32 btf_find_dtor_kfunc(struct btf *btf, u32 btf_id);
++int register_btf_id_dtor_kfuncs(const struct btf_id_dtor_kfunc *dtors, u32 add_cnt,
++				struct module *owner);
+ #else
+ static inline const struct btf_type *btf_type_by_id(const struct btf *btf,
+ 						    u32 type_id)
+@@ -369,6 +377,15 @@ static inline int register_btf_kfunc_id_
+ {
+ 	return 0;
+ }
++static inline s32 btf_find_dtor_kfunc(struct btf *btf, u32 btf_id)
++{
++	return -ENOENT;
++}
++static inline int register_btf_id_dtor_kfuncs(const struct btf_id_dtor_kfunc *dtors,
++					      u32 add_cnt, struct module *owner)
++{
++	return 0;
++}
+ #endif
+ 
+ #endif
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@ -207,12 +207,18 @@ enum btf_kfunc_hook {
+ 
+ enum {
+ 	BTF_KFUNC_SET_MAX_CNT = 32,
++	BTF_DTOR_KFUNC_MAX_CNT = 256,
+ };
+ 
+ struct btf_kfunc_set_tab {
+ 	struct btf_id_set *sets[BTF_KFUNC_HOOK_MAX][BTF_KFUNC_TYPE_MAX];
+ };
+ 
++struct btf_id_dtor_kfunc_tab {
++	u32 cnt;
++	struct btf_id_dtor_kfunc dtors[];
++};
++
+ struct btf {
+ 	void *data;
+ 	struct btf_type **types;
+@@ -228,6 +234,7 @@ struct btf {
+ 	u32 id;
+ 	struct rcu_head rcu;
+ 	struct btf_kfunc_set_tab *kfunc_set_tab;
++	struct btf_id_dtor_kfunc_tab *dtor_kfunc_tab;
+ 
+ 	/* split BTF support */
+ 	struct btf *base_btf;
+@@ -1616,8 +1623,19 @@ free_tab:
+ 	btf->kfunc_set_tab = NULL;
+ }
+ 
++static void btf_free_dtor_kfunc_tab(struct btf *btf)
++{
++	struct btf_id_dtor_kfunc_tab *tab = btf->dtor_kfunc_tab;
++
++	if (!tab)
++		return;
++	kfree(tab);
++	btf->dtor_kfunc_tab = NULL;
++}
++
+ static void btf_free(struct btf *btf)
+ {
++	btf_free_dtor_kfunc_tab(btf);
+ 	btf_free_kfunc_set_tab(btf);
+ 	kvfree(btf->types);
+ 	kvfree(btf->resolved_sizes);
+@@ -7076,6 +7094,96 @@ int register_btf_kfunc_id_set(enum bpf_p
+ }
+ EXPORT_SYMBOL_GPL(register_btf_kfunc_id_set);
+ 
++s32 btf_find_dtor_kfunc(struct btf *btf, u32 btf_id)
++{
++	struct btf_id_dtor_kfunc_tab *tab = btf->dtor_kfunc_tab;
++	struct btf_id_dtor_kfunc *dtor;
++
++	if (!tab)
++		return -ENOENT;
++	/* Even though the size of tab->dtors[0] is > sizeof(u32), we only need
++	 * to compare the first u32 with btf_id, so we can reuse btf_id_cmp_func.
++	 */
++	BUILD_BUG_ON(offsetof(struct btf_id_dtor_kfunc, btf_id) != 0);
++	dtor = bsearch(&btf_id, tab->dtors, tab->cnt, sizeof(tab->dtors[0]), btf_id_cmp_func);
++	if (!dtor)
++		return -ENOENT;
++	return dtor->kfunc_btf_id;
++}
++
++/* This function must be invoked only from initcalls/module init functions */
++int register_btf_id_dtor_kfuncs(const struct btf_id_dtor_kfunc *dtors, u32 add_cnt,
++				struct module *owner)
++{
++	struct btf_id_dtor_kfunc_tab *tab;
++	struct btf *btf;
++	u32 tab_cnt;
++	int ret;
++
++	btf = btf_get_module_btf(owner);
++	if (!btf) {
++		if (!owner && IS_ENABLED(CONFIG_DEBUG_INFO_BTF)) {
++			pr_err("missing vmlinux BTF, cannot register dtor kfuncs\n");
++			return -ENOENT;
++		}
++		if (owner && IS_ENABLED(CONFIG_DEBUG_INFO_BTF_MODULES)) {
++			pr_err("missing module BTF, cannot register dtor kfuncs\n");
++			return -ENOENT;
++		}
++		return 0;
++	}
++	if (IS_ERR(btf))
++		return PTR_ERR(btf);
++
++	if (add_cnt >= BTF_DTOR_KFUNC_MAX_CNT) {
++		pr_err("cannot register more than %d kfunc destructors\n", BTF_DTOR_KFUNC_MAX_CNT);
++		ret = -E2BIG;
++		goto end;
++	}
++
++	tab = btf->dtor_kfunc_tab;
++	/* Only one call allowed for modules */
++	if (WARN_ON_ONCE(tab && btf_is_module(btf))) {
++		ret = -EINVAL;
++		goto end;
++	}
++
++	tab_cnt = tab ? tab->cnt : 0;
++	if (tab_cnt > U32_MAX - add_cnt) {
++		ret = -EOVERFLOW;
++		goto end;
++	}
++	if (tab_cnt + add_cnt >= BTF_DTOR_KFUNC_MAX_CNT) {
++		pr_err("cannot register more than %d kfunc destructors\n", BTF_DTOR_KFUNC_MAX_CNT);
++		ret = -E2BIG;
++		goto end;
++	}
++
++	tab = krealloc(btf->dtor_kfunc_tab,
++		       offsetof(struct btf_id_dtor_kfunc_tab, dtors[tab_cnt + add_cnt]),
++		       GFP_KERNEL | __GFP_NOWARN);
++	if (!tab) {
++		ret = -ENOMEM;
++		goto end;
++	}
++
++	if (!btf->dtor_kfunc_tab)
++		tab->cnt = 0;
++	btf->dtor_kfunc_tab = tab;
++
++	memcpy(tab->dtors + tab->cnt, dtors, add_cnt * sizeof(tab->dtors[0]));
++	tab->cnt += add_cnt;
++
++	sort(tab->dtors, tab->cnt, sizeof(tab->dtors[0]), btf_id_cmp_func, NULL);
++
++	return 0;
++end:
++	btf_free_dtor_kfunc_tab(btf);
++	btf_put(btf);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(register_btf_id_dtor_kfuncs);
++
+ #define MAX_TYPES_ARE_COMPAT_DEPTH 2
+ 
+ static
