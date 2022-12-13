@@ -1,0 +1,322 @@
+From: BingJing Chang <bingjingc@synology.com>
+Date: Tue, 12 Jul 2022 09:36:32 +0800
+Git-commit: 3aa5bd367fa5a381796850ef74c2bd855b017635
+Patch-mainline: v6.0-rc1
+References: bsc#1206036
+Subject: [PATCH] btrfs: send: fix sending link commands for existing file
+ paths
+
+There is a bug sending link commands for existing file paths. When we're
+processing an inode, we go over all references. All the new file paths are
+added to the "new_refs" list. And all the deleted file paths are added to
+the "deleted_refs" list. In the end, when we finish processing the inode,
+we iterate over all the items in the "new_refs" list and send link commands
+for those file paths. After that, we go over all the items in the
+"deleted_refs" list and send unlink commands for them. If there are
+duplicated file paths in both lists, we will try to create them before we
+remove them. Then the receiver gets an -EEXIST error when trying the link
+operations.
+
+Example for having duplicated file paths in both list:
+
+  $ btrfs subvolume create vol
+
+  # create a file and 2000 hard links to the same inode
+  $ touch vol/foo
+  $ for i in {1..2000}; do link vol/foo vol/$i ; done
+
+  # take a snapshot for a parent snapshot
+  $ btrfs subvolume snapshot -r vol snap1
+
+  # remove 2000 hard links and re-create the last 1000 links
+  $ for i in {1..2000}; do rm vol/$i; done;
+  $ for i in {1001..2000}; do link vol/foo vol/$i; done
+
+  # take another one for a send snapshot
+  $ btrfs subvolume snapshot -r vol snap2
+
+  $ mkdir receive_dir
+  $ btrfs send snap2 -p snap1 | btrfs receive receive_dir/
+  At subvol snap2
+  link 1238 -> foo
+  ERROR: link 1238 -> foo failed: File exists
+
+In this case, we will have the same file paths added to both lists. In the
+parent snapshot, reference paths {1..1237} are stored in inode references,
+but reference paths {1238..2000} are stored in inode extended references.
+In the send snapshot, all reference paths {1001..2000} are stored in inode
+references. During the incremental send, we process their inode references
+first. In record_changed_ref(), we iterate all its inode references in the
+send/parent snapshot. For every inode reference, we also use find_iref() to
+check whether the same file path also appears in the parent/send snapshot
+or not. Inode references {1238..2000} which appear in the send snapshot but
+not in the parent snapshot are added to the "new_refs" list. On the other
+hand, Inode references {1..1000} which appear in the parent snapshot but
+not in the send snapshot are added to the "deleted_refs" list. Next, when
+we process their inode extended references, reference paths {1238..2000}
+are added to the "deleted_refs" list because all of them only appear in the
+parent snapshot. Now two lists contain items as below:
+"new_refs" list: {1238..2000}
+"deleted_refs" list: {1..1000}, {1238..2000}
+
+Reference paths {1238..2000} appear in both lists. And as the processing
+order mentioned about before, the receiver gets an -EEXIST error when trying
+the link operations.
+
+To fix the bug, the idea is to process the "deleted_refs" list before
+the "new_refs" list. However, it's not easy to reshuffle the processing
+order. For one reason, if we do so, we may unlink all the existing paths
+first, there's no valid path anymore for links. And it's inefficient
+because we do a bunch of unlinks followed by links for the same paths.
+Moreover, it makes less sense to have duplications in both lists. A
+reference path cannot not only be regarded as new but also has been seen in
+the past, or we won't call it a new path. However, it's also not a good
+idea to make find_iref() check a reference against all inode references
+and all inode extended references because it may result in large disk
+reads.
+
+So we introduce two rbtrees to make the references easier for lookups.
+And we also introduce record_new_ref_if_needed() and
+record_deleted_ref_if_needed() for changed_ref() to check and remove
+duplicated references early.
+
+Reviewed-by: Robbie Ko <robbieko@synology.com>
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: BingJing Chang <bingjingc@synology.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/send.c | 156 ++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 152 insertions(+), 4 deletions(-)
+
+diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+index 14753024d..98a0eeac9 100644
+--- a/fs/btrfs/send.c
++++ b/fs/btrfs/send.c
+@@ -216,6 +216,9 @@ struct send_ctx {
+ 	 * Indexed by the inode number of the directory to be deleted.
+ 	 */
+ 	struct rb_root orphan_dirs;
++
++	struct rb_root rbtree_new_refs;
++	struct rb_root rbtree_deleted_refs;
+ };
+ 
+ struct pending_dir_move {
+@@ -2745,6 +2748,8 @@ struct recorded_ref {
+ 	u64 dir;
+ 	u64 dir_gen;
+ 	int name_len;
++	struct rb_node node;
++	struct rb_root *root;
+ };
+ 
+ static struct recorded_ref *recorded_ref_alloc(void)
+@@ -2754,6 +2759,7 @@ static struct recorded_ref *recorded_ref_alloc(void)
+ 	ref = kzalloc(sizeof(*ref), GFP_KERNEL);
+ 	if (!ref)
+ 		return NULL;
++	RB_CLEAR_NODE(&ref->node);
+ 	INIT_LIST_HEAD(&ref->list);
+ 	return ref;
+ }
+@@ -2762,6 +2768,8 @@ static void recorded_ref_free(struct recorded_ref *ref)
+ {
+ 	if (!ref)
+ 		return;
++	if (!RB_EMPTY_NODE(&ref->node))
++		rb_erase(&ref->node, ref->root);
+ 	list_del(&ref->list);
+ 	fs_path_free(ref->full_path);
+ 	kfree(ref);
+@@ -4393,12 +4401,149 @@ static int __record_deleted_ref(int num, u64 dir, int index,
+ 			  &sctx->deleted_refs);
+ }
+ 
++static int rbtree_ref_comp(const void *k, const struct rb_node *node)
++{
++	const struct recorded_ref *data = k;
++	const struct recorded_ref *ref = rb_entry(node, struct recorded_ref, node);
++	int result;
++
++	if (data->dir > ref->dir)
++		return 1;
++	if (data->dir < ref->dir)
++		return -1;
++	if (data->dir_gen > ref->dir_gen)
++		return 1;
++	if (data->dir_gen < ref->dir_gen)
++		return -1;
++	if (data->name_len > ref->name_len)
++		return 1;
++	if (data->name_len < ref->name_len)
++		return -1;
++	result = strcmp(data->name, ref->name);
++	if (result > 0)
++		return 1;
++	if (result < 0)
++		return -1;
++	return 0;
++}
++
++static bool rbtree_ref_less(struct rb_node *node, const struct rb_node *parent)
++{
++	const struct recorded_ref *entry = rb_entry(node, struct recorded_ref, node);
++
++	return rbtree_ref_comp(entry, parent) < 0;
++}
++
++static int record_ref_in_tree(struct rb_root *root, struct list_head *refs,
++			      struct fs_path *name, u64 dir, u64 dir_gen,
++			      struct send_ctx *sctx)
++{
++	int ret = 0;
++	struct fs_path *path = NULL;
++	struct recorded_ref *ref = NULL;
++
++	path = fs_path_alloc();
++	if (!path) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	ref = recorded_ref_alloc();
++	if (!ref) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	ret = get_cur_path(sctx, dir, dir_gen, path);
++	if (ret < 0)
++		goto out;
++	ret = fs_path_add_path(path, name);
++	if (ret < 0)
++		goto out;
++
++	ref->dir = dir;
++	ref->dir_gen = dir_gen;
++	set_ref_path(ref, path);
++	list_add_tail(&ref->list, refs);
++	rb_add(&ref->node, root, rbtree_ref_less);
++	ref->root = root;
++out:
++	if (ret) {
++		if (path && (!ref || !ref->full_path))
++			fs_path_free(path);
++		recorded_ref_free(ref);
++	}
++	return ret;
++}
++
++static int record_new_ref_if_needed(int num, u64 dir, int index,
++				    struct fs_path *name, void *ctx)
++{
++	int ret = 0;
++	struct send_ctx *sctx = ctx;
++	struct rb_node *node = NULL;
++	struct recorded_ref data;
++	struct recorded_ref *ref;
++	u64 dir_gen;
++
++	ret = get_inode_info(sctx->send_root, dir, NULL, &dir_gen, NULL,
++			     NULL, NULL, NULL);
++	if (ret < 0)
++		goto out;
++
++	data.dir = dir;
++	data.dir_gen = dir_gen;
++	set_ref_path(&data, name);
++	node = rb_find(&data, &sctx->rbtree_deleted_refs, rbtree_ref_comp);
++	if (node) {
++		ref = rb_entry(node, struct recorded_ref, node);
++		recorded_ref_free(ref);
++	} else {
++		ret = record_ref_in_tree(&sctx->rbtree_new_refs,
++					 &sctx->new_refs, name, dir, dir_gen,
++					 sctx);
++	}
++out:
++	return ret;
++}
++
++static int record_deleted_ref_if_needed(int num, u64 dir, int index,
++					struct fs_path *name, void *ctx)
++{
++	int ret = 0;
++	struct send_ctx *sctx = ctx;
++	struct rb_node *node = NULL;
++	struct recorded_ref data;
++	struct recorded_ref *ref;
++	u64 dir_gen;
++
++	ret = get_inode_info(sctx->parent_root, dir, NULL, &dir_gen, NULL,
++			     NULL, NULL, NULL);
++	if (ret < 0)
++		goto out;
++
++	data.dir = dir;
++	data.dir_gen = dir_gen;
++	set_ref_path(&data, name);
++	node = rb_find(&data, &sctx->rbtree_new_refs, rbtree_ref_comp);
++	if (node) {
++		ref = rb_entry(node, struct recorded_ref, node);
++		recorded_ref_free(ref);
++	} else {
++		ret = record_ref_in_tree(&sctx->rbtree_deleted_refs,
++					 &sctx->deleted_refs, name, dir,
++					 dir_gen, sctx);
++	}
++out:
++	return ret;
++}
++
+ static int record_new_ref(struct send_ctx *sctx)
+ {
+ 	int ret;
+ 
+ 	ret = iterate_inode_ref(sctx->send_root, sctx->left_path,
+-				sctx->cmp_key, 0, __record_new_ref, sctx);
++				sctx->cmp_key, 0, record_new_ref_if_needed, sctx);
+ 	if (ret < 0)
+ 		goto out;
+ 	ret = 0;
+@@ -4412,7 +4557,8 @@ static int record_deleted_ref(struct send_ctx *sctx)
+ 	int ret;
+ 
+ 	ret = iterate_inode_ref(sctx->parent_root, sctx->right_path,
+-				sctx->cmp_key, 0, __record_deleted_ref, sctx);
++				sctx->cmp_key, 0, record_deleted_ref_if_needed,
++				sctx);
+ 	if (ret < 0)
+ 		goto out;
+ 	ret = 0;
+@@ -4495,7 +4641,7 @@ static int __record_changed_new_ref(int num, u64 dir, int index,
+ 	ret = find_iref(sctx->parent_root, sctx->right_path,
+ 			sctx->cmp_key, dir, dir_gen, name);
+ 	if (ret == -ENOENT)
+-		ret = __record_new_ref(num, dir, index, name, sctx);
++		ret = record_new_ref_if_needed(num, dir, index, name, sctx);
+ 	else if (ret > 0)
+ 		ret = 0;
+ 
+@@ -4518,7 +4664,7 @@ static int __record_changed_deleted_ref(int num, u64 dir, int index,
+ 	ret = find_iref(sctx->send_root, sctx->left_path, sctx->cmp_key,
+ 			dir, dir_gen, name);
+ 	if (ret == -ENOENT)
+-		ret = __record_deleted_ref(num, dir, index, name, sctx);
++		ret = record_deleted_ref_if_needed(num, dir, index, name, sctx);
+ 	else if (ret > 0)
+ 		ret = 0;
+ 
+@@ -7321,6 +7467,8 @@ long btrfs_ioctl_send(struct file *mnt_file, struct btrfs_ioctl_send_args *arg)
+ 	sctx->pending_dir_moves = RB_ROOT;
+ 	sctx->waiting_dir_moves = RB_ROOT;
+ 	sctx->orphan_dirs = RB_ROOT;
++	sctx->rbtree_new_refs = RB_ROOT;
++	sctx->rbtree_deleted_refs = RB_ROOT;
+ 
+ 	sctx->clone_roots = kvcalloc(sizeof(*sctx->clone_roots),
+ 				     arg->clone_sources_count + 1,
+-- 
+2.26.2
+
