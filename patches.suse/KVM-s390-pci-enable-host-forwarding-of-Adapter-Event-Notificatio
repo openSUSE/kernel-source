@@ -1,0 +1,187 @@
+From: Matthew Rosato <mjrosato@linux.ibm.com>
+Date: Mon, 6 Jun 2022 16:33:17 -0400
+Subject: KVM: s390: pci: enable host forwarding of Adapter Event Notifications
+Git-commit: 73f91b004321f2510fa79e66035dbbf1870fcf56
+Patch-mainline: v6.0-rc1
+References: bsc#1205701
+
+In cases where interrupts are not forwarded to the guest via firmware,
+KVM is responsible for ensuring delivery.  When an interrupt presents
+with the forwarding bit, we must process the forwarding tables until
+all interrupts are delivered.
+
+Reviewed-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+Reviewed-by: Pierre Morel <pmorel@linux.ibm.com>
+Signed-off-by: Matthew Rosato <mjrosato@linux.ibm.com>
+Link: https://lore.kernel.org/r/20220606203325.110625-14-mjrosato@linux.ibm.com
+Signed-off-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ arch/s390/include/asm/kvm_host.h |    1 
+ arch/s390/include/asm/tpi.h      |   13 ++++++
+ arch/s390/kvm/interrupt.c        |   78 ++++++++++++++++++++++++++++++++++++++-
+ arch/s390/kvm/kvm-s390.c         |    3 +
+ arch/s390/kvm/pci.h              |   10 +++++
+ 5 files changed, 103 insertions(+), 2 deletions(-)
+
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@ -757,6 +757,7 @@ struct kvm_vm_stat {
+ 	u64 inject_pfault_done;
+ 	u64 inject_service_signal;
+ 	u64 inject_virtio;
++	u64 aen_forward;
+ };
+ 
+ struct kvm_arch_memory_slot {
+--- a/arch/s390/include/asm/tpi.h
++++ b/arch/s390/include/asm/tpi.h
+@@ -19,6 +19,19 @@ struct tpi_info {
+ 	u32 :12;
+ } __packed __aligned(4);
+ 
++/* I/O-Interruption Code as stored by TPI for an Adapter I/O */
++struct tpi_adapter_info {
++	u32 aism:8;
++	u32 :22;
++	u32 error:1;
++	u32 forward:1;
++	u32 reserved;
++	u32 adapter_IO:1;
++	u32 directed_irq:1;
++	u32 isc:3;
++	u32 :27;
++} __packed __aligned(4);
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* _ASM_S390_TPI_H */
+--- a/arch/s390/kvm/interrupt.c
++++ b/arch/s390/kvm/interrupt.c
+@@ -3270,11 +3270,87 @@ out:
+ }
+ EXPORT_SYMBOL_GPL(kvm_s390_gisc_unregister);
+ 
++static void aen_host_forward(unsigned long si)
++{
++	struct kvm_s390_gisa_interrupt *gi;
++	struct zpci_gaite *gaite;
++	struct kvm *kvm;
++
++	gaite = (struct zpci_gaite *)aift->gait +
++		(si * sizeof(struct zpci_gaite));
++	if (gaite->count == 0)
++		return;
++	if (gaite->aisb != 0)
++		set_bit_inv(gaite->aisbo, (unsigned long *)gaite->aisb);
++
++	kvm = kvm_s390_pci_si_to_kvm(aift, si);
++	if (!kvm)
++		return;
++	gi = &kvm->arch.gisa_int;
++
++	if (!(gi->origin->g1.simm & AIS_MODE_MASK(gaite->gisc)) ||
++	    !(gi->origin->g1.nimm & AIS_MODE_MASK(gaite->gisc))) {
++		gisa_set_ipm_gisc(gi->origin, gaite->gisc);
++		if (hrtimer_active(&gi->timer))
++			hrtimer_cancel(&gi->timer);
++		hrtimer_start(&gi->timer, 0, HRTIMER_MODE_REL);
++		kvm->stat.aen_forward++;
++	}
++}
++
++static void aen_process_gait(u8 isc)
++{
++	bool found = false, first = true;
++	union zpci_sic_iib iib = {{0}};
++	unsigned long si, flags;
++
++	spin_lock_irqsave(&aift->gait_lock, flags);
++
++	if (!aift->gait) {
++		spin_unlock_irqrestore(&aift->gait_lock, flags);
++		return;
++	}
++
++	for (si = 0;;) {
++		/* Scan adapter summary indicator bit vector */
++		si = airq_iv_scan(aift->sbv, si, airq_iv_end(aift->sbv));
++		if (si == -1UL) {
++			if (first || found) {
++				/* Re-enable interrupts. */
++				zpci_set_irq_ctrl(SIC_IRQ_MODE_SINGLE, isc,
++						  &iib);
++				first = found = false;
++			} else {
++				/* Interrupts on and all bits processed */
++				break;
++			}
++			found = false;
++			si = 0;
++			/* Scan again after re-enabling interrupts */
++			continue;
++		}
++		found = true;
++		aen_host_forward(si);
++	}
++
++	spin_unlock_irqrestore(&aift->gait_lock, flags);
++}
++
+ static void gib_alert_irq_handler(struct airq_struct *airq,
+ 				  struct tpi_info *tpi_info)
+ {
++	struct tpi_adapter_info *info = (struct tpi_adapter_info *)tpi_info;
++
+ 	inc_irq_stat(IRQIO_GAL);
+-	process_gib_alert_list();
++
++	if ((info->forward || info->error) &&
++	    IS_ENABLED(CONFIG_VFIO_PCI_ZDEV_KVM)) {
++		aen_process_gait(info->isc);
++		if (info->aism != 0)
++			process_gib_alert_list();
++	} else {
++		process_gib_alert_list();
++	}
+ }
+ 
+ static struct airq_struct gib_alert_irq = {
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -65,7 +65,8 @@ const struct _kvm_stats_desc kvm_vm_stat
+ 	STATS_DESC_COUNTER(VM, inject_float_mchk),
+ 	STATS_DESC_COUNTER(VM, inject_pfault_done),
+ 	STATS_DESC_COUNTER(VM, inject_service_signal),
+-	STATS_DESC_COUNTER(VM, inject_virtio)
++	STATS_DESC_COUNTER(VM, inject_virtio),
++	STATS_DESC_COUNTER(VM, aen_forward)
+ };
+ static_assert(ARRAY_SIZE(kvm_vm_stats_desc) ==
+ 		sizeof(struct kvm_vm_stat) / sizeof(u64));
+--- a/arch/s390/kvm/pci.h
++++ b/arch/s390/kvm/pci.h
+@@ -13,6 +13,7 @@
+ #include <linux/kvm_host.h>
+ #include <linux/pci.h>
+ #include <linux/mutex.h>
++#include <linux/kvm_host.h>
+ #include <asm/airq.h>
+ #include <asm/cpu.h>
+ 
+@@ -40,6 +41,15 @@ struct zpci_aift {
+ 
+ extern struct zpci_aift *aift;
+ 
++static inline struct kvm *kvm_s390_pci_si_to_kvm(struct zpci_aift *aift,
++						 unsigned long si)
++{
++	if (!IS_ENABLED(CONFIG_VFIO_PCI_ZDEV_KVM) || aift->kzdev == 0 ||
++	    aift->kzdev[si] == 0)
++		return 0;
++	return aift->kzdev[si]->kvm;
++};
++
+ int kvm_s390_pci_aen_init(u8 nisc);
+ void kvm_s390_pci_aen_exit(void);
+ 
