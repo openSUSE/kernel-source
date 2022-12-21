@@ -1,0 +1,348 @@
+From: Matthew Rosato <mjrosato@linux.ibm.com>
+Date: Mon, 6 Jun 2022 16:33:20 -0400
+Subject: KVM: s390: pci: add routines to start/stop interpretive execution
+Git-commit: 09340b2fca007509c3cbc34fdc97961e0abfc589
+Patch-mainline: v6.0-rc1
+References: bsc#1205701
+
+These routines will be invoked at the time an s390x vfio-pci device is
+associated with a KVM (or when the association is removed), allowing
+the zPCI device to enable or disable load/store intepretation mode;
+this requires the host zPCI device to inform firmware of the unique
+token (GISA designation) that is associated with the owning KVM.
+
+Signed-off-by: Matthew Rosato <mjrosato@linux.ibm.com>
+Acked-by: Pierre Morel <pmorel@linux.ibm.com>
+Link: https://lore.kernel.org/r/20220606203325.110625-17-mjrosato@linux.ibm.com
+Signed-off-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ arch/s390/include/asm/kvm_host.h |   18 ++++
+ arch/s390/include/asm/pci.h      |    1 
+ arch/s390/kvm/kvm-s390.c         |   15 +++
+ arch/s390/kvm/pci.c              |  162 +++++++++++++++++++++++++++++++++++++++
+ arch/s390/kvm/pci.h              |    5 +
+ arch/s390/pci/pci.c              |    4 
+ 6 files changed, 205 insertions(+)
+
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@ -19,6 +19,7 @@
+ #include <linux/kvm.h>
+ #include <linux/seqlock.h>
+ #include <linux/module.h>
++#include <linux/pci.h>
+ #include <asm/debug.h>
+ #include <asm/cpu.h>
+ #include <asm/fpu/api.h>
+@@ -961,6 +962,8 @@ struct kvm_arch{
+ 	DECLARE_BITMAP(idle_mask, KVM_MAX_VCPUS);
+ 	struct kvm_s390_gisa_interrupt gisa_int;
+ 	struct kvm_s390_pv pv;
++	struct list_head kzdev_list;
++	spinlock_t kzdev_list_lock;
+ };
+ 
+ #define KVM_HVA_ERR_BAD		(-1UL)
+@@ -1013,4 +1016,19 @@ static inline void kvm_arch_vcpu_unblock
+ 
+ void kvm_arch_vcpu_block_finish(struct kvm_vcpu *vcpu);
+ 
++#define __KVM_HAVE_ARCH_VM_FREE
++void kvm_arch_free_vm(struct kvm *kvm);
++
++#ifdef CONFIG_VFIO_PCI_ZDEV_KVM
++int kvm_s390_pci_register_kvm(struct zpci_dev *zdev, struct kvm *kvm);
++void kvm_s390_pci_unregister_kvm(struct zpci_dev *zdev);
++#else
++static inline int kvm_s390_pci_register_kvm(struct zpci_dev *dev,
++					    struct kvm *kvm)
++{
++	return -EPERM;
++}
++static inline void kvm_s390_pci_unregister_kvm(struct zpci_dev *dev) {}
++#endif
++
+ #endif
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -191,6 +191,7 @@ struct zpci_dev {
+ 	/* IOMMU and passthrough */
+ 	struct s390_domain *s390_domain; /* s390 IOMMU domain data */
+ 	struct kvm_zdev *kzdev;
++	struct mutex kzdev_lock;
+ };
+ 
+ static inline bool zdev_enabled(struct zpci_dev *zdev)
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -2784,6 +2784,14 @@ static void sca_dispose(struct kvm *kvm)
+ 	kvm->arch.sca = NULL;
+ }
+ 
++void kvm_arch_free_vm(struct kvm *kvm)
++{
++	if (IS_ENABLED(CONFIG_VFIO_PCI_ZDEV_KVM))
++		kvm_s390_pci_clear_list(kvm);
++
++	__kvm_arch_free_vm(kvm);
++}
++
+ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ {
+ 	gfp_t alloc_flags = GFP_KERNEL_ACCOUNT;
+@@ -2866,6 +2874,13 @@ int kvm_arch_init_vm(struct kvm *kvm, un
+ 
+ 	kvm_s390_crypto_init(kvm);
+ 
++	if (IS_ENABLED(CONFIG_VFIO_PCI_ZDEV_KVM)) {
++		mutex_lock(&kvm->lock);
++		kvm_s390_pci_init_list(kvm);
++		kvm_s390_vcpu_pci_enable_interp(kvm);
++		mutex_unlock(&kvm->lock);
++	}
++
+ 	mutex_init(&kvm->arch.float_int.ais_lock);
+ 	spin_lock_init(&kvm->arch.float_int.lock);
+ 	for (i = 0; i < FIRQ_LIST_COUNT; i++)
+--- a/arch/s390/kvm/pci.c
++++ b/arch/s390/kvm/pci.c
+@@ -12,7 +12,9 @@
+ #include <asm/pci.h>
+ #include <asm/pci_insn.h>
+ #include <asm/pci_io.h>
++#include <asm/sclp.h>
+ #include "pci.h"
++#include "kvm-s390.h"
+ 
+ struct zpci_aift *aift;
+ 
+@@ -423,6 +425,166 @@ static void kvm_s390_pci_dev_release(str
+ 	kfree(kzdev);
+ }
+ 
++
++/*
++ * Register device with the specified KVM. If interpetation facilities are
++ * available, enable them and let userspace indicate whether or not they will
++ * be used (specify SHM bit to disable).
++ */
++int kvm_s390_pci_register_kvm(struct zpci_dev *zdev, struct kvm *kvm)
++{
++	int rc;
++
++	if (!zdev)
++		return -EINVAL;
++
++	mutex_lock(&zdev->kzdev_lock);
++
++	if (zdev->kzdev || zdev->gisa != 0 || !kvm) {
++		mutex_unlock(&zdev->kzdev_lock);
++		return -EINVAL;
++	}
++
++	kvm_get_kvm(kvm);
++
++	mutex_lock(&kvm->lock);
++
++	rc = kvm_s390_pci_dev_open(zdev);
++	if (rc)
++		goto err;
++
++	/*
++	 * If interpretation facilities aren't available, add the device to
++	 * the kzdev list but don't enable for interpretation.
++	 */
++	if (!kvm_s390_pci_interp_allowed())
++		goto out;
++
++	/*
++	 * If this is the first request to use an interpreted device, make the
++	 * necessary vcpu changes
++	 */
++	if (!kvm->arch.use_zpci_interp)
++		kvm_s390_vcpu_pci_enable_interp(kvm);
++
++	if (zdev_enabled(zdev)) {
++		rc = zpci_disable_device(zdev);
++		if (rc)
++			goto err;
++	}
++
++	/*
++	 * Store information about the identity of the kvm guest allowed to
++	 * access this device via interpretation to be used by host CLP
++	 */
++	zdev->gisa = (u32)virt_to_phys(&kvm->arch.sie_page2->gisa);
++
++	rc = zpci_enable_device(zdev);
++	if (rc)
++		goto clear_gisa;
++
++	/* Re-register the IOMMU that was already created */
++	rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
++				virt_to_phys(zdev->dma_table));
++	if (rc)
++		goto clear_gisa;
++
++out:
++	zdev->kzdev->kvm = kvm;
++
++	spin_lock(&kvm->arch.kzdev_list_lock);
++	list_add_tail(&zdev->kzdev->entry, &kvm->arch.kzdev_list);
++	spin_unlock(&kvm->arch.kzdev_list_lock);
++
++	mutex_unlock(&kvm->lock);
++	mutex_unlock(&zdev->kzdev_lock);
++	return 0;
++
++clear_gisa:
++	zdev->gisa = 0;
++err:
++	if (zdev->kzdev)
++		kvm_s390_pci_dev_release(zdev);
++	mutex_unlock(&kvm->lock);
++	mutex_unlock(&zdev->kzdev_lock);
++	kvm_put_kvm(kvm);
++	return rc;
++}
++EXPORT_SYMBOL_GPL(kvm_s390_pci_register_kvm);
++
++void kvm_s390_pci_unregister_kvm(struct zpci_dev *zdev)
++{
++	struct kvm *kvm;
++
++	if (!zdev)
++		return;
++
++	mutex_lock(&zdev->kzdev_lock);
++
++	if (WARN_ON(!zdev->kzdev)) {
++		mutex_unlock(&zdev->kzdev_lock);
++		return;
++	}
++
++	kvm = zdev->kzdev->kvm;
++	mutex_lock(&kvm->lock);
++
++	/*
++	 * A 0 gisa means interpretation was never enabled, just remove the
++	 * device from the list.
++	 */
++	if (zdev->gisa == 0)
++		goto out;
++
++	/* Forwarding must be turned off before interpretation */
++	if (zdev->kzdev->fib.fmt0.aibv != 0)
++		kvm_s390_pci_aif_disable(zdev, true);
++
++	/* Remove the host CLP guest designation */
++	zdev->gisa = 0;
++
++	if (zdev_enabled(zdev)) {
++		if (zpci_disable_device(zdev))
++			goto out;
++	}
++
++	if (zpci_enable_device(zdev))
++		goto out;
++
++	/* Re-register the IOMMU that was already created */
++	zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
++			   virt_to_phys(zdev->dma_table));
++
++out:
++	spin_lock(&kvm->arch.kzdev_list_lock);
++	list_del(&zdev->kzdev->entry);
++	spin_unlock(&kvm->arch.kzdev_list_lock);
++	kvm_s390_pci_dev_release(zdev);
++
++	mutex_unlock(&kvm->lock);
++	mutex_unlock(&zdev->kzdev_lock);
++
++	kvm_put_kvm(kvm);
++}
++EXPORT_SYMBOL_GPL(kvm_s390_pci_unregister_kvm);
++
++void kvm_s390_pci_init_list(struct kvm *kvm)
++{
++	spin_lock_init(&kvm->arch.kzdev_list_lock);
++	INIT_LIST_HEAD(&kvm->arch.kzdev_list);
++}
++
++void kvm_s390_pci_clear_list(struct kvm *kvm)
++{
++	/*
++	 * This list should already be empty, either via vfio device closures
++	 * or kvm fd cleanup.
++	 */
++	spin_lock(&kvm->arch.kzdev_list_lock);
++	WARN_ON_ONCE(!list_empty(&kvm->arch.kzdev_list));
++	spin_unlock(&kvm->arch.kzdev_list_lock);
++}
++
+ int kvm_s390_pci_init(void)
+ {
+ 	aift = kzalloc(sizeof(struct zpci_aift), GFP_KERNEL);
+--- a/arch/s390/kvm/pci.h
++++ b/arch/s390/kvm/pci.h
+@@ -13,6 +13,7 @@
+ #include <linux/kvm_host.h>
+ #include <linux/pci.h>
+ #include <linux/mutex.h>
++#include <linux/kvm.h>
+ #include <linux/kvm_host.h>
+ #include <asm/airq.h>
+ #include <asm/cpu.h>
+@@ -21,6 +22,7 @@ struct kvm_zdev {
+ 	struct zpci_dev *zdev;
+ 	struct kvm *kvm;
+ 	struct zpci_fib fib;
++	struct list_head entry;
+ };
+ 
+ struct zpci_gaite {
+@@ -54,6 +56,9 @@ static inline struct kvm *kvm_s390_pci_s
+ int kvm_s390_pci_aen_init(u8 nisc);
+ void kvm_s390_pci_aen_exit(void);
+ 
++void kvm_s390_pci_init_list(struct kvm *kvm);
++void kvm_s390_pci_clear_list(struct kvm *kvm);
++
+ int kvm_s390_pci_init(void);
+ void kvm_s390_pci_exit(void);
+ 
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@ -130,6 +130,7 @@ int zpci_register_ioat(struct zpci_dev *
+ 		zpci_dbg(3, "reg ioat fid:%x, cc:%d, status:%d\n", zdev->fid, cc, status);
+ 	return cc;
+ }
++EXPORT_SYMBOL_GPL(zpci_register_ioat);
+ 
+ /* Modify PCI: Unregister I/O address translation parameters */
+ int zpci_unregister_ioat(struct zpci_dev *zdev, u8 dmaas)
+@@ -705,6 +706,7 @@ int zpci_enable_device(struct zpci_dev *
+ 		zpci_update_fh(zdev, fh);
+ 	return rc;
+ }
++EXPORT_SYMBOL_GPL(zpci_enable_device);
+ 
+ int zpci_disable_device(struct zpci_dev *zdev)
+ {
+@@ -728,6 +730,7 @@ int zpci_disable_device(struct zpci_dev
+ 	}
+ 	return rc;
+ }
++EXPORT_SYMBOL_GPL(zpci_disable_device);
+ 
+ /**
+  * zpci_hot_reset_device - perform a reset of the given zPCI function
+@@ -821,6 +824,7 @@ struct zpci_dev *zpci_create_device(u32
+ 
+ 	kref_init(&zdev->kref);
+ 	mutex_init(&zdev->lock);
++	mutex_init(&zdev->kzdev_lock);
+ 
+ 	rc = zpci_init_iommu(zdev);
+ 	if (rc)

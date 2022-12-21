@@ -1,0 +1,249 @@
+From: Eric Farman <farman@linux.ibm.com>
+Date: Thu, 7 Jul 2022 15:57:37 +0200
+Subject: vfio/ccw: Move FSM open/close to MDEV open/close
+Git-commit: 204b394a23ad5e30944f23518e21e844614da2ff
+Patch-mainline: v6.0-rc1
+References: bsc#1205701
+
+Part of the confusion that has existed is the FSM lifecycle of
+subchannels between the common CSS driver and the vfio-ccw driver.
+During configuration, the FSM state goes from NOT_OPER to STANDBY
+to IDLE, but then back to NOT_OPER. For example:
+
+	vfio_ccw_sch_probe:		VFIO_CCW_STATE_NOT_OPER
+	vfio_ccw_sch_probe:		VFIO_CCW_STATE_STANDBY
+	vfio_ccw_mdev_probe:		VFIO_CCW_STATE_IDLE
+	vfio_ccw_mdev_remove:		VFIO_CCW_STATE_NOT_OPER
+	vfio_ccw_sch_remove:		VFIO_CCW_STATE_NOT_OPER
+	vfio_ccw_sch_shutdown:		VFIO_CCW_STATE_NOT_OPER
+
+Rearrange the open/close events to align with the mdev open/close,
+to better manage the memory and state of the devices as time
+progresses. Specifically, make mdev_open() perform the FSM open,
+and mdev_close() perform the FSM close instead of reset (which is
+both close and open).
+
+This makes the NOT_OPER state a dead-end path, indicating the
+device is probably not recoverable without fully probing and
+re-configuring the device.
+
+This has the nice side-effect of removing a number of special-cases
+where the FSM state is managed outside of the FSM itself (such as
+the aforementioned mdev_close() routine).
+
+Suggested-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Eric Farman <farman@linux.ibm.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+Link: https://lore.kernel.org/r/20220707135737.720765-12-farman@linux.ibm.com
+Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/s390/cio/vfio_ccw_drv.c | 11 +++--------
+ drivers/s390/cio/vfio_ccw_fsm.c | 34 +++++++++++++++++++++++++---------
+ drivers/s390/cio/vfio_ccw_ops.c | 26 +++++++++++---------------
+ 3 files changed, 39 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/s390/cio/vfio_ccw_drv.c b/drivers/s390/cio/vfio_ccw_drv.c
+index f98c9915e73d..4804101ccb0f 100644
+--- a/drivers/s390/cio/vfio_ccw_drv.c
++++ b/drivers/s390/cio/vfio_ccw_drv.c
+@@ -138,7 +138,7 @@ static struct vfio_ccw_private *vfio_ccw_alloc_private(struct subchannel *sch)
+ 
+ 	private->sch = sch;
+ 	mutex_init(&private->io_mutex);
+-	private->state = VFIO_CCW_STATE_NOT_OPER;
++	private->state = VFIO_CCW_STATE_STANDBY;
+ 	INIT_LIST_HEAD(&private->crw);
+ 	INIT_WORK(&private->io_work, vfio_ccw_sch_io_todo);
+ 	INIT_WORK(&private->crw_work, vfio_ccw_crw_todo);
+@@ -222,21 +222,15 @@ static int vfio_ccw_sch_probe(struct subchannel *sch)
+ 
+ 	dev_set_drvdata(&sch->dev, private);
+ 
+-	vfio_ccw_fsm_event(private, VFIO_CCW_EVENT_OPEN);
+-	if (private->state == VFIO_CCW_STATE_NOT_OPER)
+-		goto out_free;
+-
+ 	ret = mdev_register_device(&sch->dev, &vfio_ccw_mdev_driver);
+ 	if (ret)
+-		goto out_disable;
++		goto out_free;
+ 
+ 	VFIO_CCW_MSG_EVENT(4, "bound to subchannel %x.%x.%04x\n",
+ 			   sch->schid.cssid, sch->schid.ssid,
+ 			   sch->schid.sch_no);
+ 	return 0;
+ 
+-out_disable:
+-	cio_disable_subchannel(sch);
+ out_free:
+ 	dev_set_drvdata(&sch->dev, NULL);
+ 	vfio_ccw_free_private(private);
+@@ -264,6 +258,7 @@ static void vfio_ccw_sch_shutdown(struct subchannel *sch)
+ 	struct vfio_ccw_private *private = dev_get_drvdata(&sch->dev);
+ 
+ 	vfio_ccw_fsm_event(private, VFIO_CCW_EVENT_CLOSE);
++	vfio_ccw_fsm_event(private, VFIO_CCW_EVENT_NOT_OPER);
+ }
+ 
+ /**
+diff --git a/drivers/s390/cio/vfio_ccw_fsm.c b/drivers/s390/cio/vfio_ccw_fsm.c
+index 89eb3feffa41..4b8b623df24f 100644
+--- a/drivers/s390/cio/vfio_ccw_fsm.c
++++ b/drivers/s390/cio/vfio_ccw_fsm.c
+@@ -175,6 +175,9 @@ static void fsm_notoper(struct vfio_ccw_private *private,
+ 	 */
+ 	css_sched_sch_todo(sch, SCH_TODO_UNREG);
+ 	private->state = VFIO_CCW_STATE_NOT_OPER;
++
++	/* This is usually handled during CLOSE event */
++	cp_free(&private->cp);
+ }
+ 
+ /*
+@@ -379,9 +382,16 @@ static void fsm_open(struct vfio_ccw_private *private,
+ 	spin_lock_irq(sch->lock);
+ 	sch->isc = VFIO_CCW_ISC;
+ 	ret = cio_enable_subchannel(sch, (u32)(unsigned long)sch);
+-	if (!ret)
+-		private->state = VFIO_CCW_STATE_STANDBY;
++	if (ret)
++		goto err_unlock;
++
++	private->state = VFIO_CCW_STATE_IDLE;
+ 	spin_unlock_irq(sch->lock);
++	return;
++
++err_unlock:
++	spin_unlock_irq(sch->lock);
++	vfio_ccw_fsm_event(private, VFIO_CCW_EVENT_NOT_OPER);
+ }
+ 
+ static void fsm_close(struct vfio_ccw_private *private,
+@@ -393,16 +403,22 @@ static void fsm_close(struct vfio_ccw_private *private,
+ 	spin_lock_irq(sch->lock);
+ 
+ 	if (!sch->schib.pmcw.ena)
+-		goto out_unlock;
++		goto err_unlock;
+ 
+ 	ret = cio_disable_subchannel(sch);
+ 	if (ret == -EBUSY)
+ 		vfio_ccw_sch_quiesce(sch);
++	if (ret)
++		goto err_unlock;
+ 
+-out_unlock:
+-	private->state = VFIO_CCW_STATE_NOT_OPER;
++	private->state = VFIO_CCW_STATE_STANDBY;
+ 	spin_unlock_irq(sch->lock);
+ 	cp_free(&private->cp);
++	return;
++
++err_unlock:
++	spin_unlock_irq(sch->lock);
++	vfio_ccw_fsm_event(private, VFIO_CCW_EVENT_NOT_OPER);
+ }
+ 
+ /*
+@@ -414,16 +430,16 @@ fsm_func_t *vfio_ccw_jumptable[NR_VFIO_CCW_STATES][NR_VFIO_CCW_EVENTS] = {
+ 		[VFIO_CCW_EVENT_IO_REQ]		= fsm_io_error,
+ 		[VFIO_CCW_EVENT_ASYNC_REQ]	= fsm_async_error,
+ 		[VFIO_CCW_EVENT_INTERRUPT]	= fsm_disabled_irq,
+-		[VFIO_CCW_EVENT_OPEN]		= fsm_open,
++		[VFIO_CCW_EVENT_OPEN]		= fsm_nop,
+ 		[VFIO_CCW_EVENT_CLOSE]		= fsm_nop,
+ 	},
+ 	[VFIO_CCW_STATE_STANDBY] = {
+ 		[VFIO_CCW_EVENT_NOT_OPER]	= fsm_notoper,
+ 		[VFIO_CCW_EVENT_IO_REQ]		= fsm_io_error,
+ 		[VFIO_CCW_EVENT_ASYNC_REQ]	= fsm_async_error,
+-		[VFIO_CCW_EVENT_INTERRUPT]	= fsm_irq,
+-		[VFIO_CCW_EVENT_OPEN]		= fsm_notoper,
+-		[VFIO_CCW_EVENT_CLOSE]		= fsm_close,
++		[VFIO_CCW_EVENT_INTERRUPT]	= fsm_disabled_irq,
++		[VFIO_CCW_EVENT_OPEN]		= fsm_open,
++		[VFIO_CCW_EVENT_CLOSE]		= fsm_notoper,
+ 	},
+ 	[VFIO_CCW_STATE_IDLE] = {
+ 		[VFIO_CCW_EVENT_NOT_OPER]	= fsm_notoper,
+diff --git a/drivers/s390/cio/vfio_ccw_ops.c b/drivers/s390/cio/vfio_ccw_ops.c
+index 4673b7ddfe20..bc2176421dc5 100644
+--- a/drivers/s390/cio/vfio_ccw_ops.c
++++ b/drivers/s390/cio/vfio_ccw_ops.c
+@@ -24,17 +24,12 @@ static int vfio_ccw_mdev_reset(struct vfio_ccw_private *private)
+ 	/*
+ 	 * If the FSM state is seen as Not Operational after closing
+ 	 * and re-opening the mdev, return an error.
+-	 *
+-	 * Otherwise, change the FSM from STANDBY to IDLE which is
+-	 * normally done by vfio_ccw_mdev_probe() in current lifecycle.
+ 	 */
+ 	vfio_ccw_fsm_event(private, VFIO_CCW_EVENT_CLOSE);
+ 	vfio_ccw_fsm_event(private, VFIO_CCW_EVENT_OPEN);
+ 	if (private->state == VFIO_CCW_STATE_NOT_OPER)
+ 		return -EINVAL;
+ 
+-	private->state = VFIO_CCW_STATE_IDLE;
+-
+ 	return 0;
+ }
+ 
+@@ -121,8 +116,6 @@ static int vfio_ccw_mdev_probe(struct mdev_device *mdev)
+ 	vfio_init_group_dev(&private->vdev, &mdev->dev,
+ 			    &vfio_ccw_dev_ops);
+ 
+-	private->state = VFIO_CCW_STATE_IDLE;
+-
+ 	VFIO_CCW_MSG_EVENT(2, "sch %x.%x.%04x: create\n",
+ 			   private->sch->schid.cssid,
+ 			   private->sch->schid.ssid,
+@@ -137,7 +130,6 @@ static int vfio_ccw_mdev_probe(struct mdev_device *mdev)
+ err_atomic:
+ 	vfio_uninit_group_dev(&private->vdev);
+ 	atomic_inc(&private->avail);
+-	private->state = VFIO_CCW_STATE_STANDBY;
+ 	return ret;
+ }
+ 
+@@ -165,6 +157,10 @@ static int vfio_ccw_mdev_open_device(struct vfio_device *vdev)
+ 	unsigned long events = VFIO_IOMMU_NOTIFY_DMA_UNMAP;
+ 	int ret;
+ 
++	/* Device cannot simply be opened again from this state */
++	if (private->state == VFIO_CCW_STATE_NOT_OPER)
++		return -EINVAL;
++
+ 	private->nb.notifier_call = vfio_ccw_mdev_notifier;
+ 
+ 	ret = vfio_register_notifier(vdev, VFIO_IOMMU_NOTIFY,
+@@ -184,6 +180,12 @@ static int vfio_ccw_mdev_open_device(struct vfio_device *vdev)
+ 	if (ret)
+ 		goto out_unregister;
+ 
++	vfio_ccw_fsm_event(private, VFIO_CCW_EVENT_OPEN);
++	if (private->state == VFIO_CCW_STATE_NOT_OPER) {
++		ret = -EINVAL;
++		goto out_unregister;
++	}
++
+ 	return ret;
+ 
+ out_unregister:
+@@ -197,13 +199,7 @@ static void vfio_ccw_mdev_close_device(struct vfio_device *vdev)
+ 	struct vfio_ccw_private *private =
+ 		container_of(vdev, struct vfio_ccw_private, vdev);
+ 
+-	if ((private->state != VFIO_CCW_STATE_NOT_OPER) &&
+-	    (private->state != VFIO_CCW_STATE_STANDBY)) {
+-		if (!vfio_ccw_mdev_reset(private))
+-			private->state = VFIO_CCW_STATE_STANDBY;
+-		/* The state will be NOT_OPER on error. */
+-	}
+-
++	vfio_ccw_fsm_event(private, VFIO_CCW_EVENT_CLOSE);
+ 	vfio_ccw_unregister_dev_regions(private);
+ 	vfio_unregister_notifier(vdev, VFIO_IOMMU_NOTIFY, &private->nb);
+ }
+

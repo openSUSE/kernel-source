@@ -1,0 +1,170 @@
+From: Jason Gunthorpe <jgg@nvidia.com>
+Date: Mon, 16 May 2022 20:41:21 -0300
+Subject: vfio: Simplify the life cycle of the group FD
+Git-commit: b76c0eed748605afe8cddcc45c574f7f8536551a
+Patch-mainline: v5.19-rc1
+References: bsc#1205701
+
+Once userspace opens a group FD it is prevented from opening another
+instance of that same group FD until all the prior group FDs and users of
+the container are done.
+
+The first is done trivially by checking the group->opened during group FD
+open.
+
+However, things get a little weird if userspace creates a device FD and
+then closes the group FD. The group FD still cannot be re-opened, but this
+time it is because the group->container is still set and container_users
+is elevated by the device FD.
+
+Due to this mismatched lifecycle we have the
+vfio_group_try_dissolve_container() which tries to auto-free a container
+after the group FD is closed but the device FD remains open.
+
+Instead have the device FD hold onto a reference to the single group
+FD. This directly prevents vfio_group_fops_release() from being called
+when any device FD exists and makes the lifecycle model more
+understandable.
+
+vfio_group_try_dissolve_container() is removed as the only place a
+container is auto-deleted is during vfio_group_fops_release(). At this
+point the container_users is either 1 or 0 since all device FDs must be
+closed.
+
+Change group->opened to group->opened_file which points to the single
+struct file * that is open for the group. If the group->open_file is
+NULL then group->container == NULL.
+
+If all device FDs have closed then the group's notifier list must be
+empty.
+
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Tested-by: Nicolin Chen <nicolinc@nvidia.com>
+Tested-by: Matthew Rosato <mjrosato@linux.ibm.com>
+Link: https://lore.kernel.org/r/5-v2-d035a1842d81+1bf-vfio_group_locking_jgg@nvidia.com
+Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/vfio/vfio.c | 52 ++++++++++++++++++++++++----------------------------
+ 1 file changed, 24 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/vfio/vfio.c b/drivers/vfio/vfio.c
+index 81330c8ca7fe..149c25840130 100644
+--- a/drivers/vfio/vfio.c
++++ b/drivers/vfio/vfio.c
+@@ -73,11 +73,11 @@ struct vfio_group {
+ 	struct mutex			device_lock;
+ 	struct list_head		vfio_next;
+ 	struct list_head		container_next;
+-	bool				opened;
+ 	enum vfio_group_type		type;
+ 	unsigned int			dev_counter;
+ 	struct rw_semaphore		group_rwsem;
+ 	struct kvm			*kvm;
++	struct file			*opened_file;
+ 	struct blocking_notifier_head	notifier;
+ };
+ 
+@@ -967,20 +967,6 @@ static int vfio_group_unset_container(struct vfio_group *group)
+ 	return 0;
+ }
+ 
+-/*
+- * When removing container users, anything that removes the last user
+- * implicitly removes the group from the container.  That is, if the
+- * group file descriptor is closed, as well as any device file descriptors,
+- * the group is free.
+- */
+-static void vfio_group_try_dissolve_container(struct vfio_group *group)
+-{
+-	down_write(&group->group_rwsem);
+-	if (0 == atomic_dec_if_positive(&group->container_users))
+-		__vfio_group_unset_container(group);
+-	up_write(&group->group_rwsem);
+-}
+-
+ static int vfio_group_set_container(struct vfio_group *group, int container_fd)
+ {
+ 	struct fd f;
+@@ -1068,10 +1054,19 @@ static int vfio_device_assign_container(struct vfio_device *device)
+ 	if (group->type == VFIO_NO_IOMMU && !capable(CAP_SYS_RAWIO))
+ 		return -EPERM;
+ 
++	get_file(group->opened_file);
+ 	atomic_inc(&group->container_users);
+ 	return 0;
+ }
+ 
++static void vfio_device_unassign_container(struct vfio_device *device)
++{
++	down_write(&device->group->group_rwsem);
++	atomic_dec(&device->group->container_users);
++	fput(device->group->opened_file);
++	up_write(&device->group->group_rwsem);
++}
++
+ static struct file *vfio_device_open(struct vfio_device *device)
+ {
+ 	struct file *filep;
+@@ -1133,7 +1128,7 @@ static struct file *vfio_device_open(struct vfio_device *device)
+ 	mutex_unlock(&device->dev_set->lock);
+ 	module_put(device->dev->driver->owner);
+ err_unassign_container:
+-	vfio_group_try_dissolve_container(device->group);
++	vfio_device_unassign_container(device);
+ 	return ERR_PTR(ret);
+ }
+ 
+@@ -1264,18 +1259,12 @@ static int vfio_group_fops_open(struct inode *inode, struct file *filep)
+ 
+ 	/*
+ 	 * Do we need multiple instances of the group open?  Seems not.
+-	 * Is something still in use from a previous open?
+ 	 */
+-	if (group->opened || group->container) {
++	if (group->opened_file) {
+ 		ret = -EBUSY;
+ 		goto err_put;
+ 	}
+-	group->opened = true;
+-
+-	/* Warn if previous user didn't cleanup and re-init to drop them */
+-	if (WARN_ON(group->notifier.head))
+-		BLOCKING_INIT_NOTIFIER_HEAD(&group->notifier);
+-
++	group->opened_file = filep;
+ 	filep->private_data = group;
+ 
+ 	up_write(&group->group_rwsem);
+@@ -1293,10 +1282,17 @@ static int vfio_group_fops_release(struct inode *inode, struct file *filep)
+ 
+ 	filep->private_data = NULL;
+ 
+-	vfio_group_try_dissolve_container(group);
+-
+ 	down_write(&group->group_rwsem);
+-	group->opened = false;
++	/*
++	 * Device FDs hold a group file reference, therefore the group release
++	 * is only called when there are no open devices.
++	 */
++	WARN_ON(group->notifier.head);
++	if (group->container) {
++		WARN_ON(atomic_read(&group->container_users) != 1);
++		__vfio_group_unset_container(group);
++	}
++	group->opened_file = NULL;
+ 	up_write(&group->group_rwsem);
+ 
+ 	vfio_group_put(group);
+@@ -1328,7 +1324,7 @@ static int vfio_device_fops_release(struct inode *inode, struct file *filep)
+ 
+ 	module_put(device->dev->driver->owner);
+ 
+-	vfio_group_try_dissolve_container(device->group);
++	vfio_device_unassign_container(device);
+ 
+ 	vfio_device_put(device);
+ 
+
