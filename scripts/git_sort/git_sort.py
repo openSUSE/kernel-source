@@ -262,6 +262,8 @@ remotes = (
     Head(RepoURL("bpf/bpf-next.git")),
     Head(RepoURL("linusw/linux-gpio.git"), "for-next"),
     Head(RepoURL("soc/soc.git"), "for-next"),
+    Head(RepoURL("https://gitlab.freedesktop.org/drm/tegra.git"), "for-next"),
+    Head(RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/thierry.reding/linux-pwm.git"), "for-next"),
 )
 
 
