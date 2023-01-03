@@ -1,0 +1,163 @@
+From 837b24ceaa5fa91e21c46c458f02f73d8b4cd5e7 Mon Sep 17 00:00:00 2001
+From: Lucas De Marchi <lucas.demarchi@intel.com>
+Date: Tue, 28 Jun 2022 12:10:15 -0700
+Subject: iosys-map: Add per-word read
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 5f278dbd540b7548bc5193552e6d478255c14c2d
+Patch-mainline: v6.0-rc1
+References: jsc#PED-1166 jsc#PED-1168 jsc#PED-1170 jsc#PED-1218 jsc#PED-1220 jsc#PED-1222 jsc#PED-1223 jsc#PED-1225 jsc#PED-2849
+
+Instead of always falling back to memcpy_fromio() for any size, prefer
+using read{b,w,l}(). When reading struct members it's common to read
+individual integer variables individually. Going through memcpy_fromio()
+for each of them poses a high penalty.
+
+Employ a similar trick as __seqprop() by using _Generic() to generate
+only the specific call based on a type-compatible variable.
+
+For a pariticular i915 workload producing GPU context switches,
+__get_engine_usage_record() is particularly hot since the engine usage
+is read from device local memory with dgfx, possibly multiple times
+since it's racy. Test execution time for this test shows a ~12.5%
+improvement with DG2:
+
+Before:
+	nrepeats = 1000; min = 7.63243e+06; max = 1.01817e+07;
+	median = 9.52548e+06; var = 526149;
+After:
+	nrepeats = 1000; min = 7.03402e+06; max = 8.8832e+06;
+	median = 8.33955e+06; var = 333113;
+
+Other things attempted that didn't prove very useful:
+1) Change the _Generic() on x86 to just dereference the memory address
+2) Change __get_engine_usage_record() to do just 1 read per loop,
+   comparing with the previous value read
+3) Change __get_engine_usage_record() to access the fields directly as it
+   was before the conversion to iosys-map
+
+(3) did gave a small improvement (~3%), but doesn't seem to scale well
+to other similar cases in the driver.
+
+Additional test by Chris Wilson using gem_create from igt with some
+changes to track object creation time. This happens to accidentally
+stress this code path:
+
+	Pre iosys_map conversion of engine busyness:
+	lmem0: Creating    262144 4KiB objects took 59274.2ms
+
+	Unpatched:
+	lmem0: Creating    262144 4KiB objects took 108830.2ms
+
+	With readl (this patch):
+	lmem0: Creating    262144 4KiB objects took 61348.6ms
+
+	s/readl/READ_ONCE/
+	lmem0: Creating    262144 4KiB objects took 61333.2ms
+
+So we do take a little bit more time than before the conversion, but
+that is due to other factors: bringing the READ_ONCE back would be as
+good as just doing this conversion.
+
+v2:
+  - Remove default from _Generic() - callers wanting to read more
+    than u64 should use iosys_map_memcpy_from()
+  - Add READ_ONCE() cases dereferencing the pointer when using system
+    memory
+v3:
+  - Fix precedence issue when casting inside READ_ONCE(). By not using ()
+    around vaddr__ the offset was not part of the cast, but rather added
+    to it, producing a wrong address
+  - Remove compiletime_assert() as READ_ONCE() already contains it
+
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Reviewed-by: Christian König <christian.koenig@amd.com> # v1
+Reviewed-by: Thomas Zimmermann <tzimmermann@suse.de>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220628191016.3899428-1-lucas.demarchi@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ include/linux/iosys-map.h | 42 ++++++++++++++++++++++++++++++---------
+ 1 file changed, 33 insertions(+), 9 deletions(-)
+
+diff --git a/include/linux/iosys-map.h b/include/linux/iosys-map.h
+index 4b8406ee8bc4..d19977e011ae 100644
+--- a/include/linux/iosys-map.h
++++ b/include/linux/iosys-map.h
+@@ -6,6 +6,7 @@
+ #ifndef __IOSYS_MAP_H__
+ #define __IOSYS_MAP_H__
+ 
++#include <linux/compiler_types.h>
+ #include <linux/io.h>
+ #include <linux/string.h>
+ 
+@@ -333,6 +334,23 @@ static inline void iosys_map_memset(struct iosys_map *dst, size_t offset,
+ 		memset(dst->vaddr + offset, value, len);
+ }
+ 
++#ifdef CONFIG_64BIT
++#define __iosys_map_rd_io_u64_case(val_, vaddr_iomem_)				\
++	u64: val_ = readq(vaddr_iomem_)
++#else
++#define __iosys_map_rd_io_u64_case(val_, vaddr_iomem_)				\
++	u64: memcpy_fromio(&(val_), vaddr_iomem_, sizeof(u64))
++#endif
++
++#define __iosys_map_rd_io(val__, vaddr_iomem__, type__) _Generic(val__,		\
++	u8: val__ = readb(vaddr_iomem__),					\
++	u16: val__ = readw(vaddr_iomem__),					\
++	u32: val__ = readl(vaddr_iomem__),					\
++	__iosys_map_rd_io_u64_case(val__, vaddr_iomem__))
++
++#define __iosys_map_rd_sys(val__, vaddr__, type__)				\
++	val__ = READ_ONCE(*(type__ *)(vaddr__))
++
+ /**
+  * iosys_map_rd - Read a C-type value from the iosys_map
+  *
+@@ -340,16 +358,21 @@ static inline void iosys_map_memset(struct iosys_map *dst, size_t offset,
+  * @offset__:	The offset from which to read
+  * @type__:	Type of the value being read
+  *
+- * Read a C type value from iosys_map, handling possible un-aligned accesses to
+- * the mapping.
++ * Read a C type value (u8, u16, u32 and u64) from iosys_map. For other types or
++ * if pointer may be unaligned (and problematic for the architecture supported),
++ * use iosys_map_memcpy_from().
+  *
+  * Returns:
+  * The value read from the mapping.
+  */
+-#define iosys_map_rd(map__, offset__, type__) ({			\
+-	type__ val;							\
+-	iosys_map_memcpy_from(&val, map__, offset__, sizeof(val));	\
+-	val;								\
++#define iosys_map_rd(map__, offset__, type__) ({				\
++	type__ val;								\
++	if ((map__)->is_iomem) {						\
++		__iosys_map_rd_io(val, (map__)->vaddr_iomem + (offset__), type__);\
++	} else {								\
++		__iosys_map_rd_sys(val, (map__)->vaddr + (offset__), type__);	\
++	}									\
++	val;									\
+ })
+ 
+ /**
+@@ -379,9 +402,10 @@ static inline void iosys_map_memset(struct iosys_map *dst, size_t offset,
+  *
+  * Read a value from iosys_map considering its layout is described by a C struct
+  * starting at @struct_offset__. The field offset and size is calculated and its
+- * value read handling possible un-aligned memory accesses. For example: suppose
+- * there is a @struct foo defined as below and the value ``foo.field2.inner2``
+- * needs to be read from the iosys_map:
++ * value read. If the field access would incur in un-aligned access, then either
++ * iosys_map_memcpy_from() needs to be used or the architecture must support it.
++ * For example: suppose there is a @struct foo defined as below and the value
++ * ``foo.field2.inner2`` needs to be read from the iosys_map:
+  *
+  * .. code-block:: c
+  *
+-- 
+2.38.1
+
