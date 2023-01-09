@@ -1,0 +1,180 @@
+From: NeilBrown <neilb@suse.de>
+Subject: NFS: Handle missing attributes in OPEN reply
+Patch-mainline: Submitted, 04jan2023 linux-nfs@vger.kernel.org
+References: bsc#1203740
+
+If a NFSv4 OPEN reply reports that the file was successfully opened but
+the subsequent GETATTR fails, Linux-NFS will attempt a stand-alone
+GETATTR request.  If that also fails, handling of the reply is aborted
+with error -EAGAIN and the open is attempted again from the start.
+
+This leaves the server with an active state (because the OPEN operation
+succeeded) which the client doesn't know about.  If the open-owner
+(local user) did not have the file already open, this has minimal
+consequences for the client and only causes the server to spend
+resources on an open state that will never be used or explicitly closed.
+
+If the open-owner DID already have the file open, then it will hold a
+reference to the open-state for that file, but the seq-id in the
+state-id will now be out-of-sync with the server.  The server will have
+incremented the seq-id, but the client will not have noticed.  So when
+the client next attempts to access the file using that state (READ,
+WRITE, SETATTR), the attempt will fail with NFS4ERR_OLD_STATEID.
+
+The Linux-client assumes this error is due to a race and simply retries
+on the basis that the local state-id information should have been
+updated by another thread.  This basis is invalid in this case and the
+result is an infinite loop attempting IO and getting OLD_STATEID.
+
+This has been observed with a NetApp Filer as the server (ONTAP 9.8 p5,
+using NFSv4.0).  The client is creating, writing, and unlinking a
+particular file from multiple clients (.bash_history).  If a new OPEN
+from one client races with a REMOVE from another client while the first
+client already has the file open, the Filer can report success for the
+OPEN op, but NFS4ERR_STALE for the ACCESS and GETATTR ops in the OPEN
+request.  This gets the seq-id out-of-sync and a subsequent write to the
+other open on the first client causes the infinite loop to occur.
+
+The reason that the client returns -EAGAIN is that it needs to find the
+inode so it can find the associated state to update the seq-id, but the
+inode lookup requires the file-id which is provided in the GETATTR
+reply.  Without the file-id normal inode lookup cannot be used.
+
+This patch changes the lookup so that when the file-id is not available
+the list of states owned by the open-owner is examined to find the state
+with the correct state-id (ignoring the seq-id part of the state-id).
+If this is found it is used just as when a normal inode lookup finds an
+inode.  If it isn't found, -EAGAIN is returned as before.
+
+This bug can be demonstrated by modifying the Linux NFS server as
+follows:
+
+1/ The second time a file is opened, unlink it.  This simulates
+   a race with another client, without needing to have a race:
+
+    // in fs/nfsd/nfs4proc.c: @@ -594,6 +594,12 @@ nfsd4_open(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+     	if (reclaim && !status)
+     		nn->somebody_reclaimed = true;
+     out:
+    +	if (!status && open->op_stateid.si_generation > 1) {
+    +		printk("Opening gen %d\n", (int)open->op_stateid.si_generation);
+    +		vfs_unlink(mnt_user_ns(resfh->fh_export->ex_path.mnt),
+    +			   resfh->fh_dentry->d_parent->d_inode,
+    +			   resfh->fh_dentry, NULL);
+    +	}
+     	if (open->op_filp) {
+     		fput(open->op_filp);
+     		open->op_filp = NULL;
+
+2/ When a GETATTR op is attempted on an unlinked file, return ESTALE
+
+    // @@ -852,6 +858,11 @@ nfsd4_getattr(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+     	if (status)
+     		return status;
+
+    +	if (cstate->current_fh.fh_dentry->d_inode->i_nlink == 0) {
+    +		printk("Return Estale for unlinked file\n");
+    +		return nfserr_stale;
+    +	}
+    +
+     	if (getattr->ga_bmval[1] & NFSD_WRITEONLY_ATTRS_WORD1)
+     		return nfserr_inval;
+
+Then mount the filesystem and
+
+  Thread 1            Thread 2
+  open a file
+                      open the same file (will fail)
+  write to that file
+
+I use this shell fragment, using 'sleep' for synchronisation.
+The use of /bin/echo ensures the write is flushed when /bin/echo closes
+the fd on exit.
+
+    (
+        /bin/echo hello
+        sleep 3
+        /bin/echo there
+    ) > /import/A/afile &
+    sleep 3
+    cat /import/A/afile
+
+Probably when the OPEN succeeds, the GETATTR fails, and we don't already
+have the state open, we should explicitly close the state.  Leaving it
+open could cause problems if, for example, the server revoked it and
+signalled the client that there was a revoked state.  The client would
+not be able to find the state that needed to be relinquished.  I haven't
+attempted to implement this.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Acked-by: NeilBrown <neilb@suse.com>
+
+---
+ fs/nfs/nfs4_fs.h   |    1 +
+ fs/nfs/nfs4proc.c  |   18 ++++++++++++++----
+ fs/nfs/nfs4state.c |   17 +++++++++++++++++
+ 3 files changed, 32 insertions(+), 4 deletions(-)
+
+--- a/fs/nfs/nfs4_fs.h
++++ b/fs/nfs/nfs4_fs.h
+@@ -490,6 +490,7 @@ extern void nfs4_put_state_owner(struct
+ extern void nfs4_purge_state_owners(struct nfs_server *, struct list_head *);
+ extern void nfs4_free_state_owners(struct list_head *head);
+ extern struct nfs4_state * nfs4_get_open_state(struct inode *, struct nfs4_state_owner *);
++extern struct inode *nfs4_get_inode_by_stateid(nfs4_stateid *stateid, struct nfs4_state_owner *owner);
+ extern void nfs4_put_open_state(struct nfs4_state *);
+ extern void nfs4_close_state(struct nfs4_state *, fmode_t);
+ extern void nfs4_close_sync(struct nfs4_state *, fmode_t);
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -2016,10 +2016,20 @@ nfs4_opendata_get_inode(struct nfs4_open
+ 	case NFS4_OPEN_CLAIM_NULL:
+ 	case NFS4_OPEN_CLAIM_DELEGATE_CUR:
+ 	case NFS4_OPEN_CLAIM_DELEGATE_PREV:
+-		if (!(data->f_attr.valid & NFS_ATTR_FATTR))
+-			return ERR_PTR(-EAGAIN);
+-		inode = nfs_fhget(data->dir->d_sb, &data->o_res.fh,
+-				&data->f_attr, data->f_label);
++		if (data->f_attr.valid & NFS_ATTR_FATTR) {
++			inode = nfs_fhget(data->dir->d_sb, &data->o_res.fh,
++					  &data->f_attr, data->f_label);
++		} else {
++			/* We don't have the fileid and so cannot do inode
++			 * lookup.  If we already have this state open we MUST
++			 * update the seqid to match the server, so we need to
++			 * find it if possible.
++			 */
++			inode = nfs4_get_inode_by_stateid(&data->o_res.stateid,
++							  data->owner);
++			if (!inode)
++				inode = ERR_PTR(-EAGAIN);
++		}
+ 		break;
+ 	default:
+ 		inode = d_inode(data->dentry);
+--- a/fs/nfs/nfs4state.c
++++ b/fs/nfs/nfs4state.c
+@@ -752,6 +752,23 @@ out:
+ 	return state;
+ }
+ 
++struct inode *
++nfs4_get_inode_by_stateid(nfs4_stateid *stateid, struct nfs4_state_owner *owner)
++{
++	struct nfs4_state *state;
++	struct inode *inode = NULL;
++
++	spin_lock(&owner->so_lock);
++	list_for_each_entry(state, &owner->so_states, open_states)
++		if (nfs4_stateid_match_other(stateid, &state->open_stateid)) {
++			inode = state->inode;
++			ihold(inode);
++			break;
++		}
++	spin_unlock(&owner->so_lock);
++	return inode;
++}
++
+ void nfs4_put_open_state(struct nfs4_state *state)
+ {
+ 	struct inode *inode = state->inode;
