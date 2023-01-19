@@ -212,6 +212,7 @@ remotes = (
     Head(RepoURL("gregkh/driver-core.git"), "driver-core-next"),
     Head(RepoURL("gregkh/tty.git"), "tty-next"),
     Head(RepoURL("gregkh/usb.git"), "usb-next"),
+    Head(RepoURL("gregkh/usb.git"), "usb-linus"),
     Head(RepoURL("jj/linux-apparmor.git"), "apparmor-next"),
     Head(RepoURL("netfilter/nf.git")),
     Head(RepoURL("netfilter/nf-next.git")),
