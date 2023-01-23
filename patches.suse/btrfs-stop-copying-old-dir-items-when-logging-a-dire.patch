@@ -1,0 +1,322 @@
+From: Filipe Manana <fdmanana@suse.com>
+Date: Wed, 15 Dec 2021 12:20:00 +0000
+Subject: [PATCH] btrfs: stop copying old dir items when logging a directory
+Git-commit: 732d591a5d6c12478a14083011f59dce6a1e48d4
+Patch-mainline: v5.18-rc1
+References: bsc#1207263
+
+When logging a directory, we go over every leaf of the subvolume tree that
+was changed in the current transaction and copy all its dir index keys to
+the log tree.
+
+That includes copying dir index keys created in past transactions. This is
+done mostly for simplicity, as after logging the keys we log an item that
+specifies the start and end ranges of the keys we logged. That item is
+then used during log replay to figure out which keys need to be deleted -
+every key in that range that we find in the subvolume tree and is not in
+the log tree, needs to be deleted.
+
+Now that we log only dir index keys, and not dir item keys anymore, when
+we remove dentries from a directory (due to unlink and rename operations),
+we can get entire leaves that we changed only for deleting old dir index
+keys, or that have few dir index keys that are new - this is due to the
+fact that the offset for new index keys comes from a monotonically
+increasing counter.
+
+We can avoid logging dir index keys from past transactions, and in order
+to track the deletions, only log range items (BTRFS_DIR_LOG_INDEX_KEY key
+type) when we find gaps between consecutive index keys. This massively
+reduces the amount of logged metadata when we have deleted directory
+entries, even if it's a small percentage of the total number of entries.
+The reduction comes from both less items that are logged and instead of
+logging many dir index items (struct btrfs_dir_item), which have a size
+of 30 bytes plus a file name, we typically log just a few range items
+(struct btrfs_dir_log_item), which take only 8 bytes each.
+
+Even if no entries were deleted from a directory and only new entries
+were added, we typically still get a reduction on the amount of logged
+metadata, because it's very likely the first leaf that got the new
+dir index entries also has several old dir index entries.
+
+So change the logging logic to not log dir index keys created in past
+transactions and log a range item for every gap it finds between each
+pair of consecutive index keys, to ensure deletions are tracked and
+replayed on log replay.
+
+This patch is part of a patchset comprised of the following patches:
+
+ 1/4 btrfs: don't log unnecessary boundary keys when logging directory
+ 2/4 btrfs: put initial index value of a directory in a constant
+ 3/4 btrfs: stop copying old dir items when logging a directory
+ 4/4 btrfs: stop trying to log subdirectories created in past transactions
+
+The following test was run on a branch without this patchset and on a
+branch with the first three patches applied:
+
+  $ cat test.sh
+  #!/bin/bash
+
+  DEV=/dev/nvme0n1
+  MNT=/mnt/nvme0n1
+
+  NUM_FILES=1000000
+  NUM_FILE_DELETES=10000
+
+  MKFS_OPTIONS="-O no-holes -R free-space-tree"
+  MOUNT_OPTIONS="-o ssd"
+
+  mkfs.btrfs -f $MKFS_OPTIONS $DEV
+  mount $MOUNT_OPTIONS $DEV $MNT
+
+  mkdir $MNT/testdir
+  for ((i = 1; i <= $NUM_FILES; i++)); do
+      echo -n > $MNT/testdir/file_$i
+  done
+
+  sync
+
+  del_inc=$(( $NUM_FILES / $NUM_FILE_DELETES ))
+  for ((i = 1; i <= $NUM_FILES; i += $del_inc)); do
+      rm -f $MNT/testdir/file_$i
+  done
+
+  start=$(date +%s%N)
+  xfs_io -c "fsync" $MNT/testdir
+  end=$(date +%s%N)
+
+  dur=$(( (end - start) / 1000000 ))
+  echo "dir fsync took $dur ms after deleting $NUM_FILE_DELETES files"
+  echo
+
+  umount $MNT
+
+The test was run on a non-debug kernel (Debian's default kernel config),
+and the results were the following for various values of NUM_FILES and
+NUM_FILE_DELETES:
+
+** before, NUM_FILES = 1 000 000, NUM_FILE_DELETES = 10 000 **
+
+dir fsync took 585 ms after deleting 10000 files
+
+** after, NUM_FILES = 1 000 000, NUM_FILE_DELETES = 10 000 **
+
+dir fsync took 34 ms after deleting 10000 files   (-94.2%)
+
+** before, NUM_FILES = 100 000, NUM_FILE_DELETES = 1 000 **
+
+dir fsync took 50 ms after deleting 1000 files
+
+** after, NUM_FILES = 100 000, NUM_FILE_DELETES = 1 000 **
+
+dir fsync took 7 ms after deleting 1000 files    (-86.0%)
+
+** before, NUM_FILES = 10 000, NUM_FILE_DELETES = 100 **
+
+dir fsync took 9 ms after deleting 100 files
+
+** after, NUM_FILES = 10 000, NUM_FILE_DELETES = 100 **
+
+dir fsync took 5 ms after deleting 100 files     (-44.4%)
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/tree-log.c | 83 +++++++++++++++++++++++++++++----------------
+ 1 file changed, 53 insertions(+), 30 deletions(-)
+
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index 8386e418b75a..a367d62572c1 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -3725,7 +3725,8 @@ static int process_dir_items_leaf(struct btrfs_trans_handle *trans,
+ 				  struct btrfs_inode *inode,
+ 				  struct btrfs_path *path,
+ 				  struct btrfs_path *dst_path,
+-				  struct btrfs_log_ctx *ctx)
++				  struct btrfs_log_ctx *ctx,
++				  u64 *last_old_dentry_offset)
+ {
+ 	struct btrfs_root *log = inode->root->log_root;
+ 	struct extent_buffer *src = path->nodes[0];
+@@ -3738,6 +3739,7 @@ static int process_dir_items_leaf(struct btrfs_trans_handle *trans,
+ 	int i;
+ 
+ 	for (i = path->slots[0]; i < nritems; i++) {
++		struct btrfs_dir_item *di;
+ 		struct btrfs_key key;
+ 		int ret;
+ 
+@@ -3748,7 +3750,34 @@ static int process_dir_items_leaf(struct btrfs_trans_handle *trans,
+ 			break;
+ 		}
+ 
++		di = btrfs_item_ptr(src, i, struct btrfs_dir_item);
+ 		ctx->last_dir_item_offset = key.offset;
++
++		/*
++		 * Skip ranges of items that consist only of dir item keys created
++		 * in past transactions. However if we find a gap, we must log a
++		 * dir index range item for that gap, so that index keys in that
++		 * gap are deleted during log replay.
++		 */
++		if (btrfs_dir_transid(src, di) < trans->transid) {
++			if (key.offset > *last_old_dentry_offset + 1) {
++				ret = insert_dir_log_key(trans, log, dst_path,
++						 ino, *last_old_dentry_offset + 1,
++						 key.offset - 1);
++				/*
++				 * -EEXIST should never happen because when we
++				 * log a directory in full mode (LOG_INODE_ALL)
++				 * we drop all BTRFS_DIR_LOG_INDEX_KEY keys from
++				 * the log tree.
++				 */
++				ASSERT(ret != -EEXIST);
++				if (ret < 0)
++					return ret;
++			}
++
++			*last_old_dentry_offset = key.offset;
++			continue;
++		}
+ 		/*
+ 		 * We must make sure that when we log a directory entry, the
+ 		 * corresponding inode, after log replay, has a matching link
+@@ -3772,14 +3801,10 @@ static int process_dir_items_leaf(struct btrfs_trans_handle *trans,
+ 		 * resulting in -ENOTEMPTY errors.
+ 		 */
+ 		if (!ctx->log_new_dentries) {
+-			struct btrfs_dir_item *di;
+ 			struct btrfs_key di_key;
+ 
+-			di = btrfs_item_ptr(src, i, struct btrfs_dir_item);
+ 			btrfs_dir_item_key_to_cpu(src, di, &di_key);
+-			if ((btrfs_dir_transid(src, di) == trans->transid ||
+-			     btrfs_dir_type(src, di) == BTRFS_FT_DIR) &&
+-			    di_key.type != BTRFS_ROOT_ITEM_KEY)
++			if (di_key.type != BTRFS_ROOT_ITEM_KEY)
+ 				ctx->log_new_dentries = true;
+ 		}
+ 
+@@ -3860,7 +3885,7 @@ static noinline int log_dir_items(struct btrfs_trans_handle *trans,
+ 	struct btrfs_root *log = root->log_root;
+ 	int err = 0;
+ 	int ret;
+-	u64 first_offset = min_offset;
++	u64 last_old_dentry_offset = min_offset - 1;
+ 	u64 last_offset = (u64)-1;
+ 	u64 ino = btrfs_ino(inode);
+ 
+@@ -3894,10 +3919,11 @@ static noinline int log_dir_items(struct btrfs_trans_handle *trans,
+ 		 */
+ 		if (ret == 0) {
+ 			struct btrfs_key tmp;
++
+ 			btrfs_item_key_to_cpu(path->nodes[0], &tmp,
+ 					      path->slots[0]);
+ 			if (tmp.type == BTRFS_DIR_INDEX_KEY)
+-				first_offset = max(min_offset, tmp.offset) + 1;
++				last_old_dentry_offset = tmp.offset;
+ 		}
+ 		goto done;
+ 	}
+@@ -3917,7 +3943,7 @@ static noinline int log_dir_items(struct btrfs_trans_handle *trans,
+ 		 * previous key's offset plus 1, so that those deletes are replayed.
+ 		 */
+ 		if (tmp.type == BTRFS_DIR_INDEX_KEY)
+-			first_offset = tmp.offset + 1;
++			last_old_dentry_offset = tmp.offset;
+ 	}
+ 	btrfs_release_path(path);
+ 
+@@ -3939,7 +3965,8 @@ static noinline int log_dir_items(struct btrfs_trans_handle *trans,
+ 	 * from our directory
+ 	 */
+ 	while (1) {
+-		ret = process_dir_items_leaf(trans, inode, path, dst_path, ctx);
++		ret = process_dir_items_leaf(trans, inode, path, dst_path, ctx,
++					     &last_old_dentry_offset);
+ 		if (ret != 0) {
+ 			if (ret < 0)
+ 				err = ret;
+@@ -3990,13 +4017,21 @@ static noinline int log_dir_items(struct btrfs_trans_handle *trans,
+ 	if (err == 0) {
+ 		*last_offset_ret = last_offset;
+ 		/*
+-		 * insert the log range keys to indicate where the log
+-		 * is valid
++		 * In case the leaf was changed in the current transaction but
++		 * all its dir items are from a past transaction, the last item
++		 * in the leaf is a dir item and there's no gap between that last
++		 * dir item and the first one on the next leaf (which did not
++		 * change in the current transaction), then we don't need to log
++		 * a range, last_old_dentry_offset is == to last_offset.
+ 		 */
+-		ret = insert_dir_log_key(trans, log, path, ino, first_offset,
+-					 last_offset);
+-		if (ret)
+-			err = ret;
++		ASSERT(last_old_dentry_offset <= last_offset);
++		if (last_old_dentry_offset < last_offset) {
++			ret = insert_dir_log_key(trans, log, path, ino,
++						 last_old_dentry_offset + 1,
++						 last_offset);
++			if (ret)
++				err = ret;
++		}
+ 	}
+ 	return err;
+ }
+@@ -4038,7 +4073,7 @@ static noinline int log_directory_changes(struct btrfs_trans_handle *trans,
+ 	if (inode->logged_trans != trans->transid)
+ 		inode->last_dir_index_offset = (u64)-1;
+ 
+-	min_key = 0;
++	min_key = BTRFS_DIR_START_INDEX;
+ 	max_key = 0;
+ 	ctx->last_dir_item_offset = inode->last_dir_index_offset;
+ 
+@@ -5911,7 +5946,6 @@ static int log_new_dir_dentries(struct btrfs_trans_handle *trans,
+ 				struct btrfs_log_ctx *ctx)
+ {
+ 	struct btrfs_fs_info *fs_info = root->fs_info;
+-	struct btrfs_root *log = root->log_root;
+ 	struct btrfs_path *path;
+ 	LIST_HEAD(dir_list);
+ 	struct btrfs_dir_list *dir_elem;
+@@ -5953,7 +5987,7 @@ static int log_new_dir_dentries(struct btrfs_trans_handle *trans,
+ 		min_key.offset = 0;
+ again:
+ 		btrfs_release_path(path);
+-		ret = btrfs_search_forward(log, &min_key, path, trans->transid);
++		ret = btrfs_search_forward(root, &min_key, path, trans->transid);
+ 		if (ret < 0) {
+ 			goto next_dir_inode;
+ 		} else if (ret > 0) {
+@@ -5961,7 +5995,6 @@ static int log_new_dir_dentries(struct btrfs_trans_handle *trans,
+ 			goto next_dir_inode;
+ 		}
+ 
+-process_leaf:
+ 		leaf = path->nodes[0];
+ 		nritems = btrfs_header_nritems(leaf);
+ 		for (i = path->slots[0]; i < nritems; i++) {
+@@ -6018,16 +6051,6 @@ static int log_new_dir_dentries(struct btrfs_trans_handle *trans,
+ 			}
+ 			break;
+ 		}
+-		if (i == nritems) {
+-			ret = btrfs_next_leaf(log, path);
+-			if (ret < 0) {
+-				goto next_dir_inode;
+-			} else if (ret > 0) {
+-				ret = 0;
+-				goto next_dir_inode;
+-			}
+-			goto process_leaf;
+-		}
+ 		if (min_key.offset < (u64)-1) {
+ 			min_key.offset++;
+ 			goto again;
+-- 
+2.26.2
+
