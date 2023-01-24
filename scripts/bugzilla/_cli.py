@@ -29,7 +29,7 @@ import requests.exceptions
 import bugzilla
 
 
-DEFAULT_BZ = 'https://bugzilla.redhat.com'
+DEFAULT_BZ = 'https://apibugzilla.suse.com'
 
 format_field_re = re.compile("%{([a-z0-9_]+)(?::([^}]*))?}")
 
