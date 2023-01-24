@@ -275,6 +275,8 @@ def _setup_action_new_parser(subparsers):
         "Options that take multiple values accept comma separated lists, "
         "including --cc, --blocks, --dependson, --groups, and --keywords.")
     p = subparsers.add_parser("new", description=description)
+    p.add_argument('--no-refresh', action='store_true',
+                   help='Do not refresh bug after creating')
 
     _parser_add_bz_fields(p, "new")
     g = p.add_argument_group("'new' specific options")
@@ -479,9 +481,9 @@ def _do_query(bz, opt, parser):
             stat = ['ASSIGNED', 'ON_QA', 'FAILS_QA', 'PASSES_QA']
         elif val == 'EOL':
             # Alias for EndOfLife bug statuses
-            stat = ['VERIFIED', 'RELEASE_PENDING', 'CLOSED']
+            stat = ['VERIFIED', 'RELEASE_PENDING', 'RESOLVED']
         elif val == 'OPEN':
-            # non-Closed statuses
+            # non-RESOLVED statuses
             stat = ['NEW', 'ASSIGNED', 'MODIFIED', 'ON_DEV', 'ON_QA',
                 'VERIFIED', 'RELEASE_PENDING', 'POST']
         opt.status = stat
@@ -911,7 +913,8 @@ def _do_new(bz, opt, parser):
         _merge_field_opts(ret, opt.fields, parser)
 
     b = bz.createbug(ret)
-    b.refresh()
+    if not opt.no_refresh:
+        b.refresh()
     return [b]
 
 
@@ -938,7 +941,7 @@ def _do_modify(bz, parser, opt):
     if opt.dupeid is not None:
         opt.close = "DUPLICATE"
     if opt.close:
-        status = "CLOSED"
+        status = "RESOLVED"
 
     flags = []
     if opt.flag:

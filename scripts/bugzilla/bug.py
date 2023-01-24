@@ -178,7 +178,7 @@ class Bug(object):
         Update the status for this bug report.
         Commonly-used values are ASSIGNED, MODIFIED, and NEEDINFO.
 
-        To change bugs to CLOSED, use .close() instead.
+        To change bugs to RESOLVED, use .close() instead.
         """
         # Note: fedora bodhi uses this function
         vals = self.bugzilla.build_update(status=status,
@@ -210,7 +210,7 @@ class Bug(object):
                                           resolution=resolution,
                                           dupe_of=dupeid,
                                           fixed_in=fixedin,
-                                          status=str("CLOSED"))
+                                          status=str("RESOLVED"))
         log.debug("close: update=%s", vals)
 
         return self.bugzilla.update_bugs(self.bug_id, vals)
