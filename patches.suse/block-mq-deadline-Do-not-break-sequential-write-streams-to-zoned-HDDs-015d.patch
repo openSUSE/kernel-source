@@ -1,0 +1,168 @@
+From 015d02f48537cf2d1a65eeac50717566f9db6eec Mon Sep 17 00:00:00 2001
+From: Damien Le Moal <damien.lemoal@opensource.wdc.com>
+Date: Thu, 24 Nov 2022 11:12:08 +0900
+Subject: [PATCH] block: mq-deadline: Do not break sequential write streams to
+ zoned HDDs
+Git-commit: 015d02f48537cf2d1a65eeac50717566f9db6eec
+Patch-mainline: v6.2-rc1
+References: git-fixes
+
+mq-deadline ensures an in order dispatching of write requests to zoned
+block devices using a per zone lock (a bit). This implies that for any
+purely sequential write workload, the drive is exercised most of the
+time at a maximum queue depth of one.
+
+However, when such sequential write workload crosses a zone boundary
+(when sequentially writing multiple contiguous zones), zone write
+locking may prevent the last write to one zone to be issued (as the
+previous write is still being executed) but allow the first write to the
+following zone to be issued (as that zone is not yet being writen and
+not locked). This result in an out of order delivery of the sequential
+write commands to the device every time a zone boundary is crossed.
+
+While such behavior does not break the sequential write constraint of
+zoned block devices (and does not generate any write error), some zoned
+hard-disks react badly to seeing these out of order writes, resulting in
+lower write throughput.
+
+This problem can be addressed by always dispatching the first request
+of a stream of sequential write requests, regardless of the zones
+targeted by these sequential writes. To do so, the function
+deadline_skip_seq_writes() is introduced and used in
+deadline_next_request() to select the next write command to issue if the
+target device is an HDD (blk_queue_nonrot() being false).
+deadline_fifo_request() is modified using the new
+deadline_earlier_request() and deadline_is_seq_write() helpers to ignore
+requests in the fifo list that have a preceding request in lba order
+that is sequential.
+
+With this fix, a sequential write workload executed with the following
+fio command:
+
+fio  --name=seq-write --filename=/dev/sda --zonemode=zbd --direct=1 \
+     --size=68719476736  --ioengine=libaio --iodepth=32 --rw=write \
+     --bs=65536
+
+results in an increase from 225 MB/s to 250 MB/s of the write throughput
+of an SMR HDD (11% increase).
+
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Damien Le Moal <damien.lemoal@opensource.wdc.com>
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Link: https://lore.kernel.org/r/20221124021208.242541-3-damien.lemoal@opensource.wdc.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ block/mq-deadline.c | 66 ++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 62 insertions(+), 4 deletions(-)
+
+diff --git a/block/mq-deadline.c b/block/mq-deadline.c
+index 36374481cb87..6672f1bce379 100644
+--- a/block/mq-deadline.c
++++ b/block/mq-deadline.c
+@@ -130,6 +130,20 @@ static u8 dd_rq_ioclass(struct request *rq)
+ 	return IOPRIO_PRIO_CLASS(req_get_ioprio(rq));
+ }
+ 
++/*
++ * get the request before `rq' in sector-sorted order
++ */
++static inline struct request *
++deadline_earlier_request(struct request *rq)
++{
++	struct rb_node *node = rb_prev(&rq->rb_node);
++
++	if (node)
++		return rb_entry_rq(node);
++
++	return NULL;
++}
++
+ /*
+  * get the request after `rq' in sector-sorted order
+  */
+@@ -277,6 +291,39 @@ static inline int deadline_check_fifo(struct dd_per_prio *per_prio,
+ 	return 0;
+ }
+ 
++/*
++ * Check if rq has a sequential request preceding it.
++ */
++static bool deadline_is_seq_writes(struct deadline_data *dd, struct request *rq)
++{
++	struct request *prev = deadline_earlier_request(rq);
++
++	if (!prev)
++		return false;
++
++	return blk_rq_pos(prev) + blk_rq_sectors(prev) == blk_rq_pos(rq);
++}
++
++/*
++ * Skip all write requests that are sequential from @rq, even if we cross
++ * a zone boundary.
++ */
++static struct request *deadline_skip_seq_writes(struct deadline_data *dd,
++						struct request *rq)
++{
++	sector_t pos = blk_rq_pos(rq);
++	sector_t skipped_sectors = 0;
++
++	while (rq) {
++		if (blk_rq_pos(rq) != pos + skipped_sectors)
++			break;
++		skipped_sectors += blk_rq_sectors(rq);
++		rq = deadline_latter_request(rq);
++	}
++
++	return rq;
++}
++
+ /*
+  * For the specified data direction, return the next request to
+  * dispatch using arrival ordered lists.
+@@ -297,11 +344,16 @@ deadline_fifo_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
+ 
+ 	/*
+ 	 * Look for a write request that can be dispatched, that is one with
+-	 * an unlocked target zone.
++	 * an unlocked target zone. For some HDDs, breaking a sequential
++	 * write stream can lead to lower throughput, so make sure to preserve
++	 * sequential write streams, even if that stream crosses into the next
++	 * zones and these zones are unlocked.
+ 	 */
+ 	spin_lock_irqsave(&dd->zone_lock, flags);
+ 	list_for_each_entry(rq, &per_prio->fifo_list[DD_WRITE], queuelist) {
+-		if (blk_req_can_dispatch_to_zone(rq))
++		if (blk_req_can_dispatch_to_zone(rq) &&
++		    (blk_queue_nonrot(rq->q) ||
++		     !deadline_is_seq_writes(dd, rq)))
+ 			goto out;
+ 	}
+ 	rq = NULL;
+@@ -331,13 +383,19 @@ deadline_next_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
+ 
+ 	/*
+ 	 * Look for a write request that can be dispatched, that is one with
+-	 * an unlocked target zone.
++	 * an unlocked target zone. For some HDDs, breaking a sequential
++	 * write stream can lead to lower throughput, so make sure to preserve
++	 * sequential write streams, even if that stream crosses into the next
++	 * zones and these zones are unlocked.
+ 	 */
+ 	spin_lock_irqsave(&dd->zone_lock, flags);
+ 	while (rq) {
+ 		if (blk_req_can_dispatch_to_zone(rq))
+ 			break;
+-		rq = deadline_latter_request(rq);
++		if (blk_queue_nonrot(rq->q))
++			rq = deadline_latter_request(rq);
++		else
++			rq = deadline_skip_seq_writes(dd, rq);
+ 	}
+ 	spin_unlock_irqrestore(&dd->zone_lock, flags);
+ 
+-- 
+2.35.3
+
