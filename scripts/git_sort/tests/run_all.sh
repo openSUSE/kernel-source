@@ -6,7 +6,7 @@ for release in \
 	sle12-sp4 \
 	sle12-sp5 \
 	sle15 \
-	opensuse-15.3 \
+	opensuse-15.4 \
 	opensuse-tumbleweed \
 	; do
 	echo "Building container image for $release..."
