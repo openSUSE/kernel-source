@@ -11,8 +11,12 @@ for release in \
 	; do
 	echo "Building container image for $release..."
 	docker build -q -t gs-test-$release "$libdir/$release"
+	ret=$?
+	[ $ret -eq 0 ] || exit $?
 	echo "Running tests in $release:"
 	docker run --rm --name=gs-test-$release \
 		--mount type=bind,source="$libdir/../../",target=/scripts,readonly \
 		gs-test-$release
+	ret=$?
+	[ $ret -eq 0 ] || exit $?
 done
