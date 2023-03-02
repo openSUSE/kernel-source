@@ -1,5 +1,5 @@
 # https://hub.docker.com/r/opensuse/leap/
-FROM opensuse/leap:15.3 AS base
+FROM opensuse/leap:15.4 AS base
 
 RUN zypper -n ref
 
@@ -10,7 +10,9 @@ RUN zypper -n in git python3 python3-dbm rcs
 RUN git config --global user.email "you@example.com"
 RUN git config --global user.name "Your Name"
 
-RUN zypper -n ar -G https://download.opensuse.org/repositories/Kernel:/tools/openSUSE_Leap_15.3/Kernel:tools.repo
+COPY Kernel.gpg /tmp
+RUN rpmkeys --import /tmp/Kernel.gpg
+RUN zypper -n ar https://download.opensuse.org/repositories/Kernel:/tools/SLE_15_SP4/Kernel:tools.repo
 RUN zypper -n in python3-pygit2 quilt
 
 FROM packages
