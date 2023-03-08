@@ -66,7 +66,7 @@ sub calc_dirs
 		do {
 			$path =~ s{/[^/]+$}{};
 			$dirs{$path} = 1;
-		} while ($path ne $base);
+		} while ($path ne $base and $path ne "");
 		# This loop also makes sure that $base itself is included.
 	}
 
