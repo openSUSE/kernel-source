@@ -3,7 +3,7 @@ Date: Thu, 17 Feb 2022 15:10:54 +0100
 Subject: x86: remove cruft from <asm/dma-mapping.h>
 Git-commit: 3cb4503a330159dc5cf2f8382181ccbabbbaa5b2
 Patch-mainline: v5.19-rc1
-References: PED-3259
+References: jsc#PED-3259
 
 <asm/dma-mapping.h> gets pulled in by all drivers using the DMA API.
 Remove x86 internal variables and unnecessary includes from it.
