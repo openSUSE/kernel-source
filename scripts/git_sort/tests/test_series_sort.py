@@ -293,8 +293,8 @@ class TestFromPatch(unittest.TestCase):
         self.repo.remotes.create("rdma", self.rdma_repo)
         self.dledford_repo = k_org_canon_prefix + "dledford/rdma.git"
         self.repo.remotes.create("dledford/rdma", self.dledford_repo)
-        self.nf_repo = k_org_canon_prefix + "pablo/nf.git"
-        self.repo.remotes.create("pablo/nf", self.nf_repo)
+        self.nf_repo = k_org_canon_prefix + "netfilter/nf.git"
+        self.repo.remotes.create("netfilter/nf", self.nf_repo)
 
         self.commits = {}
         self.commits["mainline 0"] = self.repo.create_commit(
@@ -377,7 +377,7 @@ class TestFromPatch(unittest.TestCase):
             tree.write(),
             [self.commits["mainline 0"]]
         )
-        self.repo.references.create("refs/remotes/pablo/nf/master",
+        self.repo.references.create("refs/remotes/netfilter/nf/master",
                                     self.commits["nf 0"])
 
         self.commits["mainline 2"] = self.repo.create_commit(
@@ -822,13 +822,13 @@ class TestFromPatch(unittest.TestCase):
 
         with open("series.conf", mode="w") as f:
             f.write(tests.support.format_series((
-                ("pablo/nf-next", (
+                ("netfilter/nf-next", (
                     name,
                 )),
             )))
 
         series2 = tests.support.format_series((
-            ("pablo/nf", (
+            ("netfilter/nf", (
                 name,
             )),
         ))
@@ -838,9 +838,9 @@ class TestFromPatch(unittest.TestCase):
 
     def test_found_notindexed_upstream_bad2_moveupstream(self):
         """
-        patch sorted in pablo nf-next (not fetched), commit found in pablo nf,
+        patch sorted in netfilter nf-next (not fetched), commit found in netfilter nf,
         git-repo tag is bad
-            moves to pablo nf
+            moves to netfilter nf
             tag is NOT updated
 
         This is a special case. See the log of commit 0ac6457e94e8
@@ -854,7 +854,7 @@ class TestFromPatch(unittest.TestCase):
 
     def test_found_notindexed_upstream_bad2_nomoveupstream(self):
         """
-        patch sorted in pablo nf-next (not fetched), commit found in pablo nf,
+        patch sorted in netfilter nf-next (not fetched), commit found in netfilter nf,
         git-repo tag is bad
             error, possible causes:
                 section is wrong or Git-repo is wrong
