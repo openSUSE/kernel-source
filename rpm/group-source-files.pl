@@ -1,5 +1,6 @@
 #!/usr/bin/perl
 
+use File::Spec;
 use Getopt::Long;
 use strict;
 
@@ -20,7 +21,12 @@ sub main
 
 sub scan
 {
-	my $loc = shift @_;
+	# Normalize file path, mainly to strip away the ending forward slash,
+	# or any double forward slashes.
+	my $loc = File::Spec->canonpath(shift @_);
+	# We cannot use an absolute path (e.g. /usr/src/linux-5.14.21-150500.41)
+	# during find because it's under build root, but rpm wants one later.
+	my $abs_loc = rpm_path($loc);
 	my(@dev, @ndev);
 
 	foreach $_ (`find "$loc"`)
@@ -43,16 +49,12 @@ sub scan
 			m{^\Q$loc\E/arch/[^/]+/tools\b} ||
 			m{^\Q$loc\E/include/[^/]+\b} ||
 			m{^\Q$loc\E/scripts\b};
-		if (substr($_, 0, 1) ne "/") {
-			# We cannot use an absolute path during find,
-			# but rpm wants one later.
-			$_ = "/$_";
-		}
-		$is_devel ? push(@dev, $_) : push(@ndev, $_);
+		my $abs_path = rpm_path($_);
+		$is_devel ? push(@dev, $abs_path) : push(@ndev, $abs_path);
 	}
 
-	push(@dev, &calc_dirs("/$loc", \@dev));
-	push(@ndev, &calc_dirs("/$loc", \@ndev));
+	push(@dev, &calc_dirs($abs_loc, \@dev));
+	push(@ndev, &calc_dirs($abs_loc, \@ndev));
 	return (\@dev, \@ndev);
 }
 
@@ -62,11 +64,14 @@ sub calc_dirs
 	my %dirs;
 
 	foreach my $file (@$files) {
-		my $path = $file;
+		my ($volume,$path,$basename) = File::Spec->splitpath($file);
+		my @dirs = File::Spec->splitdir($path);
 		do {
-			$path =~ s{/[^/]+$}{};
+			# Always create $path from catdir() to avoid ending forward slash
+			$path = File::Spec->catdir(@dirs);
 			$dirs{$path} = 1;
-		} while ($path ne $base and $path ne "");
+			pop @dirs;
+		} while ($path ne $base);
 		# This loop also makes sure that $base itself is included.
 	}
 
@@ -85,4 +90,12 @@ sub output
 	open(FH, "> $ndev_out") || warn "Error writing to $ndev_out: $!";
 	print FH join("\n", @$ndev), "\n";
 	close FH;
+}
+
+sub rpm_path
+{
+	my $path = shift @_;
+	# Always prepend forward slash and let canonpath take care of
+	# duplicate forward slashes.
+	return File::Spec->canonpath("/$path");
 }
