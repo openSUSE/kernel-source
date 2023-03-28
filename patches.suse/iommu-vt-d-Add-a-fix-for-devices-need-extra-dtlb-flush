@@ -1,0 +1,184 @@
+From: Jacob Pan <jacob.jun.pan@linux.intel.com>
+Date: Thu, 1 Dec 2022 12:01:24 +0800
+Subject: iommu/vt-d: Add a fix for devices need extra dtlb flush
+Git-commit: e65a6897be5e4939d477c4969a05e12d90b08409
+Patch-mainline: v6.1-rc8
+References: bsc#1208219
+
+QAT devices on Intel Sapphire Rapids and Emerald Rapids have a defect in
+address translation service (ATS). These devices may inadvertently issue
+ATS invalidation completion before posted writes initiated with
+translated address that utilized translations matching the invalidation
+address range, violating the invalidation completion ordering.
+
+This patch adds an extra device TLB invalidation for the affected devices,
+it is needed to ensure no more posted writes with translated address
+following the invalidation completion. Therefore, the ordering is
+preserved and data-corruption is prevented.
+
+Device TLBs are invalidated under the following six conditions:
+1. Device driver does DMA API unmap IOVA
+2. Device driver unbind a PASID from a process, sva_unbind_device()
+3. PASID is torn down, after PASID cache is flushed. e.g. process
+exit_mmap() due to crash
+4. Under SVA usage, called by mmu_notifier.invalidate_range() where
+VM has to free pages that were unmapped
+5. userspace driver unmaps a DMA buffer
+6. Cache invalidation in vSVA usage (upcoming)
+
+For #1 and #2, device drivers are responsible for stopping DMA traffic
+before unmap/unbind. For #3, iommu driver gets mmu_notifier to
+invalidate TLB the same way as normal user unmap which will do an extra
+invalidation. The dTLB invalidation after PASID cache flush does not
+need an extra invalidation.
+
+Therefore, we only need to deal with #4 and #5 in this patch. #1 is also
+covered by this patch due to common code path with #5.
+
+Tested-by: Yuzhang Luo <yuzhang.luo@intel.com>
+Reviewed-by: Ashok Raj <ashok.raj@intel.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Signed-off-by: Jacob Pan <jacob.jun.pan@linux.intel.com>
+Link: https://lore.kernel.org/r/20221130062449.1360063-1-jacob.jun.pan@linux.intel.com
+Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+Signed-off-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/iommu/intel/iommu.c |   69 ++++++++++++++++++++++++++++++++++++++++++--
+ drivers/iommu/intel/iommu.h |    4 ++
+ drivers/iommu/intel/svm.c   |    5 ++-
+ 3 files changed, 75 insertions(+), 3 deletions(-)
+
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@ -1389,6 +1389,24 @@ static void domain_update_iotlb(struct d
+ 	spin_unlock_irqrestore(&domain->lock, flags);
+ }
+ 
++/*
++ * The extra devTLB flush quirk impacts those QAT devices with PCI device
++ * IDs ranging from 0x4940 to 0x4943. It is exempted from risky_device()
++ * check because it applies only to the built-in QAT devices and it doesn't
++ * grant additional privileges.
++ */
++#define BUGGY_QAT_DEVID_MASK 0x494c
++static bool dev_needs_extra_dtlb_flush(struct pci_dev *pdev)
++{
++	if (pdev->vendor != PCI_VENDOR_ID_INTEL)
++		return false;
++
++	if ((pdev->device & 0xfffc) != BUGGY_QAT_DEVID_MASK)
++		return false;
++
++	return true;
++}
++
+ static void iommu_enable_dev_iotlb(struct device_domain_info *info)
+ {
+ 	struct pci_dev *pdev;
+@@ -1472,6 +1490,7 @@ static void __iommu_flush_dev_iotlb(stru
+ 	qdep = info->ats_qdep;
+ 	qi_flush_dev_iotlb(info->iommu, sid, info->pfsid,
+ 			   qdep, addr, mask);
++	quirk_extra_dev_tlb_flush(info, addr, mask, PASID_RID2PASID, qdep);
+ }
+ 
+ static void iommu_flush_dev_iotlb(struct dmar_domain *domain,
+@@ -4479,9 +4498,10 @@ static struct iommu_device *intel_iommu_
+ 	if (dev_is_pci(dev)) {
+ 		if (ecap_dev_iotlb_support(iommu->ecap) &&
+ 		    pci_ats_supported(pdev) &&
+-		    dmar_ats_supported(pdev, iommu))
++		    dmar_ats_supported(pdev, iommu)) {
+ 			info->ats_supported = 1;
+-
++			info->dtlb_extra_inval = dev_needs_extra_dtlb_flush(pdev);
++		}
+ 		if (sm_supported(iommu)) {
+ 			if (pasid_supported(iommu)) {
+ 				int features = pci_pasid_features(pdev);
+@@ -4967,3 +4987,48 @@ static void __init check_tylersburg_isoc
+ 	pr_warn("Recommended TLB entries for ISOCH unit is 16; your BIOS set %d\n",
+ 	       vtisochctrl);
+ }
++
++/*
++ * Here we deal with a device TLB defect where device may inadvertently issue ATS
++ * invalidation completion before posted writes initiated with translated address
++ * that utilized translations matching the invalidation address range, violating
++ * the invalidation completion ordering.
++ * Therefore, any use cases that cannot guarantee DMA is stopped before unmap is
++ * vulnerable to this defect. In other words, any dTLB invalidation initiated not
++ * under the control of the trusted/privileged host device driver must use this
++ * quirk.
++ * Device TLBs are invalidated under the following six conditions:
++ * 1. Device driver does DMA API unmap IOVA
++ * 2. Device driver unbind a PASID from a process, sva_unbind_device()
++ * 3. PASID is torn down, after PASID cache is flushed. e.g. process
++ *    exit_mmap() due to crash
++ * 4. Under SVA usage, called by mmu_notifier.invalidate_range() where
++ *    VM has to free pages that were unmapped
++ * 5. Userspace driver unmaps a DMA buffer
++ * 6. Cache invalidation in vSVA usage (upcoming)
++ *
++ * For #1 and #2, device drivers are responsible for stopping DMA traffic
++ * before unmap/unbind. For #3, iommu driver gets mmu_notifier to
++ * invalidate TLB the same way as normal user unmap which will use this quirk.
++ * The dTLB invalidation after PASID cache flush does not need this quirk.
++ *
++ * As a reminder, #6 will *NEED* this quirk as we enable nested translation.
++ */
++void quirk_extra_dev_tlb_flush(struct device_domain_info *info,
++			       unsigned long address, unsigned long mask,
++			       u32 pasid, u16 qdep)
++{
++	u16 sid;
++
++	if (likely(!info->dtlb_extra_inval))
++		return;
++
++	sid = PCI_DEVID(info->bus, info->devfn);
++	if (pasid == PASID_RID2PASID) {
++		qi_flush_dev_iotlb(info->iommu, sid, info->pfsid,
++				   qdep, address, mask);
++	} else {
++		qi_flush_dev_iotlb_pasid(info->iommu, sid, info->pfsid,
++					 pasid, qdep, address, mask);
++	}
++}
+--- a/drivers/iommu/intel/iommu.h
++++ b/drivers/iommu/intel/iommu.h
+@@ -620,6 +620,7 @@ struct device_domain_info {
+ 	u8 pri_enabled:1;
+ 	u8 ats_supported:1;
+ 	u8 ats_enabled:1;
++	u8 dtlb_extra_inval:1;	/* Quirk for devices need extra flush */
+ 	u8 ats_qdep;
+ 	struct device *dev; /* it's NULL for PCIe-to-PCI bridge */
+ 	struct intel_iommu *iommu; /* IOMMU used by this device */
+@@ -725,6 +726,9 @@ void qi_flush_piotlb(struct intel_iommu
+ void qi_flush_dev_iotlb_pasid(struct intel_iommu *iommu, u16 sid, u16 pfsid,
+ 			      u32 pasid, u16 qdep, u64 addr,
+ 			      unsigned int size_order);
++void quirk_extra_dev_tlb_flush(struct device_domain_info *info,
++			       unsigned long address, unsigned long pages,
++			       u32 pasid, u16 qdep);
+ void qi_flush_pasid_cache(struct intel_iommu *iommu, u16 did, u64 granu,
+ 			  u32 pasid);
+ 
+--- a/drivers/iommu/intel/svm.c
++++ b/drivers/iommu/intel/svm.c
+@@ -201,10 +201,13 @@ static void __flush_svm_range_dev(struct
+ 		return;
+ 
+ 	qi_flush_piotlb(sdev->iommu, sdev->did, svm->pasid, address, pages, ih);
+-	if (info->ats_enabled)
++	if (info->ats_enabled) {
+ 		qi_flush_dev_iotlb_pasid(sdev->iommu, sdev->sid, info->pfsid,
+ 					 svm->pasid, sdev->qdep, address,
+ 					 order_base_2(pages));
++		quirk_extra_dev_tlb_flush(info, address, order_base_2(pages),
++					  svm->pasid, sdev->qdep);
++	}
+ }
+ 
+ static void intel_flush_svm_range_dev(struct intel_svm *svm,
