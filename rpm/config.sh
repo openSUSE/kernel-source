@@ -1,9 +1,9 @@
 # The version of the main tarball to use
 SRCVERSION=6.3-rc5-5-g148341f0a2f5
 # variant of the kernel-source package, either empty or "-rt"
-VARIANT=
-# Set to 1 if the tree does not contain any non-vanilla patches at all
-VANILLA_ONLY=1
+VARIANT=-vanilla
+# Set to 1 to use the variant kernel for kernel-obs-build
+OBS_BUILD_VARIANT=1
 # enable kernel module compression
 COMPRESS_MODULES="xz"
 # Compile binary devicetrees on master and stable branches.
