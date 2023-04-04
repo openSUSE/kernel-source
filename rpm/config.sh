@@ -8,8 +8,6 @@ COMPRESS_MODULES="zstd"
 LIVEPATCH=livepatch
 # Enable livepatching related packages on -rt variant
 LIVEPATCH_RT=1
-# Compile binary devicetrees for Leap
-BUILD_DTBS="Yes"
 # buildservice projects to build the kernel against
 OBS_PROJECT=SUSE:SLE-15-SP5:Update
 OBS_PROJECT_ARM=openSUSE:Step:15-SP5
