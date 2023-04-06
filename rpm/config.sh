@@ -6,8 +6,8 @@ VARIANT=-rt
 COMPRESS_MODULES="zstd"
 # Use new style livepatch package names
 LIVEPATCH=livepatch
-# Compile binary devicetrees for Leap
-BUILD_DTBS="Yes"
+# Enable livepatching related packages on -rt variant
+LIVEPATCH_RT=1
 # buildservice projects to build the kernel against
 OBS_PROJECT=SUSE:SLE-15-SP5:Update
 OBS_PROJECT_ARM=openSUSE:Step:15-SP5
