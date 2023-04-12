@@ -191,7 +191,7 @@ CLEANFILES=()
 trap 'if test -n "$CLEANFILES"; then rm -rf "${CLEANFILES[@]}"; fi' EXIT
 tmpdir=$(mktemp -dt ${0##*/}.XXXXXX)
 CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
-rpmfiles=$(ls rpm/* | grep -v "~$")
+rpmfiles=$(ls -d rpm/* | grep -v -e "~$" -e "[.]orig$" -e "[.]rej$" | { while read x ; do [ -d "$x" ] || echo "$x" ; done ; } )
 rpmstatus=$(for i in $rpmfiles ; do git status -s $i ; done)
 [ -z "$rpmstatus" ] || { inconsistent=true ; echo "$rpmstatus" ; }
 
