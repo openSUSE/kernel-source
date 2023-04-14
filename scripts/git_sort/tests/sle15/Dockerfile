@@ -1,5 +1,5 @@
 # http://registry.suse.de/
-FROM registry.suse.de/suse/containers/sle-server/15/containers/bci/python:3.6 AS base
+FROM registry.suse.de/suse/sle-15/update/images/suse/sle15:latest AS base
 
 RUN rpm -e container-suseconnect
 RUN zypper -n ar http://download.suse.de/ibs/SUSE:/SLE-15:/GA/standard/SUSE:SLE-15:GA.repo
