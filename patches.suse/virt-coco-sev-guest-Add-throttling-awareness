@@ -1,0 +1,144 @@
+From: Dionna Glaze <dionnaglaze@google.com>
+Date: Thu, 16 Feb 2023 11:08:02 +0100
+Subject: virt/coco/sev-guest: Add throttling awareness
+Git-commit: 72f7754dcf31c87c92c0c353dcf747814cc5ce10
+Patch-mainline: v6.3-rc3
+References: bsc#1209927
+
+A potentially malicious SEV guest can constantly hammer the hypervisor
+using this driver to send down requests and thus prevent or at least
+considerably hinder other guests from issuing requests to the secure
+processor which is a shared platform resource.
+
+Therefore, the host is permitted and encouraged to throttle such guest
+requests.
+
+Add the capability to handle the case when the hypervisor throttles
+excessive numbers of requests issued by the guest. Otherwise, the VM
+platform communication key will be disabled, preventing the guest from
+attesting itself.
+
+Realistically speaking, a well-behaved guest should not even care about
+throttling. During its lifetime, it would end up issuing a handful of
+requests which the hardware can easily handle.
+
+This is more to address the case of a malicious guest. Such guest should
+get throttled and if its VMPCK gets disabled, then that's its own
+wrongdoing and perhaps that guest even deserves it.
+
+To the implementation: the hypervisor signals with SNP_GUEST_REQ_ERR_BUSY
+that the guest requests should be throttled. That error code is returned
+in the upper 32-bit half of exitinfo2 and this is part of the GHCB spec
+v2.
+
+So the guest is given a throttling period of 1 minute in which it
+retries the request every 2 seconds. This is a good default but if it
+turns out to not pan out in practice, it can be tweaked later.
+
+For safety, since the encryption algorithm in GHCBv2 is AES_GCM, control
+must remain in the kernel to complete the request with the current
+sequence number. Returning without finishing the request allows the
+guest to make another request but with different message contents. This
+is IV reuse, and breaks cryptographic protections.
+
+  [ bp:
+    - Rewrite commit message and do a simplified version.
+    - The stable tags are supposed to denote that a cleanup should go
+      upfront before backporting this so that any future fixes to this
+      can preserve the sanity of the backporter(s). ]
+
+Fixes: d5af44dde546 ("x86/sev: Provide support for SNP guest request NAEs")
+Signed-off-by: Dionna Glaze <dionnaglaze@google.com>
+Co-developed-by: Borislav Petkov (AMD) <bp@alien8.de>
+Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Reviewed-by: Tom Lendacky <thomas.lendacky@amd.com>
+Cc: <stable@kernel.org> # d6fd48eff750 ("virt/coco/sev-guest: Check SEV_SNP attribute at probe time")
+Cc: <stable@kernel.org> # 970ab823743f (" virt/coco/sev-guest: Simplify extended guest request handling")
+Cc: <stable@kernel.org> # c5a338274bdb ("virt/coco/sev-guest: Remove the disable_vmpck label in handle_guest_request()")
+Cc: <stable@kernel.org> # 0fdb6cc7c89c ("virt/coco/sev-guest: Carve out the request issuing logic into a helper")
+Cc: <stable@kernel.org> # d25bae7dc7b0 ("virt/coco/sev-guest: Do some code style cleanups")
+Cc: <stable@kernel.org> # fa4ae42cc60a ("virt/coco/sev-guest: Convert the sw_exit_info_2 checking to a switch-case")
+Link: https://lore.kernel.org/r/20230214164638.1189804-2-dionnaglaze@google.com
+
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ arch/x86/include/asm/sev-common.h       |  3 ++-
+ arch/x86/kernel/sev.c                   |  4 ++++
+ drivers/virt/coco/sev-guest/sev-guest.c | 19 ++++++++++++++++++-
+ 3 files changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/include/asm/sev-common.h b/arch/x86/include/asm/sev-common.h
+index b8357d6ecd47..b63be696b776 100644
+--- a/arch/x86/include/asm/sev-common.h
++++ b/arch/x86/include/asm/sev-common.h
+@@ -128,8 +128,9 @@ struct snp_psc_desc {
+ 	struct psc_entry entries[VMGEXIT_PSC_MAX_ENTRY];
+ } __packed;
+ 
+-/* Guest message request error code */
++/* Guest message request error codes */
+ #define SNP_GUEST_REQ_INVALID_LEN	BIT_ULL(32)
++#define SNP_GUEST_REQ_ERR_BUSY		BIT_ULL(33)
+ 
+ #define GHCB_MSR_TERM_REQ		0x100
+ #define GHCB_MSR_TERM_REASON_SET_POS	12
+diff --git a/arch/x86/kernel/sev.c b/arch/x86/kernel/sev.c
+index d67884fb38c1..3f664ab277c4 100644
+--- a/arch/x86/kernel/sev.c
++++ b/arch/x86/kernel/sev.c
+@@ -2214,6 +2214,10 @@ int snp_issue_guest_request(u64 exit_code, struct snp_req_data *input, unsigned
+ 	case 0:
+ 		break;
+ 
++	case SNP_GUEST_REQ_ERR_BUSY:
++		ret = -EAGAIN;
++		break;
++
+ 	case SNP_GUEST_REQ_INVALID_LEN:
+ 		/* Number of expected pages are returned in RBX */
+ 		if (exit_code == SVM_VMGEXIT_EXT_GUEST_REQUEST) {
+diff --git a/drivers/virt/coco/sev-guest/sev-guest.c b/drivers/virt/coco/sev-guest/sev-guest.c
+index 81a53c31ff46..46f1a8d558b0 100644
+--- a/drivers/virt/coco/sev-guest/sev-guest.c
++++ b/drivers/virt/coco/sev-guest/sev-guest.c
+@@ -31,6 +31,9 @@
+ #define AAD_LEN		48
+ #define MSG_HDR_VER	1
+ 
++#define SNP_REQ_MAX_RETRY_DURATION	(60*HZ)
++#define SNP_REQ_RETRY_DELAY		(2*HZ)
++
+ struct snp_guest_crypto {
+ 	struct crypto_aead *tfm;
+ 	u8 *iv, *authtag;
+@@ -320,7 +323,8 @@ static int enc_payload(struct snp_guest_dev *snp_dev, u64 seqno, int version, u8
+ 
+ static int __handle_guest_request(struct snp_guest_dev *snp_dev, u64 exit_code, __u64 *fw_err)
+ {
+-	unsigned long err, override_err = 0;
++	unsigned long err = 0xff, override_err = 0;
++	unsigned long req_start = jiffies;
+ 	unsigned int override_npages = 0;
+ 	int rc;
+ 
+@@ -360,6 +364,19 @@ static int __handle_guest_request(struct snp_guest_dev *snp_dev, u64 exit_code,
+ 		 * user as an ioctl() return code.
+ 		 */
+ 		goto retry_request;
++
++	/*
++	 * The host may return SNP_GUEST_REQ_ERR_EBUSY if the request has been
++	 * throttled. Retry in the driver to avoid returning and reusing the
++	 * message sequence number on a different message.
++	 */
++	case -EAGAIN:
++		if (jiffies - req_start > SNP_REQ_MAX_RETRY_DURATION) {
++			rc = -ETIMEDOUT;
++			break;
++		}
++		schedule_timeout_killable(SNP_REQ_RETRY_DELAY);
++		goto retry_request;
+ 	}
+ 
+ 	/*
+
