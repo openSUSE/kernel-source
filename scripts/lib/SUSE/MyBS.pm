@@ -489,7 +489,10 @@ sub get_repo_archs {
 			$self->{has_match} = 0;
 		}
 		if ($element eq "arch" && $self->{has_match}) {
-			push(@{$self->{res}{$self->{repo_name}}}, $self->{cur_string});
+			# i586 in openSUSE:Factory is excluded from builds
+			if ($project ne 'openSUSE:Factory' || $self->{cur_string} ne 'i586') {
+				push(@{$self->{res}{$self->{repo_name}}}, $self->{cur_string});
+			}
 			$self->{cur_string} = "";
 		}
 	};
