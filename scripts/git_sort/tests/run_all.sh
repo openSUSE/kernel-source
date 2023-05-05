@@ -34,11 +34,11 @@ for release in \
 	echo "Building container image for $release..."
 	docker build "$@" -t gs-test-$release -f $testdir/Docker/$release.Dockerfile --build-arg release=$release $testdir/Docker
 	ret=$?
-	[ $ret -eq 0 ] || exit $?
+	[ $ret -eq 0 ] || exit $ret
 	echo "Running tests in $release:"
 	docker run --rm --name=gs-test-$release \
 		--mount type=bind,source="$testdir/../../",target=/scripts,readonly \
 		gs-test-$release
 	ret=$?
-	[ $ret -eq 0 ] || exit $?
+	[ $ret -eq 0 ] || exit $ret
 done
