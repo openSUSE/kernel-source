@@ -1,5 +1,5 @@
 # The version of the main tarball to use
-SRCVERSION=6.2
+SRCVERSION=6.3
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=
 # enable kernel module compression
@@ -12,6 +12,7 @@ LIVEPATCH=livepatch
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:Factory
 OBS_PROJECT_ARM=openSUSE:Factory:ARM
+OBS_PROJECT_LEGACYX86=openSUSE:Factory:LegacyX86
 OBS_PROJECT_PPC=openSUSE:Factory:PowerPC
 OBS_PROJECT_RISCV=openSUSE:Factory:RISCV
 OBS_PROJECT_S390=openSUSE:Factory:zSystems
