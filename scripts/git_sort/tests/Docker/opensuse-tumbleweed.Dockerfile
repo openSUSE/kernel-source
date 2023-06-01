@@ -12,7 +12,7 @@ RUN git config --global user.name "Your Name"
 
 COPY Kernel.gpg /tmp
 RUN rpmkeys --import /tmp/Kernel.gpg
-RUN zypper -n ar https://download.opensuse.org/repositories/Kernel:/tools/openSUSE_Factory/Kernel:tools.repo
+RUN zypper -n ar -f https://download.opensuse.org/repositories/Kernel:/tools/openSUSE_Factory/Kernel:tools.repo
 RUN zypper -n in --from Kernel_tools quilt
 
 FROM packages
