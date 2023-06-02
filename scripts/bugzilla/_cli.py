@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 #
 # bugzilla - a commandline frontend for the python bugzilla module
 #
@@ -6,39 +6,30 @@
 # Author: Will Woods <wwoods@redhat.com>
 # Author: Cole Robinson <crobinso@redhat.com>
 #
-# This program is free software; you can redistribute it and/or modify it
-# under the terms of the GNU General Public License as published by the
-# Free Software Foundation; either version 2 of the License, or (at your
-# option) any later version.  See http://www.gnu.org/copyleft/gpl.html for
-# the full text of the license.
+# This work is licensed under the GNU GPLv2 or later.
+# See the COPYING file in the top-level directory.
 
-from __future__ import print_function
-
+import argparse
+import base64
+import datetime
+import errno
+import json
 import locale
 from logging import getLogger, DEBUG, INFO, WARN, StreamHandler, Formatter
-import argparse
 import os
 import re
 import socket
 import sys
 import tempfile
-
-# pylint: disable=import-error
-if sys.version_info[0] >= 3:
-    # pylint: disable=no-name-in-module,redefined-builtin
-    from xmlrpc.client import Fault, ProtocolError
-    from urllib.parse import urlparse
-    basestring = (str, bytes)
-else:
-    from xmlrpclib import Fault, ProtocolError
-    from urlparse import urlparse
-# pylint: enable=import-error
+import urllib.parse
+import xmlrpc.client
 
 import requests.exceptions
 
 import bugzilla
 
-DEFAULT_BZ = 'https://apibugzilla.suse.com/xmlrpc.cgi'
+
+DEFAULT_BZ = 'https://apibugzilla.suse.com'
 
 format_field_re = re.compile("%{([a-z0-9_]+)(?::([^}]*))?}")
 
@@ -49,33 +40,15 @@ log = getLogger(bugzilla.__name__)
 # Util helpers #
 ################
 
-def _is_unittest():
-    return bool(os.getenv("__BUGZILLA_UNITTEST"))
-
-
 def _is_unittest_debug():
     return bool(os.getenv("__BUGZILLA_UNITTEST_DEBUG"))
 
 
-def to_encoding(ustring):
-    string = ''
-    if isinstance(ustring, basestring):
-        string = ustring
-    elif ustring is not None:
-        string = str(ustring)
-
-    if sys.version_info[0] >= 3:
-        return string
-
-    preferred = locale.getpreferredencoding()
-    if _is_unittest():
-        preferred = "UTF-8"
-    return string.encode(preferred, 'replace')
-
-
 def open_without_clobber(name, *args):
-    '''Try to open the given file with the given mode; if that filename exists,
-    try "name.1", "name.2", etc. until we find an unused filename.'''
+    """
+    Try to open the given file with the given mode; if that filename exists,
+    try "name.1", "name.2", etc. until we find an unused filename.
+    """
     fd = None
     count = 1
     orig_name = name
@@ -83,29 +56,15 @@ def open_without_clobber(name, *args):
         try:
             fd = os.open(name, os.O_CREAT | os.O_EXCL, 0o666)
         except OSError as err:
-            if err.errno == os.errno.EEXIST:
+            if err.errno == errno.EEXIST:
                 name = "%s.%i" % (orig_name, count)
                 count += 1
-            else:
-                raise IOError(err.errno, err.strerror, err.filename)
+            else:  # pragma: no cover
+                raise IOError(err.errno, err.strerror, err.filename) from None
     fobj = open(name, *args)
     if fd != fobj.fileno():
         os.close(fd)
     return fobj
-
-
-def get_default_url():
-    """
-    Grab a default URL from bugzillarc [DEFAULT] url=X
-    """
-    from bugzilla.base import _open_bugzillarc
-    cfg = _open_bugzillarc()
-    if cfg:
-        cfgurl = cfg.defaults().get("url", None)
-        if cfgurl is not None:
-            log.debug("bugzillarc: found cli url=%s", cfgurl)
-            return cfgurl
-    return DEFAULT_BZ
 
 
 def setup_logging(debug, verbose):
@@ -123,7 +82,7 @@ def setup_logging(debug, verbose):
         log.setLevel(WARN)
 
     if _is_unittest_debug():
-        log.setLevel(DEBUG)
+        log.setLevel(DEBUG)  # pragma: no cover
 
 
 ##################
@@ -134,11 +93,13 @@ def _setup_root_parser():
     epilog = 'Try "bugzilla COMMAND --help" for command-specific help.'
     p = argparse.ArgumentParser(epilog=epilog)
 
-    default_url = get_default_url()
+    default_url = bugzilla.Bugzilla.get_rcfile_default_url()
+    if not default_url:
+        default_url = DEFAULT_BZ
 
     # General bugzilla connection options
     p.add_argument('--bugzilla', default=default_url,
-            help="bugzilla XMLRPC URI. default: %s" % default_url)
+            help="bugzilla URI. default: %s" % default_url)
     p.add_argument("--nosslverify", dest="sslverify",
                  action="store_false", default=True,
                  help="Don't error on invalid bugzilla SSL certificate")
@@ -150,6 +111,9 @@ def _setup_root_parser():
              'specified command.')
     p.add_argument('--username', help="Log in with this username")
     p.add_argument('--password', help="Log in with this password")
+    p.add_argument('--restrict-login', action="store_true",
+                   help="The session (login token) will be restricted to "
+                        "the current IP address.")
 
     p.add_argument('--ensure-logged-in', action="store_true",
         help="Raise an error if we aren't logged in to bugzilla. "
@@ -161,8 +125,7 @@ def _setup_root_parser():
         help="Don't save any bugzilla cookies or tokens to disk, and "
              "don't use any pre-existing credentials.")
 
-    p.add_argument('--cookiefile', default=None,
-            help="cookie file to use for bugzilla authentication")
+    p.add_argument('--cookiefile', default=None, help=argparse.SUPPRESS)
     p.add_argument('--tokenfile', default=None,
             help="token file to use for bugzilla authentication")
 
@@ -195,8 +158,26 @@ def _parser_add_output_options(p):
     outg.add_argument('--oneline', action='store_const', dest='output',
             const='oneline',
             help="one line summary of the bug (useful for scripts)")
+    outg.add_argument('--json', action='store_const', dest='output',
+            const='json', help="output contents in json format")
+    outg.add_argument("--includefield", action="append",
+            help="Pass the field name to bugzilla include_fields list. "
+                 "Only the fields passed to include_fields are returned "
+                 "by the bugzilla server. "
+                 "This can be specified multiple times.")
+    outg.add_argument("--extrafield", action="append",
+            help="Pass the field name to bugzilla extra_fields list. "
+                 "When used with --json this can be used to request "
+                 "bugzilla to return values for non-default fields. "
+                 "This can be specified multiple times.")
+    outg.add_argument("--excludefield", action="append",
+            help="Pass the field name to bugzilla exclude_fields list. "
+                 "When used with --json this can be used to request "
+                 "bugzilla to not return values for a field. "
+                 "This can be specified multiple times.")
     outg.add_argument('--raw', action='store_const', dest='output',
-            const='raw', help="raw output of the bugzilla contents")
+            const='raw', help="raw output of the bugzilla contents. This "
+            "format is unstable and difficult to parse. Use --json instead.")
     outg.add_argument('--outputformat',
             help="Print output in the form given. "
                  "You can use RPM-style tags that match bug "
@@ -250,6 +231,10 @@ def _parser_add_bz_fields(rootp, command):
     p.add_argument('--cc', action="append", help="CC list")
     p.add_argument('-a', '--assigned_to', '--assignee', help="Bug assignee")
     p.add_argument('-q', '--qa_contact', help='QA contact')
+    if cmd_modify:
+        p.add_argument("--minor-update", action="store_true",
+                help="Request bugzilla to not send any "
+                     "email about this change")
 
     if not cmd_new:
         p.add_argument('-f', '--flag', action='append',
@@ -274,14 +259,10 @@ def _parser_add_bz_fields(rootp, command):
     # Put this at the end, so it sticks out more
     p.add_argument('--field',
         metavar="FIELD=VALUE", action="append", dest="fields",
-        help="Manually specify a bugzilla XMLRPC field. FIELD is "
-        "the raw name used by the bugzilla instance. For example if your "
+        help="Manually specify a bugzilla API field. FIELD is "
+        "the raw name used by the bugzilla instance. For example, if your "
         "bugzilla instance has a custom field cf_my_field, do:\n"
         "  --field cf_my_field=VALUE")
-
-    # Used by unit tests, not for end user consumption
-    p.add_argument('--__test-return-result', action="store_true",
-        dest="test_return_result", help=argparse.SUPPRESS)
 
     if not cmd_modify:
         _parser_add_output_options(rootp)
@@ -294,10 +275,13 @@ def _setup_action_new_parser(subparsers):
         "Options that take multiple values accept comma separated lists, "
         "including --cc, --blocks, --dependson, --groups, and --keywords.")
     p = subparsers.add_parser("new", description=description)
-
-    _parser_add_bz_fields(p, "new")
     p.add_argument('--no-refresh', action='store_true',
                    help='Do not refresh bug after creating')
+
+    _parser_add_bz_fields(p, "new")
+    g = p.add_argument_group("'new' specific options")
+    g.add_argument('--private', action='store_true', default=False,
+        help='Mark new comment as private')
 
 
 def _setup_action_query_parser(subparsers):
@@ -343,10 +327,6 @@ def _setup_action_query_parser(subparsers):
     p.add_argument('-K', '--keywords_type',
             help=argparse.SUPPRESS)
     p.add_argument('-W', '--status_whiteboard_type',
-            help=argparse.SUPPRESS)
-    p.add_argument('-B', '--booleantype',
-            help=argparse.SUPPRESS)
-    p.add_argument('--boolean_query', action="append",
             help=argparse.SUPPRESS)
     p.add_argument('--fixed_in_type', help=argparse.SUPPRESS)
 
@@ -399,7 +379,7 @@ def _setup_action_modify_parser(subparsers):
 def _setup_action_attach_parser(subparsers):
     usage = """
 bugzilla attach --file=FILE --desc=DESC [--type=TYPE] BUGID [BUGID...]
-bugzilla attach --get=ATTACHID --getall=BUGID [...]
+bugzilla attach --get=ATTACHID --getall=BUGID [--ignore-obsolete] [...]
 bugzilla attach --type=TYPE BUGID [BUGID...]"""
     description = "Attach files or download attachments."
     p = subparsers.add_parser("attach", description=description, usage=usage)
@@ -416,17 +396,29 @@ bugzilla attach --type=TYPE BUGID [BUGID...]"""
             default=[], help="Download the attachment with the given ID")
     p.add_argument("--getall", "--get-all", metavar="BUGID", action="append",
             default=[], help="Download all attachments on the given bug")
-    p.add_argument('-l', '--comment', '--long_desc', help="Add comment with attachment")
+    p.add_argument('--ignore-obsolete', action="store_true",
+        help='Do not download attachments marked as obsolete.')
+    p.add_argument('-l', '--comment', '--long_desc',
+            help="Add comment with attachment")
+    p.add_argument('--private', action='store_true', default=False,
+        help='Mark new comment as private')
 
 
 def _setup_action_login_parser(subparsers):
-    usage = 'bugzilla login [username [password]]'
-    description = "Log into bugzilla and save a login cookie or token."
+    usage = 'bugzilla login [--api-key] [username [password]]'
+    description = """Log into bugzilla and save a login cookie or token.
+Note: These tokens are short-lived, and future Bugzilla versions will no
+longer support token authentication at all. Please use a
+~/.config/python-bugzilla/bugzillarc file with an API key instead, or
+use 'bugzilla login --api-key' and we will save it for you."""
     p = subparsers.add_parser("login", description=description, usage=usage)
-    p.add_argument("pos_username", nargs="?", help="Optional username",
-            metavar="username")
-    p.add_argument("pos_password", nargs="?", help="Optional password",
-            metavar="password")
+    p.add_argument('--api-key', action='store_true', default=False,
+                   help='Prompt for and save an API key into bugzillarc, '
+                        'rather than prompt for username and password.')
+    p.add_argument("pos_username", nargs="?", help="Optional username ",
+                   metavar="username")
+    p.add_argument("pos_password", nargs="?", help="Optional password ",
+                   metavar="password")
 
 
 def setup_parser():
@@ -446,12 +438,9 @@ def setup_parser():
 # Command routines #
 ####################
 
-def _merge_field_opts(query, opt, parser):
+def _merge_field_opts(query, fields, parser):
     # Add any custom fields if specified
-    if opt.fields is None:
-        return
-
-    for f in opt.fields:
+    for f in fields:
         try:
             f, v = f.split('=', 1)
             query[f] = v
@@ -494,7 +483,7 @@ def _do_query(bz, opt, parser):
             # Alias for EndOfLife bug statuses
             stat = ['VERIFIED', 'RELEASE_PENDING', 'RESOLVED']
         elif val == 'OPEN':
-            # non-Closed statuses
+            # non-RESOLVED statuses
             stat = ['NEW', 'ASSIGNED', 'MODIFIED', 'ON_DEV', 'ON_QA',
                 'VERIFIED', 'RELEASE_PENDING', 'POST']
         opt.status = stat
@@ -512,7 +501,7 @@ def _do_query(bz, opt, parser):
         setattr(opt, optname, val.split(","))
 
     include_fields = None
-    if opt.output == 'raw':
+    if opt.output in ['raw', 'json']:
         # 'raw' always does a getbug() call anyways, so just ask for ID back
         include_fields = ['id']
 
@@ -537,55 +526,89 @@ def _do_query(bz, opt, parser):
     if include_fields is not None:
         include_fields.sort()
 
-    built_query = bz.build_query(
-        product=opt.product or None,
-        component=opt.component or None,
-        sub_component=opt.sub_component or None,
-        version=opt.version or None,
-        reporter=opt.reporter or None,
-        bug_id=opt.id or None,
-        short_desc=opt.summary or None,
-        long_desc=opt.comment or None,
-        cc=opt.cc or None,
-        assigned_to=opt.assigned_to or None,
-        qa_contact=opt.qa_contact or None,
-        status=opt.status or None,
-        blocked=opt.blocked or None,
-        dependson=opt.dependson or None,
-        keywords=opt.keywords or None,
-        keywords_type=opt.keywords_type or None,
-        url=opt.url or None,
-        url_type=opt.url_type or None,
-        status_whiteboard=opt.whiteboard or None,
-        status_whiteboard_type=opt.status_whiteboard_type or None,
-        fixed_in=opt.fixed_in or None,
-        fixed_in_type=opt.fixed_in_type or None,
-        flag=opt.flag or None,
-        alias=opt.alias or None,
-        qa_whiteboard=opt.qa_whiteboard or None,
-        devel_whiteboard=opt.devel_whiteboard or None,
-        boolean_query=opt.boolean_query or None,
-        bug_severity=opt.severity or None,
-        priority=opt.priority or None,
-        target_release=opt.target_release or None,
-        target_milestone=opt.target_milestone or None,
-        emailtype=opt.emailtype or None,
-        booleantype=opt.booleantype or None,
-        include_fields=include_fields,
-        quicksearch=opt.quicksearch or None,
-        savedsearch=opt.savedsearch or None,
-        savedsearch_sharer_id=opt.savedsearch_sharer_id or None,
-        tags=opt.tags or None)
+    kwopts = {}
+    if opt.product:
+        kwopts["product"] = opt.product
+    if opt.component:
+        kwopts["component"] = opt.component
+    if opt.sub_component:
+        kwopts["sub_component"] = opt.sub_component
+    if opt.version:
+        kwopts["version"] = opt.version
+    if opt.reporter:
+        kwopts["reporter"] = opt.reporter
+    if opt.id:
+        kwopts["bug_id"] = opt.id
+    if opt.summary:
+        kwopts["short_desc"] = opt.summary
+    if opt.comment:
+        kwopts["long_desc"] = opt.comment
+    if opt.cc:
+        kwopts["cc"] = opt.cc
+    if opt.assigned_to:
+        kwopts["assigned_to"] = opt.assigned_to
+    if opt.qa_contact:
+        kwopts["qa_contact"] = opt.qa_contact
+    if opt.status:
+        kwopts["status"] = opt.status
+    if opt.blocked:
+        kwopts["blocked"] = opt.blocked
+    if opt.dependson:
+        kwopts["dependson"] = opt.dependson
+    if opt.keywords:
+        kwopts["keywords"] = opt.keywords
+    if opt.keywords_type:
+        kwopts["keywords_type"] = opt.keywords_type
+    if opt.url:
+        kwopts["url"] = opt.url
+    if opt.url_type:
+        kwopts["url_type"] = opt.url_type
+    if opt.whiteboard:
+        kwopts["status_whiteboard"] = opt.whiteboard
+    if opt.status_whiteboard_type:
+        kwopts["status_whiteboard_type"] = opt.status_whiteboard_type
+    if opt.fixed_in:
+        kwopts["fixed_in"] = opt.fixed_in
+    if opt.fixed_in_type:
+        kwopts["fixed_in_type"] = opt.fixed_in_type
+    if opt.flag:
+        kwopts["flag"] = opt.flag
+    if opt.alias:
+        kwopts["alias"] = opt.alias
+    if opt.qa_whiteboard:
+        kwopts["qa_whiteboard"] = opt.qa_whiteboard
+    if opt.devel_whiteboard:
+        kwopts["devel_whiteboard"] = opt.devel_whiteboard
+    if opt.severity:
+        kwopts["bug_severity"] = opt.severity
+    if opt.priority:
+        kwopts["priority"] = opt.priority
+    if opt.target_release:
+        kwopts["target_release"] = opt.target_release
+    if opt.target_milestone:
+        kwopts["target_milestone"] = opt.target_milestone
+    if opt.emailtype:
+        kwopts["emailtype"] = opt.emailtype
+    if include_fields:
+        kwopts["include_fields"] = include_fields
+    if opt.quicksearch:
+        kwopts["quicksearch"] = opt.quicksearch
+    if opt.savedsearch:
+        kwopts["savedsearch"] = opt.savedsearch
+    if opt.savedsearch_sharer_id:
+        kwopts["savedsearch_sharer_id"] = opt.savedsearch_sharer_id
+    if opt.tags:
+        kwopts["tags"] = opt.tags
 
-    _merge_field_opts(built_query, opt, parser)
+    built_query = bz.build_query(**kwopts)
+    if opt.fields:
+        _merge_field_opts(built_query, opt.fields, parser)
 
     built_query.update(q)
     q = built_query
 
-    if not q:
+    if not q:  # pragma: no cover
         parser.error("'query' command requires additional arguments")
-    if opt.test_return_result:
-        return q
     return bz.query(q)
 
 
@@ -603,18 +626,18 @@ def _do_info(bz, opt):
         return ret
 
     productname = (opt.components or opt.component_owners or opt.versions)
-    include_fields = ["name", "id"]
     fastcomponents = (opt.components and not opt.active_components)
+
+    include_fields = ["name", "id"]
+    if opt.components or opt.component_owners:
+        include_fields += ["components.name"]
+        if opt.component_owners:
+            include_fields += ["components.default_assigned_to"]
+        if opt.active_components:
+            include_fields += ["components.is_active"]
+
     if opt.versions:
         include_fields += ["versions"]
-    if opt.component_owners:
-        include_fields += [
-            "components.default_assigned_to",
-            "components.name",
-        ]
-    if (opt.active_components and
-        any(["components" in i for i in include_fields])):
-        include_fields += ["components.is_active"]
 
     bz.refresh_products(names=productname and [productname] or None,
             include_fields=include_fields)
@@ -635,14 +658,12 @@ def _do_info(bz, opt):
     elif opt.versions:
         proddict = bz.getproducts()[0]
         for v in proddict['versions']:
-            if v["is_active"]:
-                print(to_encoding(v["name"]))
+            print(str(v["name"] or ''))
 
     elif opt.component_owners:
         details = bz.getcomponentsdetails(productname)
         for c in sorted(_filter_components(details)):
-            print(to_encoding(u"%s: %s" % (c,
-                details[c]['default_assigned_to'])))
+            print("%s: %s" % (c, details[c]['default_assigned_to']))
 
 
 def _convert_to_outputformat(output):
@@ -673,92 +694,139 @@ def _convert_to_outputformat(output):
         fmt += "#%{bug_id} %{status} %{assigned_to} %{component}\t"
         fmt += "[%{target_milestone}] %{flags} %{cve}"
 
-    else:
+    else:  # pragma: no cover
         raise RuntimeError("Unknown output type '%s'" % output)
 
     return fmt
 
 
+def _xmlrpc_converter(obj):
+    if "DateTime" in str(obj.__class__):
+        # xmlrpc DateTime object. Convert to date format that
+        # bugzilla REST API outputs
+        dobj = datetime.datetime.strptime(str(obj), '%Y%m%dT%H:%M:%S')
+        return dobj.isoformat() + "Z"
+    if "Binary" in str(obj.__class__):
+        # xmlrpc Binary object. Convert to base64
+        return base64.b64encode(obj.data).decode("utf-8")
+    raise RuntimeError(
+        "Unexpected JSON conversion class=%s" % obj.__class__)
+
+
+def _format_output_json(buglist):
+    out = {"bugs": [b.get_raw_data() for b in buglist]}
+    s = json.dumps(out, default=_xmlrpc_converter, indent=2, sort_keys=True)
+    print(s)
+
+
+def _format_output_raw(buglist):
+    for b in buglist:
+        print("Bugzilla %s: " % b.bug_id)
+        SKIP_NAMES = ["bugzilla"]
+        for attrname in sorted(b.__dict__):
+            if attrname in SKIP_NAMES:
+                continue
+            if attrname.startswith("_"):
+                continue
+            print("ATTRIBUTE[%s]: %s" % (attrname, b.__dict__[attrname]))
+        print("\n\n")
+
+
+def _bug_field_repl_cb(bz, b, matchobj):
+    # whiteboard and flag allow doing
+    #   %{whiteboard:devel} and %{flag:needinfo}
+    # That's what 'rest' matches
+    (fieldname, rest) = matchobj.groups()
+
+    if fieldname == "whiteboard" and rest:
+        fieldname = rest + "_" + fieldname
+
+    if fieldname == "flag" and rest:
+        val = b.get_flag_status(rest)
+
+    elif fieldname in ["flags", "flags_requestee"]:
+        tmpstr = []
+        for f in getattr(b, "flags", []):
+            requestee = f.get('requestee', "")
+            if fieldname == "flags":
+                requestee = ""
+            if fieldname == "flags_requestee":
+                if requestee == "":
+                    continue
+                tmpstr.append("%s" % requestee)
+            else:
+                tmpstr.append("%s%s%s" %
+                        (f['name'], f['status'], requestee))
+
+        val = ",".join(tmpstr)
+
+    elif fieldname == "cve":
+        cves = []
+        for key in getattr(b, "keywords", []):
+            # grab CVE from keywords and blockers
+            if key.find("Security") == -1:
+                continue
+            for bl in b.blocks:
+                cvebug = bz.getbug(bl)
+                for cb in cvebug.alias:
+                    if (cb.find("CVE") != -1 and
+                        cb.strip() not in cves):
+                        cves.append(cb)
+        val = ",".join(cves)
+
+    elif fieldname == "comments":
+        val = ""
+        for c in getattr(b, "comments", []):
+            val += ("\n* %s - %s:\n%s\n" % (c['time'],
+                     c.get("creator", c.get("author", "")), c['text']))
+
+    elif fieldname == "external_bugs":
+        val = ""
+        for e in getattr(b, "external_bugs", []):
+            url = e["type"]["full_url"].replace("%id%", e["ext_bz_bug_id"])
+            if not val:
+                val += "\n"
+            val += "External bug: %s\n" % url
+
+    elif fieldname == "__unicode__":
+        val = b.__unicode__()
+    else:
+        val = getattr(b, fieldname, "")
+
+    vallist = isinstance(val, list) and val or [val]
+    val = ','.join([str(v or '') for v in vallist])
+
+    return val
+
+
 def _format_output(bz, opt, buglist):
-    if opt.output == 'raw':
-        buglist = bz.getbugs([b.bug_id for b in buglist])
-        for b in buglist:
-            print("Bugzilla %s: " % b.bug_id)
-            for attrname in sorted(b.__dict__):
-                print(to_encoding(u"ATTRIBUTE[%s]: %s" %
-                                  (attrname, b.__dict__[attrname])))
-            print("\n\n")
+    if opt.output in ['raw', 'json']:
+        include_fields = None
+        exclude_fields = None
+        extra_fields = None
+
+        if opt.includefield:
+            include_fields = opt.includefield
+        if opt.excludefield:
+            exclude_fields = opt.excludefield
+        if opt.extrafield:
+            extra_fields = opt.extrafield
+
+        buglist = bz.getbugs([b.bug_id for b in buglist],
+                include_fields=include_fields,
+                exclude_fields=exclude_fields,
+                extra_fields=extra_fields)
+        if opt.output == 'json':
+            _format_output_json(buglist)
+        if opt.output == 'raw':
+            _format_output_raw(buglist)
         return
 
-    def bug_field(matchobj):
-        # whiteboard and flag allow doing
-        #   %{whiteboard:devel} and %{flag:needinfo}
-        # That's what 'rest' matches
-        (fieldname, rest) = matchobj.groups()
-
-        if fieldname == "whiteboard" and rest:
-            fieldname = rest + "_" + fieldname
-
-        if fieldname == "flag" and rest:
-            val = b.get_flag_status(rest)
-
-        elif fieldname == "flags" or fieldname == "flags_requestee":
-            tmpstr = []
-            for f in getattr(b, "flags", []):
-                requestee = f.get('requestee', "")
-                if fieldname == "flags":
-                    requestee = ""
-                if fieldname == "flags_requestee":
-                    if requestee == "":
-                        continue
-                    tmpstr.append("%s" % requestee)
-                else:
-                    tmpstr.append("%s%s%s" %
-                            (f['name'], f['status'], requestee))
-
-            val = ",".join(tmpstr)
-
-        elif fieldname == "cve":
-            cves = []
-            for key in getattr(b, "keywords", []):
-                # grab CVE from keywords and blockers
-                if key.find("Security") == -1:
-                    continue
-                for bl in b.blocks:
-                    cvebug = bz.getbug(bl)
-                    for cb in cvebug.alias:
-                        if cb.find("CVE") == -1:
-                            continue
-                        if cb.strip() not in cves:
-                            cves.append(cb)
-            val = ",".join(cves)
-
-        elif fieldname == "comments":
-            val = ""
-            for c in getattr(b, "comments", []):
-                val += ("\n* %s - %s:\n%s\n" % (c['time'],
-                         c.get("creator", c.get("author", "")), c['text']))
-
-        elif fieldname == "external_bugs":
-            val = ""
-            for e in getattr(b, "external_bugs", []):
-                url = e["type"]["full_url"].replace("%id%", e["ext_bz_bug_id"])
-                if not val:
-                    val += "\n"
-                val += "External bug: %s\n" % url
-
-        elif fieldname == "__unicode__":
-            val = b.__unicode__()
-        else:
-            val = getattr(b, fieldname, "")
-
-        vallist = isinstance(val, list) and val or [val]
-        val = ','.join([to_encoding(v) for v in vallist])
-
-        return val
-
     for b in buglist:
-        print(format_field_re.sub(bug_field, opt.outputformat))
+        # pylint: disable=cell-var-from-loop
+        def cb(matchobj):
+            return _bug_field_repl_cb(bz, b, matchobj)
+        print(format_field_re.sub(cb, opt.outputformat))
 
 
 def _parse_triset(vallist, checkplus=True, checkminus=True, checkequal=True,
@@ -796,33 +864,53 @@ def _do_new(bz, opt, parser):
         return _parse_triset(val, checkplus=False, checkminus=False,
                              checkequal=False, splitcomma=True)[0]
 
-    ret = bz.build_createbug(
-        blocks=parse_multi(opt.blocked) or None,
-        cc=parse_multi(opt.cc) or None,
-        component=opt.component or None,
-        depends_on=parse_multi(opt.dependson) or None,
-        description=opt.comment or None,
-        groups=parse_multi(opt.groups) or None,
-        keywords=parse_multi(opt.keywords) or None,
-        op_sys=opt.os or None,
-        platform=opt.arch or None,
-        priority=opt.priority or None,
-        product=opt.product or None,
-        severity=opt.severity or None,
-        summary=opt.summary or None,
-        url=opt.url or None,
-        version=opt.version or None,
-        assigned_to=opt.assigned_to or None,
-        qa_contact=opt.qa_contact or None,
-        sub_component=opt.sub_component or None,
-        alias=opt.alias or None,
-        comment_tags=opt.comment_tag or None,
-    )
+    kwopts = {}
+    if opt.blocked:
+        kwopts["blocks"] = parse_multi(opt.blocked)
+    if opt.cc:
+        kwopts["cc"] = parse_multi(opt.cc)
+    if opt.component:
+        kwopts["component"] = opt.component
+    if opt.dependson:
+        kwopts["depends_on"] = parse_multi(opt.dependson)
+    if opt.comment:
+        kwopts["description"] = opt.comment
+    if opt.groups:
+        kwopts["groups"] = parse_multi(opt.groups)
+    if opt.keywords:
+        kwopts["keywords"] = parse_multi(opt.keywords)
+    if opt.os:
+        kwopts["op_sys"] = opt.os
+    if opt.arch:
+        kwopts["platform"] = opt.arch
+    if opt.priority:
+        kwopts["priority"] = opt.priority
+    if opt.product:
+        kwopts["product"] = opt.product
+    if opt.severity:
+        kwopts["severity"] = opt.severity
+    if opt.summary:
+        kwopts["summary"] = opt.summary
+    if opt.url:
+        kwopts["url"] = opt.url
+    if opt.version:
+        kwopts["version"] = opt.version
+    if opt.assigned_to:
+        kwopts["assigned_to"] = opt.assigned_to
+    if opt.qa_contact:
+        kwopts["qa_contact"] = opt.qa_contact
+    if opt.sub_component:
+        kwopts["sub_component"] = opt.sub_component
+    if opt.alias:
+        kwopts["alias"] = opt.alias
+    if opt.comment_tag:
+        kwopts["comment_tags"] = opt.comment_tag
+    if opt.private:
+        kwopts["comment_private"] = opt.private
 
-    _merge_field_opts(ret, opt, parser)
-
-    if opt.test_return_result:
-        return ret
+    ret = bz.build_createbug(**kwopts)
+    if opt.fields:
+        _merge_field_opts(ret, opt.fields, parser)
 
     b = bz.createbug(ret)
     if not opt.no_refresh:
@@ -861,50 +949,96 @@ def _do_modify(bz, parser, opt):
         for f in opt.flag:
             flags.append({"name": f[:-1], "status": f[-1]})
 
-    update = bz.build_update(
-        assigned_to=opt.assigned_to or None,
-        comment=opt.comment or None,
-        comment_private=opt.private or None,
-        component=opt.component or None,
-        product=opt.product or None,
-        blocks_add=add_blk or None,
-        blocks_remove=rm_blk or None,
-        blocks_set=set_blk,
-        url=opt.url or None,
-        cc_add=add_cc or None,
-        cc_remove=rm_cc or None,
-        depends_on_add=add_deps or None,
-        depends_on_remove=rm_deps or None,
-        depends_on_set=set_deps,
-        groups_add=add_groups or None,
-        groups_remove=rm_groups or None,
-        keywords_add=add_key or None,
-        keywords_remove=rm_key or None,
-        keywords_set=set_key,
-        op_sys=opt.os or None,
-        platform=opt.arch or None,
-        priority=opt.priority or None,
-        qa_contact=opt.qa_contact or None,
-        severity=opt.severity or None,
-        status=status,
-        summary=opt.summary or None,
-        version=opt.version or None,
-        reset_assigned_to=opt.reset_assignee or None,
-        reset_qa_contact=opt.reset_qa_contact or None,
-        resolution=opt.close or None,
-        target_release=opt.target_release or None,
-        target_milestone=opt.target_milestone or None,
-        dupe_of=opt.dupeid or None,
-        fixed_in=opt.fixed_in or None,
-        whiteboard=set_wb and set_wb[0] or None,
-        devel_whiteboard=set_devwb and set_devwb[0] or None,
-        internal_whiteboard=set_intwb and set_intwb[0] or None,
-        qa_whiteboard=set_qawb and set_qawb[0] or None,
-        sub_component=opt.sub_component or None,
-        alias=opt.alias or None,
-        flags=flags or None,
-        comment_tags=opt.comment_tag or None,
-    )
+    update_opts = {}
+
+    if opt.assigned_to:
+        update_opts["assigned_to"] = opt.assigned_to
+    if opt.comment:
+        update_opts["comment"] = opt.comment
+    if opt.private:
+        update_opts["comment_private"] = opt.private
+    if opt.component:
+        update_opts["component"] = opt.component
+    if opt.product:
+        update_opts["product"] = opt.product
+    if add_blk:
+        update_opts["blocks_add"] = add_blk
+    if rm_blk:
+        update_opts["blocks_remove"] = rm_blk
+    if set_blk is not None:
+        update_opts["blocks_set"] = set_blk
+    if opt.url:
+        update_opts["url"] = opt.url
+    if add_cc:
+        update_opts["cc_add"] = add_cc
+    if rm_cc:
+        update_opts["cc_remove"] = rm_cc
+    if add_deps:
+        update_opts["depends_on_add"] = add_deps
+    if rm_deps:
+        update_opts["depends_on_remove"] = rm_deps
+    if set_deps is not None:
+        update_opts["depends_on_set"] = set_deps
+    if add_groups:
+        update_opts["groups_add"] = add_groups
+    if rm_groups:
+        update_opts["groups_remove"] = rm_groups
+    if add_key:
+        update_opts["keywords_add"] = add_key
+    if rm_key:
+        update_opts["keywords_remove"] = rm_key
+    if set_key is not None:
+        update_opts["keywords_set"] = set_key
+    if opt.os:
+        update_opts["op_sys"] = opt.os
+    if opt.arch:
+        update_opts["platform"] = opt.arch
+    if opt.priority:
+        update_opts["priority"] = opt.priority
+    if opt.qa_contact:
+        update_opts["qa_contact"] = opt.qa_contact
+    if opt.severity:
+        update_opts["severity"] = opt.severity
+    if status:
+        update_opts["status"] = status
+    if opt.summary:
+        update_opts["summary"] = opt.summary
+    if opt.version:
+        update_opts["version"] = opt.version
+    if opt.reset_assignee:
+        update_opts["reset_assigned_to"] = opt.reset_assignee
+    if opt.reset_qa_contact:
+        update_opts["reset_qa_contact"] = opt.reset_qa_contact
+    if opt.close:
+        update_opts["resolution"] = opt.close
+    if opt.target_release:
+        update_opts["target_release"] = opt.target_release
+    if opt.target_milestone:
+        update_opts["target_milestone"] = opt.target_milestone
+    if opt.dupeid:
+        update_opts["dupe_of"] = opt.dupeid
+    if opt.fixed_in:
+        update_opts["fixed_in"] = opt.fixed_in
+    if set_wb and set_wb[0]:
+        update_opts["whiteboard"] = set_wb and set_wb[0]
+    if set_devwb and set_devwb[0]:
+        update_opts["devel_whiteboard"] = set_devwb and set_devwb[0]
+    if set_intwb and set_intwb[0]:
+        update_opts["internal_whiteboard"] = set_intwb and set_intwb[0]
+    if set_qawb and set_qawb[0]:
+        update_opts["qa_whiteboard"] = set_qawb and set_qawb[0]
+    if opt.sub_component:
+        update_opts["sub_component"] = opt.sub_component
+    if opt.alias:
+        update_opts["alias"] = opt.alias
+    if flags:
+        update_opts["flags"] = flags
+    if opt.comment_tag:
+        update_opts["comment_tags"] = opt.comment_tag
+    if opt.minor_update:
+        update_opts["minor_update"] = opt.minor_update
+
+    update = bz.build_update(**update_opts)
 
     # We make this a little convoluted to facilitate unit testing
     wbmap = {
@@ -918,16 +1052,14 @@ def _do_modify(bz, parser, opt):
         if not v[0] and not v[1]:
             del(wbmap[k])
 
-    _merge_field_opts(update, opt, parser)
+    if opt.fields:
+        _merge_field_opts(update, opt.fields, parser)
 
     log.debug("update bug dict=%s", update)
     log.debug("update whiteboard dict=%s", wbmap)
 
     if not any([update, wbmap, add_tags, rm_tags]):
         parser.error("'modify' command requires additional arguments")
-
-    if opt.test_return_result:
-        return (update, wbmap, add_tags, rm_tags)
 
     if add_tags or rm_tags:
         ret = bz.update_tags(bugid_list,
@@ -943,41 +1075,55 @@ def _do_modify(bz, parser, opt):
     # Now for the things we can't blindly batch.
     # Being able to prepend/append to whiteboards, which are just
     # plain string values, is an old rhbz semantic that we try to maintain
-    # here. This is a bit weird for traditional bugzilla XMLRPC
+    # here. This is a bit weird for traditional bugzilla API
     log.debug("Adjusting whiteboard fields one by one")
     for bug in bz.getbugs(bugid_list):
-        for wb, (add_list, rm_list) in wbmap.items():
+        update_kwargs = {}
+        for wbkey, (add_list, rm_list) in wbmap.items():
+            bugval = getattr(bug, wbkey) or ""
             for tag in add_list:
-                newval = getattr(bug, wb) or ""
-                if newval:
-                    newval += " "
-                newval += tag
-                bz.update_bugs([bug.id],
-                               bz.build_update(**{wb: newval}))
+                if bugval:
+                    bugval += " "
+                bugval += tag
 
             for tag in rm_list:
-                newval = (getattr(bug, wb) or "").split()
-                for t in newval[:]:
+                bugsplit = bugval.split()
+                for t in bugsplit[:]:
                     if t == tag:
-                        newval.remove(t)
-                bz.update_bugs([bug.id],
-                               bz.build_update(**{wb: " ".join(newval)}))
+                        bugsplit.remove(t)
+                bugval = " ".join(bugsplit)
+
+            update_kwargs[wbkey] = bugval
+
+        bz.update_bugs([bug.id], bz.build_update(**update_kwargs))
 
 
 def _do_get_attach(bz, opt):
-    for bug in bz.getbugs(opt.getall):
-        opt.get += bug.get_attachment_ids()
+    data = {}
 
-    for attid in set(opt.get):
-        att = bz.openattachment(attid)
+    def _process_attachment_data(_attlist):
+        for _att in _attlist:
+            data[_att["id"]] = _att
+
+    if opt.getall:
+        for attlist in bz.get_attachments(opt.getall, None)["bugs"].values():
+            _process_attachment_data(attlist)
+    if opt.get:
+        _process_attachment_data(
+            bz.get_attachments(None, opt.get)["attachments"].values())
+
+    for attdata in data.values():
+        is_obsolete = attdata.get("is_obsolete", None) == 1
+        if opt.ignore_obsolete and is_obsolete:
+            continue
+
+        att = bz.openattachment_data(attdata)
         outfile = open_without_clobber(att.name, "wb")
         data = att.read(4096)
         while data:
             outfile.write(data)
             data = att.read(4096)
         print("Wrote %s" % outfile.name)
-
-    return
 
 
 def _do_set_attach(bz, opt, parser):
@@ -1011,6 +1157,8 @@ def _do_set_attach(bz, opt, parser):
         kwargs["ispatch"] = True
     if opt.comment:
         kwargs["comment"] = opt.comment
+    if opt.private:
+        kwargs["is_private"] = True
     desc = opt.desc or os.path.basename(fileobj.name)
 
     # Upload attachments
@@ -1032,17 +1180,19 @@ def _make_bz_instance(opt):
 
     cookiefile = None
     tokenfile = None
+    use_creds = False
     if opt.cache_credentials:
         cookiefile = opt.cookiefile or -1
         tokenfile = opt.tokenfile or -1
+        use_creds = True
 
-    bz = bugzilla.Bugzilla(
+    return bugzilla.Bugzilla(
         url=opt.bugzilla,
         cookiefile=cookiefile,
         tokenfile=tokenfile,
         sslverify=opt.sslverify,
+        use_creds=use_creds,
         cert=opt.cert)
-    return bz
 
 
 def _handle_login(opt, action, bz):
@@ -1055,12 +1205,19 @@ def _handle_login(opt, action, bz):
         opt.login or opt.username or opt.password)
     username = getattr(opt, "pos_username", None) or opt.username
     password = getattr(opt, "pos_password", None) or opt.password
+    use_key = getattr(opt, "api_key", False)
 
     try:
-        if do_interactive_login:
-            if bz.url:
-                print("Logging into %s" % urlparse(bz.url)[1])
-            bz.interactive_login(username, password)
+        if use_key:
+            bz.interactive_save_api_key()
+        elif do_interactive_login:
+            if bz.api_key:
+                print("You already have an API key configured for %s" % bz.url)
+                print("There is no need to cache a login token. Exiting.")
+                sys.exit(0)
+            print("Logging into %s" % urllib.parse.urlparse(bz.url)[1])
+            bz.interactive_login(username, password,
+                    restrict_login=opt.restrict_login)
     except bugzilla.BugzillaError as e:
         print(str(e))
         sys.exit(1)
@@ -1071,11 +1228,6 @@ def _handle_login(opt, action, bz):
         sys.exit(1)
 
     if is_login_command:
-        msg = "Login successful."
-        if bz.cookiefile or bz.tokenfile:
-            msg = "Login successful, token cache updated."
-
-        print(msg)
         sys.exit(0)
 
 
@@ -1086,9 +1238,7 @@ def _main(unittest_bz_instance):
     setup_logging(opt.debug, opt.verbose)
 
     log.debug("Launched with command line: %s", " ".join(sys.argv))
-
-    # Connect to bugzilla
-    log.info('Connecting to %s', opt.bugzilla)
+    log.debug("Bugzilla module: %s", bugzilla)
 
     if unittest_bz_instance:
         bz = unittest_bz_instance
@@ -1104,28 +1254,18 @@ def _main(unittest_bz_instance):
     ###########################
 
     if hasattr(opt, "outputformat"):
-        if not opt.outputformat and opt.output not in ['raw', None]:
+        if not opt.outputformat and opt.output not in ['raw', 'json', None]:
             opt.outputformat = _convert_to_outputformat(opt.output)
 
     buglist = []
     if action == 'info':
-        if not (opt.products or
-                opt.components or
-                opt.component_owners or
-                opt.versions):
-            parser.error("'info' command requires additional arguments")
-
         _do_info(bz, opt)
 
     elif action == 'query':
         buglist = _do_query(bz, opt, parser)
-        if opt.test_return_result:
-            return buglist
 
     elif action == 'new':
         buglist = _do_new(bz, opt, parser)
-        if opt.test_return_result:
-            return buglist
 
     elif action == 'attach':
         if opt.get or opt.getall:
@@ -1137,10 +1277,8 @@ def _main(unittest_bz_instance):
             _do_set_attach(bz, opt, parser)
 
     elif action == 'modify':
-        modout = _do_modify(bz, parser, opt)
-        if opt.test_return_result:
-            return modout
-    else:
+        _do_modify(bz, parser, opt)
+    else:  # pragma: no cover
         raise RuntimeError("Unexpected action '%s'" % action)
 
     # If we're doing new/query/modify, output our results
@@ -1155,7 +1293,10 @@ def main(unittest_bz_instance=None):
         except (Exception, KeyboardInterrupt):
             log.debug("", exc_info=True)
             raise
-    except (Fault, bugzilla.BugzillaError) as e:
+    except KeyboardInterrupt:
+        print("\nExited at user request.")
+        sys.exit(1)
+    except (xmlrpc.client.Fault, bugzilla.BugzillaError) as e:
         print("\nServer error: %s" % str(e))
         sys.exit(3)
     except requests.exceptions.SSLError as e:
@@ -1168,15 +1309,11 @@ def main(unittest_bz_instance=None):
     except (socket.error,
             requests.exceptions.HTTPError,
             requests.exceptions.ConnectionError,
-            ProtocolError) as e:
+            requests.exceptions.InvalidURL,
+            xmlrpc.client.ProtocolError) as e:
         print("\nConnection lost/failed: %s" % str(e))
         sys.exit(2)
 
 
 def cli():
-    try:
-        main()
-    except KeyboardInterrupt:
-        log.debug("", exc_info=True)
-        print("\nExited at user request.")
-        sys.exit(1)
+    main()
