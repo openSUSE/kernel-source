@@ -19,3 +19,5 @@ BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 15 SP3"
 SORT_SERIES=yes
 # Modules not listed in supported.conf will abort the kernel build
 SUPPORTED_MODULES_CHECK=Yes
+# Split Leap-only modules to kernel-*-optional subpackage
+SPLIT_OPTIONAL=Yes
