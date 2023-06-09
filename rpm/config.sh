@@ -21,3 +21,7 @@ IBS_PROJECT_ARM=Devel:ARM:Factory
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
 BUGZILLA_PRODUCT="openSUSE Tumbleweed"
+# build documentation in HTML format
+BUILD_HTML=Yes
+# build documentation in PDF format
+BUILD_PDF=No
