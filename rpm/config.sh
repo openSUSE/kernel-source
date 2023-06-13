@@ -15,3 +15,7 @@ BUGZILLA_SERVER="apibugzilla.suse.com"
 BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 15 SP3"
 # Check the sorted patches section of series.conf
 SORT_SERIES=yes
+# Modules not listed in supported.conf will abort the kernel build
+SUPPORTED_MODULES_CHECK=Yes
+# Split Leap-only modules to kernel-*-optional subpackage
+SPLIT_OPTIONAL=Yes
