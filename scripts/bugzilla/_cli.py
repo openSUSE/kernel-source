@@ -347,6 +347,8 @@ def _setup_action_info_parser(subparsers):
             help='List the versions for the given product')
     p.add_argument('--active-components', action="store_true",
             help='Only show active components. Combine with --components*')
+    p.add_argument('--active-versions', action="store_true",
+            help='Only show active versions. Combine with --versions')
 
 
 
@@ -658,7 +660,8 @@ def _do_info(bz, opt):
     elif opt.versions:
         proddict = bz.getproducts()[0]
         for v in proddict['versions']:
-            print(str(v["name"] or ''))
+            if not opt.active_versions or v["is_active"]:
+                print(str(v["name"] or ''))
 
     elif opt.component_owners:
         details = bz.getcomponentsdetails(productname)
