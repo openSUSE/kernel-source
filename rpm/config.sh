@@ -8,6 +8,8 @@ OBS_BUILD_VARIANT=1
 COMPRESS_MODULES="xz"
 # Compile binary devicetrees on master and stable branches.
 BUILD_DTBS="Yes"
+BUILD_HTML=Yes
+BUILD_PDF=Yes
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:Factory
 OBS_PROJECT_ARM=openSUSE:Factory:ARM
