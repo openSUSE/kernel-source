@@ -21,3 +21,7 @@ SORT_SERIES=yes
 SUPPORTED_MODULES_CHECK=Yes
 # Split Leap-only modules to kernel-*-optional subpackage
 SPLIT_OPTIONAL=Yes
+# build documentation in HTML format
+BUILD_HTML=Yes
+# build documentation in PDF format
+BUILD_PDF=No
