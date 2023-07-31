@@ -1,0 +1,344 @@
+From 2be79d58645465351af5320eb14c70a94724c5ef Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Tue, 20 Sep 2022 20:11:06 +0200
+Subject: [PATCH] ALSA: usb-audio: Split endpoint setups for hw_params and prepare (take#2)
+Git-commit: 2be79d58645465351af5320eb14c70a94724c5ef
+Patch-mainline: v6.1-rc1
+References: git-fixes
+
+This is a second attempt to fix the bug appearing on Android with the
+recent kernel; the first try was ff878b408a03 and reverted at commit
+79764ec772bc.
+
+The details taken from the v1 patch:
+
+One of the former changes for the endpoint management was the more
+consistent setup of endpoints at hw_params.
+snd_usb_endpoint_configure() is a single function that does the full
+setup, and it's called from both PCM hw_params and prepare callbacks.
+Although the EP setup at the prepare phase is usually skipped (by
+checking need_setup flag), it may be still effective in some cases
+like suspend/resume that requires the interface setup again.
+
+As it's a full and single setup, the invocation of
+snd_usb_endpoint_configure() includes not only the USB interface setup
+but also the buffer release and allocation.  OTOH, doing the buffer
+release and re-allocation at PCM prepare phase is rather superfluous,
+and better to be done only in the hw_params phase.
+
+For those optimizations, this patch splits the endpoint setup to two
+Phases: snd_usb_endpoint_set_params() and snd_usb_endpoint_prepare(),
+to be called from hw_params and from prepare, respectively.
+
+Note that this patch changes the driver operation slightly,
+effectively moving the USB interface setup again to PCM prepare stage
+instead of hw_params stage, while the buffer allocation and such
+initializations are still done at hw_params stage.
+
+And, the change of the USB interface setup timing (moving to prepare)
+gave an interesting "fix", too: it was reported that the recent
+kernels caused silent output at the beginning on playbacks on some
+devices on Android, and this change casually fixed the regression.
+It seems that those devices are picky about the sample rate change (or
+the interface change?), and don't follow the too immediate rate
+changes.
+
+Meanwhile, Android operates the PCM in the following order:
+- open, then hw_params with the possibly highest sample rate
+- close without prepare
+- re-open, hw_params with the normal sample rate
+- prepare, and start streaming
+This procedure ended up the hw_params twice with different rates, and
+because the recent kernel did set up the sample rate twice one and
+after, it screwed up the device.  OTOH, the earlier kernels didn't set
+up the USB interface at hw_params, hence this problem didn't appear.
+
+Now, with this patch, the USB interface setup is again back to the
+prepare phase, and it works around the problem automagically.
+Although we should address the sample rate problem in a more solid
+way in future, let's keep things working as before for now.
+
+***
+
+What's new in the take#2 patch:
+- The regression caused by the v1 patch (bko#216500) was due to the
+  missing check of need_setup flag at hw_params.  Now the check is
+  added, and the snd_usb_endpoint_set_params() call is skipped when
+  the running EP is re-opened.
+
+- There was another bug in v1 where the clock reference rate wasn't
+  updated at hw_params phase, which may lead to a lack of the proper
+  hw constraints when an application doesn't issue the prepare but
+  only the hw_params call.  This patch fixes it as well by tracking
+  the clock rate change in the prepare callback with a new flag
+  "need_update" for the clock reference object, just like others.
+
+- The configure_endpoints() are simplified and folded back into
+  snd_usb_pcm_prepare().
+
+Fixes: bf6313a0ff76 ("ALSA: usb-audio: Refactor endpoint management")
+Fixes: ff878b408a03 ("ALSA: usb-audio: Split endpoint setups for hw_params and prepare")
+Reported-by: chihhao chen <chihhao.chen@mediatek.com>
+Link: https://lore.kernel.org/r/87e6d6ae69d68dc588ac9acc8c0f24d6188375c3.camel@mediatek.com
+Link: https://lore.kernel.org/r/20220901124136.4984-1-tiwai@suse.de
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=216500
+Link: https://lore.kernel.org/r/20220920181106.4894-1-tiwai@suse.de
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ sound/usb/endpoint.c | 78 ++++++++++++++++++++++++++------------------
+ sound/usb/endpoint.h |  6 ++--
+ sound/usb/pcm.c      | 51 ++++++++++++-----------------
+ 3 files changed, 71 insertions(+), 64 deletions(-)
+
+diff --git a/sound/usb/endpoint.c b/sound/usb/endpoint.c
+index eb71df9da831..0c94ebc98e90 100644
+--- a/sound/usb/endpoint.c
++++ b/sound/usb/endpoint.c
+@@ -40,6 +40,7 @@ struct snd_usb_clock_ref {
+ 	unsigned char clock;
+ 	atomic_t locked;
+ 	int rate;
++	bool need_setup;
+ 	struct list_head list;
+ };
+ 
+@@ -758,7 +759,8 @@ bool snd_usb_endpoint_compatible(struct snd_usb_audio *chip,
+  * The endpoint needs to be closed via snd_usb_endpoint_close() later.
+  *
+  * Note that this function doesn't configure the endpoint.  The substream
+- * needs to set it up later via snd_usb_endpoint_configure().
++ * needs to set it up later via snd_usb_endpoint_set_params() and
++ * snd_usb_endpoint_prepare().
+  */
+ struct snd_usb_endpoint *
+ snd_usb_endpoint_open(struct snd_usb_audio *chip,
+@@ -1289,15 +1291,39 @@ static int sync_ep_set_params(struct snd_usb_endpoint *ep)
+ 	return -ENOMEM;
+ }
+ 
++/* update the rate of the referred clock; return the actual rate */
++static int update_clock_ref_rate(struct snd_usb_audio *chip,
++				 struct snd_usb_endpoint *ep)
++{
++	struct snd_usb_clock_ref *clock = ep->clock_ref;
++	int rate = ep->cur_rate;
++
++	if (!clock || clock->rate == rate)
++		return rate;
++	if (clock->rate) {
++		if (atomic_read(&clock->locked))
++			return clock->rate;
++		if (clock->rate != rate) {
++			usb_audio_err(chip, "Mismatched sample rate %d vs %d for EP 0x%x\n",
++				      clock->rate, rate, ep->ep_num);
++			return clock->rate;
++		}
++	}
++	clock->rate = rate;
++	clock->need_setup = true;
++	return rate;
++}
++
+ /*
+  * snd_usb_endpoint_set_params: configure an snd_usb_endpoint
+  *
++ * It's called either from hw_params callback.
+  * Determine the number of URBs to be used on this endpoint.
+  * An endpoint must be configured before it can be started.
+  * An endpoint that is already running can not be reconfigured.
+  */
+-static int snd_usb_endpoint_set_params(struct snd_usb_audio *chip,
+-				       struct snd_usb_endpoint *ep)
++int snd_usb_endpoint_set_params(struct snd_usb_audio *chip,
++				struct snd_usb_endpoint *ep)
+ {
+ 	const struct audioformat *fmt = ep->cur_audiofmt;
+ 	int err;
+@@ -1349,49 +1375,46 @@ static int snd_usb_endpoint_set_params(struct snd_usb_audio *chip,
+ 	ep->maxframesize = ep->maxpacksize / ep->cur_frame_bytes;
+ 	ep->curframesize = ep->curpacksize / ep->cur_frame_bytes;
+ 
+-	return 0;
++	return update_clock_ref_rate(chip, ep);
+ }
+ 
+ static int init_sample_rate(struct snd_usb_audio *chip,
+ 			    struct snd_usb_endpoint *ep)
+ {
+ 	struct snd_usb_clock_ref *clock = ep->clock_ref;
+-	int err;
++	int rate, err;
+ 
+-	if (clock) {
+-		if (atomic_read(&clock->locked))
+-			return 0;
+-		if (clock->rate == ep->cur_rate)
+-			return 0;
+-		if (clock->rate && clock->rate != ep->cur_rate) {
+-			usb_audio_dbg(chip, "Mismatched sample rate %d vs %d for EP 0x%x\n",
+-				      clock->rate, ep->cur_rate, ep->ep_num);
+-			return -EINVAL;
+-		}
++	rate = update_clock_ref_rate(chip, ep);
++	if (rate < 0)
++		return rate;
++	if (clock && !clock->need_setup)
++		return 0;
++
++	err = snd_usb_init_sample_rate(chip, ep->cur_audiofmt, rate);
++	if (err < 0) {
++		if (clock)
++			clock->rate = 0; /* reset rate */
++		return err;
+ 	}
+ 
+-	err = snd_usb_init_sample_rate(chip, ep->cur_audiofmt, ep->cur_rate);
+-	if (err < 0)
+-		return err;
+-
+ 	if (clock)
+-		clock->rate = ep->cur_rate;
++		clock->need_setup = false;
+ 	return 0;
+ }
+ 
+ /*
+- * snd_usb_endpoint_configure: Configure the endpoint
++ * snd_usb_endpoint_prepare: Prepare the endpoint
+  *
+  * This function sets up the EP to be fully usable state.
+- * It's called either from hw_params or prepare callback.
++ * It's called either from prepare callback.
+  * The function checks need_setup flag, and performs nothing unless needed,
+  * so it's safe to call this multiple times.
+  *
+  * This returns zero if unchanged, 1 if the configuration has changed,
+  * or a negative error code.
+  */
+-int snd_usb_endpoint_configure(struct snd_usb_audio *chip,
+-			       struct snd_usb_endpoint *ep)
++int snd_usb_endpoint_prepare(struct snd_usb_audio *chip,
++			     struct snd_usb_endpoint *ep)
+ {
+ 	bool iface_first;
+ 	int err = 0;
+@@ -1412,9 +1435,6 @@ int snd_usb_endpoint_configure(struct snd_usb_audio *chip,
+ 			if (err < 0)
+ 				goto unlock;
+ 		}
+-		err = snd_usb_endpoint_set_params(chip, ep);
+-		if (err < 0)
+-			goto unlock;
+ 		goto done;
+ 	}
+ 
+@@ -1442,10 +1462,6 @@ int snd_usb_endpoint_configure(struct snd_usb_audio *chip,
+ 	if (err < 0)
+ 		goto unlock;
+ 
+-	err = snd_usb_endpoint_set_params(chip, ep);
+-	if (err < 0)
+-		goto unlock;
+-
+ 	err = snd_usb_select_mode_quirk(chip, ep->cur_audiofmt);
+ 	if (err < 0)
+ 		goto unlock;
+diff --git a/sound/usb/endpoint.h b/sound/usb/endpoint.h
+index 6a9af04cf175..e67ea28faa54 100644
+--- a/sound/usb/endpoint.h
++++ b/sound/usb/endpoint.h
+@@ -17,8 +17,10 @@ snd_usb_endpoint_open(struct snd_usb_audio *chip,
+ 		      bool is_sync_ep);
+ void snd_usb_endpoint_close(struct snd_usb_audio *chip,
+ 			    struct snd_usb_endpoint *ep);
+-int snd_usb_endpoint_configure(struct snd_usb_audio *chip,
+-			       struct snd_usb_endpoint *ep);
++int snd_usb_endpoint_set_params(struct snd_usb_audio *chip,
++				struct snd_usb_endpoint *ep);
++int snd_usb_endpoint_prepare(struct snd_usb_audio *chip,
++			     struct snd_usb_endpoint *ep);
+ int snd_usb_endpoint_get_clock_rate(struct snd_usb_audio *chip, int clock);
+ 
+ bool snd_usb_endpoint_compatible(struct snd_usb_audio *chip,
+diff --git a/sound/usb/pcm.c b/sound/usb/pcm.c
+index d45d1d7e6664..e721fc12acde 100644
+--- a/sound/usb/pcm.c
++++ b/sound/usb/pcm.c
+@@ -433,35 +433,6 @@ static void close_endpoints(struct snd_usb_audio *chip,
+ 	}
+ }
+ 
+-static int configure_endpoints(struct snd_usb_audio *chip,
+-			       struct snd_usb_substream *subs)
+-{
+-	int err;
+-
+-	if (subs->data_endpoint->need_setup) {
+-		/* stop any running stream beforehand */
+-		if (stop_endpoints(subs, false))
+-			sync_pending_stops(subs);
+-		if (subs->sync_endpoint) {
+-			err = snd_usb_endpoint_configure(chip, subs->sync_endpoint);
+-			if (err < 0)
+-				return err;
+-		}
+-		err = snd_usb_endpoint_configure(chip, subs->data_endpoint);
+-		if (err < 0)
+-			return err;
+-		snd_usb_set_format_quirk(subs, subs->cur_audiofmt);
+-	} else {
+-		if (subs->sync_endpoint) {
+-			err = snd_usb_endpoint_configure(chip, subs->sync_endpoint);
+-			if (err < 0)
+-				return err;
+-		}
+-	}
+-
+-	return 0;
+-}
+-
+ /*
+  * hw_params callback
+  *
+@@ -551,7 +522,16 @@ static int snd_usb_hw_params(struct snd_pcm_substream *substream,
+ 	subs->cur_audiofmt = fmt;
+ 	mutex_unlock(&chip->mutex);
+ 
+-	ret = configure_endpoints(chip, subs);
++	if (!subs->data_endpoint->need_setup)
++		goto unlock;
++
++	if (subs->sync_endpoint) {
++		ret = snd_usb_endpoint_set_params(chip, subs->sync_endpoint);
++		if (ret < 0)
++			goto unlock;
++	}
++
++	ret = snd_usb_endpoint_set_params(chip, subs->data_endpoint);
+ 
+  unlock:
+ 	if (ret < 0)
+@@ -634,9 +614,18 @@ static int snd_usb_pcm_prepare(struct snd_pcm_substream *substream)
+ 		goto unlock;
+ 	}
+ 
+-	ret = configure_endpoints(chip, subs);
++	if (subs->sync_endpoint) {
++		ret = snd_usb_endpoint_prepare(chip, subs->sync_endpoint);
++		if (ret < 0)
++			goto unlock;
++	}
++
++	ret = snd_usb_endpoint_prepare(chip, subs->data_endpoint);
+ 	if (ret < 0)
+ 		goto unlock;
++	else if (ret > 0)
++		snd_usb_set_format_quirk(subs, subs->cur_audiofmt);
++	ret = 0;
+ 
+ 	/* reset the pointer */
+ 	subs->buffer_bytes = frames_to_bytes(runtime, runtime->buffer_size);
+-- 
+2.35.3
+
