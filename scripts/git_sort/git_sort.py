@@ -188,10 +188,10 @@ class Head(object):
 # kernel.org prefixes and "remote branch name" can be omitted if it is "master".
 remotes = (
     Head(RepoURL("torvalds/linux.git")),
-    Head(RepoURL("netdev/net.git")),
-    Head(RepoURL("davem/net.git")),
-    Head(RepoURL("netdev/net-next.git")),
-    Head(RepoURL("davem/net-next.git")),
+    Head(RepoURL("netdev/net.git"), "main"),
+    Head(RepoURL("davem/net.git"), "main"),
+    Head(RepoURL("netdev/net-next.git"), "main"),
+    Head(RepoURL("davem/net-next.git"), "main"),
     Head(RepoURL("rdma/rdma.git"), "for-rc"),
     Head(RepoURL("rdma/rdma.git"), "for-next"),
     Head(RepoURL("dledford/rdma.git"), "k.o/for-next"),
