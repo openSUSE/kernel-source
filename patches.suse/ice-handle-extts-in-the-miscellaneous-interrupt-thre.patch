@@ -1,0 +1,186 @@
+From: Karol Kolacinski <karol.kolacinski@intel.com>
+Date: Thu, 1 Jun 2023 14:15:03 -0700
+Subject: ice: handle extts in the miscellaneous interrupt thread
+Patch-mainline: v6.5-rc1
+Git-commit: 6e8b2c88fc8cf95ed09de25946b20b7536c88cd5
+References: git-fixes
+
+The ice_ptp_extts_work() and ice_ptp_periodic_work() functions are both
+scheduled on the same kthread worker, pf.ptp.kworker. The
+ice_ptp_periodic_work() function sends to the firmware to interact with the
+PHY, and must block to wait for responses.
+
+This can cause delay in responding to the PFINT_OICR_TSYN_EVNT interrupt
+cause, ultimately resulting in disruption to processing an input signal of
+the frequency is high enough. In our testing, even 100 Hz signals get
+disrupted.
+
+Fix this by instead processing the signal inside the miscellaneous
+interrupt thread prior to handling Tx timestamps.
+
+Use atomic bits in a new pf->misc_thread bitmap in order to safely
+communicate which tasks require processing within the
+ice_misc_intr_thread_fn(). This ensures the communication of desired tasks
+from the ice_misc_intr() are correctly processed without racing even in the
+event that the interrupt triggers again before the thread function exits.
+
+Fixes: 172db5f91d5f ("ice: add support for auxiliary input/output pins")
+Signed-off-by: Karol Kolacinski <karol.kolacinski@intel.com>
+Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+Tested-by: Arpana Arland <arpanax.arland@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice.h      |    7 +++++++
+ drivers/net/ethernet/intel/ice/ice_main.c |   29 +++++++++++++++++++++--------
+ drivers/net/ethernet/intel/ice/ice_ptp.c  |   12 +++---------
+ drivers/net/ethernet/intel/ice/ice_ptp.h  |    4 ++--
+ 4 files changed, 33 insertions(+), 19 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@ -492,6 +492,12 @@ enum ice_pf_flags {
+ 	ICE_PF_FLAGS_NBITS		/* must be last */
+ };
+ 
++enum ice_misc_thread_tasks {
++	ICE_MISC_THREAD_EXTTS_EVENT,
++	ICE_MISC_THREAD_TX_TSTAMP,
++	ICE_MISC_THREAD_NBITS		/* must be last */
++};
++
+ struct ice_switchdev_info {
+ 	struct ice_vsi *control_vsi;
+ 	struct ice_vsi *uplink_vsi;
+@@ -533,6 +539,7 @@ struct ice_pf {
+ 	DECLARE_BITMAP(features, ICE_F_MAX);
+ 	DECLARE_BITMAP(state, ICE_STATE_NBITS);
+ 	DECLARE_BITMAP(flags, ICE_PF_FLAGS_NBITS);
++	DECLARE_BITMAP(misc_thread, ICE_MISC_THREAD_NBITS);
+ 	unsigned long *avail_txqs;	/* bitmap to track PF Tx queue usage */
+ 	unsigned long *avail_rxqs;	/* bitmap to track PF Rx queue usage */
+ 	unsigned long serv_tmr_period;
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -3116,20 +3116,28 @@ static irqreturn_t ice_misc_intr(int __a
+ 
+ 	if (oicr & PFINT_OICR_TSYN_TX_M) {
+ 		ena_mask &= ~PFINT_OICR_TSYN_TX_M;
+-		if (!hw->reset_ongoing)
++		if (!hw->reset_ongoing) {
++			set_bit(ICE_MISC_THREAD_TX_TSTAMP, pf->misc_thread);
+ 			ret = IRQ_WAKE_THREAD;
++		}
+ 	}
+ 
+ 	if (oicr & PFINT_OICR_TSYN_EVNT_M) {
+ 		u8 tmr_idx = hw->func_caps.ts_func_info.tmr_index_owned;
+ 		u32 gltsyn_stat = rd32(hw, GLTSYN_STAT(tmr_idx));
+ 
+-		/* Save EVENTs from GTSYN register */
+-		pf->ptp.ext_ts_irq |= gltsyn_stat & (GLTSYN_STAT_EVENT0_M |
+-						     GLTSYN_STAT_EVENT1_M |
+-						     GLTSYN_STAT_EVENT2_M);
+ 		ena_mask &= ~PFINT_OICR_TSYN_EVNT_M;
+-		kthread_queue_work(pf->ptp.kworker, &pf->ptp.extts_work);
++
++		if (hw->func_caps.ts_func_info.src_tmr_owned) {
++			/* Save EVENTs from GLTSYN register */
++			pf->ptp.ext_ts_irq |= gltsyn_stat &
++					      (GLTSYN_STAT_EVENT0_M |
++					       GLTSYN_STAT_EVENT1_M |
++					       GLTSYN_STAT_EVENT2_M);
++
++			set_bit(ICE_MISC_THREAD_EXTTS_EVENT, pf->misc_thread);
++			ret = IRQ_WAKE_THREAD;
++		}
+ 	}
+ 
+ #define ICE_AUX_CRIT_ERR (PFINT_OICR_PE_CRITERR_M | PFINT_OICR_HMC_ERR_M | PFINT_OICR_PE_PUSH_M)
+@@ -3173,8 +3181,13 @@ static irqreturn_t ice_misc_intr_thread_
+ 	if (ice_is_reset_in_progress(pf->state))
+ 		return IRQ_HANDLED;
+ 
+-	while (!ice_ptp_process_ts(pf))
+-		usleep_range(50, 100);
++	if (test_and_clear_bit(ICE_MISC_THREAD_EXTTS_EVENT, pf->misc_thread))
++		ice_ptp_extts_event(pf);
++
++	if (test_and_clear_bit(ICE_MISC_THREAD_TX_TSTAMP, pf->misc_thread)) {
++		while (!ice_ptp_process_ts(pf))
++			usleep_range(50, 100);
++	}
+ 
+ 	return IRQ_HANDLED;
+ }
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@ -1476,15 +1476,11 @@ static int ice_ptp_adjfine(struct ptp_cl
+ }
+ 
+ /**
+- * ice_ptp_extts_work - Workqueue task function
+- * @work: external timestamp work structure
+- *
+- * Service for PTP external clock event
++ * ice_ptp_extts_event - Process PTP external clock event
++ * @pf: Board private structure
+  */
+-static void ice_ptp_extts_work(struct kthread_work *work)
++void ice_ptp_extts_event(struct ice_pf *pf)
+ {
+-	struct ice_ptp *ptp = container_of(work, struct ice_ptp, extts_work);
+-	struct ice_pf *pf = container_of(ptp, struct ice_pf, ptp);
+ 	struct ptp_clock_event event;
+ 	struct ice_hw *hw = &pf->hw;
+ 	u8 chan, tmr_idx;
+@@ -2514,7 +2510,6 @@ void ice_ptp_prepare_for_reset(struct ic
+ 	ice_ptp_cfg_timestamp(pf, false);
+ 
+ 	kthread_cancel_delayed_work_sync(&ptp->work);
+-	kthread_cancel_work_sync(&ptp->extts_work);
+ 
+ 	if (test_bit(ICE_PFR_REQ, pf->state))
+ 		return;
+@@ -2612,7 +2607,6 @@ static int ice_ptp_init_work(struct ice_
+ 
+ 	/* Initialize work functions */
+ 	kthread_init_delayed_work(&ptp->work, ice_ptp_periodic_work);
+-	kthread_init_work(&ptp->extts_work, ice_ptp_extts_work);
+ 
+ 	/* Allocate a kworker for handling work required for the ports
+ 	 * connected to the PTP hardware clock.
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.h
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.h
+@@ -159,7 +159,6 @@ struct ice_ptp_port {
+  * struct ice_ptp - data used for integrating with CONFIG_PTP_1588_CLOCK
+  * @port: data for the PHY port initialization procedure
+  * @work: delayed work function for periodic tasks
+- * @extts_work: work function for handling external Tx timestamps
+  * @cached_phc_time: a cached copy of the PHC time for timestamp extension
+  * @cached_phc_jiffies: jiffies when cached_phc_time was last updated
+  * @ext_ts_chan: the external timestamp channel in use
+@@ -180,7 +179,6 @@ struct ice_ptp_port {
+ struct ice_ptp {
+ 	struct ice_ptp_port port;
+ 	struct kthread_delayed_work work;
+-	struct kthread_work extts_work;
+ 	u64 cached_phc_time;
+ 	unsigned long cached_phc_jiffies;
+ 	u8 ext_ts_chan;
+@@ -246,6 +244,7 @@ int ice_ptp_get_ts_config(struct ice_pf
+ void ice_ptp_cfg_timestamp(struct ice_pf *pf, bool ena);
+ int ice_get_ptp_clock_index(struct ice_pf *pf);
+ 
++void ice_ptp_extts_event(struct ice_pf *pf);
+ s8 ice_ptp_request_ts(struct ice_ptp_tx *tx, struct sk_buff *skb);
+ bool ice_ptp_process_ts(struct ice_pf *pf);
+ 
+@@ -274,6 +273,7 @@ static inline int ice_get_ptp_clock_inde
+ 	return -1;
+ }
+ 
++static inline void ice_ptp_extts_event(struct ice_pf *pf) { }
+ static inline s8
+ ice_ptp_request_ts(struct ice_ptp_tx *tx, struct sk_buff *skb)
+ {
