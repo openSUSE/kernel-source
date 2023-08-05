@@ -17,7 +17,7 @@ OBS_PROJECT_PPC=openSUSE:Factory:PowerPC
 OBS_PROJECT_RISCV=openSUSE:Factory:RISCV
 OBS_PROJECT_S390=openSUSE:Factory:zSystems
 IBS_PROJECT=SUSE:ALP:Source:Standard:Core:1.0:Build
-IBS_PROJECT_ARM=Devel:ARM:Factory
+IBS_PROJECT_ARM=openSUSE.org:openSUSE:Factory:ARM
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
 BUGZILLA_PRODUCT="ALP"
