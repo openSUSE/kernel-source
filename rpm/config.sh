@@ -16,12 +16,6 @@ OBS_PROJECT_LEGACYX86=openSUSE:Factory:LegacyX86
 OBS_PROJECT_PPC=openSUSE:Factory:PowerPC
 OBS_PROJECT_RISCV=openSUSE:Factory:RISCV
 OBS_PROJECT_S390=openSUSE:Factory:zSystems
-IBS_PROJECT=openSUSE.org:openSUSE:Factory
-IBS_PROJECT_ARM=openSUSE.org:openSUSE:Factory:ARM
-IBS_PROJECT_LEGACYX86=openSUSE.org:openSUSE:Factory:LegacyX86
-IBS_PROJECT_PPC=openSUSE.org:openSUSE:Factory:PowerPC
-IBS_PROJECT_RISCV=openSUSE.org:openSUSE:Factory:RISCV
-IBS_PROJECT_S390=openSUSE.org:openSUSE:Factory:zSystems
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
 BUGZILLA_PRODUCT="openSUSE Tumbleweed"
