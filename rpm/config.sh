@@ -10,12 +10,8 @@ BUILD_DTBS="Yes"
 # Use new style livepatch package names
 LIVEPATCH=livepatch
 # buildservice projects to build the kernel against
-OBS_PROJECT=openSUSE:Factory
+OBS_PROJECT=SUSE:ALP:Source:Standard:Core:1.0:Build
 OBS_PROJECT_ARM=openSUSE:Factory:ARM
-OBS_PROJECT_LEGACYX86=openSUSE:Factory:LegacyX86
-OBS_PROJECT_PPC=openSUSE:Factory:PowerPC
-OBS_PROJECT_RISCV=openSUSE:Factory:RISCV
-OBS_PROJECT_S390=openSUSE:Factory:zSystems
 IBS_PROJECT=SUSE:ALP:Source:Standard:Core:1.0:Build
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
