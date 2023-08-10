@@ -188,10 +188,10 @@ class Head(object):
 # kernel.org prefixes and "remote branch name" can be omitted if it is "master".
 remotes = (
     Head(RepoURL("torvalds/linux.git")),
-    Head(RepoURL("netdev/net.git")),
-    Head(RepoURL("davem/net.git")),
-    Head(RepoURL("netdev/net-next.git")),
-    Head(RepoURL("davem/net-next.git")),
+    Head(RepoURL("netdev/net.git"), "main"),
+    Head(RepoURL("davem/net.git"), "main"),
+    Head(RepoURL("netdev/net-next.git"), "main"),
+    Head(RepoURL("davem/net-next.git"), "main"),
     Head(RepoURL("rdma/rdma.git"), "for-rc"),
     Head(RepoURL("rdma/rdma.git"), "for-next"),
     Head(RepoURL("dledford/rdma.git"), "k.o/for-next"),
@@ -212,9 +212,10 @@ remotes = (
     Head(RepoURL("gregkh/driver-core.git"), "driver-core-next"),
     Head(RepoURL("gregkh/tty.git"), "tty-next"),
     Head(RepoURL("gregkh/usb.git"), "usb-next"),
+    Head(RepoURL("gregkh/usb.git"), "usb-linus"),
     Head(RepoURL("jj/linux-apparmor.git"), "apparmor-next"),
-    Head(RepoURL("pablo/nf.git")),
-    Head(RepoURL("pablo/nf-next.git")),
+    Head(RepoURL("netfilter/nf.git")),
+    Head(RepoURL("netfilter/nf-next.git")),
     Head(RepoURL("horms/ipvs.git")),
     Head(RepoURL("horms/ipvs-next.git")),
     Head(RepoURL("klassert/ipsec.git")),
@@ -246,6 +247,7 @@ remotes = (
     Head(RepoURL("vkoul/soundwire.git"),"fixes"),
     Head(RepoURL("vkoul/soundwire.git"),"next"),
     Head(RepoURL("arm64/linux.git"), "for-next/core"),
+    Head(RepoURL("robh/linux.git"), "dt/linus"),
     Head(RepoURL("robh/linux.git"), "for-next"),
     Head(RepoURL("git://git.infradead.org/users/hch/dma-mapping.git"), "for-next"),
     Head(RepoURL("thermal/linux.git"), "thermal/linux-next"),
@@ -261,6 +263,9 @@ remotes = (
     Head(RepoURL("bpf/bpf.git")),
     Head(RepoURL("bpf/bpf-next.git")),
     Head(RepoURL("linusw/linux-gpio.git"), "for-next"),
+    Head(RepoURL("soc/soc.git"), "for-next"),
+    Head(RepoURL("https://gitlab.freedesktop.org/drm/tegra.git"), "for-next"),
+    Head(RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/thierry.reding/linux-pwm.git"), "for-next"),
 )
 
 

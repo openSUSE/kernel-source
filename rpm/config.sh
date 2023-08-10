@@ -6,8 +6,6 @@ VARIANT=-rt
 COMPRESS_MODULES="xz"
 # Use new style livepatch package names
 LIVEPATCH=livepatch
-# Compile binary devicetrees for Leap
-BUILD_DTBS="Yes"
 # buildservice projects to build the kernel against
 OBS_PROJECT=SUSE:SLE-15-SP3:Update
 OBS_PROJECT_ARM=openSUSE:Step:15-SP3
@@ -17,3 +15,11 @@ BUGZILLA_SERVER="apibugzilla.suse.com"
 BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 15 SP3"
 # Check the sorted patches section of series.conf
 SORT_SERIES=yes
+# Modules not listed in supported.conf will abort the kernel build
+SUPPORTED_MODULES_CHECK=Yes
+# Split Leap-only modules to kernel-*-optional subpackage
+SPLIT_OPTIONAL=Yes
+# build documentation in HTML format
+BUILD_HTML=Yes
+# build documentation in PDF format
+BUILD_PDF=No

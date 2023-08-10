@@ -1,0 +1,194 @@
+From: "Steven Rostedt (Google)" <rostedt@goodmis.org>
+Date: Thu, 20 Oct 2022 23:14:27 -0400
+Subject: tracing/ring-buffer: Have polling block on watermark
+Git-commit: 42fb0a1e84ff525ebe560e2baf9451ab69127e2b
+Patch-mainline: v6.1-rc6
+References: git-fixes
+
+Currently the way polling works on the ring buffer is broken. It will
+return immediately if there's any data in the ring buffer whereas a read
+will block until the watermark (defined by the tracefs buffer_percent file)
+is hit.
+
+That is, a select() or poll() will return as if there's data available,
+but then the following read will block. This is broken for the way
+select()s and poll()s are supposed to work.
+
+Have the polling on the ring buffer also block the same way reads and
+splice does on the ring buffer.
+
+Link: https://lkml.kernel.org/r/20221020231427.41be3f26@gandalf.local.home
+
+Cc: Linux Trace Kernel <linux-trace-kernel@vger.kernel.org>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Primiano Tucci <primiano@google.com>
+Cc: stable@vger.kernel.org
+Fixes: 1e0d6714aceb7 ("ring-buffer: Do not wake up a splice waiter when page is not full")
+Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+[ppavlu: s/trace_buffer/ring_buffer/ because we don't have cleanup
+ commit 13292494379f ("tracing: Make struct ring_buffer less ambiguous").]
+Acked-by: Petr Pavlu <petr.pavlu@suse.com>
+---
+ include/linux/ring_buffer.h |  2 +-
+ kernel/trace/ring_buffer.c  | 55 +++++++++++++++++++++++++++++----------------
+ kernel/trace/trace.c        |  2 +-
+ 3 files changed, 38 insertions(+), 21 deletions(-)
+
+diff --git a/include/linux/ring_buffer.h b/include/linux/ring_buffer.h
+index 2504df9a0453..3c7d295746f6 100644
+--- a/include/linux/ring_buffer.h
++++ b/include/linux/ring_buffer.h
+@@ -100,7 +100,7 @@ __ring_buffer_alloc(unsigned long size, unsigned flags, struct lock_class_key *k
+ 
+ int ring_buffer_wait(struct ring_buffer *buffer, int cpu, int full);
+ __poll_t ring_buffer_poll_wait(struct ring_buffer *buffer, int cpu,
+-			  struct file *filp, poll_table *poll_table);
++			  struct file *filp, poll_table *poll_table, int full);
+ void ring_buffer_wake_waiters(struct ring_buffer *buffer, int cpu);
+ 
+ #define RING_BUFFER_ALL_CPUS -1
+diff --git a/kernel/trace/ring_buffer.c b/kernel/trace/ring_buffer.c
+index 9712083832f4..089b1ec9cb3b 100644
+--- a/kernel/trace/ring_buffer.c
++++ b/kernel/trace/ring_buffer.c
+@@ -907,6 +907,21 @@ size_t ring_buffer_nr_dirty_pages(struct ring_buffer *buffer, int cpu)
+ 	return cnt - read;
+ }
+ 
++static __always_inline bool full_hit(struct ring_buffer *buffer, int cpu, int full)
++{
++	struct ring_buffer_per_cpu *cpu_buffer = buffer->buffers[cpu];
++	size_t nr_pages;
++	size_t dirty;
++
++	nr_pages = cpu_buffer->nr_pages;
++	if (!nr_pages || !full)
++		return true;
++
++	dirty = ring_buffer_nr_dirty_pages(buffer, cpu);
++
++	return (dirty * 100) > (full * nr_pages);
++}
++
+ /*
+  * rb_wake_up_waiters - wake up tasks waiting for ring buffer input
+  *
+@@ -1046,22 +1061,20 @@ int ring_buffer_wait(struct ring_buffer *buffer, int cpu, int full)
+ 		    !ring_buffer_empty_cpu(buffer, cpu)) {
+ 			unsigned long flags;
+ 			bool pagebusy;
+-			size_t nr_pages;
+-			size_t dirty;
++			bool done;
+ 
+ 			if (!full)
+ 				break;
+ 
+ 			raw_spin_lock_irqsave(&cpu_buffer->reader_lock, flags);
+ 			pagebusy = cpu_buffer->reader_page == cpu_buffer->commit_page;
+-			nr_pages = cpu_buffer->nr_pages;
+-			dirty = ring_buffer_nr_dirty_pages(buffer, cpu);
++			done = !pagebusy && full_hit(buffer, cpu, full);
++
+ 			if (!cpu_buffer->shortest_full ||
+ 			    cpu_buffer->shortest_full > full)
+ 				cpu_buffer->shortest_full = full;
+ 			raw_spin_unlock_irqrestore(&cpu_buffer->reader_lock, flags);
+-			if (!pagebusy &&
+-			    (!nr_pages || (dirty * 100) > full * nr_pages))
++			if (done)
+ 				break;
+ 		}
+ 
+@@ -1087,6 +1100,7 @@ int ring_buffer_wait(struct ring_buffer *buffer, int cpu, int full)
+  * @cpu: the cpu buffer to wait on
+  * @filp: the file descriptor
+  * @poll_table: The poll descriptor
++ * @full: wait until the percentage of pages are available, if @cpu != RING_BUFFER_ALL_CPUS
+  *
+  * If @cpu == RING_BUFFER_ALL_CPUS then the task will wake up as soon
+  * as data is added to any of the @buffer's cpu buffers. Otherwise
+@@ -1096,14 +1110,15 @@ int ring_buffer_wait(struct ring_buffer *buffer, int cpu, int full)
+  * zero otherwise.
+  */
+ __poll_t ring_buffer_poll_wait(struct ring_buffer *buffer, int cpu,
+-			  struct file *filp, poll_table *poll_table)
++			  struct file *filp, poll_table *poll_table, int full)
+ {
+ 	struct ring_buffer_per_cpu *cpu_buffer;
+ 	struct rb_irq_work *work;
+ 
+-	if (cpu == RING_BUFFER_ALL_CPUS)
++	if (cpu == RING_BUFFER_ALL_CPUS) {
+ 		work = &buffer->irq_work;
+-	else {
++		full = 0;
++	} else {
+ 		if (!cpumask_test_cpu(cpu, buffer->cpumask))
+ 			return -EINVAL;
+ 
+@@ -1111,8 +1126,14 @@ __poll_t ring_buffer_poll_wait(struct ring_buffer *buffer, int cpu,
+ 		work = &cpu_buffer->irq_work;
+ 	}
+ 
+-	poll_wait(filp, &work->waiters, poll_table);
+-	work->waiters_pending = true;
++	if (full) {
++		poll_wait(filp, &work->full_waiters, poll_table);
++		work->full_waiters_pending = true;
++	} else {
++		poll_wait(filp, &work->waiters, poll_table);
++		work->waiters_pending = true;
++	}
++
+ 	/*
+ 	 * There's a tight race between setting the waiters_pending and
+ 	 * checking if the ring buffer is empty.  Once the waiters_pending bit
+@@ -1128,6 +1149,9 @@ __poll_t ring_buffer_poll_wait(struct ring_buffer *buffer, int cpu,
+ 	 */
+ 	smp_mb();
+ 
++	if (full)
++		return full_hit(buffer, cpu, full) ? EPOLLIN | EPOLLRDNORM : 0;
++
+ 	if ((cpu == RING_BUFFER_ALL_CPUS && !ring_buffer_empty(buffer)) ||
+ 	    (cpu != RING_BUFFER_ALL_CPUS && !ring_buffer_empty_cpu(buffer, cpu)))
+ 		return EPOLLIN | EPOLLRDNORM;
+@@ -3155,10 +3179,6 @@ static void rb_commit(struct ring_buffer_per_cpu *cpu_buffer,
+ static __always_inline void
+ rb_wakeups(struct ring_buffer *buffer, struct ring_buffer_per_cpu *cpu_buffer)
+ {
+-	size_t nr_pages;
+-	size_t dirty;
+-	size_t full;
+-
+ 	if (buffer->irq_work.waiters_pending) {
+ 		buffer->irq_work.waiters_pending = false;
+ 		/* irq_work_queue() supplies it's own memory barriers */
+@@ -3182,10 +3202,7 @@ rb_wakeups(struct ring_buffer *buffer, struct ring_buffer_per_cpu *cpu_buffer)
+ 
+ 	cpu_buffer->last_pages_touch = local_read(&cpu_buffer->pages_touched);
+ 
+-	full = cpu_buffer->shortest_full;
+-	nr_pages = cpu_buffer->nr_pages;
+-	dirty = ring_buffer_nr_dirty_pages(buffer, cpu_buffer->cpu);
+-	if (full && nr_pages && (dirty * 100) <= full * nr_pages)
++	if (!full_hit(buffer, cpu_buffer->cpu, cpu_buffer->shortest_full))
+ 		return;
+ 
+ 	cpu_buffer->irq_work.wakeup_full = true;
+diff --git a/kernel/trace/trace.c b/kernel/trace/trace.c
+index 47a44b055a1d..c6c7a0af3ed2 100644
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -6681,7 +6681,7 @@ trace_poll(struct trace_iterator *iter, struct file *filp, poll_table *poll_tabl
+ 		return EPOLLIN | EPOLLRDNORM;
+ 	else
+ 		return ring_buffer_poll_wait(iter->trace_buffer->buffer, iter->cpu_file,
+-					     filp, poll_table);
++					     filp, poll_table, iter->tr->buffer_percent);
+ }
+ 
+ static __poll_t
+

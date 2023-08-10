@@ -715,3 +715,18 @@ References: FATE#123456
 Acked-by: developer@suse.com
 """
         self.header = header.Checker(text, False, "patches.kabi/FATE123456_fix_kabi.patch")
+
+    def test_patch_mainline_invalid2(self):
+        text = """
+From: developer@site.com
+Subject: some patch
+Patch-mainline: Not yet, submitted 2022-08-23
+References: bsc#12345
+Acked-by: developer@suse.com
+"""
+        with self.assertRaises(header.HeaderException) as cm:
+            self.header = header.Checker(text)
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.FormatError))
+        self.assertEqual(1, e.errors())

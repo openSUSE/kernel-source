@@ -1,0 +1,193 @@
+From 0e7ab7efe77451cba4cbecb6c9f5ef83cf32b36b Mon Sep 17 00:00:00 2001
+From: Dave Chinner <dchinner@redhat.com>
+Date: Tue, 24 Mar 2020 20:10:27 -0700
+Subject: [PATCH] xfs: Throttle commits on delayed background CIL push
+Git-commit: 0e7ab7efe77451cba4cbecb6c9f5ef83cf32b36b
+Patch-mainline: v5.7-rc1
+References: git-fixes
+
+In certain situations the background CIL push can be indefinitely
+delayed. While we have workarounds from the obvious cases now, it
+doesn't solve the underlying issue. This issue is that there is no
+upper limit on the CIL where we will either force or wait for
+a background push to start, hence allowing the CIL to grow without
+bound until it consumes all log space.
+
+To fix this, add a new wait queue to the CIL which allows background
+pushes to wait for the CIL context to be switched out. This happens
+when the push starts, so it will allow us to block incoming
+transaction commit completion until the push has started. This will
+only affect processes that are running modifications, and only when
+the CIL threshold has been significantly overrun.
+
+This has no apparent impact on performance, and doesn't even trigger
+until over 45 million inodes had been created in a 16-way fsmark
+test on a 2GB log. That was limiting at 64MB of log space used, so
+the active CIL size is only about 3% of the total log in that case.
+The concurrent removal of those files did not trigger the background
+sleep at all.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Allison Collins <allison.henderson@oracle.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Acked-by: Anthony Iliopoulos <ailiop@suse.com>
+
+---
+ fs/xfs/xfs_log_cil.c  | 37 +++++++++++++++++++++++++++++++++----
+ fs/xfs/xfs_log_priv.h | 24 ++++++++++++++++++++++++
+ fs/xfs/xfs_trace.h    |  1 +
+ 3 files changed, 58 insertions(+), 4 deletions(-)
+
+diff --git a/fs/xfs/xfs_log_cil.c b/fs/xfs/xfs_log_cil.c
+index 23d47eec4b5f..46b111c97197 100644
+--- a/fs/xfs/xfs_log_cil.c
++++ b/fs/xfs/xfs_log_cil.c
+@@ -668,6 +668,11 @@ xlog_cil_push_work(
+ 	push_seq = cil->xc_push_seq;
+ 	ASSERT(push_seq <= ctx->sequence);
+ 
++	/*
++	 * Wake up any background push waiters now this context is being pushed.
++	 */
++	wake_up_all(&ctx->push_wait);
++
+ 	/*
+ 	 * Check if we've anything to push. If there is nothing, then we don't
+ 	 * move on to a new sequence number and so we have to be able to push
+@@ -744,6 +749,7 @@ xlog_cil_push_work(
+ 	 */
+ 	INIT_LIST_HEAD(&new_ctx->committing);
+ 	INIT_LIST_HEAD(&new_ctx->busy_extents);
++	init_waitqueue_head(&new_ctx->push_wait);
+ 	new_ctx->sequence = ctx->sequence + 1;
+ 	new_ctx->cil = cil;
+ 	cil->xc_ctx = new_ctx;
+@@ -891,7 +897,7 @@ xlog_cil_push_work(
+  */
+ static void
+ xlog_cil_push_background(
+-	struct xlog	*log)
++	struct xlog	*log) __releases(cil->xc_ctx_lock)
+ {
+ 	struct xfs_cil	*cil = log->l_cilp;
+ 
+@@ -905,14 +911,36 @@ xlog_cil_push_background(
+ 	 * don't do a background push if we haven't used up all the
+ 	 * space available yet.
+ 	 */
+-	if (cil->xc_ctx->space_used < XLOG_CIL_SPACE_LIMIT(log))
++	if (cil->xc_ctx->space_used < XLOG_CIL_SPACE_LIMIT(log)) {
++		up_read(&cil->xc_ctx_lock);
+ 		return;
++	}
+ 
+ 	spin_lock(&cil->xc_push_lock);
+ 	if (cil->xc_push_seq < cil->xc_current_sequence) {
+ 		cil->xc_push_seq = cil->xc_current_sequence;
+ 		queue_work(log->l_mp->m_cil_workqueue, &cil->xc_push_work);
+ 	}
++
++	/*
++	 * Drop the context lock now, we can't hold that if we need to sleep
++	 * because we are over the blocking threshold. The push_lock is still
++	 * held, so blocking threshold sleep/wakeup is still correctly
++	 * serialised here.
++	 */
++	up_read(&cil->xc_ctx_lock);
++
++	/*
++	 * If we are well over the space limit, throttle the work that is being
++	 * done until the push work on this context has begun.
++	 */
++	if (cil->xc_ctx->space_used >= XLOG_CIL_BLOCKING_SPACE_LIMIT(log)) {
++		trace_xfs_log_cil_wait(log, cil->xc_ctx->ticket);
++		ASSERT(cil->xc_ctx->space_used < log->l_logsize);
++		xlog_wait(&cil->xc_ctx->push_wait, &cil->xc_push_lock);
++		return;
++	}
++
+ 	spin_unlock(&cil->xc_push_lock);
+ 
+ }
+@@ -1032,9 +1060,9 @@ xfs_log_commit_cil(
+ 		if (lip->li_ops->iop_committing)
+ 			lip->li_ops->iop_committing(lip, xc_commit_lsn);
+ 	}
+-	xlog_cil_push_background(log);
+ 
+-	up_read(&cil->xc_ctx_lock);
++	/* xlog_cil_push_background() releases cil->xc_ctx_lock */
++	xlog_cil_push_background(log);
+ }
+ 
+ /*
+@@ -1193,6 +1221,7 @@ xlog_cil_init(
+ 
+ 	INIT_LIST_HEAD(&ctx->committing);
+ 	INIT_LIST_HEAD(&ctx->busy_extents);
++	init_waitqueue_head(&ctx->push_wait);
+ 	ctx->sequence = 1;
+ 	ctx->cil = cil;
+ 	cil->xc_ctx = ctx;
+diff --git a/fs/xfs/xfs_log_priv.h b/fs/xfs/xfs_log_priv.h
+index 584404896f25..39bf0810841f 100644
+--- a/fs/xfs/xfs_log_priv.h
++++ b/fs/xfs/xfs_log_priv.h
+@@ -240,6 +240,7 @@ struct xfs_cil_ctx {
+ 	struct xfs_log_vec	*lv_chain;	/* logvecs being pushed */
+ 	struct list_head	iclog_entry;
+ 	struct list_head	committing;	/* ctx committing list */
++	wait_queue_head_t	push_wait;	/* background push throttle */
+ 	struct work_struct	discard_endio_work;
+ };
+ 
+@@ -337,10 +338,33 @@ struct xfs_cil {
+  *   buffer window (32MB) as measurements have shown this to be roughly the
+  *   point of diminishing performance increases under highly concurrent
+  *   modification workloads.
++ *
++ * To prevent the CIL from overflowing upper commit size bounds, we introduce a
++ * new threshold at which we block committing transactions until the background
++ * CIL commit commences and switches to a new context. While this is not a hard
++ * limit, it forces the process committing a transaction to the CIL to block and
++ * yeild the CPU, giving the CIL push work a chance to be scheduled and start
++ * work. This prevents a process running lots of transactions from overfilling
++ * the CIL because it is not yielding the CPU. We set the blocking limit at
++ * twice the background push space threshold so we keep in line with the AIL
++ * push thresholds.
++ *
++ * Note: this is not a -hard- limit as blocking is applied after the transaction
++ * is inserted into the CIL and the push has been triggered. It is largely a
++ * throttling mechanism that allows the CIL push to be scheduled and run. A hard
++ * limit will be difficult to implement without introducing global serialisation
++ * in the CIL commit fast path, and it's not at all clear that we actually need
++ * such hard limits given the ~7 years we've run without a hard limit before
++ * finding the first situation where a checkpoint size overflow actually
++ * occurred. Hence the simple throttle, and an ASSERT check to tell us that
++ * we've overrun the max size.
+  */
+ #define XLOG_CIL_SPACE_LIMIT(log)	\
+ 	min_t(int, (log)->l_logsize >> 3, BBTOB(XLOG_TOTAL_REC_SHIFT(log)) << 4)
+ 
++#define XLOG_CIL_BLOCKING_SPACE_LIMIT(log)	\
++	(XLOG_CIL_SPACE_LIMIT(log) * 2)
++
+ /*
+  * ticket grant locks, queues and accounting have their own cachlines
+  * as these are quite hot and can be operated on concurrently.
+diff --git a/fs/xfs/xfs_trace.h b/fs/xfs/xfs_trace.h
+index 6da9c4a24316..94d976e471fd 100644
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -1009,6 +1009,7 @@ DEFINE_LOGGRANT_EVENT(xfs_log_ticket_regrant_sub);
+ DEFINE_LOGGRANT_EVENT(xfs_log_ticket_ungrant);
+ DEFINE_LOGGRANT_EVENT(xfs_log_ticket_ungrant_sub);
+ DEFINE_LOGGRANT_EVENT(xfs_log_ticket_ungrant_exit);
++DEFINE_LOGGRANT_EVENT(xfs_log_cil_wait);
+ 
+ DECLARE_EVENT_CLASS(xfs_log_item_class,
+ 	TP_PROTO(struct xfs_log_item *lip),
+-- 
+2.35.3
+
