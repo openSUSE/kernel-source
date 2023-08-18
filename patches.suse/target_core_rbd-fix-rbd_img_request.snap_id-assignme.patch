@@ -1,0 +1,223 @@
+From c16938f37628c8ebc2bf34d5ccf5f8a3b7038770 Mon Sep 17 00:00:00 2001
+From: David Disseldorp <ddiss@suse.de>
+Date: Mon, 3 Jul 2023 18:23:43 +0200
+Subject: [PATCH 2/3] target_core_rbd: fix rbd_img_request.snap_id assignment
+References: bsc#1212857
+Patch-mainline: Never, legacy SES clustered LIO/RBD
+
+As of a52cc68575356 ("rbd: acquire header_rwsem just once in
+rbd_queue_workfn()"), rbd_img_request_create() is no longer responsible
+for setting the rbd_img_request snap_id and snapc members, for read and
+write operations respectively. As a rbd_img_request_create() caller,
+target_core_rbd regressed with this change, such that OSD read requests
+were issued against incorrect ceph_object_id values, resulting in read
+data corruption.
+
+Fix target_core_rbd to call the new rbd_img_capture_header() helper, to
+ensure correct snapshot context values.
+
+Signed-off-by: David Disseldorp <ddiss@suse.de>
+---
+ drivers/block/rbd.c              |  3 +-
+ drivers/target/target_core_rbd.c | 82 +++++++++++++-------------------
+ include/linux/ceph/librbd.h      |  1 +
+ 3 files changed, 35 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index f032b30e26d4..9e22b9097f5b 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -1393,7 +1393,7 @@ struct rbd_img_request *rbd_img_request_create(
+ }
+ EXPORT_SYMBOL(rbd_img_request_create);
+ 
+-static void rbd_img_capture_header(struct rbd_img_request *img_req)
++void rbd_img_capture_header(struct rbd_img_request *img_req)
+ {
+ 	struct rbd_device *rbd_dev = img_req->rbd_dev;
+ 
+@@ -1407,6 +1407,7 @@ static void rbd_img_capture_header(struct rbd_img_request *img_req)
+ 	if (rbd_dev_parent_get(rbd_dev))
+ 		img_request_layered_set(img_req);
+ }
++EXPORT_SYMBOL(rbd_img_capture_header);
+ 
+ void rbd_img_request_destroy(struct rbd_img_request *img_request)
+ {
+diff --git a/drivers/target/target_core_rbd.c b/drivers/target/target_core_rbd.c
+index e6de5fcb4f5b..ad84674e9d40 100644
+--- a/drivers/target/target_core_rbd.c
++++ b/drivers/target/target_core_rbd.c
+@@ -290,7 +290,6 @@ tcm_rbd_execute_cmd(struct se_cmd *cmd, struct rbd_device *rbd_dev,
+ 	struct tcm_rbd_dev *tcm_rbd_dev = TCM_RBD_DEV(cmd->se_dev);
+ 	struct tcm_rbd_cmd *trc;
+ 	struct rbd_img_request *img_request;
+-	struct ceph_snap_context *snapc = NULL;
+ 	u64 mapping_size;
+ 	struct tcm_rbd_sync_notify sync_notify = {
+ 		0,
+@@ -318,28 +317,10 @@ tcm_rbd_execute_cmd(struct se_cmd *cmd, struct rbd_device *rbd_dev,
+ 		goto err;	/* Shouldn't happen */
+ 	}
+ 
+-	/* See rbd_img_capture_header */
+-	down_read(&rbd_dev->header_rwsem);
+-	mapping_size = rbd_dev->mapping.size;
+-	if (op_type != OBJ_OP_READ) {
+-		snapc = rbd_dev->header.snapc;
+-		ceph_get_snap_context(snapc);
+-	}
+-	up_read(&rbd_dev->header_rwsem);
+-
+-	if (offset + length > mapping_size) {
+-		pr_warn("beyond EOD (%llu~%llu > %llu)", offset,
+-			length, mapping_size);
+-		if (!tcm_rbd_dev->emulate_legacy_capacity) {
+-			sense = TCM_ADDRESS_OUT_OF_RANGE;
+-			goto err_snapc;
+-		}
+-	}
+-
+ 	trc = kzalloc(sizeof(struct tcm_rbd_cmd), GFP_KERNEL);
+ 	if (!trc) {
+ 		sense = TCM_OUT_OF_RESOURCES;
+-		goto err_snapc;
++		goto err;
+ 	}
+ 
+ 	img_request = rbd_img_request_create(rbd_dev, op_type,
+@@ -348,11 +329,22 @@ tcm_rbd_execute_cmd(struct se_cmd *cmd, struct rbd_device *rbd_dev,
+ 		sense = TCM_OUT_OF_RESOURCES;
+ 		goto err_trc;
+ 	}
+-	/* snapc is now owned by img_request - see rbd_img_request_destroy */
+-	img_request->snapc = snapc;
+-	snapc = NULL; /* img_request consumes a ref */
+ 	trc->img_request = img_request;
+ 
++	down_read(&rbd_dev->header_rwsem);
++	mapping_size = rbd_dev->mapping.size;
++	rbd_img_capture_header(img_request);
++	up_read(&rbd_dev->header_rwsem);
++
++	if (offset + length > mapping_size) {
++		pr_warn("beyond EOD (%llu~%llu > %llu)", offset,
++			length, mapping_size);
++		if (!tcm_rbd_dev->emulate_legacy_capacity) {
++			sense = TCM_ADDRESS_OUT_OF_RANGE;
++			goto err_img_request;
++		}
++	}
++
+ 	pr_debug("rbd_dev %p img_req %p %d %llu~%llu\n", rbd_dev,
+ 	     img_request, op_type, offset, length);
+ 
+@@ -403,11 +395,9 @@ tcm_rbd_execute_cmd(struct se_cmd *cmd, struct rbd_device *rbd_dev,
+ err_trc:
+ 	kfree(trc->bvecs);
+ 	kfree(trc);
+-err_snapc:
+ 	if (sense)
+ 		pr_warn("RBD op type %d %llx at %llx sense %d",
+ 			op_type, length, offset, sense);
+-	ceph_put_snap_context(snapc);
+ err:
+ 	return sense;
+ }
+@@ -557,7 +547,6 @@ tcm_rbd_execute_cmp_and_write(struct se_cmd *cmd)
+ 	struct rbd_device *rbd_dev = tcm_rbd_dev->rbd_dev;
+ 	struct tcm_rbd_cmd *trc;
+ 	struct rbd_img_request *img_request;
+-	struct ceph_snap_context *snapc = NULL;
+ 	u64 mapping_size;
+ 	sense_reason_t sense = TCM_NO_SENSE;
+ 	u64 offset = rbd_lba_shift(dev, cmd->t_task_lba);
+@@ -582,11 +571,23 @@ tcm_rbd_execute_cmp_and_write(struct se_cmd *cmd)
+ 		goto err;	/* Shouldn't happen */
+ 	}
+ 
+-	/* See rbd_img_capture_header */
++	trc = kzalloc(sizeof(struct tcm_rbd_cmd), GFP_KERNEL);
++	if (!trc) {
++		sense = TCM_OUT_OF_RESOURCES;
++		goto err;
++	}
++
++	img_request = rbd_img_request_create(rbd_dev, OBJ_OP_CMP_AND_WRITE,
++					     tcm_rbd_cmp_and_write_callback);
++	if (!img_request) {
++		sense = TCM_OUT_OF_RESOURCES;
++		goto err_trc;
++	}
++	trc->img_request = img_request;
++
+ 	down_read(&rbd_dev->header_rwsem);
+ 	mapping_size = rbd_dev->mapping.size;
+-	snapc = rbd_dev->header.snapc;
+-	ceph_get_snap_context(snapc);
++	rbd_img_capture_header(img_request);
+ 	up_read(&rbd_dev->header_rwsem);
+ 
+ 	/*
+@@ -599,32 +600,15 @@ tcm_rbd_execute_cmp_and_write(struct se_cmd *cmd)
+ 			length, mapping_size);
+ 		if (!tcm_rbd_dev->emulate_legacy_capacity) {
+ 			sense = TCM_ADDRESS_OUT_OF_RANGE;
+-			goto err_snapc;
++			goto err_img_request;
+ 		}
+ 	}
+ 
+ 	/* need twice as much data for each compare & write operation */
+ 	if (cmd->data_length < length * 2) {
+ 		sense = TCM_INVALID_CDB_FIELD;
+-		goto err_snapc;
+-	}
+-
+-	trc = kzalloc(sizeof(struct tcm_rbd_cmd), GFP_KERNEL);
+-	if (!trc) {
+-		sense = TCM_OUT_OF_RESOURCES;
+-		goto err_snapc;
+-	}
+-
+-	img_request = rbd_img_request_create(rbd_dev, OBJ_OP_CMP_AND_WRITE,
+-					     tcm_rbd_cmp_and_write_callback);
+-	if (!img_request) {
+-		sense = TCM_OUT_OF_RESOURCES;
+-		goto err_trc;
++		goto err_img_request;
+ 	}
+-	/* snapc is now owned by img_request - see rbd_img_request_destroy */
+-	img_request->snapc = snapc;
+-	snapc = NULL;
+-	trc->img_request = img_request;
+ 
+ 	pr_debug("rbd_dev %p compare-and-write img_req %p %llu~%llu\n",
+ 		 rbd_dev, img_request, offset, length);
+@@ -665,11 +649,9 @@ tcm_rbd_execute_cmp_and_write(struct se_cmd *cmd)
+ err_trc:
+ 	kfree(trc->bvecs);
+ 	kfree(trc);
+-err_snapc:
+ 	if (sense)
+ 		pr_warn("RBD compare-and-write %llx at %llx sense %d",
+ 			length, offset, sense);
+-	ceph_put_snap_context(snapc);
+ err:
+ 	return sense;
+ }
+diff --git a/include/linux/ceph/librbd.h b/include/linux/ceph/librbd.h
+index 53ce1f35b7e1..4cd8b7c4756f 100644
+--- a/include/linux/ceph/librbd.h
++++ b/include/linux/ceph/librbd.h
+@@ -244,6 +244,7 @@ extern struct rbd_img_request *rbd_img_request_create(
+ 					struct rbd_device *rbd_dev,
+ 					enum obj_operation_type op_type,
+ 					rbd_img_request_end_cb_t end_cb);
++extern void rbd_img_capture_header(struct rbd_img_request *img_req);
+ extern int rbd_img_fill_nodata(struct rbd_img_request *img_req,
+ 			       u64 off, u64 len);
+ extern int rbd_img_fill_from_bvecs(struct rbd_img_request *img_req,
+-- 
+2.35.3
+
