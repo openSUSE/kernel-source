@@ -1,0 +1,317 @@
+From ea514c95f5dc9f6c45014e599e28b4f02ec597df Mon Sep 17 00:00:00 2001
+From: David Disseldorp <ddiss@suse.de>
+Date: Tue, 4 Jul 2023 00:10:13 +0200
+Subject: [PATCH 3/3] target_core_rbd: fix leak and reduce kmalloc calls
+References: bsc#1212873
+Patch-mainline: Never, legacy SES clustered LIO/RBD
+
+59e542c869895 ("rbd: embed image request in blk-mq pdu") drops separate
+rbd_img_request allocations, with the structure instead nested in the
+blk-mq PDU. suse-commit de4c7ec6917360df73a9dac6903380ee2d79dfb0
+subsequently readded rbd_img_request_create(), so that target_core_rbd
+could continue to allocate and init rbd_img_request structs via a single
+helper.
+rbd_img_request objects allocated via the new rbd_img_request_create()
+helper result in memory leaks:
+unreferenced object 0xffff88800a1589d8 (size 168):
+  comm "kworker/1:1", pid 23, jiffies 4294895646 (age 2311.456s)
+  hex dump (first 32 bytes):
+    00 48 a7 0a 80 88 ff ff 01 00 00 00 03 00 00 00  .H..............
+    00 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00  ................
+  backtrace:
+    [<000000008dbb35ec>] rbd_img_request_create+0x20/0xa0
+    [<000000002a9d7bea>] tcm_rbd_execute_cmd+0xdd/0x310 [target_core_rbd]
+    [<000000003124002f>] tcm_rbd_execute_rw+0x64/0xa0 [target_core_rbd]
+    [<0000000081d7ec3b>] __target_execute_cmd+0x20/0xa0 [target_core_mod]
+    [<0000000035fa319f>] transport_generic_new_cmd+0x219/0x340 [target_core_mod]
+    [<0000000055664480>] transport_handle_cdb_direct+0x2a/0x50 [target_core_mod]
+    [<00000000dcf27a19>] target_queued_submit_work+0x40/0x100 [target_core_mod]
+    [<0000000055339551>] process_one_work+0x1b4/0x310
+    [<00000000e6d2a2c6>] worker_thread+0x45/0x3c0
+    [<00000000726280bf>] kthread+0x153/0x180
+    [<0000000091131799>] ret_from_fork+0x22/0x30
+
+target_core_rbd already allocates a per SCSI request tcm_rbd_cmd struct,
+so similar to krbd this can be extended to carry the rbd_img_request,
+using the new rbd_img_request_init() helper. Similarly,
+tcm_rbd_cmd.bvecs can be converted to a flexible array member and
+allocated alongside the parent structure, to further reduce kmalloc
+calls.
+
+With this change the leaky rbd_img_request_create() could be removed,
+but is retained for SUSE kABI stability.
+
+Signed-off-by: David Disseldorp <ddiss@suse.de>
+---
+ drivers/block/rbd.c              |   3 +-
+ drivers/target/target_core_rbd.c | 107 ++++++++++++-------------------
+ include/linux/ceph/librbd.h      |   4 ++
+ 3 files changed, 46 insertions(+), 68 deletions(-)
+
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index 9e22b9097f5b..e45663613eef 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -1360,7 +1360,7 @@ static bool rbd_dev_parent_get(struct rbd_device *rbd_dev)
+ 	return counter > 0;
+ }
+ 
+-static void rbd_img_request_init(struct rbd_img_request *img_request,
++void rbd_img_request_init(struct rbd_img_request *img_request,
+ 				 struct rbd_device *rbd_dev,
+ 				 enum obj_operation_type op_type,
+ 				 rbd_img_request_end_cb_t end_cb)
+@@ -1375,6 +1375,7 @@ static void rbd_img_request_init(struct rbd_img_request *img_request,
+ 	mutex_init(&img_request->state_mutex);
+ 	img_request->callback = end_cb;
+ }
++EXPORT_SYMBOL(rbd_img_request_init);
+ 
+ /* This is for use by LIO RBD so we don't export the caches directly */
+ struct rbd_img_request *rbd_img_request_create(
+diff --git a/drivers/target/target_core_rbd.c b/drivers/target/target_core_rbd.c
+index ad84674e9d40..ee003674fb91 100644
+--- a/drivers/target/target_core_rbd.c
++++ b/drivers/target/target_core_rbd.c
+@@ -187,9 +187,9 @@ static sector_t tcm_rbd_get_blocks(struct se_device *dev)
+ }
+ 
+ struct tcm_rbd_cmd {
+-	struct rbd_img_request *img_request;
++	struct rbd_img_request img_request;
+ 	/* for sgl->bvec conversion */
+-	struct bio_vec *bvecs;
++	struct bio_vec bvecs[];
+ };
+ 
+ static sense_reason_t tcm_rbd_execute_sync_cache(struct se_cmd *cmd)
+@@ -199,17 +199,11 @@ static sense_reason_t tcm_rbd_execute_sync_cache(struct se_cmd *cmd)
+ 	return 0;
+ }
+ 
+-static int tcm_rbd_sgl_to_bvecs(struct scatterlist *sgl, u32 sgl_nents,
+-				struct bio_vec **_bvecs)
++static void tcm_rbd_sgl_to_bvecs(struct scatterlist *sgl, u32 sgl_nents,
++				 struct bio_vec *bvecs)
+ {
+ 	int i;
+ 	struct scatterlist *sg;
+-	struct bio_vec *bvecs;
+-
+-	bvecs = kcalloc(sgl_nents, sizeof(struct bio_vec), GFP_KERNEL);
+-	if (!bvecs) {
+-		return -ENOMEM;
+-	}
+ 
+ 	for_each_sg(sgl, sg, sgl_nents, i) {
+ 		pr_debug("sg %d: %u@%u\n", i, sg->length, sg->offset);
+@@ -218,9 +212,6 @@ static int tcm_rbd_sgl_to_bvecs(struct scatterlist *sgl, u32 sgl_nents,
+ 		bvecs[i].bv_offset = sg->offset;
+ 		bvecs[i].bv_len = sg->length;
+ 	}
+-	*_bvecs = bvecs;
+-
+-	return 0;
+ }
+ 
+ /*
+@@ -260,8 +251,7 @@ static void tcm_rbd_async_callback(struct rbd_img_request *img_request,
+ 	cmd->priv = NULL;
+ 	target_complete_cmd(cmd, status);
+ 	if (trc) {
+-		rbd_img_request_destroy(trc->img_request);
+-		kfree(trc->bvecs);
++		rbd_img_request_destroy(&trc->img_request);
+ 		kfree(trc);
+ 	}
+ }
+@@ -317,19 +307,16 @@ tcm_rbd_execute_cmd(struct se_cmd *cmd, struct rbd_device *rbd_dev,
+ 		goto err;	/* Shouldn't happen */
+ 	}
+ 
+-	trc = kzalloc(sizeof(struct tcm_rbd_cmd), GFP_KERNEL);
++	trc = kzalloc(sizeof(*trc) + sgl_nents * sizeof(trc->bvecs[0]),
++		      GFP_NOIO);
+ 	if (!trc) {
+ 		sense = TCM_OUT_OF_RESOURCES;
+ 		goto err;
+ 	}
+ 
+-	img_request = rbd_img_request_create(rbd_dev, op_type,
++	img_request = &trc->img_request;
++	rbd_img_request_init(img_request, rbd_dev, op_type,
+ 			sync ? tcm_rbd_sync_callback : tcm_rbd_async_callback);
+-	if (!img_request) {
+-		sense = TCM_OUT_OF_RESOURCES;
+-		goto err_trc;
+-	}
+-	trc->img_request = img_request;
+ 
+ 	down_read(&rbd_dev->header_rwsem);
+ 	mapping_size = rbd_dev->mapping.size;
+@@ -348,19 +335,17 @@ tcm_rbd_execute_cmd(struct se_cmd *cmd, struct rbd_device *rbd_dev,
+ 	pr_debug("rbd_dev %p img_req %p %d %llu~%llu\n", rbd_dev,
+ 	     img_request, op_type, offset, length);
+ 
+-	if (op_type == OBJ_OP_DISCARD || op_type == OBJ_OP_ZEROOUT)
++	if (op_type == OBJ_OP_DISCARD || op_type == OBJ_OP_ZEROOUT) {
+ 		result = rbd_img_fill_nodata(img_request, offset, length);
+-	else {
++	} else {
+ 		struct ceph_file_extent img_extent = {
+ 			.fe_off = offset,
+ 			.fe_len = length,
+ 		};
+-		result = tcm_rbd_sgl_to_bvecs(sgl, sgl_nents, &trc->bvecs);
+-		if (!result) {
+-			result = rbd_img_fill_from_bvecs(img_request,
+-							 &img_extent, 1,
+-							 trc->bvecs);
+-		}
++		tcm_rbd_sgl_to_bvecs(sgl, sgl_nents, trc->bvecs);
++		result = rbd_img_fill_from_bvecs(img_request,
++						 &img_extent, 1,
++						 trc->bvecs);
+ 	}
+ 	if (result == -ENOMEM) {
+ 		sense = TCM_OUT_OF_RESOURCES;
+@@ -392,8 +377,6 @@ tcm_rbd_execute_cmd(struct se_cmd *cmd, struct rbd_device *rbd_dev,
+ 
+ err_img_request:
+ 	rbd_img_request_destroy(img_request);
+-err_trc:
+-	kfree(trc->bvecs);
+ 	kfree(trc);
+ 	if (sense)
+ 		pr_warn("RBD op type %d %llx at %llx sense %d",
+@@ -533,8 +516,7 @@ static void tcm_rbd_cmp_and_write_callback(struct rbd_img_request *img_request,
+ 	}
+ 
+ 	if (trc) {
+-		rbd_img_request_destroy(trc->img_request);
+-		kfree(trc->bvecs);
++		rbd_img_request_destroy(&trc->img_request);
+ 		kfree(trc);
+ 	}
+ }
+@@ -551,6 +533,10 @@ tcm_rbd_execute_cmp_and_write(struct se_cmd *cmd)
+ 	sense_reason_t sense = TCM_NO_SENSE;
+ 	u64 offset = rbd_lba_shift(dev, cmd->t_task_lba);
+ 	u64 length = rbd_lba_shift(dev, cmd->t_task_nolb);
++	struct ceph_file_extent img_extent = {
++		.fe_off = offset,
++		.fe_len = length,
++	};
+ 	int result;
+ 
+ 	if (!length) {
+@@ -571,30 +557,33 @@ tcm_rbd_execute_cmp_and_write(struct se_cmd *cmd)
+ 		goto err;	/* Shouldn't happen */
+ 	}
+ 
+-	trc = kzalloc(sizeof(struct tcm_rbd_cmd), GFP_KERNEL);
+-	if (!trc) {
+-		sense = TCM_OUT_OF_RESOURCES;
++	/*
++	 * No need to take dev->caw_sem here, as the IO is mapped to a compound
++	 * compare+write OSD request, which is handled atomically by the OSD.
++	 */
++
++	/* need twice as much data for each compare & write operation */
++	if (cmd->data_length < length * 2) {
++		sense = TCM_INVALID_CDB_FIELD;
+ 		goto err;
+ 	}
+ 
+-	img_request = rbd_img_request_create(rbd_dev, OBJ_OP_CMP_AND_WRITE,
+-					     tcm_rbd_cmp_and_write_callback);
+-	if (!img_request) {
++	trc = kzalloc(sizeof(*trc) + cmd->t_data_nents * sizeof(trc->bvecs[0]),
++		      GFP_NOIO);
++	if (!trc) {
+ 		sense = TCM_OUT_OF_RESOURCES;
+-		goto err_trc;
++		goto err;
+ 	}
+-	trc->img_request = img_request;
++
++	img_request = &trc->img_request;
++	rbd_img_request_init(img_request, rbd_dev, OBJ_OP_CMP_AND_WRITE,
++			     tcm_rbd_cmp_and_write_callback);
+ 
+ 	down_read(&rbd_dev->header_rwsem);
+ 	mapping_size = rbd_dev->mapping.size;
+ 	rbd_img_capture_header(img_request);
+ 	up_read(&rbd_dev->header_rwsem);
+ 
+-	/*
+-	 * No need to take dev->caw_sem here, as the IO is mapped to a compound
+-	 * compare+write OSD request, which is handled atomically by the OSD.
+-	 */
+-
+ 	if (offset + length > mapping_size) {
+ 		pr_warn("beyond EOD (%llu~%llu > %llu)", offset,
+ 			length, mapping_size);
+@@ -604,12 +593,6 @@ tcm_rbd_execute_cmp_and_write(struct se_cmd *cmd)
+ 		}
+ 	}
+ 
+-	/* need twice as much data for each compare & write operation */
+-	if (cmd->data_length < length * 2) {
+-		sense = TCM_INVALID_CDB_FIELD;
+-		goto err_img_request;
+-	}
+-
+ 	pr_debug("rbd_dev %p compare-and-write img_req %p %llu~%llu\n",
+ 		 rbd_dev, img_request, offset, length);
+ 
+@@ -617,18 +600,10 @@ tcm_rbd_execute_cmp_and_write(struct se_cmd *cmd)
+ 	 * data in cmd->t_data_sg is arrange as:
+ 	 * [len * data for compare | len * data for write]
+ 	 */
+-	result = tcm_rbd_sgl_to_bvecs(cmd->t_data_sg, cmd->t_data_nents,
+-				      &trc->bvecs);
+-	if (!result) {
+-		struct ceph_file_extent img_extent = {
+-			.fe_off = offset,
+-			.fe_len = length,
+-		};
+-		result = rbd_img_fill_cmp_and_write_from_bvecs(img_request,
+-						      &img_extent,
+-						      trc->bvecs);
+-	}
+-
++	tcm_rbd_sgl_to_bvecs(cmd->t_data_sg, cmd->t_data_nents, trc->bvecs);
++	result = rbd_img_fill_cmp_and_write_from_bvecs(img_request,
++					      &img_extent,
++					      trc->bvecs);
+ 	if (result == -ENOMEM) {
+ 		sense = TCM_OUT_OF_RESOURCES;
+ 		goto err_img_request;
+@@ -646,8 +621,6 @@ tcm_rbd_execute_cmp_and_write(struct se_cmd *cmd)
+ 
+ err_img_request:
+ 	rbd_img_request_destroy(img_request);
+-err_trc:
+-	kfree(trc->bvecs);
+ 	kfree(trc);
+ 	if (sense)
+ 		pr_warn("RBD compare-and-write %llx at %llx sense %d",
+diff --git a/include/linux/ceph/librbd.h b/include/linux/ceph/librbd.h
+index 4cd8b7c4756f..18f34f8feb60 100644
+--- a/include/linux/ceph/librbd.h
++++ b/include/linux/ceph/librbd.h
+@@ -244,6 +244,10 @@ extern struct rbd_img_request *rbd_img_request_create(
+ 					struct rbd_device *rbd_dev,
+ 					enum obj_operation_type op_type,
+ 					rbd_img_request_end_cb_t end_cb);
++extern void rbd_img_request_init(struct rbd_img_request *img_request,
++				 struct rbd_device *rbd_dev,
++				 enum obj_operation_type op_type,
++				 rbd_img_request_end_cb_t end_cb);
+ extern void rbd_img_capture_header(struct rbd_img_request *img_req);
+ extern int rbd_img_fill_nodata(struct rbd_img_request *img_req,
+ 			       u64 off, u64 len);
+-- 
+2.35.3
+
