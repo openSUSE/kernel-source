@@ -1,0 +1,284 @@
+From 6646b9a7ac0b2082455a24bbd4b3eaec575dd623 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Fri, 2 Jun 2023 10:42:53 +0200
+Subject: [PATCH] sched: Unconditionally use full-fat wait_task_inactive()
+
+References: bsc#1212887 (Scheduler functional and performance backports)
+Git-commit: d5e1586617be7093ea3419e3fa9387ed833cdbb1
+Patch-mainline: v6.5-rc1
+
+While modifying wait_task_inactive() for PREEMPT_RT; the build robot
+noted that UP got broken. This led to audit and consideration of the
+UP implementation of wait_task_inactive().
+
+It looks like the UP implementation is also broken for PREEMPT;
+consider task_current_syscall() getting preempted between the two
+calls to wait_task_inactive().
+
+Therefore move the wait_task_inactive() implementation out of
+CONFIG_SMP and unconditionally use it.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20230602103731.GA630648%40hirez.programming.kicks-ass.net
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ include/linux/sched.h |   7 +-
+ kernel/sched/core.c   | 216 +++++++++++++++++++++++++-------------------------
+ 2 files changed, 110 insertions(+), 113 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 8041b8486e41..026c61610db4 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2009,15 +2009,12 @@ static __always_inline void scheduler_ipi(void)
+ 	 */
+ 	preempt_fold_need_resched();
+ }
+-extern unsigned long wait_task_inactive(struct task_struct *, unsigned int match_state);
+ #else
+ static inline void scheduler_ipi(void) { }
+-static inline unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state)
+-{
+-	return 1;
+-}
+ #endif
+ 
++extern unsigned long wait_task_inactive(struct task_struct *, unsigned int match_state);
++
+ /*
+  * Set thread flags in other task's structures.
+  * See asm/thread_info.h for TIF_xxxx flags available:
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index a68d1276bab0..88a48f036019 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2213,6 +2213,114 @@ void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags)
+ 		rq_clock_skip_update(rq);
+ }
+ 
++/*
++ * wait_task_inactive - wait for a thread to unschedule.
++ *
++ * Wait for the thread to block in any of the states set in @match_state.
++ * If it changes, i.e. @p might have woken up, then return zero.  When we
++ * succeed in waiting for @p to be off its CPU, we return a positive number
++ * (its total switch count).  If a second call a short while later returns the
++ * same number, the caller can be sure that @p has remained unscheduled the
++ * whole time.
++ *
++ * The caller must ensure that the task *will* unschedule sometime soon,
++ * else this function might spin for a *long* time. This function can't
++ * be called with interrupts off, or it may introduce deadlock with
++ * smp_call_function() if an IPI is sent by the same process we are
++ * waiting to become inactive.
++ */
++unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state)
++{
++	int running, queued;
++	struct rq_flags rf;
++	unsigned long ncsw;
++	struct rq *rq;
++
++	for (;;) {
++		/*
++		 * We do the initial early heuristics without holding
++		 * any task-queue locks at all. We'll only try to get
++		 * the runqueue lock when things look like they will
++		 * work out!
++		 */
++		rq = task_rq(p);
++
++		/*
++		 * If the task is actively running on another CPU
++		 * still, just relax and busy-wait without holding
++		 * any locks.
++		 *
++		 * NOTE! Since we don't hold any locks, it's not
++		 * even sure that "rq" stays as the right runqueue!
++		 * But we don't care, since "task_on_cpu()" will
++		 * return false if the runqueue has changed and p
++		 * is actually now running somewhere else!
++		 */
++		while (task_on_cpu(rq, p)) {
++			if (!(READ_ONCE(p->__state) & match_state))
++				return 0;
++			cpu_relax();
++		}
++
++		/*
++		 * Ok, time to look more closely! We need the rq
++		 * lock now, to be *sure*. If we're wrong, we'll
++		 * just go back and repeat.
++		 */
++		rq = task_rq_lock(p, &rf);
++		trace_sched_wait_task(p);
++		running = task_on_cpu(rq, p);
++		queued = task_on_rq_queued(p);
++		ncsw = 0;
++		if (READ_ONCE(p->__state) & match_state)
++			ncsw = p->nvcsw | LONG_MIN; /* sets MSB */
++		task_rq_unlock(rq, p, &rf);
++
++		/*
++		 * If it changed from the expected state, bail out now.
++		 */
++		if (unlikely(!ncsw))
++			break;
++
++		/*
++		 * Was it really running after all now that we
++		 * checked with the proper locks actually held?
++		 *
++		 * Oops. Go back and try again..
++		 */
++		if (unlikely(running)) {
++			cpu_relax();
++			continue;
++		}
++
++		/*
++		 * It's not enough that it's not actively running,
++		 * it must be off the runqueue _entirely_, and not
++		 * preempted!
++		 *
++		 * So if it was still runnable (but just not actively
++		 * running right now), it's preempted, and we should
++		 * yield - it could be a while.
++		 */
++		if (unlikely(queued)) {
++			ktime_t to = NSEC_PER_SEC / HZ;
++
++			set_current_state(TASK_UNINTERRUPTIBLE);
++			schedule_hrtimeout(&to, HRTIMER_MODE_REL_HARD);
++			continue;
++		}
++
++		/*
++		 * Ahh, all good. It wasn't running, and it wasn't
++		 * runnable, which means that it will never become
++		 * running in the future either. We're all done!
++		 */
++		break;
++	}
++
++	return ncsw;
++}
++
+ #ifdef CONFIG_SMP
+ 
+ static void
+@@ -3341,114 +3449,6 @@ int migrate_swap(struct task_struct *cur, struct task_struct *p,
+ }
+ #endif /* CONFIG_NUMA_BALANCING */
+ 
+-/*
+- * wait_task_inactive - wait for a thread to unschedule.
+- *
+- * Wait for the thread to block in any of the states set in @match_state.
+- * If it changes, i.e. @p might have woken up, then return zero.  When we
+- * succeed in waiting for @p to be off its CPU, we return a positive number
+- * (its total switch count).  If a second call a short while later returns the
+- * same number, the caller can be sure that @p has remained unscheduled the
+- * whole time.
+- *
+- * The caller must ensure that the task *will* unschedule sometime soon,
+- * else this function might spin for a *long* time. This function can't
+- * be called with interrupts off, or it may introduce deadlock with
+- * smp_call_function() if an IPI is sent by the same process we are
+- * waiting to become inactive.
+- */
+-unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state)
+-{
+-	int running, queued;
+-	struct rq_flags rf;
+-	unsigned long ncsw;
+-	struct rq *rq;
+-
+-	for (;;) {
+-		/*
+-		 * We do the initial early heuristics without holding
+-		 * any task-queue locks at all. We'll only try to get
+-		 * the runqueue lock when things look like they will
+-		 * work out!
+-		 */
+-		rq = task_rq(p);
+-
+-		/*
+-		 * If the task is actively running on another CPU
+-		 * still, just relax and busy-wait without holding
+-		 * any locks.
+-		 *
+-		 * NOTE! Since we don't hold any locks, it's not
+-		 * even sure that "rq" stays as the right runqueue!
+-		 * But we don't care, since "task_on_cpu()" will
+-		 * return false if the runqueue has changed and p
+-		 * is actually now running somewhere else!
+-		 */
+-		while (task_on_cpu(rq, p)) {
+-			if (!(READ_ONCE(p->__state) & match_state))
+-				return 0;
+-			cpu_relax();
+-		}
+-
+-		/*
+-		 * Ok, time to look more closely! We need the rq
+-		 * lock now, to be *sure*. If we're wrong, we'll
+-		 * just go back and repeat.
+-		 */
+-		rq = task_rq_lock(p, &rf);
+-		trace_sched_wait_task(p);
+-		running = task_on_cpu(rq, p);
+-		queued = task_on_rq_queued(p);
+-		ncsw = 0;
+-		if (READ_ONCE(p->__state) & match_state)
+-			ncsw = p->nvcsw | LONG_MIN; /* sets MSB */
+-		task_rq_unlock(rq, p, &rf);
+-
+-		/*
+-		 * If it changed from the expected state, bail out now.
+-		 */
+-		if (unlikely(!ncsw))
+-			break;
+-
+-		/*
+-		 * Was it really running after all now that we
+-		 * checked with the proper locks actually held?
+-		 *
+-		 * Oops. Go back and try again..
+-		 */
+-		if (unlikely(running)) {
+-			cpu_relax();
+-			continue;
+-		}
+-
+-		/*
+-		 * It's not enough that it's not actively running,
+-		 * it must be off the runqueue _entirely_, and not
+-		 * preempted!
+-		 *
+-		 * So if it was still runnable (but just not actively
+-		 * running right now), it's preempted, and we should
+-		 * yield - it could be a while.
+-		 */
+-		if (unlikely(queued)) {
+-			ktime_t to = NSEC_PER_SEC / HZ;
+-
+-			set_current_state(TASK_UNINTERRUPTIBLE);
+-			schedule_hrtimeout(&to, HRTIMER_MODE_REL_HARD);
+-			continue;
+-		}
+-
+-		/*
+-		 * Ahh, all good. It wasn't running, and it wasn't
+-		 * runnable, which means that it will never become
+-		 * running in the future either. We're all done!
+-		 */
+-		break;
+-	}
+-
+-	return ncsw;
+-}
+-
+ /***
+  * kick_process - kick a running thread to enter/exit the kernel
+  * @p: the to-be-kicked thread
