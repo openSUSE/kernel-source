@@ -1,0 +1,189 @@
+From 4de0dbf9b80189d5901d4ab9c08f7c7efce3879d Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Tue, 28 Feb 2023 10:01:59 +0000
+Subject: [PATCH] printk: nobkl: Add printer thread wakeups
+
+References: SLE Realtime Extension
+Git-commit: 4b300e1795243bcbe484d360bf3959819a903e91
+Patch-mainline: v6.5-rc1
+
+Add a function to wakeup the printer threads. Use the new function
+when:
+
+  - records are added to the printk ringbuffer
+  - consoles are started
+  - consoles are resumed
+
+The actual waking is performed via irq_work so that the wakeup can
+be triggered from any context.
+
+Co-developed-by: John Ogness <john.ogness@linutronix.de>
+Signed-off-by: John Ogness <john.ogness@linutronix.de>
+Signed-off-by: Thomas Gleixner (Intel) <tglx@linutronix.de>
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ include/linux/console.h      |  3 +++
+ kernel/printk/internal.h     |  1 +
+ kernel/printk/printk.c       | 26 ++++++++++++++++++++++++++
+ kernel/printk/printk_nobkl.c | 32 ++++++++++++++++++++++++++++++++
+ 4 files changed, 62 insertions(+)
+
+diff --git a/include/linux/console.h b/include/linux/console.h
+index c73f12651aff..b87a9751c702 100644
+--- a/include/linux/console.h
++++ b/include/linux/console.h
+@@ -16,6 +16,7 @@
+ 
+ #include <linux/atomic.h>
+ #include <linux/bits.h>
++#include <linux/irq_work.h>
+ #include <linux/rculist.h>
+ #include <linux/rcuwait.h>
+ #include <linux/types.h>
+@@ -318,6 +319,7 @@ struct cons_context_data;
+  * @thread_pbufs:	Pointer to thread private buffer
+  * @kthread:		Pointer to kernel thread
+  * @rcuwait:		RCU wait for the kernel thread
++ * @irq_work:		IRQ work for thread wakeup
+  * @kthread_waiting:	Indicator whether the kthread is waiting to be woken
+  * @write_atomic:	Write callback for atomic context
+  * @write_thread:	Write callback for printk threaded printing
+@@ -351,6 +353,7 @@ struct console {
+ 	struct printk_buffers	*thread_pbufs;
+ 	struct task_struct	*kthread;
+ 	struct rcuwait		rcuwait;
++	struct irq_work		irq_work;
+ 	atomic_t		kthread_waiting;
+ 
+ 	bool (*write_atomic)(struct console *con, struct cons_write_context *wctxt);
+diff --git a/kernel/printk/internal.h b/kernel/printk/internal.h
+index e4fb600daf06..5befa7763e14 100644
+--- a/kernel/printk/internal.h
++++ b/kernel/printk/internal.h
+@@ -78,6 +78,7 @@ void cons_nobkl_cleanup(struct console *con);
+ bool cons_nobkl_init(struct console *con);
+ bool cons_alloc_percpu_data(struct console *con);
+ void cons_kthread_create(struct console *con);
++void cons_wake_threads(void);
+ 
+ /*
+  * Check if the given console is currently capable and allowed to print
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index ae9193e1dea8..9839c9f25cf7 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -2332,6 +2332,7 @@ asmlinkage int vprintk_emit(int facility, int level,
+ 		preempt_enable();
+ 	}
+ 
++	cons_wake_threads();
+ 	if (in_sched)
+ 		defer_console_output();
+ 	else
+@@ -2602,6 +2603,8 @@ void suspend_console(void)
+ void resume_console(void)
+ {
+ 	struct console *con;
++	short flags;
++	int cookie;
+ 
+ 	if (!console_suspend_enabled)
+ 		return;
+@@ -2621,6 +2624,14 @@ void resume_console(void)
+ 	 */
+ 	synchronize_srcu(&console_srcu);
+ 
++	cookie = console_srcu_read_lock();
++	for_each_console_srcu(con) {
++		flags = console_srcu_read_flags(con);
++		if (flags & CON_NO_BKL)
++			cons_kthread_wake(con);
++	}
++	console_srcu_read_unlock(cookie);
++
+ 	pr_flush(1000, true);
+ }
+ 
+@@ -3222,9 +3233,23 @@ EXPORT_SYMBOL(console_stop);
+ 
+ void console_start(struct console *console)
+ {
++	short flags;
++
+ 	console_list_lock();
+ 	console_srcu_write_flags(console, console->flags | CON_ENABLED);
++	flags = console->flags;
+ 	console_list_unlock();
++
++	/*
++	 * Ensure that all SRCU list walks have completed. The related
++	 * printing context must be able to see it is enabled so that
++	 * it is guaranteed to wake up and resume printing.
++	 */
++	synchronize_srcu(&console_srcu);
++
++	if (flags & CON_NO_BKL)
++		cons_kthread_wake(console);
++
+ 	__pr_flush(console, 1000, true);
+ }
+ EXPORT_SYMBOL(console_start);
+@@ -3914,6 +3939,7 @@ void defer_console_output(void)
+ 
+ void printk_trigger_flush(void)
+ {
++	cons_wake_threads();
+ 	defer_console_output();
+ }
+ 
+diff --git a/kernel/printk/printk_nobkl.c b/kernel/printk/printk_nobkl.c
+index 848307d49aae..320b4e9b3c34 100644
+--- a/kernel/printk/printk_nobkl.c
++++ b/kernel/printk/printk_nobkl.c
+@@ -1371,6 +1371,37 @@ static int cons_kthread_func(void *__console)
+ 	return 0;
+ }
+ 
++/**
++ * cons_irq_work - irq work to wake printk thread
++ * @irq_work:	The irq work to operate on
++ */
++static void cons_irq_work(struct irq_work *irq_work)
++{
++	struct console *con = container_of(irq_work, struct console, irq_work);
++
++	cons_kthread_wake(con);
++}
++
++/**
++ * cons_wake_threads - Wake up printing threads
++ *
++ * A printing thread is only woken if it is within the @kthread_waiting
++ * block. If it is not within the block (or enters the block later), it
++ * will see any new records and continue printing on its own.
++ */
++void cons_wake_threads(void)
++{
++	struct console *con;
++	int cookie;
++
++	cookie = console_srcu_read_lock();
++	for_each_console_srcu(con) {
++		if (con->kthread && atomic_read(&con->kthread_waiting))
++			irq_work_queue(&con->irq_work);
++	}
++	console_srcu_read_unlock(cookie);
++}
++
+ /**
+  * cons_kthread_stop - Stop a printk thread
+  * @con:	Console to operate on
+@@ -1474,6 +1505,7 @@ bool cons_nobkl_init(struct console *con)
+ 
+ 	rcuwait_init(&con->rcuwait);
+ 	atomic_set(&con->kthread_waiting, 0);
++	init_irq_work(&con->irq_work, cons_irq_work);
+ 	cons_state_set(con, CON_STATE_CUR, &state);
+ 	cons_state_set(con, CON_STATE_REQ, &state);
+ 	cons_seq_init(con);
