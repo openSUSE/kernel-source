@@ -1,0 +1,285 @@
+From e1eec1bd789cec09c5e2271dedc694030398f411 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Sun, 11 Sep 2022 00:28:10 +0200
+Subject: [PATCH] printk: nobkl: Add emit function and callback functions for
+ atomic printing
+
+References: SLE Realtime Extension
+Git-commit: 951f18dd8a737f423035c364dc5c36b335e74019
+Patch-mainline: v6.5-rc1
+
+Implement an emit function for non-BKL consoles to output printk
+messages. It utilizes the lockless printk_get_next_message() and
+console_prepend_dropped() functions to retrieve/build the output
+message. The emit function includes the required safety points to
+check for handover/takeover and calls a new write_atomic callback
+of the console driver to output the message. It also includes proper
+handling for updating the non-BKL console sequence number.
+
+Co-developed-by: John Ogness <john.ogness@linutronix.de>
+Signed-off-by: John Ogness <john.ogness@linutronix.de>
+Signed-off-by: Thomas Gleixner (Intel) <tglx@linutronix.de>
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ include/linux/console.h      |   8 +++
+ kernel/printk/internal.h     |  10 ++++
+ kernel/printk/printk.c       |  12 ++---
+ kernel/printk/printk_nobkl.c | 121 ++++++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 142 insertions(+), 9 deletions(-)
+
+diff --git a/include/linux/console.h b/include/linux/console.h
+index 343ba2032cbd..c4fb3a345154 100644
+--- a/include/linux/console.h
++++ b/include/linux/console.h
+@@ -251,10 +251,12 @@ struct printk_buffers;
+  * @newseq:		The sequence number for progress
+  * @prio:		Priority of the context
+  * @pbufs:		Pointer to the text buffer for this context
++ * @dropped:		Dropped counter for the current context
+  * @thread:		The acquire is printk thread context
+  * @hostile:		Hostile takeover requested. Cleared on normal
+  *			acquire or friendly handover
+  * @spinwait:		Spinwait on acquire if possible
++ * @backlog:		Ringbuffer has pending records
+  */
+ struct cons_context {
+ 	struct console		*console;
+@@ -267,9 +269,11 @@ struct cons_context {
+ 	unsigned int		spinwait_max_us;
+ 	enum cons_prio		prio;
+ 	struct printk_buffers	*pbufs;
++	unsigned long		dropped;
+ 	unsigned int		thread		: 1;
+ 	unsigned int		hostile		: 1;
+ 	unsigned int		spinwait	: 1;
++	unsigned int		backlog		: 1;
+ };
+ 
+ /**
+@@ -311,6 +315,7 @@ struct cons_context_data;
+  * @atomic_state:	State array for NOBKL consoles; real and handover
+  * @atomic_seq:		Sequence for record tracking (32bit only)
+  * @thread_pbufs:	Pointer to thread private buffer
++ * @write_atomic:	Write callback for atomic context
+  * @pcpu_data:		Pointer to percpu context data
+  */
+ struct console {
+@@ -338,6 +343,9 @@ struct console {
+ 	atomic_t		__private atomic_seq;
+ #endif
+ 	struct printk_buffers	*thread_pbufs;
++
++	bool (*write_atomic)(struct console *con, struct cons_write_context *wctxt);
++
+ 	struct cons_context_data	__percpu *pcpu_data;
+ };
+ 
+diff --git a/kernel/printk/internal.h b/kernel/printk/internal.h
+index 15a412065327..219db5a26f5b 100644
+--- a/kernel/printk/internal.h
++++ b/kernel/printk/internal.h
+@@ -133,3 +133,13 @@ struct printk_message {
+ struct cons_context_data {
+ 	struct printk_buffers		pbufs;
+ };
++
++bool printk_get_next_message(struct printk_message *pmsg, u64 seq,
++			     bool is_extended, bool may_supress);
++
++#ifdef CONFIG_PRINTK
++
++void console_prepend_dropped(struct printk_message *pmsg,
++			     unsigned long dropped);
++
++#endif
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index a097a164e29f..69248e9b4728 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -713,9 +713,6 @@ static ssize_t msg_print_ext_body(char *buf, size_t size,
+ 	return len;
+ }
+ 
+-static bool printk_get_next_message(struct printk_message *pmsg, u64 seq,
+-				    bool is_extended, bool may_supress);
+-
+ /* /dev/kmsg - userspace message inject/listen interface */
+ struct devkmsg_user {
+ 	atomic64_t seq;
+@@ -2773,7 +2770,7 @@ static void __console_unlock(void)
+  * If @pmsg->pbufs->outbuf is modified, @pmsg->outbuf_len is updated.
+  */
+ #ifdef CONFIG_PRINTK
+-static void console_prepend_dropped(struct printk_message *pmsg, unsigned long dropped)
++void console_prepend_dropped(struct printk_message *pmsg, unsigned long dropped)
+ {
+ 	struct printk_buffers *pbufs = pmsg->pbufs;
+ 	const size_t scratchbuf_sz = sizeof(pbufs->scratchbuf);
+@@ -2805,7 +2802,8 @@ static void console_prepend_dropped(struct printk_message *pmsg, unsigned long d
+ 	pmsg->outbuf_len += len;
+ }
+ #else
+-#define console_prepend_dropped(pmsg, dropped)
++static inline void console_prepend_dropped(struct printk_message *pmsg,
++					   unsigned long dropped) { }
+ #endif /* CONFIG_PRINTK */
+ 
+ /*
+@@ -2827,8 +2825,8 @@ static void console_prepend_dropped(struct printk_message *pmsg, unsigned long d
+  * of @pmsg are valid. (See the documentation of struct printk_message
+  * for information about the @pmsg fields.)
+  */
+-static bool printk_get_next_message(struct printk_message *pmsg, u64 seq,
+-				    bool is_extended, bool may_suppress)
++bool printk_get_next_message(struct printk_message *pmsg, u64 seq,
++			     bool is_extended, bool may_suppress)
+ {
+ 	static int panic_console_dropped;
+ 
+diff --git a/kernel/printk/printk_nobkl.c b/kernel/printk/printk_nobkl.c
+index 6ed06d44117e..c71ed6f19178 100644
+--- a/kernel/printk/printk_nobkl.c
++++ b/kernel/printk/printk_nobkl.c
+@@ -317,7 +317,7 @@ static void cons_context_set_seq(struct cons_context *ctxt)
+  * invalid. Caller has to reacquire the console.
+  */
+ #ifdef CONFIG_64BIT
+-static bool __maybe_unused cons_seq_try_update(struct cons_context *ctxt)
++static bool cons_seq_try_update(struct cons_context *ctxt)
+ {
+ 	struct console *con = ctxt->console;
+ 	struct cons_state old;
+@@ -346,7 +346,7 @@ static bool __maybe_unused cons_seq_try_update(struct cons_context *ctxt)
+ }
+ #else
+ static bool cons_release(struct cons_context *ctxt);
+-static bool __maybe_unused cons_seq_try_update(struct cons_context *ctxt)
++static bool cons_seq_try_update(struct cons_context *ctxt)
+ {
+ 	struct console *con = ctxt->console;
+ 	struct cons_state state;
+@@ -1089,6 +1089,123 @@ bool console_exit_unsafe(struct cons_write_context *wctxt)
+ }
+ EXPORT_SYMBOL_GPL(console_exit_unsafe);
+ 
++/**
++ * cons_get_record - Fill the buffer with the next pending ringbuffer record
++ * @wctxt:	The write context which will be handed to the write function
++ *
++ * Returns:	True if there are records available. If the next record should
++ *		be printed, the output buffer is filled and @wctxt->outbuf
++ *		points to the text to print. If @wctxt->outbuf is NULL after
++ *		the call, the record should not be printed but the caller must
++ *		still update the console sequence number.
++ *
++ *		False means that there are no pending records anymore and the
++ *		printing can stop.
++ */
++static bool cons_get_record(struct cons_write_context *wctxt)
++{
++	struct cons_context *ctxt = &ACCESS_PRIVATE(wctxt, ctxt);
++	struct console *con = ctxt->console;
++	bool is_extended = console_srcu_read_flags(con) & CON_EXTENDED;
++	struct printk_message pmsg = {
++		.pbufs = ctxt->pbufs,
++	};
++
++	if (!printk_get_next_message(&pmsg, ctxt->newseq, is_extended, true))
++		return false;
++
++	ctxt->newseq = pmsg.seq;
++	ctxt->dropped += pmsg.dropped;
++
++	if (pmsg.outbuf_len == 0) {
++		wctxt->outbuf = NULL;
++	} else {
++		if (ctxt->dropped && !is_extended)
++			console_prepend_dropped(&pmsg, ctxt->dropped);
++		wctxt->outbuf = &pmsg.pbufs->outbuf[0];
++	}
++
++	wctxt->len = pmsg.outbuf_len;
++
++	return true;
++}
++
++/**
++ * cons_emit_record - Emit record in the acquired context
++ * @wctxt:	The write context that will be handed to the write function
++ *
++ * Returns:	False if the operation was aborted (takeover or handover).
++ *		True otherwise
++ *
++ * When false is returned, the caller is not allowed to touch console state.
++ * The console is owned by someone else. If the caller wants to print more
++ * it has to reacquire the console first.
++ *
++ * When true is returned, @wctxt->ctxt.backlog indicates whether there are
++ * still records pending in the ringbuffer,
++ */
++static int __maybe_unused cons_emit_record(struct cons_write_context *wctxt)
++{
++	struct cons_context *ctxt = &ACCESS_PRIVATE(wctxt, ctxt);
++	struct console *con = ctxt->console;
++	bool done = false;
++
++	/*
++	 * @con->dropped is not protected in case of hostile takeovers so
++	 * the update below is racy. Annotate it accordingly.
++	 */
++	ctxt->dropped = data_race(READ_ONCE(con->dropped));
++
++	/* Fill the output buffer with the next record */
++	ctxt->backlog = cons_get_record(wctxt);
++	if (!ctxt->backlog)
++		return true;
++
++	/* Safety point. Don't touch state in case of takeover */
++	if (!console_can_proceed(wctxt))
++		return false;
++
++	/* Counterpart to the read above */
++	WRITE_ONCE(con->dropped, ctxt->dropped);
++
++	/*
++	 * In case of skipped records, Update sequence state in @con.
++	 */
++	if (!wctxt->outbuf)
++		goto update;
++
++	/* Tell the driver about potential unsafe state */
++	wctxt->unsafe = ctxt->state.unsafe;
++
++	if (!ctxt->thread && con->write_atomic) {
++		done = con->write_atomic(con, wctxt);
++	} else {
++		cons_release(ctxt);
++		WARN_ON_ONCE(1);
++		return false;
++	}
++
++	/* If not done, the write was aborted due to takeover */
++	if (!done)
++		return false;
++
++	/* If there was a dropped message, it has now been output. */
++	if (ctxt->dropped) {
++		ctxt->dropped = 0;
++		/* Counterpart to the read above */
++		WRITE_ONCE(con->dropped, ctxt->dropped);
++	}
++update:
++	ctxt->newseq++;
++	/*
++	 * The sequence update attempt is not part of console_release()
++	 * because in panic situations the console is not released by
++	 * the panic CPU until all records are written. On 32bit the
++	 * sequence is separate from state anyway.
++	 */
++	return cons_seq_try_update(ctxt);
++}
++
+ /**
+  * cons_nobkl_init - Initialize the NOBKL console specific data
+  * @con:	Console to initialize
