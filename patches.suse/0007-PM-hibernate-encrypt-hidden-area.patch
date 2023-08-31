@@ -1,0 +1,360 @@
+From 9f5eff10f723d39ddac3ed9300cb3246e9298156 Mon Sep 17 00:00:00 2001
+From: "Lee, Chun-Yi" <jlee@suse.com>
+Date: Tue, 12 Dec 2017 14:55:01 +0800
+Subject: [PATCH 07/11] PM / hibernate: encrypt hidden area
+Patch-mainline: Never, SUSE-specific
+References: fate#316350
+
+The hidden area keeps sensitive data (symmetric key, password...) that
+it can not be leaked to user space. So the hidden area page is ignored
+by snapshot process. But it causes that the hidden area is empty after
+system resumed, then all sensitive data are lost.
+
+The idea against this situation is that using EFI secret key to
+encrypt/backup the hidden area when producing snapshot image, then
+decrypt/restore hidden area after system resumed. In resuming process,
+the boot kernel must transfers secret key to target kernel, otherwise
+target kernel doesn't have secret key to decrypt hidden area because
+hidden area (including secret key) was ignored by snapshot.
+
+For transferring secret key to targer kernel, hibernation creates a
+trampoline page in snapshot image. The trampoline page can be used
+by boot kernel to fill in secret key before whole system be restored
+from snapshot image. After system is restored, kernel uses the secret
+key in trampoline page to decrypt/restore hidden area. Then all
+sensitive data are back.
+
+Joey Lee:
+This patch will only be used by hibernation verification. This patch will
+also be replaced after hibernation encryption is ready on mainline.
+
+References: https://lkml.org/lkml/2019/1/3/281
+Signed-off-by: Lee, Chun-Yi <jlee@suse.com>
+---
+ kernel/power/hibernate.c |   18 ++++++
+ kernel/power/power.h     |    5 +
+ kernel/power/snapshot.c  |  133 +++++++++++++++++++++++++++++++++++++++++++++--
+ kernel/power/swap.c      |    2 
+ kernel/power/user.c      |    5 +
+ 5 files changed, 160 insertions(+), 3 deletions(-)
+
+--- a/kernel/power/hibernate.c
++++ b/kernel/power/hibernate.c
+@@ -30,6 +30,7 @@
+ #include <linux/syscore_ops.h>
+ #include <linux/ctype.h>
+ #include <linux/ktime.h>
++#include <linux/efi.h>
+ #include <linux/security.h>
+ #include <linux/secretmem.h>
+ #include <trace/events/power.h>
+@@ -713,12 +714,28 @@ static int load_image_and_restore(void)
+ int hibernate(void)
+ {
+ 	int error;
++	void *secret_key;
+ 
+ 	if (!hibernation_available()) {
+ 		pm_pr_dbg("Hibernation not available.\n");
+ 		return -EPERM;
+ 	}
+ 
++	error = snapshot_create_trampoline();
++	if (error)
++		return error;
++
++	/* using EFI secret key to encrypt hidden area */
++	secret_key = get_efi_secret_key();
++	if (secret_key) {
++		error = encrypt_backup_hidden_area(secret_key, SECRET_KEY_SIZE);
++		if (error) {
++			pr_err("Encrypt hidden area failed: %d\n", error);
++			snapshot_free_trampoline();
++			return error;
++		}
++	}
++
+ 	lock_system_sleep();
+ 	/* The snapshot device should not be opened while we're running */
+ 	if (!hibernate_acquire()) {
+@@ -774,6 +791,7 @@ int hibernate(void)
+ 		pm_restore_gfp_mask();
+ 	} else {
+ 		pm_pr_dbg("Hibernation image restored successfully.\n");
++		snapshot_restore_trampoline();
+ 	}
+ 
+  Free_bitmaps:
+--- a/kernel/power/power.h
++++ b/kernel/power/power.h
+@@ -13,6 +13,7 @@ struct swsusp_info {
+ 	unsigned long		image_pages;
+ 	unsigned long		pages;
+ 	unsigned long		size;
++	unsigned long           trampoline_pfn;
+ } __aligned(PAGE_SIZE);
+ 
+ #ifdef CONFIG_HIBERNATION
+@@ -154,6 +155,10 @@ extern int snapshot_read_next(struct sna
+ extern int snapshot_write_next(struct snapshot_handle *handle);
+ extern void snapshot_write_finalize(struct snapshot_handle *handle);
+ extern int snapshot_image_loaded(struct snapshot_handle *handle);
++extern int snapshot_create_trampoline(void);
++extern void snapshot_init_trampoline(void);
++extern void snapshot_restore_trampoline(void);
++extern void snapshot_free_trampoline(void);
+ 
+ extern bool hibernate_acquire(void);
+ extern void hibernate_release(void);
+--- a/kernel/power/snapshot.c
++++ b/kernel/power/snapshot.c
+@@ -32,6 +32,7 @@
+ #include <linux/ktime.h>
+ #include <linux/set_memory.h>
+ #include <linux/security.h>
++#include <linux/efi.h>
+ 
+ #include <linux/uaccess.h>
+ #include <asm/mmu_context.h>
+@@ -111,6 +112,24 @@ static inline void hibernate_unmap_page(
+ 	}
+ }
+ 
++/*
++ * The trampoline is used to forward information from boot kernel
++ * to image kernel.
++ */
++struct trampoline {
++	bool secret_key_valid;
++	u8 secret_key[SECRET_KEY_SIZE];
++};
++
++/* the trampoline is used by image kernel */
++static void *trampoline_virt;
++
++/* trampoline pfn from swsusp_info in snapshot for snapshot_write_next() */
++static unsigned long trampoline_pfn;
++
++/* Keep the buffer for foward page in snapshot_write_next() */
++static void *trampoline_buff;
++
+ static int swsusp_page_is_free(struct page *);
+ static void swsusp_set_page_forbidden(struct page *);
+ static void swsusp_unset_page_forbidden(struct page *);
+@@ -2094,10 +2113,109 @@ static int init_header(struct swsusp_inf
+ 	info->pages = snapshot_get_image_size();
+ 	info->size = info->pages;
+ 	info->size <<= PAGE_SHIFT;
++	info->trampoline_pfn = page_to_pfn(virt_to_page(trampoline_virt));
+ 	return init_header_complete(info);
+ }
+ 
+ /**
++ * create trampoline - Create a trampoline page before snapshot be created
++ * In hibernation process, this routine will be called by kernel before
++ * the snapshot image be created. It can be used in resuming process.
++ */
++int snapshot_create_trampoline(void)
++{
++	if (trampoline_virt) {
++		pr_warn("PM: Tried to create trampoline again\n");
++		return 0;
++	}
++
++	trampoline_virt = (void *)get_zeroed_page(GFP_KERNEL);
++	if (!trampoline_virt) {
++		pr_err("PM: Allocate trampoline page failed\n");
++		return -ENOMEM;
++	}
++	trampoline_pfn = 0;
++	trampoline_buff = NULL;
++
++	return 0;
++}
++
++/**
++ * initial trampoline - Put data to trampoline buffer for target kernel
++ *
++ * In resuming process, this routine will be called by boot kernel before
++ * the target kernel be restored. The boot kernel uses trampoline buffer
++ * to transfer information to target kernel.
++ */
++void snapshot_init_trampoline(void)
++{
++	struct trampoline *t;
++	void *efi_secret_key;
++
++	if (!trampoline_pfn || !trampoline_buff) {
++		pr_err("PM: Did not find trampoline buffer, pfn: %ld\n",
++			trampoline_pfn);
++		return;
++	}
++
++	hibernate_restore_unprotect_page(trampoline_buff);
++	memset(trampoline_buff, 0, PAGE_SIZE);
++	t = (struct trampoline *)trampoline_buff;
++
++	efi_secret_key = get_efi_secret_key();
++	if (efi_secret_key) {
++		memset(t->secret_key, 0, SECRET_KEY_SIZE);
++		memcpy(t->secret_key, efi_secret_key, SECRET_KEY_SIZE);
++		t->secret_key_valid = true;
++	}
++	pr_info("PM: Hibernation trampoline page prepared\n");
++}
++
++/**
++ * restore trampoline - Handle the data from boot kernel and free.
++ *
++ * In resuming process, this routine will be called by target kernel
++ * after target kernel is restored. The target kernel handles
++ * the data in trampoline that it is transferred from boot kernel.
++ */
++void snapshot_restore_trampoline(void)
++{
++	struct trampoline *t;
++	int ret;
++
++	if (!trampoline_virt) {
++		pr_err("PM: Doesn't have trampoline page\n");
++		return;
++	}
++
++	t = (struct trampoline *)trampoline_virt;
++	if (t->secret_key_valid) {
++		ret = decrypt_restore_hidden_area(t->secret_key, SECRET_KEY_SIZE);
++		if (ret)
++			pr_err("PM: Decrypted hidden area failed: %d\n", ret);
++		else
++			pr_info("PM: Hidden area decrypted\n");
++	}
++
++	snapshot_free_trampoline();
++}
++
++void snapshot_free_trampoline(void)
++{
++	if (!trampoline_virt) {
++		pr_err("PM: No trampoline page can be freed\n");
++		return;
++	}
++
++	trampoline_pfn = 0;
++	trampoline_buff = NULL;
++	memset(trampoline_virt, 0, PAGE_SIZE);
++	free_page((unsigned long)trampoline_virt);
++	trampoline_virt = NULL;
++	pr_info("PM: Trampoline freed\n");
++}
++
++/**
+  * pack_pfns - Prepare PFNs for saving.
+  * @bm: Memory bitmap.
+  * @buf: Memory buffer to store the PFNs in.
+@@ -2242,6 +2360,7 @@ static int load_header(struct swsusp_inf
+ 	if (!error) {
+ 		nr_copy_pages = info->image_pages;
+ 		nr_meta_pages = info->pages - info->image_pages - 1;
++		trampoline_pfn = info->trampoline_pfn;
+ 	}
+ 	return error;
+ }
+@@ -2572,7 +2691,8 @@ static int prepare_image(struct memory_b
+  * Get the address that snapshot_write_next() should return to its caller to
+  * write to.
+  */
+-static void *get_buffer(struct memory_bitmap *bm, struct chain_allocator *ca)
++static void *get_buffer(struct memory_bitmap *bm, struct chain_allocator *ca,
++			unsigned long *pfn_out)
+ {
+ 	struct pbe *pbe;
+ 	struct page *page;
+@@ -2581,6 +2701,9 @@ static void *get_buffer(struct memory_bi
+ 	if (pfn == BM_END_OF_MAP)
+ 		return ERR_PTR(-EFAULT);
+ 
++	if (pfn_out)
++		*pfn_out = pfn;
++
+ 	page = pfn_to_page(pfn);
+ 	if (PageHighMem(page))
+ 		return get_highmem_page_buffer(page, ca);
+@@ -2628,6 +2751,7 @@ static void *get_buffer(struct memory_bi
+ int snapshot_write_next(struct snapshot_handle *handle)
+ {
+ 	static struct chain_allocator ca;
++	unsigned long pfn;
+ 	int error = 0;
+ 
+ 	/* Check if we have already loaded the entire image */
+@@ -2670,7 +2794,7 @@ int snapshot_write_next(struct snapshot_
+ 			chain_init(&ca, GFP_ATOMIC, PG_SAFE);
+ 			memory_bm_position_reset(&orig_bm);
+ 			restore_pblist = NULL;
+-			handle->buffer = get_buffer(&orig_bm, &ca);
++			handle->buffer = get_buffer(&orig_bm, &ca, &pfn);
+ 			handle->sync_read = 0;
+ 			if (IS_ERR(handle->buffer))
+ 				return PTR_ERR(handle->buffer);
+@@ -2678,11 +2802,14 @@ int snapshot_write_next(struct snapshot_
+ 	} else {
+ 		copy_last_highmem_page();
+ 		hibernate_restore_protect_page(handle->buffer);
+-		handle->buffer = get_buffer(&orig_bm, &ca);
++		handle->buffer = get_buffer(&orig_bm, &ca, &pfn);
+ 		if (IS_ERR(handle->buffer))
+ 			return PTR_ERR(handle->buffer);
+ 		if (handle->buffer != buffer)
+ 			handle->sync_read = 0;
++		/* Capture the trampoline for transfer data */
++		if (pfn == trampoline_pfn && trampoline_pfn)
++			trampoline_buff = handle->buffer;
+ 	}
+ 	handle->cur++;
+ 	return PAGE_SIZE;
+--- a/kernel/power/swap.c
++++ b/kernel/power/swap.c
+@@ -1102,6 +1102,7 @@ static int load_image(struct swap_map_ha
+ 		if (!snapshot_image_loaded(snapshot))
+ 			ret = -ENODATA;
+ 
++		snapshot_init_trampoline();
+ 		/* clean the hidden area in boot kernel */
+ 		clean_hidden_area();
+ 	}
+@@ -1453,6 +1454,7 @@ out_finish:
+ 				}
+ 			}
+ 		}
++		snapshot_init_trampoline();
+ 		/* clean the hidden area in boot kernel */
+ 		clean_hidden_area();
+ 	}
+--- a/kernel/power/user.c
++++ b/kernel/power/user.c
+@@ -293,6 +293,7 @@ static long snapshot_ioctl(struct file *
+ 		if (!data->frozen || data->ready)
+ 			break;
+ 		pm_restore_gfp_mask();
++		snapshot_restore_trampoline();
+ 		free_basic_memory_bitmaps();
+ 		data->free_bitmaps = false;
+ 		thaw_processes();
+@@ -304,6 +305,9 @@ static long snapshot_ioctl(struct file *
+ 			error = -EPERM;
+ 			break;
+ 		}
++		error = snapshot_create_trampoline();
++		if (error)
++			return error;
+ 		pm_restore_gfp_mask();
+ 		error = hibernation_snapshot(data->platform_support);
+ 		if (!error) {
+@@ -320,6 +324,7 @@ static long snapshot_ioctl(struct file *
+ 			error = -EPERM;
+ 			break;
+ 		}
++		snapshot_init_trampoline();
+ 		/* clean the hidden area in boot kernel */
+ 		clean_hidden_area();
+ 		error = hibernation_restore(data->platform_support);

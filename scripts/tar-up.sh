@@ -63,7 +63,7 @@ until [ "$#" = "0" ] ; do
       shift
       ;;
     -iu|--ignore-unsupported-deps)
-      # ignored, set %supported_modules_check in the spec instead
+      # ignored, unset SUPPORTED_MODULES_CHECK in the config.sh instead
       shift
       ;;
     -rs|--release-string)

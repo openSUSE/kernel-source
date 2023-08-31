@@ -1,0 +1,156 @@
+From f018b46e3a0120a5ea07bfad5fbbb4265ad67141 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Thu, 25 May 2023 14:57:04 +0200
+Subject: [PATCH] mm/vmalloc: avoid iterating over per CPU vmap blocks twice
+
+References: bsc#1212886 (MM functional and performance backports)
+Patch-mainline: v6.5-rc1
+Git-commit: ca5e46c3400badc418a8fbcaeba711ad60ff4e1b
+
+_vunmap_aliases() walks the per CPU xarrays to find partially unmapped
+blocks and then walks the per cpu free lists to purge fragmented blocks.
+
+Arguably that's waste of CPU cycles and cache lines as the full xarray
+walk already touches every block.
+
+Avoid this double iteration:
+
+  - Split out the code to purge one block and the code to free the local
+    purge list into helper functions.
+
+  - Try to purge the fragmented blocks in the xarray walk before looking at
+    their dirty space.
+
+Link: https://lkml.kernel.org/r/20230525124504.633469722@linutronix.de
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Baoquan He <bhe@redhat.com>
+Cc: Lorenzo Stoakes <lstoakes@gmail.com>
+Cc: Uladzislau Rezki (Sony) <urezki@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ mm/vmalloc.c | 70 +++++++++++++++++++++++++++++++++++++++---------------------
+ 1 file changed, 46 insertions(+), 24 deletions(-)
+
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index 581f7d4a52f1..a51eb56887d4 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -2086,39 +2086,54 @@ static void free_vmap_block(struct vmap_block *vb)
+ 	kfree_rcu(vb, rcu_head);
+ }
+ 
++static bool purge_fragmented_block(struct vmap_block *vb,
++		struct vmap_block_queue *vbq, struct list_head *purge_list)
++{
++	if (vb->free + vb->dirty != VMAP_BBMAP_BITS ||
++	    vb->dirty == VMAP_BBMAP_BITS)
++		return false;
++
++	/* prevent further allocs after releasing lock */
++	vb->free = 0;
++	/* prevent purging it again */
++	vb->dirty = VMAP_BBMAP_BITS;
++	vb->dirty_min = 0;
++	vb->dirty_max = VMAP_BBMAP_BITS;
++	spin_lock(&vbq->lock);
++	list_del_rcu(&vb->free_list);
++	spin_unlock(&vbq->lock);
++	list_add_tail(&vb->purge, purge_list);
++	return true;
++}
++
++static void free_purged_blocks(struct list_head *purge_list)
++{
++	struct vmap_block *vb, *n_vb;
++
++	list_for_each_entry_safe(vb, n_vb, purge_list, purge) {
++		list_del(&vb->purge);
++		free_vmap_block(vb);
++	}
++}
++
+ static void purge_fragmented_blocks(int cpu)
+ {
+ 	LIST_HEAD(purge);
+ 	struct vmap_block *vb;
+-	struct vmap_block *n_vb;
+ 	struct vmap_block_queue *vbq = &per_cpu(vmap_block_queue, cpu);
+ 
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(vb, &vbq->free, free_list) {
+-
+-		if (!(vb->free + vb->dirty == VMAP_BBMAP_BITS && vb->dirty != VMAP_BBMAP_BITS))
++		if (vb->free + vb->dirty != VMAP_BBMAP_BITS ||
++		    vb->dirty == VMAP_BBMAP_BITS)
+ 			continue;
+ 
+ 		spin_lock(&vb->lock);
+-		if (vb->free + vb->dirty == VMAP_BBMAP_BITS && vb->dirty != VMAP_BBMAP_BITS) {
+-			vb->free = 0; /* prevent further allocs after releasing lock */
+-			vb->dirty = VMAP_BBMAP_BITS; /* prevent purging it again */
+-			vb->dirty_min = 0;
+-			vb->dirty_max = VMAP_BBMAP_BITS;
+-			spin_lock(&vbq->lock);
+-			list_del_rcu(&vb->free_list);
+-			spin_unlock(&vbq->lock);
+-			spin_unlock(&vb->lock);
+-			list_add_tail(&vb->purge, &purge);
+-		} else
+-			spin_unlock(&vb->lock);
++		purge_fragmented_block(vb, vbq, &purge);
++		spin_unlock(&vb->lock);
+ 	}
+ 	rcu_read_unlock();
+-
+-	list_for_each_entry_safe(vb, n_vb, &purge, purge) {
+-		list_del(&vb->purge);
+-		free_vmap_block(vb);
+-	}
++	free_purged_blocks(&purge);
+ }
+ 
+ static void purge_fragmented_blocks_allcpus(void)
+@@ -2226,12 +2241,13 @@ static void vb_free(unsigned long addr, unsigned long size)
+ 
+ static void _vm_unmap_aliases(unsigned long start, unsigned long end, int flush)
+ {
++	LIST_HEAD(purge_list);
+ 	int cpu;
+ 
+ 	if (unlikely(!vmap_initialized))
+ 		return;
+ 
+-	might_sleep();
++	mutex_lock(&vmap_purge_lock);
+ 
+ 	for_each_possible_cpu(cpu) {
+ 		struct vmap_block_queue *vbq = &per_cpu(vmap_block_queue, cpu);
+@@ -2241,7 +2257,14 @@ static void _vm_unmap_aliases(unsigned long start, unsigned long end, int flush)
+ 		rcu_read_lock();
+ 		xa_for_each(&vbq->vmap_blocks, idx, vb) {
+ 			spin_lock(&vb->lock);
+-			if (vb->dirty && vb->dirty != VMAP_BBMAP_BITS) {
++
++			/*
++			 * Try to purge a fragmented block first. If it's
++			 * not purgeable, check whether there is dirty
++			 * space to be flushed.
++			 */
++			if (!purge_fragmented_block(vb, vbq, &purge_list) &&
++			    vb->dirty && vb->dirty != VMAP_BBMAP_BITS) {
+ 				unsigned long va_start = vb->va->va_start;
+ 				unsigned long s, e;
+ 
+@@ -2257,9 +2280,8 @@ static void _vm_unmap_aliases(unsigned long start, unsigned long end, int flush)
+ 		}
+ 		rcu_read_unlock();
+ 	}
++	free_purged_blocks(&purge_list);
+ 
+-	mutex_lock(&vmap_purge_lock);
+-	purge_fragmented_blocks_allcpus();
+ 	if (!__purge_vmap_area_lazy(start, end) && flush)
+ 		flush_tlb_kernel_range(start, end);
+ 	mutex_unlock(&vmap_purge_lock);

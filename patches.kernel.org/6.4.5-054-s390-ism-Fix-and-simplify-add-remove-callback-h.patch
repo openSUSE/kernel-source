@@ -1,0 +1,243 @@
+From: Niklas Schnelle <schnelle@linux.ibm.com>
+Date: Fri, 7 Jul 2023 12:56:21 +0200
+Subject: [PATCH] s390/ism: Fix and simplify add()/remove() callback handling
+References: bsc#1012628
+Patch-mainline: 6.4.5
+Git-commit: 76631ffa2fd2d45bae5ad717eef716b94144e0e7
+
+[ Upstream commit 76631ffa2fd2d45bae5ad717eef716b94144e0e7 ]
+
+Previously the clients_lock was protecting the clients array against
+concurrent addition/removal of clients but was also accessed from IRQ
+context. This meant that it had to be a spinlock and that the add() and
+remove() callbacks in which clients need to do allocation and take
+mutexes can't be called under the clients_lock. To work around this these
+callbacks were moved to workqueues. This not only introduced significant
+complexity but is also subtly broken in at least one way.
+
+In ism_dev_init() and ism_dev_exit() clients[i]->tgt_ism is used to
+communicate the added/removed ISM device to the work function. While
+write access to client[i]->tgt_ism is protected by the clients_lock and
+the code waits that there is no pending add/remove work before and after
+setting clients[i]->tgt_ism this is not enough. The problem is that the
+wait happens based on per ISM device counters. Thus a concurrent
+ism_dev_init()/ism_dev_exit() for a different ISM device may overwrite
+a clients[i]->tgt_ism between unlocking the clients_lock and the
+subsequent wait for the work to finnish.
+
+Thankfully with the clients_lock no longer held in IRQ context it can be
+turned into a mutex which can be held during the calls to add()/remove()
+completely removing the need for the workqueues and the associated
+broken housekeeping including the per ISM device counters and the
+clients[i]->tgt_ism.
+
+Fixes: 89e7d2ba61b7 ("net/ism: Add new API for client registration")
+Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/s390/net/ism_drv.c | 86 +++++++++++---------------------------
+ include/linux/ism.h        |  6 ---
+ 2 files changed, 24 insertions(+), 68 deletions(-)
+
+diff --git a/drivers/s390/net/ism_drv.c b/drivers/s390/net/ism_drv.c
+index 216eb4b3..d65571b3 100644
+--- a/drivers/s390/net/ism_drv.c
++++ b/drivers/s390/net/ism_drv.c
+@@ -36,7 +36,7 @@ static const struct smcd_ops ism_ops;
+ static struct ism_client *clients[MAX_CLIENTS];	/* use an array rather than */
+ 						/* a list for fast mapping  */
+ static u8 max_client;
+-static DEFINE_SPINLOCK(clients_lock);
++static DEFINE_MUTEX(clients_lock);
+ struct ism_dev_list {
+ 	struct list_head list;
+ 	struct mutex mutex; /* protects ism device list */
+@@ -59,11 +59,10 @@ static void ism_setup_forwarding(struct ism_client *client, struct ism_dev *ism)
+ int ism_register_client(struct ism_client *client)
+ {
+ 	struct ism_dev *ism;
+-	unsigned long flags;
+ 	int i, rc = -ENOSPC;
+ 
+ 	mutex_lock(&ism_dev_list.mutex);
+-	spin_lock_irqsave(&clients_lock, flags);
++	mutex_lock(&clients_lock);
+ 	for (i = 0; i < MAX_CLIENTS; ++i) {
+ 		if (!clients[i]) {
+ 			clients[i] = client;
+@@ -74,7 +73,8 @@ int ism_register_client(struct ism_client *client)
+ 			break;
+ 		}
+ 	}
+-	spin_unlock_irqrestore(&clients_lock, flags);
++	mutex_unlock(&clients_lock);
++
+ 	if (i < MAX_CLIENTS) {
+ 		/* initialize with all devices that we got so far */
+ 		list_for_each_entry(ism, &ism_dev_list.list, list) {
+@@ -96,11 +96,11 @@ int ism_unregister_client(struct ism_client *client)
+ 	int rc = 0;
+ 
+ 	mutex_lock(&ism_dev_list.mutex);
+-	spin_lock_irqsave(&clients_lock, flags);
++	mutex_lock(&clients_lock);
+ 	clients[client->id] = NULL;
+ 	if (client->id + 1 == max_client)
+ 		max_client--;
+-	spin_unlock_irqrestore(&clients_lock, flags);
++	mutex_unlock(&clients_lock);
+ 	list_for_each_entry(ism, &ism_dev_list.list, list) {
+ 		spin_lock_irqsave(&ism->lock, flags);
+ 		/* Stop forwarding IRQs and events */
+@@ -571,21 +571,9 @@ static u64 ism_get_local_gid(struct ism_dev *ism)
+ 	return ism->local_gid;
+ }
+ 
+-static void ism_dev_add_work_func(struct work_struct *work)
+-{
+-	struct ism_client *client = container_of(work, struct ism_client,
+-						 add_work);
+-
+-	client->add(client->tgt_ism);
+-	ism_setup_forwarding(client, client->tgt_ism);
+-	atomic_dec(&client->tgt_ism->add_dev_cnt);
+-	wake_up(&client->tgt_ism->waitq);
+-}
+-
+ static int ism_dev_init(struct ism_dev *ism)
+ {
+ 	struct pci_dev *pdev = ism->pdev;
+-	unsigned long flags;
+ 	int i, ret;
+ 
+ 	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
+@@ -618,25 +606,16 @@ static int ism_dev_init(struct ism_dev *ism)
+ 		/* hardware is V2 capable */
+ 		ism_create_system_eid();
+ 
+-	init_waitqueue_head(&ism->waitq);
+-	atomic_set(&ism->free_clients_cnt, 0);
+-	atomic_set(&ism->add_dev_cnt, 0);
+-
+-	wait_event(ism->waitq, !atomic_read(&ism->add_dev_cnt));
+-	spin_lock_irqsave(&clients_lock, flags);
+-	for (i = 0; i < max_client; ++i)
++	mutex_lock(&ism_dev_list.mutex);
++	mutex_lock(&clients_lock);
++	for (i = 0; i < max_client; ++i) {
+ 		if (clients[i]) {
+-			INIT_WORK(&clients[i]->add_work,
+-				  ism_dev_add_work_func);
+-			clients[i]->tgt_ism = ism;
+-			atomic_inc(&ism->add_dev_cnt);
+-			schedule_work(&clients[i]->add_work);
++			clients[i]->add(ism);
++			ism_setup_forwarding(clients[i], ism);
+ 		}
+-	spin_unlock_irqrestore(&clients_lock, flags);
+-
+-	wait_event(ism->waitq, !atomic_read(&ism->add_dev_cnt));
++	}
++	mutex_unlock(&clients_lock);
+ 
+-	mutex_lock(&ism_dev_list.mutex);
+ 	list_add(&ism->list, &ism_dev_list.list);
+ 	mutex_unlock(&ism_dev_list.mutex);
+ 
+@@ -711,40 +690,24 @@ static int ism_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	return ret;
+ }
+ 
+-static void ism_dev_remove_work_func(struct work_struct *work)
+-{
+-	struct ism_client *client = container_of(work, struct ism_client,
+-						 remove_work);
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&client->tgt_ism->lock, flags);
+-	client->tgt_ism->subs[client->id] = NULL;
+-	spin_unlock_irqrestore(&client->tgt_ism->lock, flags);
+-	client->remove(client->tgt_ism);
+-	atomic_dec(&client->tgt_ism->free_clients_cnt);
+-	wake_up(&client->tgt_ism->waitq);
+-}
+-
+-/* Callers must hold ism_dev_list.mutex */
+ static void ism_dev_exit(struct ism_dev *ism)
+ {
+ 	struct pci_dev *pdev = ism->pdev;
+ 	unsigned long flags;
+ 	int i;
+ 
+-	wait_event(ism->waitq, !atomic_read(&ism->free_clients_cnt));
+-	spin_lock_irqsave(&clients_lock, flags);
++	spin_lock_irqsave(&ism->lock, flags);
+ 	for (i = 0; i < max_client; ++i)
+-		if (clients[i]) {
+-			INIT_WORK(&clients[i]->remove_work,
+-				  ism_dev_remove_work_func);
+-			clients[i]->tgt_ism = ism;
+-			atomic_inc(&ism->free_clients_cnt);
+-			schedule_work(&clients[i]->remove_work);
+-		}
+-	spin_unlock_irqrestore(&clients_lock, flags);
++		ism->subs[i] = NULL;
++	spin_unlock_irqrestore(&ism->lock, flags);
+ 
+-	wait_event(ism->waitq, !atomic_read(&ism->free_clients_cnt));
++	mutex_lock(&ism_dev_list.mutex);
++	mutex_lock(&clients_lock);
++	for (i = 0; i < max_client; ++i) {
++		if (clients[i])
++			clients[i]->remove(ism);
++	}
++	mutex_unlock(&clients_lock);
+ 
+ 	if (SYSTEM_EID.serial_number[0] != '0' ||
+ 	    SYSTEM_EID.type[0] != '0')
+@@ -755,15 +718,14 @@ static void ism_dev_exit(struct ism_dev *ism)
+ 	kfree(ism->sba_client_arr);
+ 	pci_free_irq_vectors(pdev);
+ 	list_del_init(&ism->list);
++	mutex_unlock(&ism_dev_list.mutex);
+ }
+ 
+ static void ism_remove(struct pci_dev *pdev)
+ {
+ 	struct ism_dev *ism = dev_get_drvdata(&pdev->dev);
+ 
+-	mutex_lock(&ism_dev_list.mutex);
+ 	ism_dev_exit(ism);
+-	mutex_unlock(&ism_dev_list.mutex);
+ 
+ 	pci_release_mem_regions(pdev);
+ 	pci_disable_device(pdev);
+diff --git a/include/linux/ism.h b/include/linux/ism.h
+index 5160d47e..9a4c204d 100644
+--- a/include/linux/ism.h
++++ b/include/linux/ism.h
+@@ -45,9 +45,6 @@ struct ism_dev {
+ 	int ieq_idx;
+ 
+ 	struct ism_client *subs[MAX_CLIENTS];
+-	atomic_t free_clients_cnt;
+-	atomic_t add_dev_cnt;
+-	wait_queue_head_t waitq;
+ };
+ 
+ struct ism_event {
+@@ -69,9 +66,6 @@ struct ism_client {
+ 	 */
+ 	void (*handle_irq)(struct ism_dev *dev, unsigned int bit, u16 dmbemask);
+ 	/* Private area - don't touch! */
+-	struct work_struct remove_work;
+-	struct work_struct add_work;
+-	struct ism_dev *tgt_ism;
+ 	u8 id;
+ };
+ 
+-- 
+2.35.3
+

@@ -1,5 +1,5 @@
 # The version of the main tarball to use
-SRCVERSION=6.2
+SRCVERSION=6.4
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=-rt
 # enable kernel module compression
@@ -10,13 +10,15 @@ BUILD_DTBS="Yes"
 # Use new style livepatch package names
 LIVEPATCH=livepatch
 # buildservice projects to build the kernel against
-OBS_PROJECT=openSUSE:Factory
+OBS_PROJECT=SUSE:ALP:Source:Standard:Core:1.0:Build
 OBS_PROJECT_ARM=openSUSE:Factory:ARM
-OBS_PROJECT_PPC=openSUSE:Factory:PowerPC
-OBS_PROJECT_RISCV=openSUSE:Factory:RISCV
-OBS_PROJECT_S390=openSUSE:Factory:zSystems
-IBS_PROJECT=SUSE:Factory:Head
-IBS_PROJECT_ARM=Devel:ARM:Factory
+IBS_PROJECT=SUSE:ALP:Source:Standard:Core:1.0:Build
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
-BUGZILLA_PRODUCT="openSUSE Tumbleweed"
+BUGZILLA_PRODUCT="ALP"
+SPLIT_OPTIONAL=No
+SUPPORTED_MODULES_CHECK=Yes
+# build documentation in HTML format
+BUILD_HTML=Yes
+# build documentation in PDF format
+BUILD_PDF=No
