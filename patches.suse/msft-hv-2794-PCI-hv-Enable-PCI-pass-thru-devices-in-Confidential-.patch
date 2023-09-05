@@ -1,0 +1,405 @@
+From: Michael Kelley <mikelley@microsoft.com>
+Date: Sun, 26 Mar 2023 06:52:07 -0700
+Patch-mainline: v6.4-rc1
+Subject: PCI: hv: Enable PCI pass-thru devices in Confidential VMs
+Git-commit: 2c6ba4216844ca7918289b49ed5f3f7138ee2402
+References: bsc#1206453
+
+For PCI pass-thru devices in a Confidential VM, Hyper-V requires
+that PCI config space be accessed via hypercalls.  In normal VMs,
+config space accesses are trapped to the Hyper-V host and emulated.
+But in a confidential VM, the host can't access guest memory to
+decode the instruction for emulation, so an explicit hypercall must
+be used.
+
+Add functions to make the new MMIO read and MMIO write hypercalls.
+Update the PCI config space access functions to use the hypercalls
+when such use is indicated by Hyper-V flags.  Also, set the flag to
+allow the Hyper-V PCI driver to be loaded and used in a Confidential
+VM (a.k.a., "Isolation VM").  The driver has previously been hardened
+against a malicious Hyper-V host[1].
+
+[1] https://lore.kernel.org/all/20220511223207.3386-2-parri.andrea@gmail.com/
+
+Co-developed-by: Dexuan Cui <decui@microsoft.com>
+Signed-off-by: Dexuan Cui <decui@microsoft.com>
+Signed-off-by: Michael Kelley <mikelley@microsoft.com>
+Reviewed-by: Boqun Feng <boqun.feng@gmail.com>
+Reviewed-by: Haiyang Zhang <haiyangz@microsoft.com>
+Link: https://lore.kernel.org/r/1679838727-87310-13-git-send-email-mikelley@microsoft.com
+Signed-off-by: Wei Liu <wei.liu@kernel.org>
+Acked-by: Olaf Hering <ohering@suse.de>
+---
+ arch/x86/include/asm/hyperv-tlfs.h  |   3 +
+ drivers/hv/channel_mgmt.c           |   2 +-
+ drivers/pci/controller/pci-hyperv.c | 232 ++++++++++++++++++++--------
+ include/asm-generic/hyperv-tlfs.h   |  22 +++
+ 4 files changed, 194 insertions(+), 65 deletions(-)
+
+diff --git a/arch/x86/include/asm/hyperv-tlfs.h b/arch/x86/include/asm/hyperv-tlfs.h
+--- a/arch/x86/include/asm/hyperv-tlfs.h
++++ b/arch/x86/include/asm/hyperv-tlfs.h
+@@ -122,6 +122,9 @@
+ /* Recommend using enlightened VMCS */
+ #define HV_X64_ENLIGHTENED_VMCS_RECOMMENDED		BIT(14)
+ 
++/* Use hypercalls for MMIO config space access */
++#define HV_X64_USE_MMIO_HYPERCALLS			BIT(21)
++
+ /*
+  * CPU management features identification.
+  * These are HYPERV_CPUID_CPU_MANAGEMENT_FEATURES.EAX bits.
+diff --git a/drivers/hv/channel_mgmt.c b/drivers/hv/channel_mgmt.c
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@ -67,7 +67,7 @@ const struct vmbus_device vmbus_devs[] = {
+ 	{ .dev_type = HV_PCIE,
+ 	  HV_PCIE_GUID,
+ 	  .perf_device = false,
+-	  .allowed_in_isolated = false,
++	  .allowed_in_isolated = true,
+ 	},
+ 
+ 	/* Synthetic Frame Buffer */
+diff --git a/drivers/pci/controller/pci-hyperv.c b/drivers/pci/controller/pci-hyperv.c
+--- a/drivers/pci/controller/pci-hyperv.c
++++ b/drivers/pci/controller/pci-hyperv.c
+@@ -514,6 +514,7 @@ struct hv_pcibus_device {
+ 
+ 	/* Highest slot of child device with resources allocated */
+ 	int wslot_res_allocated;
++	bool use_calls; /* Use hypercalls to access mmio cfg space */
+ 
+ 	/* hypercall arg, must not cross page boundary */
+ 	struct hv_retarget_device_interrupt retarget_msi_interrupt_params;
+@@ -1041,6 +1042,70 @@ static int wslot_to_devfn(u32 wslot)
+ 	return PCI_DEVFN(slot_no.bits.dev, slot_no.bits.func);
+ }
+ 
++static void hv_pci_read_mmio(struct device *dev, phys_addr_t gpa, int size, u32 *val)
++{
++	struct hv_mmio_read_input *in;
++	struct hv_mmio_read_output *out;
++	u64 ret;
++
++	/*
++	 * Must be called with interrupts disabled so it is safe
++	 * to use the per-cpu input argument page.  Use it for
++	 * both input and output.
++	 */
++	in = *this_cpu_ptr(hyperv_pcpu_input_arg);
++	out = *this_cpu_ptr(hyperv_pcpu_input_arg) + sizeof(*in);
++	in->gpa = gpa;
++	in->size = size;
++
++	ret = hv_do_hypercall(HVCALL_MMIO_READ, in, out);
++	if (hv_result_success(ret)) {
++		switch (size) {
++		case 1:
++			*val = *(u8 *)(out->data);
++			break;
++		case 2:
++			*val = *(u16 *)(out->data);
++			break;
++		default:
++			*val = *(u32 *)(out->data);
++			break;
++		}
++	} else
++		dev_err(dev, "MMIO read hypercall error %llx addr %llx size %d\n",
++				ret, gpa, size);
++}
++
++static void hv_pci_write_mmio(struct device *dev, phys_addr_t gpa, int size, u32 val)
++{
++	struct hv_mmio_write_input *in;
++	u64 ret;
++
++	/*
++	 * Must be called with interrupts disabled so it is safe
++	 * to use the per-cpu input argument memory.
++	 */
++	in = *this_cpu_ptr(hyperv_pcpu_input_arg);
++	in->gpa = gpa;
++	in->size = size;
++	switch (size) {
++	case 1:
++		*(u8 *)(in->data) = val;
++		break;
++	case 2:
++		*(u16 *)(in->data) = val;
++		break;
++	default:
++		*(u32 *)(in->data) = val;
++		break;
++	}
++
++	ret = hv_do_hypercall(HVCALL_MMIO_WRITE, in, NULL);
++	if (!hv_result_success(ret))
++		dev_err(dev, "MMIO write hypercall error %llx addr %llx size %d\n",
++				ret, gpa, size);
++}
++
+ /*
+  * PCI Configuration Space for these root PCI buses is implemented as a pair
+  * of pages in memory-mapped I/O space.  Writing to the first page chooses
+@@ -1059,8 +1124,10 @@ static int wslot_to_devfn(u32 wslot)
+ static void _hv_pcifront_read_config(struct hv_pci_dev *hpdev, int where,
+ 				     int size, u32 *val)
+ {
++	struct hv_pcibus_device *hbus = hpdev->hbus;
++	struct device *dev = &hbus->hdev->device;
++	int offset = where + CFG_PAGE_OFFSET;
+ 	unsigned long flags;
+-	void __iomem *addr = hpdev->hbus->cfg_addr + CFG_PAGE_OFFSET + where;
+ 
+ 	/*
+ 	 * If the attempt is to read the IDs or the ROM BAR, simulate that.
+@@ -1088,56 +1155,79 @@ static void _hv_pcifront_read_config(struct hv_pci_dev *hpdev, int where,
+ 		 */
+ 		*val = 0;
+ 	} else if (where + size <= CFG_PAGE_SIZE) {
+-		spin_lock_irqsave(&hpdev->hbus->config_lock, flags);
+-		/* Choose the function to be read. (See comment above) */
+-		writel(hpdev->desc.win_slot.slot, hpdev->hbus->cfg_addr);
+-		/* Make sure the function was chosen before we start reading. */
+-		mb();
+-		/* Read from that function's config space. */
+-		switch (size) {
+-		case 1:
+-			*val = readb(addr);
+-			break;
+-		case 2:
+-			*val = readw(addr);
+-			break;
+-		default:
+-			*val = readl(addr);
+-			break;
++
++		spin_lock_irqsave(&hbus->config_lock, flags);
++		if (hbus->use_calls) {
++			phys_addr_t addr = hbus->mem_config->start + offset;
++
++			hv_pci_write_mmio(dev, hbus->mem_config->start, 4,
++						hpdev->desc.win_slot.slot);
++			hv_pci_read_mmio(dev, addr, size, val);
++		} else {
++			void __iomem *addr = hbus->cfg_addr + offset;
++
++			/* Choose the function to be read. (See comment above) */
++			writel(hpdev->desc.win_slot.slot, hbus->cfg_addr);
++			/* Make sure the function was chosen before reading. */
++			mb();
++			/* Read from that function's config space. */
++			switch (size) {
++			case 1:
++				*val = readb(addr);
++				break;
++			case 2:
++				*val = readw(addr);
++				break;
++			default:
++				*val = readl(addr);
++				break;
++			}
++			/*
++			 * Make sure the read was done before we release the
++			 * spinlock allowing consecutive reads/writes.
++			 */
++			mb();
+ 		}
+-		/*
+-		 * Make sure the read was done before we release the spinlock
+-		 * allowing consecutive reads/writes.
+-		 */
+-		mb();
+-		spin_unlock_irqrestore(&hpdev->hbus->config_lock, flags);
++		spin_unlock_irqrestore(&hbus->config_lock, flags);
+ 	} else {
+-		dev_err(&hpdev->hbus->hdev->device,
+-			"Attempt to read beyond a function's config space.\n");
++		dev_err(dev, "Attempt to read beyond a function's config space.\n");
+ 	}
+ }
+ 
+ static u16 hv_pcifront_get_vendor_id(struct hv_pci_dev *hpdev)
+ {
++	struct hv_pcibus_device *hbus = hpdev->hbus;
++	struct device *dev = &hbus->hdev->device;
++	u32 val;
+ 	u16 ret;
+ 	unsigned long flags;
+-	void __iomem *addr = hpdev->hbus->cfg_addr + CFG_PAGE_OFFSET +
+-			     PCI_VENDOR_ID;
+ 
+-	spin_lock_irqsave(&hpdev->hbus->config_lock, flags);
++	spin_lock_irqsave(&hbus->config_lock, flags);
+ 
+-	/* Choose the function to be read. (See comment above) */
+-	writel(hpdev->desc.win_slot.slot, hpdev->hbus->cfg_addr);
+-	/* Make sure the function was chosen before we start reading. */
+-	mb();
+-	/* Read from that function's config space. */
+-	ret = readw(addr);
+-	/*
+-	 * mb() is not required here, because the spin_unlock_irqrestore()
+-	 * is a barrier.
+-	 */
++	if (hbus->use_calls) {
++		phys_addr_t addr = hbus->mem_config->start +
++					 CFG_PAGE_OFFSET + PCI_VENDOR_ID;
++
++		hv_pci_write_mmio(dev, hbus->mem_config->start, 4,
++					hpdev->desc.win_slot.slot);
++		hv_pci_read_mmio(dev, addr, 2, &val);
++		ret = val;  /* Truncates to 16 bits */
++	} else {
++		void __iomem *addr = hbus->cfg_addr + CFG_PAGE_OFFSET +
++					     PCI_VENDOR_ID;
++		/* Choose the function to be read. (See comment above) */
++		writel(hpdev->desc.win_slot.slot, hbus->cfg_addr);
++		/* Make sure the function was chosen before we start reading. */
++		mb();
++		/* Read from that function's config space. */
++		ret = readw(addr);
++		/*
++		 * mb() is not required here, because the
++		 * spin_unlock_irqrestore() is a barrier.
++		 */
++	}
+ 
+-	spin_unlock_irqrestore(&hpdev->hbus->config_lock, flags);
++	spin_unlock_irqrestore(&hbus->config_lock, flags);
+ 
+ 	return ret;
+ }
+@@ -1152,39 +1242,51 @@ static u16 hv_pcifront_get_vendor_id(struct hv_pci_dev *hpdev)
+ static void _hv_pcifront_write_config(struct hv_pci_dev *hpdev, int where,
+ 				      int size, u32 val)
+ {
++	struct hv_pcibus_device *hbus = hpdev->hbus;
++	struct device *dev = &hbus->hdev->device;
++	int offset = where + CFG_PAGE_OFFSET;
+ 	unsigned long flags;
+-	void __iomem *addr = hpdev->hbus->cfg_addr + CFG_PAGE_OFFSET + where;
+ 
+ 	if (where >= PCI_SUBSYSTEM_VENDOR_ID &&
+ 	    where + size <= PCI_CAPABILITY_LIST) {
+ 		/* SSIDs and ROM BARs are read-only */
+ 	} else if (where >= PCI_COMMAND && where + size <= CFG_PAGE_SIZE) {
+-		spin_lock_irqsave(&hpdev->hbus->config_lock, flags);
+-		/* Choose the function to be written. (See comment above) */
+-		writel(hpdev->desc.win_slot.slot, hpdev->hbus->cfg_addr);
+-		/* Make sure the function was chosen before we start writing. */
+-		wmb();
+-		/* Write to that function's config space. */
+-		switch (size) {
+-		case 1:
+-			writeb(val, addr);
+-			break;
+-		case 2:
+-			writew(val, addr);
+-			break;
+-		default:
+-			writel(val, addr);
+-			break;
++		spin_lock_irqsave(&hbus->config_lock, flags);
++
++		if (hbus->use_calls) {
++			phys_addr_t addr = hbus->mem_config->start + offset;
++
++			hv_pci_write_mmio(dev, hbus->mem_config->start, 4,
++						hpdev->desc.win_slot.slot);
++			hv_pci_write_mmio(dev, addr, size, val);
++		} else {
++			void __iomem *addr = hbus->cfg_addr + offset;
++
++			/* Choose the function to write. (See comment above) */
++			writel(hpdev->desc.win_slot.slot, hbus->cfg_addr);
++			/* Make sure the function was chosen before writing. */
++			wmb();
++			/* Write to that function's config space. */
++			switch (size) {
++			case 1:
++				writeb(val, addr);
++				break;
++			case 2:
++				writew(val, addr);
++				break;
++			default:
++				writel(val, addr);
++				break;
++			}
++			/*
++			 * Make sure the write was done before we release the
++			 * spinlock allowing consecutive reads/writes.
++			 */
++			mb();
+ 		}
+-		/*
+-		 * Make sure the write was done before we release the spinlock
+-		 * allowing consecutive reads/writes.
+-		 */
+-		mb();
+-		spin_unlock_irqrestore(&hpdev->hbus->config_lock, flags);
++		spin_unlock_irqrestore(&hbus->config_lock, flags);
+ 	} else {
+-		dev_err(&hpdev->hbus->hdev->device,
+-			"Attempt to write beyond a function's config space.\n");
++		dev_err(dev, "Attempt to write beyond a function's config space.\n");
+ 	}
+ }
+ 
+@@ -3563,6 +3665,7 @@ static int hv_pci_probe(struct hv_device *hdev,
+ 	hbus->bridge->domain_nr = dom;
+ #ifdef CONFIG_X86
+ 	hbus->sysdata.domain = dom;
++	hbus->use_calls = !!(ms_hyperv.hints & HV_X64_USE_MMIO_HYPERCALLS);
+ #elif defined(CONFIG_ARM64)
+ 	/*
+ 	 * Set the PCI bus parent to be the corresponding VMbus
+@@ -3572,6 +3675,7 @@ static int hv_pci_probe(struct hv_device *hdev,
+ 	 * information to devices created on the bus.
+ 	 */
+ 	hbus->sysdata.parent = hdev->device.parent;
++	hbus->use_calls = false;
+ #endif
+ 
+ 	hbus->hdev = hdev;
+diff --git a/include/asm-generic/hyperv-tlfs.h b/include/asm-generic/hyperv-tlfs.h
+--- a/include/asm-generic/hyperv-tlfs.h
++++ b/include/asm-generic/hyperv-tlfs.h
+@@ -168,6 +168,8 @@ union hv_reference_tsc_msr {
+ #define HVCALL_FLUSH_GUEST_PHYSICAL_ADDRESS_SPACE 0x00af
+ #define HVCALL_FLUSH_GUEST_PHYSICAL_ADDRESS_LIST 0x00b0
+ #define HVCALL_MODIFY_SPARSE_GPA_PAGE_HOST_VISIBILITY 0x00db
++#define HVCALL_MMIO_READ			0x0106
++#define HVCALL_MMIO_WRITE			0x0107
+ 
+ /* Extended hypercalls */
+ #define HV_EXT_CALL_QUERY_CAPABILITIES		0x8001
+@@ -796,4 +798,24 @@ struct hv_memory_hint {
+ 	union hv_gpa_page_range ranges[];
+ } __packed;
+ 
++/* Data structures for HVCALL_MMIO_READ and HVCALL_MMIO_WRITE */
++#define HV_HYPERCALL_MMIO_MAX_DATA_LENGTH 64
++
++struct hv_mmio_read_input {
++	u64 gpa;
++	u32 size;
++	u32 reserved;
++} __packed;
++
++struct hv_mmio_read_output {
++	u8 data[HV_HYPERCALL_MMIO_MAX_DATA_LENGTH];
++} __packed;
++
++struct hv_mmio_write_input {
++	u64 gpa;
++	u32 size;
++	u32 reserved;
++	u8 data[HV_HYPERCALL_MMIO_MAX_DATA_LENGTH];
++} __packed;
++
+ #endif
