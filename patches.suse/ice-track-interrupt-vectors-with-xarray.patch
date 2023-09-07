@@ -1,0 +1,311 @@
+From: Piotr Raczynski <piotr.raczynski@intel.com>
+Date: Mon, 15 May 2023 21:03:18 +0200
+Subject: ice: track interrupt vectors with xarray
+Patch-mainline: v6.5-rc1
+Git-commit: cfebc0a36ea5518d6b32a6999da5accf0a94fafa
+References: jsc#PED-4876
+
+Replace custom interrupt tracker with generic xarray data structure.
+Remove all code responsible for searching for a new entry with xa_alloc,
+which always tries to allocate at the lowes possible index. As a result
+driver is always using a contiguous region of the MSIX vector table.
+
+New tracker keeps ice_irq_entry entries in xarray as opaque for the rest
+of the driver hiding the entry details from the caller.
+
+Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+Reviewed-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+Reviewed-by: Simon Horman <simon.horman@corigine.com>
+Tested-by: Pucha Himasekhar Reddy <himasekharx.reddy.pucha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Piotr Raczynski <piotr.raczynski@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice.h       |    9 --
+ drivers/net/ethernet/intel/ice/ice_irq.c   |  101 ++++++++++++++++++++++-------
+ drivers/net/ethernet/intel/ice/ice_irq.h   |    9 ++
+ drivers/net/ethernet/intel/ice/ice_lib.c   |   45 ------------
+ drivers/net/ethernet/intel/ice/ice_lib.h   |    5 -
+ drivers/net/ethernet/intel/ice/ice_sriov.c |    4 -
+ 6 files changed, 89 insertions(+), 84 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@ -104,7 +104,6 @@
+ #define ICE_Q_WAIT_RETRY_LIMIT	10
+ #define ICE_Q_WAIT_MAX_RETRY	(5 * ICE_Q_WAIT_RETRY_LIMIT)
+ #define ICE_MAX_LG_RSS_QS	256
+-#define ICE_RES_VALID_BIT	0x8000
+ #define ICE_INVAL_Q_INDEX	0xffff
+ 
+ #define ICE_MAX_RXQS_PER_TC		256	/* Used when setting VSI context per TC Rx queues */
+@@ -242,12 +241,6 @@ struct ice_tc_cfg {
+ 	struct ice_tc_info tc_info[ICE_MAX_TRAFFIC_CLASS];
+ };
+ 
+-struct ice_res_tracker {
+-	u16 num_entries;
+-	u16 end;
+-	u16 list[];
+-};
+-
+ struct ice_qs_cfg {
+ 	struct mutex *qs_mutex;  /* will be assigned to &pf->avail_q_mutex */
+ 	unsigned long *pf_map;
+@@ -542,7 +535,7 @@ struct ice_pf {
+ 
+ 	/* OS reserved IRQ details */
+ 	struct msix_entry *msix_entries;
+-	struct ice_res_tracker *irq_tracker;
++	struct ice_irq_tracker irq_tracker;
+ 	/* First MSIX vector used by SR-IOV VFs. Calculated by subtracting the
+ 	 * number of MSIX vectors needed for all SR-IOV VFs from the number of
+ 	 * MSIX vectors allowed on this PF.
+--- a/drivers/net/ethernet/intel/ice/ice_irq.c
++++ b/drivers/net/ethernet/intel/ice/ice_irq.c
+@@ -6,6 +6,75 @@
+ #include "ice_irq.h"
+ 
+ /**
++ * ice_init_irq_tracker - initialize interrupt tracker
++ * @pf: board private structure
++ * @max_vectors: maximum number of vectors that tracker can hold
++ */
++static void
++ice_init_irq_tracker(struct ice_pf *pf, unsigned int max_vectors)
++{
++	pf->irq_tracker.num_entries = max_vectors;
++	xa_init_flags(&pf->irq_tracker.entries, XA_FLAGS_ALLOC);
++}
++
++/**
++ * ice_deinit_irq_tracker - free xarray tracker
++ * @pf: board private structure
++ */
++static void ice_deinit_irq_tracker(struct ice_pf *pf)
++{
++	xa_destroy(&pf->irq_tracker.entries);
++}
++
++/**
++ * ice_free_irq_res - free a block of resources
++ * @pf: board private structure
++ * @index: starting index previously returned by ice_get_res
++ */
++static void ice_free_irq_res(struct ice_pf *pf, u16 index)
++{
++	struct ice_irq_entry *entry;
++
++	entry = xa_erase(&pf->irq_tracker.entries, index);
++	kfree(entry);
++}
++
++/**
++ * ice_get_irq_res - get an interrupt resource
++ * @pf: board private structure
++ *
++ * Allocate new irq entry in the free slot of the tracker. Since xarray
++ * is used, always allocate new entry at the lowest possible index. Set
++ * proper allocation limit for maximum tracker entries.
++ *
++ * Returns allocated irq entry or NULL on failure.
++ */
++static struct ice_irq_entry *ice_get_irq_res(struct ice_pf *pf)
++{
++	struct xa_limit limit = { .max = pf->irq_tracker.num_entries,
++				  .min = 0 };
++	struct ice_irq_entry *entry;
++	unsigned int index;
++	int ret;
++
++	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return NULL;
++
++	ret = xa_alloc(&pf->irq_tracker.entries, &index, entry, limit,
++		       GFP_KERNEL);
++
++	if (ret) {
++		kfree(entry);
++		entry = NULL;
++	} else {
++		entry->index = index;
++	}
++
++	return entry;
++}
++
++/**
+  * ice_reduce_msix_usage - Reduce usage of MSI-X vectors
+  * @pf: board private structure
+  * @v_remain: number of remaining MSI-X vectors to be distributed
+@@ -163,11 +232,7 @@ exit_err:
+ void ice_clear_interrupt_scheme(struct ice_pf *pf)
+ {
+ 	pci_free_irq_vectors(pf->pdev);
+-
+-	if (pf->irq_tracker) {
+-		devm_kfree(ice_pf_to_dev(pf), pf->irq_tracker);
+-		pf->irq_tracker = NULL;
+-	}
++	ice_deinit_irq_tracker(pf);
+ }
+ 
+ /**
+@@ -183,19 +248,7 @@ int ice_init_interrupt_scheme(struct ice
+ 	if (vectors < 0)
+ 		return vectors;
+ 
+-	/* set up vector assignment tracking */
+-	pf->irq_tracker = devm_kzalloc(ice_pf_to_dev(pf),
+-				       struct_size(pf->irq_tracker, list,
+-						   vectors),
+-				       GFP_KERNEL);
+-	if (!pf->irq_tracker) {
+-		pci_free_irq_vectors(pf->pdev);
+-		return -ENOMEM;
+-	}
+-
+-	/* populate SW interrupts pool with number of OS granted IRQs. */
+-	pf->irq_tracker->num_entries = (u16)vectors;
+-	pf->irq_tracker->end = pf->irq_tracker->num_entries;
++	ice_init_irq_tracker(pf, vectors);
+ 
+ 	return 0;
+ }
+@@ -221,13 +274,13 @@ int ice_init_interrupt_scheme(struct ice
+ struct msi_map ice_alloc_irq(struct ice_pf *pf)
+ {
+ 	struct msi_map map = { .index = -ENOENT };
+-	int entry;
++	struct ice_irq_entry *entry;
+ 
+-	entry = ice_get_res(pf, pf->irq_tracker);
+-	if (entry < 0)
++	entry = ice_get_irq_res(pf);
++	if (!entry)
+ 		return map;
+ 
+-	map.index = entry;
++	map.index = entry->index;
+ 	map.virq = pci_irq_vector(pf->pdev, map.index);
+ 
+ 	return map;
+@@ -238,9 +291,9 @@ struct msi_map ice_alloc_irq(struct ice_
+  * @pf: board private structure
+  * @map: map with interrupt details
+  *
+- * Remove allocated interrupt from the interrupt tracker
++ * Remove allocated interrupt from the interrupt tracker.
+  */
+ void ice_free_irq(struct ice_pf *pf, struct msi_map map)
+ {
+-	ice_free_res(pf->irq_tracker, map.index);
++	ice_free_irq_res(pf, map.index);
+ }
+--- a/drivers/net/ethernet/intel/ice/ice_irq.h
++++ b/drivers/net/ethernet/intel/ice/ice_irq.h
+@@ -4,6 +4,15 @@
+ #ifndef _ICE_IRQ_H_
+ #define _ICE_IRQ_H_
+ 
++struct ice_irq_entry {
++	unsigned int index;
++};
++
++struct ice_irq_tracker {
++	struct xarray entries;
++	u16 num_entries;	/* total vectors available */
++};
++
+ int ice_init_interrupt_scheme(struct ice_pf *pf);
+ void ice_clear_interrupt_scheme(struct ice_pf *pf);
+ 
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -1371,51 +1371,6 @@ out:
+ }
+ 
+ /**
+- * ice_free_res - free a block of resources
+- * @res: pointer to the resource
+- * @index: starting index previously returned by ice_get_res
+- *
+- * Returns number of resources freed
+- */
+-int ice_free_res(struct ice_res_tracker *res, u16 index)
+-{
+-	if (!res || index >= res->end)
+-		return -EINVAL;
+-
+-	res->list[index] = 0;
+-
+-	return 0;
+-}
+-
+-/**
+- * ice_get_res - get a resource from the tracker
+- * @pf: board private structure
+- * @res: pointer to the resource
+- *
+- * Returns the item index, or negative for error
+- */
+-int
+-ice_get_res(struct ice_pf *pf, struct ice_res_tracker *res)
+-{
+-	u16 i;
+-
+-	if (!res || !pf)
+-		return -EINVAL;
+-
+-	/* skip already allocated entries */
+-	for (i = 0; i < res->end; i++)
+-		if (!(res->list[i] & ICE_RES_VALID_BIT))
+-			break;
+-
+-	if (i < res->end) {
+-		res->list[i] = ICE_RES_VALID_BIT;
+-		return i;
+-	} else {
+-		return -ENOMEM;
+-	}
+-}
+-
+-/**
+  * ice_vsi_clear_rings - Deallocates the Tx and Rx rings for VSI
+  * @vsi: the VSI having rings deallocated
+  */
+--- a/drivers/net/ethernet/intel/ice/ice_lib.h
++++ b/drivers/net/ethernet/intel/ice/ice_lib.h
+@@ -104,11 +104,6 @@ int ice_ena_vsi(struct ice_vsi *vsi, boo
+ void ice_vsi_decfg(struct ice_vsi *vsi);
+ void ice_dis_vsi(struct ice_vsi *vsi, bool locked);
+ 
+-int ice_free_res(struct ice_res_tracker *res, u16 index);
+-
+-int
+-ice_get_res(struct ice_pf *pf, struct ice_res_tracker *res);
+-
+ int ice_vsi_rebuild(struct ice_vsi *vsi, u32 vsi_flags);
+ int ice_vsi_cfg(struct ice_vsi *vsi, struct ice_vsi_cfg_params *params);
+ 
+--- a/drivers/net/ethernet/intel/ice/ice_sriov.c
++++ b/drivers/net/ethernet/intel/ice/ice_sriov.c
+@@ -418,7 +418,7 @@ int ice_calc_vf_reg_idx(struct ice_vf *v
+ static int ice_sriov_set_msix_res(struct ice_pf *pf, u16 num_msix_needed)
+ {
+ 	u16 total_vectors = pf->hw.func_caps.common_cap.num_msix_vectors;
+-	int vectors_used = pf->irq_tracker->num_entries;
++	int vectors_used = pf->irq_tracker.num_entries;
+ 	int sriov_base_vector;
+ 
+ 	sriov_base_vector = total_vectors - num_msix_needed;
+@@ -470,7 +470,7 @@ static int ice_set_per_vf_res(struct ice
+ 
+ 	/* determine MSI-X resources per VF */
+ 	msix_avail_for_sriov = pf->hw.func_caps.common_cap.num_msix_vectors -
+-		pf->irq_tracker->num_entries;
++		pf->irq_tracker.num_entries;
+ 	msix_avail_per_vf = msix_avail_for_sriov / num_vfs;
+ 	if (msix_avail_per_vf >= ICE_NUM_VF_MSIX_MED) {
+ 		num_msix_per_vf = ICE_NUM_VF_MSIX_MED;
