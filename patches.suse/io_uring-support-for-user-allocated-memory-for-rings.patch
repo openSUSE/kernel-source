@@ -1,0 +1,262 @@
+From 03d89a2de25bbc5c77e61a0cf77663978c4b6ea7 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 5 Nov 2021 17:20:54 -0600
+Subject: [PATCH] io_uring: support for user allocated memory for rings/sqes
+Git-commit: 03d89a2de25bbc5c77e61a0cf77663978c4b6ea7
+Patch-mainline: v6.5-rc1
+References: bsc#1215211
+
+Currently io_uring applications must call mmap(2) twice to map the rings
+themselves, and the sqes array. This works fine, but it does not support
+using huge pages to back the rings/sqes.
+
+Provide a way for the application to pass in pre-allocated memory for
+the rings/sqes, which can then suitably be allocated from shmfs or
+via mmap to get huge page support.
+
+Particularly for larger rings, this reduces the TLBs needed.
+
+If an application wishes to take advantage of that, it must pre-allocate
+the memory needed for the sq/cq ring, and the sqes. The former must
+be passed in via the io_uring_params->cq_off.user_data field, while the
+latter is passed in via the io_uring_params->sq_off.user_data field. Then
+it must set IORING_SETUP_NO_MMAP in the io_uring_params->flags field,
+and io_uring will then map the existing memory into the kernel for shared
+use. The application must not call mmap(2) to map rings as it otherwise
+would have, that will now fail with -EINVAL if this setup flag was used.
+
+The pages used for the rings and sqes must be contigious. The intent here
+is clearly that huge pages should be used, otherwise the normal setup
+procedure works fine as-is. The application may use one huge page for
+both the rings and sqes.
+
+Outside of those initialization changes, everything works like it did
+before.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ include/linux/io_uring_types.h |  10 ++++
+ include/uapi/linux/io_uring.h  |   9 ++-
+ io_uring/io_uring.c            | 106 ++++++++++++++++++++++++++++++---
+ 3 files changed, 114 insertions(+), 11 deletions(-)
+
+diff --git a/include/linux/io_uring_types.h b/include/linux/io_uring_types.h
+index 1b2a20a42413..f04ce513fadb 100644
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -211,6 +211,16 @@ struct io_ring_ctx {
+ 		unsigned int		compat: 1;
+ 
+ 		enum task_work_notify_mode	notify_method;
++
++		/*
++		 * If IORING_SETUP_NO_MMAP is used, then the below holds
++		 * the gup'ed pages for the two rings, and the sqes.
++		 */
++		unsigned short		n_ring_pages;
++		unsigned short		n_sqe_pages;
++		struct page		**ring_pages;
++		struct page		**sqe_pages;
++
+ 		struct io_rings			*rings;
+ 		struct task_struct		*submitter_task;
+ 		struct percpu_ref		refs;
+diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+index 0716cb17e436..2edba9a274de 100644
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -173,6 +173,11 @@ enum {
+  */
+ #define IORING_SETUP_DEFER_TASKRUN	(1U << 13)
+ 
++/*
++ * Application provides the memory for the rings
++ */
++#define IORING_SETUP_NO_MMAP		(1U << 14)
++
+ enum io_uring_op {
+ 	IORING_OP_NOP,
+ 	IORING_OP_READV,
+@@ -406,7 +411,7 @@ struct io_sqring_offsets {
+ 	__u32 dropped;
+ 	__u32 array;
+ 	__u32 resv1;
+-	__u64 resv2;
++	__u64 user_addr;
+ };
+ 
+ /*
+@@ -425,7 +430,7 @@ struct io_cqring_offsets {
+ 	__u32 cqes;
+ 	__u32 flags;
+ 	__u32 resv1;
+-	__u64 resv2;
++	__u64 user_addr;
+ };
+ 
+ /*
+diff --git a/io_uring/io_uring.c b/io_uring/io_uring.c
+index 74433939a318..61379cf8e7f5 100644
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -2688,12 +2688,85 @@ static void io_mem_free(void *ptr)
+ 		free_compound_page(page);
+ }
+ 
++static void io_pages_free(struct page ***pages, int npages)
++{
++	struct page **page_array;
++	int i;
++
++	if (!pages)
++		return;
++	page_array = *pages;
++	for (i = 0; i < npages; i++)
++		unpin_user_page(page_array[i]);
++	kvfree(page_array);
++	*pages = NULL;
++}
++
++static void *__io_uaddr_map(struct page ***pages, unsigned short *npages,
++			    unsigned long uaddr, size_t size)
++{
++	struct page **page_array;
++	unsigned int nr_pages;
++	int ret;
++
++	*npages = 0;
++
++	if (uaddr & (PAGE_SIZE - 1) || !size)
++		return ERR_PTR(-EINVAL);
++
++	nr_pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
++	if (nr_pages > USHRT_MAX)
++		return ERR_PTR(-EINVAL);
++	page_array = kvmalloc_array(nr_pages, sizeof(struct page *), GFP_KERNEL);
++	if (!page_array)
++		return ERR_PTR(-ENOMEM);
++
++	ret = pin_user_pages_fast(uaddr, nr_pages, FOLL_WRITE | FOLL_LONGTERM,
++					page_array);
++	if (ret != nr_pages) {
++err:
++		io_pages_free(&page_array, ret > 0 ? ret : 0);
++		return ret < 0 ? ERR_PTR(ret) : ERR_PTR(-EFAULT);
++	}
++	/*
++	 * Should be a single page. If the ring is small enough that we can
++	 * use a normal page, that is fine. If we need multiple pages, then
++	 * userspace should use a huge page. That's the only way to guarantee
++	 * that we get contigious memory, outside of just being lucky or
++	 * (currently) having low memory fragmentation.
++	 */
++	if (page_array[0] != page_array[ret - 1])
++		goto err;
++	*pages = page_array;
++	*npages = nr_pages;
++	return page_to_virt(page_array[0]);
++}
++
++static void *io_rings_map(struct io_ring_ctx *ctx, unsigned long uaddr,
++			  size_t size)
++{
++	return __io_uaddr_map(&ctx->ring_pages, &ctx->n_ring_pages, uaddr,
++				size);
++}
++
++static void *io_sqes_map(struct io_ring_ctx *ctx, unsigned long uaddr,
++			 size_t size)
++{
++	return __io_uaddr_map(&ctx->sqe_pages, &ctx->n_sqe_pages, uaddr,
++				size);
++}
++
+ static void io_rings_free(struct io_ring_ctx *ctx)
+ {
+-	io_mem_free(ctx->rings);
+-	io_mem_free(ctx->sq_sqes);
+-	ctx->rings = NULL;
+-	ctx->sq_sqes = NULL;
++	if (!(ctx->flags & IORING_SETUP_NO_MMAP)) {
++		io_mem_free(ctx->rings);
++		io_mem_free(ctx->sq_sqes);
++		ctx->rings = NULL;
++		ctx->sq_sqes = NULL;
++	} else {
++		io_pages_free(&ctx->ring_pages, ctx->n_ring_pages);
++		io_pages_free(&ctx->sqe_pages, ctx->n_sqe_pages);
++	}
+ }
+ 
+ static void *io_mem_alloc(size_t size)
+@@ -3338,6 +3411,10 @@ static void *io_uring_validate_mmap_request(struct file *file,
+ 	struct page *page;
+ 	void *ptr;
+ 
++	/* Don't allow mmap if the ring was setup without it */
++	if (ctx->flags & IORING_SETUP_NO_MMAP)
++		return ERR_PTR(-EINVAL);
++
+ 	switch (offset & IORING_OFF_MMAP_MASK) {
+ 	case IORING_OFF_SQ_RING:
+ 	case IORING_OFF_CQ_RING:
+@@ -3673,7 +3750,11 @@ static __cold int io_allocate_scq_urings(struct io_ring_ctx *ctx,
+ 	if (size == SIZE_MAX)
+ 		return -EOVERFLOW;
+ 
+-	rings = io_mem_alloc(size);
++	if (!(ctx->flags & IORING_SETUP_NO_MMAP))
++		rings = io_mem_alloc(size);
++	else
++		rings = io_rings_map(ctx, p->cq_off.user_addr, size);
++
+ 	if (IS_ERR(rings))
+ 		return PTR_ERR(rings);
+ 
+@@ -3693,7 +3774,11 @@ static __cold int io_allocate_scq_urings(struct io_ring_ctx *ctx,
+ 		return -EOVERFLOW;
+ 	}
+ 
+-	ptr = io_mem_alloc(size);
++	if (!(ctx->flags & IORING_SETUP_NO_MMAP))
++		ptr = io_mem_alloc(size);
++	else
++		ptr = io_sqes_map(ctx, p->sq_off.user_addr, size);
++
+ 	if (IS_ERR(ptr)) {
+ 		io_rings_free(ctx);
+ 		return PTR_ERR(ptr);
+@@ -3885,7 +3970,8 @@ static __cold int io_uring_create(unsigned entries, struct io_uring_params *p,
+ 	p->sq_off.dropped = offsetof(struct io_rings, sq_dropped);
+ 	p->sq_off.array = (char *)ctx->sq_array - (char *)ctx->rings;
+ 	p->sq_off.resv1 = 0;
+-	p->sq_off.resv2 = 0;
++	if (!(ctx->flags & IORING_SETUP_NO_MMAP))
++		p->sq_off.user_addr = 0;
+ 
+ 	p->cq_off.head = offsetof(struct io_rings, cq.head);
+ 	p->cq_off.tail = offsetof(struct io_rings, cq.tail);
+@@ -3895,7 +3981,8 @@ static __cold int io_uring_create(unsigned entries, struct io_uring_params *p,
+ 	p->cq_off.cqes = offsetof(struct io_rings, cqes);
+ 	p->cq_off.flags = offsetof(struct io_rings, cq_flags);
+ 	p->cq_off.resv1 = 0;
+-	p->cq_off.resv2 = 0;
++	if (!(ctx->flags & IORING_SETUP_NO_MMAP))
++		p->cq_off.user_addr = 0;
+ 
+ 	p->features = IORING_FEAT_SINGLE_MMAP | IORING_FEAT_NODROP |
+ 			IORING_FEAT_SUBMIT_STABLE | IORING_FEAT_RW_CUR_POS |
+@@ -3961,7 +4048,8 @@ static long io_uring_setup(u32 entries, struct io_uring_params __user *params)
+ 			IORING_SETUP_R_DISABLED | IORING_SETUP_SUBMIT_ALL |
+ 			IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG |
+ 			IORING_SETUP_SQE128 | IORING_SETUP_CQE32 |
+-			IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN))
++			IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
++			IORING_SETUP_NO_MMAP))
+ 		return -EINVAL;
+ 
+ 	return io_uring_create(entries, &p, params);
+-- 
+2.42.0
+
