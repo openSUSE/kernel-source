@@ -1,0 +1,306 @@
+From a8d50b51d6c84f916ec18d7c70350f2e2c4cf1f0 Mon Sep 17 00:00:00 2001
+From: Jonathan Kim <jonathan.kim@amd.com>
+Date: Fri, 8 Apr 2022 13:12:24 -0400
+Subject: drm/amdkfd: add runtime enable operation
+Git-commit: 455227c4642c5e1867213cea73a527e431779060
+Patch-mainline: v6.5-rc1
+References: jsc#PED-3527 jsc#PED-5475 jsc#PED-6068 jsc#PED-6070 jsc#PED-6116 jsc#PED-6120 jsc#PED-5065 jsc#PED-5477 jsc#PED-5511 jsc#PED-6041 jsc#PED-6069 jsc#PED-6071
+
+The debugger can attach to a process prior to HSA enablement (i.e.
+inferior is spawned by the debugger and attached to immediately before
+target process has been enabled for HSA dispatches) or it
+can attach to a running target that is already HSA enabled.  Either
+way, the debugger needs to know the enablement status to know when
+it can inspect queues.
+
+For the scenario where the debugger spawns the target process,
+it will have to wait for ROCr's runtime enable request from the target.
+The runtime enable request will be able to see that its process has been
+debug attached.  ROCr raises an EC_PROCESS_RUNTIME signal to the
+debugger then blocks the target process while waiting the debugger's
+response. Once the debugger has received the runtime signal, it will
+unblock the target process.
+
+For the scenario where the debugger attaches to a running target
+process, ROCr will set the target process' runtime status as enabled so
+that on an attach request, the debugger will be able to see this
+status and will continue with debug enablement as normal.
+
+A secondary requirement is to conditionally enable the trap tempories only
+if the user requests it (env var HSA_ENABLE_DEBUG=1) or if the debugger
+attaches with HSA runtime enabled.  This is because setting up the trap
+temporaries incurs a performance overhead that is unacceptable for
+microbench performance in normal mode for certain customers.
+
+In the scenario where the debugger spawns the target process, when ROCr
+detects that the debugger has attached during the runtime enable
+request, it will enable the trap temporaries before it blocks the target
+process while waiting for the debugger to respond.
+
+In the scenario where the debugger attaches to a running target process,
+it will enable to trap temporaries itself.
+
+Finally, there is an additional restriction that is required to be
+enforced with runtime enable and HW debug mode setting. The debugger must
+first ensure that HW debug mode has been enabled before permitting HW debug
+mode operations.
+
+With single process debug devices, allowing the debugger to set debug
+HW modes prior to trap activation means that debug HW mode setting can
+occur before the KFD has reserved the debug VMID (0xf) from the hardware
+scheduler's VMID allocation resource pool.  This can result in the
+hardware scheduler assigning VMID 0xf to a non-debugged process and
+having that process inherit debug HW mode settings intended for the
+debugged target process instead, which is both incorrect and potentially
+fatal for normal mode operation.
+
+With multi process debug devices, allowing the debugger to set debug
+HW modes prior to trap activation means that non-debugged processes
+migrating to a new VMID could inherit unintended debug settings.
+
+All debug operations that touch HW settings must require trap activation
+where trap activation is triggered by both debug attach and runtime
+enablement (target has KFD opened and is ready to dispatch work).
+
+Signed-off-by: Jonathan Kim <jonathan.kim@amd.com>
+Reviewed-by: Felix Kuehling <felix.kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c | 143 ++++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_debug.c   |   6 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_debug.h   |   4 +
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |   1 +
+ 4 files changed, 150 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 3776d0248335..3cf4c05fbca7 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -2738,11 +2738,140 @@ static int kfd_ioctl_criu(struct file *filep, struct kfd_process *p, void *data)
+ 	return ret;
+ }
+ 
+-static int kfd_ioctl_runtime_enable(struct file *filep, struct kfd_process *p, void *data)
++static int runtime_enable(struct kfd_process *p, uint64_t r_debug,
++			bool enable_ttmp_setup)
++{
++	int i = 0, ret = 0;
++
++	if (p->is_runtime_retry)
++		goto retry;
++
++	if (p->runtime_info.runtime_state != DEBUG_RUNTIME_STATE_DISABLED)
++		return -EBUSY;
++
++	for (i = 0; i < p->n_pdds; i++) {
++		struct kfd_process_device *pdd = p->pdds[i];
++
++		if (pdd->qpd.queue_count)
++			return -EEXIST;
++	}
++
++	p->runtime_info.runtime_state = DEBUG_RUNTIME_STATE_ENABLED;
++	p->runtime_info.r_debug = r_debug;
++	p->runtime_info.ttmp_setup = enable_ttmp_setup;
++
++	if (p->runtime_info.ttmp_setup) {
++		for (i = 0; i < p->n_pdds; i++) {
++			struct kfd_process_device *pdd = p->pdds[i];
++
++			if (!kfd_dbg_is_rlc_restore_supported(pdd->dev)) {
++				amdgpu_gfx_off_ctrl(pdd->dev->adev, false);
++				pdd->dev->kfd2kgd->enable_debug_trap(
++						pdd->dev->adev,
++						true,
++						pdd->dev->vm_info.last_vmid_kfd);
++			} else if (kfd_dbg_is_per_vmid_supported(pdd->dev)) {
++				pdd->spi_dbg_override = pdd->dev->kfd2kgd->enable_debug_trap(
++						pdd->dev->adev,
++						false,
++						0);
++			}
++		}
++	}
++
++retry:
++	if (p->debug_trap_enabled) {
++		if (!p->is_runtime_retry) {
++			kfd_dbg_trap_activate(p);
++			kfd_dbg_ev_raise(KFD_EC_MASK(EC_PROCESS_RUNTIME),
++					p, NULL, 0, false, NULL, 0);
++		}
++
++		mutex_unlock(&p->mutex);
++		ret = down_interruptible(&p->runtime_enable_sema);
++		mutex_lock(&p->mutex);
++
++		p->is_runtime_retry = !!ret;
++	}
++
++	return ret;
++}
++
++static int runtime_disable(struct kfd_process *p)
+ {
++	int i = 0, ret;
++	bool was_enabled = p->runtime_info.runtime_state == DEBUG_RUNTIME_STATE_ENABLED;
++
++	p->runtime_info.runtime_state = DEBUG_RUNTIME_STATE_DISABLED;
++	p->runtime_info.r_debug = 0;
++
++	if (p->debug_trap_enabled) {
++		if (was_enabled)
++			kfd_dbg_trap_deactivate(p, false, 0);
++
++		if (!p->is_runtime_retry)
++			kfd_dbg_ev_raise(KFD_EC_MASK(EC_PROCESS_RUNTIME),
++					p, NULL, 0, false, NULL, 0);
++
++		mutex_unlock(&p->mutex);
++		ret = down_interruptible(&p->runtime_enable_sema);
++		mutex_lock(&p->mutex);
++
++		p->is_runtime_retry = !!ret;
++		if (ret)
++			return ret;
++	}
++
++	if (was_enabled && p->runtime_info.ttmp_setup) {
++		for (i = 0; i < p->n_pdds; i++) {
++			struct kfd_process_device *pdd = p->pdds[i];
++
++			if (!kfd_dbg_is_rlc_restore_supported(pdd->dev))
++				amdgpu_gfx_off_ctrl(pdd->dev->adev, true);
++		}
++	}
++
++	p->runtime_info.ttmp_setup = false;
++
++	/* disable ttmp setup */
++	for (i = 0; i < p->n_pdds; i++) {
++		struct kfd_process_device *pdd = p->pdds[i];
++
++		if (kfd_dbg_is_per_vmid_supported(pdd->dev)) {
++			pdd->spi_dbg_override =
++					pdd->dev->kfd2kgd->disable_debug_trap(
++					pdd->dev->adev,
++					false,
++					pdd->dev->vm_info.last_vmid_kfd);
++
++			if (!pdd->dev->kfd->shared_resources.enable_mes)
++				debug_refresh_runlist(pdd->dev->dqm);
++			else
++				kfd_dbg_set_mes_debug_mode(pdd);
++		}
++	}
++
+ 	return 0;
+ }
+ 
++static int kfd_ioctl_runtime_enable(struct file *filep, struct kfd_process *p, void *data)
++{
++	struct kfd_ioctl_runtime_enable_args *args = data;
++	int r;
++
++	mutex_lock(&p->mutex);
++
++	if (args->mode_mask & KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK)
++		r = runtime_enable(p, args->r_debug,
++				!!(args->mode_mask & KFD_RUNTIME_ENABLE_MODE_TTMP_SAVE_MASK));
++	else
++		r = runtime_disable(p);
++
++	mutex_unlock(&p->mutex);
++
++	return r;
++}
++
+ static int kfd_ioctl_set_debug_trap(struct file *filep, struct kfd_process *p, void *data)
+ {
+ 	struct kfd_ioctl_dbg_trap_args *args = data;
+@@ -2815,6 +2944,18 @@ static int kfd_ioctl_set_debug_trap(struct file *filep, struct kfd_process *p, v
+ 		goto unlock_out;
+ 	}
+ 
++	if (target->runtime_info.runtime_state != DEBUG_RUNTIME_STATE_ENABLED &&
++			(args->op == KFD_IOC_DBG_TRAP_SET_WAVE_LAUNCH_OVERRIDE ||
++			 args->op == KFD_IOC_DBG_TRAP_SET_WAVE_LAUNCH_MODE ||
++			 args->op == KFD_IOC_DBG_TRAP_SUSPEND_QUEUES ||
++			 args->op == KFD_IOC_DBG_TRAP_RESUME_QUEUES ||
++			 args->op == KFD_IOC_DBG_TRAP_SET_NODE_ADDRESS_WATCH ||
++			 args->op == KFD_IOC_DBG_TRAP_CLEAR_NODE_ADDRESS_WATCH ||
++			 args->op == KFD_IOC_DBG_TRAP_SET_FLAGS)) {
++		r = -EPERM;
++		goto unlock_out;
++	}
++
+ 	switch (args->op) {
+ 	case KFD_IOC_DBG_TRAP_ENABLE:
+ 		if (target != p)
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_debug.c b/drivers/gpu/drm/amd/amdkfd/kfd_debug.c
+index 61098975bb0e..a19c21d04438 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_debug.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_debug.c
+@@ -219,7 +219,7 @@ static int kfd_dbg_set_workaround(struct kfd_process *target, bool enable)
+ 	return r;
+ }
+ 
+-static int kfd_dbg_set_mes_debug_mode(struct kfd_process_device *pdd)
++int kfd_dbg_set_mes_debug_mode(struct kfd_process_device *pdd)
+ {
+ 	uint32_t spi_dbg_cntl = pdd->spi_dbg_override | pdd->spi_dbg_launch_mode;
+ 	uint32_t flags = pdd->process->dbg_flags;
+@@ -239,7 +239,7 @@ static int kfd_dbg_set_mes_debug_mode(struct kfd_process_device *pdd)
+  *				to unwind
+  *		else: ignored
+  */
+-static void kfd_dbg_trap_deactivate(struct kfd_process *target, bool unwind, int unwind_count)
++void kfd_dbg_trap_deactivate(struct kfd_process *target, bool unwind, int unwind_count)
+ {
+ 	int i;
+ 
+@@ -307,7 +307,7 @@ int kfd_dbg_trap_disable(struct kfd_process *target)
+ 	return 0;
+ }
+ 
+-static int kfd_dbg_trap_activate(struct kfd_process *target)
++int kfd_dbg_trap_activate(struct kfd_process *target)
+ {
+ 	int i, r = 0;
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_debug.h b/drivers/gpu/drm/amd/amdkfd/kfd_debug.h
+index 2c6866bb8850..fca928564948 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_debug.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_debug.h
+@@ -25,6 +25,8 @@
+ 
+ #include "kfd_priv.h"
+ 
++void kfd_dbg_trap_deactivate(struct kfd_process *target, bool unwind, int unwind_count);
++int kfd_dbg_trap_activate(struct kfd_process *target);
+ bool kfd_dbg_ev_raise(uint64_t event_mask,
+ 			struct kfd_process *process, struct kfd_node *dev,
+ 			unsigned int source_id, bool use_worker,
+@@ -77,4 +79,6 @@ static inline bool kfd_dbg_has_gws_support(struct kfd_node *dev)
+ 	/* Assume debugging and cooperative launch supported otherwise. */
+ 	return true;
+ }
++
++int kfd_dbg_set_mes_debug_mode(struct kfd_process_device *pdd);
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 58b82fa59584..4b80f74b9de0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -980,6 +980,7 @@ struct kfd_process {
+ 
+ 	/* Tracks runtime enable status */
+ 	struct semaphore runtime_enable_sema;
++	bool is_runtime_retry;
+ 	struct kfd_runtime_info runtime_info;
+ 
+ };
+-- 
+2.42.0
+
