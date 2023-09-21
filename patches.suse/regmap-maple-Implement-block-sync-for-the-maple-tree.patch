@@ -1,0 +1,175 @@
+From bfa0b38c148379c8a8c52e23bbdcb086414fb354 Mon Sep 17 00:00:00 2001
+From: Mark Brown <broonie@kernel.org>
+Date: Sun, 11 Jun 2023 13:06:07 +0100
+Subject: [PATCH] regmap: maple: Implement block sync for the maple tree cache
+Git-commit: bfa0b38c148379c8a8c52e23bbdcb086414fb354
+Patch-mainline: v6.5-rc1
+References: jsc#PED-6045 jsc#PED-6036 jsc#PED-6104 jsc#PED-6114 jsc#PED-6067 jsc#PED-6123
+
+For register maps where we can write multiple values in a single bus
+operation it is generally much faster to do so. Improve the performance of
+maple tree cache syncs on such devices by identifying blocks of adjacent
+registers that need to be written out and combining them into a single
+operation.
+
+Combining writes does mean that we need to allocate a scratch buffer and
+format the data into it but it is expected that for most cases where caches
+are in use the cost of I/O will be much greater than the cost of doing the
+allocation and format.
+
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Link: https://lore.kernel.org/r/20230609-regcache-maple-sync-raw-v1-1-8ddeb4e2b9ab@kernel.org
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/base/regmap/internal.h       |  2 +
+ drivers/base/regmap/regcache-maple.c | 82 ++++++++++++++++++++++++++--
+ drivers/base/regmap/regcache.c       |  4 +-
+ 3 files changed, 80 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/base/regmap/internal.h b/drivers/base/regmap/internal.h
+index 9bd0dfd1e259..f993e2484f80 100644
+--- a/drivers/base/regmap/internal.h
++++ b/drivers/base/regmap/internal.h
+@@ -257,6 +257,8 @@ int regcache_sync_block(struct regmap *map, void *block,
+ 			unsigned long *cache_present,
+ 			unsigned int block_base, unsigned int start,
+ 			unsigned int end);
++bool regcache_reg_needs_sync(struct regmap *map, unsigned int reg,
++			     unsigned int val);
+ 
+ static inline const void *regcache_get_val_addr(struct regmap *map,
+ 						const void *base,
+diff --git a/drivers/base/regmap/regcache-maple.c b/drivers/base/regmap/regcache-maple.c
+index 14f6f49af097..283c2e02a298 100644
+--- a/drivers/base/regmap/regcache-maple.c
++++ b/drivers/base/regmap/regcache-maple.c
+@@ -186,6 +186,55 @@ static int regcache_maple_drop(struct regmap *map, unsigned int min,
+ 	return ret;
+ }
+ 
++static int regcache_maple_sync_block(struct regmap *map, unsigned long *entry,
++				     struct ma_state *mas,
++				     unsigned int min, unsigned int max)
++{
++	void *buf;
++	unsigned long r;
++	size_t val_bytes = map->format.val_bytes;
++	int ret = 0;
++
++	mas_pause(mas);
++	rcu_read_unlock();
++
++	/*
++	 * Use a raw write if writing more than one register to a
++	 * device that supports raw writes to reduce transaction
++	 * overheads.
++	 */
++	if (max - min > 1 && regmap_can_raw_write(map)) {
++		buf = kmalloc(val_bytes * (max - min), map->alloc_flags);
++		if (!buf) {
++			ret = -ENOMEM;
++			goto out;
++		}
++
++		/* Render the data for a raw write */
++		for (r = min; r < max; r++) {
++			regcache_set_val(map, buf, r - min,
++					 entry[r - mas->index]);
++		}
++
++		ret = _regmap_raw_write(map, min, buf, (max - min) * val_bytes,
++					false);
++
++		kfree(buf);
++	} else {
++		for (r = min; r < max; r++) {
++			ret = _regmap_write(map, r,
++					    entry[r - mas->index]);
++			if (ret != 0)
++				goto out;
++		}
++	}
++
++out:
++	rcu_read_lock();
++
++	return ret;
++}
++
+ static int regcache_maple_sync(struct regmap *map, unsigned int min,
+ 			       unsigned int max)
+ {
+@@ -194,8 +243,9 @@ static int regcache_maple_sync(struct regmap *map, unsigned int min,
+ 	MA_STATE(mas, mt, min, max);
+ 	unsigned long lmin = min;
+ 	unsigned long lmax = max;
+-	unsigned int r;
++	unsigned int r, v, sync_start;
+ 	int ret;
++	bool sync_needed = false;
+ 
+ 	map->cache_bypass = true;
+ 
+@@ -203,18 +253,38 @@ static int regcache_maple_sync(struct regmap *map, unsigned int min,
+ 
+ 	mas_for_each(&mas, entry, max) {
+ 		for (r = max(mas.index, lmin); r <= min(mas.last, lmax); r++) {
+-			mas_pause(&mas);
+-			rcu_read_unlock();
+-			ret = regcache_sync_val(map, r, entry[r - mas.index]);
++			v = entry[r - mas.index];
++
++			if (regcache_reg_needs_sync(map, r, v)) {
++				if (!sync_needed) {
++					sync_start = r;
++					sync_needed = true;
++				}
++				continue;
++			}
++
++			if (!sync_needed)
++				continue;
++
++			ret = regcache_maple_sync_block(map, entry, &mas,
++							sync_start, r);
+ 			if (ret != 0)
+ 				goto out;
+-			rcu_read_lock();
++			sync_needed = false;
++		}
++
++		if (sync_needed) {
++			ret = regcache_maple_sync_block(map, entry, &mas,
++							sync_start, r);
++			if (ret != 0)
++				goto out;
++			sync_needed = false;
+ 		}
+ 	}
+ 
++out:
+ 	rcu_read_unlock();
+ 
+-out:
+ 	map->cache_bypass = false;
+ 
+ 	return ret;
+diff --git a/drivers/base/regmap/regcache.c b/drivers/base/regmap/regcache.c
+index 029564695dbb..c7d065f96a87 100644
+--- a/drivers/base/regmap/regcache.c
++++ b/drivers/base/regmap/regcache.c
+@@ -279,8 +279,8 @@ int regcache_write(struct regmap *map,
+ 	return 0;
+ }
+ 
+-static bool regcache_reg_needs_sync(struct regmap *map, unsigned int reg,
+-				    unsigned int val)
++bool regcache_reg_needs_sync(struct regmap *map, unsigned int reg,
++			     unsigned int val)
+ {
+ 	int ret;
+ 
+-- 
+2.35.3
+
