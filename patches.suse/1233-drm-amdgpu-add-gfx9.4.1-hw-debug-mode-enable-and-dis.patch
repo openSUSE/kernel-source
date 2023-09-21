@@ -1,0 +1,223 @@
+From 4806ed7c326ee4a9ea825d4263666267570280c1 Mon Sep 17 00:00:00 2001
+From: Jonathan Kim <jonathan.kim@amd.com>
+Date: Wed, 30 Mar 2022 15:31:00 -0400
+Subject: drm/amdgpu: add gfx9.4.1 hw debug mode enable and disable calls
+Git-commit: 01f648202c5390f4c366793b34c27cddad4ca8d7
+Patch-mainline: v6.5-rc1
+References: jsc#PED-3527 jsc#PED-5475 jsc#PED-6068 jsc#PED-6070 jsc#PED-6116 jsc#PED-6120 jsc#PED-5065 jsc#PED-5477 jsc#PED-5511 jsc#PED-6041 jsc#PED-6069 jsc#PED-6071
+
+On GFX9.4.1, the implicit wait count instruction on s_barrier is
+disabled by default in the driver during normal operation for
+performance requirements.
+
+There is a hardware bug in GFX9.4.1 where if the implicit wait count
+instruction after an s_barrier instruction is disabled, any wave that
+hits an exception may step over the s_barrier when returning from the
+trap handler with the barrier logic having no ability to be
+aware of this, thereby causing other waves to wait at the barrier
+indefinitely resulting in a shader hang.  This bug has been corrected
+for GFX9.4.2 and onward.
+
+Since the debugger subscribes to hardware exceptions, in order to avoid
+this bug, the debugger must enable implicit wait count on s_barrier
+for a debug session and disable it on detach.
+
+In order to change this setting in the in the device global SQ_CONFIG
+register, the GFX pipeline must be idle.  GFX9.4.1 as a compute device
+will either dispatch work through the compute ring buffers used for
+image post processing or through the hardware scheduler by the KFD.
+
+Have the KGD suspend and drain the compute ring buffer, then suspend the
+hardware scheduler and block any future KFD process job requests before
+changing the implicit wait count setting.  Once set, resume all work.
+
+Signed-off-by: Jonathan Kim <jonathan.kim@amd.com>
+Reviewed-by: Felix Kuehling <felix.kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |   3 +
+ .../drm/amd/amdgpu/amdgpu_amdkfd_arcturus.c   | 116 ++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c         |   4 +-
+ 3 files changed, 121 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 8b4a89a6c3fd..74104d46a7be 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1046,6 +1046,9 @@ struct amdgpu_device {
+ 	struct pci_saved_state          *pci_state;
+ 	pci_channel_state_t		pci_channel_state;
+ 
++	/* Track auto wait count on s_barrier settings */
++	bool				barrier_has_auto_waitcnt;
++
+ 	struct amdgpu_reset_control     *reset_cntl;
+ 	uint32_t                        ip_versions[MAX_HWIP][HWIP_MAX_INSTANCE];
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_arcturus.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_arcturus.c
+index 4191af5a3f13..d2918e5c0dea 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_arcturus.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_arcturus.c
+@@ -26,6 +26,7 @@
+ #include "amdgpu.h"
+ #include "amdgpu_amdkfd.h"
+ #include "amdgpu_amdkfd_arcturus.h"
++#include "amdgpu_reset.h"
+ #include "sdma0/sdma0_4_2_2_offset.h"
+ #include "sdma0/sdma0_4_2_2_sh_mask.h"
+ #include "sdma1/sdma1_4_2_2_offset.h"
+@@ -48,6 +49,8 @@
+ #include "amdgpu_amdkfd_gfx_v9.h"
+ #include "gfxhub_v1_0.h"
+ #include "mmhub_v9_4.h"
++#include "gc/gc_9_0_offset.h"
++#include "gc/gc_9_0_sh_mask.h"
+ 
+ #define HQD_N_REGS 56
+ #define DUMP_REG(addr) do {				\
+@@ -276,6 +279,117 @@ int kgd_arcturus_hqd_sdma_destroy(struct amdgpu_device *adev, void *mqd,
+ 	return 0;
+ }
+ 
++/*
++ * Helper used to suspend/resume gfx pipe for image post process work to set
++ * barrier behaviour.
++ */
++static int suspend_resume_compute_scheduler(struct amdgpu_device *adev, bool suspend)
++{
++	int i, r = 0;
++
++	for (i = 0; i < adev->gfx.num_compute_rings; i++) {
++		struct amdgpu_ring *ring = &adev->gfx.compute_ring[i];
++
++		if (!(ring && ring->sched.thread))
++			continue;
++
++		/* stop secheduler and drain ring. */
++		if (suspend) {
++			drm_sched_stop(&ring->sched, NULL);
++			r = amdgpu_fence_wait_empty(ring);
++			if (r)
++				goto out;
++		} else {
++			drm_sched_start(&ring->sched, false);
++		}
++	}
++
++out:
++	/* return on resume or failure to drain rings. */
++	if (!suspend || r)
++		return r;
++
++	return amdgpu_device_ip_wait_for_idle(adev, GC_HWIP);
++}
++
++static void set_barrier_auto_waitcnt(struct amdgpu_device *adev, bool enable_waitcnt)
++{
++	uint32_t data;
++
++	WRITE_ONCE(adev->barrier_has_auto_waitcnt, enable_waitcnt);
++
++	if (!down_read_trylock(&adev->reset_domain->sem))
++		return;
++
++	amdgpu_amdkfd_suspend(adev, false);
++
++	if (suspend_resume_compute_scheduler(adev, true))
++		goto out;
++
++	data = RREG32(SOC15_REG_OFFSET(GC, 0, mmSQ_CONFIG));
++	data = REG_SET_FIELD(data, SQ_CONFIG, DISABLE_BARRIER_WAITCNT,
++						!enable_waitcnt);
++	WREG32(SOC15_REG_OFFSET(GC, 0, mmSQ_CONFIG), data);
++
++out:
++	suspend_resume_compute_scheduler(adev, false);
++
++	amdgpu_amdkfd_resume(adev, false);
++
++	up_read(&adev->reset_domain->sem);
++}
++
++/*
++ * restore_dbg_registers is ignored here but is a general interface requirement
++ * for devices that support GFXOFF and where the RLC save/restore list
++ * does not support hw registers for debugging i.e. the driver has to manually
++ * initialize the debug mode registers after it has disabled GFX off during the
++ * debug session.
++ */
++static uint32_t kgd_arcturus_enable_debug_trap(struct amdgpu_device *adev,
++				bool restore_dbg_registers,
++				uint32_t vmid)
++{
++	mutex_lock(&adev->grbm_idx_mutex);
++
++	kgd_gfx_v9_set_wave_launch_stall(adev, vmid, true);
++
++	set_barrier_auto_waitcnt(adev, true);
++
++	WREG32(SOC15_REG_OFFSET(GC, 0, mmSPI_GDBG_TRAP_MASK), 0);
++
++	kgd_gfx_v9_set_wave_launch_stall(adev, vmid, false);
++
++	mutex_unlock(&adev->grbm_idx_mutex);
++
++	return 0;
++}
++
++/*
++ * keep_trap_enabled is ignored here but is a general interface requirement
++ * for devices that support multi-process debugging where the performance
++ * overhead from trap temporary setup needs to be bypassed when the debug
++ * session has ended.
++ */
++static uint32_t kgd_arcturus_disable_debug_trap(struct amdgpu_device *adev,
++					bool keep_trap_enabled,
++					uint32_t vmid)
++{
++
++	mutex_lock(&adev->grbm_idx_mutex);
++
++	kgd_gfx_v9_set_wave_launch_stall(adev, vmid, true);
++
++	set_barrier_auto_waitcnt(adev, false);
++
++	WREG32(SOC15_REG_OFFSET(GC, 0, mmSPI_GDBG_TRAP_MASK), 0);
++
++	kgd_gfx_v9_set_wave_launch_stall(adev, vmid, false);
++
++	mutex_unlock(&adev->grbm_idx_mutex);
++
++	return 0;
++}
+ const struct kfd2kgd_calls arcturus_kfd2kgd = {
+ 	.program_sh_mem_settings = kgd_gfx_v9_program_sh_mem_settings,
+ 	.set_pasid_vmid_mapping = kgd_gfx_v9_set_pasid_vmid_mapping,
+@@ -294,6 +408,8 @@ const struct kfd2kgd_calls arcturus_kfd2kgd = {
+ 				kgd_gfx_v9_get_atc_vmid_pasid_mapping_info,
+ 	.set_vm_context_page_table_base =
+ 				kgd_gfx_v9_set_vm_context_page_table_base,
++	.enable_debug_trap = kgd_arcturus_enable_debug_trap,
++	.disable_debug_trap = kgd_arcturus_disable_debug_trap,
+ 	.get_cu_occupancy = kgd_gfx_v9_get_cu_occupancy,
+ 	.program_trap_handler_settings = kgd_gfx_v9_program_trap_handler_settings
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index ec52b9cc960c..65577eca58f1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -2380,8 +2380,8 @@ static void gfx_v9_0_init_sq_config(struct amdgpu_device *adev)
+ 	switch (adev->ip_versions[GC_HWIP][0]) {
+ 	case IP_VERSION(9, 4, 1):
+ 		tmp = RREG32_SOC15(GC, 0, mmSQ_CONFIG);
+-		tmp = REG_SET_FIELD(tmp, SQ_CONFIG,
+-					DISABLE_BARRIER_WAITCNT, 1);
++		tmp = REG_SET_FIELD(tmp, SQ_CONFIG, DISABLE_BARRIER_WAITCNT,
++				!READ_ONCE(adev->barrier_has_auto_waitcnt));
+ 		WREG32_SOC15(GC, 0, mmSQ_CONFIG, tmp);
+ 		break;
+ 	default:
+-- 
+2.42.0
+
