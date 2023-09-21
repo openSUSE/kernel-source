@@ -1,0 +1,169 @@
+From: Nadav Amit <namit@vmware.com>
+Date: Wed, 21 Sep 2022 18:09:32 +0000
+Subject: x86/alternative: Fix race in try_get_desc()
+Git-commit: efd608fa7403ba106412b437f873929e2c862e28
+Patch-mainline: v6.0
+References: git-fixes
+
+I encountered some occasional crashes of poke_int3_handler() when
+kprobes are set, while accessing desc->vec.
+
+The text poke mechanism claims to have an RCU-like behavior, but it
+does not appear that there is any quiescent state to ensure that
+nobody holds reference to desc. As a result, the following race
+appears to be possible, which can lead to memory corruption.
+
+  CPU0					CPU1
+  ----					----
+  text_poke_bp_batch()
+  -> smp_store_release(&bp_desc, &desc)
+
+  [ notice that desc is on
+    the stack			]
+
+					poke_int3_handler()
+
+					[ int3 might be kprobe's
+					  so sync events are do not
+					  help ]
+
+					-> try_get_desc(descp=&bp_desc)
+					   desc = __READ_ONCE(bp_desc)
+
+					   if (!desc) [false, success]
+  WRITE_ONCE(bp_desc, NULL);
+  atomic_dec_and_test(&desc.refs)
+
+  [ success, desc space on the stack
+    is being reused and might have
+    non-zero value. ]
+					arch_atomic_inc_not_zero(&desc->refs)
+
+					[ might succeed since desc points to
+					  stack memory that was freed and might
+					  be reused. ]
+
+Fix this issue with small backportable patch. Instead of trying to
+make RCU-like behavior for bp_desc, just eliminate the unnecessary
+level of indirection of bp_desc, and hold the whole descriptor as a
+global.  Anyhow, there is only a single descriptor at any given
+moment.
+
+Fixes: 1f676247f36a4 ("x86/alternatives: Implement a better poke_int3_handler() completion scheme")
+Signed-off-by: Nadav Amit <namit@vmware.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: stable@kernel.org
+Link: https://lkml.kernel.org/r/20220920224743.3089-1-namit@vmware.com
+
+Acked-by: nborisov <nik.borisov@suse.com>
+---
+ arch/x86/kernel/alternative.c | 45 ++++++++++++++++++++++---------------------
+ 1 file changed, 23 insertions(+), 22 deletions(-)
+
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index 62f6b8b7c4a5..4f3204364caa 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -1319,22 +1319,23 @@ struct bp_patching_desc {
+ 	atomic_t refs;
+ };
+ 
+-static struct bp_patching_desc *bp_desc;
++static struct bp_patching_desc bp_desc;
+ 
+ static __always_inline
+-struct bp_patching_desc *try_get_desc(struct bp_patching_desc **descp)
++struct bp_patching_desc *try_get_desc(void)
+ {
+-	/* rcu_dereference */
+-	struct bp_patching_desc *desc = __READ_ONCE(*descp);
++	struct bp_patching_desc *desc = &bp_desc;
+ 
+-	if (!desc || !arch_atomic_inc_not_zero(&desc->refs))
++	if (!arch_atomic_inc_not_zero(&desc->refs))
+ 		return NULL;
+ 
+ 	return desc;
+ }
+ 
+-static __always_inline void put_desc(struct bp_patching_desc *desc)
++static __always_inline void put_desc(void)
+ {
++	struct bp_patching_desc *desc = &bp_desc;
++
+ 	smp_mb__before_atomic();
+ 	arch_atomic_dec(&desc->refs);
+ }
+@@ -1367,15 +1368,15 @@ noinstr int poke_int3_handler(struct pt_regs *regs)
+ 
+ 	/*
+ 	 * Having observed our INT3 instruction, we now must observe
+-	 * bp_desc:
++	 * bp_desc with non-zero refcount:
+ 	 *
+-	 *	bp_desc = desc			INT3
++	 *	bp_desc.refs = 1		INT3
+ 	 *	WMB				RMB
+-	 *	write INT3			if (desc)
++	 *	write INT3			if (bp_desc.refs != 0)
+ 	 */
+ 	smp_rmb();
+ 
+-	desc = try_get_desc(&bp_desc);
++	desc = try_get_desc();
+ 	if (!desc)
+ 		return 0;
+ 
+@@ -1429,7 +1430,7 @@ noinstr int poke_int3_handler(struct pt_regs *regs)
+ 	ret = 1;
+ 
+ out_put:
+-	put_desc(desc);
++	put_desc();
+ 	return ret;
+ }
+ 
+@@ -1460,18 +1461,20 @@ static int tp_vec_nr;
+  */
+ static void text_poke_bp_batch(struct text_poke_loc *tp, unsigned int nr_entries)
+ {
+-	struct bp_patching_desc desc = {
+-		.vec = tp,
+-		.nr_entries = nr_entries,
+-		.refs = ATOMIC_INIT(1),
+-	};
+ 	unsigned char int3 = INT3_INSN_OPCODE;
+ 	unsigned int i;
+ 	int do_sync;
+ 
+ 	lockdep_assert_held(&text_mutex);
+ 
+-	smp_store_release(&bp_desc, &desc); /* rcu_assign_pointer */
++	bp_desc.vec = tp;
++	bp_desc.nr_entries = nr_entries;
++
++	/*
++	 * Corresponds to the implicit memory barrier in try_get_desc() to
++	 * ensure reading a non-zero refcount provides up to date bp_desc data.
++	 */
++	atomic_set_release(&bp_desc.refs, 1);
+ 
+ 	/*
+ 	 * Corresponding read barrier in int3 notifier for making sure the
+@@ -1559,12 +1562,10 @@ static void text_poke_bp_batch(struct text_poke_loc *tp, unsigned int nr_entries
+ 		text_poke_sync();
+ 
+ 	/*
+-	 * Remove and synchronize_rcu(), except we have a very primitive
+-	 * refcount based completion.
++	 * Remove and wait for refs to be zero.
+ 	 */
+-	WRITE_ONCE(bp_desc, NULL); /* RCU_INIT_POINTER */
+-	if (!atomic_dec_and_test(&desc.refs))
+-		atomic_cond_read_acquire(&desc.refs, !VAL);
++	if (!atomic_dec_and_test(&bp_desc.refs))
++		atomic_cond_read_acquire(&bp_desc.refs, !VAL);
+ }
+ 
+ static void text_poke_loc_init(struct text_poke_loc *tp, void *addr,
+
