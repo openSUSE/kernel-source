@@ -401,6 +401,65 @@ Acked-by: developer@suse.com
             self.assertTrue(e.tag_is_missing('patch-mainline'))
             self.assertEqual(2, e.errors())
 
+    def test_alt_commit_short(self):
+        text = """
+From: developer@site.com
+Subject: some patch
+Patch-mainline: v4.2-rc2
+Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Alt-commit: bbbbbbbbbb
+References: bsc#12345
+Acked-by: developer@suse.com
+"""
+
+        try:
+            self.header = header.Checker(text)
+        except header.HeaderException as e:
+            self.assertEqual(1, e.errors(header.FormatError))
+            self.assertEqual(1, e.errors())
+
+    def test_alt_commit_many(self):
+        text = """
+From: developer@site.com
+Subject: some patch
+Patch-mainline: v4.2-rc2
+Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Alt-commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccccccccccc
+References: bsc#12345
+Acked-by: developer@suse.com
+"""
+
+        try:
+            self.header = header.Checker(text)
+        except header.HeaderException as e:
+            self.assertEqual(1, e.errors(header.FormatError))
+            self.assertEqual(1, e.errors())
+
+    def test_alt_commit_correct(self):
+        text = """
+From: developer@site.com
+Subject: some patch
+Patch-mainline: v4.2-rc2
+Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Alt-commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+References: bsc#12345
+Acked-by: developer@suse.com
+"""
+        self.header = header.Checker(text)
+
+    def test_alt_commit_multi_correct(self):
+        text = """
+From: developer@site.com
+Subject: some patch
+Patch-mainline: v4.2-rc2
+Git-commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Alt-commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+Alt-commit: cccccccccccccccccccccccccccccccccccccccc
+References: bsc#12345
+Acked-by: developer@suse.com
+"""
+        self.header = header.Checker(text)
+
     def test_patch_mainline_queued_correct(self):
         text = """
 From: developer@site.com

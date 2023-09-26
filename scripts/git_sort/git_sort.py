@@ -241,6 +241,8 @@ remotes = (
     Head(RepoURL("acme/linux.git"), "perf/core"),
     Head(RepoURL("will/linux.git"), "for-joerg/arm-smmu/updates"),
     Head(RepoURL("herbert/crypto-2.6.git"), "master"),
+    Head(RepoURL("jarkko/linux-tpmdd"), "next"),
+    Head(RepoURL("jarkko/linux-tpmdd"), "master"),
     Head(RepoURL("rafael/linux-pm.git")),
     Head(RepoURL("git://git.linux-nfs.org/~bfields/linux.git"), "nfsd-next"),
     Head(RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"), "for-next"),
