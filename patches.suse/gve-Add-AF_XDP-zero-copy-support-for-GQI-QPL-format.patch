@@ -1,0 +1,533 @@
+From: Praveen Kaligineedi <pkaligineedi@google.com>
+Date: Wed, 15 Mar 2023 16:33:12 -0700
+Subject: gve: Add AF_XDP zero-copy support for GQI-QPL format
+Patch-mainline: v6.4-rc1
+Git-commit: fd8e40321a12391e6f554cc637d0c4b6109682a9
+References: bsc#1214479
+
+Adding AF_XDP zero-copy support.
+
+Note: Although these changes support AF_XDP socket in zero-copy
+mode, there is still a copy happening within the driver between
+XSK buffer pool and QPL bounce buffers in GQI-QPL format.
+In GQI-QPL queue format, the driver needs to allocate a fixed size
+memory, the size specified by vNIC device, for RX/TX and register this
+memory as a bounce buffer with the vNIC device when a queue is
+created. The number of pages in the bounce buffer is limited and the
+pages need to be made available to the vNIC by copying the RX data out
+to prevent head-of-line blocking. Therefore, we cannot pass the XSK
+buffer pool to the vNIC.
+
+The number of copies on RX path from the bounce buffer to XSK buffer is 2
+for AF_XDP copy mode (bounce buffer -> allocated page frag -> XSK buffer)
+and 1 for AF_XDP zero-copy mode (bounce buffer -> XSK buffer).
+
+This patch contains the following changes:
+1) Enable and disable XSK buffer pool
+2) Copy XDP packets from QPL bounce buffers to XSK buffer on rx
+3) Copy XDP packets from XSK buffer to QPL bounce buffers and
+   ring the doorbell as part of XDP TX napi poll
+4) ndo_xsk_wakeup callback support
+
+Signed-off-by: Praveen Kaligineedi <pkaligineedi@google.com>
+Reviewed-by: Jeroen de Borst <jeroendb@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/google/gve/gve.h         |    7 +
+ drivers/net/ethernet/google/gve/gve_ethtool.c |   14 +-
+ drivers/net/ethernet/google/gve/gve_main.c    |  174 +++++++++++++++++++++++++-
+ drivers/net/ethernet/google/gve/gve_rx.c      |   30 ++++
+ drivers/net/ethernet/google/gve/gve_tx.c      |   58 ++++++++
+ 5 files changed, 274 insertions(+), 9 deletions(-)
+
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@ -250,6 +250,8 @@ struct gve_rx_ring {
+ 
+ 	/* XDP stuff */
+ 	struct xdp_rxq_info xdp_rxq;
++	struct xdp_rxq_info xsk_rxq;
++	struct xsk_buff_pool *xsk_pool;
+ 	struct page_frag_cache page_cache; /* Page cache to allocate XDP frames */
+ };
+ 
+@@ -277,6 +279,7 @@ struct gve_tx_buffer_state {
+ 	};
+ 	struct {
+ 		u16 size; /* size of xmitted xdp pkt */
++		u8 is_xsk; /* xsk buff */
+ 	} xdp;
+ 	union {
+ 		struct gve_tx_iovec iov[GVE_TX_MAX_IOVEC]; /* segments of this pkt */
+@@ -471,6 +474,10 @@ struct gve_tx_ring {
+ 	dma_addr_t q_resources_bus; /* dma address of the queue resources */
+ 	dma_addr_t complq_bus_dqo; /* dma address of the dqo.compl_ring */
+ 	struct u64_stats_sync statss; /* sync stats for 32bit archs */
++	struct xsk_buff_pool *xsk_pool;
++	u32 xdp_xsk_wakeup;
++	u32 xdp_xsk_done;
++	u64 xdp_xsk_sent;
+ 	u64 xdp_xmit;
+ 	u64 xdp_xmit_errors;
+ } ____cacheline_aligned;
+--- a/drivers/net/ethernet/google/gve/gve_ethtool.c
++++ b/drivers/net/ethernet/google/gve/gve_ethtool.c
+@@ -62,8 +62,8 @@ static const char gve_gstrings_rx_stats[
+ static const char gve_gstrings_tx_stats[][ETH_GSTRING_LEN] = {
+ 	"tx_posted_desc[%u]", "tx_completed_desc[%u]", "tx_consumed_desc[%u]", "tx_bytes[%u]",
+ 	"tx_wake[%u]", "tx_stop[%u]", "tx_event_counter[%u]",
+-	"tx_dma_mapping_error[%u]",
+-	"tx_xdp_xmit[%u]", "tx_xdp_xmit_errors[%u]"
++	"tx_dma_mapping_error[%u]", "tx_xsk_wakeup[%u]",
++	"tx_xsk_done[%u]", "tx_xsk_sent[%u]", "tx_xdp_xmit[%u]", "tx_xdp_xmit_errors[%u]"
+ };
+ 
+ static const char gve_gstrings_adminq_stats[][ETH_GSTRING_LEN] = {
+@@ -381,13 +381,17 @@ gve_get_ethtool_stats(struct net_device
+ 					data[i++] = value;
+ 				}
+ 			}
++			/* XDP xsk counters */
++			data[i++] = tx->xdp_xsk_wakeup;
++			data[i++] = tx->xdp_xsk_done;
+ 			do {
+ 				start = u64_stats_fetch_begin(&priv->tx[ring].statss);
+-				data[i] = tx->xdp_xmit;
+-				data[i + 1] = tx->xdp_xmit_errors;
++				data[i] = tx->xdp_xsk_sent;
++				data[i + 1] = tx->xdp_xmit;
++				data[i + 2] = tx->xdp_xmit_errors;
+ 			} while (u64_stats_fetch_retry(&priv->tx[ring].statss,
+ 						       start));
+-			i += 2; /* XDP tx counters */
++			i += 3; /* XDP tx counters */
+ 		}
+ 	} else {
+ 		i += num_tx_queues * NUM_GVE_TX_CNTS;
+--- a/drivers/net/ethernet/google/gve/gve_main.c
++++ b/drivers/net/ethernet/google/gve/gve_main.c
+@@ -17,6 +17,7 @@
+ #include <linux/utsname.h>
+ #include <linux/version.h>
+ #include <net/sch_generic.h>
++#include <net/xdp_sock_drv.h>
+ #include "gve.h"
+ #include "gve_dqo.h"
+ #include "gve_adminq.h"
+@@ -1189,6 +1190,7 @@ static int gve_reg_xdp_info(struct gve_p
+ 	struct gve_rx_ring *rx;
+ 	int err = 0;
+ 	int i, j;
++	u32 tx_qid;
+ 
+ 	if (!priv->num_xdp_queues)
+ 		return 0;
+@@ -1205,6 +1207,24 @@ static int gve_reg_xdp_info(struct gve_p
+ 						 MEM_TYPE_PAGE_SHARED, NULL);
+ 		if (err)
+ 			goto err;
++		rx->xsk_pool = xsk_get_pool_from_qid(dev, i);
++		if (rx->xsk_pool) {
++			err = xdp_rxq_info_reg(&rx->xsk_rxq, dev, i,
++					       napi->napi_id);
++			if (err)
++				goto err;
++			err = xdp_rxq_info_reg_mem_model(&rx->xsk_rxq,
++							 MEM_TYPE_XSK_BUFF_POOL, NULL);
++			if (err)
++				goto err;
++			xsk_pool_set_rxq_info(rx->xsk_pool,
++					      &rx->xsk_rxq);
++		}
++	}
++
++	for (i = 0; i < priv->num_xdp_queues; i++) {
++		tx_qid = gve_xdp_tx_queue_id(priv, i);
++		priv->tx[tx_qid].xsk_pool = xsk_get_pool_from_qid(dev, i);
+ 	}
+ 	return 0;
+ 
+@@ -1213,13 +1233,15 @@ err:
+ 		rx = &priv->rx[j];
+ 		if (xdp_rxq_info_is_reg(&rx->xdp_rxq))
+ 			xdp_rxq_info_unreg(&rx->xdp_rxq);
++		if (xdp_rxq_info_is_reg(&rx->xsk_rxq))
++			xdp_rxq_info_unreg(&rx->xsk_rxq);
+ 	}
+ 	return err;
+ }
+ 
+ static void gve_unreg_xdp_info(struct gve_priv *priv)
+ {
+-	int i;
++	int i, tx_qid;
+ 
+ 	if (!priv->num_xdp_queues)
+ 		return;
+@@ -1228,6 +1250,15 @@ static void gve_unreg_xdp_info(struct gv
+ 		struct gve_rx_ring *rx = &priv->rx[i];
+ 
+ 		xdp_rxq_info_unreg(&rx->xdp_rxq);
++		if (rx->xsk_pool) {
++			xdp_rxq_info_unreg(&rx->xsk_rxq);
++			rx->xsk_pool = NULL;
++		}
++	}
++
++	for (i = 0; i < priv->num_xdp_queues; i++) {
++		tx_qid = gve_xdp_tx_queue_id(priv, i);
++		priv->tx[tx_qid].xsk_pool = NULL;
+ 	}
+ }
+ 
+@@ -1470,6 +1501,140 @@ out:
+ 	return err;
+ }
+ 
++static int gve_xsk_pool_enable(struct net_device *dev,
++			       struct xsk_buff_pool *pool,
++			       u16 qid)
++{
++	struct gve_priv *priv = netdev_priv(dev);
++	struct napi_struct *napi;
++	struct gve_rx_ring *rx;
++	int tx_qid;
++	int err;
++
++	if (qid >= priv->rx_cfg.num_queues) {
++		dev_err(&priv->pdev->dev, "xsk pool invalid qid %d", qid);
++		return -EINVAL;
++	}
++	if (xsk_pool_get_rx_frame_size(pool) <
++	     priv->dev->max_mtu + sizeof(struct ethhdr)) {
++		dev_err(&priv->pdev->dev, "xsk pool frame_len too small");
++		return -EINVAL;
++	}
++
++	err = xsk_pool_dma_map(pool, &priv->pdev->dev,
++			       DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_WEAK_ORDERING);
++	if (err)
++		return err;
++
++	/* If XDP prog is not installed, return */
++	if (!priv->xdp_prog)
++		return 0;
++
++	rx = &priv->rx[qid];
++	napi = &priv->ntfy_blocks[rx->ntfy_id].napi;
++	err = xdp_rxq_info_reg(&rx->xsk_rxq, dev, qid, napi->napi_id);
++	if (err)
++		goto err;
++
++	err = xdp_rxq_info_reg_mem_model(&rx->xsk_rxq,
++					 MEM_TYPE_XSK_BUFF_POOL, NULL);
++	if (err)
++		goto err;
++
++	xsk_pool_set_rxq_info(pool, &rx->xsk_rxq);
++	rx->xsk_pool = pool;
++
++	tx_qid = gve_xdp_tx_queue_id(priv, qid);
++	priv->tx[tx_qid].xsk_pool = pool;
++
++	return 0;
++err:
++	if (xdp_rxq_info_is_reg(&rx->xsk_rxq))
++		xdp_rxq_info_unreg(&rx->xsk_rxq);
++
++	xsk_pool_dma_unmap(pool,
++			   DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_WEAK_ORDERING);
++	return err;
++}
++
++static int gve_xsk_pool_disable(struct net_device *dev,
++				u16 qid)
++{
++	struct gve_priv *priv = netdev_priv(dev);
++	struct napi_struct *napi_rx;
++	struct napi_struct *napi_tx;
++	struct xsk_buff_pool *pool;
++	int tx_qid;
++
++	pool = xsk_get_pool_from_qid(dev, qid);
++	if (!pool)
++		return -EINVAL;
++	if (qid >= priv->rx_cfg.num_queues)
++		return -EINVAL;
++
++	/* If XDP prog is not installed, unmap DMA and return */
++	if (!priv->xdp_prog)
++		goto done;
++
++	tx_qid = gve_xdp_tx_queue_id(priv, qid);
++	if (!netif_running(dev)) {
++		priv->rx[qid].xsk_pool = NULL;
++		xdp_rxq_info_unreg(&priv->rx[qid].xsk_rxq);
++		priv->tx[tx_qid].xsk_pool = NULL;
++		goto done;
++	}
++
++	napi_rx = &priv->ntfy_blocks[priv->rx[qid].ntfy_id].napi;
++	napi_disable(napi_rx); /* make sure current rx poll is done */
++
++	napi_tx = &priv->ntfy_blocks[priv->tx[tx_qid].ntfy_id].napi;
++	napi_disable(napi_tx); /* make sure current tx poll is done */
++
++	priv->rx[qid].xsk_pool = NULL;
++	xdp_rxq_info_unreg(&priv->rx[qid].xsk_rxq);
++	priv->tx[tx_qid].xsk_pool = NULL;
++	smp_mb(); /* Make sure it is visible to the workers on datapath */
++
++	napi_enable(napi_rx);
++	if (gve_rx_work_pending(&priv->rx[qid]))
++		napi_schedule(napi_rx);
++
++	napi_enable(napi_tx);
++	if (gve_tx_clean_pending(priv, &priv->tx[tx_qid]))
++		napi_schedule(napi_tx);
++
++done:
++	xsk_pool_dma_unmap(pool,
++			   DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_WEAK_ORDERING);
++	return 0;
++}
++
++static int gve_xsk_wakeup(struct net_device *dev, u32 queue_id, u32 flags)
++{
++	struct gve_priv *priv = netdev_priv(dev);
++	int tx_queue_id = gve_xdp_tx_queue_id(priv, queue_id);
++
++	if (queue_id >= priv->rx_cfg.num_queues || !priv->xdp_prog)
++		return -EINVAL;
++
++	if (flags & XDP_WAKEUP_TX) {
++		struct gve_tx_ring *tx = &priv->tx[tx_queue_id];
++		struct napi_struct *napi =
++			&priv->ntfy_blocks[tx->ntfy_id].napi;
++
++		if (!napi_if_scheduled_mark_missed(napi)) {
++			/* Call local_bh_enable to trigger SoftIRQ processing */
++			local_bh_disable();
++			napi_schedule(napi);
++			local_bh_enable();
++		}
++
++		tx->xdp_xsk_wakeup++;
++	}
++
++	return 0;
++}
++
+ static int verify_xdp_configuration(struct net_device *dev)
+ {
+ 	struct gve_priv *priv = netdev_priv(dev);
+@@ -1513,6 +1678,11 @@ static int gve_xdp(struct net_device *de
+ 	switch (xdp->command) {
+ 	case XDP_SETUP_PROG:
+ 		return gve_set_xdp(priv, xdp->prog, xdp->extack);
++	case XDP_SETUP_XSK_POOL:
++		if (xdp->xsk.pool)
++			return gve_xsk_pool_enable(dev, xdp->xsk.pool, xdp->xsk.queue_id);
++		else
++			return gve_xsk_pool_disable(dev, xdp->xsk.queue_id);
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -1714,6 +1884,7 @@ static const struct net_device_ops gve_n
+ 	.ndo_set_features	=	gve_set_features,
+ 	.ndo_bpf		=	gve_xdp,
+ 	.ndo_xdp_xmit		=	gve_xdp_xmit,
++	.ndo_xsk_wakeup		=	gve_xsk_wakeup,
+ };
+ 
+ static void gve_handle_status(struct gve_priv *priv, u32 status)
+@@ -1840,6 +2011,7 @@ static void gve_set_netdev_xdp_features(
+ 		priv->dev->xdp_features = NETDEV_XDP_ACT_BASIC;
+ 		priv->dev->xdp_features |= NETDEV_XDP_ACT_REDIRECT;
+ 		priv->dev->xdp_features |= NETDEV_XDP_ACT_NDO_XMIT;
++		priv->dev->xdp_features |= NETDEV_XDP_ACT_XSK_ZEROCOPY;
+ 	} else {
+ 		priv->dev->xdp_features = 0;
+ 	}
+--- a/drivers/net/ethernet/google/gve/gve_rx.c
++++ b/drivers/net/ethernet/google/gve/gve_rx.c
+@@ -10,6 +10,7 @@
+ #include <linux/etherdevice.h>
+ #include <linux/filter.h>
+ #include <net/xdp.h>
++#include <net/xdp_sock_drv.h>
+ 
+ static void gve_rx_free_buffer(struct device *dev,
+ 			       struct gve_rx_slot_page_info *page_info,
+@@ -593,6 +594,31 @@ static struct sk_buff *gve_rx_skb(struct
+ 	return skb;
+ }
+ 
++static int gve_xsk_pool_redirect(struct net_device *dev,
++				 struct gve_rx_ring *rx,
++				 void *data, int len,
++				 struct bpf_prog *xdp_prog)
++{
++	struct xdp_buff *xdp;
++	int err;
++
++	if (rx->xsk_pool->frame_len < len)
++		return -E2BIG;
++	xdp = xsk_buff_alloc(rx->xsk_pool);
++	if (!xdp) {
++		u64_stats_update_begin(&rx->statss);
++		rx->xdp_alloc_fails++;
++		u64_stats_update_end(&rx->statss);
++		return -ENOMEM;
++	}
++	xdp->data_end = xdp->data + len;
++	memcpy(xdp->data, data, len);
++	err = xdp_do_redirect(dev, xdp, xdp_prog);
++	if (err)
++		xsk_buff_free(xdp);
++	return err;
++}
++
+ static int gve_xdp_redirect(struct net_device *dev, struct gve_rx_ring *rx,
+ 			    struct xdp_buff *orig, struct bpf_prog *xdp_prog)
+ {
+@@ -602,6 +628,10 @@ static int gve_xdp_redirect(struct net_d
+ 	void *frame;
+ 	int err;
+ 
++	if (rx->xsk_pool)
++		return gve_xsk_pool_redirect(dev, rx, orig->data,
++					     len, xdp_prog);
++
+ 	total_len = headroom + SKB_DATA_ALIGN(len) +
+ 		SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+ 	frame = page_frag_alloc(&rx->page_cache, total_len, GFP_ATOMIC);
+--- a/drivers/net/ethernet/google/gve/gve_tx.c
++++ b/drivers/net/ethernet/google/gve/gve_tx.c
+@@ -11,6 +11,7 @@
+ #include <linux/tcp.h>
+ #include <linux/vmalloc.h>
+ #include <linux/skbuff.h>
++#include <net/xdp_sock_drv.h>
+ 
+ static inline void gve_tx_put_doorbell(struct gve_priv *priv,
+ 				       struct gve_queue_resources *q_resources,
+@@ -160,6 +161,7 @@ static int gve_clean_xdp_done(struct gve
+ 	u32 clean_end = tx->done + to_do;
+ 	u64 pkts = 0, bytes = 0;
+ 	size_t space_freed = 0;
++	u32 xsk_complete = 0;
+ 	u32 idx;
+ 
+ 	for (; tx->done < clean_end; tx->done++) {
+@@ -171,6 +173,7 @@ static int gve_clean_xdp_done(struct gve
+ 
+ 		bytes += info->xdp.size;
+ 		pkts++;
++		xsk_complete += info->xdp.is_xsk;
+ 
+ 		info->xdp.size = 0;
+ 		if (info->xdp_frame) {
+@@ -181,6 +184,8 @@ static int gve_clean_xdp_done(struct gve
+ 	}
+ 
+ 	gve_tx_free_fifo(&tx->tx_fifo, space_freed);
++	if (xsk_complete > 0 && tx->xsk_pool)
++		xsk_tx_completed(tx->xsk_pool, xsk_complete);
+ 	u64_stats_update_begin(&tx->statss);
+ 	tx->bytes_done += bytes;
+ 	tx->pkt_done += pkts;
+@@ -718,7 +723,7 @@ netdev_tx_t gve_tx(struct sk_buff *skb,
+ }
+ 
+ static int gve_tx_fill_xdp(struct gve_priv *priv, struct gve_tx_ring *tx,
+-			   void *data, int len, void *frame_p)
++			   void *data, int len, void *frame_p, bool is_xsk)
+ {
+ 	int pad, nfrags, ndescs, iovi, offset;
+ 	struct gve_tx_buffer_state *info;
+@@ -730,6 +735,7 @@ static int gve_tx_fill_xdp(struct gve_pr
+ 	info = &tx->info[reqi & tx->mask];
+ 	info->xdp_frame = frame_p;
+ 	info->xdp.size = len;
++	info->xdp.is_xsk = is_xsk;
+ 
+ 	nfrags = gve_tx_alloc_fifo(&tx->tx_fifo, pad + len,
+ 				   &info->iov[0]);
+@@ -807,7 +813,7 @@ int gve_xdp_xmit_one(struct gve_priv *pr
+ 	if (!gve_can_tx(tx, len + GVE_TX_MAX_HEADER_SIZE - 1))
+ 		return -EBUSY;
+ 
+-	nsegs = gve_tx_fill_xdp(priv, tx, data, len, frame_p);
++	nsegs = gve_tx_fill_xdp(priv, tx, data, len, frame_p, false);
+ 	tx->req += nsegs;
+ 
+ 	return 0;
+@@ -880,11 +886,43 @@ u32 gve_tx_load_event_counter(struct gve
+ 	return be32_to_cpu(counter);
+ }
+ 
++static int gve_xsk_tx(struct gve_priv *priv, struct gve_tx_ring *tx,
++		      int budget)
++{
++	struct xdp_desc desc;
++	int sent = 0, nsegs;
++	void *data;
++
++	spin_lock(&tx->xdp_lock);
++	while (sent < budget) {
++		if (!gve_can_tx(tx, GVE_TX_START_THRESH))
++			goto out;
++
++		if (!xsk_tx_peek_desc(tx->xsk_pool, &desc)) {
++			tx->xdp_xsk_done = tx->xdp_xsk_wakeup;
++			goto out;
++		}
++
++		data = xsk_buff_raw_get_data(tx->xsk_pool, desc.addr);
++		nsegs = gve_tx_fill_xdp(priv, tx, data, desc.len, NULL, true);
++		tx->req += nsegs;
++		sent++;
++	}
++out:
++	if (sent > 0) {
++		gve_tx_put_doorbell(priv, tx->q_resources, tx->req);
++		xsk_tx_release(tx->xsk_pool);
++	}
++	spin_unlock(&tx->xdp_lock);
++	return sent;
++}
++
+ bool gve_xdp_poll(struct gve_notify_block *block, int budget)
+ {
+ 	struct gve_priv *priv = block->priv;
+ 	struct gve_tx_ring *tx = block->tx;
+ 	u32 nic_done;
++	bool repoll;
+ 	u32 to_do;
+ 
+ 	/* If budget is 0, do all the work */
+@@ -895,7 +933,21 @@ bool gve_xdp_poll(struct gve_notify_bloc
+ 	nic_done = gve_tx_load_event_counter(priv, tx);
+ 	to_do = min_t(u32, (nic_done - tx->done), budget);
+ 	gve_clean_xdp_done(priv, tx, to_do);
+-	return nic_done != tx->done;
++	repoll = nic_done != tx->done;
++
++	if (tx->xsk_pool) {
++		int sent = gve_xsk_tx(priv, tx, budget);
++
++		u64_stats_update_begin(&tx->statss);
++		tx->xdp_xsk_sent += sent;
++		u64_stats_update_end(&tx->statss);
++		repoll |= (sent == budget);
++		if (xsk_uses_need_wakeup(tx->xsk_pool))
++			xsk_set_tx_need_wakeup(tx->xsk_pool);
++	}
++
++	/* If we still have work we want to repoll */
++	return repoll;
+ }
+ 
+ bool gve_tx_poll(struct gve_notify_block *block, int budget)
