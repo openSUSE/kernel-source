@@ -1,0 +1,355 @@
+From: Eli Cohen <elic@nvidia.com>
+Date: Wed, 7 Jun 2023 22:00:06 +0300
+Subject: vdpa/mlx5: Support interrupt bypassing
+Patch-mainline: v6.5-rc1
+Git-commit: bc9a2b3e686e32ebd764d92e66e21c01e23ffb16
+References: jsc#PED-3311
+
+Add support for generation of interrupts from the device directly to the
+VM to the VCPU thus avoiding the overhead on the host CPU.
+
+When supported, the driver will attempt to allocate vectors for each
+data virtqueue. If a vector for a virtqueue cannot be provided it will
+use the QP mode where notifications go through the driver.
+
+In addition, we add a shutdown callback to make sure allocated
+interrupts are released in case of shutdown to allow clean shutdown.
+
+Signed-off-by: Eli Cohen <elic@nvidia.com>
+Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+Message-Id: <20230607190007.290505-1-dtatulea@nvidia.com>
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/vdpa/mlx5/net/mlx5_vnet.c |  165 +++++++++++++++++++++++++++++++++++---
+ drivers/vdpa/mlx5/net/mlx5_vnet.h |   15 +++
+ 2 files changed, 171 insertions(+), 9 deletions(-)
+
+--- a/drivers/vdpa/mlx5/net/mlx5_vnet.c
++++ b/drivers/vdpa/mlx5/net/mlx5_vnet.c
+@@ -83,6 +83,7 @@ struct mlx5_vq_restore_info {
+ 	u64 driver_addr;
+ 	u16 avail_index;
+ 	u16 used_index;
++	struct msi_map map;
+ 	bool ready;
+ 	bool restore;
+ };
+@@ -118,6 +119,7 @@ struct mlx5_vdpa_virtqueue {
+ 	u16 avail_idx;
+ 	u16 used_idx;
+ 	int fw_state;
++	struct msi_map map;
+ 
+ 	/* keep last in the struct */
+ 	struct mlx5_vq_restore_info ri;
+@@ -808,6 +810,13 @@ static bool counters_supported(const str
+ 	       BIT_ULL(MLX5_OBJ_TYPE_VIRTIO_Q_COUNTERS);
+ }
+ 
++static bool msix_mode_supported(struct mlx5_vdpa_dev *mvdev)
++{
++	return MLX5_CAP_DEV_VDPA_EMULATION(mvdev->mdev, event_mode) &
++		(1 << MLX5_VIRTIO_Q_EVENT_MODE_MSIX_MODE) &&
++		pci_msix_can_alloc_dyn(mvdev->mdev->pdev);
++}
++
+ static int create_virtqueue(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtqueue *mvq)
+ {
+ 	int inlen = MLX5_ST_SZ_BYTES(create_virtio_net_q_in);
+@@ -849,9 +858,15 @@ static int create_virtqueue(struct mlx5_
+ 	if (vq_is_tx(mvq->index))
+ 		MLX5_SET(virtio_net_q_object, obj_context, tisn_or_qpn, ndev->res.tisn);
+ 
+-	MLX5_SET(virtio_q, vq_ctx, event_mode, MLX5_VIRTIO_Q_EVENT_MODE_QP_MODE);
++	if (mvq->map.virq) {
++		MLX5_SET(virtio_q, vq_ctx, event_mode, MLX5_VIRTIO_Q_EVENT_MODE_MSIX_MODE);
++		MLX5_SET(virtio_q, vq_ctx, event_qpn_or_msix, mvq->map.index);
++	} else {
++		MLX5_SET(virtio_q, vq_ctx, event_mode, MLX5_VIRTIO_Q_EVENT_MODE_QP_MODE);
++		MLX5_SET(virtio_q, vq_ctx, event_qpn_or_msix, mvq->fwqp.mqp.qpn);
++	}
++
+ 	MLX5_SET(virtio_q, vq_ctx, queue_index, mvq->index);
+-	MLX5_SET(virtio_q, vq_ctx, event_qpn_or_msix, mvq->fwqp.mqp.qpn);
+ 	MLX5_SET(virtio_q, vq_ctx, queue_size, mvq->num_ent);
+ 	MLX5_SET(virtio_q, vq_ctx, virtio_version_1_0,
+ 		 !!(ndev->mvdev.actual_features & BIT_ULL(VIRTIO_F_VERSION_1)));
+@@ -1194,6 +1209,56 @@ static void counter_set_dealloc(struct m
+ 		mlx5_vdpa_warn(&ndev->mvdev, "dealloc counter set 0x%x\n", mvq->counter_set_id);
+ }
+ 
++static irqreturn_t mlx5_vdpa_int_handler(int irq, void *priv)
++{
++	struct vdpa_callback *cb = priv;
++
++	if (cb->callback)
++		return cb->callback(cb->private);
++
++	return IRQ_HANDLED;
++}
++
++static void alloc_vector(struct mlx5_vdpa_net *ndev,
++			 struct mlx5_vdpa_virtqueue *mvq)
++{
++	struct mlx5_vdpa_irq_pool *irqp = &ndev->irqp;
++	struct mlx5_vdpa_irq_pool_entry *ent;
++	int err;
++	int i;
++
++	for (i = 0; i < irqp->num_ent; i++) {
++		ent = &irqp->entries[i];
++		if (!ent->used) {
++			snprintf(ent->name, MLX5_VDPA_IRQ_NAME_LEN, "%s-vq-%d",
++				 dev_name(&ndev->mvdev.vdev.dev), mvq->index);
++			ent->dev_id = &ndev->event_cbs[mvq->index];
++			err = request_irq(ent->map.virq, mlx5_vdpa_int_handler, 0,
++					  ent->name, ent->dev_id);
++			if (err)
++				return;
++
++			ent->used = true;
++			mvq->map = ent->map;
++			return;
++		}
++	}
++}
++
++static void dealloc_vector(struct mlx5_vdpa_net *ndev,
++			   struct mlx5_vdpa_virtqueue *mvq)
++{
++	struct mlx5_vdpa_irq_pool *irqp = &ndev->irqp;
++	int i;
++
++	for (i = 0; i < irqp->num_ent; i++)
++		if (mvq->map.virq == irqp->entries[i].map.virq) {
++			free_irq(mvq->map.virq, irqp->entries[i].dev_id);
++			irqp->entries[i].used = false;
++			return;
++		}
++}
++
+ static int setup_vq(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtqueue *mvq)
+ {
+ 	u16 idx = mvq->index;
+@@ -1223,27 +1288,31 @@ static int setup_vq(struct mlx5_vdpa_net
+ 
+ 	err = counter_set_alloc(ndev, mvq);
+ 	if (err)
+-		goto err_counter;
++		goto err_connect;
+ 
++	alloc_vector(ndev, mvq);
+ 	err = create_virtqueue(ndev, mvq);
+ 	if (err)
+-		goto err_connect;
++		goto err_vq;
+ 
+ 	if (mvq->ready) {
+ 		err = modify_virtqueue(ndev, mvq, MLX5_VIRTIO_NET_Q_OBJECT_STATE_RDY);
+ 		if (err) {
+ 			mlx5_vdpa_warn(&ndev->mvdev, "failed to modify to ready vq idx %d(%d)\n",
+ 				       idx, err);
+-			goto err_connect;
++			goto err_modify;
+ 		}
+ 	}
+ 
+ 	mvq->initialized = true;
+ 	return 0;
+ 
+-err_connect:
++err_modify:
++	destroy_virtqueue(ndev, mvq);
++err_vq:
++	dealloc_vector(ndev, mvq);
+ 	counter_set_dealloc(ndev, mvq);
+-err_counter:
++err_connect:
+ 	qp_destroy(ndev, &mvq->vqqp);
+ err_vqqp:
+ 	qp_destroy(ndev, &mvq->fwqp);
+@@ -1288,6 +1357,7 @@ static void teardown_vq(struct mlx5_vdpa
+ 
+ 	suspend_vq(ndev, mvq);
+ 	destroy_virtqueue(ndev, mvq);
++	dealloc_vector(ndev, mvq);
+ 	counter_set_dealloc(ndev, mvq);
+ 	qp_destroy(ndev, &mvq->vqqp);
+ 	qp_destroy(ndev, &mvq->fwqp);
+@@ -2505,6 +2575,7 @@ static int save_channel_info(struct mlx5
+ 	ri->desc_addr = mvq->desc_addr;
+ 	ri->device_addr = mvq->device_addr;
+ 	ri->driver_addr = mvq->driver_addr;
++	ri->map = mvq->map;
+ 	ri->restore = true;
+ 	return 0;
+ }
+@@ -2549,6 +2620,7 @@ static void restore_channels_info(struct
+ 		mvq->desc_addr = ri->desc_addr;
+ 		mvq->device_addr = ri->device_addr;
+ 		mvq->driver_addr = ri->driver_addr;
++		mvq->map = ri->map;
+ 	}
+ }
+ 
+@@ -2833,6 +2905,25 @@ static struct device *mlx5_get_vq_dma_de
+ 	return mvdev->vdev.dma_dev;
+ }
+ 
++static void free_irqs(struct mlx5_vdpa_net *ndev)
++{
++	struct mlx5_vdpa_irq_pool_entry *ent;
++	int i;
++
++	if (!msix_mode_supported(&ndev->mvdev))
++		return;
++
++	if (!ndev->irqp.entries)
++		return;
++
++	for (i = ndev->irqp.num_ent - 1; i >= 0; i--) {
++		ent = ndev->irqp.entries + i;
++		if (ent->map.virq)
++			pci_msix_free_irq(ndev->mvdev.mdev->pdev, ent->map);
++	}
++	kfree(ndev->irqp.entries);
++}
++
+ static void mlx5_vdpa_free(struct vdpa_device *vdev)
+ {
+ 	struct mlx5_vdpa_dev *mvdev = to_mvdev(vdev);
+@@ -2848,6 +2939,7 @@ static void mlx5_vdpa_free(struct vdpa_d
+ 		mlx5_mpfs_del_mac(pfmdev, ndev->config.mac);
+ 	}
+ 	mlx5_vdpa_free_resources(&ndev->mvdev);
++	free_irqs(ndev);
+ 	kfree(ndev->event_cbs);
+ 	kfree(ndev->vqs);
+ }
+@@ -2876,9 +2968,23 @@ static struct vdpa_notification_area mlx
+ 	return ret;
+ }
+ 
+-static int mlx5_get_vq_irq(struct vdpa_device *vdv, u16 idx)
++static int mlx5_get_vq_irq(struct vdpa_device *vdev, u16 idx)
+ {
+-	return -EOPNOTSUPP;
++	struct mlx5_vdpa_dev *mvdev = to_mvdev(vdev);
++	struct mlx5_vdpa_net *ndev = to_mlx5_vdpa_ndev(mvdev);
++	struct mlx5_vdpa_virtqueue *mvq;
++
++	if (!is_index_valid(mvdev, idx))
++		return -EINVAL;
++
++	if (is_ctrl_vq_idx(mvdev, idx))
++		return -EOPNOTSUPP;
++
++	mvq = &ndev->vqs[idx];
++	if (!mvq->map.virq)
++		return -EOPNOTSUPP;
++
++	return mvq->map.virq;
+ }
+ 
+ static u64 mlx5_vdpa_get_driver_features(struct vdpa_device *vdev)
+@@ -3155,6 +3261,34 @@ static int config_func_mtu(struct mlx5_c
+ 	return err;
+ }
+ 
++static void allocate_irqs(struct mlx5_vdpa_net *ndev)
++{
++	struct mlx5_vdpa_irq_pool_entry *ent;
++	int i;
++
++	if (!msix_mode_supported(&ndev->mvdev))
++		return;
++
++	if (!ndev->mvdev.mdev->pdev)
++		return;
++
++	ndev->irqp.entries = kcalloc(ndev->mvdev.max_vqs, sizeof(*ndev->irqp.entries), GFP_KERNEL);
++	if (!ndev->irqp.entries)
++		return;
++
++
++	for (i = 0; i < ndev->mvdev.max_vqs; i++) {
++		ent = ndev->irqp.entries + i;
++		snprintf(ent->name, MLX5_VDPA_IRQ_NAME_LEN, "%s-vq-%d",
++			 dev_name(&ndev->mvdev.vdev.dev), i);
++		ent->map = pci_msix_alloc_irq_at(ndev->mvdev.mdev->pdev, MSI_ANY_INDEX, NULL);
++		if (!ent->map.virq)
++			return;
++
++		ndev->irqp.num_ent++;
++	}
++}
++
+ static int mlx5_vdpa_dev_add(struct vdpa_mgmt_dev *v_mdev, const char *name,
+ 			     const struct vdpa_dev_set_config *add_config)
+ {
+@@ -3233,6 +3367,7 @@ static int mlx5_vdpa_dev_add(struct vdpa
+ 	}
+ 
+ 	init_mvqs(ndev);
++	allocate_irqs(ndev);
+ 	init_rwsem(&ndev->reslock);
+ 	config = &ndev->config;
+ 
+@@ -3413,6 +3548,17 @@ static void mlx5v_remove(struct auxiliar
+ 	kfree(mgtdev);
+ }
+ 
++static void mlx5v_shutdown(struct auxiliary_device *auxdev)
++{
++	struct mlx5_vdpa_mgmtdev *mgtdev;
++	struct mlx5_vdpa_net *ndev;
++
++	mgtdev = auxiliary_get_drvdata(auxdev);
++	ndev = mgtdev->ndev;
++
++	free_irqs(ndev);
++}
++
+ static const struct auxiliary_device_id mlx5v_id_table[] = {
+ 	{ .name = MLX5_ADEV_NAME ".vnet", },
+ 	{},
+@@ -3424,6 +3570,7 @@ static struct auxiliary_driver mlx5v_dri
+ 	.name = "vnet",
+ 	.probe = mlx5v_probe,
+ 	.remove = mlx5v_remove,
++	.shutdown = mlx5v_shutdown,
+ 	.id_table = mlx5v_id_table,
+ };
+ 
+--- a/drivers/vdpa/mlx5/net/mlx5_vnet.h
++++ b/drivers/vdpa/mlx5/net/mlx5_vnet.h
+@@ -26,6 +26,20 @@ static inline u16 key2vid(u64 key)
+ 	return (u16)(key >> 48) & 0xfff;
+ }
+ 
++#define MLX5_VDPA_IRQ_NAME_LEN 32
++
++struct mlx5_vdpa_irq_pool_entry {
++	struct msi_map map;
++	bool used;
++	char name[MLX5_VDPA_IRQ_NAME_LEN];
++	void *dev_id;
++};
++
++struct mlx5_vdpa_irq_pool {
++	int num_ent;
++	struct mlx5_vdpa_irq_pool_entry *entries;
++};
++
+ struct mlx5_vdpa_net {
+ 	struct mlx5_vdpa_dev mvdev;
+ 	struct mlx5_vdpa_net_resources res;
+@@ -49,6 +63,7 @@ struct mlx5_vdpa_net {
+ 	struct vdpa_callback config_cb;
+ 	struct mlx5_vdpa_wq_ent cvq_ent;
+ 	struct hlist_head macvlan_hash[MLX5V_MACVLAN_SIZE];
++	struct mlx5_vdpa_irq_pool irqp;
+ 	struct dentry *debugfs;
+ };
+ 
