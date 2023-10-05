@@ -1,0 +1,288 @@
+From: Rushil Gupta <rushilg@google.com>
+Date: Fri, 4 Aug 2023 21:34:43 +0000
+Subject: gve: RX path for DQO-QPL
+Patch-mainline: v6.6-rc1
+Git-commit: e7075ab4fb6b39730dfbfbfa3a5505d678f01d2c
+References: bsc#1214479
+
+The RX path allocates the QPL page pool at queue creation, and
+tries to reuse these pages through page recycling. This patch
+ensures that on refill no non-QPL pages are posted to the device.
+
+When the driver is running low on free buffers, an ondemand
+allocation step kicks in that allocates a non-qpl page for
+SKB business to free up the QPL page in use.
+
+gve_try_recycle_buf was moved to gve_rx_append_frags so that driver does
+not attempt to mark buffer as used if a non-qpl page was allocated
+ondemand.
+
+Signed-off-by: Rushil Gupta <rushilg@google.com>
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Signed-off-by: Praveen Kaligineedi <pkaligineedi@google.com>
+Signed-off-by: Bailey Forrest <bcf@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/google/gve/gve.h        |    6 +
+ drivers/net/ethernet/google/gve/gve_rx_dqo.c |  126 +++++++++++++++++++++++----
+ 2 files changed, 114 insertions(+), 18 deletions(-)
+
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@ -240,6 +240,12 @@ struct gve_rx_ring {
+ 
+ 			/* qpl assigned to this queue */
+ 			struct gve_queue_page_list *qpl;
++
++			/* index into queue page list */
++			u32 next_qpl_page_idx;
++
++			/* track number of used buffers */
++			u16 used_buf_states_cnt;
+ 		} dqo;
+ 	};
+ 
+--- a/drivers/net/ethernet/google/gve/gve_rx_dqo.c
++++ b/drivers/net/ethernet/google/gve/gve_rx_dqo.c
+@@ -22,11 +22,13 @@ static int gve_buf_ref_cnt(struct gve_rx
+ }
+ 
+ static void gve_free_page_dqo(struct gve_priv *priv,
+-			      struct gve_rx_buf_state_dqo *bs)
++			      struct gve_rx_buf_state_dqo *bs,
++			      bool free_page)
+ {
+ 	page_ref_sub(bs->page_info.page, bs->page_info.pagecnt_bias - 1);
+-	gve_free_page(&priv->pdev->dev, bs->page_info.page, bs->addr,
+-		      DMA_FROM_DEVICE);
++	if (free_page)
++		gve_free_page(&priv->pdev->dev, bs->page_info.page, bs->addr,
++			      DMA_FROM_DEVICE);
+ 	bs->page_info.page = NULL;
+ }
+ 
+@@ -130,12 +132,20 @@ gve_get_recycled_buf_state(struct gve_rx
+ 	 */
+ 	for (i = 0; i < 5; i++) {
+ 		buf_state = gve_dequeue_buf_state(rx, &rx->dqo.used_buf_states);
+-		if (gve_buf_ref_cnt(buf_state) == 0)
++		if (gve_buf_ref_cnt(buf_state) == 0) {
++			rx->dqo.used_buf_states_cnt--;
+ 			return buf_state;
++		}
+ 
+ 		gve_enqueue_buf_state(rx, &rx->dqo.used_buf_states, buf_state);
+ 	}
+ 
++	/* For QPL, we cannot allocate any new buffers and must
++	 * wait for the existing ones to be available.
++	 */
++	if (rx->dqo.qpl)
++		return NULL;
++
+ 	/* If there are no free buf states discard an entry from
+ 	 * `used_buf_states` so it can be used.
+ 	 */
+@@ -144,23 +154,39 @@ gve_get_recycled_buf_state(struct gve_rx
+ 		if (gve_buf_ref_cnt(buf_state) == 0)
+ 			return buf_state;
+ 
+-		gve_free_page_dqo(rx->gve, buf_state);
++		gve_free_page_dqo(rx->gve, buf_state, true);
+ 		gve_free_buf_state(rx, buf_state);
+ 	}
+ 
+ 	return NULL;
+ }
+ 
+-static int gve_alloc_page_dqo(struct gve_priv *priv,
++static int gve_alloc_page_dqo(struct gve_rx_ring *rx,
+ 			      struct gve_rx_buf_state_dqo *buf_state)
+ {
+-	int err;
++	struct gve_priv *priv = rx->gve;
++	u32 idx;
+ 
+-	err = gve_alloc_page(priv, &priv->pdev->dev, &buf_state->page_info.page,
+-			     &buf_state->addr, DMA_FROM_DEVICE, GFP_ATOMIC);
+-	if (err)
+-		return err;
++	if (!rx->dqo.qpl) {
++		int err;
+ 
++		err = gve_alloc_page(priv, &priv->pdev->dev,
++				     &buf_state->page_info.page,
++				     &buf_state->addr,
++				     DMA_FROM_DEVICE, GFP_ATOMIC);
++		if (err)
++			return err;
++	} else {
++		idx = rx->dqo.next_qpl_page_idx;
++		if (idx >= priv->rx_pages_per_qpl) {
++			net_err_ratelimited("%s: Out of QPL pages\n",
++					    priv->dev->name);
++			return -ENOMEM;
++		}
++		buf_state->page_info.page = rx->dqo.qpl->pages[idx];
++		buf_state->addr = rx->dqo.qpl->page_buses[idx];
++		rx->dqo.next_qpl_page_idx++;
++	}
+ 	buf_state->page_info.page_offset = 0;
+ 	buf_state->page_info.page_address =
+ 		page_address(buf_state->page_info.page);
+@@ -195,9 +221,13 @@ static void gve_rx_free_ring_dqo(struct
+ 
+ 	for (i = 0; i < rx->dqo.num_buf_states; i++) {
+ 		struct gve_rx_buf_state_dqo *bs = &rx->dqo.buf_states[i];
+-
++		/* Only free page for RDA. QPL pages are freed in gve_main. */
+ 		if (bs->page_info.page)
+-			gve_free_page_dqo(priv, bs);
++			gve_free_page_dqo(priv, bs, !rx->dqo.qpl);
++	}
++	if (rx->dqo.qpl) {
++		gve_unassign_qpl(priv, rx->dqo.qpl->id);
++		rx->dqo.qpl = NULL;
+ 	}
+ 
+ 	if (rx->dqo.bufq.desc_ring) {
+@@ -229,7 +259,8 @@ static int gve_rx_alloc_ring_dqo(struct
+ 	int i;
+ 
+ 	const u32 buffer_queue_slots =
+-		priv->options_dqo_rda.rx_buff_ring_entries;
++		priv->queue_format == GVE_DQO_RDA_FORMAT ?
++		priv->options_dqo_rda.rx_buff_ring_entries : priv->rx_desc_cnt;
+ 	const u32 completion_queue_slots = priv->rx_desc_cnt;
+ 
+ 	netif_dbg(priv, drv, priv->dev, "allocating rx ring DQO\n");
+@@ -243,7 +274,9 @@ static int gve_rx_alloc_ring_dqo(struct
+ 	rx->ctx.skb_head = NULL;
+ 	rx->ctx.skb_tail = NULL;
+ 
+-	rx->dqo.num_buf_states = min_t(s16, S16_MAX, buffer_queue_slots * 4);
++	rx->dqo.num_buf_states = priv->queue_format == GVE_DQO_RDA_FORMAT ?
++		min_t(s16, S16_MAX, buffer_queue_slots * 4) :
++		priv->rx_pages_per_qpl;
+ 	rx->dqo.buf_states = kvcalloc(rx->dqo.num_buf_states,
+ 				      sizeof(rx->dqo.buf_states[0]),
+ 				      GFP_KERNEL);
+@@ -275,6 +308,13 @@ static int gve_rx_alloc_ring_dqo(struct
+ 	if (!rx->dqo.bufq.desc_ring)
+ 		goto err;
+ 
++	if (priv->queue_format != GVE_DQO_RDA_FORMAT) {
++		rx->dqo.qpl = gve_assign_rx_qpl(priv, rx->q_num);
++		if (!rx->dqo.qpl)
++			goto err;
++		rx->dqo.next_qpl_page_idx = 0;
++	}
++
+ 	rx->q_resources = dma_alloc_coherent(hdev, sizeof(*rx->q_resources),
+ 					     &rx->q_resources_bus, GFP_KERNEL);
+ 	if (!rx->q_resources)
+@@ -352,7 +392,7 @@ void gve_rx_post_buffers_dqo(struct gve_
+ 			if (unlikely(!buf_state))
+ 				break;
+ 
+-			if (unlikely(gve_alloc_page_dqo(priv, buf_state))) {
++			if (unlikely(gve_alloc_page_dqo(rx, buf_state))) {
+ 				u64_stats_update_begin(&rx->statss);
+ 				rx->rx_buf_alloc_fail++;
+ 				u64_stats_update_end(&rx->statss);
+@@ -415,6 +455,7 @@ static void gve_try_recycle_buf(struct g
+ 
+ mark_used:
+ 	gve_enqueue_buf_state(rx, &rx->dqo.used_buf_states, buf_state);
++	rx->dqo.used_buf_states_cnt++;
+ }
+ 
+ static void gve_rx_skb_csum(struct sk_buff *skb,
+@@ -475,6 +516,43 @@ static void gve_rx_free_skb(struct gve_r
+ 	rx->ctx.skb_tail = NULL;
+ }
+ 
++static bool gve_rx_should_trigger_copy_ondemand(struct gve_rx_ring *rx)
++{
++	if (!rx->dqo.qpl)
++		return false;
++	if (rx->dqo.used_buf_states_cnt <
++		     (rx->dqo.num_buf_states -
++		     GVE_DQO_QPL_ONDEMAND_ALLOC_THRESHOLD))
++		return false;
++	return true;
++}
++
++static int gve_rx_copy_ondemand(struct gve_rx_ring *rx,
++				struct gve_rx_buf_state_dqo *buf_state,
++				u16 buf_len)
++{
++	struct page *page = alloc_page(GFP_ATOMIC);
++	int num_frags;
++
++	if (!page)
++		return -ENOMEM;
++
++	memcpy(page_address(page),
++	       buf_state->page_info.page_address +
++	       buf_state->page_info.page_offset,
++	       buf_len);
++	num_frags = skb_shinfo(rx->ctx.skb_tail)->nr_frags;
++	skb_add_rx_frag(rx->ctx.skb_tail, num_frags, page,
++			0, buf_len, PAGE_SIZE);
++
++	u64_stats_update_begin(&rx->statss);
++	rx->rx_frag_alloc_cnt++;
++	u64_stats_update_end(&rx->statss);
++	/* Return unused buffer. */
++	gve_enqueue_buf_state(rx, &rx->dqo.recycled_buf_states, buf_state);
++	return 0;
++}
++
+ /* Chains multi skbs for single rx packet.
+  * Returns 0 if buffer is appended, -1 otherwise.
+  */
+@@ -502,12 +580,20 @@ static int gve_rx_append_frags(struct na
+ 		rx->ctx.skb_head->truesize += priv->data_buffer_size_dqo;
+ 	}
+ 
++	/* Trigger ondemand page allocation if we are running low on buffers */
++	if (gve_rx_should_trigger_copy_ondemand(rx))
++		return gve_rx_copy_ondemand(rx, buf_state, buf_len);
++
+ 	skb_add_rx_frag(rx->ctx.skb_tail, num_frags,
+ 			buf_state->page_info.page,
+ 			buf_state->page_info.page_offset,
+ 			buf_len, priv->data_buffer_size_dqo);
+ 	gve_dec_pagecnt_bias(&buf_state->page_info);
+ 
++	/* Advances buffer page-offset if page is partially used.
++	 * Marks buffer as used if page is full.
++	 */
++	gve_try_recycle_buf(priv, rx, buf_state);
+ 	return 0;
+ }
+ 
+@@ -561,8 +647,6 @@ static int gve_rx_dqo(struct napi_struct
+ 						 priv)) != 0) {
+ 			goto error;
+ 		}
+-
+-		gve_try_recycle_buf(priv, rx, buf_state);
+ 		return 0;
+ 	}
+ 
+@@ -588,6 +672,12 @@ static int gve_rx_dqo(struct napi_struct
+ 		goto error;
+ 	rx->ctx.skb_tail = rx->ctx.skb_head;
+ 
++	if (gve_rx_should_trigger_copy_ondemand(rx)) {
++		if (gve_rx_copy_ondemand(rx, buf_state, buf_len) < 0)
++			goto error;
++		return 0;
++	}
++
+ 	skb_add_rx_frag(rx->ctx.skb_head, 0, buf_state->page_info.page,
+ 			buf_state->page_info.page_offset, buf_len,
+ 			priv->data_buffer_size_dqo);
