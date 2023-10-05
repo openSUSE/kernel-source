@@ -1,0 +1,293 @@
+From: Edward Cree <ecree.xilinx@gmail.com>
+Date: Thu, 11 May 2023 20:47:30 +0100
+Subject: sfc: support TC decap rules matching on enc_ip_tos
+Patch-mainline: v6.5-rc1
+Git-commit: 3c9561c0a5b988be3dfd24ea1de2301b95efc640
+References: jsc#PED-3311
+
+Allow efx_tc_encap_match entries to include an ip_tos and ip_tos_mask.
+To avoid partially-overlapping Outer Rules (which can lead to undefined
+ behaviour in the hardware), store extra "pseudo" entries in our
+ encap_match hashtable, which are used to enforce that all Outer Rule
+ entries within a given <src_ip,dst_ip,udp_dport> tuple (or IPv6
+ equivalent) have the same ip_tos_mask.
+The "direct" encap_match entry takes a reference on the "pseudo",
+ allowing it to be destroyed when all "direct" entries using it are
+ removed.
+efx_tc_em_pseudo_type is an enum rather than just a bool because in
+ future an additional pseudo-type will be added to support Conntrack
+ offload.
+
+Signed-off-by: Edward Cree <ecree.xilinx@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/sfc/tc.c |  145 +++++++++++++++++++++++++++++++-----------
+ drivers/net/ethernet/sfc/tc.h |   24 ++++++
+ 2 files changed, 133 insertions(+), 36 deletions(-)
+
+--- a/drivers/net/ethernet/sfc/tc.c
++++ b/drivers/net/ethernet/sfc/tc.c
+@@ -202,6 +202,7 @@ static int efx_tc_flower_parse_match(str
+ 	      BIT(FLOW_DISSECTOR_KEY_ENC_KEYID) |
+ 	      BIT(FLOW_DISSECTOR_KEY_ENC_IPV4_ADDRS) |
+ 	      BIT(FLOW_DISSECTOR_KEY_ENC_IPV6_ADDRS) |
++	      BIT(FLOW_DISSECTOR_KEY_ENC_IP) |
+ 	      BIT(FLOW_DISSECTOR_KEY_ENC_PORTS) |
+ 	      BIT(FLOW_DISSECTOR_KEY_ENC_CONTROL) |
+ 	      BIT(FLOW_DISSECTOR_KEY_TCP) |
+@@ -346,20 +347,47 @@ static int efx_tc_flower_parse_match(str
+ 	return 0;
+ }
+ 
++static void efx_tc_flower_release_encap_match(struct efx_nic *efx,
++					      struct efx_tc_encap_match *encap)
++{
++	int rc;
++
++	if (!refcount_dec_and_test(&encap->ref))
++		return; /* still in use */
++
++	if (encap->type == EFX_TC_EM_DIRECT) {
++		rc = efx_mae_unregister_encap_match(efx, encap);
++		if (rc)
++			/* Display message but carry on and remove entry from our
++			 * SW tables, because there's not much we can do about it.
++			 */
++			netif_err(efx, drv, efx->net_dev,
++				  "Failed to release encap match %#x, rc %d\n",
++				  encap->fw_id, rc);
++	}
++	rhashtable_remove_fast(&efx->tc->encap_match_ht, &encap->linkage,
++			       efx_tc_encap_match_ht_params);
++	if (encap->pseudo)
++		efx_tc_flower_release_encap_match(efx, encap->pseudo);
++	kfree(encap);
++}
++
+ static int efx_tc_flower_record_encap_match(struct efx_nic *efx,
+ 					    struct efx_tc_match *match,
+ 					    enum efx_encap_type type,
++					    enum efx_tc_em_pseudo_type em_type,
++					    u8 child_ip_tos_mask,
+ 					    struct netlink_ext_ack *extack)
+ {
+-	struct efx_tc_encap_match *encap, *old;
++	struct efx_tc_encap_match *encap, *old, *pseudo = NULL;
+ 	bool ipv6 = false;
+ 	int rc;
+ 
+ 	/* We require that the socket-defining fields (IP addrs and UDP dest
+-	 * port) are present and exact-match.  Other fields are currently not
+-	 * allowed.  This meets what OVS will ask for, and means that we don't
+-	 * need to handle difficult checks for overlapping matches as could
+-	 * come up if we allowed masks or varying sets of match fields.
++	 * port) are present and exact-match.  Other fields may only be used
++	 * if the field-set (and any masks) are the same for all encap
++	 * matches on the same <sip,dip,dport> tuple; this is enforced by
++	 * pseudo encap matches.
+ 	 */
+ 	if (match->mask.enc_dst_ip | match->mask.enc_src_ip) {
+ 		if (!IS_ALL_ONES(match->mask.enc_dst_ip)) {
+@@ -402,21 +430,37 @@ static int efx_tc_flower_record_encap_ma
+ 		return -EOPNOTSUPP;
+ 	}
+ 	if (match->mask.enc_ip_tos) {
+-		NL_SET_ERR_MSG_MOD(extack, "Egress encap match on IP ToS not supported");
+-		return -EOPNOTSUPP;
++		struct efx_tc_match pmatch = *match;
++
++		if (em_type == EFX_TC_EM_PSEUDO_MASK) { /* can't happen */
++			NL_SET_ERR_MSG_MOD(extack, "Bad recursion in egress encap match handler");
++			return -EOPNOTSUPP;
++		}
++		pmatch.value.enc_ip_tos = 0;
++		pmatch.mask.enc_ip_tos = 0;
++		rc = efx_tc_flower_record_encap_match(efx, &pmatch, type,
++						      EFX_TC_EM_PSEUDO_MASK,
++						      match->mask.enc_ip_tos,
++						      extack);
++		if (rc)
++			return rc;
++		pseudo = pmatch.encap;
+ 	}
+ 	if (match->mask.enc_ip_ttl) {
+ 		NL_SET_ERR_MSG_MOD(extack, "Egress encap match on IP TTL not supported");
+-		return -EOPNOTSUPP;
++		rc = -EOPNOTSUPP;
++		goto fail_pseudo;
+ 	}
+ 
+ 	rc = efx_mae_check_encap_match_caps(efx, ipv6, match->mask.enc_ip_tos, extack);
+ 	if (rc)
+-		return rc;
++		goto fail_pseudo;
+ 
+ 	encap = kzalloc(sizeof(*encap), GFP_USER);
+-	if (!encap)
+-		return -ENOMEM;
++	if (!encap) {
++		rc = -ENOMEM;
++		goto fail_pseudo;
++	}
+ 	encap->src_ip = match->value.enc_src_ip;
+ 	encap->dst_ip = match->value.enc_dst_ip;
+ #ifdef CONFIG_IPV6
+@@ -425,12 +469,56 @@ static int efx_tc_flower_record_encap_ma
+ #endif
+ 	encap->udp_dport = match->value.enc_dport;
+ 	encap->tun_type = type;
++	encap->ip_tos = match->value.enc_ip_tos;
++	encap->ip_tos_mask = match->mask.enc_ip_tos;
++	encap->child_ip_tos_mask = child_ip_tos_mask;
++	encap->type = em_type;
++	encap->pseudo = pseudo;
+ 	old = rhashtable_lookup_get_insert_fast(&efx->tc->encap_match_ht,
+ 						&encap->linkage,
+ 						efx_tc_encap_match_ht_params);
+ 	if (old) {
+ 		/* don't need our new entry */
+ 		kfree(encap);
++		if (pseudo) /* don't need our new pseudo either */
++			efx_tc_flower_release_encap_match(efx, pseudo);
++		/* check old and new em_types are compatible */
++		switch (old->type) {
++		case EFX_TC_EM_DIRECT:
++			/* old EM is in hardware, so mustn't overlap with a
++			 * pseudo, but may be shared with another direct EM
++			 */
++			if (em_type == EFX_TC_EM_DIRECT)
++				break;
++			NL_SET_ERR_MSG_MOD(extack, "Pseudo encap match conflicts with existing direct entry");
++			return -EEXIST;
++		case EFX_TC_EM_PSEUDO_MASK:
++			/* old EM is protecting a ToS-qualified filter, so may
++			 * only be shared with another pseudo for the same
++			 * ToS mask.
++			 */
++			if (em_type != EFX_TC_EM_PSEUDO_MASK) {
++				NL_SET_ERR_MSG_FMT_MOD(extack,
++						       "%s encap match conflicts with existing pseudo(MASK) entry",
++						       encap->type ? "Pseudo" : "Direct");
++				return -EEXIST;
++			}
++			if (child_ip_tos_mask != old->child_ip_tos_mask) {
++				NL_SET_ERR_MSG_FMT_MOD(extack,
++						       "Pseudo encap match for TOS mask %#04x conflicts with existing pseudo(MASK) entry for TOS mask %#04x",
++						       child_ip_tos_mask,
++						       old->child_ip_tos_mask);
++				return -EEXIST;
++			}
++			break;
++		default: /* Unrecognised pseudo-type.  Just say no */
++			NL_SET_ERR_MSG_FMT_MOD(extack,
++					       "%s encap match conflicts with existing pseudo(%d) entry",
++					       encap->type ? "Pseudo" : "Direct",
++					       old->type);
++			return -EEXIST;
++		}
++		/* check old and new tun_types are compatible */
+ 		if (old->tun_type != type) {
+ 			NL_SET_ERR_MSG_FMT_MOD(extack,
+ 					       "Egress encap match with conflicting tun_type %u != %u",
+@@ -442,10 +530,12 @@ static int efx_tc_flower_record_encap_ma
+ 		/* existing entry found */
+ 		encap = old;
+ 	} else {
+-		rc = efx_mae_register_encap_match(efx, encap);
+-		if (rc) {
+-			NL_SET_ERR_MSG_MOD(extack, "Failed to record egress encap match in HW");
+-			goto fail;
++		if (em_type == EFX_TC_EM_DIRECT) {
++			rc = efx_mae_register_encap_match(efx, encap);
++			if (rc) {
++				NL_SET_ERR_MSG_MOD(extack, "Failed to record egress encap match in HW");
++				goto fail;
++			}
+ 		}
+ 		refcount_set(&encap->ref, 1);
+ 	}
+@@ -455,30 +545,12 @@ fail:
+ 	rhashtable_remove_fast(&efx->tc->encap_match_ht, &encap->linkage,
+ 			       efx_tc_encap_match_ht_params);
+ 	kfree(encap);
++fail_pseudo:
++	if (pseudo)
++		efx_tc_flower_release_encap_match(efx, pseudo);
+ 	return rc;
+ }
+ 
+-static void efx_tc_flower_release_encap_match(struct efx_nic *efx,
+-					      struct efx_tc_encap_match *encap)
+-{
+-	int rc;
+-
+-	if (!refcount_dec_and_test(&encap->ref))
+-		return; /* still in use */
+-
+-	rc = efx_mae_unregister_encap_match(efx, encap);
+-	if (rc)
+-		/* Display message but carry on and remove entry from our
+-		 * SW tables, because there's not much we can do about it.
+-		 */
+-		netif_err(efx, drv, efx->net_dev,
+-			  "Failed to release encap match %#x, rc %d\n",
+-			  encap->fw_id, rc);
+-	rhashtable_remove_fast(&efx->tc->encap_match_ht, &encap->linkage,
+-			       efx_tc_encap_match_ht_params);
+-	kfree(encap);
+-}
+-
+ static void efx_tc_delete_rule(struct efx_nic *efx, struct efx_tc_flow_rule *rule)
+ {
+ 	efx_mae_delete_rule(efx, rule->fw_id);
+@@ -630,6 +702,7 @@ static int efx_tc_flower_replace_foreign
+ 		}
+ 
+ 		rc = efx_tc_flower_record_encap_match(efx, &match, type,
++						      EFX_TC_EM_DIRECT, 0,
+ 						      extack);
+ 		if (rc)
+ 			return rc;
+--- a/drivers/net/ethernet/sfc/tc.h
++++ b/drivers/net/ethernet/sfc/tc.h
+@@ -74,6 +74,27 @@ static inline bool efx_tc_match_is_encap
+ 	       mask->enc_ip_ttl || mask->enc_sport || mask->enc_dport;
+ }
+ 
++/**
++ * enum efx_tc_em_pseudo_type - &struct efx_tc_encap_match pseudo type
++ *
++ * These are used to classify "pseudo" encap matches, which don't refer
++ * to an entry in hardware but rather indicate that a section of the
++ * match space is in use by another Outer Rule.
++ *
++ * @EFX_TC_EM_DIRECT: real HW entry in Outer Rule table; not a pseudo.
++ *	Hardware index in &struct efx_tc_encap_match.fw_id is valid.
++ * @EFX_TC_EM_PSEUDO_MASK: registered by an encap match which includes a
++ *	match on an optional field (currently only ip_tos), to prevent an
++ *	overlapping encap match _without_ optional fields.
++ *	The pseudo encap match may be referenced again by an encap match
++ *	with a different ip_tos value, but all ip_tos_mask must match the
++ *	first (stored in our child_ip_tos_mask).
++ */
++enum efx_tc_em_pseudo_type {
++	EFX_TC_EM_DIRECT,
++	EFX_TC_EM_PSEUDO_MASK,
++};
++
+ struct efx_tc_encap_match {
+ 	__be32 src_ip, dst_ip;
+ 	struct in6_addr src_ip6, dst_ip6;
+@@ -81,8 +102,11 @@ struct efx_tc_encap_match {
+ 	u8 ip_tos, ip_tos_mask;
+ 	struct rhash_head linkage;
+ 	enum efx_encap_type tun_type;
++	u8 child_ip_tos_mask;
+ 	refcount_t ref;
++	enum efx_tc_em_pseudo_type type;
+ 	u32 fw_id; /* index of this entry in firmware encap match table */
++	struct efx_tc_encap_match *pseudo; /* Referenced pseudo EM if needed */
+ };
+ 
+ struct efx_tc_match {
