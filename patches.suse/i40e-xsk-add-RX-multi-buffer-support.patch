@@ -1,0 +1,255 @@
+From: Tirthendu Sarkar <tirthendu.sarkar@intel.com>
+Date: Wed, 19 Jul 2023 15:24:10 +0200
+Subject: i40e: xsk: add RX multi-buffer support
+Patch-mainline: v6.6-rc1
+Git-commit: 1c9ba9c146589ff3d679b21e5e56b2d25ef43edd
+References: jsc#PED-4874
+
+This patch is inspired from the multi-buffer support in non-zc path for
+i40e as well as from the patch to support zc on ice. Each subsequent
+frag is added to skb_shared_info of the first frag for possible xdp_prog
+use as well to xsk buffer list for accessing the buffers in af_xdp.
+
+For XDP_PASS, new pages are allocated for frags and contents are copied
+from memory backed by xsk_buff_pool.
+
+Replace next_to_clean with next_to_process as done in non-zc path and
+advance it for every buffer and change the semantics of next_to_clean to
+point to the first buffer of a packet. Driver will use next_to_process
+in the same way next_to_clean was used previously.
+
+For the non multi-buffer case, next_to_process and next_to_clean will
+always be the same since each packet consists of a single buffer.
+
+Signed-off-by: Tirthendu Sarkar <tirthendu.sarkar@intel.com>
+Link: https://lore.kernel.org/r/20230719132421.584801-14-maciej.fijalkowski@intel.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/i40e/i40e_main.c |    5 -
+ drivers/net/ethernet/intel/i40e/i40e_txrx.c |    4 -
+ drivers/net/ethernet/intel/i40e/i40e_txrx.h |    2 
+ drivers/net/ethernet/intel/i40e/i40e_xsk.c  |   91 ++++++++++++++++++++++++----
+ 4 files changed, 84 insertions(+), 18 deletions(-)
+
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@ -3586,11 +3586,6 @@ static int i40e_configure_rx_ring(struct
+ 	if (ring->xsk_pool) {
+ 		ring->rx_buf_len =
+ 		  xsk_pool_get_rx_frame_size(ring->xsk_pool);
+-		/* For AF_XDP ZC, we disallow packets to span on
+-		 * multiple buffers, thus letting us skip that
+-		 * handling in the fast-path.
+-		 */
+-		chain_len = 1;
+ 		ret = xdp_rxq_info_reg_mem_model(&ring->xdp_rxq,
+ 						 MEM_TYPE_XSK_BUFF_POOL,
+ 						 NULL);
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@ -2284,8 +2284,8 @@ static struct sk_buff *i40e_build_skb(st
+  * If the buffer is an EOP buffer, this function exits returning false,
+  * otherwise return true indicating that this is in fact a non-EOP buffer.
+  */
+-static bool i40e_is_non_eop(struct i40e_ring *rx_ring,
+-			    union i40e_rx_desc *rx_desc)
++bool i40e_is_non_eop(struct i40e_ring *rx_ring,
++		     union i40e_rx_desc *rx_desc)
+ {
+ 	/* if we are the last buffer then there is nothing else to do */
+ #define I40E_RXD_EOF BIT(I40E_RX_DESC_STATUS_EOF_SHIFT)
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.h
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.h
+@@ -473,6 +473,8 @@ int __i40e_maybe_stop_tx(struct i40e_rin
+ bool __i40e_chk_linearize(struct sk_buff *skb);
+ int i40e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+ 		  u32 flags);
++bool i40e_is_non_eop(struct i40e_ring *rx_ring,
++		     union i40e_rx_desc *rx_desc);
+ 
+ /**
+  * i40e_get_head - Retrieve head from head writeback
+--- a/drivers/net/ethernet/intel/i40e/i40e_xsk.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_xsk.c
+@@ -294,8 +294,14 @@ static struct sk_buff *i40e_construct_sk
+ {
+ 	unsigned int totalsize = xdp->data_end - xdp->data_meta;
+ 	unsigned int metasize = xdp->data - xdp->data_meta;
++	struct skb_shared_info *sinfo = NULL;
+ 	struct sk_buff *skb;
++	u32 nr_frags = 0;
+ 
++	if (unlikely(xdp_buff_has_frags(xdp))) {
++		sinfo = xdp_get_shared_info_from_buff(xdp);
++		nr_frags = sinfo->nr_frags;
++	}
+ 	net_prefetch(xdp->data_meta);
+ 
+ 	/* allocate a skb to store the frags */
+@@ -312,6 +318,28 @@ static struct sk_buff *i40e_construct_sk
+ 		__skb_pull(skb, metasize);
+ 	}
+ 
++	if (likely(!xdp_buff_has_frags(xdp)))
++		goto out;
++
++	for (int i = 0; i < nr_frags; i++) {
++		struct skb_shared_info *skinfo = skb_shinfo(skb);
++		skb_frag_t *frag = &sinfo->frags[i];
++		struct page *page;
++		void *addr;
++
++		page = dev_alloc_page();
++		if (!page) {
++			dev_kfree_skb(skb);
++			return NULL;
++		}
++		addr = page_to_virt(page);
++
++		memcpy(addr, skb_frag_page(frag), skb_frag_size(frag));
++
++		__skb_fill_page_desc_noacc(skinfo, skinfo->nr_frags++,
++					   addr, 0, skb_frag_size(frag));
++	}
++
+ out:
+ 	xsk_buff_free(xdp);
+ 	return skb;
+@@ -322,14 +350,13 @@ static void i40e_handle_xdp_result_zc(st
+ 				      union i40e_rx_desc *rx_desc,
+ 				      unsigned int *rx_packets,
+ 				      unsigned int *rx_bytes,
+-				      unsigned int size,
+ 				      unsigned int xdp_res,
+ 				      bool *failure)
+ {
+ 	struct sk_buff *skb;
+ 
+ 	*rx_packets = 1;
+-	*rx_bytes = size;
++	*rx_bytes = xdp_get_buff_len(xdp_buff);
+ 
+ 	if (likely(xdp_res == I40E_XDP_REDIR) || xdp_res == I40E_XDP_TX)
+ 		return;
+@@ -363,7 +390,6 @@ static void i40e_handle_xdp_result_zc(st
+ 			return;
+ 		}
+ 
+-		*rx_bytes = skb->len;
+ 		i40e_process_skb_fields(rx_ring, rx_desc, skb);
+ 		napi_gro_receive(&rx_ring->q_vector->napi, skb);
+ 		return;
+@@ -374,6 +400,31 @@ static void i40e_handle_xdp_result_zc(st
+ 	WARN_ON_ONCE(1);
+ }
+ 
++static int
++i40e_add_xsk_frag(struct i40e_ring *rx_ring, struct xdp_buff *first,
++		  struct xdp_buff *xdp, const unsigned int size)
++{
++	struct skb_shared_info *sinfo = xdp_get_shared_info_from_buff(first);
++
++	if (!xdp_buff_has_frags(first)) {
++		sinfo->nr_frags = 0;
++		sinfo->xdp_frags_size = 0;
++		xdp_buff_set_frags_flag(first);
++	}
++
++	if (unlikely(sinfo->nr_frags == MAX_SKB_FRAGS)) {
++		xsk_buff_free(first);
++		return -ENOMEM;
++	}
++
++	__skb_fill_page_desc_noacc(sinfo, sinfo->nr_frags++,
++				   virt_to_page(xdp->data_hard_start), 0, size);
++	sinfo->xdp_frags_size += size;
++	xsk_buff_add_frag(xdp);
++
++	return 0;
++}
++
+ /**
+  * i40e_clean_rx_irq_zc - Consumes Rx packets from the hardware ring
+  * @rx_ring: Rx ring
+@@ -384,13 +435,18 @@ static void i40e_handle_xdp_result_zc(st
+ int i40e_clean_rx_irq_zc(struct i40e_ring *rx_ring, int budget)
+ {
+ 	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
++	u16 next_to_process = rx_ring->next_to_process;
+ 	u16 next_to_clean = rx_ring->next_to_clean;
+ 	u16 count_mask = rx_ring->count - 1;
+ 	unsigned int xdp_res, xdp_xmit = 0;
++	struct xdp_buff *first = NULL;
+ 	struct bpf_prog *xdp_prog;
+ 	bool failure = false;
+ 	u16 cleaned_count;
+ 
++	if (next_to_process != next_to_clean)
++		first = *i40e_rx_bi(rx_ring, next_to_clean);
++
+ 	/* NB! xdp_prog will always be !NULL, due to the fact that
+ 	 * this path is enabled by setting an XDP program.
+ 	 */
+@@ -404,7 +460,7 @@ int i40e_clean_rx_irq_zc(struct i40e_rin
+ 		unsigned int size;
+ 		u64 qword;
+ 
+-		rx_desc = I40E_RX_DESC(rx_ring, next_to_clean);
++		rx_desc = I40E_RX_DESC(rx_ring, next_to_process);
+ 		qword = le64_to_cpu(rx_desc->wb.qword1.status_error_len);
+ 
+ 		/* This memory barrier is needed to keep us from reading
+@@ -417,9 +473,9 @@ int i40e_clean_rx_irq_zc(struct i40e_rin
+ 			i40e_clean_programming_status(rx_ring,
+ 						      rx_desc->raw.qword[0],
+ 						      qword);
+-			bi = *i40e_rx_bi(rx_ring, next_to_clean);
++			bi = *i40e_rx_bi(rx_ring, next_to_process);
+ 			xsk_buff_free(bi);
+-			next_to_clean = (next_to_clean + 1) & count_mask;
++			next_to_process = (next_to_process + 1) & count_mask;
+ 			continue;
+ 		}
+ 
+@@ -428,22 +484,35 @@ int i40e_clean_rx_irq_zc(struct i40e_rin
+ 		if (!size)
+ 			break;
+ 
+-		bi = *i40e_rx_bi(rx_ring, next_to_clean);
++		bi = *i40e_rx_bi(rx_ring, next_to_process);
+ 		xsk_buff_set_size(bi, size);
+ 		xsk_buff_dma_sync_for_cpu(bi, rx_ring->xsk_pool);
+ 
+-		xdp_res = i40e_run_xdp_zc(rx_ring, bi, xdp_prog);
+-		i40e_handle_xdp_result_zc(rx_ring, bi, rx_desc, &rx_packets,
+-					  &rx_bytes, size, xdp_res, &failure);
++		if (!first)
++			first = bi;
++		else if (i40e_add_xsk_frag(rx_ring, first, bi, size))
++			break;
++
++		next_to_process = (next_to_process + 1) & count_mask;
++
++		if (i40e_is_non_eop(rx_ring, rx_desc))
++			continue;
++
++		xdp_res = i40e_run_xdp_zc(rx_ring, first, xdp_prog);
++		i40e_handle_xdp_result_zc(rx_ring, first, rx_desc, &rx_packets,
++					  &rx_bytes, xdp_res, &failure);
++		first->flags = 0;
++		next_to_clean = next_to_process;
+ 		if (failure)
+ 			break;
+ 		total_rx_packets += rx_packets;
+ 		total_rx_bytes += rx_bytes;
+ 		xdp_xmit |= xdp_res & (I40E_XDP_TX | I40E_XDP_REDIR);
+-		next_to_clean = (next_to_clean + 1) & count_mask;
++		first = NULL;
+ 	}
+ 
+ 	rx_ring->next_to_clean = next_to_clean;
++	rx_ring->next_to_process = next_to_process;
+ 	cleaned_count = (next_to_clean - rx_ring->next_to_use - 1) & count_mask;
+ 
+ 	if (cleaned_count >= I40E_RX_BUFFER_WRITE)
