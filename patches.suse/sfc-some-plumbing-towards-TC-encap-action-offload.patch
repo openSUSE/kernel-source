@@ -1,0 +1,464 @@
+From: Edward Cree <ecree.xilinx@gmail.com>
+Date: Thu, 8 Jun 2023 17:42:31 +0100
+Subject: sfc: some plumbing towards TC encap action offload
+Patch-mainline: v6.5-rc1
+Git-commit: b4da4235dc69427fbdb66c9fbdf094ac76cdf745
+References: jsc#PED-6894
+
+Create software objects to manage the metadata for encap actions that
+ can be attached to TC rules.  However, since we don't yet have the
+ neighbouring information (needed to generate the Ethernet header),
+ all rules with encap actions are marked as "unready" and thus insert
+ the fallback action into hardware rather than actually offloading the
+ encapsulation action.
+
+Reviewed-by: Pieter Jansen van Vuuren <pieter.jansen-van-vuuren@amd.com>
+Signed-off-by: Edward Cree <ecree.xilinx@gmail.com>
+Reviewed-by: Simon Horman <simon.horman@corigine.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/sfc/Makefile           |    3 
+ drivers/net/ethernet/sfc/tc.c               |  104 ++++++++++++++++++++++-
+ drivers/net/ethernet/sfc/tc.h               |    7 +
+ drivers/net/ethernet/sfc/tc_encap_actions.c |  126 ++++++++++++++++++++++++++++
+ drivers/net/ethernet/sfc/tc_encap_actions.h |   47 ++++++++++
+ 5 files changed, 284 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/net/ethernet/sfc/tc_encap_actions.c
+ create mode 100644 drivers/net/ethernet/sfc/tc_encap_actions.h
+
+--- a/drivers/net/ethernet/sfc/Makefile
++++ b/drivers/net/ethernet/sfc/Makefile
+@@ -10,7 +10,8 @@ sfc-y			+= efx.o efx_common.o efx_channe
+ 			   efx_devlink.o
+ sfc-$(CONFIG_SFC_MTD)	+= mtd.o
+ sfc-$(CONFIG_SFC_SRIOV)	+= sriov.o ef10_sriov.o ef100_sriov.o ef100_rep.o \
+-                           mae.o tc.o tc_bindings.o tc_counters.o
++                           mae.o tc.o tc_bindings.o tc_counters.o \
++                           tc_encap_actions.o
+ 
+ obj-$(CONFIG_SFC)	+= sfc.o
+ 
+--- a/drivers/net/ethernet/sfc/tc.c
++++ b/drivers/net/ethernet/sfc/tc.c
+@@ -14,11 +14,12 @@
+ #include <net/geneve.h>
+ #include "tc.h"
+ #include "tc_bindings.h"
++#include "tc_encap_actions.h"
+ #include "mae.h"
+ #include "ef100_rep.h"
+ #include "efx.h"
+ 
+-static enum efx_encap_type efx_tc_indr_netdev_type(struct net_device *net_dev)
++enum efx_encap_type efx_tc_indr_netdev_type(struct net_device *net_dev)
+ {
+ 	if (netif_is_vxlan(net_dev))
+ 		return EFX_ENCAP_TYPE_VXLAN;
+@@ -111,6 +112,8 @@ static void efx_tc_free_action_set(struc
+ 	}
+ 	if (act->count)
+ 		efx_tc_flower_put_counter_index(efx, act->count);
++	if (act->encap_md)
++		efx_tc_flower_release_encap_md(efx, act->encap_md);
+ 	kfree(act);
+ }
+ 
+@@ -594,6 +597,7 @@ enum efx_tc_action_order {
+ 	EFX_TC_AO_VLAN_POP,
+ 	EFX_TC_AO_VLAN_PUSH,
+ 	EFX_TC_AO_COUNT,
++	EFX_TC_AO_ENCAP,
+ 	EFX_TC_AO_DELIVER
+ };
+ /* Determine whether we can add @new action without violating order */
+@@ -623,6 +627,10 @@ static bool efx_tc_flower_action_order_o
+ 		if (act->count)
+ 			return false;
+ 		fallthrough;
++	case EFX_TC_AO_ENCAP:
++		if (act->encap_md)
++			return false;
++		fallthrough;
+ 	case EFX_TC_AO_DELIVER:
+ 		return !act->deliver;
+ 	default:
+@@ -918,11 +926,13 @@ static int efx_tc_flower_replace(struct
+ {
+ 	struct flow_rule *fr = flow_cls_offload_flow_rule(tc);
+ 	struct netlink_ext_ack *extack = tc->common.extack;
++	const struct ip_tunnel_info *encap_info = NULL;
+ 	struct efx_tc_flow_rule *rule = NULL, *old;
+ 	struct efx_tc_action_set *act = NULL;
+ 	const struct flow_action_entry *fa;
+ 	struct efx_rep *from_efv, *to_efv;
+ 	struct efx_tc_match match;
++	u32 acts_id;
+ 	s64 rc;
+ 	int i;
+ 
+@@ -1087,6 +1097,46 @@ static int efx_tc_flower_replace(struct
+ 		case FLOW_ACTION_MIRRED:
+ 			save = *act;
+ 
++			if (encap_info) {
++				struct efx_tc_encap_action *encap;
++
++				if (!efx_tc_flower_action_order_ok(act,
++								   EFX_TC_AO_ENCAP)) {
++					rc = -EOPNOTSUPP;
++					NL_SET_ERR_MSG_MOD(extack, "Encap action violates action order");
++					goto release;
++				}
++				encap = efx_tc_flower_create_encap_md(
++						efx, encap_info, fa->dev, extack);
++				if (IS_ERR_OR_NULL(encap)) {
++					rc = PTR_ERR(encap);
++					if (!rc)
++						rc = -EIO; /* arbitrary */
++					goto release;
++				}
++				act->encap_md = encap;
++				act->dest_mport = encap->dest_mport;
++				act->deliver = 1;
++				rc = efx_mae_alloc_action_set(efx, act);
++				if (rc) {
++					NL_SET_ERR_MSG_MOD(extack, "Failed to write action set to hw (encap)");
++					goto release;
++				}
++				list_add_tail(&act->list, &rule->acts.list);
++				act = NULL;
++				if (fa->id == FLOW_ACTION_REDIRECT)
++					break; /* end of the line */
++				/* Mirror, so continue on with saved act */
++				save.count = NULL;
++				act = kzalloc(sizeof(*act), GFP_USER);
++				if (!act) {
++					rc = -ENOMEM;
++					goto release;
++				}
++				*act = save;
++				break;
++			}
++
+ 			if (!efx_tc_flower_action_order_ok(act, EFX_TC_AO_DELIVER)) {
+ 				/* can't happen */
+ 				rc = -EOPNOTSUPP;
+@@ -1150,6 +1200,37 @@ static int efx_tc_flower_replace(struct
+ 			act->vlan_proto[act->vlan_push] = fa->vlan.proto;
+ 			act->vlan_push++;
+ 			break;
++		case FLOW_ACTION_TUNNEL_ENCAP:
++			if (encap_info) {
++				/* Can't specify encap multiple times.
++				 * If you want to overwrite an existing
++				 * encap_info, use an intervening
++				 * FLOW_ACTION_TUNNEL_DECAP to clear it.
++				 */
++				NL_SET_ERR_MSG_MOD(extack, "Tunnel key set when already set");
++				rc = -EINVAL;
++				goto release;
++			}
++			if (!fa->tunnel) {
++				NL_SET_ERR_MSG_MOD(extack, "Tunnel key set is missing key");
++				rc = -EOPNOTSUPP;
++				goto release;
++			}
++			encap_info = fa->tunnel;
++			break;
++		case FLOW_ACTION_TUNNEL_DECAP:
++			if (encap_info) {
++				encap_info = NULL;
++				break;
++			}
++			/* Since we don't support enc_key matches on ingress
++			 * (and if we did there'd be no tunnel-device to give
++			 * us a type), we can't offload a decap that's not
++			 * just undoing a previous encap action.
++			 */
++			NL_SET_ERR_MSG_MOD(extack, "Cannot offload tunnel decap action without tunnel device");
++			rc = -EOPNOTSUPP;
++			goto release;
+ 		default:
+ 			NL_SET_ERR_MSG_FMT_MOD(extack, "Unhandled action %u",
+ 					       fa->id);
+@@ -1193,8 +1274,21 @@ static int efx_tc_flower_replace(struct
+ 		NL_SET_ERR_MSG_MOD(extack, "Failed to write action set list to hw");
+ 		goto release;
+ 	}
++	if (from_efv == EFX_EFV_PF)
++		/* PF netdev, so rule applies to traffic from wire */
++		rule->fallback = &efx->tc->facts.pf;
++	else
++		/* repdev, so rule applies to traffic from representee */
++		rule->fallback = &efx->tc->facts.reps;
++	if (!efx_tc_check_ready(efx, rule)) {
++		netif_dbg(efx, drv, efx->net_dev, "action not ready for hw\n");
++		acts_id = rule->fallback->fw_id;
++	} else {
++		netif_dbg(efx, drv, efx->net_dev, "ready for hw\n");
++		acts_id = rule->acts.fw_id;
++	}
+ 	rc = efx_mae_insert_rule(efx, &rule->match, EFX_TC_PRIO_TC,
+-				 rule->acts.fw_id, &rule->fw_id);
++				 acts_id, &rule->fw_id);
+ 	if (rc) {
+ 		NL_SET_ERR_MSG_MOD(extack, "Failed to insert rule in hw");
+ 		goto release_acts;
+@@ -1609,6 +1703,9 @@ int efx_init_struct_tc(struct efx_nic *e
+ 
+ 	mutex_init(&efx->tc->mutex);
+ 	init_waitqueue_head(&efx->tc->flush_wq);
++	rc = efx_tc_init_encap_actions(efx);
++	if (rc < 0)
++		goto fail_encap_actions;
+ 	rc = efx_tc_init_counters(efx);
+ 	if (rc < 0)
+ 		goto fail_counters;
+@@ -1635,6 +1732,8 @@ fail_match_action_ht:
+ fail_encap_match_ht:
+ 	efx_tc_destroy_counters(efx);
+ fail_counters:
++	efx_tc_destroy_encap_actions(efx);
++fail_encap_actions:
+ 	mutex_destroy(&efx->tc->mutex);
+ 	kfree(efx->tc->caps);
+ fail_alloc_caps:
+@@ -1662,6 +1761,7 @@ void efx_fini_struct_tc(struct efx_nic *
+ 	rhashtable_free_and_destroy(&efx->tc->encap_match_ht,
+ 				    efx_tc_encap_match_free, NULL);
+ 	efx_tc_fini_counters(efx);
++	efx_tc_fini_encap_actions(efx);
+ 	mutex_unlock(&efx->tc->mutex);
+ 	mutex_destroy(&efx->tc->mutex);
+ 	kfree(efx->tc->caps);
+--- a/drivers/net/ethernet/sfc/tc.h
++++ b/drivers/net/ethernet/sfc/tc.h
+@@ -25,6 +25,8 @@ static inline bool efx_ipv6_addr_all_one
+ }
+ #endif
+ 
++struct efx_tc_encap_action; /* see tc_encap_actions.h */
++
+ struct efx_tc_action_set {
+ 	u16 vlan_push:2;
+ 	u16 vlan_pop:2;
+@@ -33,6 +35,7 @@ struct efx_tc_action_set {
+ 	__be16 vlan_tci[2]; /* TCIs for vlan_push */
+ 	__be16 vlan_proto[2]; /* Ethertypes for vlan_push */
+ 	struct efx_tc_counter_index *count;
++	struct efx_tc_encap_action *encap_md; /* entry in tc_encap_ht table */
+ 	u32 dest_mport;
+ 	u32 fw_id; /* index of this entry in firmware actions table */
+ 	struct list_head list;
+@@ -127,6 +130,7 @@ struct efx_tc_flow_rule {
+ 	struct rhash_head linkage;
+ 	struct efx_tc_match match;
+ 	struct efx_tc_action_set_list acts;
++	struct efx_tc_action_set_list *fallback; /* what to use when unready? */
+ 	u32 fw_id;
+ };
+ 
+@@ -144,6 +148,7 @@ enum efx_tc_rule_prios {
+  * @mutex: Used to serialise operations on TC hashtables
+  * @counter_ht: Hashtable of TC counters (FW IDs and counter values)
+  * @counter_id_ht: Hashtable mapping TC counter cookies to counters
++ * @encap_ht: Hashtable of TC encap actions
+  * @encap_match_ht: Hashtable of TC encap matches
+  * @match_action_ht: Hashtable of TC match-action rules
+  * @reps_mport_id: MAE port allocated for representor RX
+@@ -173,6 +178,7 @@ struct efx_tc_state {
+ 	struct mutex mutex;
+ 	struct rhashtable counter_ht;
+ 	struct rhashtable counter_id_ht;
++	struct rhashtable encap_ht;
+ 	struct rhashtable encap_match_ht;
+ 	struct rhashtable match_action_ht;
+ 	u32 reps_mport_id, reps_mport_vport_id;
+@@ -194,6 +200,7 @@ struct efx_tc_state {
+ 
+ struct efx_rep;
+ 
++enum efx_encap_type efx_tc_indr_netdev_type(struct net_device *net_dev);
+ int efx_tc_configure_default_rule_rep(struct efx_rep *efv);
+ void efx_tc_deconfigure_default_rule(struct efx_nic *efx,
+ 				     struct efx_tc_flow_rule *rule);
+--- /dev/null
++++ b/drivers/net/ethernet/sfc/tc_encap_actions.c
+@@ -0,0 +1,126 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/****************************************************************************
++ * Driver for Solarflare network controllers and boards
++ * Copyright 2023, Advanced Micro Devices, Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published
++ * by the Free Software Foundation, incorporated herein by reference.
++ */
++
++#include "tc_encap_actions.h"
++#include "tc.h"
++#include "mae.h"
++#include <net/vxlan.h>
++#include <net/geneve.h>
++
++static const struct rhashtable_params efx_tc_encap_ht_params = {
++	.key_len	= offsetofend(struct efx_tc_encap_action, key),
++	.key_offset	= 0,
++	.head_offset	= offsetof(struct efx_tc_encap_action, linkage),
++};
++
++static void efx_tc_encap_free(void *ptr, void *__unused)
++{
++	struct efx_tc_encap_action *enc = ptr;
++
++	WARN_ON(refcount_read(&enc->ref));
++	kfree(enc);
++}
++
++int efx_tc_init_encap_actions(struct efx_nic *efx)
++{
++	return rhashtable_init(&efx->tc->encap_ht, &efx_tc_encap_ht_params);
++}
++
++/* Only call this in init failure teardown.
++ * Normal exit should fini instead as there may be entries in the table.
++ */
++void efx_tc_destroy_encap_actions(struct efx_nic *efx)
++{
++	rhashtable_destroy(&efx->tc->encap_ht);
++}
++
++void efx_tc_fini_encap_actions(struct efx_nic *efx)
++{
++	rhashtable_free_and_destroy(&efx->tc->encap_ht, efx_tc_encap_free, NULL);
++}
++
++bool efx_tc_check_ready(struct efx_nic *efx, struct efx_tc_flow_rule *rule)
++{
++	struct efx_tc_action_set *act;
++
++	/* Encap actions can only be offloaded if they have valid
++	 * neighbour info for the outer Ethernet header.
++	 */
++	list_for_each_entry(act, &rule->acts.list, list)
++		if (act->encap_md) /* neigh bindings not implemented yet */
++			return false;
++	return true;
++}
++
++struct efx_tc_encap_action *efx_tc_flower_create_encap_md(
++			struct efx_nic *efx, const struct ip_tunnel_info *info,
++			struct net_device *egdev, struct netlink_ext_ack *extack)
++{
++	enum efx_encap_type type = efx_tc_indr_netdev_type(egdev);
++	struct efx_tc_encap_action *encap, *old;
++	s64 rc;
++
++	if (type == EFX_ENCAP_TYPE_NONE) {
++		/* dest is not an encap device */
++		NL_SET_ERR_MSG_MOD(extack, "Not a (supported) tunnel device but tunnel_key is set");
++		return ERR_PTR(-EOPNOTSUPP);
++	}
++	rc = efx_mae_check_encap_type_supported(efx, type);
++	if (rc < 0) {
++		NL_SET_ERR_MSG_MOD(extack, "Firmware reports no support for this tunnel type");
++		return ERR_PTR(rc);
++	}
++	/* No support yet for Geneve options */
++	if (info->options_len) {
++		NL_SET_ERR_MSG_MOD(extack, "Unsupported tunnel options");
++		return ERR_PTR(-EOPNOTSUPP);
++	}
++	switch (info->mode) {
++	case IP_TUNNEL_INFO_TX:
++		break;
++	case IP_TUNNEL_INFO_TX | IP_TUNNEL_INFO_IPV6:
++		type |= EFX_ENCAP_FLAG_IPV6;
++		break;
++	default:
++		NL_SET_ERR_MSG_FMT_MOD(extack, "Unsupported tunnel mode %u",
++				       info->mode);
++		return ERR_PTR(-EOPNOTSUPP);
++	}
++	encap = kzalloc(sizeof(*encap), GFP_KERNEL_ACCOUNT);
++	if (!encap)
++		return ERR_PTR(-ENOMEM);
++	encap->type = type;
++	encap->key = info->key;
++	old = rhashtable_lookup_get_insert_fast(&efx->tc->encap_ht,
++						&encap->linkage,
++						efx_tc_encap_ht_params);
++	if (old) {
++		/* don't need our new entry */
++		kfree(encap);
++		if (!refcount_inc_not_zero(&old->ref))
++			return ERR_PTR(-EAGAIN);
++		/* existing entry found, ref taken */
++		return old;
++	}
++
++	/* ref and return */
++	refcount_set(&encap->ref, 1);
++	return encap;
++}
++
++void efx_tc_flower_release_encap_md(struct efx_nic *efx,
++				    struct efx_tc_encap_action *encap)
++{
++	if (!refcount_dec_and_test(&encap->ref))
++		return; /* still in use */
++	rhashtable_remove_fast(&efx->tc->encap_ht, &encap->linkage,
++			       efx_tc_encap_ht_params);
++	kfree(encap);
++}
+--- /dev/null
++++ b/drivers/net/ethernet/sfc/tc_encap_actions.h
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/****************************************************************************
++ * Driver for Solarflare network controllers and boards
++ * Copyright 2023, Advanced Micro Devices, Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published
++ * by the Free Software Foundation, incorporated herein by reference.
++ */
++
++#ifndef EFX_TC_ENCAP_ACTIONS_H
++#define EFX_TC_ENCAP_ACTIONS_H
++#include "net_driver.h"
++
++#include <linux/refcount.h>
++#include <net/tc_act/tc_tunnel_key.h>
++
++/* This limit is arbitrary; current hardware (SN1022) handles encap headers
++ * of up to 126 bytes, but that limit is not enshrined in the MCDI protocol.
++ */
++#define EFX_TC_MAX_ENCAP_HDR	126
++struct efx_tc_encap_action {
++	enum efx_encap_type type;
++	struct ip_tunnel_key key; /* 52 bytes */
++	u32 dest_mport; /* is copied into struct efx_tc_action_set */
++	u8 encap_hdr_len;
++	u8 encap_hdr[EFX_TC_MAX_ENCAP_HDR];
++	struct rhash_head linkage; /* efx->tc_encap_ht */
++	refcount_t ref;
++	u32 fw_id; /* index of this entry in firmware encap table */
++};
++
++/* create/uncreate/teardown hashtables */
++int efx_tc_init_encap_actions(struct efx_nic *efx);
++void efx_tc_destroy_encap_actions(struct efx_nic *efx);
++void efx_tc_fini_encap_actions(struct efx_nic *efx);
++
++struct efx_tc_flow_rule;
++bool efx_tc_check_ready(struct efx_nic *efx, struct efx_tc_flow_rule *rule);
++
++struct efx_tc_encap_action *efx_tc_flower_create_encap_md(
++			struct efx_nic *efx, const struct ip_tunnel_info *info,
++			struct net_device *egdev, struct netlink_ext_ack *extack);
++void efx_tc_flower_release_encap_md(struct efx_nic *efx,
++				    struct efx_tc_encap_action *encap);
++
++#endif /* EFX_TC_ENCAP_ACTIONS_H */
