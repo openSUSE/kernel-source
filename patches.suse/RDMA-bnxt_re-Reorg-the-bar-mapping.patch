@@ -1,0 +1,558 @@
+From: Selvin Xavier <selvin.xavier@broadcom.com>
+Date: Tue, 13 Jun 2023 11:12:22 -0700
+Subject: RDMA/bnxt_re: Reorg the bar mapping
+Patch-mainline: v6.5-rc1
+Git-commit: 0ac20faf5d837b59fb4c041ea320932ed47fd67f
+References: jsc#PED-6864
+
+Reorganize the code for allocation and mapping of Doorbell
+pages. Implements new HW command to get the BAR length used by L2
+driver. These changes are used by the future patch which maps the WC
+Doorbell pages.
+
+Also, introduced a new lock dpi_tbl_lock for synchronize the DB page
+allocation from users.
+
+Link: https://lore.kernel.org/r/1686679943-17117-7-git-send-email-selvin.xavier@broadcom.com
+Signed-off-by: Selvin Xavier <selvin.xavier@broadcom.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/bnxt_re/ib_verbs.c   |    7 -
+ drivers/infiniband/hw/bnxt_re/main.c       |   71 +++++++++++
+ drivers/infiniband/hw/bnxt_re/qplib_fp.c   |    4 
+ drivers/infiniband/hw/bnxt_re/qplib_rcfw.h |    2 
+ drivers/infiniband/hw/bnxt_re/qplib_res.c  |  174 ++++++++++++++++++-----------
+ drivers/infiniband/hw/bnxt_re/qplib_res.h  |   28 +++-
+ drivers/infiniband/hw/bnxt_re/qplib_sp.c   |    3 
+ drivers/infiniband/hw/bnxt_re/qplib_sp.h   |    1 
+ 8 files changed, 213 insertions(+), 77 deletions(-)
+
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@ -619,8 +619,8 @@ int bnxt_re_alloc_pd(struct ib_pd *ibpd,
+ 			 * ibv_devinfo and family of application when DPIs
+ 			 * are depleted.
+ 			 */
+-			if (bnxt_qplib_alloc_dpi(&rdev->qplib_res.dpi_tbl,
+-						 &ucntx->dpi, ucntx)) {
++			if (bnxt_qplib_alloc_dpi(&rdev->qplib_res,
++						 &ucntx->dpi, ucntx, BNXT_QPLIB_DPI_TYPE_UC)) {
+ 				rc = -ENOMEM;
+ 				goto dbfail;
+ 			}
+@@ -4094,8 +4094,7 @@ void bnxt_re_dealloc_ucontext(struct ib_
+ 		/* Free DPI only if this is the first PD allocated by the
+ 		 * application and mark the context dpi as NULL
+ 		 */
+-		bnxt_qplib_dealloc_dpi(&rdev->qplib_res,
+-				       &rdev->qplib_res.dpi_tbl, &uctx->dpi);
++		bnxt_qplib_dealloc_dpi(&rdev->qplib_res, &uctx->dpi);
+ 		uctx->dpi.dbr = NULL;
+ 	}
+ }
+--- a/drivers/infiniband/hw/bnxt_re/main.c
++++ b/drivers/infiniband/hw/bnxt_re/main.c
+@@ -85,6 +85,40 @@ static struct bnxt_re_dev *bnxt_re_from_
+ static void bnxt_re_dev_uninit(struct bnxt_re_dev *rdev);
+ static int bnxt_re_hwrm_qcaps(struct bnxt_re_dev *rdev);
+ 
++static int bnxt_re_hwrm_qcfg(struct bnxt_re_dev *rdev, u32 *db_len,
++			     u32 *offset);
++static void bnxt_re_set_db_offset(struct bnxt_re_dev *rdev)
++{
++	struct bnxt_qplib_chip_ctx *cctx;
++	struct bnxt_en_dev *en_dev;
++	struct bnxt_qplib_res *res;
++	u32 l2db_len = 0;
++	u32 offset = 0;
++	u32 barlen;
++	int rc;
++
++	res = &rdev->qplib_res;
++	en_dev = rdev->en_dev;
++	cctx = rdev->chip_ctx;
++
++	/* Issue qcfg */
++	rc = bnxt_re_hwrm_qcfg(rdev, &l2db_len, &offset);
++	if (rc)
++		dev_info(rdev_to_dev(rdev),
++			 "Couldn't get DB bar size, Low latency framework is disabled\n");
++	/* set register offsets for both UC and WC */
++	res->dpi_tbl.ucreg.offset = res->is_vf ? BNXT_QPLIB_DBR_VF_DB_OFFSET :
++						 BNXT_QPLIB_DBR_PF_DB_OFFSET;
++	res->dpi_tbl.wcreg.offset = res->dpi_tbl.ucreg.offset;
++
++	/* If WC mapping is disabled by L2 driver then en_dev->l2_db_size
++	 * is equal to the DB-Bar actual size. This indicates that L2
++	 * is mapping entire bar as UC-. RoCE driver can't enable WC mapping
++	 * in such cases and DB-push will be disabled.
++	 */
++	barlen = pci_resource_len(res->pdev, RCFW_DBR_PCI_BAR_REGION);
++}
++
+ static void bnxt_re_set_drv_mode(struct bnxt_re_dev *rdev, u8 mode)
+ {
+ 	struct bnxt_qplib_chip_ctx *cctx;
+@@ -116,6 +150,7 @@ static int bnxt_re_setup_chip_ctx(struct
+ {
+ 	struct bnxt_qplib_chip_ctx *chip_ctx;
+ 	struct bnxt_en_dev *en_dev;
++	int rc;
+ 
+ 	en_dev = rdev->en_dev;
+ 
+@@ -134,6 +169,12 @@ static int bnxt_re_setup_chip_ctx(struct
+ 	rdev->qplib_res.is_vf = BNXT_EN_VF(en_dev);
+ 
+ 	bnxt_re_set_drv_mode(rdev, wqe_mode);
++
++	bnxt_re_set_db_offset(rdev);
++	rc = bnxt_qplib_map_db_bar(&rdev->qplib_res);
++	if (rc)
++		return rc;
++
+ 	if (bnxt_qplib_determine_atomics(en_dev->pdev))
+ 		ibdev_info(&rdev->ibdev,
+ 			   "platform doesn't support global atomics.");
+@@ -343,6 +384,30 @@ static void bnxt_re_fill_fw_msg(struct b
+ 	fw_msg->timeout = timeout;
+ }
+ 
++/* Query device config using common hwrm */
++static int bnxt_re_hwrm_qcfg(struct bnxt_re_dev *rdev, u32 *db_len,
++			     u32 *offset)
++{
++	struct bnxt_en_dev *en_dev = rdev->en_dev;
++	struct hwrm_func_qcfg_output resp = {0};
++	struct hwrm_func_qcfg_input req = {0};
++	struct bnxt_fw_msg fw_msg;
++	int rc;
++
++	memset(&fw_msg, 0, sizeof(fw_msg));
++	bnxt_re_init_hwrm_hdr(rdev, (void *)&req,
++			      HWRM_FUNC_QCFG, -1, -1);
++	req.fid = cpu_to_le16(0xffff);
++	bnxt_re_fill_fw_msg(&fw_msg, (void *)&req, sizeof(req), (void *)&resp,
++			    sizeof(resp), DFLT_HWRM_CMD_TIMEOUT);
++	rc = bnxt_send_msg(en_dev, &fw_msg);
++	if (!rc) {
++		*db_len = PAGE_ALIGN(le16_to_cpu(resp.l2_doorbell_bar_size_kb) * 1024);
++		*offset = PAGE_ALIGN(le16_to_cpu(resp.legacy_l2_db_size_kb) * 1024);
++	}
++	return rc;
++}
++
+ /* Query function capabilities using common hwrm */
+ int bnxt_re_hwrm_qcaps(struct bnxt_re_dev *rdev)
+ {
+@@ -847,7 +912,6 @@ static void bnxt_re_free_res(struct bnxt
+ 
+ 	if (rdev->qplib_res.dpi_tbl.max) {
+ 		bnxt_qplib_dealloc_dpi(&rdev->qplib_res,
+-				       &rdev->qplib_res.dpi_tbl,
+ 				       &rdev->dpi_privileged);
+ 	}
+ 	if (rdev->qplib_res.rcfw) {
+@@ -875,9 +939,9 @@ static int bnxt_re_alloc_res(struct bnxt
+ 	if (rc)
+ 		goto fail;
+ 
+-	rc = bnxt_qplib_alloc_dpi(&rdev->qplib_res.dpi_tbl,
++	rc = bnxt_qplib_alloc_dpi(&rdev->qplib_res,
+ 				  &rdev->dpi_privileged,
+-				  rdev);
++				  rdev, BNXT_QPLIB_DPI_TYPE_KERNEL);
+ 	if (rc)
+ 		goto dealloc_res;
+ 
+@@ -917,7 +981,6 @@ free_nq:
+ 		bnxt_qplib_free_nq(&rdev->nq[i]);
+ 	}
+ 	bnxt_qplib_dealloc_dpi(&rdev->qplib_res,
+-			       &rdev->qplib_res.dpi_tbl,
+ 			       &rdev->dpi_privileged);
+ dealloc_res:
+ 	bnxt_qplib_free_res(&rdev->qplib_res);
+--- a/drivers/infiniband/hw/bnxt_re/qplib_fp.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_fp.c
+@@ -668,7 +668,7 @@ int bnxt_qplib_create_srq(struct bnxt_qp
+ 	srq->dbinfo.xid = srq->id;
+ 	srq->dbinfo.db = srq->dpi->dbr;
+ 	srq->dbinfo.max_slot = 1;
+-	srq->dbinfo.priv_db = res->dpi_tbl.dbr_bar_reg_iomem;
++	srq->dbinfo.priv_db = res->dpi_tbl.priv_db;
+ 	if (srq->threshold)
+ 		bnxt_qplib_armen_db(&srq->dbinfo, DBC_DBC_TYPE_SRQ_ARMENA);
+ 	srq->arm_req = false;
+@@ -2105,7 +2105,7 @@ int bnxt_qplib_create_cq(struct bnxt_qpl
+ 	cq->dbinfo.hwq = &cq->hwq;
+ 	cq->dbinfo.xid = cq->id;
+ 	cq->dbinfo.db = cq->dpi->dbr;
+-	cq->dbinfo.priv_db = res->dpi_tbl.dbr_bar_reg_iomem;
++	cq->dbinfo.priv_db = res->dpi_tbl.priv_db;
+ 
+ 	bnxt_qplib_armen_db(&cq->dbinfo, DBC_DBC_TYPE_CQ_ARMENA);
+ 
+--- a/drivers/infiniband/hw/bnxt_re/qplib_rcfw.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_rcfw.h
+@@ -130,6 +130,8 @@ static inline u32 bnxt_qplib_set_cmd_slo
+ #define RCFW_MAX_COOKIE_VALUE		(BNXT_QPLIB_CMDQE_MAX_CNT - 1)
+ #define RCFW_CMD_IS_BLOCKING		0x8000
+ 
++#define HWRM_VERSION_DEV_ATTR_MAX_DPI  0x1000A0000000DULL
++
+ /* Crsq buf is 1024-Byte */
+ struct bnxt_qplib_crsbe {
+ 	u8			data[1024];
+--- a/drivers/infiniband/hw/bnxt_re/qplib_res.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_res.c
+@@ -696,44 +696,73 @@ static int bnxt_qplib_alloc_pd_tbl(struc
+ }
+ 
+ /* DPIs */
+-int bnxt_qplib_alloc_dpi(struct bnxt_qplib_dpi_tbl *dpit,
+-			 struct bnxt_qplib_dpi     *dpi,
+-			 void                      *app)
++int bnxt_qplib_alloc_dpi(struct bnxt_qplib_res *res,
++			 struct bnxt_qplib_dpi *dpi,
++			 void *app, u8 type)
+ {
++	struct bnxt_qplib_dpi_tbl *dpit = &res->dpi_tbl;
++	struct bnxt_qplib_reg_desc *reg;
+ 	u32 bit_num;
++	u64 umaddr;
++
++	reg = &dpit->wcreg;
++	mutex_lock(&res->dpi_tbl_lock);
+ 
+ 	bit_num = find_first_bit(dpit->tbl, dpit->max);
+-	if (bit_num == dpit->max)
++	if (bit_num == dpit->max) {
++		mutex_unlock(&res->dpi_tbl_lock);
+ 		return -ENOMEM;
++	}
+ 
+ 	/* Found unused DPI */
+ 	clear_bit(bit_num, dpit->tbl);
+ 	dpit->app_tbl[bit_num] = app;
+ 
+-	dpi->dpi = bit_num;
+-	dpi->dbr = dpit->dbr_bar_reg_iomem + (bit_num * PAGE_SIZE);
+-	dpi->umdbr = dpit->unmapped_dbr + (bit_num * PAGE_SIZE);
++	dpi->bit = bit_num;
++	dpi->dpi = bit_num + (reg->offset - dpit->ucreg.offset) / PAGE_SIZE;
++
++	umaddr = reg->bar_base + reg->offset + bit_num * PAGE_SIZE;
++	dpi->umdbr = umaddr;
++
++	switch (type) {
++	case BNXT_QPLIB_DPI_TYPE_KERNEL:
++		/* priviledged dbr was already mapped just initialize it. */
++		dpi->umdbr = dpit->ucreg.bar_base +
++			     dpit->ucreg.offset + bit_num * PAGE_SIZE;
++		dpi->dbr = dpit->priv_db;
++		dpi->dpi = dpi->bit;
++		break;
++	default:
++		dpi->dbr = ioremap(umaddr, PAGE_SIZE);
++		break;
++	}
+ 
++	dpi->type = type;
++	mutex_unlock(&res->dpi_tbl_lock);
+ 	return 0;
++
+ }
+ 
+ int bnxt_qplib_dealloc_dpi(struct bnxt_qplib_res *res,
+-			   struct bnxt_qplib_dpi_tbl *dpit,
+-			   struct bnxt_qplib_dpi     *dpi)
++			   struct bnxt_qplib_dpi *dpi)
+ {
+-	if (dpi->dpi >= dpit->max) {
+-		dev_warn(&res->pdev->dev, "Invalid DPI? dpi = %d\n", dpi->dpi);
+-		return -EINVAL;
+-	}
+-	if (test_and_set_bit(dpi->dpi, dpit->tbl)) {
+-		dev_warn(&res->pdev->dev, "Freeing an unused DPI? dpi = %d\n",
+-			 dpi->dpi);
++	struct bnxt_qplib_dpi_tbl *dpit = &res->dpi_tbl;
++
++	mutex_lock(&res->dpi_tbl_lock);
++	if (dpi->dpi && dpi->type != BNXT_QPLIB_DPI_TYPE_KERNEL)
++		pci_iounmap(res->pdev, dpi->dbr);
++
++	if (test_and_set_bit(dpi->bit, dpit->tbl)) {
++		dev_warn(&res->pdev->dev,
++			 "Freeing an unused DPI? dpi = %d, bit = %d\n",
++				dpi->dpi, dpi->bit);
++		mutex_unlock(&res->dpi_tbl_lock);
+ 		return -EINVAL;
+ 	}
+ 	if (dpit->app_tbl)
+-		dpit->app_tbl[dpi->dpi] = NULL;
++		dpit->app_tbl[dpi->bit] = NULL;
+ 	memset(dpi, 0, sizeof(*dpi));
+-
++	mutex_unlock(&res->dpi_tbl_lock);
+ 	return 0;
+ }
+ 
+@@ -742,52 +771,38 @@ static void bnxt_qplib_free_dpi_tbl(stru
+ {
+ 	kfree(dpit->tbl);
+ 	kfree(dpit->app_tbl);
+-	if (dpit->dbr_bar_reg_iomem)
+-		pci_iounmap(res->pdev, dpit->dbr_bar_reg_iomem);
+-	memset(dpit, 0, sizeof(*dpit));
++	dpit->tbl = NULL;
++	dpit->app_tbl = NULL;
++	dpit->max = 0;
+ }
+ 
+-static int bnxt_qplib_alloc_dpi_tbl(struct bnxt_qplib_res     *res,
+-				    struct bnxt_qplib_dpi_tbl *dpit,
+-				    u32                       dbr_offset)
++static int bnxt_qplib_alloc_dpi_tbl(struct bnxt_qplib_res *res,
++				    struct bnxt_qplib_dev_attr *dev_attr)
+ {
+-	u32 dbr_bar_reg = RCFW_DBR_PCI_BAR_REGION;
+-	resource_size_t bar_reg_base;
+-	u32 dbr_len, bytes;
+-
+-	if (dpit->dbr_bar_reg_iomem) {
+-		dev_err(&res->pdev->dev, "DBR BAR region %d already mapped\n",
+-			dbr_bar_reg);
+-		return -EALREADY;
+-	}
+-
+-	bar_reg_base = pci_resource_start(res->pdev, dbr_bar_reg);
+-	if (!bar_reg_base) {
+-		dev_err(&res->pdev->dev, "BAR region %d resc start failed\n",
+-			dbr_bar_reg);
+-		return -ENOMEM;
+-	}
++	struct bnxt_qplib_dpi_tbl *dpit;
++	struct bnxt_qplib_reg_desc *reg;
++	unsigned long bar_len;
++	u32 dbr_offset;
++	u32 bytes;
+ 
+-	dbr_len = pci_resource_len(res->pdev, dbr_bar_reg) - dbr_offset;
+-	if (!dbr_len || ((dbr_len & (PAGE_SIZE - 1)) != 0)) {
+-		dev_err(&res->pdev->dev, "Invalid DBR length %d\n", dbr_len);
+-		return -ENOMEM;
+-	}
++	dpit = &res->dpi_tbl;
++	reg = &dpit->wcreg;
+ 
+-	dpit->dbr_bar_reg_iomem = ioremap(bar_reg_base + dbr_offset,
+-						  dbr_len);
+-	if (!dpit->dbr_bar_reg_iomem) {
+-		dev_err(&res->pdev->dev,
+-			"FP: DBR BAR region %d mapping failed\n", dbr_bar_reg);
+-		return -ENOMEM;
++	if (!bnxt_qplib_is_chip_gen_p5(res->cctx)) {
++		/* Offest should come from L2 driver */
++		dbr_offset = dev_attr->l2_db_size;
++		dpit->ucreg.offset = dbr_offset;
++		dpit->wcreg.offset = dbr_offset;
+ 	}
+ 
+-	dpit->unmapped_dbr = bar_reg_base + dbr_offset;
+-	dpit->max = dbr_len / PAGE_SIZE;
++	bar_len = pci_resource_len(res->pdev, reg->bar_id);
++	dpit->max = (bar_len - reg->offset) / PAGE_SIZE;
++	if (dev_attr->max_dpi)
++		dpit->max = min_t(u32, dpit->max, dev_attr->max_dpi);
+ 
+-	dpit->app_tbl = kcalloc(dpit->max, sizeof(void *), GFP_KERNEL);
++	dpit->app_tbl = kcalloc(dpit->max,  sizeof(void *), GFP_KERNEL);
+ 	if (!dpit->app_tbl)
+-		goto unmap_io;
++		return -ENOMEM;
+ 
+ 	bytes = dpit->max >> 3;
+ 	if (!bytes)
+@@ -797,17 +812,14 @@ static int bnxt_qplib_alloc_dpi_tbl(stru
+ 	if (!dpit->tbl) {
+ 		kfree(dpit->app_tbl);
+ 		dpit->app_tbl = NULL;
+-		goto unmap_io;
++		return -ENOMEM;
+ 	}
+ 
+ 	memset((u8 *)dpit->tbl, 0xFF, bytes);
++	dpit->priv_db = dpit->ucreg.bar_reg + dpit->ucreg.offset;
+ 
+ 	return 0;
+ 
+-unmap_io:
+-	iounmap(dpit->dbr_bar_reg_iomem);
+-	dpit->dbr_bar_reg_iomem = NULL;
+-	return -ENOMEM;
+ }
+ 
+ /* Stats */
+@@ -874,7 +886,7 @@ int bnxt_qplib_alloc_res(struct bnxt_qpl
+ 	if (rc)
+ 		goto fail;
+ 
+-	rc = bnxt_qplib_alloc_dpi_tbl(res, &res->dpi_tbl, dev_attr->l2_db_size);
++	rc = bnxt_qplib_alloc_dpi_tbl(res, dev_attr);
+ 	if (rc)
+ 		goto fail;
+ 
+@@ -884,6 +896,46 @@ fail:
+ 	return rc;
+ }
+ 
++void bnxt_qplib_unmap_db_bar(struct bnxt_qplib_res *res)
++{
++	struct bnxt_qplib_reg_desc *reg;
++
++	reg = &res->dpi_tbl.ucreg;
++	if (reg->bar_reg)
++		pci_iounmap(res->pdev, reg->bar_reg);
++	reg->bar_reg = NULL;
++	reg->bar_base = 0;
++	reg->len = 0;
++	reg->bar_id = 0;
++}
++
++int bnxt_qplib_map_db_bar(struct bnxt_qplib_res *res)
++{
++	struct bnxt_qplib_reg_desc *ucreg;
++	struct bnxt_qplib_reg_desc *wcreg;
++
++	wcreg = &res->dpi_tbl.wcreg;
++	wcreg->bar_id = RCFW_DBR_PCI_BAR_REGION;
++	wcreg->bar_base = pci_resource_start(res->pdev, wcreg->bar_id);
++
++	ucreg = &res->dpi_tbl.ucreg;
++	ucreg->bar_id = RCFW_DBR_PCI_BAR_REGION;
++	ucreg->bar_base = pci_resource_start(res->pdev, ucreg->bar_id);
++	ucreg->len = ucreg->offset + PAGE_SIZE;
++	if (!ucreg->len || ((ucreg->len & (PAGE_SIZE - 1)) != 0)) {
++		dev_err(&res->pdev->dev, "QPLIB: invalid dbr length %d",
++			(int)ucreg->len);
++		return -EINVAL;
++	}
++	ucreg->bar_reg = ioremap(ucreg->bar_base, ucreg->len);
++	if (!ucreg->bar_reg) {
++		dev_err(&res->pdev->dev, "priviledged dpi map failed!");
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
+ int bnxt_qplib_determine_atomics(struct pci_dev *dev)
+ {
+ 	int comp;
+--- a/drivers/infiniband/hw/bnxt_re/qplib_res.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_res.h
+@@ -60,6 +60,9 @@ struct bnxt_qplib_chip_ctx {
+ 	u64	hwrm_intf_ver;
+ };
+ 
++#define BNXT_QPLIB_DBR_PF_DB_OFFSET     0x10000
++#define BNXT_QPLIB_DBR_VF_DB_OFFSET     0x4000
++
+ #define PTR_CNT_PER_PG		(PAGE_SIZE / sizeof(void *))
+ #define PTR_MAX_IDX_PER_PG	(PTR_CNT_PER_PG - 1)
+ #define PTR_PG(x)		(((x) & ~PTR_MAX_IDX_PER_PG) / PTR_CNT_PER_PG)
+@@ -111,6 +114,7 @@ enum bnxt_qplib_hwrm_pg_size {
+ struct bnxt_qplib_reg_desc {
+ 	u8		bar_id;
+ 	resource_size_t	bar_base;
++	unsigned long	offset;
+ 	void __iomem	*bar_reg;
+ 	size_t		len;
+ };
+@@ -187,18 +191,26 @@ struct bnxt_qplib_sgid_tbl {
+ 	u8				*vlan;
+ };
+ 
++enum {
++	BNXT_QPLIB_DPI_TYPE_KERNEL      = 0,
++	BNXT_QPLIB_DPI_TYPE_UC          = 1,
++};
++
+ struct bnxt_qplib_dpi {
+ 	u32				dpi;
++	u32				bit;
+ 	void __iomem			*dbr;
+ 	u64				umdbr;
++	u8				type;
+ };
+ 
+ struct bnxt_qplib_dpi_tbl {
+ 	void				**app_tbl;
+ 	unsigned long			*tbl;
+ 	u16				max;
+-	void __iomem			*dbr_bar_reg_iomem;
+-	u64				unmapped_dbr;
++	struct bnxt_qplib_reg_desc	ucreg; /* Hold entire DB bar. */
++	struct bnxt_qplib_reg_desc	wcreg;
++	void __iomem			*priv_db;
+ };
+ 
+ struct bnxt_qplib_stats {
+@@ -254,6 +266,8 @@ struct bnxt_qplib_res {
+ 	struct bnxt_qplib_pd_tbl	pd_tbl;
+ 	struct bnxt_qplib_sgid_tbl	sgid_tbl;
+ 	struct bnxt_qplib_dpi_tbl	dpi_tbl;
++	/* To protect the dpi table bit map */
++	struct mutex                    dpi_tbl_lock;
+ 	bool				prio;
+ 	bool                            is_vf;
+ };
+@@ -345,11 +359,10 @@ int bnxt_qplib_alloc_pd(struct bnxt_qpli
+ int bnxt_qplib_dealloc_pd(struct bnxt_qplib_res *res,
+ 			  struct bnxt_qplib_pd_tbl *pd_tbl,
+ 			  struct bnxt_qplib_pd *pd);
+-int bnxt_qplib_alloc_dpi(struct bnxt_qplib_dpi_tbl *dpit,
+-			 struct bnxt_qplib_dpi     *dpi,
+-			 void                      *app);
++int bnxt_qplib_alloc_dpi(struct bnxt_qplib_res *res,
++			 struct bnxt_qplib_dpi *dpi,
++			 void *app, u8 type);
+ int bnxt_qplib_dealloc_dpi(struct bnxt_qplib_res *res,
+-			   struct bnxt_qplib_dpi_tbl *dpi_tbl,
+ 			   struct bnxt_qplib_dpi *dpi);
+ void bnxt_qplib_cleanup_res(struct bnxt_qplib_res *res);
+ int bnxt_qplib_init_res(struct bnxt_qplib_res *res);
+@@ -362,6 +375,9 @@ void bnxt_qplib_free_ctx(struct bnxt_qpl
+ int bnxt_qplib_alloc_ctx(struct bnxt_qplib_res *res,
+ 			 struct bnxt_qplib_ctx *ctx,
+ 			 bool virt_fn, bool is_p5);
++int bnxt_qplib_map_db_bar(struct bnxt_qplib_res *res);
++void bnxt_qplib_unmap_db_bar(struct bnxt_qplib_res *res);
++
+ int bnxt_qplib_determine_atomics(struct pci_dev *dev);
+ 
+ static inline void bnxt_qplib_hwq_incr_prod(struct bnxt_qplib_hwq *hwq, u32 cnt)
+--- a/drivers/infiniband/hw/bnxt_re/qplib_sp.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_sp.c
+@@ -170,6 +170,9 @@ int bnxt_qplib_get_dev_attr(struct bnxt_
+ 		attr->tqm_alloc_reqs[i * 4 + 3] = *(++tqm_alloc);
+ 	}
+ 
++	if (rcfw->res->cctx->hwrm_intf_ver >= HWRM_VERSION_DEV_ATTR_MAX_DPI)
++		attr->max_dpi = le32_to_cpu(sb->max_dpi);
++
+ 	attr->is_atomic = bnxt_qplib_is_atomic_cap(rcfw);
+ bail:
+ 	bnxt_qplib_rcfw_free_sbuf(rcfw, sbuf);
+--- a/drivers/infiniband/hw/bnxt_re/qplib_sp.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_sp.h
+@@ -72,6 +72,7 @@ struct bnxt_qplib_dev_attr {
+ 	u8				tqm_alloc_reqs[MAX_TQM_ALLOC_REQ];
+ 	bool				is_atomic;
+ 	u16                             dev_cap_flags;
++	u32                             max_dpi;
+ };
+ 
+ struct bnxt_qplib_pd {
