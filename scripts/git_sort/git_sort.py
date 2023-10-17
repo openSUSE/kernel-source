@@ -269,6 +269,7 @@ remotes = (
     Head(RepoURL("soc/soc.git"), "for-next"),
     Head(RepoURL("https://gitlab.freedesktop.org/drm/tegra.git"), "for-next"),
     Head(RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/thierry.reding/linux-pwm.git"), "for-next"),
+    Head(RepoURL("kvmarm/kvmarm.git"), "next"),
 )
 
 
