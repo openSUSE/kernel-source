@@ -1,0 +1,235 @@
+From c31a25e1db486f36a0ffe3c849b0a82cda3db7db Mon Sep 17 00:00:00 2001
+From: David Howells <dhowells@redhat.com>
+Date: Fri, 9 Jun 2023 11:02:21 +0100
+Subject: [PATCH 1/1] kcm: Send multiple frags in one sendmsg()
+Git-commit: c31a25e1db486f36a0ffe3c849b0a82cda3db7db
+Patch-mainline: v6.5-rc1
+References: bsc#1216396
+
+Rewrite the AF_KCM transmission loop to send all the fragments in a single
+skb or frag_list-skb in one sendmsg() with MSG_SPLICE_PAGES set.  The list
+of fragments in each skb is conveniently a bio_vec[] that can just be
+attached to a BVEC iter.
+
+Note: I'm working out the size of each fragment-skb by adding up bv_len for
+all the bio_vecs in skb->frags[] - but surely this information is recorded
+somewhere?  For the skbs in head->frag_list, this is equal to
+skb->data_len, but not for the head.  head->data_len includes all the tail
+frags too.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Tom Herbert <tom@herbertland.com>
+cc: Tom Herbert <tom@quantonium.net>
+cc: Jens Axboe <axboe@kernel.dk>
+cc: Matthew Wilcox <willy@infradead.org>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ include/net/kcm.h |   2 +-
+ net/kcm/kcmsock.c | 126 ++++++++++++++++++----------------------------
+ 2 files changed, 51 insertions(+), 77 deletions(-)
+
+diff --git a/include/net/kcm.h b/include/net/kcm.h
+index 2d704f8f4905..90279e5e09a5 100644
+--- a/include/net/kcm.h
++++ b/include/net/kcm.h
+@@ -47,9 +47,9 @@ struct kcm_stats {
+ 
+ struct kcm_tx_msg {
+ 	unsigned int sent;
+-	unsigned int fragidx;
+ 	unsigned int frag_offset;
+ 	unsigned int msg_flags;
++	bool started_tx;
+ 	struct sk_buff *frag_skb;
+ 	struct sk_buff *last_skb;
+ };
+diff --git a/net/kcm/kcmsock.c b/net/kcm/kcmsock.c
+index 3bcac1453f10..d75d775e9462 100644
+--- a/net/kcm/kcmsock.c
++++ b/net/kcm/kcmsock.c
+@@ -581,12 +581,10 @@ static void kcm_report_tx_retry(struct kcm_sock *kcm)
+  */
+ static int kcm_write_msgs(struct kcm_sock *kcm)
+ {
++	unsigned int total_sent = 0;
+ 	struct sock *sk = &kcm->sk;
+ 	struct kcm_psock *psock;
+-	struct sk_buff *skb, *head;
+-	struct kcm_tx_msg *txm;
+-	unsigned short fragidx, frag_offset;
+-	unsigned int sent, total_sent = 0;
++	struct sk_buff *head;
+ 	int ret = 0;
+ 
+ 	kcm->tx_wait_more = false;
+@@ -600,78 +598,57 @@ static int kcm_write_msgs(struct kcm_sock *kcm)
+ 		if (skb_queue_empty(&sk->sk_write_queue))
+ 			return 0;
+ 
+-		kcm_tx_msg(skb_peek(&sk->sk_write_queue))->sent = 0;
+-
+-	} else if (skb_queue_empty(&sk->sk_write_queue)) {
+-		return 0;
++		kcm_tx_msg(skb_peek(&sk->sk_write_queue))->started_tx = false;
+ 	}
+ 
+-	head = skb_peek(&sk->sk_write_queue);
+-	txm = kcm_tx_msg(head);
+-
+-	if (txm->sent) {
+-		/* Send of first skbuff in queue already in progress */
+-		if (WARN_ON(!psock)) {
+-			ret = -EINVAL;
+-			goto out;
++retry:
++	while ((head = skb_peek(&sk->sk_write_queue))) {
++		struct msghdr msg = {
++			.msg_flags = MSG_DONTWAIT | MSG_SPLICE_PAGES,
++		};
++		struct kcm_tx_msg *txm = kcm_tx_msg(head);
++		struct sk_buff *skb;
++		unsigned int msize;
++		int i;
++
++		if (!txm->started_tx) {
++			psock = reserve_psock(kcm);
++			if (!psock)
++				goto out;
++			skb = head;
++			txm->frag_offset = 0;
++			txm->sent = 0;
++			txm->started_tx = true;
++		} else {
++			if (WARN_ON(!psock)) {
++				ret = -EINVAL;
++				goto out;
++			}
++			skb = txm->frag_skb;
+ 		}
+-		sent = txm->sent;
+-		frag_offset = txm->frag_offset;
+-		fragidx = txm->fragidx;
+-		skb = txm->frag_skb;
+-
+-		goto do_frag;
+-	}
+-
+-try_again:
+-	psock = reserve_psock(kcm);
+-	if (!psock)
+-		goto out;
+-
+-	do {
+-		skb = head;
+-		txm = kcm_tx_msg(head);
+-		sent = 0;
+ 
+-do_frag_list:
+ 		if (WARN_ON(!skb_shinfo(skb)->nr_frags)) {
+ 			ret = -EINVAL;
+ 			goto out;
+ 		}
+ 
+-		for (fragidx = 0; fragidx < skb_shinfo(skb)->nr_frags;
+-		     fragidx++) {
+-			struct bio_vec bvec;
+-			struct msghdr msg = {
+-				.msg_flags = MSG_DONTWAIT | MSG_SPLICE_PAGES,
+-			};
+-			skb_frag_t *frag;
+-
+-			frag_offset = 0;
+-do_frag:
+-			frag = &skb_shinfo(skb)->frags[fragidx];
+-			if (WARN_ON(!skb_frag_size(frag))) {
+-				ret = -EINVAL;
+-				goto out;
+-			}
++		msize = 0;
++		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++)
++			msize += skb_shinfo(skb)->frags[i].bv_len;
++
++		iov_iter_bvec(&msg.msg_iter, ITER_SOURCE,
++			      skb_shinfo(skb)->frags, skb_shinfo(skb)->nr_frags,
++			      msize);
++		iov_iter_advance(&msg.msg_iter, txm->frag_offset);
+ 
+-			bvec_set_page(&bvec,
+-				      skb_frag_page(frag),
+-				      skb_frag_size(frag) - frag_offset,
+-				      skb_frag_off(frag) + frag_offset);
+-			iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, &bvec, 1,
+-				      bvec.bv_len);
++		do {
+ 			ret = sock_sendmsg(psock->sk->sk_socket, &msg);
+ 			if (ret <= 0) {
+ 				if (ret == -EAGAIN) {
+ 					/* Save state to try again when there's
+ 					 * write space on the socket
+ 					 */
+-					txm->sent = sent;
+-					txm->frag_offset = frag_offset;
+-					txm->fragidx = fragidx;
+ 					txm->frag_skb = skb;
+-
+ 					ret = 0;
+ 					goto out;
+ 				}
+@@ -685,39 +662,36 @@ do_frag:
+ 						   true);
+ 				unreserve_psock(kcm);
+ 
+-				txm->sent = 0;
++				txm->started_tx = false;
+ 				kcm_report_tx_retry(kcm);
+ 				ret = 0;
+-
+-				goto try_again;
++				goto retry;
+ 			}
+ 
+-			sent += ret;
+-			frag_offset += ret;
++			txm->sent += ret;
++			txm->frag_offset += ret;
+ 			KCM_STATS_ADD(psock->stats.tx_bytes, ret);
+-			if (frag_offset < skb_frag_size(frag)) {
+-				/* Not finished with this frag */
+-				goto do_frag;
+-			}
+-		}
++		} while (msg.msg_iter.count > 0);
+ 
+ 		if (skb == head) {
+ 			if (skb_has_frag_list(skb)) {
+-				skb = skb_shinfo(skb)->frag_list;
+-				goto do_frag_list;
++				txm->frag_skb = skb_shinfo(skb)->frag_list;
++				txm->frag_offset = 0;
++				continue;
+ 			}
+ 		} else if (skb->next) {
+-			skb = skb->next;
+-			goto do_frag_list;
++			txm->frag_skb = skb->next;
++			txm->frag_offset = 0;
++			continue;
+ 		}
+ 
+ 		/* Successfully sent the whole packet, account for it. */
++		sk->sk_wmem_queued -= txm->sent;
++		total_sent += txm->sent;
+ 		skb_dequeue(&sk->sk_write_queue);
+ 		kfree_skb(head);
+-		sk->sk_wmem_queued -= sent;
+-		total_sent += sent;
+ 		KCM_STATS_INCR(psock->stats.tx_msgs);
+-	} while ((head = skb_peek(&sk->sk_write_queue)));
++	}
+ out:
+ 	if (!head) {
+ 		/* Done with all queued messages. */
+-- 
+2.39.1.1.gbe015eda0162
+
