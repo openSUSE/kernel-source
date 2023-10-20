@@ -1,0 +1,140 @@
+From a54ce3703613e41fe1d98060b62ec09a3984dc28 Mon Sep 17 00:00:00 2001
+From: Vincent Ray <vray@kalrayinc.com>
+Date: Wed, 25 May 2022 17:17:46 -0700
+Subject: [PATCH] net: sched: fixed barrier to prevent skbuff sticking in qdisc
+ backlog
+Git-commit: a54ce3703613e41fe1d98060b62ec09a3984dc28
+Patch-mainline: v5.19-rc1
+References: bsc#1216345
+
+In qdisc_run_begin(), smp_mb__before_atomic() used before test_bit()
+does not provide any ordering guarantee as test_bit() is not an atomic
+operation. This, added to the fact that the spin_trylock() call at
+the beginning of qdisc_run_begin() does not guarantee acquire
+semantics if it does not grab the lock, makes it possible for the
+following statement :
+
+if (test_bit(__QDISC_STATE_MISSED, &qdisc->state))
+
+to be executed before an enqueue operation called before
+qdisc_run_begin().
+
+As a result the following race can happen :
+
+           CPU 1                             CPU 2
+
+      qdisc_run_begin()               qdisc_run_begin() /* true */
+        set(MISSED)                            .
+      /* returns false */                      .
+          .                            /* sees MISSED = 1 */
+          .                            /* so qdisc not empty */
+          .                            __qdisc_run()
+          .                                    .
+          .                              pfifo_fast_dequeue()
+ ----> /* may be done here */                  .
+|         .                                clear(MISSED)
+|         .                                    .
+|         .                                smp_mb __after_atomic();
+|         .                                    .
+|         .                                /* recheck the queue */
+|         .                                /* nothing => exit   */
+|   enqueue(skb1)
+|         .
+|   qdisc_run_begin()
+|         .
+|     spin_trylock() /* fail */
+|         .
+|     smp_mb__before_atomic() /* not enough */
+|         .
+ ---- if (test_bit(MISSED))
+        return false;   /* exit */
+
+In the above scenario, CPU 1 and CPU 2 both try to grab the
+qdisc->seqlock at the same time. Only CPU 2 succeeds and enters the
+bypass code path, where it emits its skb then calls __qdisc_run().
+
+CPU1 fails, sets MISSED and goes down the traditionnal enqueue() +
+dequeue() code path. But when executing qdisc_run_begin() for the
+second time, after enqueuing its skbuff, it sees the MISSED bit still
+set (by itself) and consequently chooses to exit early without setting
+it again nor trying to grab the spinlock again.
+
+Meanwhile CPU2 has seen MISSED = 1, cleared it, checked the queue
+and found it empty, so it returned.
+
+At the end of the sequence, we end up with skb1 enqueued in the
+backlog, both CPUs out of __dev_xmit_skb(), the MISSED bit not set,
+and no __netif_schedule() called made. skb1 will now linger in the
+qdisc until somebody later performs a full __qdisc_run(). Associated
+to the bypass capacity of the qdisc, and the ability of the TCP layer
+to avoid resending packets which it knows are still in the qdisc, this
+can lead to serious traffic "holes" in a TCP connection.
+
+We fix this by replacing the smp_mb__before_atomic() / test_bit() /
+set_bit() / smp_mb__after_atomic() sequence inside qdisc_run_begin()
+by a single test_and_set_bit() call, which is more concise and
+enforces the needed memory barriers.
+
+Fixes: 89837eb4b246 ("net: sched: add barrier to ensure correct ordering for lockless qdisc")
+Signed-off-by: Vincent Ray <vray@kalrayinc.com>
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Link: https://lore.kernel.org/r/20220526001746.2437669-1-eric.dumazet@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Jiri Wiesner <jwiesner@suse.de>
+---
+ include/net/sch_generic.h | 36 ++++++++----------------------------
+ 1 file changed, 8 insertions(+), 28 deletions(-)
+
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 9bab396c1f3b..80973ce820f3 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -187,37 +187,17 @@ static inline bool qdisc_run_begin(struct Qdisc *qdisc)
+ 		if (spin_trylock(&qdisc->seqlock))
+ 			return true;
+ 
+-		/* Paired with smp_mb__after_atomic() to make sure
+-		 * STATE_MISSED checking is synchronized with clearing
+-		 * in pfifo_fast_dequeue().
++		/* No need to insist if the MISSED flag was already set.
++		 * Note that test_and_set_bit() also gives us memory ordering
++		 * guarantees wrt potential earlier enqueue() and below
++		 * spin_trylock(), both of which are necessary to prevent races
+ 		 */
+-		smp_mb__before_atomic();
+-
+-		/* If the MISSED flag is set, it means other thread has
+-		 * set the MISSED flag before second spin_trylock(), so
+-		 * we can return false here to avoid multi cpus doing
+-		 * the set_bit() and second spin_trylock() concurrently.
+-		 */
+-		if (test_bit(__QDISC_STATE_MISSED, &qdisc->state))
++		if (test_and_set_bit(__QDISC_STATE_MISSED, &qdisc->state))
+ 			return false;
+ 
+-		/* Set the MISSED flag before the second spin_trylock(),
+-		 * if the second spin_trylock() return false, it means
+-		 * other cpu holding the lock will do dequeuing for us
+-		 * or it will see the MISSED flag set after releasing
+-		 * lock and reschedule the net_tx_action() to do the
+-		 * dequeuing.
+-		 */
+-		set_bit(__QDISC_STATE_MISSED, &qdisc->state);
+-
+-		/* spin_trylock() only has load-acquire semantic, so use
+-		 * smp_mb__after_atomic() to ensure STATE_MISSED is set
+-		 * before doing the second spin_trylock().
+-		 */
+-		smp_mb__after_atomic();
+-
+-		/* Retry again in case other CPU may not see the new flag
+-		 * after it releases the lock at the end of qdisc_run_end().
++		/* Try to take the lock again to make sure that we will either
++		 * grab it or the CPU that still has it will see MISSED set
++		 * when testing it in qdisc_run_end()
+ 		 */
+ 		return spin_trylock(&qdisc->seqlock);
+ 	}
+-- 
+2.35.3
+
