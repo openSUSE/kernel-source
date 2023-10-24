@@ -1,0 +1,188 @@
+From: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+Date: Wed, 19 Jul 2023 15:24:08 +0200
+Subject: xsk: support mbuf on ZC RX
+Patch-mainline: v6.6-rc1
+Git-commit: 24ea50127ecf0efe819c1f6230add27abc6ca9d9
+References: jsc#PED-4876
+
+Given that skb_shared_info relies on skb_frag_t, in order to support
+xskb chaining, introduce xdp_buff_xsk::xskb_list_node and
+xsk_buff_pool::xskb_list.
+
+This is needed so ZC drivers can add frags as xskb nodes which will make
+it possible to handle it both when producing AF_XDP Rx descriptors as
+well as freeing/recycling all the frags that a single frame carries.
+
+Speaking of latter, update xsk_buff_free() to take care of list nodes.
+For the former (adding as frags), introduce xsk_buff_add_frag() for ZC
+drivers usage that is going to be used to add a frag to xskb list from
+pool.
+
+xsk_buff_get_frag() will be utilized by XDP_TX and, on contrary, will
+return xdp_buff.
+
+One of the previous patches added a wrapper for ZC Rx so implement xskb
+list walk and production of Rx descriptors there.
+
+On bind() path, bail out if socket wants to use ZC multi-buffer but
+underlying netdev does not support it.
+
+Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+Link: https://lore.kernel.org/r/20230719132421.584801-12-maciej.fijalkowski@intel.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/xdp_sock_drv.h  |   44 ++++++++++++++++++++++++++++++++++++++++++++
+ include/net/xsk_buff_pool.h |    2 ++
+ net/xdp/xsk.c               |   26 +++++++++++++++++++++++++-
+ net/xdp/xsk_buff_pool.c     |    7 +++++++
+ 4 files changed, 78 insertions(+), 1 deletion(-)
+
+--- a/include/net/xdp_sock_drv.h
++++ b/include/net/xdp_sock_drv.h
+@@ -108,10 +108,45 @@ static inline bool xsk_buff_can_alloc(st
+ static inline void xsk_buff_free(struct xdp_buff *xdp)
+ {
+ 	struct xdp_buff_xsk *xskb = container_of(xdp, struct xdp_buff_xsk, xdp);
++	struct list_head *xskb_list = &xskb->pool->xskb_list;
++	struct xdp_buff_xsk *pos, *tmp;
+ 
++	if (likely(!xdp_buff_has_frags(xdp)))
++		goto out;
++
++	list_for_each_entry_safe(pos, tmp, xskb_list, xskb_list_node) {
++		list_del(&pos->xskb_list_node);
++		xp_free(pos);
++	}
++
++	xdp_get_shared_info_from_buff(xdp)->nr_frags = 0;
++out:
+ 	xp_free(xskb);
+ }
+ 
++static inline void xsk_buff_add_frag(struct xdp_buff *xdp)
++{
++	struct xdp_buff_xsk *frag = container_of(xdp, struct xdp_buff_xsk, xdp);
++
++	list_add_tail(&frag->xskb_list_node, &frag->pool->xskb_list);
++}
++
++static inline struct xdp_buff *xsk_buff_get_frag(struct xdp_buff *first)
++{
++	struct xdp_buff_xsk *xskb = container_of(first, struct xdp_buff_xsk, xdp);
++	struct xdp_buff *ret = NULL;
++	struct xdp_buff_xsk *frag;
++
++	frag = list_first_entry_or_null(&xskb->pool->xskb_list,
++					struct xdp_buff_xsk, xskb_list_node);
++	if (frag) {
++		list_del(&frag->xskb_list_node);
++		ret = &frag->xdp;
++	}
++
++	return ret;
++}
++
+ static inline void xsk_buff_set_size(struct xdp_buff *xdp, u32 size)
+ {
+ 	xdp->data = xdp->data_hard_start + XDP_PACKET_HEADROOM;
+@@ -269,6 +304,15 @@ static inline void xsk_buff_discard(stru
+ {
+ }
+ 
++static inline void xsk_buff_add_frag(struct xdp_buff *xdp)
++{
++}
++
++static inline struct xdp_buff *xsk_buff_get_frag(struct xdp_buff *first)
++{
++	return NULL;
++}
++
+ static inline void xsk_buff_set_size(struct xdp_buff *xdp, u32 size)
+ {
+ }
+--- a/include/net/xsk_buff_pool.h
++++ b/include/net/xsk_buff_pool.h
+@@ -29,6 +29,7 @@ struct xdp_buff_xsk {
+ 	struct xsk_buff_pool *pool;
+ 	u64 orig_addr;
+ 	struct list_head free_list_node;
++	struct list_head xskb_list_node;
+ };
+ 
+ #define XSK_CHECK_PRIV_TYPE(t) BUILD_BUG_ON(sizeof(t) > offsetofend(struct xdp_buff_xsk, cb))
+@@ -54,6 +55,7 @@ struct xsk_buff_pool {
+ 	struct xdp_umem *umem;
+ 	struct work_struct work;
+ 	struct list_head free_list;
++	struct list_head xskb_list;
+ 	u32 heads_cnt;
+ 	u16 queue_id;
+ 
+--- a/net/xdp/xsk.c
++++ b/net/xdp/xsk.c
+@@ -155,8 +155,32 @@ static int __xsk_rcv_zc(struct xdp_sock
+ static int xsk_rcv_zc(struct xdp_sock *xs, struct xdp_buff *xdp, u32 len)
+ {
+ 	struct xdp_buff_xsk *xskb = container_of(xdp, struct xdp_buff_xsk, xdp);
++	u32 frags = xdp_buff_has_frags(xdp);
++	struct xdp_buff_xsk *pos, *tmp;
++	struct list_head *xskb_list;
++	u32 contd = 0;
++	int err;
+ 
+-	return __xsk_rcv_zc(xs, xskb, len, 0);
++	if (frags)
++		contd = XDP_PKT_CONTD;
++
++	err = __xsk_rcv_zc(xs, xskb, len, contd);
++	if (err || likely(!frags))
++		goto out;
++
++	xskb_list = &xskb->pool->xskb_list;
++	list_for_each_entry_safe(pos, tmp, xskb_list, xskb_list_node) {
++		if (list_is_singular(xskb_list))
++			contd = 0;
++		len = pos->xdp.data_end - pos->xdp.data;
++		err = __xsk_rcv_zc(xs, pos, len, contd);
++		if (err)
++			return err;
++		list_del(&pos->xskb_list_node);
++	}
++
++out:
++	return err;
+ }
+ 
+ static void *xsk_copy_xdp_start(struct xdp_buff *from)
+--- a/net/xdp/xsk_buff_pool.c
++++ b/net/xdp/xsk_buff_pool.c
+@@ -86,6 +86,7 @@ struct xsk_buff_pool *xp_create_and_assi
+ 	pool->umem = umem;
+ 	pool->addrs = umem->addrs;
+ 	INIT_LIST_HEAD(&pool->free_list);
++	INIT_LIST_HEAD(&pool->xskb_list);
+ 	INIT_LIST_HEAD(&pool->xsk_tx_list);
+ 	spin_lock_init(&pool->xsk_tx_list_lock);
+ 	spin_lock_init(&pool->cq_lock);
+@@ -99,6 +100,7 @@ struct xsk_buff_pool *xp_create_and_assi
+ 		xskb->pool = pool;
+ 		xskb->xdp.frame_sz = umem->chunk_size - umem->headroom;
+ 		INIT_LIST_HEAD(&xskb->free_list_node);
++		INIT_LIST_HEAD(&xskb->xskb_list_node);
+ 		if (pool->unaligned)
+ 			pool->free_heads[i] = xskb;
+ 		else
+@@ -186,6 +188,11 @@ int xp_assign_dev(struct xsk_buff_pool *
+ 		err = -EOPNOTSUPP;
+ 		goto err_unreg_pool;
+ 	}
++
++	if (netdev->xdp_zc_max_segs == 1 && (flags & XDP_USE_SG)) {
++		err = -EOPNOTSUPP;
++		goto err_unreg_pool;
++	}
+ 
+ 	bpf.command = XDP_SETUP_XSK_POOL;
+ 	bpf.xsk.pool = pool;
