@@ -1,0 +1,146 @@
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Thu, 16 Feb 2023 00:36:02 -0800
+Subject: [PATCH] dax/kmem: Fix leak of memory-hotplug resources
+References: bsc#1012628
+Patch-mainline: 6.1.16
+Git-commit: e686c32590f40bffc45f105c04c836ffad3e531a
+
+commit e686c32590f40bffc45f105c04c836ffad3e531a upstream.
+
+While experimenting with CXL region removal the following corruption of
+/proc/iomem appeared.
+
+Before:
+f010000000-f04fffffff : CXL Window 0
+  f010000000-f02fffffff : region4
+    f010000000-f02fffffff : dax4.0
+      f010000000-f02fffffff : System RAM (kmem)
+
+After (modprobe -r cxl_test):
+f010000000-f02fffffff : **redacted binary garbage**
+  f010000000-f02fffffff : System RAM (kmem)
+
+...and testing further the same is visible with persistent memory
+assigned to kmem:
+
+Before:
+480000000-243fffffff : Persistent Memory
+  480000000-57e1fffff : namespace3.0
+  580000000-243fffffff : dax3.0
+    580000000-243fffffff : System RAM (kmem)
+
+After (ndctl disable-region all):
+480000000-243fffffff : Persistent Memory
+  580000000-243fffffff : ***redacted binary garbage***
+    580000000-243fffffff : System RAM (kmem)
+
+The corrupted data is from a use-after-free of the "dax4.0" and "dax3.0"
+resources, and it also shows that the "System RAM (kmem)" resource is
+not being removed. The bug does not appear after "modprobe -r kmem", it
+requires the parent of "dax4.0" and "dax3.0" to be removed which
+re-parents the leaked "System RAM (kmem)" instances. Those in turn
+reference the freed resource as a parent.
+
+First up for the fix is release_mem_region_adjustable() needs to
+reliably delete the resource inserted by add_memory_driver_managed().
+That is thwarted by a check for IORESOURCE_SYSRAM that predates the
+dax/kmem driver, from commit:
+
+65c78784135f ("kernel, resource: check for IORESOURCE_SYSRAM in release_mem_region_adjustable")
+
+That appears to be working around the behavior of HMM's
+"MEMORY_DEVICE_PUBLIC" facility that has since been deleted. With that
+check removed the "System RAM (kmem)" resource gets removed, but
+corruption still occurs occasionally because the "dax" resource is not
+reliably removed.
+
+The dax range information is freed before the device is unregistered, so
+the driver can not reliably recall (another use after free) what it is
+meant to release. Lastly if that use after free got lucky, the driver
+was covering up the leak of "System RAM (kmem)" due to its use of
+release_resource() which detaches, but does not free, child resources.
+The switch to remove_resource() forces remove_memory() to be responsible
+for the deletion of the resource added by add_memory_driver_managed().
+
+Fixes: c2f3011ee697 ("device-dax: add an allocation interface for device-dax instances")
+Cc: <stable@vger.kernel.org>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+Reviewed-by: Vishal Verma <vishal.l.verma@intel.com>
+Reviewed-by: Pasha Tatashin <pasha.tatashin@soleen.com>
+Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://lore.kernel.org/r/167653656244.3147810.5705900882794040229.stgit@dwillia2-xfh.jf.intel.com
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/dax/bus.c  |  2 +-
+ drivers/dax/kmem.c |  4 ++--
+ kernel/resource.c  | 14 --------------
+ 3 files changed, 3 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/dax/bus.c b/drivers/dax/bus.c
+index 1dad813ee4a6..c64e7076537c 100644
+--- a/drivers/dax/bus.c
++++ b/drivers/dax/bus.c
+@@ -427,8 +427,8 @@ static void unregister_dev_dax(void *dev)
+ 	dev_dbg(dev, "%s\n", __func__);
+ 
+ 	kill_dev_dax(dev_dax);
+-	free_dev_dax_ranges(dev_dax);
+ 	device_del(dev);
++	free_dev_dax_ranges(dev_dax);
+ 	put_device(dev);
+ }
+ 
+diff --git a/drivers/dax/kmem.c b/drivers/dax/kmem.c
+index 4852a2dbdb27..4aa758a2b3d1 100644
+--- a/drivers/dax/kmem.c
++++ b/drivers/dax/kmem.c
+@@ -146,7 +146,7 @@ static int dev_dax_kmem_probe(struct dev_dax *dev_dax)
+ 		if (rc) {
+ 			dev_warn(dev, "mapping%d: %#llx-%#llx memory add failed\n",
+ 					i, range.start, range.end);
+-			release_resource(res);
++			remove_resource(res);
+ 			kfree(res);
+ 			data->res[i] = NULL;
+ 			if (mapped)
+@@ -195,7 +195,7 @@ static void dev_dax_kmem_remove(struct dev_dax *dev_dax)
+ 
+ 		rc = remove_memory(range.start, range_len(&range));
+ 		if (rc == 0) {
+-			release_resource(data->res[i]);
++			remove_resource(data->res[i]);
+ 			kfree(data->res[i]);
+ 			data->res[i] = NULL;
+ 			success++;
+diff --git a/kernel/resource.c b/kernel/resource.c
+index 4c5e80b92f2f..1aeeededdd4c 100644
+--- a/kernel/resource.c
++++ b/kernel/resource.c
+@@ -1345,20 +1345,6 @@ void release_mem_region_adjustable(resource_size_t start, resource_size_t size)
+ 			continue;
+ 		}
+ 
+-		/*
+-		 * All memory regions added from memory-hotplug path have the
+-		 * flag IORESOURCE_SYSTEM_RAM. If the resource does not have
+-		 * this flag, we know that we are dealing with a resource coming
+-		 * from HMM/devm. HMM/devm use another mechanism to add/release
+-		 * a resource. This goes via devm_request_mem_region and
+-		 * devm_release_mem_region.
+-		 * HMM/devm take care to release their resources when they want,
+-		 * so if we are dealing with them, let us just back off here.
+-		 */
+-		if (!(res->flags & IORESOURCE_SYSRAM)) {
+-			break;
+-		}
+-
+ 		if (!(res->flags & IORESOURCE_MEM))
+ 			break;
+ 
+-- 
+2.42.0
+

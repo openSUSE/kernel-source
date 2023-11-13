@@ -1,0 +1,145 @@
+From: Damien Le Moal <dlemoal@kernel.org>
+Date: Thu, 15 Jun 2023 17:18:53 +0900
+Subject: [PATCH] ata: libata-scsi: Avoid deadlock on rescan after device
+ resume
+References: bsc#1012628
+Patch-mainline: 6.1.36
+Git-commit: 6aa0365a3c8512587fffd42fe438768709ddef8e
+
+[ Upstream commit 6aa0365a3c8512587fffd42fe438768709ddef8e ]
+
+When an ATA port is resumed from sleep, the port is reset and a power
+management request issued to libata EH to reset the port and rescanning
+the device(s) attached to the port. Device rescanning is done by
+scheduling an ata_scsi_dev_rescan() work, which will execute
+scsi_rescan_device().
+
+However, scsi_rescan_device() takes the generic device lock, which is
+also taken by dpm_resume() when the SCSI device is resumed as well. If
+a device rescan execution starts before the completion of the SCSI
+device resume, the rcu locking used to refresh the cached VPD pages of
+the device, combined with the generic device locking from
+scsi_rescan_device() and from dpm_resume() can cause a deadlock.
+
+Avoid this situation by changing struct ata_port scsi_rescan_task to be
+a delayed work instead of a simple work_struct. ata_scsi_dev_rescan() is
+modified to check if the SCSI device associated with the ATA device that
+must be rescanned is not suspended. If the SCSI device is still
+suspended, ata_scsi_dev_rescan() returns early and reschedule itself for
+execution after an arbitrary delay of 5ms.
+
+Reported-by: Kai-Heng Feng <kai.heng.feng@canonical.com>
+Reported-by: Joe Breuer <linux-kernel@jmbreuer.net>
+Closes: https://bugzilla.kernel.org/show_bug.cgi?id=217530
+Fixes: a19a93e4c6a9 ("scsi: core: pm: Rely on the device driver core for async power management")
+Signed-off-by: Damien Le Moal <dlemoal@kernel.org>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Tested-by: Kai-Heng Feng <kai.heng.feng@canonical.com>
+Tested-by: Joe Breuer <linux-kernel@jmbreuer.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/ata/libata-core.c |  3 ++-
+ drivers/ata/libata-eh.c   |  2 +-
+ drivers/ata/libata-scsi.c | 22 +++++++++++++++++++++-
+ include/linux/libata.h    |  2 +-
+ 4 files changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/ata/libata-core.c b/drivers/ata/libata-core.c
+index a5ea144722fa..0ba0c3d1613f 100644
+--- a/drivers/ata/libata-core.c
++++ b/drivers/ata/libata-core.c
+@@ -5313,7 +5313,7 @@ struct ata_port *ata_port_alloc(struct ata_host *host)
+ 
+ 	mutex_init(&ap->scsi_scan_mutex);
+ 	INIT_DELAYED_WORK(&ap->hotplug_task, ata_scsi_hotplug);
+-	INIT_WORK(&ap->scsi_rescan_task, ata_scsi_dev_rescan);
++	INIT_DELAYED_WORK(&ap->scsi_rescan_task, ata_scsi_dev_rescan);
+ 	INIT_LIST_HEAD(&ap->eh_done_q);
+ 	init_waitqueue_head(&ap->eh_wait_q);
+ 	init_completion(&ap->park_req_pending);
+@@ -5919,6 +5919,7 @@ static void ata_port_detach(struct ata_port *ap)
+ 	WARN_ON(!(ap->pflags & ATA_PFLAG_UNLOADED));
+ 
+ 	cancel_delayed_work_sync(&ap->hotplug_task);
++	cancel_delayed_work_sync(&ap->scsi_rescan_task);
+ 
+  skip_eh:
+ 	/* clean up zpodd on port removal */
+diff --git a/drivers/ata/libata-eh.c b/drivers/ata/libata-eh.c
+index 08e11bc312c2..a3ae5fc2a42f 100644
+--- a/drivers/ata/libata-eh.c
++++ b/drivers/ata/libata-eh.c
+@@ -2973,7 +2973,7 @@ static int ata_eh_revalidate_and_attach(struct ata_link *link,
+ 			ehc->i.flags |= ATA_EHI_SETMODE;
+ 
+ 			/* schedule the scsi_rescan_device() here */
+-			schedule_work(&(ap->scsi_rescan_task));
++			schedule_delayed_work(&ap->scsi_rescan_task, 0);
+ 		} else if (dev->class == ATA_DEV_UNKNOWN &&
+ 			   ehc->tries[dev->devno] &&
+ 			   ata_class_enabled(ehc->classes[dev->devno])) {
+diff --git a/drivers/ata/libata-scsi.c b/drivers/ata/libata-scsi.c
+index 39e1ff9b686b..9c0052d28078 100644
+--- a/drivers/ata/libata-scsi.c
++++ b/drivers/ata/libata-scsi.c
+@@ -4601,10 +4601,11 @@ int ata_scsi_user_scan(struct Scsi_Host *shost, unsigned int channel,
+ void ata_scsi_dev_rescan(struct work_struct *work)
+ {
+ 	struct ata_port *ap =
+-		container_of(work, struct ata_port, scsi_rescan_task);
++		container_of(work, struct ata_port, scsi_rescan_task.work);
+ 	struct ata_link *link;
+ 	struct ata_device *dev;
+ 	unsigned long flags;
++	bool delay_rescan = false;
+ 
+ 	mutex_lock(&ap->scsi_scan_mutex);
+ 	spin_lock_irqsave(ap->lock, flags);
+@@ -4618,6 +4619,21 @@ void ata_scsi_dev_rescan(struct work_struct *work)
+ 			if (scsi_device_get(sdev))
+ 				continue;
+ 
++			/*
++			 * If the rescan work was scheduled because of a resume
++			 * event, the port is already fully resumed, but the
++			 * SCSI device may not yet be fully resumed. In such
++			 * case, executing scsi_rescan_device() may cause a
++			 * deadlock with the PM code on device_lock(). Prevent
++			 * this by giving up and retrying rescan after a short
++			 * delay.
++			 */
++			delay_rescan = sdev->sdev_gendev.power.is_suspended;
++			if (delay_rescan) {
++				scsi_device_put(sdev);
++				break;
++			}
++
+ 			spin_unlock_irqrestore(ap->lock, flags);
+ 			scsi_rescan_device(&(sdev->sdev_gendev));
+ 			scsi_device_put(sdev);
+@@ -4627,4 +4643,8 @@ void ata_scsi_dev_rescan(struct work_struct *work)
+ 
+ 	spin_unlock_irqrestore(ap->lock, flags);
+ 	mutex_unlock(&ap->scsi_scan_mutex);
++
++	if (delay_rescan)
++		schedule_delayed_work(&ap->scsi_rescan_task,
++				      msecs_to_jiffies(5));
+ }
+diff --git a/include/linux/libata.h b/include/linux/libata.h
+index fe990176e6ee..9713f4d8f15f 100644
+--- a/include/linux/libata.h
++++ b/include/linux/libata.h
+@@ -834,7 +834,7 @@ struct ata_port {
+ 
+ 	struct mutex		scsi_scan_mutex;
+ 	struct delayed_work	hotplug_task;
+-	struct work_struct	scsi_rescan_task;
++	struct delayed_work	scsi_rescan_task;
+ 
+ 	unsigned int		hsm_task_state;
+ 
+-- 
+2.42.0
+

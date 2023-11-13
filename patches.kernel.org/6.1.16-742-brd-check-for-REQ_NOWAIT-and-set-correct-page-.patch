@@ -1,0 +1,161 @@
+From: Jens Axboe <axboe@kernel.dk>
+Date: Thu, 16 Feb 2023 08:01:08 -0700
+Subject: [PATCH] brd: check for REQ_NOWAIT and set correct page allocation
+ mask
+References: bsc#1012628
+Patch-mainline: 6.1.16
+Git-commit: 6ded703c56c21bfb259725d4f1831a5feb563e9b
+
+commit 6ded703c56c21bfb259725d4f1831a5feb563e9b upstream.
+
+If REQ_NOWAIT is set, then do a non-blocking allocation if the operation
+is a write and we need to insert a new page. Currently REQ_NOWAIT cannot
+be set as the queue isn't marked as supporting nowait, this change is in
+preparation for allowing that.
+
+radix_tree_preload() warns on attempting to call it with an allocation
+mask that doesn't allow blocking. While that warning could arguably
+be removed, we need to handle radix insertion failures anyway as they
+are more likely if we cannot block to get memory.
+
+Remove legacy BUG_ON()'s and turn them into proper errors instead, one
+for the allocation failure and one for finding a page that doesn't
+match the correct index.
+
+Cc: stable@vger.kernel.org # 5.10+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/block/brd.c | 48 ++++++++++++++++++++++++++-------------------
+ 1 file changed, 28 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/block/brd.c b/drivers/block/brd.c
+index 39cad8b26971..740631dcdd0e 100644
+--- a/drivers/block/brd.c
++++ b/drivers/block/brd.c
+@@ -80,26 +80,21 @@ static struct page *brd_lookup_page(struct brd_device *brd, sector_t sector)
+ /*
+  * Insert a new page for a given sector, if one does not already exist.
+  */
+-static int brd_insert_page(struct brd_device *brd, sector_t sector)
++static int brd_insert_page(struct brd_device *brd, sector_t sector, gfp_t gfp)
+ {
+ 	pgoff_t idx;
+ 	struct page *page;
+-	gfp_t gfp_flags;
++	int ret = 0;
+ 
+ 	page = brd_lookup_page(brd, sector);
+ 	if (page)
+ 		return 0;
+ 
+-	/*
+-	 * Must use NOIO because we don't want to recurse back into the
+-	 * block or filesystem layers from page reclaim.
+-	 */
+-	gfp_flags = GFP_NOIO | __GFP_ZERO | __GFP_HIGHMEM;
+-	page = alloc_page(gfp_flags);
++	page = alloc_page(gfp | __GFP_ZERO | __GFP_HIGHMEM);
+ 	if (!page)
+ 		return -ENOMEM;
+ 
+-	if (radix_tree_preload(GFP_NOIO)) {
++	if (gfpflags_allow_blocking(gfp) && radix_tree_preload(gfp)) {
+ 		__free_page(page);
+ 		return -ENOMEM;
+ 	}
+@@ -110,15 +105,17 @@ static int brd_insert_page(struct brd_device *brd, sector_t sector)
+ 	if (radix_tree_insert(&brd->brd_pages, idx, page)) {
+ 		__free_page(page);
+ 		page = radix_tree_lookup(&brd->brd_pages, idx);
+-		BUG_ON(!page);
+-		BUG_ON(page->index != idx);
++		if (!page)
++			ret = -ENOMEM;
++		else if (page->index != idx)
++			ret = -EIO;
+ 	} else {
+ 		brd->brd_nr_pages++;
+ 	}
+ 	spin_unlock(&brd->brd_lock);
+ 
+ 	radix_tree_preload_end();
+-	return 0;
++	return ret;
+ }
+ 
+ /*
+@@ -167,19 +164,20 @@ static void brd_free_pages(struct brd_device *brd)
+ /*
+  * copy_to_brd_setup must be called before copy_to_brd. It may sleep.
+  */
+-static int copy_to_brd_setup(struct brd_device *brd, sector_t sector, size_t n)
++static int copy_to_brd_setup(struct brd_device *brd, sector_t sector, size_t n,
++			     gfp_t gfp)
+ {
+ 	unsigned int offset = (sector & (PAGE_SECTORS-1)) << SECTOR_SHIFT;
+ 	size_t copy;
+ 	int ret;
+ 
+ 	copy = min_t(size_t, n, PAGE_SIZE - offset);
+-	ret = brd_insert_page(brd, sector);
++	ret = brd_insert_page(brd, sector, gfp);
+ 	if (ret)
+ 		return ret;
+ 	if (copy < n) {
+ 		sector += copy >> SECTOR_SHIFT;
+-		ret = brd_insert_page(brd, sector);
++		ret = brd_insert_page(brd, sector, gfp);
+ 	}
+ 	return ret;
+ }
+@@ -254,20 +252,26 @@ static void copy_from_brd(void *dst, struct brd_device *brd,
+  * Process a single bvec of a bio.
+  */
+ static int brd_do_bvec(struct brd_device *brd, struct page *page,
+-			unsigned int len, unsigned int off, enum req_op op,
++			unsigned int len, unsigned int off, blk_opf_t opf,
+ 			sector_t sector)
+ {
+ 	void *mem;
+ 	int err = 0;
+ 
+-	if (op_is_write(op)) {
+-		err = copy_to_brd_setup(brd, sector, len);
++	if (op_is_write(opf)) {
++		/*
++		 * Must use NOIO because we don't want to recurse back into the
++		 * block or filesystem layers from page reclaim.
++		 */
++		gfp_t gfp = opf & REQ_NOWAIT ? GFP_NOWAIT : GFP_NOIO;
++
++		err = copy_to_brd_setup(brd, sector, len, gfp);
+ 		if (err)
+ 			goto out;
+ 	}
+ 
+ 	mem = kmap_atomic(page);
+-	if (!op_is_write(op)) {
++	if (!op_is_write(opf)) {
+ 		copy_from_brd(mem + off, brd, sector, len);
+ 		flush_dcache_page(page);
+ 	} else {
+@@ -296,8 +300,12 @@ static void brd_submit_bio(struct bio *bio)
+ 				(len & (SECTOR_SIZE - 1)));
+ 
+ 		err = brd_do_bvec(brd, bvec.bv_page, len, bvec.bv_offset,
+-				  bio_op(bio), sector);
++				  bio->bi_opf, sector);
+ 		if (err) {
++			if (err == -ENOMEM && bio->bi_opf & REQ_NOWAIT) {
++				bio_wouldblock_error(bio);
++				return;
++			}
+ 			bio_io_error(bio);
+ 			return;
+ 		}
+-- 
+2.42.0
+

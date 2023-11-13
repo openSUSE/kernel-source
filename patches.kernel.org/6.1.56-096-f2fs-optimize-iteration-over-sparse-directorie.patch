@@ -1,0 +1,285 @@
+From: Chao Yu <chao@kernel.org>
+Date: Tue, 8 Nov 2022 22:33:21 +0800
+Subject: [PATCH] f2fs: optimize iteration over sparse directories
+References: bsc#1012628
+Patch-mainline: 6.1.56
+Git-commit: 59237a21776f70ffb0420611c23e7158e1317037
+
+[ Upstream commit 59237a21776f70ffb0420611c23e7158e1317037 ]
+
+Wei Chen reports a kernel bug as blew:
+
+INFO: task syz-executor.0:29056 blocked for more than 143 seconds.
+      Not tainted 5.15.0-rc5 #1
+"echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+task:syz-executor.0  state:D stack:14632 pid:29056 ppid:  6574 flags:0x00000004
+Call Trace:
+ __schedule+0x4a1/0x1720
+ schedule+0x36/0xe0
+ rwsem_down_write_slowpath+0x322/0x7a0
+ fscrypt_ioctl_set_policy+0x11f/0x2a0
+ __f2fs_ioctl+0x1a9f/0x5780
+ f2fs_ioctl+0x89/0x3a0
+ __x64_sys_ioctl+0xe8/0x140
+ do_syscall_64+0x34/0xb0
+ entry_SYSCALL_64_after_hwframe+0x44/0xae
+
+Eric did some investigation on this issue, quoted from reply of Eric:
+
+"Well, the quality of this bug report has a lot to be desired (not on
+upstream kernel, reproducer is full of totally irrelevant stuff, not
+sent to the mailing list of the filesystem whose disk image is being
+fuzzed, etc.).  But what is going on is that f2fs_empty_dir() doesn't
+consider the case of a directory with an extremely large i_size on a
+malicious disk image.
+
+Specifically, the reproducer mounts an f2fs image with a directory
+that has an i_size of 14814520042850357248, then calls
+FS_IOC_SET_ENCRYPTION_POLICY on it.
+
+That results in a call to f2fs_empty_dir() to check whether the
+directory is empty.  f2fs_empty_dir() then iterates through all
+3616826182336513 blocks the directory allegedly contains to check
+whether any contain anything.  i_rwsem is held during this, so
+anything else that tries to take it will hang."
+
+In order to solve this issue, let's use f2fs_get_next_page_offset()
+to speed up iteration by skipping holes for all below functions:
+- f2fs_empty_dir
+- f2fs_readdir
+- find_in_level
+
+The way why we can speed up iteration was described in
+'commit 3cf4574705b4 ("f2fs: introduce get_next_page_offset to speed
+up SEEK_DATA")'.
+
+Meanwhile, in f2fs_empty_dir(), let's use f2fs_find_data_page()
+instead f2fs_get_lock_data_page(), due to i_rwsem was held in
+caller of f2fs_empty_dir(), there shouldn't be any races, so it's
+fine to not lock dentry page during lookuping dirents in the page.
+
+Link: https://lore.kernel.org/lkml/536944df-a0ae-1dd8-148f-510b476e1347@kernel.org/T/
+Reported-by: Wei Chen <harperchen1110@gmail.com>
+Cc: Eric Biggers <ebiggers@google.com>
+Signed-off-by: Chao Yu <chao@kernel.org>
+Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
+Stable-dep-of: d2d9bb3b6d2f ("f2fs: get out of a repeat loop when getting a locked data page")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/f2fs/data.c | 17 ++++++++++++-----
+ fs/f2fs/dir.c  | 34 ++++++++++++++++++++++++----------
+ fs/f2fs/f2fs.h |  5 +++--
+ fs/f2fs/gc.c   |  4 ++--
+ 4 files changed, 41 insertions(+), 19 deletions(-)
+
+diff --git a/fs/f2fs/data.c b/fs/f2fs/data.c
+index c230824ab5e6..0faed0575f8a 100644
+--- a/fs/f2fs/data.c
++++ b/fs/f2fs/data.c
+@@ -1212,7 +1212,8 @@ int f2fs_get_block(struct dnode_of_data *dn, pgoff_t index)
+ }
+ 
+ struct page *f2fs_get_read_data_page(struct inode *inode, pgoff_t index,
+-				     blk_opf_t op_flags, bool for_write)
++				     blk_opf_t op_flags, bool for_write,
++				     pgoff_t *next_pgofs)
+ {
+ 	struct address_space *mapping = inode->i_mapping;
+ 	struct dnode_of_data dn;
+@@ -1238,12 +1239,17 @@ struct page *f2fs_get_read_data_page(struct inode *inode, pgoff_t index,
+ 
+ 	set_new_dnode(&dn, inode, NULL, NULL, 0);
+ 	err = f2fs_get_dnode_of_data(&dn, index, LOOKUP_NODE);
+-	if (err)
++	if (err) {
++		if (err == -ENOENT && next_pgofs)
++			*next_pgofs = f2fs_get_next_page_offset(&dn, index);
+ 		goto put_err;
++	}
+ 	f2fs_put_dnode(&dn);
+ 
+ 	if (unlikely(dn.data_blkaddr == NULL_ADDR)) {
+ 		err = -ENOENT;
++		if (next_pgofs)
++			*next_pgofs = index + 1;
+ 		goto put_err;
+ 	}
+ 	if (dn.data_blkaddr != NEW_ADDR &&
+@@ -1287,7 +1293,8 @@ struct page *f2fs_get_read_data_page(struct inode *inode, pgoff_t index,
+ 	return ERR_PTR(err);
+ }
+ 
+-struct page *f2fs_find_data_page(struct inode *inode, pgoff_t index)
++struct page *f2fs_find_data_page(struct inode *inode, pgoff_t index,
++					pgoff_t *next_pgofs)
+ {
+ 	struct address_space *mapping = inode->i_mapping;
+ 	struct page *page;
+@@ -1297,7 +1304,7 @@ struct page *f2fs_find_data_page(struct inode *inode, pgoff_t index)
+ 		return page;
+ 	f2fs_put_page(page, 0);
+ 
+-	page = f2fs_get_read_data_page(inode, index, 0, false);
++	page = f2fs_get_read_data_page(inode, index, 0, false, next_pgofs);
+ 	if (IS_ERR(page))
+ 		return page;
+ 
+@@ -1323,7 +1330,7 @@ struct page *f2fs_get_lock_data_page(struct inode *inode, pgoff_t index,
+ 	struct address_space *mapping = inode->i_mapping;
+ 	struct page *page;
+ repeat:
+-	page = f2fs_get_read_data_page(inode, index, 0, for_write);
++	page = f2fs_get_read_data_page(inode, index, 0, for_write, NULL);
+ 	if (IS_ERR(page))
+ 		return page;
+ 
+diff --git a/fs/f2fs/dir.c b/fs/f2fs/dir.c
+index bf5ba75b75d2..8373eba3a133 100644
+--- a/fs/f2fs/dir.c
++++ b/fs/f2fs/dir.c
+@@ -340,6 +340,7 @@ static struct f2fs_dir_entry *find_in_level(struct inode *dir,
+ 	unsigned int bidx, end_block;
+ 	struct page *dentry_page;
+ 	struct f2fs_dir_entry *de = NULL;
++	pgoff_t next_pgofs;
+ 	bool room = false;
+ 	int max_slots;
+ 
+@@ -350,12 +351,13 @@ static struct f2fs_dir_entry *find_in_level(struct inode *dir,
+ 			       le32_to_cpu(fname->hash) % nbucket);
+ 	end_block = bidx + nblock;
+ 
+-	for (; bidx < end_block; bidx++) {
++	while (bidx < end_block) {
+ 		/* no need to allocate new dentry pages to all the indices */
+-		dentry_page = f2fs_find_data_page(dir, bidx);
++		dentry_page = f2fs_find_data_page(dir, bidx, &next_pgofs);
+ 		if (IS_ERR(dentry_page)) {
+ 			if (PTR_ERR(dentry_page) == -ENOENT) {
+ 				room = true;
++				bidx = next_pgofs;
+ 				continue;
+ 			} else {
+ 				*res_page = dentry_page;
+@@ -376,6 +378,8 @@ static struct f2fs_dir_entry *find_in_level(struct inode *dir,
+ 		if (max_slots >= s)
+ 			room = true;
+ 		f2fs_put_page(dentry_page, 0);
++
++		bidx++;
+ 	}
+ 
+ 	if (!de && room && F2FS_I(dir)->chash != fname->hash) {
+@@ -963,7 +967,7 @@ void f2fs_delete_entry(struct f2fs_dir_entry *dentry, struct page *page,
+ 
+ bool f2fs_empty_dir(struct inode *dir)
+ {
+-	unsigned long bidx;
++	unsigned long bidx = 0;
+ 	struct page *dentry_page;
+ 	unsigned int bit_pos;
+ 	struct f2fs_dentry_block *dentry_blk;
+@@ -972,13 +976,17 @@ bool f2fs_empty_dir(struct inode *dir)
+ 	if (f2fs_has_inline_dentry(dir))
+ 		return f2fs_empty_inline_dir(dir);
+ 
+-	for (bidx = 0; bidx < nblock; bidx++) {
+-		dentry_page = f2fs_get_lock_data_page(dir, bidx, false);
++	while (bidx < nblock) {
++		pgoff_t next_pgofs;
++
++		dentry_page = f2fs_find_data_page(dir, bidx, &next_pgofs);
+ 		if (IS_ERR(dentry_page)) {
+-			if (PTR_ERR(dentry_page) == -ENOENT)
++			if (PTR_ERR(dentry_page) == -ENOENT) {
++				bidx = next_pgofs;
+ 				continue;
+-			else
++			} else {
+ 				return false;
++			}
+ 		}
+ 
+ 		dentry_blk = page_address(dentry_page);
+@@ -990,10 +998,12 @@ bool f2fs_empty_dir(struct inode *dir)
+ 						NR_DENTRY_IN_BLOCK,
+ 						bit_pos);
+ 
+-		f2fs_put_page(dentry_page, 1);
++		f2fs_put_page(dentry_page, 0);
+ 
+ 		if (bit_pos < NR_DENTRY_IN_BLOCK)
+ 			return false;
++
++		bidx++;
+ 	}
+ 	return true;
+ }
+@@ -1111,7 +1121,8 @@ static int f2fs_readdir(struct file *file, struct dir_context *ctx)
+ 		goto out_free;
+ 	}
+ 
+-	for (; n < npages; n++, ctx->pos = n * NR_DENTRY_IN_BLOCK) {
++	for (; n < npages; ctx->pos = n * NR_DENTRY_IN_BLOCK) {
++		pgoff_t next_pgofs;
+ 
+ 		/* allow readdir() to be interrupted */
+ 		if (fatal_signal_pending(current)) {
+@@ -1125,11 +1136,12 @@ static int f2fs_readdir(struct file *file, struct dir_context *ctx)
+ 			page_cache_sync_readahead(inode->i_mapping, ra, file, n,
+ 				min(npages - n, (pgoff_t)MAX_DIR_RA_PAGES));
+ 
+-		dentry_page = f2fs_find_data_page(inode, n);
++		dentry_page = f2fs_find_data_page(inode, n, &next_pgofs);
+ 		if (IS_ERR(dentry_page)) {
+ 			err = PTR_ERR(dentry_page);
+ 			if (err == -ENOENT) {
+ 				err = 0;
++				n = next_pgofs;
+ 				continue;
+ 			} else {
+ 				goto out_free;
+@@ -1148,6 +1160,8 @@ static int f2fs_readdir(struct file *file, struct dir_context *ctx)
+ 		}
+ 
+ 		f2fs_put_page(dentry_page, 0);
++
++		n++;
+ 	}
+ out_free:
+ 	fscrypt_fname_free_buffer(&fstr);
+diff --git a/fs/f2fs/f2fs.h b/fs/f2fs/f2fs.h
+index 37dca728ff96..f56abb39601a 100644
+--- a/fs/f2fs/f2fs.h
++++ b/fs/f2fs/f2fs.h
+@@ -3784,8 +3784,9 @@ int f2fs_reserve_new_block(struct dnode_of_data *dn);
+ int f2fs_get_block(struct dnode_of_data *dn, pgoff_t index);
+ int f2fs_reserve_block(struct dnode_of_data *dn, pgoff_t index);
+ struct page *f2fs_get_read_data_page(struct inode *inode, pgoff_t index,
+-			blk_opf_t op_flags, bool for_write);
+-struct page *f2fs_find_data_page(struct inode *inode, pgoff_t index);
++			blk_opf_t op_flags, bool for_write, pgoff_t *next_pgofs);
++struct page *f2fs_find_data_page(struct inode *inode, pgoff_t index,
++							pgoff_t *next_pgofs);
+ struct page *f2fs_get_lock_data_page(struct inode *inode, pgoff_t index,
+ 			bool for_write);
+ struct page *f2fs_get_new_data_page(struct inode *inode,
+diff --git a/fs/f2fs/gc.c b/fs/f2fs/gc.c
+index aa4d513daa8f..ec7212f7a9b7 100644
+--- a/fs/f2fs/gc.c
++++ b/fs/f2fs/gc.c
+@@ -1600,8 +1600,8 @@ static int gc_data_segment(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
+ 				continue;
+ 			}
+ 
+-			data_page = f2fs_get_read_data_page(inode,
+-						start_bidx, REQ_RAHEAD, true);
++			data_page = f2fs_get_read_data_page(inode, start_bidx,
++							REQ_RAHEAD, true, NULL);
+ 			f2fs_up_write(&F2FS_I(inode)->i_gc_rwsem[WRITE]);
+ 			if (IS_ERR(data_page)) {
+ 				iput(inode);
+-- 
+2.42.0
+

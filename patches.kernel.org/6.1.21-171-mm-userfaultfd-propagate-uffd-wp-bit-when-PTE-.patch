@@ -1,0 +1,230 @@
+From: David Hildenbrand <david@redhat.com>
+Date: Thu, 2 Mar 2023 18:54:23 +0100
+Subject: [PATCH] mm/userfaultfd: propagate uffd-wp bit when PTE-mapping the
+ huge zeropage
+References: bsc#1012628
+Patch-mainline: 6.1.21
+Git-commit: 42b2af2c9b7eede8ef21d0943f84d135e21a32a3
+
+commit 42b2af2c9b7eede8ef21d0943f84d135e21a32a3 upstream.
+
+Currently, we'd lose the userfaultfd-wp marker when PTE-mapping a huge
+zeropage, resulting in the next write faults in the PMD range not
+triggering uffd-wp events.
+
+Various actions (partial MADV_DONTNEED, partial mremap, partial munmap,
+partial mprotect) could trigger this.  However, most importantly,
+un-protecting a single sub-page from the userfaultfd-wp handler when
+processing a uffd-wp event will PTE-map the shared huge zeropage and lose
+the uffd-wp bit for the remainder of the PMD.
+
+Let's properly propagate the uffd-wp bit to the PMDs.
+
+ #define _GNU_SOURCE
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <stdint.h>
+ #include <stdbool.h>
+ #include <inttypes.h>
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <errno.h>
+ #include <poll.h>
+ #include <pthread.h>
+ #include <sys/mman.h>
+ #include <sys/syscall.h>
+ #include <sys/ioctl.h>
+ #include <linux/userfaultfd.h>
+
+ static size_t pagesize;
+ static int uffd;
+ static volatile bool uffd_triggered;
+
+ #define barrier() __asm__ __volatile__("": : :"memory")
+
+ static void uffd_wp_range(char *start, size_t size, bool wp)
+ {
+ 	struct uffdio_writeprotect uffd_writeprotect;
+
+ 	uffd_writeprotect.range.start = (unsigned long) start;
+ 	uffd_writeprotect.range.len = size;
+ 	if (wp) {
+ 		uffd_writeprotect.mode = UFFDIO_WRITEPROTECT_MODE_WP;
+ 	} else {
+ 		uffd_writeprotect.mode = 0;
+ 	}
+ 	if (ioctl(uffd, UFFDIO_WRITEPROTECT, &uffd_writeprotect)) {
+ 		fprintf(stderr, "UFFDIO_WRITEPROTECT failed: %d\n", errno);
+ 		exit(1);
+ 	}
+ }
+
+ static void *uffd_thread_fn(void *arg)
+ {
+ 	static struct uffd_msg msg;
+ 	ssize_t nread;
+
+ 	while (1) {
+ 		struct pollfd pollfd;
+ 		int nready;
+
+ 		pollfd.fd = uffd;
+ 		pollfd.events = POLLIN;
+ 		nready = poll(&pollfd, 1, -1);
+ 		if (nready == -1) {
+ 			fprintf(stderr, "poll() failed: %d\n", errno);
+ 			exit(1);
+ 		}
+
+ 		nread = read(uffd, &msg, sizeof(msg));
+ 		if (nread <= 0)
+ 			continue;
+
+ 		if (msg.event != UFFD_EVENT_PAGEFAULT ||
+ 		    !(msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP)) {
+ 			printf("FAIL: wrong uffd-wp event fired\n");
+ 			exit(1);
+ 		}
+
+ 		/* un-protect the single page. */
+ 		uffd_triggered = true;
+ 		uffd_wp_range((char *)(uintptr_t)msg.arg.pagefault.address,
+ 			      pagesize, false);
+ 	}
+ 	return arg;
+ }
+
+ static int setup_uffd(char *map, size_t size)
+ {
+ 	struct uffdio_api uffdio_api;
+ 	struct uffdio_register uffdio_register;
+ 	pthread_t thread;
+
+ 	uffd = syscall(__NR_userfaultfd,
+ 		       O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+ 	if (uffd < 0) {
+ 		fprintf(stderr, "syscall() failed: %d\n", errno);
+ 		return -errno;
+ 	}
+
+ 	uffdio_api.api = UFFD_API;
+ 	uffdio_api.features = UFFD_FEATURE_PAGEFAULT_FLAG_WP;
+ 	if (ioctl(uffd, UFFDIO_API, &uffdio_api) < 0) {
+ 		fprintf(stderr, "UFFDIO_API failed: %d\n", errno);
+ 		return -errno;
+ 	}
+
+ 	if (!(uffdio_api.features & UFFD_FEATURE_PAGEFAULT_FLAG_WP)) {
+ 		fprintf(stderr, "UFFD_FEATURE_WRITEPROTECT missing\n");
+ 		return -ENOSYS;
+ 	}
+
+ 	uffdio_register.range.start = (unsigned long) map;
+ 	uffdio_register.range.len = size;
+ 	uffdio_register.mode = UFFDIO_REGISTER_MODE_WP;
+ 	if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) < 0) {
+ 		fprintf(stderr, "UFFDIO_REGISTER failed: %d\n", errno);
+ 		return -errno;
+ 	}
+
+ 	pthread_create(&thread, NULL, uffd_thread_fn, NULL);
+
+ 	return 0;
+ }
+
+ int main(void)
+ {
+ 	const size_t size = 4 * 1024 * 1024ull;
+ 	char *map, *cur;
+
+ 	pagesize = getpagesize();
+
+ 	map = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
+ 	if (map == MAP_FAILED) {
+ 		fprintf(stderr, "mmap() failed\n");
+ 		return -errno;
+ 	}
+
+ 	if (madvise(map, size, MADV_HUGEPAGE)) {
+ 		fprintf(stderr, "MADV_HUGEPAGE failed\n");
+ 		return -errno;
+ 	}
+
+ 	if (setup_uffd(map, size))
+ 		return 1;
+
+ 	/* Read the whole range, populating zeropages. */
+ 	madvise(map, size, MADV_POPULATE_READ);
+
+ 	/* Write-protect the whole range. */
+ 	uffd_wp_range(map, size, true);
+
+ 	/* Make sure uffd-wp triggers on each page. */
+ 	for (cur = map; cur < map + size; cur += pagesize) {
+ 		uffd_triggered = false;
+
+ 		barrier();
+ 		/* Trigger a write fault. */
+ 		*cur = 1;
+ 		barrier();
+
+ 		if (!uffd_triggered) {
+ 			printf("FAIL: uffd-wp did not trigger\n");
+ 			return 1;
+ 		}
+ 	}
+
+ 	printf("PASS: uffd-wp triggered\n");
+ 	return 0;
+ }
+
+Link: https://lkml.kernel.org/r/20230302175423.589164-1-david@redhat.com
+Fixes: e06f1e1dd499 ("userfaultfd: wp: enabled write protection in userfaultfd API")
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Acked-by: Peter Xu <peterx@redhat.com>
+Cc: Mike Rapoport <rppt@linux.vnet.ibm.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Jerome Glisse <jglisse@redhat.com>
+Cc: Shaohua Li <shli@fb.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ mm/huge_memory.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 0729973d486a..b8d654963df8 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -2004,7 +2004,7 @@ static void __split_huge_zero_page_pmd(struct vm_area_struct *vma,
+ {
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	pgtable_t pgtable;
+-	pmd_t _pmd;
++	pmd_t _pmd, old_pmd;
+ 	int i;
+ 
+ 	/*
+@@ -2015,7 +2015,7 @@ static void __split_huge_zero_page_pmd(struct vm_area_struct *vma,
+ 	 *
+ 	 * See Documentation/mm/mmu_notifier.rst
+ 	 */
+-	pmdp_huge_clear_flush(vma, haddr, pmd);
++	old_pmd = pmdp_huge_clear_flush(vma, haddr, pmd);
+ 
+ 	pgtable = pgtable_trans_huge_withdraw(mm, pmd);
+ 	pmd_populate(mm, &_pmd, pgtable);
+@@ -2024,6 +2024,8 @@ static void __split_huge_zero_page_pmd(struct vm_area_struct *vma,
+ 		pte_t *pte, entry;
+ 		entry = pfn_pte(my_zero_pfn(haddr), vma->vm_page_prot);
+ 		entry = pte_mkspecial(entry);
++		if (pmd_uffd_wp(old_pmd))
++			entry = pte_mkuffd_wp(entry);
+ 		pte = pte_offset_map(&_pmd, haddr);
+ 		VM_BUG_ON(!pte_none(*pte));
+ 		set_pte_at(mm, haddr, pte, entry);
+-- 
+2.42.0
+

@@ -1,0 +1,151 @@
+From: David Belanger <david.belanger@amd.com>
+Date: Tue, 28 Feb 2023 14:11:24 -0500
+Subject: [PATCH] drm/amdkfd: Fixed kfd_process cleanup on module exit.
+References: bsc#1012628
+Patch-mainline: 6.1.23
+Git-commit: 20bc9f76b6a2455c6b54b91ae7634f147f64987f
+
+[ Upstream commit 20bc9f76b6a2455c6b54b91ae7634f147f64987f ]
+
+Handle case when module is unloaded (kfd_exit) before a process space
+(mm_struct) is released.
+
+v2: Fixed potential race conditions by removing all kfd_process from
+the process table first, then working on releasing the resources.
+
+v3: Fixed loop element access / synchronization.  Fixed extra empty lines.
+
+Signed-off-by: David Belanger <david.belanger@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_module.c  |  1 +
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |  1 +
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c | 67 +++++++++++++++++++++---
+ 3 files changed, 62 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_module.c b/drivers/gpu/drm/amd/amdkfd/kfd_module.c
+index 09b966dc3768..aee2212e52f6 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_module.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_module.c
+@@ -77,6 +77,7 @@ static int kfd_init(void)
+ 
+ static void kfd_exit(void)
+ {
++	kfd_cleanup_processes();
+ 	kfd_debugfs_fini();
+ 	kfd_process_destroy_wq();
+ 	kfd_procfs_shutdown();
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index bf610e3b683b..6d6588b9beed 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -928,6 +928,7 @@ bool kfd_dev_is_large_bar(struct kfd_dev *dev);
+ 
+ int kfd_process_create_wq(void);
+ void kfd_process_destroy_wq(void);
++void kfd_cleanup_processes(void);
+ struct kfd_process *kfd_create_process(struct file *filep);
+ struct kfd_process *kfd_get_process(const struct task_struct *task);
+ struct kfd_process *kfd_lookup_process_by_pasid(u32 pasid);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index dd351105c1bc..7f68d51541e8 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -1167,6 +1167,17 @@ static void kfd_process_free_notifier(struct mmu_notifier *mn)
+ 	kfd_unref_process(container_of(mn, struct kfd_process, mmu_notifier));
+ }
+ 
++static void kfd_process_notifier_release_internal(struct kfd_process *p)
++{
++	cancel_delayed_work_sync(&p->eviction_work);
++	cancel_delayed_work_sync(&p->restore_work);
++
++	/* Indicate to other users that MM is no longer valid */
++	p->mm = NULL;
++
++	mmu_notifier_put(&p->mmu_notifier);
++}
++
+ static void kfd_process_notifier_release(struct mmu_notifier *mn,
+ 					struct mm_struct *mm)
+ {
+@@ -1181,17 +1192,22 @@ static void kfd_process_notifier_release(struct mmu_notifier *mn,
+ 		return;
+ 
+ 	mutex_lock(&kfd_processes_mutex);
++	/*
++	 * Do early return if table is empty.
++	 *
++	 * This could potentially happen if this function is called concurrently
++	 * by mmu_notifier and by kfd_cleanup_pocesses.
++	 *
++	 */
++	if (hash_empty(kfd_processes_table)) {
++		mutex_unlock(&kfd_processes_mutex);
++		return;
++	}
+ 	hash_del_rcu(&p->kfd_processes);
+ 	mutex_unlock(&kfd_processes_mutex);
+ 	synchronize_srcu(&kfd_processes_srcu);
+ 
+-	cancel_delayed_work_sync(&p->eviction_work);
+-	cancel_delayed_work_sync(&p->restore_work);
+-
+-	/* Indicate to other users that MM is no longer valid */
+-	p->mm = NULL;
+-
+-	mmu_notifier_put(&p->mmu_notifier);
++	kfd_process_notifier_release_internal(p);
+ }
+ 
+ static const struct mmu_notifier_ops kfd_process_mmu_notifier_ops = {
+@@ -1200,6 +1216,43 @@ static const struct mmu_notifier_ops kfd_process_mmu_notifier_ops = {
+ 	.free_notifier = kfd_process_free_notifier,
+ };
+ 
++/*
++ * This code handles the case when driver is being unloaded before all
++ * mm_struct are released.  We need to safely free the kfd_process and
++ * avoid race conditions with mmu_notifier that might try to free them.
++ *
++ */
++void kfd_cleanup_processes(void)
++{
++	struct kfd_process *p;
++	struct hlist_node *p_temp;
++	unsigned int temp;
++	HLIST_HEAD(cleanup_list);
++
++	/*
++	 * Move all remaining kfd_process from the process table to a
++	 * temp list for processing.   Once done, callback from mmu_notifier
++	 * release will not see the kfd_process in the table and do early return,
++	 * avoiding double free issues.
++	 */
++	mutex_lock(&kfd_processes_mutex);
++	hash_for_each_safe(kfd_processes_table, temp, p_temp, p, kfd_processes) {
++		hash_del_rcu(&p->kfd_processes);
++		synchronize_srcu(&kfd_processes_srcu);
++		hlist_add_head(&p->kfd_processes, &cleanup_list);
++	}
++	mutex_unlock(&kfd_processes_mutex);
++
++	hlist_for_each_entry_safe(p, p_temp, &cleanup_list, kfd_processes)
++		kfd_process_notifier_release_internal(p);
++
++	/*
++	 * Ensures that all outstanding free_notifier get called, triggering
++	 * the release of the kfd_process struct.
++	 */
++	mmu_notifier_synchronize();
++}
++
+ static int kfd_process_init_cwsr_apu(struct kfd_process *p, struct file *filep)
+ {
+ 	unsigned long  offset;
+-- 
+2.42.0
+

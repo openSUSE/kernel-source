@@ -1,0 +1,151 @@
+From: Nick Child <nnac123@linux.ibm.com>
+Date: Wed, 9 Aug 2023 17:10:38 -0500
+Subject: [PATCH] ibmvnic: Ensure login failure recovery is safe from other
+ resets
+References: bsc#1012628
+Patch-mainline: 6.1.46
+Git-commit: 6db541ae279bd4e76dbd939e5fbf298396166242
+
+commit 6db541ae279bd4e76dbd939e5fbf298396166242 upstream.
+
+If a login request fails, the recovery process should be protected
+against parallel resets. It is a known issue that freeing and
+registering CRQ's in quick succession can result in a failover CRQ from
+the VIOS. Processing a failover during login recovery is dangerous for
+two reasons:
+ 1. This will result in two parallel initialization processes, this can
+ cause serious issues during login.
+ 2. It is possible that the failover CRQ is received but never executed.
+ We get notified of a pending failover through a transport event CRQ.
+ The reset is not performed until a INIT CRQ request is received.
+ Previously, if CRQ init fails during login recovery, then the ibmvnic
+ irq is freed and the login process returned error. If failover_pending
+ is true (a transport event was received), then the ibmvnic device
+ would never be able to process the reset since it cannot receive the
+ CRQ_INIT request due to the irq being freed. This leaved the device
+ in a inoperable state.
+
+Therefore, the login failure recovery process must be hardened against
+these possible issues. Possible failovers (due to quick CRQ free and
+init) must be avoided and any issues during re-initialization should be
+dealt with instead of being propagated up the stack. This logic is
+similar to that of ibmvnic_probe().
+
+Fixes: dff515a3e71d ("ibmvnic: Harden device login requests")
+Signed-off-by: Nick Child <nnac123@linux.ibm.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://lore.kernel.org/r/20230809221038.51296-5-nnac123@linux.ibm.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/net/ethernet/ibm/ibmvnic.c | 68 +++++++++++++++++++++---------
+ 1 file changed, 47 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/net/ethernet/ibm/ibmvnic.c b/drivers/net/ethernet/ibm/ibmvnic.c
+index a47c1e3a5728..157be4e9be4b 100644
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@ -115,6 +115,7 @@ static void ibmvnic_tx_scrq_clean_buffer(struct ibmvnic_adapter *adapter,
+ static void free_long_term_buff(struct ibmvnic_adapter *adapter,
+ 				struct ibmvnic_long_term_buff *ltb);
+ static void ibmvnic_disable_irqs(struct ibmvnic_adapter *adapter);
++static void flush_reset_queue(struct ibmvnic_adapter *adapter);
+ 
+ struct ibmvnic_stat {
+ 	char name[ETH_GSTRING_LEN];
+@@ -1316,8 +1317,8 @@ static const char *adapter_state_to_string(enum vnic_state state)
+ 
+ static int ibmvnic_login(struct net_device *netdev)
+ {
++	unsigned long flags, timeout = msecs_to_jiffies(20000);
+ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+-	unsigned long timeout = msecs_to_jiffies(20000);
+ 	int retry_count = 0;
+ 	int retries = 10;
+ 	bool retry;
+@@ -1382,6 +1383,7 @@ static int ibmvnic_login(struct net_device *netdev)
+ 					    "SCRQ irq initialization failed\n");
+ 				return rc;
+ 			}
++		/* Default/timeout error handling, reset and start fresh */
+ 		} else if (adapter->init_done_rc) {
+ 			netdev_warn(netdev, "Adapter login failed, init_done_rc = %d\n",
+ 				    adapter->init_done_rc);
+@@ -1397,29 +1399,53 @@ static int ibmvnic_login(struct net_device *netdev)
+ 				    "Freeing and re-registering CRQs before attempting to login again\n");
+ 			retry = true;
+ 			adapter->init_done_rc = 0;
+-			retry_count++;
+ 			release_sub_crqs(adapter, true);
+-			reinit_init_done(adapter);
+-			release_crq_queue(adapter);
+-			/* If we don't sleep here then we risk an unnecessary
+-			 * failover event from the VIOS. This is a known VIOS
+-			 * issue caused by a vnic device freeing and registering
+-			 * a CRQ too quickly.
++			/* Much of this is similar logic as ibmvnic_probe(),
++			 * we are essentially re-initializing communication
++			 * with the server. We really should not run any
++			 * resets/failovers here because this is already a form
++			 * of reset and we do not want parallel resets occurring
+ 			 */
+-			msleep(1500);
+-			rc = init_crq_queue(adapter);
+-			if (rc) {
+-				netdev_err(netdev, "login recovery: init CRQ failed %d\n",
+-					   rc);
+-				return -EIO;
+-			}
++			do {
++				reinit_init_done(adapter);
++				/* Clear any failovers we got in the previous
++				 * pass since we are re-initializing the CRQ
++				 */
++				adapter->failover_pending = false;
++				release_crq_queue(adapter);
++				/* If we don't sleep here then we risk an
++				 * unnecessary failover event from the VIOS.
++				 * This is a known VIOS issue caused by a vnic
++				 * device freeing and registering a CRQ too
++				 * quickly.
++				 */
++				msleep(1500);
++				/* Avoid any resets, since we are currently
++				 * resetting.
++				 */
++				spin_lock_irqsave(&adapter->rwi_lock, flags);
++				flush_reset_queue(adapter);
++				spin_unlock_irqrestore(&adapter->rwi_lock,
++						       flags);
++
++				rc = init_crq_queue(adapter);
++				if (rc) {
++					netdev_err(netdev, "login recovery: init CRQ failed %d\n",
++						   rc);
++					return -EIO;
++				}
+ 
+-			rc = ibmvnic_reset_init(adapter, false);
+-			if (rc) {
+-				netdev_err(netdev, "login recovery: Reset init failed %d\n",
+-					   rc);
+-				return -EIO;
+-			}
++				rc = ibmvnic_reset_init(adapter, false);
++				if (rc)
++					netdev_err(netdev, "login recovery: Reset init failed %d\n",
++						   rc);
++				/* IBMVNIC_CRQ_INIT will return EAGAIN if it
++				 * fails, since ibmvnic_reset_init will free
++				 * irq's in failure, we won't be able to receive
++				 * new CRQs so we need to keep trying. probe()
++				 * handles this similarly.
++				 */
++			} while (rc == -EAGAIN && retry_count++ < retries);
+ 		}
+ 	} while (retry);
+ 
+-- 
+2.42.0
+
