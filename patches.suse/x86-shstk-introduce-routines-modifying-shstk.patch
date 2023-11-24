@@ -1,0 +1,174 @@
+From: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Date: Mon, 12 Jun 2023 17:10:56 -0700
+Subject: x86/shstk: Introduce routines modifying shstk
+Git-commit: 928054769dbdedc03aaebceecaaef15a0707b8cb
+Patch-mainline: v6.6-rc1
+References: jsc#PED-6018
+
+Shadow stacks are normally written to via CALL/RET or specific CET
+instructions like RSTORSSP/SAVEPREVSSP. However, sometimes the kernel will
+need to write to the shadow stack directly using the ring-0 only WRUSS
+instruction.
+
+A shadow stack restore token marks a restore point of the shadow stack, and
+the address in a token must point directly above the token, which is within
+the same shadow stack. This is distinctively different from other pointers
+on the shadow stack, since those pointers point to executable code area.
+
+Introduce token setup and verify routines. Also introduce WRUSS, which is
+a kernel-mode instruction but writes directly to user shadow stack.
+
+In future patches that enable shadow stack to work with signals, the kernel
+will need something to denote the point in the stack where sigreturn may be
+called. This will prevent attackers calling sigreturn at arbitrary places
+in the stack, in order to help prevent SROP attacks.
+
+To do this, something that can only be written by the kernel needs to be
+placed on the shadow stack. This can be accomplished by setting bit 63 in
+the frame written to the shadow stack. Userspace return addresses can't
+have this bit set as it is in the kernel range. It also can't be a valid
+restore token.
+
+Co-developed-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+Signed-off-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+Signed-off-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: Borislav Petkov (AMD) <bp@alien8.de>
+Reviewed-by: Kees Cook <keescook@chromium.org>
+Acked-by: Mike Rapoport (IBM) <rppt@kernel.org>
+Tested-by: Pengfei Xu <pengfei.xu@intel.com>
+Tested-by: John Allen <john.allen@amd.com>
+Tested-by: Kees Cook <keescook@chromium.org>
+Link: https://lore.kernel.org/all/20230613001108.3040476-31-rick.p.edgecombe%40intel.com
+
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/include/asm/special_insns.h | 13 +++++++
+ arch/x86/kernel/shstk.c              | 75 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 88 insertions(+)
+
+diff --git a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_insns.h
+index de48d1389936..d6cd9344f6c7 100644
+--- a/arch/x86/include/asm/special_insns.h
++++ b/arch/x86/include/asm/special_insns.h
+@@ -202,6 +202,19 @@ static inline void clwb(volatile void *__p)
+ 		: [pax] "a" (p));
+ }
+ 
++#ifdef CONFIG_X86_USER_SHADOW_STACK
++static inline int write_user_shstk_64(u64 __user *addr, u64 val)
++{
++	asm_volatile_goto("1: wrussq %[val], (%[addr])\n"
++			  _ASM_EXTABLE(1b, %l[fail])
++			  :: [addr] "r" (addr), [val] "r" (val)
++			  :: fail);
++	return 0;
++fail:
++	return -EFAULT;
++}
++#endif /* CONFIG_X86_USER_SHADOW_STACK */
++
+ #define nop() asm volatile ("nop")
+ 
+ static inline void serialize(void)
+diff --git a/arch/x86/kernel/shstk.c b/arch/x86/kernel/shstk.c
+index bd9cdc3a7338..e22928c63ffc 100644
+--- a/arch/x86/kernel/shstk.c
++++ b/arch/x86/kernel/shstk.c
+@@ -25,6 +25,8 @@
+ #include <asm/fpu/api.h>
+ #include <asm/prctl.h>
+ 
++#define SS_FRAME_SIZE 8
++
+ static bool features_enabled(unsigned long features)
+ {
+ 	return current->thread.features & features;
+@@ -40,6 +42,35 @@ static void features_clr(unsigned long features)
+ 	current->thread.features &= ~features;
+ }
+ 
++/*
++ * Create a restore token on the shadow stack.  A token is always 8-byte
++ * and aligned to 8.
++ */
++static int create_rstor_token(unsigned long ssp, unsigned long *token_addr)
++{
++	unsigned long addr;
++
++	/* Token must be aligned */
++	if (!IS_ALIGNED(ssp, 8))
++		return -EINVAL;
++
++	addr = ssp - SS_FRAME_SIZE;
++
++	/*
++	 * SSP is aligned, so reserved bits and mode bit are a zero, just mark
++	 * the token 64-bit.
++	 */
++	ssp |= BIT(0);
++
++	if (write_user_shstk_64((u64 __user *)addr, (u64)ssp))
++		return -EFAULT;
++
++	if (token_addr)
++		*token_addr = addr;
++
++	return 0;
++}
++
+ static unsigned long alloc_shstk(unsigned long size)
+ {
+ 	int flags = MAP_ANONYMOUS | MAP_PRIVATE | MAP_ABOVE4G;
+@@ -157,6 +188,50 @@ unsigned long shstk_alloc_thread_stack(struct task_struct *tsk, unsigned long cl
+ 	return addr + size;
+ }
+ 
++static unsigned long get_user_shstk_addr(void)
++{
++	unsigned long long ssp;
++
++	fpregs_lock_and_load();
++
++	rdmsrl(MSR_IA32_PL3_SSP, ssp);
++
++	fpregs_unlock();
++
++	return ssp;
++}
++
++#define SHSTK_DATA_BIT BIT(63)
++
++static int put_shstk_data(u64 __user *addr, u64 data)
++{
++	if (WARN_ON_ONCE(data & SHSTK_DATA_BIT))
++		return -EINVAL;
++
++	/*
++	 * Mark the high bit so that the sigframe can't be processed as a
++	 * return address.
++	 */
++	if (write_user_shstk_64(addr, data | SHSTK_DATA_BIT))
++		return -EFAULT;
++	return 0;
++}
++
++static int get_shstk_data(unsigned long *data, unsigned long __user *addr)
++{
++	unsigned long ldata;
++
++	if (unlikely(get_user(ldata, addr)))
++		return -EFAULT;
++
++	if (!(ldata & SHSTK_DATA_BIT))
++		return -EINVAL;
++
++	*data = ldata & ~SHSTK_DATA_BIT;
++
++	return 0;
++}
++
+ void shstk_free(struct task_struct *tsk)
+ {
+ 	struct thread_shstk *shstk = &tsk->thread.shstk;
+
