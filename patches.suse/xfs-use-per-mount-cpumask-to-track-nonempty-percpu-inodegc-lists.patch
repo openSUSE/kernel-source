@@ -1,0 +1,269 @@
+From 62334fab47621dd91ab30dd5bb6c43d78a8ec279 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Mon, 11 Sep 2023 08:39:03 -0700
+Subject: [PATCH] xfs: use per-mount cpumask to track nonempty percpu inodegc
+ lists
+Git-commit: 62334fab47621dd91ab30dd5bb6c43d78a8ec279
+Patch-mainline: v6.6-rc3
+References: git-fixes
+
+Directly track which CPUs have contributed to the inodegc percpu lists
+instead of trusting the cpu online mask.  This eliminates a theoretical
+problem where the inodegc flush functions might fail to flush a CPU's
+inodes if that CPU happened to be dying at exactly the same time.  Most
+likely nobody's noticed this because the CPU dead hook moves the percpu
+inodegc list to another CPU and schedules that worker immediately.  But
+it's quite possible that this is a subtle race leading to UAF if the
+inodegc flush were part of an unmount.
+
+Further benefits: This reduces the overhead of the inodegc flush code
+slightly by allowing us to ignore CPUs that have empty lists.  Better
+yet, it reduces our dependence on the cpu online masks, which have been
+the cause of confusion and drama lately.
+
+Fixes: ab23a7768739 ("xfs: per-cpu deferred inode inactivation queues")
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Acked-by: Anthony Iliopoulos <ailiop@suse.com>
+
+---
+ fs/xfs/xfs_icache.c | 78 ++++++++++++++++-----------------------------
+ fs/xfs/xfs_icache.h |  1 -
+ fs/xfs/xfs_mount.h  |  6 ++--
+ fs/xfs/xfs_super.c  |  4 +--
+ 4 files changed, 33 insertions(+), 56 deletions(-)
+
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index e541f5c0bc25..30d7454a9b93 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -443,7 +443,7 @@ xfs_inodegc_queue_all(
+ 	int			cpu;
+ 	bool			ret = false;
+ 
+-	for_each_online_cpu(cpu) {
++	for_each_cpu(cpu, &mp->m_inodegc_cpumask) {
+ 		gc = per_cpu_ptr(mp->m_inodegc, cpu);
+ 		if (!llist_empty(&gc->list)) {
+ 			mod_delayed_work_on(cpu, mp->m_inodegc_wq, &gc->work, 0);
+@@ -463,7 +463,7 @@ xfs_inodegc_wait_all(
+ 	int			error = 0;
+ 
+ 	flush_workqueue(mp->m_inodegc_wq);
+-	for_each_online_cpu(cpu) {
++	for_each_cpu(cpu, &mp->m_inodegc_cpumask) {
+ 		struct xfs_inodegc	*gc;
+ 
+ 		gc = per_cpu_ptr(mp->m_inodegc, cpu);
+@@ -1845,9 +1845,17 @@ xfs_inodegc_worker(
+ 						struct xfs_inodegc, work);
+ 	struct llist_node	*node = llist_del_all(&gc->list);
+ 	struct xfs_inode	*ip, *n;
++	struct xfs_mount	*mp = gc->mp;
+ 	unsigned int		nofs_flag;
+ 
+-	ASSERT(gc->cpu == smp_processor_id());
++	/*
++	 * Clear the cpu mask bit and ensure that we have seen the latest
++	 * update of the gc structure associated with this CPU. This matches
++	 * with the release semantics used when setting the cpumask bit in
++	 * xfs_inodegc_queue.
++	 */
++	cpumask_clear_cpu(gc->cpu, &mp->m_inodegc_cpumask);
++	smp_mb__after_atomic();
+ 
+ 	WRITE_ONCE(gc->items, 0);
+ 
+@@ -1862,7 +1870,7 @@ xfs_inodegc_worker(
+ 	nofs_flag = memalloc_nofs_save();
+ 
+ 	ip = llist_entry(node, struct xfs_inode, i_gclist);
+-	trace_xfs_inodegc_worker(ip->i_mount, READ_ONCE(gc->shrinker_hits));
++	trace_xfs_inodegc_worker(mp, READ_ONCE(gc->shrinker_hits));
+ 
+ 	WRITE_ONCE(gc->shrinker_hits, 0);
+ 	llist_for_each_entry_safe(ip, n, node, i_gclist) {
+@@ -2057,6 +2065,7 @@ xfs_inodegc_queue(
+ 	struct xfs_inodegc	*gc;
+ 	int			items;
+ 	unsigned int		shrinker_hits;
++	unsigned int		cpu_nr;
+ 	unsigned long		queue_delay = 1;
+ 
+ 	trace_xfs_inode_set_need_inactive(ip);
+@@ -2064,18 +2073,28 @@ xfs_inodegc_queue(
+ 	ip->i_flags |= XFS_NEED_INACTIVE;
+ 	spin_unlock(&ip->i_flags_lock);
+ 
+-	gc = get_cpu_ptr(mp->m_inodegc);
++	cpu_nr = get_cpu();
++	gc = this_cpu_ptr(mp->m_inodegc);
+ 	llist_add(&ip->i_gclist, &gc->list);
+ 	items = READ_ONCE(gc->items);
+ 	WRITE_ONCE(gc->items, items + 1);
+ 	shrinker_hits = READ_ONCE(gc->shrinker_hits);
+ 
++	/*
++	 * Ensure the list add is always seen by anyone who finds the cpumask
++	 * bit set. This effectively gives the cpumask bit set operation
++	 * release ordering semantics.
++	 */
++	smp_mb__before_atomic();
++	if (!cpumask_test_cpu(cpu_nr, &mp->m_inodegc_cpumask))
++		cpumask_test_and_set_cpu(cpu_nr, &mp->m_inodegc_cpumask);
++
+ 	/*
+ 	 * We queue the work while holding the current CPU so that the work
+ 	 * is scheduled to run on this CPU.
+ 	 */
+ 	if (!xfs_is_inodegc_enabled(mp)) {
+-		put_cpu_ptr(gc);
++		put_cpu();
+ 		return;
+ 	}
+ 
+@@ -2085,7 +2104,7 @@ xfs_inodegc_queue(
+ 	trace_xfs_inodegc_queue(mp, __return_address);
+ 	mod_delayed_work_on(current_cpu(), mp->m_inodegc_wq, &gc->work,
+ 			queue_delay);
+-	put_cpu_ptr(gc);
++	put_cpu();
+ 
+ 	if (xfs_inodegc_want_flush_work(ip, items, shrinker_hits)) {
+ 		trace_xfs_inodegc_throttle(mp, __return_address);
+@@ -2093,47 +2112,6 @@ xfs_inodegc_queue(
+ 	}
+ }
+ 
+-/*
+- * Fold the dead CPU inodegc queue into the current CPUs queue.
+- */
+-void
+-xfs_inodegc_cpu_dead(
+-	struct xfs_mount	*mp,
+-	unsigned int		dead_cpu)
+-{
+-	struct xfs_inodegc	*dead_gc, *gc;
+-	struct llist_node	*first, *last;
+-	unsigned int		count = 0;
+-
+-	dead_gc = per_cpu_ptr(mp->m_inodegc, dead_cpu);
+-	cancel_delayed_work_sync(&dead_gc->work);
+-
+-	if (llist_empty(&dead_gc->list))
+-		return;
+-
+-	first = dead_gc->list.first;
+-	last = first;
+-	while (last->next) {
+-		last = last->next;
+-		count++;
+-	}
+-	dead_gc->list.first = NULL;
+-	dead_gc->items = 0;
+-
+-	/* Add pending work to current CPU */
+-	gc = get_cpu_ptr(mp->m_inodegc);
+-	llist_add_batch(first, last, &gc->list);
+-	count += READ_ONCE(gc->items);
+-	WRITE_ONCE(gc->items, count);
+-
+-	if (xfs_is_inodegc_enabled(mp)) {
+-		trace_xfs_inodegc_queue(mp, __return_address);
+-		mod_delayed_work_on(current_cpu(), mp->m_inodegc_wq, &gc->work,
+-				0);
+-	}
+-	put_cpu_ptr(gc);
+-}
+-
+ /*
+  * We set the inode flag atomically with the radix tree tag.  Once we get tag
+  * lookups on the radix tree, this inode flag can go away.
+@@ -2195,7 +2173,7 @@ xfs_inodegc_shrinker_count(
+ 	if (!xfs_is_inodegc_enabled(mp))
+ 		return 0;
+ 
+-	for_each_online_cpu(cpu) {
++	for_each_cpu(cpu, &mp->m_inodegc_cpumask) {
+ 		gc = per_cpu_ptr(mp->m_inodegc, cpu);
+ 		if (!llist_empty(&gc->list))
+ 			return XFS_INODEGC_SHRINKER_COUNT;
+@@ -2220,7 +2198,7 @@ xfs_inodegc_shrinker_scan(
+ 
+ 	trace_xfs_inodegc_shrinker_scan(mp, sc, __return_address);
+ 
+-	for_each_online_cpu(cpu) {
++	for_each_cpu(cpu, &mp->m_inodegc_cpumask) {
+ 		gc = per_cpu_ptr(mp->m_inodegc, cpu);
+ 		if (!llist_empty(&gc->list)) {
+ 			unsigned int	h = READ_ONCE(gc->shrinker_hits);
+diff --git a/fs/xfs/xfs_icache.h b/fs/xfs/xfs_icache.h
+index 2fa6f2e09d07..905944dafbe5 100644
+--- a/fs/xfs/xfs_icache.h
++++ b/fs/xfs/xfs_icache.h
+@@ -79,7 +79,6 @@ void xfs_inodegc_push(struct xfs_mount *mp);
+ int xfs_inodegc_flush(struct xfs_mount *mp);
+ void xfs_inodegc_stop(struct xfs_mount *mp);
+ void xfs_inodegc_start(struct xfs_mount *mp);
+-void xfs_inodegc_cpu_dead(struct xfs_mount *mp, unsigned int cpu);
+ int xfs_inodegc_register_shrinker(struct xfs_mount *mp);
+ 
+ #endif
+diff --git a/fs/xfs/xfs_mount.h b/fs/xfs/xfs_mount.h
+index a25eece3be2b..f4a8879ba0e9 100644
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -60,6 +60,7 @@ struct xfs_error_cfg {
+  * Per-cpu deferred inode inactivation GC lists.
+  */
+ struct xfs_inodegc {
++	struct xfs_mount	*mp;
+ 	struct llist_head	list;
+ 	struct delayed_work	work;
+ 	int			error;
+@@ -67,9 +68,7 @@ struct xfs_inodegc {
+ 	/* approximate count of inodes in the list */
+ 	unsigned int		items;
+ 	unsigned int		shrinker_hits;
+-#if defined(DEBUG) || defined(XFS_WARN)
+ 	unsigned int		cpu;
+-#endif
+ };
+ 
+ /*
+@@ -249,6 +248,9 @@ typedef struct xfs_mount {
+ 	unsigned int		*m_errortag;
+ 	struct xfs_kobj		m_errortag_kobj;
+ #endif
++
++	/* cpus that have inodes queued for inactivation */
++	struct cpumask		m_inodegc_cpumask;
+ } xfs_mount_t;
+ 
+ #define M_IGEO(mp)		(&(mp)->m_ino_geo)
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index ed29a5022e36..3a91ba3a4c62 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -1135,9 +1135,8 @@ xfs_inodegc_init_percpu(
+ 
+ 	for_each_possible_cpu(cpu) {
+ 		gc = per_cpu_ptr(mp->m_inodegc, cpu);
+-#if defined(DEBUG) || defined(XFS_WARN)
+ 		gc->cpu = cpu;
+-#endif
++		gc->mp = mp;
+ 		init_llist_head(&gc->list);
+ 		gc->items = 0;
+ 		gc->error = 0;
+@@ -2336,7 +2335,6 @@ xfs_cpu_dead(
+ 	spin_lock(&xfs_mount_list_lock);
+ 	list_for_each_entry_safe(mp, n, &xfs_mount_list, m_mount_list) {
+ 		spin_unlock(&xfs_mount_list_lock);
+-		xfs_inodegc_cpu_dead(mp, cpu);
+ 		spin_lock(&xfs_mount_list_lock);
+ 	}
+ 	spin_unlock(&xfs_mount_list_lock);
+-- 
+2.42.0
+
