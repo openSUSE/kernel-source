@@ -1,0 +1,189 @@
+Patch-mainline: v6.6-rc1
+Git-commit: 3cca6b262876d30aae423431e8392d8b97b044fd
+References: jsc#PED-7322
+From: Sean Christopherson <seanjc@google.com>
+Date: Fri, 28 Jul 2023 18:35:17 -0700
+Subject: [PATCH] drm/i915/gvt: Protect gfn hash table with vgpu_lock
+
+Use vgpu_lock instead of KVM's mmu_lock to protect accesses to the hash
+table used to track which gfns are write-protected when shadowing the
+guest's GTT, and hoist the acquisition of vgpu_lock from
+intel_vgpu_page_track_handler() out to its sole caller,
+kvmgt_page_track_write().
+
+This fixes a bug where kvmgt_page_track_write(), which doesn't hold
+kvm->mmu_lock, could race with intel_gvt_page_track_remove() and trigger
+a use-after-free.
+
+Fixing kvmgt_page_track_write() by taking kvm->mmu_lock is not an option
+as mmu_lock is a r/w spinlock, and intel_vgpu_page_track_handler() might
+sleep when acquiring vgpu->cache_lock deep down the callstack:
+
+  intel_vgpu_page_track_handler()
+  |
+  |->  page_track->handler / ppgtt_write_protection_handler()
+       |
+       |-> ppgtt_handle_guest_write_page_table_bytes()
+           |
+           |->  ppgtt_handle_guest_write_page_table()
+                |
+                |-> ppgtt_handle_guest_entry_removal()
+                    |
+                    |-> ppgtt_invalidate_pte()
+                        |
+                        |-> intel_gvt_dma_unmap_guest_page()
+                            |
+                            |-> mutex_lock(&vgpu->cache_lock);
+
+Reviewed-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Yongwei Ma <yongwei.ma@intel.com>
+Reviewed-by: Zhi Wang <zhi.a.wang@intel.com>
+Link: https://lore.kernel.org/r/20230729013535.1070024-12-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ drivers/gpu/drm/i915/gvt/kvmgt.c      | 39 ++++++++++++++++-----------
+ drivers/gpu/drm/i915/gvt/page_track.c | 10 ++-----
+ 2 files changed, 25 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gvt/kvmgt.c b/drivers/gpu/drm/i915/gvt/kvmgt.c
+index 6f52886c4051..034be0655daa 100644
+--- a/drivers/gpu/drm/i915/gvt/kvmgt.c
++++ b/drivers/gpu/drm/i915/gvt/kvmgt.c
+@@ -352,6 +352,8 @@ __kvmgt_protect_table_find(struct intel_vgpu *info, gfn_t gfn)
+ {
+ 	struct kvmgt_pgfn *p, *res = NULL;
+ 
++	lockdep_assert_held(&info->vgpu_lock);
++
+ 	hash_for_each_possible(info->ptable, p, hnode, gfn) {
+ 		if (gfn == p->gfn) {
+ 			res = p;
+@@ -1553,6 +1555,9 @@ int intel_gvt_page_track_add(struct intel_vgpu *info, u64 gfn)
+ 	if (!test_bit(INTEL_VGPU_STATUS_ATTACHED, info->status))
+ 		return -ESRCH;
+ 
++	if (kvmgt_gfn_is_write_protected(info, gfn))
++		return 0;
++
+ 	idx = srcu_read_lock(&kvm->srcu);
+ 	slot = gfn_to_memslot(kvm, gfn);
+ 	if (!slot) {
+@@ -1561,16 +1566,12 @@ int intel_gvt_page_track_add(struct intel_vgpu *info, u64 gfn)
+ 	}
+ 
+ 	write_lock(&kvm->mmu_lock);
+-
+-	if (kvmgt_gfn_is_write_protected(info, gfn))
+-		goto out;
+-
+ 	kvm_slot_page_track_add_page(kvm, slot, gfn, KVM_PAGE_TRACK_WRITE);
+-	kvmgt_protect_table_add(info, gfn);
+-
+-out:
+ 	write_unlock(&kvm->mmu_lock);
++
+ 	srcu_read_unlock(&kvm->srcu, idx);
++
++	kvmgt_protect_table_add(info, gfn);
+ 	return 0;
+ }
+ 
+@@ -1583,6 +1584,9 @@ int intel_gvt_page_track_remove(struct intel_vgpu *info, u64 gfn)
+ 	if (!test_bit(INTEL_VGPU_STATUS_ATTACHED, info->status))
+ 		return -ESRCH;
+ 
++	if (!kvmgt_gfn_is_write_protected(info, gfn))
++		return 0;
++
+ 	idx = srcu_read_lock(&kvm->srcu);
+ 	slot = gfn_to_memslot(kvm, gfn);
+ 	if (!slot) {
+@@ -1591,16 +1595,11 @@ int intel_gvt_page_track_remove(struct intel_vgpu *info, u64 gfn)
+ 	}
+ 
+ 	write_lock(&kvm->mmu_lock);
+-
+-	if (!kvmgt_gfn_is_write_protected(info, gfn))
+-		goto out;
+-
+ 	kvm_slot_page_track_remove_page(kvm, slot, gfn, KVM_PAGE_TRACK_WRITE);
+-	kvmgt_protect_table_del(info, gfn);
+-
+-out:
+ 	write_unlock(&kvm->mmu_lock);
+ 	srcu_read_unlock(&kvm->srcu, idx);
++
++	kvmgt_protect_table_del(info, gfn);
+ 	return 0;
+ }
+ 
+@@ -1611,9 +1610,13 @@ static void kvmgt_page_track_write(struct kvm_vcpu *vcpu, gpa_t gpa,
+ 	struct intel_vgpu *info =
+ 		container_of(node, struct intel_vgpu, track_node);
+ 
++	mutex_lock(&info->vgpu_lock);
++
+ 	if (kvmgt_gfn_is_write_protected(info, gpa_to_gfn(gpa)))
+ 		intel_vgpu_page_track_handler(info, gpa,
+ 						     (void *)val, len);
++
++	mutex_unlock(&info->vgpu_lock);
+ }
+ 
+ static void kvmgt_page_track_flush_slot(struct kvm *kvm,
+@@ -1625,16 +1628,20 @@ static void kvmgt_page_track_flush_slot(struct kvm *kvm,
+ 	struct intel_vgpu *info =
+ 		container_of(node, struct intel_vgpu, track_node);
+ 
+-	write_lock(&kvm->mmu_lock);
++	mutex_lock(&info->vgpu_lock);
++
+ 	for (i = 0; i < slot->npages; i++) {
+ 		gfn = slot->base_gfn + i;
+ 		if (kvmgt_gfn_is_write_protected(info, gfn)) {
++			write_lock(&kvm->mmu_lock);
+ 			kvm_slot_page_track_remove_page(kvm, slot, gfn,
+ 						KVM_PAGE_TRACK_WRITE);
++			write_unlock(&kvm->mmu_lock);
++
+ 			kvmgt_protect_table_del(info, gfn);
+ 		}
+ 	}
+-	write_unlock(&kvm->mmu_lock);
++	mutex_unlock(&info->vgpu_lock);
+ }
+ 
+ void intel_vgpu_detach_regions(struct intel_vgpu *vgpu)
+diff --git a/drivers/gpu/drm/i915/gvt/page_track.c b/drivers/gpu/drm/i915/gvt/page_track.c
+index df34e73cba41..60a65435556d 100644
+--- a/drivers/gpu/drm/i915/gvt/page_track.c
++++ b/drivers/gpu/drm/i915/gvt/page_track.c
+@@ -162,13 +162,9 @@ int intel_vgpu_page_track_handler(struct intel_vgpu *vgpu, u64 gpa,
+ 	struct intel_vgpu_page_track *page_track;
+ 	int ret = 0;
+ 
+-	mutex_lock(&vgpu->vgpu_lock);
+-
+ 	page_track = intel_vgpu_find_page_track(vgpu, gpa >> PAGE_SHIFT);
+-	if (!page_track) {
+-		ret = -ENXIO;
+-		goto out;
+-	}
++	if (!page_track)
++		return -ENXIO;
+ 
+ 	if (unlikely(vgpu->failsafe)) {
+ 		/* Remove write protection to prevent furture traps. */
+@@ -179,7 +175,5 @@ int intel_vgpu_page_track_handler(struct intel_vgpu *vgpu, u64 gpa,
+ 			gvt_err("guest page write error, gpa %llx\n", gpa);
+ 	}
+ 
+-out:
+-	mutex_unlock(&vgpu->vgpu_lock);
+ 	return ret;
+ }
+-- 
+2.35.3
+

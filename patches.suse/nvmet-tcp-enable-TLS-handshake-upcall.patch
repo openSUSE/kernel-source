@@ -1,0 +1,372 @@
+From: Hannes Reinecke <hare@suse.de>
+Date: Thu, 24 Aug 2023 16:39:23 +0200
+Subject: nvmet-tcp: enable TLS handshake upcall
+Patch-mainline: v6.7-rc1
+Git-commit: 675b453e024154dd547921c6e6d5b58747ba7e0e
+References: jsc#PED-6252 jsc#PED-5728 jsc#PED-5062 jsc#PED-3535
+
+TLS handshake is handled in userspace with the netlink tls handshake
+protocol.
+
+The patch adds a function to start the TLS handshake upcall for any
+incoming network connections if the TCP TSAS sectype is set to 'tls1.3'.
+
+A config option NVME_TARGET_TCP_TLS selects whether the TLS handshake
+upcall should be compiled in.  The patch also adds reference counting
+to struct nvmet_tcp_queue to ensure the queue is always valid when the
+the TLS handshake completes.
+
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+Signed-off-by: Keith Busch <kbusch@kernel.org>
+Acked-by: Daniel Wagner <dwagner@suse.de>
+---
+ drivers/nvme/target/Kconfig    |   15 +++
+ drivers/nvme/target/configfs.c |   21 +++++
+ drivers/nvme/target/nvmet.h    |    1 
+ drivers/nvme/target/tcp.c      |  157 +++++++++++++++++++++++++++++++++++++++--
+ 4 files changed, 189 insertions(+), 5 deletions(-)
+
+--- a/drivers/nvme/target/configfs.c
++++ b/drivers/nvme/target/configfs.c
+@@ -15,6 +15,7 @@
+ #ifdef CONFIG_NVME_TARGET_AUTH
+ #include <linux/nvme-auth.h>
+ #endif
++#include <linux/nvme-keyring.h>
+ #include <crypto/hash.h>
+ #include <crypto/kpp.h>
+ 
+@@ -396,6 +397,17 @@ static ssize_t nvmet_addr_tsas_store(str
+ 	return -EINVAL;
+ 
+ found:
++	if (sectype == NVMF_TCP_SECTYPE_TLS13) {
++		if (!IS_ENABLED(CONFIG_NVME_TARGET_TCP_TLS)) {
++			pr_err("TLS is not supported\n");
++			return -EINVAL;
++		}
++		if (!port->keyring) {
++			pr_err("TLS keyring not configured\n");
++			return -EINVAL;
++		}
++	}
++
+ 	nvmet_port_init_tsas_tcp(port, sectype);
+ 	/*
+ 	 * The TLS implementation currently does not support
+@@ -1814,6 +1826,7 @@ static void nvmet_port_release(struct co
+ 	flush_workqueue(nvmet_wq);
+ 	list_del(&port->global_entry);
+ 
++	key_put(port->keyring);
+ 	kfree(port->ana_state);
+ 	kfree(port);
+ }
+@@ -1863,6 +1876,14 @@ static struct config_group *nvmet_ports_
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
++	if (nvme_keyring_id()) {
++		port->keyring = key_lookup(nvme_keyring_id());
++		if (IS_ERR(port->keyring)) {
++			pr_warn("NVMe keyring not available, disabling TLS\n");
++			port->keyring = NULL;
++		}
++	}
++
+ 	for (i = 1; i <= NVMET_MAX_ANAGRPS; i++) {
+ 		if (i == NVMET_DEFAULT_ANA_GRPID)
+ 			port->ana_state[1] = NVME_ANA_OPTIMIZED;
+--- a/drivers/nvme/target/Kconfig
++++ b/drivers/nvme/target/Kconfig
+@@ -84,6 +84,21 @@ config NVME_TARGET_TCP
+ 
+ 	  If unsure, say N.
+ 
++config NVME_TARGET_TCP_TLS
++	bool "NVMe over Fabrics TCP target TLS encryption support"
++	depends on NVME_TARGET_TCP
++	select NVME_COMMON
++	select NVME_KEYRING
++	select NET_HANDSHAKE
++	select KEYS
++	help
++	  Enables TLS encryption for the NVMe TCP target using the netlink handshake API.
++
++	  The TLS handshake daemon is available at
++	  https://github.com/oracle/ktls-utils.
++
++	  If unsure, say N.
++
+ config NVME_TARGET_AUTH
+ 	bool "NVMe over Fabrics In-band Authentication support"
+ 	depends on NVME_TARGET
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@ -158,6 +158,7 @@ struct nvmet_port {
+ 	struct config_group		ana_groups_group;
+ 	struct nvmet_ana_group		ana_default_group;
+ 	enum nvme_ana_state		*ana_state;
++	struct key			*keyring;
+ 	void				*priv;
+ 	bool				enabled;
+ 	int				inline_data_size;
+--- a/drivers/nvme/target/tcp.c
++++ b/drivers/nvme/target/tcp.c
+@@ -8,9 +8,13 @@
+ #include <linux/init.h>
+ #include <linux/slab.h>
+ #include <linux/err.h>
++#include <linux/key.h>
+ #include <linux/nvme-tcp.h>
++#include <linux/nvme-keyring.h>
+ #include <net/sock.h>
+ #include <net/tcp.h>
++#include <net/tls.h>
++#include <net/handshake.h>
+ #include <linux/inet.h>
+ #include <linux/llist.h>
+ #include <crypto/hash.h>
+@@ -66,6 +70,16 @@ device_param_cb(idle_poll_period_usecs,
+ MODULE_PARM_DESC(idle_poll_period_usecs,
+ 		"nvmet tcp io_work poll till idle time period in usecs: Default 0");
+ 
++#ifdef CONFIG_NVME_TARGET_TCP_TLS
++/*
++ * TLS handshake timeout
++ */
++static int tls_handshake_timeout = 10;
++module_param(tls_handshake_timeout, int, 0644);
++MODULE_PARM_DESC(tls_handshake_timeout,
++		 "nvme TLS handshake timeout in seconds (default 10)");
++#endif
++
+ #define NVMET_TCP_RECV_BUDGET		8
+ #define NVMET_TCP_SEND_BUDGET		8
+ #define NVMET_TCP_IO_WORK_BUDGET	64
+@@ -122,8 +136,10 @@ struct nvmet_tcp_cmd {
+ 
+ enum nvmet_tcp_queue_state {
+ 	NVMET_TCP_Q_CONNECTING,
++	NVMET_TCP_Q_TLS_HANDSHAKE,
+ 	NVMET_TCP_Q_LIVE,
+ 	NVMET_TCP_Q_DISCONNECTING,
++	NVMET_TCP_Q_FAILED,
+ };
+ 
+ struct nvmet_tcp_queue {
+@@ -132,6 +148,7 @@ struct nvmet_tcp_queue {
+ 	struct work_struct	io_work;
+ 	struct nvmet_cq		nvme_cq;
+ 	struct nvmet_sq		nvme_sq;
++	struct kref		kref;
+ 
+ 	/* send state */
+ 	struct nvmet_tcp_cmd	*cmds;
+@@ -155,6 +172,10 @@ struct nvmet_tcp_queue {
+ 	struct ahash_request	*snd_hash;
+ 	struct ahash_request	*rcv_hash;
+ 
++	/* TLS state */
++	key_serial_t		tls_pskid;
++	struct delayed_work	tls_handshake_tmo_work;
++
+ 	unsigned long           poll_end;
+ 
+ 	spinlock_t		state_lock;
+@@ -910,8 +931,10 @@ static int nvmet_tcp_handle_icreq(struct
+ 	iov.iov_base = icresp;
+ 	iov.iov_len = sizeof(*icresp);
+ 	ret = kernel_sendmsg(queue->sock, &msg, &iov, 1, iov.iov_len);
+-	if (ret < 0)
++	if (ret < 0) {
++		queue->state = NVMET_TCP_Q_FAILED;
+ 		return ret; /* queue removal will cleanup */
++	}
+ 
+ 	queue->state = NVMET_TCP_Q_LIVE;
+ 	nvmet_prepare_receive_pdu(queue);
+@@ -1280,12 +1303,25 @@ static int nvmet_tcp_try_recv(struct nvm
+ 	return ret;
+ }
+ 
++static void nvmet_tcp_release_queue(struct kref *kref)
++{
++	struct nvmet_tcp_queue *queue =
++		container_of(kref, struct nvmet_tcp_queue, kref);
++
++	WARN_ON(queue->state != NVMET_TCP_Q_DISCONNECTING);
++	queue_work(nvmet_wq, &queue->release_work);
++}
++
+ static void nvmet_tcp_schedule_release_queue(struct nvmet_tcp_queue *queue)
+ {
+ 	spin_lock(&queue->state_lock);
++	if (queue->state == NVMET_TCP_Q_TLS_HANDSHAKE) {
++		/* Socket closed during handshake */
++		tls_handshake_cancel(queue->sock->sk);
++	}
+ 	if (queue->state != NVMET_TCP_Q_DISCONNECTING) {
+ 		queue->state = NVMET_TCP_Q_DISCONNECTING;
+-		queue_work(nvmet_wq, &queue->release_work);
++		kref_put(&queue->kref, nvmet_tcp_release_queue);
+ 	}
+ 	spin_unlock(&queue->state_lock);
+ }
+@@ -1482,6 +1518,7 @@ static void nvmet_tcp_release_queue_work
+ 	mutex_unlock(&nvmet_tcp_queue_mutex);
+ 
+ 	nvmet_tcp_restore_socket_callbacks(queue);
++	cancel_delayed_work_sync(&queue->tls_handshake_tmo_work);
+ 	cancel_work_sync(&queue->io_work);
+ 	/* stop accepting incoming data */
+ 	queue->rcv_state = NVMET_TCP_RECV_ERR;
+@@ -1509,8 +1546,13 @@ static void nvmet_tcp_data_ready(struct
+ 
+ 	read_lock_bh(&sk->sk_callback_lock);
+ 	queue = sk->sk_user_data;
+-	if (likely(queue))
+-		queue_work_on(queue_cpu(queue), nvmet_tcp_wq, &queue->io_work);
++	if (likely(queue)) {
++		if (queue->data_ready)
++			queue->data_ready(sk);
++		if (queue->state != NVMET_TCP_Q_TLS_HANDSHAKE)
++			queue_work_on(queue_cpu(queue), nvmet_tcp_wq,
++				      &queue->io_work);
++	}
+ 	read_unlock_bh(&sk->sk_callback_lock);
+ }
+ 
+@@ -1618,6 +1660,87 @@ static int nvmet_tcp_set_queue_sock(stru
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_NVME_TARGET_TCP_TLS
++static void nvmet_tcp_tls_handshake_done(void *data, int status,
++					 key_serial_t peerid)
++{
++	struct nvmet_tcp_queue *queue = data;
++
++	pr_debug("queue %d: TLS handshake done, key %x, status %d\n",
++		 queue->idx, peerid, status);
++	spin_lock_bh(&queue->state_lock);
++	if (WARN_ON(queue->state != NVMET_TCP_Q_TLS_HANDSHAKE)) {
++		spin_unlock_bh(&queue->state_lock);
++		return;
++	}
++	if (!status) {
++		queue->tls_pskid = peerid;
++		queue->state = NVMET_TCP_Q_CONNECTING;
++	} else
++		queue->state = NVMET_TCP_Q_FAILED;
++	spin_unlock_bh(&queue->state_lock);
++
++	cancel_delayed_work_sync(&queue->tls_handshake_tmo_work);
++	if (status)
++		nvmet_tcp_schedule_release_queue(queue);
++	else
++		nvmet_tcp_set_queue_sock(queue);
++	kref_put(&queue->kref, nvmet_tcp_release_queue);
++}
++
++static void nvmet_tcp_tls_handshake_timeout(struct work_struct *w)
++{
++	struct nvmet_tcp_queue *queue = container_of(to_delayed_work(w),
++			struct nvmet_tcp_queue, tls_handshake_tmo_work);
++
++	pr_warn("queue %d: TLS handshake timeout\n", queue->idx);
++	/*
++	 * If tls_handshake_cancel() fails we've lost the race with
++	 * nvmet_tcp_tls_handshake_done() */
++	if (!tls_handshake_cancel(queue->sock->sk))
++		return;
++	spin_lock_bh(&queue->state_lock);
++	if (WARN_ON(queue->state != NVMET_TCP_Q_TLS_HANDSHAKE)) {
++		spin_unlock_bh(&queue->state_lock);
++		return;
++	}
++	queue->state = NVMET_TCP_Q_FAILED;
++	spin_unlock_bh(&queue->state_lock);
++	nvmet_tcp_schedule_release_queue(queue);
++	kref_put(&queue->kref, nvmet_tcp_release_queue);
++}
++
++static int nvmet_tcp_tls_handshake(struct nvmet_tcp_queue *queue)
++{
++	int ret = -EOPNOTSUPP;
++	struct tls_handshake_args args;
++
++	if (queue->state != NVMET_TCP_Q_TLS_HANDSHAKE) {
++		pr_warn("cannot start TLS in state %d\n", queue->state);
++		return -EINVAL;
++	}
++
++	kref_get(&queue->kref);
++	pr_debug("queue %d: TLS ServerHello\n", queue->idx);
++	memset(&args, 0, sizeof(args));
++	args.ta_sock = queue->sock;
++	args.ta_done = nvmet_tcp_tls_handshake_done;
++	args.ta_data = queue;
++	args.ta_keyring = key_serial(queue->port->nport->keyring);
++	args.ta_timeout_ms = tls_handshake_timeout * 1000;
++
++	ret = tls_server_hello_psk(&args, GFP_KERNEL);
++	if (ret) {
++		kref_put(&queue->kref, nvmet_tcp_release_queue);
++		pr_err("failed to start TLS, err=%d\n", ret);
++	} else {
++		queue_delayed_work(nvmet_wq, &queue->tls_handshake_tmo_work,
++				   tls_handshake_timeout * HZ);
++	}
++	return ret;
++}
++#endif
++
+ static void nvmet_tcp_alloc_queue(struct nvmet_tcp_port *port,
+ 		struct socket *newsock)
+ {
+@@ -1633,11 +1756,16 @@ static void nvmet_tcp_alloc_queue(struct
+ 
+ 	INIT_WORK(&queue->release_work, nvmet_tcp_release_queue_work);
+ 	INIT_WORK(&queue->io_work, nvmet_tcp_io_work);
++	kref_init(&queue->kref);
+ 	queue->sock = newsock;
+ 	queue->port = port;
+ 	queue->nr_cmds = 0;
+ 	spin_lock_init(&queue->state_lock);
+-	queue->state = NVMET_TCP_Q_CONNECTING;
++	if (queue->port->nport->disc_addr.tsas.tcp.sectype ==
++	    NVMF_TCP_SECTYPE_TLS13)
++		queue->state = NVMET_TCP_Q_TLS_HANDSHAKE;
++	else
++		queue->state = NVMET_TCP_Q_CONNECTING;
+ 	INIT_LIST_HEAD(&queue->free_list);
+ 	init_llist_head(&queue->resp_list);
+ 	INIT_LIST_HEAD(&queue->resp_send_list);
+@@ -1668,6 +1796,25 @@ static void nvmet_tcp_alloc_queue(struct
+ 	list_add_tail(&queue->queue_list, &nvmet_tcp_queue_list);
+ 	mutex_unlock(&nvmet_tcp_queue_mutex);
+ 
++#ifdef CONFIG_NVME_TARGET_TCP_TLS
++	INIT_DELAYED_WORK(&queue->tls_handshake_tmo_work,
++			  nvmet_tcp_tls_handshake_timeout);
++	if (queue->state == NVMET_TCP_Q_TLS_HANDSHAKE) {
++		struct sock *sk = queue->sock->sk;
++
++		/* Restore the default callbacks before starting upcall */
++		read_lock_bh(&sk->sk_callback_lock);
++		sk->sk_user_data = NULL;
++		sk->sk_data_ready = port->data_ready;
++		read_unlock_bh(&sk->sk_callback_lock);
++		if (!nvmet_tcp_tls_handshake(queue))
++			return;
++
++		/* TLS handshake failed, terminate the connection */
++		goto out_destroy_sq;
++	}
++#endif
++
+ 	ret = nvmet_tcp_set_queue_sock(queue);
+ 	if (ret)
+ 		goto out_destroy_sq;
