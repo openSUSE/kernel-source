@@ -216,8 +216,8 @@ remotes = (
     Head(RepoURL("jj/linux-apparmor.git"), "apparmor-next"),
     Head(RepoURL("netfilter/nf.git")),
     Head(RepoURL("netfilter/nf-next.git")),
-    Head(RepoURL("horms/ipvs.git")),
-    Head(RepoURL("horms/ipvs-next.git")),
+    Head(RepoURL("horms/ipvs.git"), "main"),
+    Head(RepoURL("horms/ipvs-next.git"), "main"),
     Head(RepoURL("klassert/ipsec.git")),
     Head(RepoURL("klassert/ipsec-next.git")),
     Head(RepoURL("kvalo/wireless-drivers-next.git")),
@@ -268,6 +268,7 @@ remotes = (
     Head(RepoURL("soc/soc.git"), "for-next"),
     Head(RepoURL("https://gitlab.freedesktop.org/drm/tegra.git"), "for-next"),
     Head(RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/thierry.reding/linux-pwm.git"), "for-next"),
+    Head(RepoURL("kvmarm/kvmarm.git"), "next"),
 )
 
 
