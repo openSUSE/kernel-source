@@ -3,141 +3,42 @@
 # Copyright (C) 2007, 2008, 2009, 2010 Red Hat Inc.
 # Author: Will Woods <wwoods@redhat.com>
 #
-# This program is free software; you can redistribute it and/or modify it
-# under the terms of the GNU General Public License as published by the
-# Free Software Foundation; either version 2 of the License, or (at your
-# option) any later version.  See http://www.gnu.org/copyleft/gpl.html for
-# the full text of the license.
+# This work is licensed under the GNU GPLv2 or later.
+# See the COPYING file in the top-level directory.
 
 import collections
 import getpass
 import locale
 from logging import getLogger
+import mimetypes
 import os
 import sys
+import urllib.parse
 
 from io import BytesIO
 
-# pylint: disable=import-error
-if sys.version_info[0] >= 3:
-    # pylint: disable=no-name-in-module
-    from configparser import SafeConfigParser
-    from http.cookiejar import LoadError, MozillaCookieJar
-    from urllib.parse import urlparse, parse_qsl
-    from xmlrpc.client import Binary, Fault
-else:
-    from ConfigParser import SafeConfigParser
-    from cookielib import LoadError, MozillaCookieJar
-    from urlparse import urlparse, parse_qsl
-    from xmlrpclib import Binary, Fault
-# pylint: enable=import-error
-
-
+from ._authfiles import _BugzillaRCFile, _BugzillaTokenCache
 from .apiversion import __version__
-from .bug import Bug, User
-from .transport import BugzillaError, _BugzillaServerProxy, _RequestsTransport
+from ._backendrest import _BackendREST
+from ._backendxmlrpc import _BackendXMLRPC
+from .bug import Bug, Group, User
+from .exceptions import BugzillaError
+from ._rhconverters import _RHBugzillaConverters
+from ._session import _BugzillaSession
+from ._util import listify
 
 
 log = getLogger(__name__)
 
-mimemagic = None
-
-
-def _detect_filetype(fname):
-    global mimemagic
-
-    if mimemagic is None:
-        try:
-            # pylint: disable=import-error
-            import magic
-            mimemagic = magic.open(getattr(magic, "MAGIC_MIME_TYPE", 16))
-            mimemagic.load()
-        except ImportError as e:
-            log.debug("Could not load python-magic: %s", e)
-            mimemagic = None
-    if not mimemagic:
-        return None
-
-    if not os.path.isabs(fname):
-        return None
-
-    try:
-        return mimemagic.file(fname)
-    except Exception as e:
-        log.debug("Could not detect content_type: %s", e)
-    return None
-
 
 def _nested_update(d, u):
     # Helper for nested dict update()
-    # https://stackoverflow.com/questions/3232943/update-value-of-a-nested-dictionary-of-varying-depth
     for k, v in list(u.items()):
-        if isinstance(v, collections.Mapping):
+        if isinstance(v, collections.abc.Mapping):
             d[k] = _nested_update(d.get(k, {}), v)
         else:
             d[k] = v
     return d
-
-
-def _default_auth_location(filename):
-    """
-    Determine auth location for filename, like 'bugzillacookies'. If
-    old style ~/.bugzillacookies exists, we use that, otherwise we
-    use ~/.cache/python-bugzilla/bugzillacookies. Same for bugzillatoken
-    """
-    homepath = os.path.expanduser("~/.%s" % filename)
-    xdgpath = os.path.expanduser("~/.cache/python-bugzilla/%s" % filename)
-    if os.path.exists(xdgpath):
-        return xdgpath
-    if os.path.exists(homepath):
-        return homepath
-
-    if not os.path.exists(os.path.dirname(xdgpath)):
-        os.makedirs(os.path.dirname(xdgpath), 0o700)
-    return xdgpath
-
-
-def _build_cookiejar(cookiefile):
-    cj = MozillaCookieJar(cookiefile)
-    if cookiefile is None:
-        return cj
-    if not os.path.exists(cookiefile):
-        # Make sure a new file has correct permissions
-        open(cookiefile, 'a').close()
-        os.chmod(cookiefile, 0o600)
-        cj.save()
-        return cj
-
-    try:
-        cj.load()
-        return cj
-    except LoadError:
-        raise BugzillaError("cookiefile=%s not in Mozilla format" %
-                            cookiefile)
-
-
-_default_configpaths = [
-    '/etc/bugzillarc',
-    '~/.bugzillarc',
-    '~/.config/python-bugzilla/bugzillarc',
-]
-
-
-def _open_bugzillarc(configpaths=-1):
-    if configpaths == -1:
-        configpaths = _default_configpaths[:]
-
-    # pylint: disable=protected-access
-    configpaths = [os.path.expanduser(p) for p in
-                   Bugzilla._listify(configpaths)]
-    # pylint: enable=protected-access
-    cfg = SafeConfigParser()
-    read_files = cfg.read(configpaths)
-    if not read_files:
-        return
-
-    log.info("Found bugzillarc files: %s", read_files)
-    return cfg
 
 
 class _FieldAlias(object):
@@ -171,6 +72,8 @@ class _BugzillaAPICache(object):
         self.products = []
         self.component_names = {}
         self.bugfields = []
+        self.version_raw = None
+        self.version_parsed = (0, 0)
 
 
 class Bugzilla(object):
@@ -183,11 +86,11 @@ class Bugzilla(object):
         bzapi = Bugzilla("http://bugzilla.example.com")
 
     If you have previously logged into that URL, and have cached login
-    cookies/tokens, you will automatically be logged in. Otherwise to
+    tokens, you will automatically be logged in. Otherwise to
     log in, you can either pass auth options to __init__, or call a login
     helper like interactive_login().
 
-    If you are not logged in, you won be able to access restricted data like
+    If you are not logged in, you won't be able to access restricted data like
     user email, or perform write actions like bug create/update. But simple
     querys will work correctly.
 
@@ -197,29 +100,23 @@ class Bugzilla(object):
     Another way to specify auth credentials is via a 'bugzillarc' file.
     See readconfig() documentation for details.
     """
-
-    # bugzilla version that the class is targeting. filled in by
-    # subclasses
-    bz_ver_major = 0
-    bz_ver_minor = 0
-
     @staticmethod
     def url_to_query(url):
-        '''
+        """
         Given a big huge bugzilla query URL, returns a query dict that can
         be passed along to the Bugzilla.query() method.
-        '''
+        """
         q = {}
 
         # pylint: disable=unpacking-non-sequence
-        (ignore, ignore, path,
-         ignore, query, ignore) = urlparse(url)
+        (ignore1, ignore2, path,
+         ignore, query, ignore3) = urllib.parse.urlparse(url)
 
         base = os.path.basename(path)
         if base not in ('buglist.cgi', 'query.cgi'):
             return {}
 
-        for (k, v) in parse_qsl(query):
+        for (k, v) in urllib.parse.parse_qsl(query):
             if k not in q:
                 q[k] = v
             elif isinstance(q[k], list):
@@ -238,30 +135,46 @@ class Bugzilla(object):
         return q
 
     @staticmethod
-    def fix_url(url):
+    def fix_url(url, force_rest=False):
         """
         Turn passed url into a bugzilla XMLRPC web url
+
+        :param force_rest: If True, generate a REST API url
         """
-        if '://' not in url:
-            log.debug('No scheme given for url, assuming https')
-            url = 'https://' + url
-        if url.count('/') < 3:
-            log.debug('No path given for url, assuming /xmlrpc.cgi')
-            url = url + '/xmlrpc.cgi'
-        return url
+        (scheme, netloc, path,
+         params, query, fragment) = urllib.parse.urlparse(url)
+        if not scheme:
+            scheme = 'https'
+
+        if path and not netloc:
+            netloc = path.split("/", 1)[0]
+            path = "/".join(path.split("/")[1:]) or None
+
+        if not path:
+            path = 'xmlrpc.cgi'
+            if force_rest:
+                path = "rest/"
+
+        newurl = urllib.parse.urlunparse(
+            (scheme, netloc, path, params, query, fragment))
+        return newurl
 
     @staticmethod
-    def _listify(val):
-        if val is None:
-            return val
-        if isinstance(val, list):
-            return val
-        return [val]
+    def get_rcfile_default_url():
+        """
+        Helper to check all the default bugzillarc file paths for
+        a [DEFAULT] url=X section, and if found, return it.
+        """
+        configpaths = _BugzillaRCFile.get_default_configpaths()
+        rcfile = _BugzillaRCFile()
+        rcfile.set_configpaths(configpaths)
+        return rcfile.get_default_url()
 
 
     def __init__(self, url=-1, user=None, password=None, cookiefile=-1,
                  sslverify=True, tokenfile=-1, use_creds=True, api_key=None,
-                 cert=None, authtype=None):
+                 cert=None, configpaths=-1,
+                 force_rest=False, force_xmlrpc=False, requests_session=None):
         """
         :param url: The bugzilla instance URL, which we will connect
             to immediately. Most users will want to specify this at
@@ -271,25 +184,29 @@ class Bugzilla(object):
         :param password: optional password for the connecting user
         :param cert: optional certificate file for client side certificate
             authentication
-        :param cookiefile: Location to cache the login session cookies so you
-            don't have to keep specifying username/password. Bugzilla 5+ will
-            use tokens instead of cookies.
-            If -1, use the default path. If None, don't use or save
-            any cookiefile.
+        :param cookiefile: Deprecated, raises an error if not -1 or None
         :param sslverify: Set this to False to skip SSL hostname and CA
             validation checks, like out of date certificate
         :param tokenfile: Location to cache the API login token so youi
             don't have to keep specifying username/password.
             If -1, use the default path. If None, don't use
             or save any tokenfile.
-        :param use_creds: If False, this disables cookiefile, tokenfile,
-            and any bugzillarc reading. This overwrites any tokenfile
-            or cookiefile settings
+        :param use_creds: If False, this disables tokenfile
+            and configpaths by default. This is a convenience option to
+            unset those values at init time. If those values are later
+            changed, they may be used for future operations.
         :param sslverify: Maps to 'requests' sslverify parameter. Set to
             False to disable SSL verification, but it can also be a path
             to file or directory for custom certs.
-        :param api_key: A bugzilla
-        :param authtype: Authentication type: empty or 'basic'
+        :param api_key: A bugzilla5+ API key
+        :param configpaths: A list of possible bugzillarc locations.
+        :param force_rest: Force use of the REST API
+        :param force_xmlrpc: Force use of the XMLRPC API. If neither force_X
+            parameter are specified, heuristics will be used to determine
+            which API to use, with XMLRPC preferred for back compatability.
+        :param requests_session: An optional requests.Session object the
+            API will use to contact the remote bugzilla instance. This
+            way the API user can set up whatever auth bits they may need.
         """
         if url == -1:
             raise TypeError("Specify a valid bugzilla url, or pass url=None")
@@ -298,158 +215,177 @@ class Bugzilla(object):
         self.user = user or ''
         self.password = password or ''
         self.api_key = api_key
-        self.cert = cert or ''
+        self.cert = cert or None
         self.url = ''
-        self.authtype = authtype or ''
 
-        self._proxy = None
-        self._transport = None
-        self._cookiejar = None
+        self._backend = None
+        self._session = None
+        self._user_requests_session = requests_session
         self._sslverify = sslverify
         self._cache = _BugzillaAPICache()
         self._bug_autorefresh = False
+        self._is_redhat_bugzilla = False
 
-        self._field_aliases = []
-        self._init_field_aliases()
+        self._rcfile = _BugzillaRCFile()
+        self._tokencache = _BugzillaTokenCache()
 
-        self.configpath = _default_configpaths[:]
+        self._force_rest = force_rest
+        self._force_xmlrpc = force_xmlrpc
+
+        if cookiefile not in [None, -1]:
+            raise TypeError("cookiefile is deprecated, don't pass any value.")
+
         if not use_creds:
-            cookiefile = None
             tokenfile = None
-            self.configpath = []
+            configpaths = []
 
-        if cookiefile == -1:
-            cookiefile = _default_auth_location("bugzillacookies")
         if tokenfile == -1:
-            tokenfile = _default_auth_location("bugzillatoken")
-        log.debug("Using tokenfile=%s", tokenfile)
-        self.cookiefile = cookiefile
-        self.tokenfile = tokenfile
+            tokenfile = self._tokencache.get_default_path()
+        if configpaths == -1:
+            configpaths = _BugzillaRCFile.get_default_configpaths()
+
+        self._settokenfile(tokenfile)
+        self._setconfigpath(configpaths)
 
         if url:
             self.connect(url)
-            self._init_class_from_url()
-        self._init_class_state()
+
+    def _detect_is_redhat_bugzilla(self):
+        if self._is_redhat_bugzilla:
+            return True
+
+        match = ".redhat.com"
+        if match in self.url:
+            log.info("Using RHBugzilla for URL containing %s", match)
+            return True
+
+        return False
 
     def _init_class_from_url(self):
         """
         Detect if we should use RHBugzilla class, and if so, set it
         """
-        from bugzilla import RHBugzilla
-        if isinstance(self, RHBugzilla):
+        from .oldclasses import RHBugzilla  # pylint: disable=cyclic-import
+
+        if not self._detect_is_redhat_bugzilla():
             return
 
-        c = None
-        if "bugzilla.redhat.com" in self.url:
-            log.info("Using RHBugzilla for URL containing bugzilla.redhat.com")
-            c = RHBugzilla
-        else:
-            try:
-                extensions = self._proxy.Bugzilla.extensions()
-                if "RedHat" in extensions.get('extensions', {}):
-                    log.info("Found RedHat bugzilla extension, "
-                        "using RHBugzilla")
-                    c = RHBugzilla
-            except Fault:
-                log.debug("Failed to fetch bugzilla extensions", exc_info=True)
+        self._is_redhat_bugzilla = True
+        if self.__class__ == Bugzilla:
+            # Overriding the class doesn't have any functional effect,
+            # but we continue to do it for API back compat incase anyone
+            # is doing any class comparison. We should drop this in the future
+            self.__class__ = RHBugzilla
 
-        if not c:
-            return
-
-        self.__class__ = c
-
-    def _init_class_state(self):
-        """
-        Hook for subclasses to do any __init__ time setup
-        """
-        pass
-
-    def _init_field_aliases(self):
+    def _get_field_aliases(self):
         # List of field aliases. Maps old style RHBZ parameter
         # names to actual upstream values. Used for createbug() and
         # query include_fields at least.
-        self._add_field_alias('summary', 'short_desc')
-        self._add_field_alias('description', 'comment')
-        self._add_field_alias('platform', 'rep_platform')
-        self._add_field_alias('severity', 'bug_severity')
-        self._add_field_alias('status', 'bug_status')
-        self._add_field_alias('id', 'bug_id')
-        self._add_field_alias('blocks', 'blockedby')
-        self._add_field_alias('blocks', 'blocked')
-        self._add_field_alias('depends_on', 'dependson')
-        self._add_field_alias('creator', 'reporter')
-        self._add_field_alias('url', 'bug_file_loc')
-        self._add_field_alias('dupe_of', 'dupe_id')
-        self._add_field_alias('dupe_of', 'dup_id')
-        self._add_field_alias('comments', 'longdescs')
-        self._add_field_alias('creation_time', 'opendate')
-        self._add_field_alias('creation_time', 'creation_ts')
-        self._add_field_alias('whiteboard', 'status_whiteboard')
-        self._add_field_alias('last_change_time', 'delta_ts')
+        ret = []
+
+        def _add(*args, **kwargs):
+            ret.append(_FieldAlias(*args, **kwargs))
+
+        def _add_both(newname, origname):
+            _add(newname, origname, is_api=False)
+            _add(origname, newname, is_bug=False)
+
+        _add('summary', 'short_desc')
+        _add('description', 'comment')
+        _add('platform', 'rep_platform')
+        _add('severity', 'bug_severity')
+        _add('status', 'bug_status')
+        _add('id', 'bug_id')
+        _add('blocks', 'blockedby')
+        _add('blocks', 'blocked')
+        _add('depends_on', 'dependson')
+        _add('creator', 'reporter')
+        _add('url', 'bug_file_loc')
+        _add('dupe_of', 'dupe_id')
+        _add('dupe_of', 'dup_id')
+        _add('comments', 'longdescs')
+        _add('creation_time', 'opendate')
+        _add('creation_time', 'creation_ts')
+        _add('whiteboard', 'status_whiteboard')
+        _add('last_change_time', 'delta_ts')
+
+        if self._is_redhat_bugzilla:
+            _add_both('fixed_in', 'cf_fixed_in')
+            _add_both('qa_whiteboard', 'cf_qa_whiteboard')
+            _add_both('devel_whiteboard', 'cf_devel_whiteboard')
+            _add_both('internal_whiteboard', 'cf_internal_whiteboard')
+
+            _add('component', 'components', is_bug=False)
+            _add('version', 'versions', is_bug=False)
+            # Yes, sub_components is the field name the API expects
+            _add('sub_components', 'sub_component', is_bug=False)
+            # flags format isn't exactly the same but it's the closest approx
+            _add('flags', 'flag_types')
+
+        return ret
 
     def _get_user_agent(self):
         return 'python-bugzilla/%s' % __version__
     user_agent = property(_get_user_agent)
+
+    @property
+    def bz_ver_major(self):
+        return self._cache.version_parsed[0]
+
+    @property
+    def bz_ver_minor(self):
+        return self._cache.version_parsed[1]
 
 
     ###################
     # Private helpers #
     ###################
 
-    def _check_version(self, major, minor):
+    def _get_version(self):
         """
-        Check if the detected bugzilla version is >= passed major/minor pair.
+        Return version number as a float
         """
-        if major < self.bz_ver_major:
-            return True
-        if (major == self.bz_ver_major and minor <= self.bz_ver_minor):
-            return True
-        return False
-
-    def _add_field_alias(self, *args, **kwargs):
-        self._field_aliases.append(_FieldAlias(*args, **kwargs))
+        return float("%d.%d" % (self.bz_ver_major, self.bz_ver_minor))
 
     def _get_bug_aliases(self):
         return [(f.newname, f.oldname)
-                for f in self._field_aliases if f.is_bug]
+                for f in self._get_field_aliases() if f.is_bug]
 
     def _get_api_aliases(self):
         return [(f.newname, f.oldname)
-                for f in self._field_aliases if f.is_api]
+                for f in self._get_field_aliases() if f.is_api]
 
 
-    ###################
-    # Cookie handling #
-    ###################
+    #################
+    # Auth handling #
+    #################
 
     def _getcookiefile(self):
-        '''cookiefile is the file that bugzilla session cookies are loaded
-        and saved from.
-        '''
-        return self._cookiejar.filename
+        return None
+    cookiefile = property(_getcookiefile)
 
-    def _delcookiefile(self):
-        self._cookiejar = None
+    def _gettokenfile(self):
+        return self._tokencache.get_filename()
+    def _settokenfile(self, filename):
+        self._tokencache.set_filename(filename)
+    def _deltokenfile(self):
+        self._settokenfile(None)
+    tokenfile = property(_gettokenfile, _settokenfile, _deltokenfile)
 
-    def _setcookiefile(self, cookiefile):
-        if (self._cookiejar and cookiefile == self._cookiejar.filename):
-            return
-
-        if self._proxy is not None:
-            raise RuntimeError("Can't set cookies with an open connection, "
-                               "disconnect() first.")
-
-        log.debug("Using cookiefile=%s", cookiefile)
-        self._cookiejar = _build_cookiejar(cookiefile)
-
-    cookiefile = property(_getcookiefile, _setcookiefile, _delcookiefile)
+    def _getconfigpath(self):
+        return self._rcfile.get_configpaths()
+    def _setconfigpath(self, configpaths):
+        return self._rcfile.set_configpaths(configpaths)
+    def _delconfigpath(self):
+        return self._rcfile.set_configpaths(None)
+    configpath = property(_getconfigpath, _setconfigpath, _delconfigpath)
 
 
     #############################
     # Login/connection handling #
     #############################
 
-    def readconfig(self, configpath=None):
+    def readconfig(self, configpath=None, overwrite=True):
         """
         :param configpath: Optional bugzillarc path to read, instead of
             the default list.
@@ -478,55 +414,73 @@ class Bugzilla(object):
 
         Be sure to set appropriate permissions on bugzillarc if you choose to
         store your password in it!
+
+        :param overwrite: If True, bugzillarc will clobber any already
+            set self.user/password/api_key/cert value.
         """
-        cfg = _open_bugzillarc(configpath or self.configpath)
-        if not cfg:
-            return
+        if configpath:
+            self._setconfigpath(configpath)
+        data = self._rcfile.parse(self.url)
 
-        section = ""
-        log.debug("bugzillarc: Searching for config section matching %s",
-            self.url)
-        for s in sorted(cfg.sections()):
-            # Substring match - prefer the longest match found
-            if s in self.url:
-                log.debug("bugzillarc: Found matching section: %s", s)
-                section = s
-
-        if not section:
-            log.debug("bugzillarc: No section found")
-            return
-
-        for key, val in cfg.items(section):
-            if key == "api_key":
+        for key, val in data.items():
+            if key == "api_key" and (overwrite or not self.api_key):
                 log.debug("bugzillarc: setting api_key")
                 self.api_key = val
-            elif key == "user":
+            elif key == "user" and (overwrite or not self.user):
                 log.debug("bugzillarc: setting user=%s", val)
                 self.user = val
-            elif key == "password":
+            elif key == "password" and (overwrite or not self.password):
                 log.debug("bugzillarc: setting password")
                 self.password = val
-            elif key == "cert":
+            elif key == "cert" and (overwrite or not self.cert):
                 log.debug("bugzillarc: setting cert")
                 self.cert = val
-            elif key == "authtype":
-                log.debug("bugzillarc: setting authtype=%s", val)
-                self.authtype = val
             else:
                 log.debug("bugzillarc: unknown key=%s", key)
 
     def _set_bz_version(self, version):
+        self._cache.version_raw = version
         try:
-            self.bz_ver_major, self.bz_ver_minor = [
-                int(i) for i in version.split(".")[0:2]]
+            major, minor = [int(i) for i in version.split(".")[0:2]]
         except Exception:
             log.debug("version doesn't match expected format X.Y.Z, "
                     "assuming 5.0", exc_info=True)
-            self.bz_ver_major = 5
-            self.bz_ver_minor = 0
+            major = 5
+            minor = 0
+        self._cache.version_parsed = (major, minor)
+
+    def _get_backend_class(self, url):  # pragma: no cover
+        # This is a hook for the test suite to do some mock hackery
+        if self._force_rest and self._force_xmlrpc:
+            raise BugzillaError(
+                "Cannot specify both force_rest and force_xmlrpc")
+
+        xmlurl = self.fix_url(url)
+        if self._force_xmlrpc:
+            return _BackendXMLRPC, xmlurl
+
+        resturl = self.fix_url(url, force_rest=self._force_rest)
+        if self._force_rest:
+            return _BackendREST, resturl
+
+        # Simple heuristic if the original url has a path in it
+        if "/xmlrpc" in url:
+            return _BackendXMLRPC, xmlurl
+        if "/rest" in url:
+            return _BackendREST, resturl
+
+        # We were passed something like bugzilla.example.com but we
+        # aren't sure which method to use, try probing
+        if _BackendXMLRPC.probe(xmlurl):
+            return _BackendXMLRPC, xmlurl
+        if _BackendREST.probe(resturl):
+            return _BackendREST, resturl
+
+        # Otherwise fallback to XMLRPC default and let it fail
+        return _BackendXMLRPC, xmlurl
 
     def connect(self, url=None):
-        '''
+        """
         Connect to the bugzilla instance with the given url. This is
         called by __init__ if a URL is passed. Or it can be called manually
         at any time with a passed URL.
@@ -536,57 +490,87 @@ class Bugzilla(object):
 
         If 'user' and 'password' are both set, we'll run login(). Otherwise
         you'll have to login() yourself before some methods will work.
-        '''
-        if self._transport:
+        """
+        if self._session:
             self.disconnect()
 
-        if url is None and self.url:
-            url = self.url
-        url = self.fix_url(url)
+        url = url or self.url
+        backendclass, newurl = self._get_backend_class(url)
+        if url != newurl:
+            log.debug("Converted url=%s to fixed url=%s", url, newurl)
+        self.url = newurl
+        log.debug("Connecting with URL %s", self.url)
 
-        self.url = url
         # we've changed URLs - reload config
-        self.readconfig()
+        self.readconfig(overwrite=False)
 
-        self._transport = _RequestsTransport(
-            url, self._cookiejar, sslverify=self._sslverify, cert=self.cert)
-        if self.authtype == 'basic' and self.user and self.password:
-            self._transport.session.auth = (self.user, self.password)
-        self._transport.user_agent = self.user_agent
-        self._proxy = _BugzillaServerProxy(url, self.tokenfile,
-            self._transport)
+        # Detect if connecting to redhat bugzilla
+        self._init_class_from_url()
 
-        if (self.authtype == '' and self.user and self.password):
+        self._session = _BugzillaSession(self.url, self.user_agent,
+                sslverify=self._sslverify,
+                cert=self.cert,
+                tokencache=self._tokencache,
+                api_key=self.api_key,
+                is_redhat_bugzilla=self._is_redhat_bugzilla,
+                requests_session=self._user_requests_session)
+        self._backend = backendclass(self.url, self._session)
+
+        if (self.user and self.password):
             log.info("user and password present - doing login()")
             self.login()
 
         if self.api_key:
             log.debug("using API key")
-            self._proxy.use_api_key(self.api_key)
 
-        version = self._proxy.Bugzilla.version()["version"]
+        version = self._backend.bugzilla_version()["version"]
         log.debug("Bugzilla version string: %s", version)
         self._set_bz_version(version)
 
+
+    @property
+    def _proxy(self):
+        """
+        Return an xmlrpc ServerProxy instance that will work seamlessly
+        with bugzilla
+
+        Some apps have historically accessed _proxy directly, like
+        fedora infrastrucutre pieces. So we consider it part of the API
+        """
+        return self._backend.get_xmlrpc_proxy()
+
+    def is_xmlrpc(self):
+        """
+        :returns: True if using the XMLRPC API
+        """
+        return self._backend.is_xmlrpc()
+
+    def is_rest(self):
+        """
+        :returns: True if using the REST API
+        """
+        return self._backend.is_rest()
+
+    def get_requests_session(self):
+        """
+        Give API users access to the Requests.session object we use for
+        talking to the remote bugzilla instance.
+
+        :returns: The Requests.session object backing the open connection.
+        """
+        return self._session.get_requests_session()
+
     def disconnect(self):
-        '''
+        """
         Disconnect from the given bugzilla instance.
-        '''
-        self._proxy = None
-        self._transport = None
+        """
+        self._backend = None
+        self._session = None
         self._cache = _BugzillaAPICache()
 
-
-    def _login(self, user, password):
-        '''Backend login method for Bugzilla3'''
-        return self._proxy.User.login({'login': user, 'password': password})
-
-    def _logout(self):
-        '''Backend login method for Bugzilla3'''
-        return self._proxy.User.logout()
-
-    def login(self, user=None, password=None):
-        '''Attempt to log in using the given username and password. Subsequent
+    def login(self, user=None, password=None, restrict_login=None):
+        """
+        Attempt to log in using the given username and password. Subsequent
         method calls will use this username and password. Returns False if
         login fails, otherwise returns some kind of login info - typically
         either a numeric userid, or a dict of user info.
@@ -595,10 +579,13 @@ class Bugzilla(object):
         is not set, ValueError will be raised. If login fails, BugzillaError
         will be raised.
 
+        The login session can be restricted to current user IP address
+        with restrict_login argument. (Bugzilla 4.4+)
+
         This method will be called implicitly at the end of connect() if user
         and password are both set. So under most circumstances you won't need
         to call this yourself.
-        '''
+        """
         if self.api_key:
             raise ValueError("cannot login when using an API key")
 
@@ -612,21 +599,61 @@ class Bugzilla(object):
         if not self.password:
             raise ValueError("missing password")
 
-        try:
-            ret = self._login(self.user, self.password)
-            self.password = ''
-            log.info("login successful for user=%s", self.user)
-            return ret
-        except Fault as e:
-            raise BugzillaError("Login failed: %s" % str(e.faultString))
+        payload = {"login": self.user}
+        if restrict_login:
+            payload['restrict_login'] = True
+        log.debug("logging in with options %s", str(payload))
+        payload['password'] = self.password
 
-    def interactive_login(self, user=None, password=None, force=False):
+        try:
+            ret = self._backend.user_login(payload)
+            self.password = ''
+            log.info("login succeeded for user=%s", self.user)
+            if "token" in ret:
+                self._tokencache.set_value(self.url, ret["token"])
+            return ret
+        except Exception as e:
+            log.debug("Login exception: %s", str(e), exc_info=True)
+            raise BugzillaError("Login failed: %s" %
+                    BugzillaError.get_bugzilla_error_string(e)) from None
+
+    def interactive_save_api_key(self):
+        """
+        Helper method to interactively ask for an API key, verify it
+        is valid, and save it to a bugzillarc file referenced via
+        self.configpaths
+        """
+        sys.stdout.write('API Key: ')
+        sys.stdout.flush()
+        api_key = sys.stdin.readline().strip()
+
+        self.disconnect()
+        self.api_key = api_key
+
+        log.info('Checking API key... ')
+        self.connect()
+
+        if not self.logged_in:  # pragma: no cover
+            raise BugzillaError("Login with API_KEY failed")
+        log.info('API Key accepted')
+
+        wrote_filename = self._rcfile.save_api_key(self.url, self.api_key)
+        log.info("API key written to filename=%s", wrote_filename)
+
+        msg = "Login successful."
+        if wrote_filename:
+            msg += " API key written to %s" % wrote_filename
+        print(msg)
+
+    def interactive_login(self, user=None, password=None, force=False,
+                          restrict_login=None):
         """
         Helper method to handle login for this bugzilla instance.
 
         :param user: bugzilla username. If not specified, prompt for it.
         :param password: bugzilla password. If not specified, prompt for it.
         :param force: Unused
+        :param restrict_login: restricts session to IP address
         """
         ignore = force
         log.debug('Calling interactive_login')
@@ -639,13 +666,27 @@ class Bugzilla(object):
             password = getpass.getpass('Bugzilla Password: ')
 
         log.info('Logging in... ')
-        self.login(user, password)
-        log.info('Authorization cookie received.')
+        out = self.login(user, password, restrict_login)
+        msg = "Login successful."
+        if "token" not in out:
+            msg += " However no token was returned."
+        else:
+            if not self.tokenfile:
+                msg += " Token not saved to disk."
+            else:
+                msg += " Token cache saved to %s" % self.tokenfile
+            if self._get_version() >= 5.0:
+                msg += "\nToken usage is deprecated. "
+                msg += "Consider using bugzilla API keys instead. "
+                msg += "See `man bugzilla` for more details."
+        print(msg)
 
     def logout(self):
-        '''Log out of bugzilla. Drops server connection and user info, and
-        destroys authentication cookies.'''
-        self._logout()
+        """
+        Log out of bugzilla. Drops server connection and user info, and
+        destroys authentication cache
+        """
+        self._backend.user_logout()
         self.disconnect()
         self.user = ''
         self.password = ''
@@ -670,10 +711,11 @@ class Bugzilla(object):
         http://bugzilla.readthedocs.org/en/latest/api/core/v1/user.html#valid-login
         """
         try:
-            self._proxy.User.get({'ids': []})
+            self._backend.user_get({"ids": [1]})
             return True
-        except Fault as e:
-            if e.faultCode == 505 or e.faultCode == 32000:
+        except Exception as e:
+            code = BugzillaError.get_bugzilla_error_code(e)
+            if code in [505, 32000]:
                 return False
             raise e
 
@@ -682,22 +724,26 @@ class Bugzilla(object):
     # Bugfields querying #
     ######################
 
-    def _getbugfields(self):
-        '''
-        Get the list of valid fields for Bug objects
-        '''
-        r = self._proxy.Bug.fields({'include_fields': ['name']})
-        return [f['name'] for f in r['fields']]
-
-    def getbugfields(self, force_refresh=False):
-        '''
+    def getbugfields(self, force_refresh=False, names=None):
+        """
         Calls getBugFields, which returns a list of fields in each bug
         for this bugzilla instance. This can be used to set the list of attrs
         on the Bug object.
-        '''
+
+        :param force_refresh: If True, overwrite the bugfield cache
+            with these newly checked values.
+        :param names: Only check for the passed bug field names
+        """
+        def _fieldnames():
+            data = {"include_fields": ["name"]}
+            if names:
+                data["names"] = names
+            r = self._backend.bug_fields(data)
+            return [f['name'] for f in r['fields']]
+
         if force_refresh or not self._cache.bugfields:
             log.debug("Refreshing bugfields")
-            self._cache.bugfields = self._getbugfields()
+            self._cache.bugfields = _fieldnames()
             self._cache.bugfields.sort()
             log.debug("bugfields = %s", self._cache.bugfields)
 
@@ -734,11 +780,11 @@ class Bugzilla(object):
         if ptype:
             raw = None
             if ptype == "accessible":
-                raw = self._proxy.Product.get_accessible_products()
-            elif ptype == "selectable":
-                raw = self._proxy.Product.get_selectable_products()
+                raw = self._backend.product_get_accessible()
             elif ptype == "enterable":
-                raw = self._proxy.Product.get_enterable_products()
+                raw = self._backend.product_get_enterable()
+            elif ptype == "selectable":
+                raw = self._backend.product_get_selectable()
 
             if raw is None:
                 raise RuntimeError("Unknown ptype=%s" % ptype)
@@ -747,16 +793,15 @@ class Bugzilla(object):
 
         kwargs = {}
         if ids:
-            kwargs["ids"] = self._listify(ids)
+            kwargs["ids"] = listify(ids)
         if names:
-            kwargs["names"] = self._listify(names)
+            kwargs["names"] = listify(names)
         if include_fields:
             kwargs["include_fields"] = include_fields
         if exclude_fields:
             kwargs["exclude_fields"] = exclude_fields
 
-        log.debug("Calling Product.get with: %s", kwargs)
-        ret = self._proxy.Product.get(kwargs)
+        ret = self._backend.product_get(kwargs)
         return ret['products']
 
     def refresh_products(self, **kwargs):
@@ -857,12 +902,6 @@ class Bugzilla(object):
         """
         Return a list of component names for the passed product.
 
-        This can be implemented with Product.get, but behind the
-        scenes it uses Bug.legal_values. Reason being that on bugzilla
-        instances with tons of components, like bugzilla.redhat.com
-        Product=Fedora for example, there's a 10x speed difference
-        even with properly limited Product.get calls.
-
         On first invocation the value is cached, and subsequent calls
         will return the cached data.
 
@@ -872,17 +911,22 @@ class Bugzilla(object):
         proddict = self._lookup_product_in_cache(product)
         product_id = proddict.get("id", None)
 
-        if (force_refresh or
-            product_id is None or
-            product_id not in self._cache.component_names):
-            self.refresh_products(names=[product],
-                                  include_fields=["names", "id"])
+        if (force_refresh or product_id is None or
+            "components" not in proddict):
+            self.refresh_products(
+                names=[product],
+                include_fields=["name", "id", "components.name"])
             proddict = self._lookup_product_in_cache(product)
+            if "id" not in proddict:
+                raise BugzillaError("Product '%s' not found" % product)
             product_id = proddict["id"]
 
-            opts = {'product_id': product_id, 'field': 'component'}
-            log.debug("Calling Bug.legal_values with: %s", opts)
-            names = self._proxy.Bug.legal_values(opts)["values"]
+        if product_id not in self._cache.component_names:
+            names = []
+            for comp in proddict.get("components", []):
+                name = comp.get("name")
+                if name:
+                    names.append(name)
             self._cache.component_names[product_id] = names
 
         return self._cache.component_names[product_id]
@@ -915,13 +959,13 @@ class Bugzilla(object):
 
 
     def addcomponent(self, data):
-        '''
+        """
         A method to create a component in Bugzilla. Takes a dict, with the
         following elements:
 
         product: The product to create the component in
         component: The name of the component to create
-        desription: A one sentence summary of the component
+        description: A one sentence summary of the component
         default_assignee: The bugzilla login (email address) of the initial
                           owner of the component
         default_qa_contact (optional): The bugzilla login of the
@@ -930,23 +974,21 @@ class Bugzilla(object):
                                new bugs for the component.
         is_active: (optional) If False, the component is hidden from
                               the component list when filing new bugs.
-        '''
+        """
         data = data.copy()
         self._component_data_convert(data)
-        log.debug("Calling Component.create with: %s", data)
-        return self._proxy.Component.create(data)
+        return self._backend.component_create(data)
 
     def editcomponent(self, data):
-        '''
+        """
         A method to edit a component in Bugzilla. Takes a dict, with
         mandatory elements of product. component, and initialowner.
         All other elements are optional and use the same names as the
         addcomponent() method.
-        '''
+        """
         data = data.copy()
         self._component_data_convert(data, update=True)
-        log.debug("Calling Component.update with: %s", data)
-        return self._proxy.Component.update(data)
+        return self._backend.component_update(data)
 
 
     ###################
@@ -959,9 +1001,6 @@ class Bugzilla(object):
         Internal helper to process include_fields lists
         """
         def _convert_fields(_in):
-            if not _in:
-                return _in
-
             for newname, oldname in self._get_api_aliases():
                 if oldname in _in:
                     _in.remove(oldname)
@@ -970,16 +1009,15 @@ class Bugzilla(object):
             return _in
 
         ret = {}
-        if self._check_version(4, 0):
-            if include_fields:
-                include_fields = _convert_fields(include_fields)
-                if "id" not in include_fields:
-                    include_fields.append("id")
-                ret["include_fields"] = include_fields
-            if exclude_fields:
-                exclude_fields = _convert_fields(exclude_fields)
-                ret["exclude_fields"] = exclude_fields
-        if self._supports_getbug_extra_fields:
+        if include_fields:
+            include_fields = _convert_fields(include_fields)
+            if "id" not in include_fields:
+                include_fields.append("id")
+            ret["include_fields"] = include_fields
+        if exclude_fields:
+            exclude_fields = _convert_fields(exclude_fields)
+            ret["exclude_fields"] = exclude_fields
+        if self._supports_getbug_extra_fields():
             if extra_fields:
                 ret["extra_fields"] = _convert_fields(extra_fields)
         return ret
@@ -997,61 +1035,78 @@ class Bugzilla(object):
     bug_autorefresh = property(_get_bug_autorefresh, _set_bug_autorefresh)
 
 
-    # getbug_extra_fields: Extra fields that need to be explicitly
-    # requested from Bug.get in order for the data to be returned.
-    #
-    # As of Dec 2012 it seems like only RH bugzilla actually has behavior
-    # like this, for upstream bz it returns all info for every Bug.get()
-    _getbug_extra_fields = []
-    _supports_getbug_extra_fields = False
+    def _getbug_extra_fields(self):
+        """
+        Extra fields that need to be explicitly
+        requested from Bug.get in order for the data to be returned.
+        """
+        rhbz_extra_fields = [
+            "comments", "description",
+            "external_bugs", "flags", "sub_components",
+            "tags",
+        ]
+        if self._is_redhat_bugzilla:
+            return rhbz_extra_fields
+        return []
+
+    def _supports_getbug_extra_fields(self):
+        """
+        Return True if the bugzilla instance supports passing
+        extra_fields to getbug
+
+        As of Dec 2012 it seems like only RH bugzilla actually has behavior
+        like this, for upstream bz it returns all info for every Bug.get()
+        """
+        return self._is_redhat_bugzilla
+
 
     def _getbugs(self, idlist, permissive,
             include_fields=None, exclude_fields=None, extra_fields=None):
-        '''
+        """
         Return a list of dicts of full bug info for each given bug id.
         bug ids that couldn't be found will return None instead of a dict.
-        '''
-        oldidlist = idlist
-        idlist = []
-        for i in oldidlist:
-            try:
-                idlist.append(int(i))
-            except ValueError:
-                # String aliases can be passed as well
-                idlist.append(i)
+        """
+        ids = []
+        aliases = []
 
-        extra_fields = self._listify(extra_fields or [])
-        extra_fields += self._getbug_extra_fields
+        def _alias_or_int(_v):
+            if str(_v).isdigit():
+                return int(_v), None
+            return None, str(_v)
 
-        getbugdata = {"ids": idlist}
+        for idstr in idlist:
+            idint, alias = _alias_or_int(idstr)
+            if alias:
+                aliases.append(alias)
+            else:
+                ids.append(idstr)
+
+        extra_fields = listify(extra_fields or [])
+        extra_fields += self._getbug_extra_fields()
+
+        getbugdata = {}
         if permissive:
             getbugdata["permissive"] = 1
 
         getbugdata.update(self._process_include_fields(
             include_fields, exclude_fields, extra_fields))
 
-        log.debug("Calling Bug.get with: %s", getbugdata)
-        r = self._proxy.Bug.get(getbugdata)
+        r = self._backend.bug_get(ids, aliases, getbugdata)
 
-        if self._check_version(4, 0):
-            bugdict = dict([(b['id'], b) for b in r['bugs']])
-        else:
-            bugdict = dict([(b['id'], b['internals']) for b in r['bugs']])
-
+        # Do some wrangling to ensure we return bugs in the same order
+        # the were passed in, for historical reasons
         ret = []
-        for i in idlist:
-            found = None
-            if i in bugdict:
-                found = bugdict[i]
-            else:
-                # Need to map an alias
-                for valdict in bugdict.values():
-                    if i in self._listify(valdict.get("alias", None)):
-                        found = valdict
-                        break
+        for idval in idlist:
+            idint, alias = _alias_or_int(idval)
+            for bugdict in r["bugs"]:
+                if idint and idint != bugdict.get("id", None):
+                    continue
+                aliaslist = listify(bugdict.get("alias", None) or [])
+                if alias and alias not in aliaslist:
+                    continue
 
-            ret.append(found)
-
+                ret.append(bugdict)
+                break
         return ret
 
     def _getbug(self, objid, **kwargs):
@@ -1067,8 +1122,10 @@ class Bugzilla(object):
 
     def getbug(self, objid,
                include_fields=None, exclude_fields=None, extra_fields=None):
-        '''Return a Bug object with the full complement of bug data
-        already loaded.'''
+        """
+        Return a Bug object with the full complement of bug data
+        already loaded.
+        """
         data = self._getbug(objid,
             include_fields=include_fields, exclude_fields=exclude_fields,
             extra_fields=extra_fields)
@@ -1077,9 +1134,11 @@ class Bugzilla(object):
     def getbugs(self, idlist,
                 include_fields=None, exclude_fields=None, extra_fields=None,
                 permissive=True):
-        '''Return a list of Bug objects with the full complement of bug data
+        """
+        Return a list of Bug objects with the full complement of bug data
         already loaded. If there's a problem getting the data for a given id,
-        the corresponding item in the returned list will be None.'''
+        the corresponding item in the returned list will be None.
+        """
         data = self._getbugs(idlist, include_fields=include_fields,
             exclude_fields=exclude_fields, extra_fields=extra_fields,
             permissive=permissive)
@@ -1088,9 +1147,11 @@ class Bugzilla(object):
                 for b in data]
 
     def get_comments(self, idlist):
-        '''Returns a dictionary of bugs and comments.  The comments key will
-           be empty.  See bugzilla docs for details'''
-        return self._proxy.Bug.comments({'ids': idlist})
+        """
+        Returns a dictionary of bugs and comments.  The comments key will
+        be empty.  See bugzilla docs for details
+        """
+        return self._backend.bug_comments(idlist, {})
 
 
     #################
@@ -1123,13 +1184,11 @@ class Bugzilla(object):
                     alias=None,
                     qa_whiteboard=None,
                     devel_whiteboard=None,
-                    boolean_query=None,
                     bug_severity=None,
                     priority=None,
                     target_release=None,
                     target_milestone=None,
                     emailtype=None,
-                    booleantype=None,
                     include_fields=None,
                     quicksearch=None,
                     savedsearch=None,
@@ -1137,12 +1196,13 @@ class Bugzilla(object):
                     sub_component=None,
                     tags=None,
                     exclude_fields=None,
-                    extra_fields=None):
+                    extra_fields=None,
+                    limit=None):
         """
         Build a query string from passed arguments. Will handle
         query parameter differences between various bugzilla versions.
 
-        Most of the parameters should be self explanatory. However
+        Most of the parameters should be self-explanatory. However,
         if you want to perform a complex query, and easy way is to
         create it with the bugzilla web UI, copy the entire URL it
         generates, and pass it to the static method
@@ -1154,15 +1214,10 @@ class Bugzilla(object):
         For details about the specific argument formats, see the bugzilla docs:
         https://bugzilla.readthedocs.io/en/latest/api/core/v1/bug.html#search-bugs
         """
-        if boolean_query or booleantype:
-            raise RuntimeError("boolean_query format is no longer supported. "
-                "If you need complicated URL queries, look into "
-                "query --from-url/url_to_query().")
-
         query = {
             "alias": alias,
-            "product": self._listify(product),
-            "component": self._listify(component),
+            "product": listify(product),
+            "component": listify(component),
             "version": version,
             "id": bug_id,
             "short_desc": short_desc,
@@ -1171,17 +1226,18 @@ class Bugzilla(object):
             "priority": priority,
             "target_release": target_release,
             "target_milestone": target_milestone,
-            "tag": self._listify(tags),
+            "tag": listify(tags),
             "quicksearch": quicksearch,
             "savedsearch": savedsearch,
             "sharer_id": savedsearch_sharer_id,
+            "limit": limit,
 
             # RH extensions... don't add any more. See comment below
-            "sub_components": self._listify(sub_component),
+            "sub_components": listify(sub_component),
         }
 
         def add_bool(bzkey, value, bool_id, booltype=None):
-            value = self._listify(value)
+            value = listify(value)
             if value is None:
                 return bool_id
 
@@ -1252,49 +1308,55 @@ class Bugzilla(object):
         return query
 
     def query(self, query):
-        '''Query bugzilla and return a list of matching bugs.
+        """
+        Query bugzilla and return a list of matching bugs.
         query must be a dict with fields like those in in querydata['fields'].
         Returns a list of Bug objects.
         Also see the _query() method for details about the underlying
         implementation.
-        '''
-        log.debug("Calling Bug.search with: %s", query)
+        """
         try:
-            r = self._proxy.Bug.search(query)
-        except Fault as e:
-
+            r = self._backend.bug_search(query)
+            log.debug("bug_search returned:\n%s", str(r))
+        except Exception as e:
             # Try to give a hint in the error message if url_to_query
             # isn't supported by this bugzilla instance
             if ("query_format" not in str(e) or
-                "RHBugzilla" in str(e.__class__) or
-                self._check_version(5, 0)):
+                not BugzillaError.get_bugzilla_error_code(e) or
+                self._get_version() >= 5.0):
                 raise
             raise BugzillaError("%s\nYour bugzilla instance does not "
                 "appear to support API queries derived from bugzilla "
-                "web URL queries." % e)
+                "web URL queries." % e) from None
 
         log.debug("Query returned %s bugs", len(r['bugs']))
         return [Bug(self, dict=b,
                 autorefresh=self.bug_autorefresh) for b in r['bugs']]
 
     def pre_translation(self, query):
-        '''In order to keep the API the same, Bugzilla4 needs to process the
+        """
+        In order to keep the API the same, Bugzilla4 needs to process the
         query and the result. This also applies to the refresh() function
-        '''
-        pass
+        """
+        if self._is_redhat_bugzilla:
+            _RHBugzillaConverters.pre_translation(query)
+            query.update(self._process_include_fields(
+                query.get("include_fields", []), None, None))
 
     def post_translation(self, query, bug):
-        '''In order to keep the API the same, Bugzilla4 needs to process the
+        """
+        In order to keep the API the same, Bugzilla4 needs to process the
         query and the result. This also applies to the refresh() function
-        '''
-        pass
+        """
+        if self._is_redhat_bugzilla:
+            _RHBugzillaConverters.post_translation(query, bug)
 
     def bugs_history_raw(self, bug_ids):
-        '''
+        """
         Experimental. Gets the history of changes for
         particular bugs in the database.
-        '''
-        return self._proxy.Bug.history({'ids': bug_ids})
+        """
+        return self._backend.bug_history(bug_ids, {})
 
 
     #######################################
@@ -1312,28 +1374,23 @@ class Bugzilla(object):
         build_update(), otherwise we cannot guarantee back compatibility.
         """
         tmp = updates.copy()
-        tmp["ids"] = self._listify(ids)
-
-        log.debug("Calling Bug.update with: %s", tmp)
-        return self._proxy.Bug.update(tmp)
+        return self._backend.bug_update(listify(ids), tmp)
 
     def update_tags(self, idlist, tags_add=None, tags_remove=None):
-        '''
+        """
         Updates the 'tags' field for a bug.
-        '''
+        """
         tags = {}
         if tags_add:
-            tags["add"] = self._listify(tags_add)
+            tags["add"] = listify(tags_add)
         if tags_remove:
-            tags["remove"] = self._listify(tags_remove)
+            tags["remove"] = listify(tags_remove)
 
         d = {
-            "ids": self._listify(idlist),
             "tags": tags,
         }
 
-        log.debug("Calling Bug.update_tags with: %s", d)
-        return self._proxy.Bug.update_tags(d)
+        return self._backend.bug_update_tags(listify(idlist), d)
 
     def update_flags(self, idlist, flags):
         """
@@ -1392,7 +1449,8 @@ class Bugzilla(object):
                      internal_whiteboard=None,
                      sub_component=None,
                      flags=None,
-                     comment_tags=None):
+                     comment_tags=None,
+                     minor_update=None):
         """
         Returns a python dict() with properly formatted parameters to
         pass to update_bugs(). See bugzilla documentation for the format
@@ -1401,18 +1459,28 @@ class Bugzilla(object):
         https://bugzilla.readthedocs.io/en/latest/api/core/v1/bug.html#create-bug
         """
         ret = {}
+        rhbzret = {}
 
         # These are only supported for rhbugzilla
-        for key, val in [
-            ("fixed_in", fixed_in),
-            ("devel_whiteboard", devel_whiteboard),
-            ("qa_whiteboard", qa_whiteboard),
-            ("internal_whiteboard", internal_whiteboard),
-            ("sub_component", sub_component),
-        ]:
-            if val is not None:
-                raise ValueError("bugzilla instance does not support "
-                                 "updating '%s'" % key)
+        #
+        # This should not be extended any more.
+        # If people want to handle custom fields, manually extend the
+        # returned dictionary.
+        rhbzargs = {
+            "fixed_in": fixed_in,
+            "devel_whiteboard": devel_whiteboard,
+            "qa_whiteboard": qa_whiteboard,
+            "internal_whiteboard": internal_whiteboard,
+            "sub_component": sub_component,
+        }
+        if self._is_redhat_bugzilla:
+            rhbzret = _RHBugzillaConverters.convert_build_update(
+                component=component, **rhbzargs)
+        else:
+            for key, val in rhbzargs.items():
+                if val is not None:
+                    raise ValueError("bugzilla instance does not support "
+                                     "updating '%s'" % key)
 
         def s(key, val, convert=None):
             if val is None:
@@ -1426,7 +1494,7 @@ class Bugzilla(object):
                 return
 
             def c(val):
-                val = self._listify(val)
+                val = listify(val)
                 if convert:
                     val = [convert(v) for v in val]
                 return val
@@ -1468,7 +1536,8 @@ class Bugzilla(object):
         s("whiteboard", whiteboard)
         s("work_time", work_time, float)
         s("flags", flags)
-        s("comment_tags", comment_tags, self._listify)
+        s("comment_tags", comment_tags, listify)
+        s("minor_update", minor_update, bool)
 
         add_dict("blocks", blocks_add, blocks_remove, blocks_set,
                  convert=int)
@@ -1484,6 +1553,7 @@ class Bugzilla(object):
             if comment_private:
                 ret["comment"]["is_private"] = comment_private
 
+        ret.update(rhbzret)
         return ret
 
 
@@ -1491,14 +1561,8 @@ class Bugzilla(object):
     # Methods for working with attachments #
     ########################################
 
-    def _attachment_uri(self, attachid):
-        '''Returns the URI for the given attachment ID.'''
-        att_uri = self.url.replace('xmlrpc.cgi', 'attachment.cgi')
-        att_uri = att_uri + '?id=%s' % attachid
-        return att_uri
-
     def attachfile(self, idlist, attachfile, description, **kwargs):
-        '''
+        """
         Attach a file to the given bug IDs. Returns the ID of the attachment
         or raises XMLRPC Fault if something goes wrong.
 
@@ -1522,7 +1586,7 @@ class Bugzilla(object):
 
         Returns the list of attachment ids that were added. If only one
         attachment was added, we return the single int ID for back compat
-        '''
+        """
         if isinstance(attachfile, str):
             f = open(attachfile, "rb")
         elif hasattr(attachfile, 'read'):
@@ -1543,21 +1607,20 @@ class Bugzilla(object):
         kwargs['summary'] = description
 
         data = f.read()
-        if not isinstance(data, bytes):
+        if not isinstance(data, bytes):  # pragma: no cover
             data = data.encode(locale.getpreferredencoding())
-        kwargs['data'] = Binary(data)
-
-        kwargs['ids'] = self._listify(idlist)
 
         if 'file_name' not in kwargs and hasattr(f, "name"):
             kwargs['file_name'] = os.path.basename(f.name)
         if 'content_type' not in kwargs:
-            ctype = _detect_filetype(getattr(f, "name", None))
-            if not ctype:
-                ctype = 'application/octet-stream'
-            kwargs['content_type'] = ctype
+            ctype = None
+            if kwargs['file_name']:
+                ctype = mimetypes.guess_type(
+                    kwargs['file_name'], strict=False)[0]
+            kwargs['content_type'] = ctype or 'application/octet-stream'
 
-        ret = self._proxy.Bug.add_attachment(kwargs)
+        ret = self._backend.bug_attachment_create(
+            listify(idlist), data, kwargs)
 
         if "attachments" in ret:
             # Up to BZ 4.2
@@ -1570,37 +1633,52 @@ class Bugzilla(object):
             ret = ret[0]
         return ret
 
-
-    def openattachment(self, attachid):
-        '''Get the contents of the attachment with the given attachment ID.
-        Returns a file-like object.'''
-        attachments = self.get_attachments(None, attachid)
-        data = attachments["attachments"][str(attachid)]
-        xmlrpcbinary = data["data"]
-
+    def openattachment_data(self, attachment_dict):
+        """
+        Helper for turning passed API attachment dictionary into a
+        filelike object
+        """
         ret = BytesIO()
-        ret.write(xmlrpcbinary.data)
-        ret.name = data["file_name"]
+        data = attachment_dict["data"]
+
+        if hasattr(data, "data"):
+            # This is for xmlrpc Binary
+            content = data.data  # pragma: no cover
+        else:
+            import base64
+            content = base64.b64decode(data)
+
+        ret.write(content)
+        ret.name = attachment_dict["file_name"]
         ret.seek(0)
         return ret
 
+    def openattachment(self, attachid):
+        """
+        Get the contents of the attachment with the given attachment ID.
+        Returns a file-like object.
+        """
+        attachments = self.get_attachments(None, attachid)
+        data = attachments["attachments"][str(attachid)]
+        return self.openattachment_data(data)
+
     def updateattachmentflags(self, bugid, attachid, flagname, **kwargs):
-        '''
+        """
         Updates a flag for the given attachment ID.
         Optional keyword args are:
             status:    new status for the flag ('-', '+', '?', 'X')
             requestee: new requestee for the flag
-        '''
+        """
         # Bug ID was used for the original custom redhat API, no longer
         # needed though
         ignore = bugid
 
         flags = {"name": flagname}
         flags.update(kwargs)
-        update = {'ids': [int(attachid)], 'flags': [flags]}
+        attachment_ids = [int(attachid)]
+        update = {'flags': [flags]}
 
-        log.debug("Calling Bug.update_attachment(%s)", update)
-        return self._proxy.Bug.update_attachment(update)
+        return self._backend.bug_attachment_update(attachment_ids, update)
 
     def get_attachments(self, ids, attachment_ids,
                         include_fields=None, exclude_fields=None):
@@ -1612,17 +1690,15 @@ class Bugzilla(object):
 
         https://bugzilla.readthedocs.io/en/latest/api/core/v1/attachment.html#get-attachment
         """
-        params = {
-            "ids": self._listify(ids) or [],
-            "attachment_ids": self._listify(attachment_ids) or [],
-        }
+        params = {}
         if include_fields:
-            params["include_fields"] = self._listify(include_fields)
+            params["include_fields"] = listify(include_fields)
         if exclude_fields:
-            params["exclude_fields"] = self._listify(exclude_fields)
+            params["exclude_fields"] = listify(exclude_fields)
 
-        log.debug("Calling Bug.attachments(%s)", params)
-        return self._proxy.Bug.attachments(params)
+        if attachment_ids:
+            return self._backend.bug_attachment_get(attachment_ids, params)
+        return self._backend.bug_attachment_get_all(ids, params)
 
 
     #####################
@@ -1658,7 +1734,7 @@ class Bugzilla(object):
         sub_component=None,
         alias=None,
         comment_tags=None):
-        """"
+        """
         Returns a python dict() with properly formatted parameters to
         pass to createbug(). See bugzilla documentation for the format
         of the individual fields:
@@ -1668,15 +1744,15 @@ class Bugzilla(object):
 
         localdict = {}
         if blocks:
-            localdict["blocks"] = self._listify(blocks)
+            localdict["blocks"] = listify(blocks)
         if cc:
-            localdict["cc"] = self._listify(cc)
+            localdict["cc"] = listify(cc)
         if depends_on:
-            localdict["depends_on"] = self._listify(depends_on)
+            localdict["depends_on"] = listify(depends_on)
         if groups:
-            localdict["groups"] = self._listify(groups)
+            localdict["groups"] = listify(groups)
         if keywords:
-            localdict["keywords"] = self._listify(keywords)
+            localdict["keywords"] = listify(keywords)
         if description:
             localdict["description"] = description
             if comment_private:
@@ -1700,14 +1776,15 @@ class Bugzilla(object):
         # Previous API required users specifying keyword args that mapped
         # to the XMLRPC arg names. Maintain that bad compat, but also allow
         # receiving a single dictionary like query() does
-        if kwargs and args:
+        if kwargs and args:  # pragma: no cover
             raise BugzillaError("createbug: cannot specify positional "
                                 "args=%s with kwargs=%s, must be one or the "
                                 "other." % (args, kwargs))
         if args:
             if len(args) > 1 or not isinstance(args[0], dict):
-                raise BugzillaError("createbug: positional arguments only "
-                                    "accept a single dictionary.")
+                raise BugzillaError(  # pragma: no cover
+                    "createbug: positional arguments only "
+                    "accept a single dictionary.")
             data = args[0]
         else:
             data = kwargs
@@ -1727,15 +1804,14 @@ class Bugzilla(object):
         return data
 
     def createbug(self, *args, **kwargs):
-        '''
+        """
         Create a bug with the given info. Returns a new Bug object.
         Check bugzilla API documentation for valid values, at least
         product, component, summary, version, and description need to
         be passed.
-        '''
+        """
         data = self._validate_createbug(*args, **kwargs)
-        log.debug("Calling Bug.create with: %s", data)
-        rawbug = self._proxy.Bug.create(data)
+        rawbug = self._backend.bug_create(data)
         return Bug(self, bug_id=rawbug["id"],
                    autorefresh=self.bug_autorefresh)
 
@@ -1744,54 +1820,28 @@ class Bugzilla(object):
     # Methods for handling Users #
     ##############################
 
-    def _getusers(self, ids=None, names=None, match=None):
-        '''Return a list of users that match criteria.
-
-        :kwarg ids: list of user ids to return data on
-        :kwarg names: list of user names to return data on
-        :kwarg match: list of patterns.  Returns users whose real name or
-            login name match the pattern.
-        :raises XMLRPC Fault: Code 51: if a Bad Login Name was sent to the
-                names array.
-            Code 304: if the user was not authorized to see user they
-                requested.
-            Code 505: user is logged out and can't use the match or ids
-                parameter.
-
-        Available in Bugzilla-3.4+
-        '''
-        params = {}
-        if ids:
-            params['ids'] = self._listify(ids)
-        if names:
-            params['names'] = self._listify(names)
-        if match:
-            params['match'] = self._listify(match)
-        if not params:
-            raise BugzillaError('_get() needs one of ids, '
-                                ' names, or match kwarg.')
-
-        log.debug("Calling User.get with: %s", params)
-        return self._proxy.User.get(params)
-
     def getuser(self, username):
-        '''Return a bugzilla User for the given username
+        """
+        Return a bugzilla User for the given username
 
         :arg username: The username used in bugzilla.
         :raises XMLRPC Fault: Code 51 if the username does not exist
         :returns: User record for the username
-        '''
+        """
         ret = self.getusers(username)
         return ret and ret[0]
 
     def getusers(self, userlist):
-        '''Return a list of Users from .
+        """
+        Return a list of Users from .
 
         :userlist: List of usernames to lookup
         :returns: List of User records
-        '''
+        """
+        userlist = listify(userlist)
+        rawusers = self._backend.user_get({"names": userlist})
         userobjs = [User(self, **rawuser) for rawuser in
-                    self._getusers(names=userlist).get('users', [])]
+                    rawusers.get('users', [])]
 
         # Return users in same order they were passed in
         ret = []
@@ -1806,16 +1856,19 @@ class Bugzilla(object):
 
 
     def searchusers(self, pattern):
-        '''Return a bugzilla User for the given list of patterns
+        """
+        Return a bugzilla User for the given list of patterns
 
         :arg pattern: List of patterns to match against.
         :returns: List of User records
-        '''
+        """
+        rawusers = self._backend.user_get({"match": listify(pattern)})
         return [User(self, **rawuser) for rawuser in
-                self._getusers(match=pattern).get('users', [])]
+                rawusers.get('users', [])]
 
     def createuser(self, email, name='', password=''):
-        '''Return a bugzilla User for the given username
+        """
+        Return a bugzilla User for the given username
 
         :arg email: The email address to use in bugzilla
         :kwarg name: Real name to associate with the account
@@ -1825,12 +1878,17 @@ class Bugzilla(object):
             Code 502 if the password is too short
             Code 503 if the password is too long
         :return: User record for the username
-        '''
-        self._proxy.User.create(email, name, password)
+        """
+        args = {"email": email}
+        if name:
+            args["name"] = name
+        if password:
+            args["password"] = password
+        self._backend.user_create(args)
         return self.getuser(email)
 
     def updateperms(self, user, action, groups):
-        '''
+        """
         A method to update the permissions (group membership) of a bugzilla
         user.
 
@@ -1838,19 +1896,211 @@ class Bugzilla(object):
             also be a list of emails.
         :arg action: add, remove, or set
         :arg groups: list of groups to be added to (i.e. ['fedora_contrib'])
-        '''
-        groups = self._listify(groups)
+        """
+        groups = listify(groups)
         if action == "rem":
             action = "remove"
         if action not in ["add", "remove", "set"]:
             raise BugzillaError("Unknown user permission action '%s'" % action)
 
         update = {
-            "names": self._listify(user),
+            "names": listify(user),
             "groups": {
                 action: groups,
             }
         }
 
-        log.debug("Call User.update with: %s", update)
-        return self._proxy.User.update(update)
+        return self._backend.user_update(update)
+
+
+    ###############################
+    # Methods for handling Groups #
+    ###############################
+
+    def _getgroups(self, names, membership=False):
+        """
+        Return a list of groups that match criteria.
+
+        :kwarg ids: list of group ids to return data on
+        :kwarg membership: boolean specifying wether to query the members
+            of the group or not.
+        :raises XMLRPC Fault: Code 51: if a Bad Login Name was sent to the
+                names array.
+            Code 304: if the user was not authorized to see user they
+                requested.
+            Code 505: user is logged out and can't use the match or ids
+                parameter.
+            Code 805: logged in user do not have enough priviledges to view
+                groups.
+        """
+        params = {"membership": membership}
+        params['names'] = listify(names)
+        return self._backend.group_get(params)
+
+    def getgroup(self, name, membership=False):
+        """
+        Return a bugzilla Group for the given name
+
+        :arg name: The group name used in bugzilla.
+        :raises XMLRPC Fault: Code 51 if the name does not exist
+        :raises XMLRPC Fault: Code 805 if the user does not have enough
+            permissions to view groups
+        :returns: Group record for the name
+        """
+        ret = self.getgroups(name, membership=membership)
+        return ret and ret[0]
+
+    def getgroups(self, grouplist, membership=False):
+        """
+        Return a list of Groups from .
+
+        :userlist: List of group names to lookup
+        :returns: List of Group records
+        """
+        grouplist = listify(grouplist)
+        groupobjs = [
+            Group(self, **rawgroup)
+            for rawgroup in self._getgroups(
+                names=grouplist, membership=membership).get('groups', [])
+        ]
+
+        # Return in same order they were passed in
+        ret = []
+        for g in grouplist:
+            for gobj in groupobjs[:]:
+                if gobj.name == g:
+                    groupobjs.remove(gobj)
+                    ret.append(gobj)
+                    break
+        ret += groupobjs
+        return ret
+
+
+    #############################
+    # ExternalBugs API wrappers #
+    #############################
+
+    def add_external_tracker(self, bug_ids, ext_bz_bug_id, ext_type_id=None,
+                             ext_type_description=None, ext_type_url=None,
+                             ext_status=None, ext_description=None,
+                             ext_priority=None):
+        """
+        Wrapper method to allow adding of external tracking bugs using the
+        ExternalBugs::WebService::add_external_bug method.
+
+        This is documented at
+        https://bugzilla.redhat.com/docs/en/html/integrating/api/Bugzilla/Extension/ExternalBugs/WebService.html#add-external-bug
+
+        bug_ids: A single bug id or list of bug ids to have external trackers
+            added.
+        ext_bz_bug_id: The external bug id (ie: the bug number in the
+            external tracker).
+        ext_type_id: The external tracker id as used by Bugzilla.
+        ext_type_description: The external tracker description as used by
+            Bugzilla.
+        ext_type_url: The external tracker url as used by Bugzilla.
+        ext_status: The status of the external bug.
+        ext_description: The description of the external bug.
+        ext_priority: The priority of the external bug.
+        """
+        param_dict = {'ext_bz_bug_id': ext_bz_bug_id}
+        if ext_type_id is not None:
+            param_dict['ext_type_id'] = ext_type_id
+        if ext_type_description is not None:
+            param_dict['ext_type_description'] = ext_type_description
+        if ext_type_url is not None:
+            param_dict['ext_type_url'] = ext_type_url
+        if ext_status is not None:
+            param_dict['ext_status'] = ext_status
+        if ext_description is not None:
+            param_dict['ext_description'] = ext_description
+        if ext_priority is not None:
+            param_dict['ext_priority'] = ext_priority
+        params = {
+            'bug_ids': listify(bug_ids),
+            'external_bugs': [param_dict],
+        }
+        return self._backend.externalbugs_add(params)
+
+    def update_external_tracker(self, ids=None, ext_type_id=None,
+                                ext_type_description=None, ext_type_url=None,
+                                ext_bz_bug_id=None, bug_ids=None,
+                                ext_status=None, ext_description=None,
+                                ext_priority=None):
+        """
+        Wrapper method to allow adding of external tracking bugs using the
+        ExternalBugs::WebService::update_external_bug method.
+
+        This is documented at
+        https://bugzilla.redhat.com/docs/en/html/integrating/api/Bugzilla/Extension/ExternalBugs/WebService.html#update-external-bug
+
+        ids: A single external tracker bug id or list of external tracker bug
+            ids.
+        ext_type_id: The external tracker id as used by Bugzilla.
+        ext_type_description: The external tracker description as used by
+            Bugzilla.
+        ext_type_url: The external tracker url as used by Bugzilla.
+        ext_bz_bug_id: A single external bug id or list of external bug ids
+            (ie: the bug number in the external tracker).
+        bug_ids: A single bug id or list of bug ids to have external tracker
+            info updated.
+        ext_status: The status of the external bug.
+        ext_description: The description of the external bug.
+        ext_priority: The priority of the external bug.
+        """
+        params = {}
+        if ids is not None:
+            params['ids'] = listify(ids)
+        if ext_type_id is not None:
+            params['ext_type_id'] = ext_type_id
+        if ext_type_description is not None:
+            params['ext_type_description'] = ext_type_description
+        if ext_type_url is not None:
+            params['ext_type_url'] = ext_type_url
+        if ext_bz_bug_id is not None:
+            params['ext_bz_bug_id'] = listify(ext_bz_bug_id)
+        if bug_ids is not None:
+            params['bug_ids'] = listify(bug_ids)
+        if ext_status is not None:
+            params['ext_status'] = ext_status
+        if ext_description is not None:
+            params['ext_description'] = ext_description
+        if ext_priority is not None:
+            params['ext_priority'] = ext_priority
+        return self._backend.externalbugs_update(params)
+
+    def remove_external_tracker(self, ids=None, ext_type_id=None,
+                                ext_type_description=None, ext_type_url=None,
+                                ext_bz_bug_id=None, bug_ids=None):
+        """
+        Wrapper method to allow removal of external tracking bugs using the
+        ExternalBugs::WebService::remove_external_bug method.
+
+        This is documented at
+        https://bugzilla.redhat.com/docs/en/html/integrating/api/Bugzilla/Extension/ExternalBugs/WebService.html#remove-external-bug
+
+        ids: A single external tracker bug id or list of external tracker bug
+            ids.
+        ext_type_id: The external tracker id as used by Bugzilla.
+        ext_type_description: The external tracker description as used by
+            Bugzilla.
+        ext_type_url: The external tracker url as used by Bugzilla.
+        ext_bz_bug_id: A single external bug id or list of external bug ids
+            (ie: the bug number in the external tracker).
+        bug_ids: A single bug id or list of bug ids to have external tracker
+            info updated.
+        """
+        params = {}
+        if ids is not None:
+            params['ids'] = listify(ids)
+        if ext_type_id is not None:
+            params['ext_type_id'] = ext_type_id
+        if ext_type_description is not None:
+            params['ext_type_description'] = ext_type_description
+        if ext_type_url is not None:
+            params['ext_type_url'] = ext_type_url
+        if ext_bz_bug_id is not None:
+            params['ext_bz_bug_id'] = listify(ext_bz_bug_id)
+        if bug_ids is not None:
+            params['bug_ids'] = listify(bug_ids)
+        return self._backend.externalbugs_remove(params)

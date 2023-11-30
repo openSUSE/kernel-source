@@ -100,6 +100,16 @@ tag_map = {
         'requires_any' : [ 'Patch-mainline:Version', 'Patch-mainline:Queued' ],
         'error' : "requires full SHA1 hash and optional (partial) tag",
     },
+    'Alt-commit' : {
+        'multi' : True,
+        'accepted' : [
+            {
+                # 40-character SHA1 hash
+                'match' : '([0-9a-fA-F]){40}$',
+            }
+        ],
+        'error' : "requires one full SHA1 hash without trailing spaces",
+    },
     'Git-repo' : {
         'accepted' : [
             {
