@@ -1,0 +1,162 @@
+From: Mike Christie <michael.christie@oracle.com>
+Date: Mon, 26 Jun 2023 18:22:52 -0500
+Subject: vhost: dynamically allocate vhost_worker
+Patch-mainline: v6.5-rc1
+Git-commit: c011bb669ddc22b0374d747d90467d1b2f80bc05
+References: jsc#PED-3311
+
+This patchset allows us to allocate multiple workers, so this has us
+move from the vhost_worker that's embedded in the vhost_dev to
+dynamically allocating it.
+
+Signed-off-by: Mike Christie <michael.christie@oracle.com>
+Message-Id: <20230626232307.97930-3-michael.christie@oracle.com>
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/vhost/vhost.c |   66 ++++++++++++++++++++++++++++++++------------------
+ drivers/vhost/vhost.h |    4 +--
+ 2 files changed, 45 insertions(+), 25 deletions(-)
+
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@ -235,36 +235,40 @@ void vhost_dev_flush(struct vhost_dev *d
+ {
+ 	struct vhost_flush_struct flush;
+ 
+-	if (dev->worker.vtsk) {
+-		init_completion(&flush.wait_event);
+-		vhost_work_init(&flush.work, vhost_flush_work);
++	init_completion(&flush.wait_event);
++	vhost_work_init(&flush.work, vhost_flush_work);
+ 
+-		vhost_work_queue(dev, &flush.work);
++	if (vhost_work_queue(dev, &flush.work))
+ 		wait_for_completion(&flush.wait_event);
+-	}
+ }
+ EXPORT_SYMBOL_GPL(vhost_dev_flush);
+ 
+-void vhost_work_queue(struct vhost_dev *dev, struct vhost_work *work)
++bool vhost_work_queue(struct vhost_dev *dev, struct vhost_work *work)
+ {
+-	if (!dev->worker.vtsk)
+-		return;
+-
++	if (!dev->worker)
++		return false;
++	/*
++	 * vsock can queue while we do a VHOST_SET_OWNER, so we have a smp_wmb
++	 * when setting up the worker. We don't have a smp_rmb here because
++	 * test_and_set_bit gives us a mb already.
++	 */
+ 	if (!test_and_set_bit(VHOST_WORK_QUEUED, &work->flags)) {
+ 		/* We can only add the work to the list after we're
+ 		 * sure it was not in the list.
+ 		 * test_and_set_bit() implies a memory barrier.
+ 		 */
+-		llist_add(&work->node, &dev->worker.work_list);
+-		vhost_task_wake(dev->worker.vtsk);
++		llist_add(&work->node, &dev->worker->work_list);
++		vhost_task_wake(dev->worker->vtsk);
+ 	}
++
++	return true;
+ }
+ EXPORT_SYMBOL_GPL(vhost_work_queue);
+ 
+ /* A lockless hint for busy polling code to exit the loop */
+ bool vhost_has_work(struct vhost_dev *dev)
+ {
+-	return !llist_empty(&dev->worker.work_list);
++	return !llist_empty(&dev->worker->work_list);
+ }
+ EXPORT_SYMBOL_GPL(vhost_has_work);
+ 
+@@ -458,8 +462,7 @@ void vhost_dev_init(struct vhost_dev *de
+ 	dev->umem = NULL;
+ 	dev->iotlb = NULL;
+ 	dev->mm = NULL;
+-	memset(&dev->worker, 0, sizeof(dev->worker));
+-	init_llist_head(&dev->worker.work_list);
++	dev->worker = NULL;
+ 	dev->iov_limit = iov_limit;
+ 	dev->weight = weight;
+ 	dev->byte_weight = byte_weight;
+@@ -533,30 +536,47 @@ static void vhost_detach_mm(struct vhost
+ 
+ static void vhost_worker_free(struct vhost_dev *dev)
+ {
+-	if (!dev->worker.vtsk)
++	if (!dev->worker)
+ 		return;
+ 
+-	WARN_ON(!llist_empty(&dev->worker.work_list));
+-	vhost_task_stop(dev->worker.vtsk);
+-	dev->worker.kcov_handle = 0;
+-	dev->worker.vtsk = NULL;
++	WARN_ON(!llist_empty(&dev->worker->work_list));
++	vhost_task_stop(dev->worker->vtsk);
++	kfree(dev->worker);
++	dev->worker = NULL;
+ }
+ 
+ static int vhost_worker_create(struct vhost_dev *dev)
+ {
++	struct vhost_worker *worker;
+ 	struct vhost_task *vtsk;
+ 	char name[TASK_COMM_LEN];
+ 
++	worker = kzalloc(sizeof(*worker), GFP_KERNEL_ACCOUNT);
++	if (!worker)
++		return -ENOMEM;
++
+ 	snprintf(name, sizeof(name), "vhost-%d", current->pid);
+ 
+-	vtsk = vhost_task_create(vhost_worker, &dev->worker, name);
++	vtsk = vhost_task_create(vhost_worker, worker, name);
+ 	if (!vtsk)
+-		return -ENOMEM;
++		goto free_worker;
++
++	init_llist_head(&worker->work_list);
++	worker->kcov_handle = kcov_common_handle();
++	worker->vtsk = vtsk;
++	/*
++	 * vsock can already try to queue so make sure llist and vtsk are both
++	 * set before vhost_work_queue sees dev->worker is set.
++	 */
++	smp_wmb();
++	dev->worker = worker;
+ 
+-	dev->worker.kcov_handle = kcov_common_handle();
+-	dev->worker.vtsk = vtsk;
+ 	vhost_task_start(vtsk);
+ 	return 0;
++
++free_worker:
++	kfree(worker);
++	return -ENOMEM;
+ }
+ 
+ /* Caller should have device mutex */
+--- a/drivers/vhost/vhost.h
++++ b/drivers/vhost/vhost.h
+@@ -44,7 +44,7 @@ struct vhost_poll {
+ };
+ 
+ void vhost_work_init(struct vhost_work *work, vhost_work_fn_t fn);
+-void vhost_work_queue(struct vhost_dev *dev, struct vhost_work *work);
++bool vhost_work_queue(struct vhost_dev *dev, struct vhost_work *work);
+ bool vhost_has_work(struct vhost_dev *dev);
+ 
+ void vhost_poll_init(struct vhost_poll *poll, vhost_work_fn_t fn,
+@@ -158,7 +158,7 @@ struct vhost_dev {
+ 	struct vhost_virtqueue **vqs;
+ 	int nvqs;
+ 	struct eventfd_ctx *log_ctx;
+-	struct vhost_worker worker;
++	struct vhost_worker *worker;
+ 	struct vhost_iotlb *umem;
+ 	struct vhost_iotlb *iotlb;
+ 	spinlock_t iotlb_lock;

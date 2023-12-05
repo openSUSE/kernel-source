@@ -1,0 +1,308 @@
+From: Edward Cree <ecree.xilinx@gmail.com>
+Date: Mon, 2 Oct 2023 16:44:41 +0100
+Subject: sfc: support TC left-hand-side rules on foreign netdevs
+Patch-mainline: v6.7-rc1
+Git-commit: ec1dc6c88ce4f4fb541244f22c42e8cd69037d98
+References: jsc#PED-6894
+
+Allow a tunnel netdevice (such as a vxlan) to offload conntrack lookups,
+ in much the same way as efx netdevs.
+To ensure this rule does not overlap with other tunnel rules on the same
+ sip,dip,dport tuple, register a pseudo encap match of a new type
+ (EFX_TC_EM_PSEUDO_OR), which unlike PSEUDO_MASK may only be referenced
+ once (because an actual Outer Rule in hardware exists, although its
+ fw_id is not recorded in the encap match entry).
+
+Reviewed-by: Pieter Jansen van Vuuren <pieter.jansen-van-vuuren@amd.com>
+Signed-off-by: Edward Cree <ecree.xilinx@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/sfc/mae.c |    6 -
+ drivers/net/ethernet/sfc/tc.c  |  213 +++++++++++++++++++++++++++++++++++++++++
+ drivers/net/ethernet/sfc/tc.h  |    5 
+ 3 files changed, 222 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/sfc/mae.c
++++ b/drivers/net/ethernet/sfc/mae.c
+@@ -1705,8 +1705,10 @@ static int efx_mae_insert_lhs_outer_rule
+ 
+ 	/* action */
+ 	act = &rule->lhs_act;
+-	MCDI_SET_DWORD(inbuf, MAE_OUTER_RULE_INSERT_IN_ENCAP_TYPE,
+-		       MAE_MCDI_ENCAP_TYPE_NONE);
++	rc = efx_mae_encap_type_to_mae_type(act->tun_type);
++	if (rc < 0)
++		return rc;
++	MCDI_SET_DWORD(inbuf, MAE_OUTER_RULE_INSERT_IN_ENCAP_TYPE, rc);
+ 	/* We always inhibit CT lookup on TCP_INTERESTING_FLAGS, since the
+ 	 * SW path needs to process the packet to update the conntrack tables
+ 	 * on connection establishment (SYN) or termination (FIN, RST).
+--- a/drivers/net/ethernet/sfc/tc.c
++++ b/drivers/net/ethernet/sfc/tc.c
+@@ -642,6 +642,15 @@ static int efx_tc_flower_record_encap_ma
+ 				return -EEXIST;
+ 			}
+ 			break;
++		case EFX_TC_EM_PSEUDO_OR:
++			/* old EM corresponds to an OR that has to be unique
++			 * (it must not overlap with any other OR, whether
++			 * direct-EM or pseudo).
++			 */
++			NL_SET_ERR_MSG_FMT_MOD(extack,
++					       "%s encap match conflicts with existing pseudo(OR) entry",
++					       em_type ? "Pseudo" : "Direct");
++			return -EEXIST;
+ 		default: /* Unrecognised pseudo-type.  Just say no */
+ 			NL_SET_ERR_MSG_FMT_MOD(extack,
+ 					       "%s encap match conflicts with existing pseudo(%d) entry",
+@@ -872,6 +881,93 @@ static bool efx_tc_rule_is_lhs_rule(stru
+ 	return false;
+ }
+ 
++/* A foreign LHS rule has matches on enc_ keys at the TC layer (including an
++ * implied match on enc_ip_proto UDP).  Translate these into non-enc_ keys,
++ * so that we can use the same MAE machinery as local LHS rules (and so that
++ * the lhs_rules entries have uniform semantics).  It may seem odd to do it
++ * this way round, given that the corresponding fields in the MAE MCDIs are
++ * all ENC_, but (a) we don't have enc_L2 or enc_ip_proto in struct
++ * efx_tc_match_fields and (b) semantically an LHS rule doesn't have inner
++ * fields so it's just matching on *the* header rather than the outer header.
++ * Make sure that the non-enc_ keys were not already being matched on, as that
++ * would imply a rule that needed a triple lookup.  (Hardware can do that,
++ * with OR-AR-CT-AR, but it halves packet rate so we avoid it where possible;
++ * see efx_tc_flower_flhs_needs_ar().)
++ */
++static int efx_tc_flower_translate_flhs_match(struct efx_tc_match *match)
++{
++	int rc = 0;
++
++#define COPY_MASK_AND_VALUE(_key, _ekey)	({	\
++	if (match->mask._key) {				\
++		rc = -EOPNOTSUPP;			\
++	} else {					\
++		match->mask._key = match->mask._ekey;	\
++		match->mask._ekey = 0;			\
++		match->value._key = match->value._ekey;	\
++		match->value._ekey = 0;			\
++	}						\
++	rc;						\
++})
++#define COPY_FROM_ENC(_key)	COPY_MASK_AND_VALUE(_key, enc_##_key)
++	if (match->mask.ip_proto)
++		return -EOPNOTSUPP;
++	match->mask.ip_proto = ~0;
++	match->value.ip_proto = IPPROTO_UDP;
++	if (COPY_FROM_ENC(src_ip) || COPY_FROM_ENC(dst_ip))
++		return rc;
++#ifdef CONFIG_IPV6
++	if (!ipv6_addr_any(&match->mask.src_ip6))
++		return -EOPNOTSUPP;
++	match->mask.src_ip6 = match->mask.enc_src_ip6;
++	memset(&match->mask.enc_src_ip6, 0, sizeof(struct in6_addr));
++	if (!ipv6_addr_any(&match->mask.dst_ip6))
++		return -EOPNOTSUPP;
++	match->mask.dst_ip6 = match->mask.enc_dst_ip6;
++	memset(&match->mask.enc_dst_ip6, 0, sizeof(struct in6_addr));
++#endif
++	if (COPY_FROM_ENC(ip_tos) || COPY_FROM_ENC(ip_ttl))
++		return rc;
++	/* should really copy enc_ip_frag but we don't have that in
++	 * parse_match yet
++	 */
++	if (COPY_MASK_AND_VALUE(l4_sport, enc_sport) ||
++	    COPY_MASK_AND_VALUE(l4_dport, enc_dport))
++		return rc;
++	return 0;
++#undef COPY_FROM_ENC
++#undef COPY_MASK_AND_VALUE
++}
++
++/* If a foreign LHS rule wants to match on keys that are only available after
++ * encap header identification and parsing, then it can't be done in the Outer
++ * Rule lookup, because that lookup determines the encap type used to parse
++ * beyond the outer headers.  Thus, such rules must use the OR-AR-CT-AR lookup
++ * sequence, with an EM (struct efx_tc_encap_match) in the OR step.
++ * Return true iff the passed match requires this.
++ */
++static bool efx_tc_flower_flhs_needs_ar(struct efx_tc_match *match)
++{
++	/* matches on inner-header keys can't be done in OR */
++	return match->mask.eth_proto ||
++	       match->mask.vlan_tci[0] || match->mask.vlan_tci[1] ||
++	       match->mask.vlan_proto[0] || match->mask.vlan_proto[1] ||
++	       memchr_inv(match->mask.eth_saddr, 0, ETH_ALEN) ||
++	       memchr_inv(match->mask.eth_daddr, 0, ETH_ALEN) ||
++	       match->mask.ip_proto ||
++	       match->mask.ip_tos || match->mask.ip_ttl ||
++	       match->mask.src_ip || match->mask.dst_ip ||
++#ifdef CONFIG_IPV6
++	       !ipv6_addr_any(&match->mask.src_ip6) ||
++	       !ipv6_addr_any(&match->mask.dst_ip6) ||
++#endif
++	       match->mask.ip_frag || match->mask.ip_firstfrag ||
++	       match->mask.l4_sport || match->mask.l4_dport ||
++	       match->mask.tcp_flags ||
++	/* nor can VNI */
++	       match->mask.enc_keyid;
++}
++
+ static int efx_tc_flower_handle_lhs_actions(struct efx_nic *efx,
+ 					    struct flow_cls_offload *tc,
+ 					    struct flow_rule *fr,
+@@ -1354,6 +1450,119 @@ static int efx_tc_incomplete_mangle(stru
+ 	return 0;
+ }
+ 
++static int efx_tc_flower_replace_foreign_lhs(struct efx_nic *efx,
++					     struct flow_cls_offload *tc,
++					     struct flow_rule *fr,
++					     struct efx_tc_match *match,
++					     struct net_device *net_dev)
++{
++	struct netlink_ext_ack *extack = tc->common.extack;
++	struct efx_tc_lhs_rule *rule, *old;
++	enum efx_encap_type type;
++	int rc;
++
++	if (tc->common.chain_index) {
++		NL_SET_ERR_MSG_MOD(extack, "LHS rule only allowed in chain 0");
++		return -EOPNOTSUPP;
++	}
++
++	if (!efx_tc_match_is_encap(&match->mask)) {
++		/* This is not a tunnel decap rule, ignore it */
++		netif_dbg(efx, drv, efx->net_dev, "Ignoring foreign LHS filter without encap match\n");
++		return -EOPNOTSUPP;
++	}
++
++	if (efx_tc_flower_flhs_needs_ar(match)) {
++		NL_SET_ERR_MSG_MOD(extack, "Match keys not available in Outer Rule");
++		return -EOPNOTSUPP;
++	}
++
++	type = efx_tc_indr_netdev_type(net_dev);
++	if (type == EFX_ENCAP_TYPE_NONE) {
++		NL_SET_ERR_MSG_MOD(extack, "Egress encap match on unsupported tunnel device\n");
++		return -EOPNOTSUPP;
++	}
++
++	rc = efx_mae_check_encap_type_supported(efx, type);
++	if (rc) {
++		NL_SET_ERR_MSG_FMT_MOD(extack,
++				       "Firmware reports no support for %s encap match",
++				       efx_tc_encap_type_name(type));
++		return rc;
++	}
++	/* Reserve the outer tuple with a pseudo Encap Match */
++	rc = efx_tc_flower_record_encap_match(efx, match, type,
++					      EFX_TC_EM_PSEUDO_OR, 0, 0,
++					      extack);
++	if (rc)
++		return rc;
++
++	if (match->mask.ct_state_trk && match->value.ct_state_trk) {
++		NL_SET_ERR_MSG_MOD(extack, "LHS rule can never match +trk");
++		rc = -EOPNOTSUPP;
++		goto release_encap_match;
++	}
++	/* LHS rules are always -trk, so we don't need to match on that */
++	match->mask.ct_state_trk = 0;
++	match->value.ct_state_trk = 0;
++
++	rc = efx_tc_flower_translate_flhs_match(match);
++	if (rc) {
++		NL_SET_ERR_MSG_MOD(extack, "LHS rule cannot match on inner fields");
++		goto release_encap_match;
++	}
++
++	rc = efx_mae_match_check_caps_lhs(efx, &match->mask, extack);
++	if (rc)
++		goto release_encap_match;
++
++	rule = kzalloc(sizeof(*rule), GFP_USER);
++	if (!rule) {
++		rc = -ENOMEM;
++		goto release_encap_match;
++	}
++	rule->cookie = tc->cookie;
++	old = rhashtable_lookup_get_insert_fast(&efx->tc->lhs_rule_ht,
++						&rule->linkage,
++						efx_tc_lhs_rule_ht_params);
++	if (old) {
++		netif_dbg(efx, drv, efx->net_dev,
++			  "Already offloaded rule (cookie %lx)\n", tc->cookie);
++		rc = -EEXIST;
++		NL_SET_ERR_MSG_MOD(extack, "Rule already offloaded");
++		goto release;
++	}
++
++	/* Parse actions */
++	rc = efx_tc_flower_handle_lhs_actions(efx, tc, fr, net_dev, rule);
++	if (rc)
++		goto release;
++
++	rule->match = *match;
++	rule->lhs_act.tun_type = type;
++
++	rc = efx_mae_insert_lhs_rule(efx, rule, EFX_TC_PRIO_TC);
++	if (rc) {
++		NL_SET_ERR_MSG_MOD(extack, "Failed to insert rule in hw");
++		goto release;
++	}
++	netif_dbg(efx, drv, efx->net_dev,
++		  "Successfully parsed lhs rule (cookie %lx)\n",
++		  tc->cookie);
++	return 0;
++
++release:
++	efx_tc_flower_release_lhs_actions(efx, &rule->lhs_act);
++	if (!old)
++		rhashtable_remove_fast(&efx->tc->lhs_rule_ht, &rule->linkage,
++				       efx_tc_lhs_rule_ht_params);
++	kfree(rule);
++release_encap_match:
++	if (match->encap)
++		efx_tc_flower_release_encap_match(efx, match->encap);
++	return rc;
++}
++
+ static int efx_tc_flower_replace_foreign(struct efx_nic *efx,
+ 					 struct net_device *net_dev,
+ 					 struct flow_cls_offload *tc)
+@@ -1387,6 +1596,10 @@ static int efx_tc_flower_replace_foreign
+ 	match.value.ingress_port = rc;
+ 	match.mask.ingress_port = ~0;
+ 
++	if (efx_tc_rule_is_lhs_rule(fr, &match))
++		return efx_tc_flower_replace_foreign_lhs(efx, tc, fr, &match,
++							 net_dev);
++
+ 	if (tc->common.chain_index) {
+ 		struct efx_tc_recirc_id *rid;
+ 
+--- a/drivers/net/ethernet/sfc/tc.h
++++ b/drivers/net/ethernet/sfc/tc.h
+@@ -140,10 +140,14 @@ static inline bool efx_tc_match_is_encap
+  *	The pseudo encap match may be referenced again by an encap match
+  *	with different values for these fields, but all masks must match the
+  *	first (stored in our child_* fields).
++ * @EFX_TC_EM_PSEUDO_OR: registered by an fLHS rule that fits in the OR
++ *	table.  The &struct efx_tc_lhs_rule already holds the HW OR entry.
++ *	Only one reference to this encap match may exist.
+  */
+ enum efx_tc_em_pseudo_type {
+ 	EFX_TC_EM_DIRECT,
+ 	EFX_TC_EM_PSEUDO_MASK,
++	EFX_TC_EM_PSEUDO_OR,
+ };
+ 
+ struct efx_tc_encap_match {
+@@ -183,6 +187,7 @@ struct efx_tc_action_set_list {
+ };
+ 
+ struct efx_tc_lhs_action {
++	enum efx_encap_type tun_type;
+ 	struct efx_tc_recirc_id *rid;
+ 	struct efx_tc_ct_zone *zone;
+ 	struct efx_tc_counter_index *count;

@@ -1,0 +1,301 @@
+From: Mike Christie <michael.christie@oracle.com>
+Date: Mon, 26 Jun 2023 18:23:05 -0500
+Subject: vhost: allow userspace to create workers
+Patch-mainline: v6.5-rc1
+Git-commit: c1ecd8e9500797748ae4f79657971955d452d69d
+References: jsc#PED-3311
+
+For vhost-scsi with 3 vqs or more and a workload that tries to use
+them in parallel like:
+
+fio --filename=/dev/sdb  --direct=1 --rw=randrw --bs=4k \
+--ioengine=libaio --iodepth=128  --numjobs=3
+
+the single vhost worker thread will become a bottlneck and we are stuck
+at around 500K IOPs no matter how many jobs, virtqueues, and CPUs are
+used.
+
+To better utilize virtqueues and available CPUs, this patch allows
+userspace to create workers and bind them to vqs. You can have N workers
+per dev and also share N workers with M vqs on that dev.
+
+This patch adds the interface related code and the next patch will hook
+vhost-scsi into it. The patches do not try to hook net and vsock into
+the interface because:
+
+1. multiple workers don't seem to help vsock. The problem is that with
+only 2 virtqueues we never fully use the existing worker when doing
+bidirectional tests. This seems to match vhost-scsi where we don't see
+the worker as a bottleneck until 3 virtqueues are used.
+
+2. net already has a way to use multiple workers.
+
+Signed-off-by: Mike Christie <michael.christie@oracle.com>
+Message-Id: <20230626232307.97930-16-michael.christie@oracle.com>
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/vhost/vhost.c            |  142 ++++++++++++++++++++++++++++++++++++++-
+ drivers/vhost/vhost.h            |    3 
+ include/uapi/linux/vhost.h       |   33 +++++++++
+ include/uapi/linux/vhost_types.h |   16 ++++
+ 4 files changed, 193 insertions(+), 1 deletion(-)
+
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@ -626,6 +626,76 @@ free_worker:
+ 	return NULL;
+ }
+ 
++/* Caller must have device mutex */
++static void __vhost_vq_attach_worker(struct vhost_virtqueue *vq,
++				     struct vhost_worker *worker)
++{
++	if (vq->worker)
++		vq->worker->attachment_cnt--;
++	worker->attachment_cnt++;
++	vq->worker = worker;
++}
++
++ /* Caller must have device and virtqueue mutex */
++static int vhost_vq_attach_worker(struct vhost_virtqueue *vq,
++				  struct vhost_vring_worker *info)
++{
++	unsigned long index = info->worker_id;
++	struct vhost_dev *dev = vq->dev;
++	struct vhost_worker *worker;
++
++	if (!dev->use_worker)
++		return -EINVAL;
++
++	/*
++	 * We only allow userspace to set a virtqueue's worker if it's not
++	 * active and polling is not enabled. We also assume drivers
++	 * supporting this will not be internally queueing works directly or
++	 * via calls like vhost_dev_flush at this time.
++	 */
++	if (vhost_vq_get_backend(vq) || vq->kick)
++		return -EBUSY;
++
++	worker = xa_find(&dev->worker_xa, &index, UINT_MAX, XA_PRESENT);
++	if (!worker || worker->id != info->worker_id)
++		return -ENODEV;
++
++	__vhost_vq_attach_worker(vq, worker);
++	return 0;
++}
++
++/* Caller must have device mutex */
++static int vhost_new_worker(struct vhost_dev *dev,
++			    struct vhost_worker_state *info)
++{
++	struct vhost_worker *worker;
++
++	worker = vhost_worker_create(dev);
++	if (!worker)
++		return -ENOMEM;
++
++	info->worker_id = worker->id;
++	return 0;
++}
++
++/* Caller must have device mutex */
++static int vhost_free_worker(struct vhost_dev *dev,
++			     struct vhost_worker_state *info)
++{
++	unsigned long index = info->worker_id;
++	struct vhost_worker *worker;
++
++	worker = xa_find(&dev->worker_xa, &index, UINT_MAX, XA_PRESENT);
++	if (!worker || worker->id != info->worker_id)
++		return -ENODEV;
++
++	if (worker->attachment_cnt)
++		return -EBUSY;
++
++	vhost_worker_destroy(dev, worker);
++	return 0;
++}
++
+ static int vhost_get_vq_from_user(struct vhost_dev *dev, void __user *argp,
+ 				  struct vhost_virtqueue **vq, u32 *id)
+ {
+@@ -647,6 +717,76 @@ static int vhost_get_vq_from_user(struct
+ 	return 0;
+ }
+ 
++/* Caller must have device mutex */
++long vhost_worker_ioctl(struct vhost_dev *dev, unsigned int ioctl,
++			void __user *argp)
++{
++	struct vhost_vring_worker ring_worker;
++	struct vhost_worker_state state;
++	struct vhost_virtqueue *vq;
++	long ret;
++	u32 idx;
++
++	if (!dev->use_worker)
++		return -EINVAL;
++
++	if (!vhost_dev_has_owner(dev))
++		return -EINVAL;
++
++	ret = vhost_dev_check_owner(dev);
++	if (ret)
++		return ret;
++
++	switch (ioctl) {
++	/* dev worker ioctls */
++	case VHOST_NEW_WORKER:
++		ret = vhost_new_worker(dev, &state);
++		if (!ret && copy_to_user(argp, &state, sizeof(state)))
++			ret = -EFAULT;
++		return ret;
++	case VHOST_FREE_WORKER:
++		if (copy_from_user(&state, argp, sizeof(state)))
++			return -EFAULT;
++		return vhost_free_worker(dev, &state);
++	/* vring worker ioctls */
++	case VHOST_ATTACH_VRING_WORKER:
++	case VHOST_GET_VRING_WORKER:
++		break;
++	default:
++		return -ENOIOCTLCMD;
++	}
++
++	ret = vhost_get_vq_from_user(dev, argp, &vq, &idx);
++	if (ret)
++		return ret;
++
++	mutex_lock(&vq->mutex);
++	switch (ioctl) {
++	case VHOST_ATTACH_VRING_WORKER:
++		if (copy_from_user(&ring_worker, argp, sizeof(ring_worker))) {
++			ret = -EFAULT;
++			break;
++		}
++
++		ret = vhost_vq_attach_worker(vq, &ring_worker);
++		break;
++	case VHOST_GET_VRING_WORKER:
++		ring_worker.index = idx;
++		ring_worker.worker_id = vq->worker->id;
++
++		if (copy_to_user(argp, &ring_worker, sizeof(ring_worker)))
++			ret = -EFAULT;
++		break;
++	default:
++		ret = -ENOIOCTLCMD;
++		break;
++	}
++
++	mutex_unlock(&vq->mutex);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(vhost_worker_ioctl);
++
+ /* Caller should have device mutex */
+ long vhost_dev_set_owner(struct vhost_dev *dev)
+ {
+@@ -684,7 +824,7 @@ long vhost_dev_set_owner(struct vhost_de
+ 		smp_wmb();
+ 
+ 		for (i = 0; i < dev->nvqs; i++)
+-			dev->vqs[i]->worker = worker;
++			__vhost_vq_attach_worker(dev->vqs[i], worker);
+ 	}
+ 
+ 	return 0;
+--- a/drivers/vhost/vhost.h
++++ b/drivers/vhost/vhost.h
+@@ -31,6 +31,7 @@ struct vhost_worker {
+ 	struct llist_head	work_list;
+ 	u64			kcov_handle;
+ 	u32			id;
++	int			attachment_cnt;
+ };
+ 
+ /* Poll a file (eventfd or socket) */
+@@ -190,6 +191,8 @@ void vhost_dev_cleanup(struct vhost_dev
+ void vhost_dev_stop(struct vhost_dev *);
+ long vhost_dev_ioctl(struct vhost_dev *, unsigned int ioctl, void __user *argp);
+ long vhost_vring_ioctl(struct vhost_dev *d, unsigned int ioctl, void __user *argp);
++long vhost_worker_ioctl(struct vhost_dev *dev, unsigned int ioctl,
++			void __user *argp);
+ bool vhost_vq_access_ok(struct vhost_virtqueue *vq);
+ bool vhost_log_access_ok(struct vhost_dev *);
+ void vhost_clear_msg(struct vhost_dev *dev);
+--- a/include/uapi/linux/vhost.h
++++ b/include/uapi/linux/vhost.h
+@@ -45,6 +45,25 @@
+ #define VHOST_SET_LOG_BASE _IOW(VHOST_VIRTIO, 0x04, __u64)
+ /* Specify an eventfd file descriptor to signal on log write. */
+ #define VHOST_SET_LOG_FD _IOW(VHOST_VIRTIO, 0x07, int)
++/* By default, a device gets one vhost_worker that its virtqueues share. This
++ * command allows the owner of the device to create an additional vhost_worker
++ * for the device. It can later be bound to 1 or more of its virtqueues using
++ * the VHOST_ATTACH_VRING_WORKER command.
++ *
++ * This must be called after VHOST_SET_OWNER and the caller must be the owner
++ * of the device. The new thread will inherit caller's cgroups and namespaces,
++ * and will share the caller's memory space. The new thread will also be
++ * counted against the caller's RLIMIT_NPROC value.
++ *
++ * The worker's ID used in other commands will be returned in
++ * vhost_worker_state.
++ */
++#define VHOST_NEW_WORKER _IOR(VHOST_VIRTIO, 0x8, struct vhost_worker_state)
++/* Free a worker created with VHOST_NEW_WORKER if it's not attached to any
++ * virtqueue. If userspace is not able to call this for workers its created,
++ * the kernel will free all the device's workers when the device is closed.
++ */
++#define VHOST_FREE_WORKER _IOW(VHOST_VIRTIO, 0x9, struct vhost_worker_state)
+ 
+ /* Ring setup. */
+ /* Set number of descriptors in ring. This parameter can not
+@@ -70,6 +89,20 @@
+ #define VHOST_VRING_BIG_ENDIAN 1
+ #define VHOST_SET_VRING_ENDIAN _IOW(VHOST_VIRTIO, 0x13, struct vhost_vring_state)
+ #define VHOST_GET_VRING_ENDIAN _IOW(VHOST_VIRTIO, 0x14, struct vhost_vring_state)
++/* Attach a vhost_worker created with VHOST_NEW_WORKER to one of the device's
++ * virtqueues. This must be done before VHOST_SET_VRING_KICK and the driver
++ * specific ioctl to activate the virtqueue (VHOST_SCSI_SET_ENDPOINT,
++ * VHOST_NET_SET_BACKEND, VHOST_VSOCK_SET_RUNNING) has been run.
++ *
++ * This will replace the virtqueue's existing worker. If the replaced worker
++ * is no longer attached to any virtqueues, it can be freed with
++ * VHOST_FREE_WORKER.
++ */
++#define VHOST_ATTACH_VRING_WORKER _IOW(VHOST_VIRTIO, 0x15,		\
++				       struct vhost_vring_worker)
++/* Return the vring worker's ID */
++#define VHOST_GET_VRING_WORKER _IOWR(VHOST_VIRTIO, 0x16,		\
++				     struct vhost_vring_worker)
+ 
+ /* The following ioctls use eventfd file descriptors to signal and poll
+  * for events. */
+--- a/include/uapi/linux/vhost_types.h
++++ b/include/uapi/linux/vhost_types.h
+@@ -47,6 +47,22 @@ struct vhost_vring_addr {
+ 	__u64 log_guest_addr;
+ };
+ 
++struct vhost_worker_state {
++	/*
++	 * For VHOST_NEW_WORKER the kernel will return the new vhost_worker id.
++	 * For VHOST_FREE_WORKER this must be set to the id of the vhost_worker
++	 * to free.
++	 */
++	unsigned int worker_id;
++};
++
++struct vhost_vring_worker {
++	/* vring index */
++	unsigned int index;
++	/* The id of the vhost_worker returned from VHOST_NEW_WORKER */
++	unsigned int worker_id;
++};
++
+ /* no alignment requirement */
+ struct vhost_iotlb_msg {
+ 	__u64 iova;
