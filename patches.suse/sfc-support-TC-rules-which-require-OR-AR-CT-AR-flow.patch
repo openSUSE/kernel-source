@@ -1,0 +1,260 @@
+From: Edward Cree <ecree.xilinx@gmail.com>
+Date: Mon, 2 Oct 2023 16:44:44 +0100
+Subject: sfc: support TC rules which require OR-AR-CT-AR flow
+Patch-mainline: v6.7-rc1
+Git-commit: e447056147effae1f77854986b5782bb22d77f62
+References: jsc#PED-6894
+
+When a foreign LHS rule (TC rule from a tunnel netdev which requests
+ conntrack lookup) matches on inner headers or enc_key_id, these matches
+ cannot be performed by the Outer Rule table, as the keys are only
+ available after the tunnel type has been identified (by the OR lookup)
+ and the rest of the headers parsed accordingly.
+Offload such rules with an Action Rule, using the LOOKUP_CONTROL section
+ of the AR response to specify the conntrack and/or recirculation actions,
+ combined with an Outer Rule which performs only the usual Encap Match
+ duties.
+This processing flow, as it requires two AR lookups per packet, is less
+ performant than OR-CT-AR, so only use it where necessary.
+
+Reviewed-by: Pieter Jansen van Vuuren <pieter.jansen-van-vuuren@amd.com>
+Signed-off-by: Edward Cree <ecree.xilinx@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/sfc/mae.c |   53 ++++++++++++++++++
+ drivers/net/ethernet/sfc/tc.c  |  116 +++++++++++++++++++++++++++++++++++++++--
+ drivers/net/ethernet/sfc/tc.h  |    1 
+ 3 files changed, 165 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/ethernet/sfc/mae.c
++++ b/drivers/net/ethernet/sfc/mae.c
+@@ -1736,9 +1736,60 @@ static int efx_mae_insert_lhs_outer_rule
+ 	return 0;
+ }
+ 
++static int efx_mae_populate_match_criteria(MCDI_DECLARE_STRUCT_PTR(match_crit),
++					   const struct efx_tc_match *match);
++
++static int efx_mae_insert_lhs_action_rule(struct efx_nic *efx,
++					  struct efx_tc_lhs_rule *rule,
++					  u32 prio)
++{
++	MCDI_DECLARE_BUF(inbuf, MC_CMD_MAE_ACTION_RULE_INSERT_IN_LEN(MAE_FIELD_MASK_VALUE_PAIRS_V2_LEN));
++	MCDI_DECLARE_BUF(outbuf, MC_CMD_MAE_ACTION_RULE_INSERT_OUT_LEN);
++	struct efx_tc_lhs_action *act = &rule->lhs_act;
++	MCDI_DECLARE_STRUCT_PTR(match_crit);
++	MCDI_DECLARE_STRUCT_PTR(response);
++	size_t outlen;
++	int rc;
++
++	match_crit = _MCDI_DWORD(inbuf, MAE_ACTION_RULE_INSERT_IN_MATCH_CRITERIA);
++	response = _MCDI_DWORD(inbuf, MAE_ACTION_RULE_INSERT_IN_RESPONSE);
++	MCDI_STRUCT_SET_DWORD(response, MAE_ACTION_RULE_RESPONSE_ASL_ID,
++			      MC_CMD_MAE_ACTION_SET_LIST_ALLOC_OUT_ACTION_SET_LIST_ID_NULL);
++	MCDI_STRUCT_SET_DWORD(response, MAE_ACTION_RULE_RESPONSE_AS_ID,
++			      MC_CMD_MAE_ACTION_SET_ALLOC_OUT_ACTION_SET_ID_NULL);
++	EFX_POPULATE_DWORD_5(*_MCDI_STRUCT_DWORD(response, MAE_ACTION_RULE_RESPONSE_LOOKUP_CONTROL),
++			     MAE_ACTION_RULE_RESPONSE_DO_CT, !!act->zone,
++			     MAE_ACTION_RULE_RESPONSE_DO_RECIRC,
++			     act->rid && !act->zone,
++			     MAE_ACTION_RULE_RESPONSE_CT_VNI_MODE,
++			     MAE_CT_VNI_MODE_ZERO,
++			     MAE_ACTION_RULE_RESPONSE_RECIRC_ID,
++			     act->rid ? act->rid->fw_id : 0,
++			     MAE_ACTION_RULE_RESPONSE_CT_DOMAIN,
++			     act->zone ? act->zone->zone : 0);
++	MCDI_STRUCT_SET_DWORD(response, MAE_ACTION_RULE_RESPONSE_COUNTER_ID,
++			      act->count ? act->count->cnt->fw_id :
++			      MC_CMD_MAE_COUNTER_ALLOC_OUT_COUNTER_ID_NULL);
++	MCDI_SET_DWORD(inbuf, MAE_ACTION_RULE_INSERT_IN_PRIO, prio);
++	rc = efx_mae_populate_match_criteria(match_crit, &rule->match);
++	if (rc)
++		return rc;
++
++	rc = efx_mcdi_rpc(efx, MC_CMD_MAE_ACTION_RULE_INSERT, inbuf, sizeof(inbuf),
++			  outbuf, sizeof(outbuf), &outlen);
++	if (rc)
++		return rc;
++	if (outlen < sizeof(outbuf))
++		return -EIO;
++	rule->fw_id = MCDI_DWORD(outbuf, MAE_ACTION_RULE_INSERT_OUT_AR_ID);
++	return 0;
++}
++
+ int efx_mae_insert_lhs_rule(struct efx_nic *efx, struct efx_tc_lhs_rule *rule,
+ 			    u32 prio)
+ {
++	if (rule->is_ar)
++		return efx_mae_insert_lhs_action_rule(efx, rule, prio);
+ 	return efx_mae_insert_lhs_outer_rule(efx, rule, prio);
+ }
+ 
+@@ -1772,6 +1823,8 @@ static int efx_mae_remove_lhs_outer_rule
+ 
+ int efx_mae_remove_lhs_rule(struct efx_nic *efx, struct efx_tc_lhs_rule *rule)
+ {
++	if (rule->is_ar)
++		return efx_mae_delete_rule(efx, rule->fw_id);
+ 	return efx_mae_remove_lhs_outer_rule(efx, rule);
+ }
+ 
+--- a/drivers/net/ethernet/sfc/tc.c
++++ b/drivers/net/ethernet/sfc/tc.c
+@@ -978,9 +978,12 @@ static int efx_tc_flower_handle_lhs_acti
+ 	struct netlink_ext_ack *extack = tc->common.extack;
+ 	struct efx_tc_lhs_action *act = &rule->lhs_act;
+ 	const struct flow_action_entry *fa;
++	enum efx_tc_counter_type ctype;
+ 	bool pipe = true;
+ 	int i;
+ 
++	ctype = rule->is_ar ? EFX_TC_COUNTER_TYPE_AR : EFX_TC_COUNTER_TYPE_OR;
++
+ 	flow_action_for_each(i, fa, &fr->action) {
+ 		struct efx_tc_ct_zone *ct_zone;
+ 		struct efx_tc_recirc_id *rid;
+@@ -1013,7 +1016,7 @@ static int efx_tc_flower_handle_lhs_acti
+ 					return -EOPNOTSUPP;
+ 				}
+ 				cnt = efx_tc_flower_get_counter_index(efx, tc->cookie,
+-								      EFX_TC_COUNTER_TYPE_OR);
++								      ctype);
+ 				if (IS_ERR(cnt)) {
+ 					NL_SET_ERR_MSG_MOD(extack, "Failed to obtain a counter");
+ 					return PTR_ERR(cnt);
+@@ -1450,6 +1453,110 @@ static int efx_tc_incomplete_mangle(stru
+ 	return 0;
+ }
+ 
++static int efx_tc_flower_replace_foreign_lhs_ar(struct efx_nic *efx,
++						struct flow_cls_offload *tc,
++						struct flow_rule *fr,
++						struct efx_tc_match *match,
++						struct net_device *net_dev)
++{
++	struct netlink_ext_ack *extack = tc->common.extack;
++	struct efx_tc_lhs_rule *rule, *old;
++	enum efx_encap_type type;
++	int rc;
++
++	type = efx_tc_indr_netdev_type(net_dev);
++	if (type == EFX_ENCAP_TYPE_NONE) {
++		NL_SET_ERR_MSG_MOD(extack, "Egress encap match on unsupported tunnel device");
++		return -EOPNOTSUPP;
++	}
++
++	rc = efx_mae_check_encap_type_supported(efx, type);
++	if (rc) {
++		NL_SET_ERR_MSG_FMT_MOD(extack,
++				       "Firmware reports no support for %s encap match",
++				       efx_tc_encap_type_name(type));
++		return rc;
++	}
++	/* This is an Action Rule, so it needs a separate Encap Match in the
++	 * Outer Rule table.  Insert that now.
++	 */
++	rc = efx_tc_flower_record_encap_match(efx, match, type,
++					      EFX_TC_EM_DIRECT, 0, 0, extack);
++	if (rc)
++		return rc;
++
++	match->mask.recirc_id = 0xff;
++	if (match->mask.ct_state_trk && match->value.ct_state_trk) {
++		NL_SET_ERR_MSG_MOD(extack, "LHS rule can never match +trk");
++		rc = -EOPNOTSUPP;
++		goto release_encap_match;
++	}
++	/* LHS rules are always -trk, so we don't need to match on that */
++	match->mask.ct_state_trk = 0;
++	match->value.ct_state_trk = 0;
++	/* We must inhibit match on TCP SYN/FIN/RST, so that SW can see
++	 * the packet and update the conntrack table.
++	 * Outer Rules will do that with CT_TCP_FLAGS_INHIBIT, but Action
++	 * Rules don't have that; instead they support matching on
++	 * TCP_SYN_FIN_RST (aka TCP_INTERESTING_FLAGS), so use that.
++	 * This is only strictly needed if there will be a DO_CT action,
++	 * which we don't know yet, but typically there will be and it's
++	 * simpler not to bother checking here.
++	 */
++	match->mask.tcp_syn_fin_rst = true;
++
++	rc = efx_mae_match_check_caps(efx, &match->mask, extack);
++	if (rc)
++		goto release_encap_match;
++
++	rule = kzalloc(sizeof(*rule), GFP_USER);
++	if (!rule) {
++		rc = -ENOMEM;
++		goto release_encap_match;
++	}
++	rule->cookie = tc->cookie;
++	rule->is_ar = true;
++	old = rhashtable_lookup_get_insert_fast(&efx->tc->lhs_rule_ht,
++						&rule->linkage,
++						efx_tc_lhs_rule_ht_params);
++	if (old) {
++		netif_dbg(efx, drv, efx->net_dev,
++			  "Already offloaded rule (cookie %lx)\n", tc->cookie);
++		rc = -EEXIST;
++		NL_SET_ERR_MSG_MOD(extack, "Rule already offloaded");
++		goto release;
++	}
++
++	/* Parse actions */
++	rc = efx_tc_flower_handle_lhs_actions(efx, tc, fr, net_dev, rule);
++	if (rc)
++		goto release;
++
++	rule->match = *match;
++	rule->lhs_act.tun_type = type;
++
++	rc = efx_mae_insert_lhs_rule(efx, rule, EFX_TC_PRIO_TC);
++	if (rc) {
++		NL_SET_ERR_MSG_MOD(extack, "Failed to insert rule in hw");
++		goto release;
++	}
++	netif_dbg(efx, drv, efx->net_dev,
++		  "Successfully parsed lhs rule (cookie %lx)\n",
++		  tc->cookie);
++	return 0;
++
++release:
++	efx_tc_flower_release_lhs_actions(efx, &rule->lhs_act);
++	if (!old)
++		rhashtable_remove_fast(&efx->tc->lhs_rule_ht, &rule->linkage,
++				       efx_tc_lhs_rule_ht_params);
++	kfree(rule);
++release_encap_match:
++	if (match->encap)
++		efx_tc_flower_release_encap_match(efx, match->encap);
++	return rc;
++}
++
+ static int efx_tc_flower_replace_foreign_lhs(struct efx_nic *efx,
+ 					     struct flow_cls_offload *tc,
+ 					     struct flow_rule *fr,
+@@ -1472,10 +1579,9 @@ static int efx_tc_flower_replace_foreign
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	if (efx_tc_flower_flhs_needs_ar(match)) {
+-		NL_SET_ERR_MSG_MOD(extack, "Match keys not available in Outer Rule");
+-		return -EOPNOTSUPP;
+-	}
++	if (efx_tc_flower_flhs_needs_ar(match))
++		return efx_tc_flower_replace_foreign_lhs_ar(efx, tc, fr, match,
++							    net_dev);
+ 
+ 	type = efx_tc_indr_netdev_type(net_dev);
+ 	if (type == EFX_ENCAP_TYPE_NONE) {
+--- a/drivers/net/ethernet/sfc/tc.h
++++ b/drivers/net/ethernet/sfc/tc.h
+@@ -208,6 +208,7 @@ struct efx_tc_lhs_rule {
+ 	struct efx_tc_lhs_action lhs_act;
+ 	struct rhash_head linkage;
+ 	u32 fw_id;
++	bool is_ar; /* Action Rule (for OR-AR-CT-AR sequence) */
+ };
+ 
+ enum efx_tc_rule_prios {
