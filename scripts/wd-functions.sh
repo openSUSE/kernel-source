@@ -60,7 +60,7 @@ _find_tarball()
             suffixes="tar.bz2"
         fi
     fi
-    for dir in . $MIRROR {/mounts,/labs,}/mirror/kernel; do
+    for dir in . $LINUX_TAR_DIR {/mounts,/labs,}/mirror/kernel; do
         for subdir in "" "/v$major" "/testing" "/v$major/testing"; do
             for suffix in $suffixes; do
                 tarball="$dir$subdir/linux-$version.$suffix"
