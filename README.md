@@ -76,7 +76,7 @@ with the patch. The rules for patch headers are:
   A brief summary that could appear in a change log makes the most sense in most
   cases.
 
-* Unless the author specified in the From tag has a @suse.de, @suse.com or
+* Unless the author specified in the From tag has a @suse.com, @suse.de or
   @suse.cz address, the patch must include a Signed-off-by, Acked-by or
   Reviewed-by header which identifies the person in one of these domains who
   feels responsible for the patch inside the company.
@@ -107,9 +107,9 @@ with the patch. The rules for patch headers are:
 
 * The patch should include a References tag that identifies the Bugzilla bug
   number, JIRA issue ID, etc. where the patch is discussed. Please prefix
-  bugzilla.suse.com bug numbers with bsc# and JIRA issue IDs with jsc#. Please
-  make sure you specify a JIRA Implementation task when referencing JIRA
-  features, not its Epic ID. Have a look at
+  bugzilla.suse.com bug numbers with bsc# and JIRA issue IDs with jsc#. Make
+  sure you specify a JIRA Implementation task when referencing JIRA features,
+  not its Epic ID. Have a look at
   <https://en.opensuse.org/openSUSE:Packaging_Patches_guidelines#Current_set_of_abbreviations>
   for a full list of abbreviations.
 
@@ -151,7 +151,7 @@ Patch sorting
 -------------
 
 Patches added to the "sorted patches" section of `series.conf` must be sorted
-according to the upstream order of the commit that they backport.
+according to the upstream order of the commits that they backport.
 
 After you've added a patch file to the main `patches.suse/` or a different patch
 directory, and supplemented the required tags described in the section [Patch
@@ -226,9 +226,9 @@ those configuration files are missing necessary config options.
 When adding patches that introduce new kernel config options, please also update
 all config files as follows:
 
-    $ scripts/sequence-patch.sh
+    $ ./scripts/sequence-patch.sh
     $ cd /var/tmp/scratch/linux-5.14-SLE15-SP5
-    $ patches/scripts/run_oldconfig.sh
+    $ ./patches/scripts/run_oldconfig.sh
 
 
 Committing and log messages
@@ -327,10 +327,10 @@ Related information
 
 Internal:
 
-* <https://wiki.suse.net/index.php/SUSE-Labs_Publications/Kernel_Building>
-* <https://wiki.suse.net/index.php/SUSE-Labs_Publications/kernel_patches_rules>
+* <https://wiki.suse.net/index.php/SUSE-Labs_Publications/Kernel_Building>,
+* <https://wiki.suse.net/index.php/SUSE-Labs_Publications/kernel_patches_rules>.
 
 Public:
 
-* <https://kernel.suse.com/>
-* <https://en.opensuse.org/Kernel>
+* <https://kernel.suse.com/>,
+* <https://en.opensuse.org/Kernel>.
