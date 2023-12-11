@@ -1,0 +1,179 @@
+Patch-mainline: v6.7-rc1
+Git-commit: 5d6d6a7d7e66a98bb3432478d226c68c219aaba3
+References: jsc#PED-7322
+From: David Woodhouse <dwmw@amazon.co.uk>
+Date: Thu, 5 Oct 2023 10:16:10 +0100
+Subject: [PATCH] KVM: x86: Refine calculation of guest wall clock to use a
+ single TSC read
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When populating the guest's PV wall clock information, KVM currently does
+a simple 'kvm_get_real_ns() - get_kvmclock_ns(kvm)'. This is an antipattern
+which should be avoided; when working with the relationship between two
+clocks, it's never correct to obtain one of them "now" and then the other
+at a slightly different "now" after an unspecified period of preemption
+(which might not even be under the control of the kernel, if this is an
+L1 hosting an L2 guest under nested virtualization).
+
+Add a kvm_get_wall_clock_epoch() function to return the guest wall clock
+epoch in nanoseconds using the same method as __get_kvmclock() — by using
+kvm_get_walltime_and_clockread() to calculate both the wall clock and KVM
+clock time from a *single* TSC reading.
+
+The condition using get_cpu_tsc_khz() is equivalent to the version in
+__get_kvmclock() which separately checks for the CONSTANT_TSC feature or
+the per-CPU cpu_tsc_khz. Which is what get_cpu_tsc_khz() does anyway.
+
+Signed-off-by: David Woodhouse <dwmw@amazon.co.uk>
+Link: https://lore.kernel.org/r/bfc6d3d7cfb88c47481eabbf5a30a264c58c7789.camel@infradead.org
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/kvm/x86.c | 85 ++++++++++++++++++++++++++++++++++++++++++----
+ arch/x86/kvm/x86.h |  1 +
+ arch/x86/kvm/xen.c |  4 +--
+ 3 files changed, 81 insertions(+), 9 deletions(-)
+
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 2b5b325e19f2..42b33ef997a5 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -2331,14 +2331,9 @@ static void kvm_write_wall_clock(struct kvm *kvm, gpa_t wall_clock, int sec_hi_o
+ 	if (kvm_write_guest(kvm, wall_clock, &version, sizeof(version)))
+ 		return;
+ 
+-	/*
+-	 * The guest calculates current wall clock time by adding
+-	 * system time (updated by kvm_guest_time_update below) to the
+-	 * wall clock specified here.  We do the reverse here.
+-	 */
+-	wall_nsec = ktime_get_real_ns() - get_kvmclock_ns(kvm);
++	wall_nsec = kvm_get_wall_clock_epoch(kvm);
+ 
+-	wc.nsec = do_div(wall_nsec, 1000000000);
++	wc.nsec = do_div(wall_nsec, NSEC_PER_SEC);
+ 	wc.sec = (u32)wall_nsec; /* overflow in 2106 guest time */
+ 	wc.version = version;
+ 
+@@ -3241,6 +3236,82 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
+ 	return 0;
+ }
+ 
++/*
++ * The pvclock_wall_clock ABI tells the guest the wall clock time at
++ * which it started (i.e. its epoch, when its kvmclock was zero).
++ *
++ * In fact those clocks are subtly different; wall clock frequency is
++ * adjusted by NTP and has leap seconds, while the kvmclock is a
++ * simple function of the TSC without any such adjustment.
++ *
++ * Perhaps the ABI should have exposed CLOCK_TAI and a ratio between
++ * that and kvmclock, but even that would be subject to change over
++ * time.
++ *
++ * Attempt to calculate the epoch at a given moment using the *same*
++ * TSC reading via kvm_get_walltime_and_clockread() to obtain both
++ * wallclock and kvmclock times, and subtracting one from the other.
++ *
++ * Fall back to using their values at slightly different moments by
++ * calling ktime_get_real_ns() and get_kvmclock_ns() separately.
++ */
++uint64_t kvm_get_wall_clock_epoch(struct kvm *kvm)
++{
++#ifdef CONFIG_X86_64
++	struct pvclock_vcpu_time_info hv_clock;
++	struct kvm_arch *ka = &kvm->arch;
++	unsigned long seq, local_tsc_khz;
++	struct timespec64 ts;
++	uint64_t host_tsc;
++
++	do {
++		seq = read_seqcount_begin(&ka->pvclock_sc);
++
++		local_tsc_khz = 0;
++		if (!ka->use_master_clock)
++			break;
++
++		/*
++		 * The TSC read and the call to get_cpu_tsc_khz() must happen
++		 * on the same CPU.
++		 */
++		get_cpu();
++
++		local_tsc_khz = get_cpu_tsc_khz();
++
++		if (local_tsc_khz &&
++		    !kvm_get_walltime_and_clockread(&ts, &host_tsc))
++			local_tsc_khz = 0; /* Fall back to old method */
++
++		put_cpu();
++
++		/*
++		 * These values must be snapshotted within the seqcount loop.
++		 * After that, it's just mathematics which can happen on any
++		 * CPU at any time.
++		 */
++		hv_clock.tsc_timestamp = ka->master_cycle_now;
++		hv_clock.system_time = ka->master_kernel_ns + ka->kvmclock_offset;
++
++	} while (read_seqcount_retry(&ka->pvclock_sc, seq));
++
++	/*
++	 * If the conditions were right, and obtaining the wallclock+TSC was
++	 * successful, calculate the KVM clock at the corresponding time and
++	 * subtract one from the other to get the guest's epoch in nanoseconds
++	 * since 1970-01-01.
++	 */
++	if (local_tsc_khz) {
++		kvm_get_time_scale(NSEC_PER_SEC, local_tsc_khz * NSEC_PER_USEC,
++				   &hv_clock.tsc_shift,
++				   &hv_clock.tsc_to_system_mul);
++		return ts.tv_nsec + NSEC_PER_SEC * ts.tv_sec -
++			__pvclock_read_cycles(&hv_clock, host_tsc);
++	}
++#endif
++	return ktime_get_real_ns() - get_kvmclock_ns(kvm);
++}
++
+ /*
+  * kvmclock updates which are isolated to a given vcpu, such as
+  * vcpu->cpu migration, should not allow system_timestamp from
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index 1e7be1f6ab29..5184fde1dc54 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -293,6 +293,7 @@ static inline bool kvm_check_has_quirk(struct kvm *kvm, u64 quirk)
+ void kvm_inject_realmode_interrupt(struct kvm_vcpu *vcpu, int irq, int inc_eip);
+ 
+ u64 get_kvmclock_ns(struct kvm *kvm);
++uint64_t kvm_get_wall_clock_epoch(struct kvm *kvm);
+ 
+ int kvm_read_guest_virt(struct kvm_vcpu *vcpu,
+ 	gva_t addr, void *val, unsigned int bytes,
+diff --git a/arch/x86/kvm/xen.c b/arch/x86/kvm/xen.c
+index 40edf4d1974c..b946d9f28030 100644
+--- a/arch/x86/kvm/xen.c
++++ b/arch/x86/kvm/xen.c
+@@ -59,7 +59,7 @@ static int kvm_xen_shared_info_init(struct kvm *kvm, gfn_t gfn)
+ 		 * This code mirrors kvm_write_wall_clock() except that it writes
+ 		 * directly through the pfn cache and doesn't mark the page dirty.
+ 		 */
+-		wall_nsec = ktime_get_real_ns() - get_kvmclock_ns(kvm);
++		wall_nsec = kvm_get_wall_clock_epoch(kvm);
+ 
+ 		/* It could be invalid again already, so we need to check */
+ 		read_lock_irq(&gpc->lock);
+@@ -98,7 +98,7 @@ static int kvm_xen_shared_info_init(struct kvm *kvm, gfn_t gfn)
+ 	wc_version = wc->version = (wc->version + 1) | 1;
+ 	smp_wmb();
+ 
+-	wc->nsec = do_div(wall_nsec,  1000000000);
++	wc->nsec = do_div(wall_nsec, NSEC_PER_SEC);
+ 	wc->sec = (u32)wall_nsec;
+ 	*wc_sec_hi = wall_nsec >> 32;
+ 	smp_wmb();
+-- 
+2.35.3
+
