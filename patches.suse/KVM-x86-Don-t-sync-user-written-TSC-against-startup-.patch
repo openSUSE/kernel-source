@@ -1,0 +1,168 @@
+Patch-mainline: v6.7-rc1
+Git-commit: bf328e22e47242695445a33da6887ba2ef9aec19
+References: jsc#PED-7322
+From: Like Xu <likexu@tencent.com>
+Date: Sun, 8 Oct 2023 10:53:35 +0800
+Subject: [PATCH] KVM: x86: Don't sync user-written TSC against startup values
+
+The legacy API for setting the TSC is fundamentally broken, and only
+allows userspace to set a TSC "now", without any way to account for
+time lost between the calculation of the value, and the kernel eventually
+handling the ioctl.
+
+To work around this, KVM has a hack which, if a TSC is set with a value
+which is within a second's worth of the last TSC "written" to any vCPU in
+the VM, assumes that userspace actually intended the two TSC values to be
+in sync and adjusts the newly-written TSC value accordingly.
+
+Thus, when a VMM restores a guest after suspend or migration using the
+legacy API, the TSCs aren't necessarily *right*, but at least they're
+in sync.
+
+This trick falls down when restoring a guest which genuinely has been
+running for less time than the 1 second of imprecision KVM allows for in
+in the legacy API.  On *creation*, the first vCPU starts its TSC counting
+from zero, and the subsequent vCPUs synchronize to that.  But then when
+the VMM tries to restore a vCPU's intended TSC, because the VM has been
+alive for less than 1 second and KVM's default TSC value for new vCPU's is
+'0', the intended TSC is within a second of the last "written" TSC and KVM
+incorrectly adjusts the intended TSC in an attempt to synchronize.
+
+But further hacks can be piled onto KVM's existing hackish ABI, and
+declare that the *first* value written by *userspace* (on any vCPU)
+should not be subject to this "correction", i.e. KVM can assume that the
+first write from userspace is not an attempt to sync up with TSC values
+that only come from the kernel's default vCPU creation.
+
+To that end: Add a flag, kvm->arch.user_set_tsc, protected by
+kvm->arch.tsc_write_lock, to record that a TSC for at least one vCPU in
+the VM *has* been set by userspace, and make the 1-second slop hack only
+trigger if user_set_tsc is already set.
+
+Note that userspace can explicitly request a *synchronization* of the
+TSC by writing zero. For the purpose of user_set_tsc, an explicit
+synchronization counts as "setting" the TSC, i.e. if userspace then
+subsequently writes an explicit non-zero value which happens to be within
+1 second of the previous value, the new value will be "corrected".  This
+behavior is deliberate, as treating explicit synchronization as "setting"
+the TSC preserves KVM's existing behaviour inasmuch as possible (KVM
+always applied the 1-second "correction" regardless of whether the write
+came from userspace vs. the kernel).
+
+Reported-by: Yong He <alexyonghe@tencent.com>
+Closes: https://bugzilla.kernel.org/show_bug.cgi?id=217423
+Suggested-by: Oliver Upton <oliver.upton@linux.dev>
+Original-by: Oliver Upton <oliver.upton@linux.dev>
+Original-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Like Xu <likexu@tencent.com>
+Tested-by: Yong He <alexyonghe@tencent.com>
+Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+Link: https://lore.kernel.org/r/20231008025335.7419-1-likexu@tencent.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |  1 +
+ arch/x86/kvm/x86.c              | 34 +++++++++++++++++++++++----------
+ 2 files changed, 25 insertions(+), 10 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index c356aa27fbee..da497cc56e84 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1332,6 +1332,7 @@ struct kvm_arch {
+ 	int nr_vcpus_matched_tsc;
+ 
+ 	u32 default_tsc_khz;
++	bool user_set_tsc;
+ 
+ 	seqcount_raw_spinlock_t pvclock_sc;
+ 	bool use_master_clock;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 6c3485215994..756bdc1127ff 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -2709,8 +2709,9 @@ static void __kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 offset, u64 tsc,
+ 	kvm_track_tsc_matching(vcpu);
+ }
+ 
+-static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 data)
++static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 *user_value)
+ {
++	u64 data = user_value ? *user_value : 0;
+ 	struct kvm *kvm = vcpu->kvm;
+ 	u64 offset, ns, elapsed;
+ 	unsigned long flags;
+@@ -2725,25 +2726,37 @@ static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 data)
+ 	if (vcpu->arch.virtual_tsc_khz) {
+ 		if (data == 0) {
+ 			/*
+-			 * detection of vcpu initialization -- need to sync
+-			 * with other vCPUs. This particularly helps to keep
+-			 * kvm_clock stable after CPU hotplug
++			 * Force synchronization when creating a vCPU, or when
++			 * userspace explicitly writes a zero value.
+ 			 */
+ 			synchronizing = true;
+-		} else {
++		} else if (kvm->arch.user_set_tsc) {
+ 			u64 tsc_exp = kvm->arch.last_tsc_write +
+ 						nsec_to_cycles(vcpu, elapsed);
+ 			u64 tsc_hz = vcpu->arch.virtual_tsc_khz * 1000LL;
+ 			/*
+-			 * Special case: TSC write with a small delta (1 second)
+-			 * of virtual cycle time against real time is
+-			 * interpreted as an attempt to synchronize the CPU.
++			 * Here lies UAPI baggage: when a user-initiated TSC write has
++			 * a small delta (1 second) of virtual cycle time against the
++			 * previously set vCPU, we assume that they were intended to be
++			 * in sync and the delta was only due to the racy nature of the
++			 * legacy API.
++			 *
++			 * This trick falls down when restoring a guest which genuinely
++			 * has been running for less time than the 1 second of imprecision
++			 * which we allow for in the legacy API. In this case, the first
++			 * value written by userspace (on any vCPU) should not be subject
++			 * to this 'correction' to make it sync up with values that only
++			 * come from the kernel's default vCPU creation. Make the 1-second
++			 * slop hack only trigger if the user_set_tsc flag is already set.
+ 			 */
+ 			synchronizing = data < tsc_exp + tsc_hz &&
+ 					data + tsc_hz > tsc_exp;
+ 		}
+ 	}
+ 
++	if (user_value)
++		kvm->arch.user_set_tsc = true;
++
+ 	/*
+ 	 * For a reliable TSC, we can match TSC offsets, and for an unstable
+ 	 * TSC, we add elapsed time in this computation.  We could let the
+@@ -3870,7 +3883,7 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		break;
+ 	case MSR_IA32_TSC:
+ 		if (msr_info->host_initiated) {
+-			kvm_synchronize_tsc(vcpu, data);
++			kvm_synchronize_tsc(vcpu, &data);
+ 		} else {
+ 			u64 adj = kvm_compute_l1_tsc_offset(vcpu, data) - vcpu->arch.l1_tsc_offset;
+ 			adjust_tsc_offset_guest(vcpu, adj);
+@@ -5629,6 +5642,7 @@ static int kvm_arch_tsc_set_attr(struct kvm_vcpu *vcpu,
+ 		tsc = kvm_scale_tsc(rdtsc(), vcpu->arch.l1_tsc_scaling_ratio) + offset;
+ 		ns = get_kvmclock_base_ns();
+ 
++		kvm->arch.user_set_tsc = true;
+ 		__kvm_synchronize_tsc(vcpu, offset, tsc, ns, matched);
+ 		raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
+ 
+@@ -12055,7 +12069,7 @@ void kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
+ 	if (mutex_lock_killable(&vcpu->mutex))
+ 		return;
+ 	vcpu_load(vcpu);
+-	kvm_synchronize_tsc(vcpu, 0);
++	kvm_synchronize_tsc(vcpu, NULL);
+ 	vcpu_put(vcpu);
+ 
+ 	/* poll control enabled by default */
+-- 
+2.35.3
+
