@@ -1,0 +1,226 @@
+From: Martin Wilck <mwilck@suse.com>
+Subject: dm_blk_ioctl: implement path failover for SG_IO
+Patch-mainline: not yet, testing
+References: bsc#1183045, bsc#1216776
+
+In virtual deployments, SCSI passthrough over dm-multipath devices is a
+common setup. The qemu pr-helper was specifically invented for it.
+In this setup, guests send SCSI IO to the hypervisor in the form
+of SG_IO ioctls issued by qemu. But on the device-mapper level, these
+SCSI ioctls aren't treated like regular IO. Up to 2361ae595352
+("dm mpath: switch paths in dm_blk_ioctl() code path"), no path switching
+was done at all. Worse though, if an SG_IO call fails because of a
+path error, dm-multipath doesn't retry the IO on a another path; rather,
+the failure is passed back to the guest, an paths are not marked as faulty.
+This is wrong in the mentioned SCSI-passthrough scenario, where the guest
+should only see an IO error if the entire multipath map is faulty in the
+hypervisor (all paths unusable and no queueing, or some sort of 
+"target"-level error).
+
+This patch fixes this by taking a special code path for SG_IO on request-
+based device mapper targets.
+
+Signed-off-by: Martin Wilck <mwilck@suse.com>
+
+---
+ block/scsi_ioctl.c     |    5 +
+ drivers/md/dm.c        |  125 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ include/linux/blkdev.h |    4 +
+ 3 files changed, 130 insertions(+), 4 deletions(-)
+
+--- a/block/scsi_ioctl.c
++++ b/block/scsi_ioctl.c
+@@ -281,8 +281,8 @@ static int blk_complete_sghdr_rq(struct
+ 	return ret;
+ }
+ 
+-static int sg_io(struct request_queue *q, struct gendisk *bd_disk,
+-		struct sg_io_hdr *hdr, fmode_t mode)
++int sg_io(struct request_queue *q, struct gendisk *bd_disk,
++	  struct sg_io_hdr *hdr, fmode_t mode)
+ {
+ 	unsigned long start_time;
+ 	ssize_t ret = 0;
+@@ -367,6 +367,7 @@ out_put_request:
+ 	blk_put_request(rq);
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(sg_io);
+ 
+ /**
+  * sg_scsi_ioctl  --  handle deprecated SCSI_IOCTL_SEND_COMMAND ioctl
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -29,6 +29,10 @@
+ #include <linux/part_stat.h>
+ #include <linux/blk-crypto.h>
+ #include <linux/keyslot-manager.h>
++#ifndef __GENKSYMS__
++#include <scsi/sg.h>
++#include <scsi/scsi.h>
++#endif
+ 
+ #define DM_MSG_PREFIX "core"
+ 
+@@ -408,8 +412,9 @@ static int dm_blk_getgeo(struct block_de
+ 	return dm_get_geometry(md, geo);
+ }
+ 
+-static int dm_prepare_ioctl(struct mapped_device *md, int *srcu_idx,
+-			    struct block_device **bdev)
++static int _dm_prepare_ioctl(struct mapped_device *md, int *srcu_idx,
++			     struct block_device **bdev,
++			     struct dm_target **tgt0)
+ {
+ 	struct dm_target *tgt;
+ 	struct dm_table *map;
+@@ -439,20 +444,136 @@ retry:
+ 		goto retry;
+ 	}
+ 
++	if (r >= 0 && tgt0)
++		*tgt0 = tgt;
++
+ 	return r;
+ }
+ 
++static int dm_prepare_ioctl(struct mapped_device *md, int *srcu_idx,
++			    struct block_device **bdev)
++{
++	return _dm_prepare_ioctl(md, srcu_idx, bdev, NULL);
++}
++
+ static void dm_unprepare_ioctl(struct mapped_device *md, int srcu_idx)
+ {
+ 	dm_put_live_table(md, srcu_idx);
+ }
+ 
++static int dm_sg_io_ioctl(struct block_device *bdev, fmode_t mode,
++			  void __user *arg)
++{
++	struct mapped_device *md = bdev->bd_disk->private_data;
++	struct sg_io_hdr hdr;
++	int rc, srcu_idx;
++
++	if (copy_from_user(&hdr, arg, sizeof(hdr)))
++		return -EFAULT;
++
++	if (hdr.interface_id != 'S')
++		return -EINVAL;
++
++	if (hdr.dxfer_len > (queue_max_hw_sectors(bdev->bd_disk->queue) << 9))
++		return -EIO;
++
++	for (;;) {
++		struct dm_target *tgt;
++		struct sg_io_hdr rhdr;
++
++		rc = _dm_prepare_ioctl(md, &srcu_idx, &bdev, &tgt);
++		if (rc < 0) {
++			pr_err("%s: failed to get path: %d\n",
++			       __func__, rc);
++			goto out;
++		}
++
++		rhdr = hdr;
++
++		rc = sg_io(bdev->bd_disk->queue, bdev->bd_disk, &rhdr, mode);
++		dev_dbg(&bdev->bd_disk->part0->bd_device, "rc = %d D%02xH%02xM%02xS%02x %s\n",
++			rc,
++			rhdr.driver_status,
++			rhdr.host_status,
++			rhdr.msg_status,
++			rhdr.status,
++			(rhdr.info & SG_INFO_CHECK ? " INFO!" : ""));
++
++		if (rhdr.info & SG_INFO_CHECK) {
++			/*
++			 * See if this is a target or path error.
++			 * Compare blk_path_error(), scsi_result_to_blk_status(),
++			 * blk_errors[].
++			 */
++			switch (rhdr.host_status) {
++			case DID_OK:
++				if (scsi_status_is_good(rhdr.status))
++					rc = 0;
++				break;
++			case DID_TARGET_FAILURE:
++				rc = -EREMOTEIO;
++				goto out;
++			case DID_NEXUS_FAILURE:
++				rc = -EBADE;
++				goto out;
++			case DID_ALLOC_FAILURE:
++				rc = -ENOSPC;
++				goto out;
++			case DID_MEDIUM_ERROR:
++				rc = -ENODATA;
++				goto out;
++			default:
++				/* Everything else is a path error */
++				rc = -EIO;
++				break;
++			}
++		}
++
++		if (rc == 0) {
++			/* success */
++			if (copy_to_user(arg, &rhdr, sizeof(rhdr)))
++				rc = -EFAULT;
++			goto out;
++		}
++
++		/* Failure - fail path by sending a message to the target */
++		if (!tgt->type->message) {
++			DMWARN("invalid target!");
++			rc = -EIO;
++			goto out;
++		} else {
++			char bdbuf[BDEVNAME_SIZE];
++			char *argv[2] = { "fail_path", bdbuf };
++
++			scnprintf(bdbuf, sizeof(bdbuf), "%u:%u",
++				  MAJOR(bdev->bd_dev), MINOR(bdev->bd_dev));
++			dev_info(&bdev->bd_disk->part0->bd_device, "sending %s %s\n",
++				 argv[0], argv[1]);
++			rc = tgt->type->message(tgt, 2, argv, NULL, 0);
++			if (rc < 0)
++				goto out;
++		}
++
++		dm_unprepare_ioctl(md, srcu_idx);
++	}
++out:
++	dm_unprepare_ioctl(md, srcu_idx);
++	return rc;
++}
++
+ static int dm_blk_ioctl(struct block_device *bdev, fmode_t mode,
+ 			unsigned int cmd, unsigned long arg)
+ {
+ 	struct mapped_device *md = bdev->bd_disk->private_data;
+ 	int r, srcu_idx;
+ 
++	if ((dm_get_md_type(md) == DM_TYPE_REQUEST_BASED) &&
++            cmd == SG_IO) {
++		void __user *p = (void __user *)arg;
++
++		return dm_sg_io_ioctl(bdev, mode, p);
++	}
++
+ 	r = dm_prepare_ioctl(md, &srcu_idx, &bdev);
+ 	if (r < 0)
+ 		goto out;
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -896,6 +896,10 @@ extern blk_status_t blk_insert_cloned_re
+ 				     struct request *rq);
+ int blk_rq_append_bio(struct request *rq, struct bio *bio);
+ extern void blk_queue_split(struct bio **);
++#ifndef __GENKSYMS__
++extern int sg_io(struct request_queue *, struct gendisk *,
++		 struct sg_io_hdr *, fmode_t mode);
++#endif
+ extern int scsi_verify_blk_ioctl(struct block_device *, unsigned int);
+ extern int scsi_cmd_blk_ioctl(struct block_device *, fmode_t,
+ 			      unsigned int, void __user *);
