@@ -214,11 +214,6 @@ if grep -q '^Source.*:[[:space:]]*log\.sh[[:space:]]*$' rpm/kernel-source.spec.i
 	cp -p scripts/rpm-log.sh "$build_dir"/log.sh
 fi
 rm -f "$build_dir/kernel-source.changes.old" "$build_dir/gitlog-fixups" "$build_dir/gitlog-excludes"
-if test -e "$build_dir"/config-options.changes; then
-	# Rename to  avoid triggering a build service rule error
-	mv "$build_dir"/config-options.changes \
-		"$build_dir"/config-options.changes.txt
-fi
 rm -f "$build_dir/config-subst"
 
 changelog=$build_dir/kernel-source$VARIANT.changes
