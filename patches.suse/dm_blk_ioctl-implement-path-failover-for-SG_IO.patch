@@ -1,6 +1,6 @@
 From: Martin Wilck <mwilck@suse.com>
 Subject: dm_blk_ioctl: implement path failover for SG_IO
-Patch-mainline: not yet, testing
+Patch-mainline: never, rejected upstream
 References: bsc#1183045, bsc#1216776
 
 In virtual deployments, SCSI passthrough over dm-multipath devices is a
@@ -23,82 +23,192 @@ based device mapper targets.
 Signed-off-by: Martin Wilck <mwilck@suse.com>
 
 ---
- block/scsi_ioctl.c     |    5 +
- drivers/md/dm.c        |  125 ++++++++++++++++++++++++++++++++++++++++++++++++-
- include/linux/blkdev.h |    4 +
- 3 files changed, 130 insertions(+), 4 deletions(-)
+ drivers/md/dm-mpath.c         |  228 +++++++++++++++++++++++++++++++++++++++++-
+ drivers/md/dm.c               |   31 +++++
+ drivers/scsi/scsi_ioctl.c     |    3 
+ include/linux/device-mapper.h |   19 +++
+ include/scsi/scsi_ioctl.h     |    2 
+ 5 files changed, 278 insertions(+), 5 deletions(-)
 
---- a/block/scsi_ioctl.c
-+++ b/block/scsi_ioctl.c
-@@ -281,8 +281,8 @@ static int blk_complete_sghdr_rq(struct
- 	return ret;
- }
- 
--static int sg_io(struct request_queue *q, struct gendisk *bd_disk,
--		struct sg_io_hdr *hdr, fmode_t mode)
-+int sg_io(struct request_queue *q, struct gendisk *bd_disk,
-+	  struct sg_io_hdr *hdr, fmode_t mode)
- {
- 	unsigned long start_time;
- 	ssize_t ret = 0;
-@@ -367,6 +367,7 @@ out_put_request:
- 	blk_put_request(rq);
- 	return ret;
- }
-+EXPORT_SYMBOL_GPL(sg_io);
- 
- /**
-  * sg_scsi_ioctl  --  handle deprecated SCSI_IOCTL_SEND_COMMAND ioctl
---- a/drivers/md/dm.c
-+++ b/drivers/md/dm.c
-@@ -29,6 +29,10 @@
- #include <linux/part_stat.h>
- #include <linux/blk-crypto.h>
- #include <linux/keyslot-manager.h>
-+#ifndef __GENKSYMS__
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@ -24,6 +24,9 @@
+ #include <linux/workqueue.h>
+ #include <linux/delay.h>
+ #include <scsi/scsi_dh.h>
++#include <scsi/scsi_eh.h>
++#include <scsi/scsi_ioctl.h>
 +#include <scsi/sg.h>
-+#include <scsi/scsi.h>
-+#endif
+ #include <linux/atomic.h>
+ #include <linux/blk-mq.h>
  
- #define DM_MSG_PREFIX "core"
- 
-@@ -408,8 +412,9 @@ static int dm_blk_getgeo(struct block_de
- 	return dm_get_geometry(md, geo);
+@@ -2176,7 +2179,229 @@ static int multipath_busy(struct dm_targ
+ 	return busy;
  }
  
--static int dm_prepare_ioctl(struct mapped_device *md, int *srcu_idx,
--			    struct block_device **bdev)
-+static int _dm_prepare_ioctl(struct mapped_device *md, int *srcu_idx,
-+			     struct block_device **bdev,
-+			     struct dm_target **tgt0)
- {
- 	struct dm_target *tgt;
- 	struct dm_table *map;
-@@ -439,20 +444,136 @@ retry:
- 		goto retry;
- 	}
- 
-+	if (r >= 0 && tgt0)
-+		*tgt0 = tgt;
-+
- 	return r;
- }
- 
-+static int dm_prepare_ioctl(struct mapped_device *md, int *srcu_idx,
-+			    struct block_device **bdev)
+-/*-----------------------------------------------------------------
++/*
++ * For regular block I/O, SCSI results are processed by scsi_io_completion(),
++ * setting the blk_status_t. Only ACTION_FAIL cases from
++ * scsi_io_completion_action() are relevant. The sg driver drops the
++ * blk_status_t and the midlayer status byte.
++ *
++ * blk_status_t is used in blk_path_error() to determine if it makes sens to
++ * retry the command on a different path.  The relevant blk status codes that
++ * are not retried are BLK_STS_TARGET, BLK_STS_RESV_CONFLICT, BLK_STS_MEDIUM,
++ * and BLK_STS_PROTECTION.
++ */
++static blk_status_t sg_status_to_blkstat(const struct block_device *path_dev,
++					 const struct sg_io_hdr *hdr)
 +{
-+	return _dm_prepare_ioctl(md, srcu_idx, bdev, NULL);
++	struct scsi_sense_hdr sshdr = { .sense_key = 0 };
++	bool sense_current = false;
++	u8 sense_buffer[SCSI_SENSE_BUFFERSIZE];
++	unsigned char sbuf_len = sizeof(sense_buffer);
++
++	if (!hdr->info & SG_INFO_CHECK)
++		return BLK_STS_OK;
++
++	dev_dbg_ratelimited(&path_dev->bd_disk->part0->bd_device,
++			    "D=%02x H=%02x M=%02x S=%02x\n",
++			    hdr->driver_status, hdr->host_status,
++			    hdr->msg_status, hdr->status);
++
++	sbuf_len = min(sbuf_len, hdr->sb_len_wr);
++	if (sbuf_len > 0 && !copy_from_user(sense_buffer, hdr->sbp, sbuf_len)) {
++		sense_current = scsi_normalize_sense(sense_buffer, hdr->sb_len_wr, &sshdr)
++			&& !scsi_sense_is_deferred(&sshdr);
++
++		if (sense_current)
++			dev_dbg_ratelimited(&path_dev->bd_disk->part0->bd_device,
++					    "sense data: %02x %02x/%02x\n",
++					    sshdr.sense_key, sshdr.asc, sshdr.ascq);
++		else
++			/* Ignore deferred sense below */
++			sshdr.sense_key = NO_SENSE;
++	}
++
++	/*
++	 * scsi_result_to_blk_status() looks at SCSIML flags first.
++	 * (e.g. SCSIML_STAT_TGT_FAILURE)
++	 * They are set from status and sense data in the mid layer.
++	 */
++
++	switch (sshdr.sense_key) {
++	case DATA_PROTECT:
++		if (sshdr.asc == 0x27 && sshdr.ascq == 0x07)
++			return BLK_STS_NOSPC;
++		break;
++
++	case HARDWARE_ERROR:
++	case COPY_ABORTED:
++	case VOLUME_OVERFLOW:
++	case MISCOMPARE:
++	case BLANK_CHECK:
++		return BLK_STS_TARGET;
++
++	case MEDIUM_ERROR:
++		if (sshdr.asc == 0x11 || sshdr.asc == 0x13 || sshdr.asc == 0x14)
++			return BLK_STS_MEDIUM;
++		break;
++
++	case ILLEGAL_REQUEST:
++		if (sshdr.asc == 0x20 || sshdr.asc == 0x21 || sshdr.asc == 0x22 ||
++		    sshdr.asc == 0x24 || sshdr.asc == 0x26 || sshdr.asc == 0x27)
++			return BLK_STS_TARGET;
++		break;
++	}
++
++	/* Host byte handling in scsi_result_to_blk_status() */
++	switch (hdr->host_status) {
++	case DID_OK:
++		/* scsi_status_is_good() */
++		switch (hdr->status) {
++		case SAM_STAT_GOOD:
++		case SAM_STAT_CONDITION_MET:
++		case SAM_STAT_INTERMEDIATE:
++		case SAM_STAT_INTERMEDIATE_CONDITION_MET:
++		case SAM_STAT_COMMAND_TERMINATED:
++			return BLK_STS_OK;
++		default:
++			return BLK_STS_IOERR;
++		}
++	case DID_TRANSPORT_FAILFAST:
++	case DID_TRANSPORT_MARGINAL:
++		return BLK_STS_TRANSPORT;
++	default:
++		break;
++	}
++
++	/* Sense keys from scsi_io_completion_action() in addition to the above */
++	switch (sshdr.sense_key) {
++	case ILLEGAL_REQUEST:
++	case ABORTED_COMMAND:
++		if (sshdr.asc == 0x10)
++			return BLK_STS_PROTECTION;
++		break;
++	}
++
++	return BLK_STS_IOERR;
 +}
 +
- static void dm_unprepare_ioctl(struct mapped_device *md, int srcu_idx)
- {
- 	dm_put_live_table(md, srcu_idx);
- }
- 
-+static int dm_sg_io_ioctl(struct block_device *bdev, fmode_t mode,
-+			  void __user *arg)
++enum {
++	SG_IO_SUCCESS = 0,
++	SG_IO_SWITCH_PATH,
++};
++
++static int path_sg_io(const struct block_device *path_dev,
++		      struct sg_io_hdr *hdr, fmode_t mode)
++{
++	struct scsi_device *sdev;
++	blk_status_t blkstat;
++	int rc;
++
++	sdev = path_dev->bd_disk->queue->queuedata;
++	rc = sg_io(sdev, hdr, mode);
++
++	if (rc != 0) {
++		dev_dbg_ratelimited(&path_dev->bd_disk->part0->bd_device,
++				    "sg_io() -> %d\n", rc);
++		return rc;
++	}
++
++	blkstat = sg_status_to_blkstat(path_dev, hdr);
++	if (blkstat == BLK_STS_OK)
++		return SG_IO_SUCCESS;
++	dev_dbg_ratelimited(&path_dev->bd_disk->part0->bd_device,
++			    "blkstat = %d\n", blkstat);
++	if (blk_path_error(blkstat))
++		return SG_IO_SWITCH_PATH;
++	else
++		return blk_status_to_errno(blkstat);
++
++	return rc;
++}
++
++static int multipath_fail_bdev(struct dm_target *ti, const struct block_device *bdev)
++{
++	struct multipath *m = ti->private;
++	struct pgpath *pgpath;
++	struct priority_group *pg;
++
++	list_for_each_entry(pg, &m->priority_groups, list) {
++		list_for_each_entry(pgpath, &pg->pgpaths, list) {
++			if (pgpath->path.dev->bdev == bdev) {
++				dev_dbg_ratelimited(&bdev->bd_disk->part0->bd_device,
++						    "failing path\n");
++				return fail_path(pgpath);
++			}
++		}
++	}
++	return -ENODEV;
++}
++
++static int multipath_sg_io_ioctl(struct block_device *bdev, fmode_t mode,
++				 void __user *arg)
 +{
 +	struct mapped_device *md = bdev->bd_disk->private_data;
++	struct device *dev = &bdev->bd_disk->part0->bd_device;
 +	struct sg_io_hdr hdr;
 +	int rc, srcu_idx;
 +
@@ -113,81 +223,44 @@ Signed-off-by: Martin Wilck <mwilck@suse.com>
 +
 +	for (;;) {
 +		struct dm_target *tgt;
-+		struct sg_io_hdr rhdr;
++		struct sg_io_hdr path_hdr;
++		struct block_device *path_dev;
 +
-+		rc = _dm_prepare_ioctl(md, &srcu_idx, &bdev, &tgt);
-+		if (rc < 0) {
-+			pr_err("%s: failed to get path: %d\n",
-+			       __func__, rc);
++	suspended:
++		rc = _dm_prepare_ioctl(md, &srcu_idx, &path_dev, &tgt);
++		if (rc == -EAGAIN) {
++			dm_unprepare_ioctl(md, srcu_idx);
++			dev_dbg_ratelimited(dev,"device is suspended, retrying\n");
++			fsleep(10000);
++			goto suspended;
++		} else if (rc < 0) {
++			dev_warn_ratelimited(dev, "failed to get path: %d\n", rc);
++			goto out;
++		} else if (rc > 0 && !capable(CAP_SYS_RAWIO)) {
++			dev_warn_ratelimited(dev, "%s: sending SG_IO ioctl to DM device without required privilege\n",
++					     current->comm);
 +			goto out;
 +		}
 +
-+		rhdr = hdr;
++		path_hdr = hdr;
++		rc = path_sg_io(path_dev, &path_hdr, mode);
 +
-+		rc = sg_io(bdev->bd_disk->queue, bdev->bd_disk, &rhdr, mode);
-+		dev_dbg(&bdev->bd_disk->part0->bd_device, "rc = %d D%02xH%02xM%02xS%02x %s\n",
-+			rc,
-+			rhdr.driver_status,
-+			rhdr.host_status,
-+			rhdr.msg_status,
-+			rhdr.status,
-+			(rhdr.info & SG_INFO_CHECK ? " INFO!" : ""));
-+
-+		if (rhdr.info & SG_INFO_CHECK) {
-+			/*
-+			 * See if this is a target or path error.
-+			 * Compare blk_path_error(), scsi_result_to_blk_status(),
-+			 * blk_errors[].
-+			 */
-+			switch (rhdr.host_status) {
-+			case DID_OK:
-+				if (scsi_status_is_good(rhdr.status))
-+					rc = 0;
-+				break;
-+			case DID_TARGET_FAILURE:
-+				rc = -EREMOTEIO;
++		switch (rc) {
++		case SG_IO_SWITCH_PATH:
++			rc = multipath_fail_bdev(tgt, path_dev);
++			if (rc < 0) {
++				dev_warn_ratelimited(&path_dev->bd_disk->part0->bd_device,
++						     "error trying to fail path: %d", rc);
 +				goto out;
-+			case DID_NEXUS_FAILURE:
-+				rc = -EBADE;
-+				goto out;
-+			case DID_ALLOC_FAILURE:
-+				rc = -ENOSPC;
-+				goto out;
-+			case DID_MEDIUM_ERROR:
-+				rc = -ENODATA;
-+				goto out;
-+			default:
-+				/* Everything else is a path error */
-+				rc = -EIO;
-+				break;
 +			}
-+		}
-+
-+		if (rc == 0) {
-+			/* success */
-+			if (copy_to_user(arg, &rhdr, sizeof(rhdr)))
++			break;
++		case SG_IO_SUCCESS:
++			if (copy_to_user(arg, &path_hdr, sizeof(path_hdr)))
 +				rc = -EFAULT;
++			fallthrough;
++		default: /* negative error code */
 +			goto out;
 +		}
-+
-+		/* Failure - fail path by sending a message to the target */
-+		if (!tgt->type->message) {
-+			DMWARN("invalid target!");
-+			rc = -EIO;
-+			goto out;
-+		} else {
-+			char bdbuf[BDEVNAME_SIZE];
-+			char *argv[2] = { "fail_path", bdbuf };
-+
-+			scnprintf(bdbuf, sizeof(bdbuf), "%u:%u",
-+				  MAJOR(bdev->bd_dev), MINOR(bdev->bd_dev));
-+			dev_info(&bdev->bd_disk->part0->bd_device, "sending %s %s\n",
-+				 argv[0], argv[1]);
-+			rc = tgt->type->message(tgt, 2, argv, NULL, 0);
-+			if (rc < 0)
-+				goto out;
-+		}
-+
 +		dm_unprepare_ioctl(md, srcu_idx);
 +	}
 +out:
@@ -195,32 +268,149 @@ Signed-off-by: Martin Wilck <mwilck@suse.com>
 +	return rc;
 +}
 +
++/*
++ *---------------------------------------------------------------
+  * Module setup
+  *---------------------------------------------------------------*/
+ static struct target_type multipath_target = {
+@@ -2200,6 +2425,7 @@ static struct target_type multipath_targ
+ 	.prepare_ioctl = multipath_prepare_ioctl,
+ 	.iterate_devices = multipath_iterate_devices,
+ 	.busy = multipath_busy,
++	.sg_io = multipath_sg_io_ioctl,
+ };
+ 
+ static int __init dm_multipath_init(void)
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -30,6 +30,7 @@
+ #include <linux/part_stat.h>
+ #include <linux/blk-crypto.h>
+ #include <linux/blk-crypto-profile.h>
++#include <scsi/sg.h>
+ 
+ #define DM_MSG_PREFIX "core"
+ 
+@@ -417,8 +418,9 @@ static int dm_blk_getgeo(struct block_de
+ 	return dm_get_geometry(md, geo);
+ }
+ 
+-static int dm_prepare_ioctl(struct mapped_device *md, int *srcu_idx,
+-			    struct block_device **bdev)
++int _dm_prepare_ioctl(struct mapped_device *md, int *srcu_idx,
++		      struct block_device **bdev,
++		      struct dm_target **tgt0)
+ {
+ 	struct dm_target *ti;
+ 	struct dm_table *map;
+@@ -448,13 +450,24 @@ retry:
+ 		goto retry;
+ 	}
+ 
++	if (r >= 0 && tgt0)
++		*tgt0 = ti;
++
+ 	return r;
+ }
++EXPORT_SYMBOL_GPL(_dm_prepare_ioctl);
++
++static int dm_prepare_ioctl(struct mapped_device *md, int *srcu_idx,
++			    struct block_device **bdev)
++{
++	return _dm_prepare_ioctl(md, srcu_idx, bdev, NULL);
++}
+ 
+-static void dm_unprepare_ioctl(struct mapped_device *md, int srcu_idx)
++void dm_unprepare_ioctl(struct mapped_device *md, int srcu_idx)
+ {
+ 	dm_put_live_table(md, srcu_idx);
+ }
++EXPORT_SYMBOL_GPL(dm_unprepare_ioctl);
+ 
  static int dm_blk_ioctl(struct block_device *bdev, fmode_t mode,
  			unsigned int cmd, unsigned long arg)
- {
+@@ -462,6 +475,18 @@ static int dm_blk_ioctl(struct block_dev
  	struct mapped_device *md = bdev->bd_disk->private_data;
  	int r, srcu_idx;
  
-+	if ((dm_get_md_type(md) == DM_TYPE_REQUEST_BASED) &&
-+            cmd == SG_IO) {
-+		void __user *p = (void __user *)arg;
++	if (cmd == SG_IO && dm_get_md_type(md) == DM_TYPE_REQUEST_BASED) {
++		struct target_type *tgt_type = dm_get_immutable_target_type(md);
 +
-+		return dm_sg_io_ioctl(bdev, mode, p);
++		if (tgt_type) {
++			dm_sg_io_ioctl_fn sg_io_ioctl;
++
++			sg_io_ioctl = tgt_type->sg_io;
++			if (sg_io_ioctl)
++				return sg_io_ioctl(bdev, mode, (void __user *)arg);
++		}
 +	}
 +
  	r = dm_prepare_ioctl(md, &srcu_idx, &bdev);
  	if (r < 0)
  		goto out;
---- a/include/linux/blkdev.h
-+++ b/include/linux/blkdev.h
-@@ -896,6 +896,10 @@ extern blk_status_t blk_insert_cloned_re
- 				     struct request *rq);
- int blk_rq_append_bio(struct request *rq, struct bio *bio);
- extern void blk_queue_split(struct bio **);
+--- a/drivers/scsi/scsi_ioctl.c
++++ b/drivers/scsi/scsi_ioctl.c
+@@ -405,7 +405,7 @@ static int scsi_complete_sghdr_rq(struct
+ 	return ret;
+ }
+ 
+-static int sg_io(struct scsi_device *sdev, struct sg_io_hdr *hdr, fmode_t mode)
++int sg_io(struct scsi_device *sdev, struct sg_io_hdr *hdr, fmode_t mode)
+ {
+ 	unsigned long start_time;
+ 	ssize_t ret = 0;
+@@ -487,6 +487,7 @@ out_put_request:
+ 	blk_mq_free_request(rq);
+ 	return ret;
+ }
++EXPORT_SYMBOL(sg_io);
+ 
+ /**
+  * sg_scsi_ioctl  --  handle deprecated SCSI_IOCTL_SEND_COMMAND ioctl
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@ -152,6 +152,15 @@ typedef size_t (*dm_dax_copy_iter_fn)(st
+ typedef int (*dm_dax_zero_page_range_fn)(struct dm_target *ti, pgoff_t pgoff,
+ 		size_t nr_pages);
+ 
++/*
++ * Returns:
++ * 0 : success
++ * <0: negative error code
++ */
++typedef int (*dm_sg_io_ioctl_fn)(struct block_device *bdev,
++				 fmode_t mode, void __user *arg);
++
++
+ void dm_error(const char *message);
+ 
+ struct dm_dev {
+@@ -206,8 +215,18 @@ struct target_type {
+ 
+ 	/* For internal device-mapper use. */
+ 	struct list_head list;
++
 +#ifndef __GENKSYMS__
-+extern int sg_io(struct request_queue *, struct gendisk *,
-+		 struct sg_io_hdr *, fmode_t mode);
++	dm_sg_io_ioctl_fn sg_io;
 +#endif
- extern int scsi_verify_blk_ioctl(struct block_device *, unsigned int);
- extern int scsi_cmd_blk_ioctl(struct block_device *, fmode_t,
- 			      unsigned int, void __user *);
+ };
+ 
++/* for the sg_io handler */
++int _dm_prepare_ioctl(struct mapped_device *md, int *srcu_idx,
++		      struct block_device **bdev,
++		      struct dm_target **tgt0);
++void dm_unprepare_ioctl(struct mapped_device *md, int srcu_idx);
++
+ /*
+  * Target features
+  */
+--- a/include/scsi/scsi_ioctl.h
++++ b/include/scsi/scsi_ioctl.h
+@@ -51,5 +51,7 @@ int get_sg_io_hdr(struct sg_io_hdr *hdr,
+ int put_sg_io_hdr(const struct sg_io_hdr *hdr, void __user *argp);
+ bool scsi_cmd_allowed(unsigned char *cmd, fmode_t mode);
+ 
++int sg_io(struct scsi_device *sdev, struct sg_io_hdr *hdr, fmode_t mode);
++
+ #endif /* __KERNEL__ */
+ #endif /* _SCSI_IOCTL_H */
