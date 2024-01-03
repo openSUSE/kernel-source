@@ -650,19 +650,16 @@ sub create_project {
 }
 
 sub create_package {
-	my ($self, $prj, $package, $title, $description) = @_;
-	$title ||= $package;
-	$description ||= "";
+	my ($self, $prj, $package, $qa_package, $qa_std_package) = @_;
 
 	my $meta;
 	my $writer = XML::Writer->new(OUTPUT => \$meta);
 	$writer->startTag("package", project => $prj->{name}, name => $package);
-	$writer->dataElement("title", $title);
-	$writer->dataElement("description", $description);
-	# XXX: HACK
-	if ($package =~ /^kernel-obs-(qa|build)/) {
+	$writer->dataElement("title", $package);
+	$writer->dataElement("description", "");
+	if ($qa_package) {
 		$writer->startTag("build");
-		$writer->emptyTag("disable");
+		$writer->emptyTag("disable") unless $qa_std_package;
 		for my $repo (@{$prj->{qa_repos} || []}) {
 			$writer->emptyTag("enable", repository => $repo);
 		}
@@ -796,7 +793,7 @@ sub upload_package {
 	for my $spec (keys(%specfiles)) {
 		next if $remove_packages{$spec};
 		next if $spec eq $package;
-		$self->create_package($prj, $spec);
+		$self->create_package($prj, $spec, ($spec =~ /^kernel-obs-(qa|build)/));
 		$self->put("/source/$project/$spec/_link", $link_xml);
 		&$progresscb('LINK', "$project/$spec");
 		delete($links{$spec});
