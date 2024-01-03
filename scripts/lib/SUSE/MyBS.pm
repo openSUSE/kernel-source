@@ -710,11 +710,8 @@ sub upload_package {
 	my $no_init = $options->{no_init};
 	my $remove_packages = $options->{remove_packages} || [];
 	my %remove_packages = map { $_ => 1 } @$remove_packages;
-	my $limit_packages = $options->{limit_packages} || [];
-	my %limit_packages = map { $_ => 1 } @$limit_packages;
-	my $do_limit_packages = (scalar(@$limit_packages) > 0);
-	my $extra_links = $options->{extra_links} || [];
-	my %specfiles = map { $_ => 1 } @$extra_links;
+	my $specfiles = $options->{specfiles} || [];
+	my %specfiles = map { $_ => 1 } @$specfiles;
 	my $revision;
 	if (!ref($prj)) {
 		$prj = { name => $prj };
@@ -750,11 +747,6 @@ sub upload_package {
 		if ($remote->{$name}) {
 			delete $remote->{$name};
 		}
-		if ($name =~ /(.*)\.spec$/) {
-			if ($1 ne $package) {
-				$specfiles{$1} = 1;
-			}
-		}
 	}
 	closedir($dh);
 	for my $name (keys(%$remote)) {
@@ -782,7 +774,7 @@ sub upload_package {
 
 	for my $spec (keys(%specfiles)) {
 		next if $remove_packages{$spec};
-		next if $do_limit_packages && !$limit_packages{$spec};
+		next if $spec eq $package;
 		$self->create_package($prj, $spec);
 		$self->put("/source/$project/$spec/_link", $link_xml);
 		&$progresscb('LINK', "$project/$spec");
