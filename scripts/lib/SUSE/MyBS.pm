@@ -26,6 +26,7 @@ use SUSE::MyBS::Buildresults;
 my $cookiefile = "~/.local/state/MyBS/cookie";
 my $lockfile = $cookiefile . ".lock";
 my $locktime = 300;
+my $errok = ();
 
 sub new {
 	my ($class, $api_url) = @_;
@@ -362,7 +363,12 @@ sub api {
 	}
 	if ($res->code != 200) {
 		#print STDERR $res->as_string();
-		die "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
+		my $message = "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
+		if ($errok) {
+			print STDERR $message;
+		} else {
+			die $message;
+		}
 	}
 	my $headers = $res->headers();
 	my $cookie = $headers->{'set-cookie'};
@@ -703,6 +709,14 @@ sub get_directory_revision {
 	return $p->{res}[0];
 }
 
+sub wipe_package {
+	my ($self, $project, $package, $progresscb) = @_;
+	$errok = 1;
+	$self->post("/build/$project?cmd=wipe&package=$package");
+	$errok = ();
+	&$progresscb('WIPE', "$project/$package");
+}
+
 sub upload_package {
 	my ($self, $dir, $prj, $package, $commit, $options) = @_;
 	$options ||= {};
@@ -724,6 +738,13 @@ sub upload_package {
 	if (!$no_init) {
 		$self->create_package($prj, $package);
 		&$progresscb('CREATE', "$project/$package");
+	}
+	# delete stale kernel-obs-build
+	my $wipe = 'kernel-obs-build';
+	if ($specfiles{$wipe}) {
+		$self->wipe_package($project, $wipe, $progresscb);
+	} else {
+		$wipe = ();
 	}
 	opendir(my $dh, $dir) or die "$dir: $!\n";
 	my $remote = $self->readdir("/source/$project/$package");
@@ -786,10 +807,8 @@ sub upload_package {
 		&$progresscb('DELETE', "$project/$link");
 	}
 	# delete stale kernel-obs-build
-	my $kob = "kernel-obs-build";
-	if ($specfiles{$kob}) {
-		$self->post("/build/$project?cmd=wipe&package=$kob");
-		&$progresscb('WIPE', "$project $kob");
+	if ($wipe) {
+		$self->wipe_package($project, $wipe, $progresscb);
 	}
 	return $revision;
 }
