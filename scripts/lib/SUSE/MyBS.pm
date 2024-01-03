@@ -755,7 +755,7 @@ sub upload_package {
 	}
 	# delete stale kernel-obs-build
 	my $wipe = 'kernel-obs-build';
-	if ($specfiles{$wipe}) {
+	if (($specfiles{$wipe} or $multibuild) and not $no_init) {
 		$wipe = ($multibuild ? $package . ":" : "") . $wipe;
 		$self->wipe_package($project, $wipe, $progresscb);
 	} else {
