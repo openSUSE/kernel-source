@@ -513,6 +513,7 @@ sub get_repo_archs {
 
 sub create_project {
 	my ($self, $project, $options) = @_;
+	my $multibuild = $options->{multibuild};
 	my %limit_archs;
 
 	$options->{title} ||= $project,
@@ -644,7 +645,22 @@ sub create_project {
 	for my $macro (@{$options->{macros} || []}) {
 		$prjconf .= "$macro\n";
 	}
+	my $qa_expr = "";
+	for my $repo (@qa_repos) {
+		my $separator = $qa_expr ? " || " : "";
+		$qa_expr .= $separator . '("%_repository" == "' . $repo . '")';
+	}
+	$prjconf .= "%is_kotd_qa ($qa_expr)\n";
 	$prjconf .= ":Macros\n";
+	my $specfiles = $options->{limit_packages} || [];
+	if (@$specfiles && $multibuild) {
+		my %specfiles = map { $_ => 1 } @$specfiles;
+		my $package = $options->{package};
+		for my $spec (keys(%specfiles)) {
+			$spec = ($spec eq $package) ? $package : "$package:$spec";
+			$prjconf .= "BuildFlags: onlybuild:$spec\n";
+		}
+	}
 	$self->put("/source/$project/_config", $prjconf);
 	return { name => $project, qa_repos => \@qa_repos };
 }
@@ -717,6 +733,7 @@ sub wipe_package {
 sub upload_package {
 	my ($self, $dir, $prj, $package, $commit, $options) = @_;
 	$options ||= {};
+	my $multibuild = $options->{multibuild};
 	my $progresscb = $options->{progresscb} || sub { };
 	my $no_init = $options->{no_init};
 	my $remove_packages = $options->{remove_packages} || [];
@@ -733,12 +750,13 @@ sub upload_package {
 		die "Project $project does not exist\n";
 	}
 	if (!$no_init) {
-		$self->create_package($prj, $package);
+		$self->create_package($prj, $package, $multibuild, 1);
 		&$progresscb('CREATE', "$project/$package");
 	}
 	# delete stale kernel-obs-build
 	my $wipe = 'kernel-obs-build';
 	if ($specfiles{$wipe}) {
+		$wipe = ($multibuild ? $package . ":" : "") . $wipe;
 		$self->wipe_package($project, $wipe, $progresscb);
 	} else {
 		$wipe = ();
@@ -784,19 +802,20 @@ sub upload_package {
 
 	# Create links for all specfiles in this package
 	my %links = map { $_ => 1 } $self->local_links($project, $package);
-	my $link_xml;
-	my $writer = XML::Writer->new(OUTPUT => \$link_xml);
-	$writer->emptyTag("link", project => $project, package => $package,
-		cicount => "copy");
-	$writer->end();
-
-	for my $spec (keys(%specfiles)) {
-		next if $remove_packages{$spec};
-		next if $spec eq $package;
-		$self->create_package($prj, $spec, ($spec =~ /^kernel-obs-(qa|build)/));
-		$self->put("/source/$project/$spec/_link", $link_xml);
-		&$progresscb('LINK', "$project/$spec");
-		delete($links{$spec});
+	if (not $multibuild) {
+		my $link_xml;
+		my $writer = XML::Writer->new(OUTPUT => \$link_xml);
+		$writer->emptyTag("link", project => $project, package => $package,
+			cicount => "copy");
+		$writer->end();
+		for my $spec (keys(%specfiles)) {
+			next if $remove_packages{$spec};
+			next if $spec eq $package;
+			$self->create_package($prj, $spec, ($spec =~ /^kernel-obs-(qa|build)/));
+			$self->put("/source/$project/$spec/_link", $link_xml);
+			&$progresscb('LINK', "$project/$spec");
+			delete($links{$spec});
+		}
 	}
 	# delete stale links
 	for my $link (keys(%links)) {
