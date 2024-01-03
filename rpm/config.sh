@@ -10,6 +10,8 @@ COMPRESS_MODULES="xz"
 BUILD_DTBS="Yes"
 BUILD_HTML=Yes
 BUILD_PDF=Yes
+# Generate a _multibuild file
+MULTIBUILD="Yes"
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:Factory
 OBS_PROJECT_ARM=openSUSE:Factory:ARM
