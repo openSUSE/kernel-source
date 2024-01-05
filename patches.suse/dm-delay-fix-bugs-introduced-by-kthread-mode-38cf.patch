@@ -1,0 +1,204 @@
+From 38cfff568169ff9f99784948f79f62ca1af5a187 Mon Sep 17 00:00:00 2001
+From: Mikulas Patocka <mpatocka@redhat.com>
+Date: Fri, 17 Nov 2023 18:22:47 +0100
+Subject: [PATCH] dm-delay: fix bugs introduced by kthread mode
+Git-commit: 38cfff568169ff9f99784948f79f62ca1af5a187
+Patch-mainline: v6.7-rc2
+References: jsc#PED-7514
+
+This commit fixes the following bugs introduced by commit 70bbeb29fab0
+("dm delay: for short delays, use kthread instead of timers and wq"):
+
+* the function flush_worker_fn has no exit path - on unload, this
+  function will just loop and consume 100% CPU without any progress
+
+* the wake-up mechanism in flush_worker_fn is racy - a wake up will be
+  missed if the process adds entries to the delayed_bios list just
+  before set_current_state(TASK_INTERRUPTIBLE)
+
+* flush_delayed_bios_fast submits a bio while holding a global mutex;
+  this may deadlock if we have multiple stacked dm-delay devices and
+  the underlying device attempts to acquire the mutex too
+
+* if the target constructor fails, it will call delay_dtr. delay_dtr
+  would attempt to free dc->timer_lock without it being initialized by
+  the constructor.
+
+* if the target constructor's kthread allocation fails, delay_dtr
+  would crash trying to dereference dc->worker because it is non-NULL
+  due to ERR_PTR.
+
+Fixes: 70bbeb29fab0 ("dm delay: for short delays, use kthread instead of timers and wq")
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/dm-delay.c | 61 +++++++++++++++++++++++++------------------
+ 1 file changed, 35 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/md/dm-delay.c b/drivers/md/dm-delay.c
+index 2d6b900e4353..00c09d9fffeb 100644
+--- a/drivers/md/dm-delay.c
++++ b/drivers/md/dm-delay.c
+@@ -73,9 +73,23 @@ static inline bool delay_is_fast(struct delay_c *dc)
+ 	return !!dc->worker;
+ }
+ 
++static void flush_bios(struct bio *bio)
++{
++	struct bio *n;
++
++	while (bio) {
++		n = bio->bi_next;
++		bio->bi_next = NULL;
++		dm_submit_bio_remap(bio, NULL);
++		bio = n;
++	}
++}
++
+ static void flush_delayed_bios_fast(struct delay_c *dc, bool flush_all)
+ {
+ 	struct dm_delay_info *delayed, *next;
++	struct bio_list flush_bio_list;
++	bio_list_init(&flush_bio_list);
+ 
+ 	mutex_lock(&delayed_bios_lock);
+ 	list_for_each_entry_safe(delayed, next, &dc->delayed_bios, list) {
+@@ -83,47 +97,42 @@ static void flush_delayed_bios_fast(struct delay_c *dc, bool flush_all)
+ 			struct bio *bio = dm_bio_from_per_bio_data(delayed,
+ 						sizeof(struct dm_delay_info));
+ 			list_del(&delayed->list);
+-			dm_submit_bio_remap(bio, NULL);
++			bio_list_add(&flush_bio_list, bio);
+ 			delayed->class->ops--;
+ 		}
+ 	}
+ 	mutex_unlock(&delayed_bios_lock);
++
++	flush_bios(bio_list_get(&flush_bio_list));
+ }
+ 
+ static int flush_worker_fn(void *data)
+ {
+ 	struct delay_c *dc = data;
+ 
+-	while (1) {
++	while (!kthread_should_stop()) {
+ 		flush_delayed_bios_fast(dc, false);
++		mutex_lock(&delayed_bios_lock);
+ 		if (unlikely(list_empty(&dc->delayed_bios))) {
+ 			set_current_state(TASK_INTERRUPTIBLE);
++			mutex_unlock(&delayed_bios_lock);
+ 			schedule();
+-		} else
++		} else {
++			mutex_unlock(&delayed_bios_lock);
+ 			cond_resched();
++		}
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-static void flush_bios(struct bio *bio)
+-{
+-	struct bio *n;
+-
+-	while (bio) {
+-		n = bio->bi_next;
+-		bio->bi_next = NULL;
+-		dm_submit_bio_remap(bio, NULL);
+-		bio = n;
+-	}
+-}
+-
+-static struct bio *flush_delayed_bios(struct delay_c *dc, bool flush_all)
++static void flush_delayed_bios(struct delay_c *dc, bool flush_all)
+ {
+ 	struct dm_delay_info *delayed, *next;
+ 	unsigned long next_expires = 0;
+ 	unsigned long start_timer = 0;
+-	struct bio_list flush_bios = { };
++	struct bio_list flush_bio_list;
++	bio_list_init(&flush_bio_list);
+ 
+ 	mutex_lock(&delayed_bios_lock);
+ 	list_for_each_entry_safe(delayed, next, &dc->delayed_bios, list) {
+@@ -131,7 +140,7 @@ static struct bio *flush_delayed_bios(struct delay_c *dc, bool flush_all)
+ 			struct bio *bio = dm_bio_from_per_bio_data(delayed,
+ 						sizeof(struct dm_delay_info));
+ 			list_del(&delayed->list);
+-			bio_list_add(&flush_bios, bio);
++			bio_list_add(&flush_bio_list, bio);
+ 			delayed->class->ops--;
+ 			continue;
+ 		}
+@@ -147,7 +156,7 @@ static struct bio *flush_delayed_bios(struct delay_c *dc, bool flush_all)
+ 	if (start_timer)
+ 		queue_timeout(dc, next_expires);
+ 
+-	return bio_list_get(&flush_bios);
++	flush_bios(bio_list_get(&flush_bio_list));
+ }
+ 
+ static void flush_expired_bios(struct work_struct *work)
+@@ -158,7 +167,7 @@ static void flush_expired_bios(struct work_struct *work)
+ 	if (delay_is_fast(dc))
+ 		flush_delayed_bios_fast(dc, false);
+ 	else
+-		flush_bios(flush_delayed_bios(dc, false));
++		flush_delayed_bios(dc, false);
+ }
+ 
+ static void delay_dtr(struct dm_target *ti)
+@@ -177,8 +186,7 @@ static void delay_dtr(struct dm_target *ti)
+ 	if (dc->worker)
+ 		kthread_stop(dc->worker);
+ 
+-	if (!delay_is_fast(dc))
+-		mutex_destroy(&dc->timer_lock);
++	mutex_destroy(&dc->timer_lock);
+ 
+ 	kfree(dc);
+ }
+@@ -236,6 +244,7 @@ static int delay_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+ 
+ 	ti->private = dc;
+ 	INIT_LIST_HEAD(&dc->delayed_bios);
++	mutex_init(&dc->timer_lock);
+ 	dc->may_delay = true;
+ 	dc->argc = argc;
+ 
+@@ -282,12 +291,12 @@ static int delay_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+ 					    "dm-delay-flush-worker");
+ 		if (IS_ERR(dc->worker)) {
+ 			ret = PTR_ERR(dc->worker);
++			dc->worker = NULL;
+ 			goto bad;
+ 		}
+ 	} else {
+ 		timer_setup(&dc->delay_timer, handle_delayed_timer, 0);
+ 		INIT_WORK(&dc->flush_expired_bios, flush_expired_bios);
+-		mutex_init(&dc->timer_lock);
+ 		dc->kdelayd_wq = alloc_workqueue("kdelayd", WQ_MEM_RECLAIM, 0);
+ 		if (!dc->kdelayd_wq) {
+ 			ret = -EINVAL;
+@@ -345,11 +354,11 @@ static void delay_presuspend(struct dm_target *ti)
+ 	dc->may_delay = false;
+ 	mutex_unlock(&delayed_bios_lock);
+ 
+-	if (delay_is_fast(dc))
++	if (delay_is_fast(dc)) {
+ 		flush_delayed_bios_fast(dc, true);
+-	else {
++	} else {
+ 		del_timer_sync(&dc->delay_timer);
+-		flush_bios(flush_delayed_bios(dc, true));
++		flush_delayed_bios(dc, true);
+ 	}
+ }
+ 
+-- 
+2.35.3
+
