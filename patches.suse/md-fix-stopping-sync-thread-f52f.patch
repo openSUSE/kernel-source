@@ -1,0 +1,199 @@
+From f52f5c71f3d4bb0992800139d2f35cf9f6f6e0ee Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Tue, 5 Dec 2023 17:42:15 +0800
+Subject: [PATCH] md: fix stopping sync thread
+Git-commit: f52f5c71f3d4bb0992800139d2f35cf9f6f6e0ee
+Patch-mainline: v6.7-rc5
+References: jsc#PED-7542
+
+Currently sync thread is stopped from multiple contex:
+ - idle_sync_thread
+ - frozen_sync_thread
+ - __md_stop_writes
+ - md_set_readonly
+ - do_md_stop
+
+And there are some problems:
+1) sync_work is flushed while reconfig_mutex is grabbed, this can
+   deadlock because the work function will grab reconfig_mutex as well.
+2) md_reap_sync_thread() can't be called directly while md_do_sync() is
+   not finished yet, for example, commit 130443d60b1b ("md: refactor
+   idle/frozen_sync_thread() to fix deadlock").
+3) If MD_RECOVERY_RUNNING is not set, there is no need to stop
+   sync_thread at all because sync_thread must not be registered.
+
+Factor out a helper stop_sync_thread(), so that above contex will behave
+the same. Fix 1) by flushing sync_work after reconfig_mutex is released,
+before waiting for sync_thread to be done; Fix 2) bt letting daemon thread
+to unregister sync_thread; Fix 3) by always checking MD_RECOVERY_RUNNING
+first.
+
+Fixes: db5e653d7c9f ("md: delay choosing sync action to md_start_sync()")
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Signed-off-by: Song Liu <song@kernel.org>
+Link: https://lore.kernel.org/r/20231205094215.1824240-4-yukuai1@huaweicloud.com
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/md.c | 90 ++++++++++++++++++++-----------------------------
+ 1 file changed, 37 insertions(+), 53 deletions(-)
+
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 2d8e45a1af23..bc9d67af1961 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -4840,25 +4840,29 @@ action_show(struct mddev *mddev, char *page)
+ 	return sprintf(page, "%s\n", type);
+ }
+ 
+-static void stop_sync_thread(struct mddev *mddev)
++/**
++ * stop_sync_thread() - wait for sync_thread to stop if it's running.
++ * @mddev:	the array.
++ * @locked:	if set, reconfig_mutex will still be held after this function
++ *		return; if not set, reconfig_mutex will be released after this
++ *		function return.
++ * @check_seq:	if set, only wait for curent running sync_thread to stop, noted
++ *		that new sync_thread can still start.
++ */
++static void stop_sync_thread(struct mddev *mddev, bool locked, bool check_seq)
+ {
+-	if (!test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
+-		return;
++	int sync_seq;
+ 
+-	if (mddev_lock(mddev))
+-		return;
++	if (check_seq)
++		sync_seq = atomic_read(&mddev->sync_seq);
+ 
+-	/*
+-	 * Check again in case MD_RECOVERY_RUNNING is cleared before lock is
+-	 * held.
+-	 */
+ 	if (!test_bit(MD_RECOVERY_RUNNING, &mddev->recovery)) {
+-		mddev_unlock(mddev);
++		if (!locked)
++			mddev_unlock(mddev);
+ 		return;
+ 	}
+ 
+-	if (work_pending(&mddev->sync_work))
+-		flush_workqueue(md_misc_wq);
++	mddev_unlock(mddev);
+ 
+ 	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+ 	/*
+@@ -4866,21 +4870,28 @@ static void stop_sync_thread(struct mddev *mddev)
+ 	 * never happen
+ 	 */
+ 	md_wakeup_thread_directly(mddev->sync_thread);
++	if (work_pending(&mddev->sync_work))
++		flush_work(&mddev->sync_work);
+ 
+-	mddev_unlock(mddev);
++	wait_event(resync_wait,
++		   !test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) ||
++		   (check_seq && sync_seq != atomic_read(&mddev->sync_seq)));
++
++	if (locked)
++		mddev_lock_nointr(mddev);
+ }
+ 
+ static void idle_sync_thread(struct mddev *mddev)
+ {
+-	int sync_seq = atomic_read(&mddev->sync_seq);
+-
+ 	mutex_lock(&mddev->sync_mutex);
+ 	clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+-	stop_sync_thread(mddev);
+ 
+-	wait_event(resync_wait, sync_seq != atomic_read(&mddev->sync_seq) ||
+-			!test_bit(MD_RECOVERY_RUNNING, &mddev->recovery));
++	if (mddev_lock(mddev)) {
++		mutex_unlock(&mddev->sync_mutex);
++		return;
++	}
+ 
++	stop_sync_thread(mddev, false, true);
+ 	mutex_unlock(&mddev->sync_mutex);
+ }
+ 
+@@ -4888,11 +4899,13 @@ static void frozen_sync_thread(struct mddev *mddev)
+ {
+ 	mutex_lock(&mddev->sync_mutex);
+ 	set_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+-	stop_sync_thread(mddev);
+ 
+-	wait_event(resync_wait, mddev->sync_thread == NULL &&
+-			!test_bit(MD_RECOVERY_RUNNING, &mddev->recovery));
++	if (mddev_lock(mddev)) {
++		mutex_unlock(&mddev->sync_mutex);
++		return;
++	}
+ 
++	stop_sync_thread(mddev, false, false);
+ 	mutex_unlock(&mddev->sync_mutex);
+ }
+ 
+@@ -6264,14 +6277,7 @@ static void md_clean(struct mddev *mddev)
+ 
+ static void __md_stop_writes(struct mddev *mddev)
+ {
+-	set_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+-	if (work_pending(&mddev->sync_work))
+-		flush_workqueue(md_misc_wq);
+-	if (mddev->sync_thread) {
+-		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+-		md_reap_sync_thread(mddev);
+-	}
+-
++	stop_sync_thread(mddev, true, false);
+ 	del_timer_sync(&mddev->safemode_timer);
+ 
+ 	if (mddev->pers && mddev->pers->quiesce) {
+@@ -6363,18 +6369,8 @@ static int md_set_readonly(struct mddev *mddev, struct block_device *bdev)
+ 		set_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+ 		md_wakeup_thread(mddev->thread);
+ 	}
+-	if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
+-		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+-
+-	/*
+-	 * Thread might be blocked waiting for metadata update which will now
+-	 * never happen
+-	 */
+-	md_wakeup_thread_directly(mddev->sync_thread);
+ 
+-	mddev_unlock(mddev);
+-	wait_event(resync_wait, !test_bit(MD_RECOVERY_RUNNING,
+-					  &mddev->recovery));
++	stop_sync_thread(mddev, false, false);
+ 	wait_event(mddev->sb_wait,
+ 		   !test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags));
+ 	mddev_lock_nointr(mddev);
+@@ -6428,20 +6424,8 @@ static int do_md_stop(struct mddev *mddev, int mode,
+ 		set_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+ 		md_wakeup_thread(mddev->thread);
+ 	}
+-	if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
+-		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+ 
+-	/*
+-	 * Thread might be blocked waiting for metadata update which will now
+-	 * never happen
+-	 */
+-	md_wakeup_thread_directly(mddev->sync_thread);
+-
+-	mddev_unlock(mddev);
+-	wait_event(resync_wait, (mddev->sync_thread == NULL &&
+-				 !test_bit(MD_RECOVERY_RUNNING,
+-					   &mddev->recovery)));
+-	mddev_lock_nointr(mddev);
++	stop_sync_thread(mddev, true, false);
+ 
+ 	mutex_lock(&mddev->open_mutex);
+ 	if ((mddev->pers && atomic_read(&mddev->openers) > !!bdev) ||
+-- 
+2.35.3
+
