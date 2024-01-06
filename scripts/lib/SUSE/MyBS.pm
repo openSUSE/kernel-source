@@ -26,6 +26,7 @@ use SUSE::MyBS::Buildresults;
 my $cookiefile = "~/.local/state/MyBS/cookie";
 my $lockfile = $cookiefile . ".lock";
 my $locktime = 300;
+my $errok = ();
 
 sub new {
 	my ($class, $api_url) = @_;
@@ -362,7 +363,12 @@ sub api {
 	}
 	if ($res->code != 200) {
 		#print STDERR $res->as_string();
-		die "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
+		my $message = "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
+		if ($errok) {
+			print STDERR $message;
+		} else {
+			die $message;
+		}
 	}
 	my $headers = $res->headers();
 	my $cookie = $headers->{'set-cookie'};
@@ -507,6 +513,7 @@ sub get_repo_archs {
 
 sub create_project {
 	my ($self, $project, $options) = @_;
+	my $multibuild = $options->{multibuild};
 	my %limit_archs;
 
 	$options->{title} ||= $project,
@@ -634,29 +641,42 @@ sub create_project {
 	for my $package (@{$options->{add_packages} || []}) {
 		$prjconf .= "Support: $package\n";
 	}
+	$prjconf .= "BuildFlags: allowrootforbuild\n" if $multibuild;
 	$prjconf .= "Macros:\n";
 	for my $macro (@{$options->{macros} || []}) {
 		$prjconf .= "$macro\n";
 	}
+	my $qa_expr = "";
+	for my $repo (@qa_repos) {
+		my $separator = $qa_expr ? " || " : "";
+		$qa_expr .= $separator . '("%_repository" == "' . $repo . '")';
+	}
+	$prjconf .= "%is_kotd_qa ($qa_expr)\n";
 	$prjconf .= ":Macros\n";
+	my $specfiles = $options->{limit_packages} || [];
+	if (@$specfiles && $multibuild) {
+		my %specfiles = map { $_ => 1 } @$specfiles;
+		my $package = $options->{package};
+		for my $spec (keys(%specfiles)) {
+			$spec = ($spec eq $package) ? $package : "$package:$spec";
+			$prjconf .= "BuildFlags: onlybuild:$spec\n";
+		}
+	}
 	$self->put("/source/$project/_config", $prjconf);
 	return { name => $project, qa_repos => \@qa_repos };
 }
 
 sub create_package {
-	my ($self, $prj, $package, $title, $description) = @_;
-	$title ||= $package;
-	$description ||= "";
+	my ($self, $prj, $package, $qa_package, $qa_std_package) = @_;
 
 	my $meta;
 	my $writer = XML::Writer->new(OUTPUT => \$meta);
 	$writer->startTag("package", project => $prj->{name}, name => $package);
-	$writer->dataElement("title", $title);
-	$writer->dataElement("description", $description);
-	# XXX: HACK
-	if ($package =~ /^kernel-obs-(qa|build)/) {
+	$writer->dataElement("title", $package);
+	$writer->dataElement("description", "");
+	if ($qa_package) {
 		$writer->startTag("build");
-		$writer->emptyTag("disable");
+		$writer->emptyTag("disable") unless $qa_std_package;
 		for my $repo (@{$prj->{qa_repos} || []}) {
 			$writer->emptyTag("enable", repository => $repo);
 		}
@@ -703,18 +723,24 @@ sub get_directory_revision {
 	return $p->{res}[0];
 }
 
+sub wipe_package {
+	my ($self, $project, $package, $progresscb) = @_;
+	$errok = 1;
+	$self->post("/build/$project?cmd=wipe&package=$package");
+	$errok = ();
+	&$progresscb('WIPE', "$project/$package");
+}
+
 sub upload_package {
 	my ($self, $dir, $prj, $package, $commit, $options) = @_;
 	$options ||= {};
+	my $multibuild = $options->{multibuild};
 	my $progresscb = $options->{progresscb} || sub { };
 	my $no_init = $options->{no_init};
 	my $remove_packages = $options->{remove_packages} || [];
 	my %remove_packages = map { $_ => 1 } @$remove_packages;
-	my $limit_packages = $options->{limit_packages} || [];
-	my %limit_packages = map { $_ => 1 } @$limit_packages;
-	my $do_limit_packages = (scalar(@$limit_packages) > 0);
-	my $extra_links = $options->{extra_links} || [];
-	my %specfiles = map { $_ => 1 } @$extra_links;
+	my $specfiles = $options->{specfiles} || [];
+	my %specfiles = map { $_ => 1 } @$specfiles;
 	my $revision;
 	if (!ref($prj)) {
 		$prj = { name => $prj };
@@ -725,8 +751,16 @@ sub upload_package {
 		die "Project $project does not exist\n";
 	}
 	if (!$no_init) {
-		$self->create_package($prj, $package);
+		$self->create_package($prj, $package, $multibuild, 1);
 		&$progresscb('CREATE', "$project/$package");
+	}
+	# delete stale kernel-obs-build
+	my $wipe = 'kernel-obs-build';
+	if (($specfiles{$wipe} or $multibuild) and not $no_init) {
+		$wipe = ($multibuild ? $package . ":" : "") . $wipe;
+		$self->wipe_package($project, $wipe, $progresscb);
+	} else {
+		$wipe = ();
 	}
 	opendir(my $dh, $dir) or die "$dir: $!\n";
 	my $remote = $self->readdir("/source/$project/$package");
@@ -750,11 +784,6 @@ sub upload_package {
 		if ($remote->{$name}) {
 			delete $remote->{$name};
 		}
-		if ($name =~ /(.*)\.spec$/) {
-			if ($1 ne $package) {
-				$specfiles{$1} = 1;
-			}
-		}
 	}
 	closedir($dh);
 	for my $name (keys(%$remote)) {
@@ -774,19 +803,20 @@ sub upload_package {
 
 	# Create links for all specfiles in this package
 	my %links = map { $_ => 1 } $self->local_links($project, $package);
-	my $link_xml;
-	my $writer = XML::Writer->new(OUTPUT => \$link_xml);
-	$writer->emptyTag("link", project => $project, package => $package,
-		cicount => "copy");
-	$writer->end();
-
-	for my $spec (keys(%specfiles)) {
-		next if $remove_packages{$spec};
-		next if $do_limit_packages && !$limit_packages{$spec};
-		$self->create_package($prj, $spec);
-		$self->put("/source/$project/$spec/_link", $link_xml);
-		&$progresscb('LINK', "$project/$spec");
-		delete($links{$spec});
+	if (not $multibuild) {
+		my $link_xml;
+		my $writer = XML::Writer->new(OUTPUT => \$link_xml);
+		$writer->emptyTag("link", project => $project, package => $package,
+			cicount => "copy");
+		$writer->end();
+		for my $spec (keys(%specfiles)) {
+			next if $remove_packages{$spec};
+			next if $spec eq $package;
+			$self->create_package($prj, $spec, ($spec =~ /^kernel-obs-(qa|build)/));
+			$self->put("/source/$project/$spec/_link", $link_xml);
+			&$progresscb('LINK', "$project/$spec");
+			delete($links{$spec});
+		}
 	}
 	# delete stale links
 	for my $link (keys(%links)) {
@@ -794,10 +824,8 @@ sub upload_package {
 		&$progresscb('DELETE', "$project/$link");
 	}
 	# delete stale kernel-obs-build
-	my $kob = "kernel-obs-build";
-	if ($specfiles{$kob}) {
-		$self->post("/build/$project?cmd=wipe&package=$kob");
-		&$progresscb('WIPE', "$project $kob");
+	if ($wipe) {
+		$self->wipe_package($project, $wipe, $progresscb);
 	}
 	return $revision;
 }
