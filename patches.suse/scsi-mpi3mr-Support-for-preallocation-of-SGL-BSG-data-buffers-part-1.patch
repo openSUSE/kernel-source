@@ -1,0 +1,203 @@
+From: Chandrakanth patil <chandrakanth.patil@broadcom.com>
+Date: Wed, 6 Dec 2023 00:46:27 +0530
+Subject: scsi: mpi3mr: Support for preallocation of SGL BSG data buffers
+ part-1
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/jejb/scsi.git
+Git-commit: c432e167523939e64ff882c86cdbf28e279a56ab
+Patch-mainline: Queued in subsystem maintainer repo
+References: bsc#1218003
+
+The driver now supports SGLs for BSG data transfer. Upon loading, the
+driver pre-allocates SGLs in chunks of 8k, results in a total of 256 * 8k,
+equal to 2MB. These pre-allocated SGLs are reserved for handling BSG
+commands and are deallocated during driver unload.
+
+Co-developed-by: Sathya Prakash <sathya.prakash@broadcom.com>
+Signed-off-by: Sathya Prakash <sathya.prakash@broadcom.com>
+Signed-off-by: Chandrakanth patil <chandrakanth.patil@broadcom.com>
+Link: https://lore.kernel.org/r/20231205191630.12201-2-chandrakanth.patil@broadcom.com
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Lee Duncan <lduncan@suse.com>
+---
+ drivers/scsi/mpi3mr/mpi3mr.h    |  15 ++++++
+ drivers/scsi/mpi3mr/mpi3mr_fw.c | 112 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 127 insertions(+)
+
+diff --git a/drivers/scsi/mpi3mr/mpi3mr.h b/drivers/scsi/mpi3mr/mpi3mr.h
+index 4f49f8396309..8fce57894f8f 100644
+--- a/drivers/scsi/mpi3mr/mpi3mr.h
++++ b/drivers/scsi/mpi3mr/mpi3mr.h
+@@ -477,6 +477,10 @@ struct mpi3mr_throttle_group_info {
+ /* HBA port flags */
+ #define MPI3MR_HBA_PORT_FLAG_DIRTY	0x01
+ 
++/* IOCTL data transfer sge*/
++#define MPI3MR_NUM_IOCTL_SGE		256
++#define MPI3MR_IOCTL_SGE_SIZE		(8 * 1024)
++
+ /**
+  * struct mpi3mr_hba_port - HBA's port information
+  * @port_id: Port number
+@@ -1042,6 +1046,11 @@ struct scmd_priv {
+  * @sas_node_lock: Lock to protect SAS node list
+  * @hba_port_table_list: List of HBA Ports
+  * @enclosure_list: List of Enclosure objects
++ * @ioctl_dma_pool: DMA pool for IOCTL data buffers
++ * @ioctl_sge: DMA buffer descriptors for IOCTL data
++ * @ioctl_chain_sge: DMA buffer descriptor for IOCTL chain
++ * @ioctl_resp_sge: DMA buffer descriptor for Mgmt cmd response
++ * @ioctl_sges_allocated: Flag for IOCTL SGEs allocated or not
+  */
+ struct mpi3mr_ioc {
+ 	struct list_head list;
+@@ -1227,6 +1236,12 @@ struct mpi3mr_ioc {
+ 	spinlock_t sas_node_lock;
+ 	struct list_head hba_port_table_list;
+ 	struct list_head enclosure_list;
++
++	struct dma_pool *ioctl_dma_pool;
++	struct dma_memory_desc ioctl_sge[MPI3MR_NUM_IOCTL_SGE];
++	struct dma_memory_desc ioctl_chain_sge;
++	struct dma_memory_desc ioctl_resp_sge;
++	bool ioctl_sges_allocated;
+ };
+ 
+ /**
+diff --git a/drivers/scsi/mpi3mr/mpi3mr_fw.c b/drivers/scsi/mpi3mr/mpi3mr_fw.c
+index 1ad2f88e0528..d8c57a0a518f 100644
+--- a/drivers/scsi/mpi3mr/mpi3mr_fw.c
++++ b/drivers/scsi/mpi3mr/mpi3mr_fw.c
+@@ -1058,6 +1058,114 @@ enum mpi3mr_iocstate mpi3mr_get_iocstate(struct mpi3mr_ioc *mrioc)
+ 	return MRIOC_STATE_RESET_REQUESTED;
+ }
+ 
++/**
++ * mpi3mr_free_ioctl_dma_memory - free memory for ioctl dma
++ * @mrioc: Adapter instance reference
++ *
++ * Free the DMA memory allocated for IOCTL handling purpose.
++
++ *
++ * Return: None
++ */
++static void mpi3mr_free_ioctl_dma_memory(struct mpi3mr_ioc *mrioc)
++{
++	struct dma_memory_desc *mem_desc;
++	u16 i;
++
++	if (!mrioc->ioctl_dma_pool)
++		return;
++
++	for (i = 0; i < MPI3MR_NUM_IOCTL_SGE; i++) {
++		mem_desc = &mrioc->ioctl_sge[i];
++		if (mem_desc->addr) {
++			dma_pool_free(mrioc->ioctl_dma_pool,
++				      mem_desc->addr,
++				      mem_desc->dma_addr);
++			mem_desc->addr = NULL;
++		}
++	}
++	dma_pool_destroy(mrioc->ioctl_dma_pool);
++	mrioc->ioctl_dma_pool = NULL;
++	mem_desc = &mrioc->ioctl_chain_sge;
++
++	if (mem_desc->addr) {
++		dma_free_coherent(&mrioc->pdev->dev, mem_desc->size,
++				  mem_desc->addr, mem_desc->dma_addr);
++		mem_desc->addr = NULL;
++	}
++	mem_desc = &mrioc->ioctl_resp_sge;
++	if (mem_desc->addr) {
++		dma_free_coherent(&mrioc->pdev->dev, mem_desc->size,
++				  mem_desc->addr, mem_desc->dma_addr);
++		mem_desc->addr = NULL;
++	}
++
++	mrioc->ioctl_sges_allocated = false;
++}
++
++/**
++ * mpi3mr_alloc_ioctl_dma_memory - Alloc memory for ioctl dma
++ * @mrioc: Adapter instance reference
++
++ *
++ * This function allocates dmaable memory required to handle the
++ * application issued MPI3 IOCTL requests.
++ *
++ * Return: None
++ */
++static void mpi3mr_alloc_ioctl_dma_memory(struct mpi3mr_ioc *mrioc)
++
++{
++	struct dma_memory_desc *mem_desc;
++	u16 i;
++
++	mrioc->ioctl_dma_pool = dma_pool_create("ioctl dma pool",
++						&mrioc->pdev->dev,
++						MPI3MR_IOCTL_SGE_SIZE,
++						MPI3MR_PAGE_SIZE_4K, 0);
++
++	if (!mrioc->ioctl_dma_pool) {
++		ioc_err(mrioc, "ioctl_dma_pool: dma_pool_create failed\n");
++		goto out_failed;
++	}
++
++	for (i = 0; i < MPI3MR_NUM_IOCTL_SGE; i++) {
++		mem_desc = &mrioc->ioctl_sge[i];
++		mem_desc->size = MPI3MR_IOCTL_SGE_SIZE;
++		mem_desc->addr = dma_pool_zalloc(mrioc->ioctl_dma_pool,
++						 GFP_KERNEL,
++						 &mem_desc->dma_addr);
++		if (!mem_desc->addr)
++			goto out_failed;
++	}
++
++	mem_desc = &mrioc->ioctl_chain_sge;
++	mem_desc->size = MPI3MR_PAGE_SIZE_4K;
++	mem_desc->addr = dma_alloc_coherent(&mrioc->pdev->dev,
++					    mem_desc->size,
++					    &mem_desc->dma_addr,
++					    GFP_KERNEL);
++	if (!mem_desc->addr)
++		goto out_failed;
++
++	mem_desc = &mrioc->ioctl_resp_sge;
++	mem_desc->size = MPI3MR_PAGE_SIZE_4K;
++	mem_desc->addr = dma_alloc_coherent(&mrioc->pdev->dev,
++					    mem_desc->size,
++					    &mem_desc->dma_addr,
++					    GFP_KERNEL);
++	if (!mem_desc->addr)
++		goto out_failed;
++
++	mrioc->ioctl_sges_allocated = true;
++
++	return;
++out_failed:
++	ioc_warn(mrioc, "cannot allocate DMA memory for the mpt commands\n"
++		 "from the applications, application interface for MPT command is disabled\n");
++	mpi3mr_free_ioctl_dma_memory(mrioc);
++}
++
+ /**
+  * mpi3mr_clear_reset_history - clear reset history
+  * @mrioc: Adapter instance reference
+@@ -3874,6 +3982,9 @@ retry_init:
+ 		}
+ 	}
+ 
++	dprint_init(mrioc, "allocating ioctl dma buffers\n");
++	mpi3mr_alloc_ioctl_dma_memory(mrioc);
++
+ 	if (!mrioc->init_cmds.reply) {
+ 		retval = mpi3mr_alloc_reply_sense_bufs(mrioc);
+ 		if (retval) {
+@@ -4293,6 +4404,7 @@ void mpi3mr_free_mem(struct mpi3mr_ioc *mrioc)
+ 	struct mpi3mr_intr_info *intr_info;
+ 
+ 	mpi3mr_free_enclosure_list(mrioc);
++	mpi3mr_free_ioctl_dma_memory(mrioc);
+ 
+ 	if (mrioc->sense_buf_pool) {
+ 		if (mrioc->sense_buf)
+
