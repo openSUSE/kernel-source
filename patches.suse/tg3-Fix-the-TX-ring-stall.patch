@@ -1,0 +1,161 @@
+From: Alex Pakhunov <alexey.pakhunov@spacex.com>
+Date: Sun, 5 Nov 2023 10:58:28 -0800
+Subject: tg3: Fix the TX ring stall
+Patch-mainline: v6.7-rc1
+Git-commit: c542b39b607dc0619e3b1b36e289600a555c4774
+References: jsc#PED-5736
+
+The TX ring maintained by the tg3 driver can end up in the state, when it
+has packets queued for sending but the NIC hardware is not informed, so no
+progress is made. This leads to a multi-second interruption in network
+traffic followed by dev_watchdog() firing and resetting the queue.
+
+The specific sequence of steps is:
+
+1. tg3_start_xmit() is called at least once and queues packet(s) without
+   updating tnapi->prodmbox (netdev_xmit_more() returns true)
+2. tg3_start_xmit() is called with an SKB which causes tg3_tso_bug() to be
+   called.
+3. tg3_tso_bug() determines that the SKB is too large, ...
+
+        if (unlikely(tg3_tx_avail(tnapi) <= frag_cnt_est)) {
+
+   ... stops the queue, and returns NETDEV_TX_BUSY:
+
+        netif_tx_stop_queue(txq);
+        ...
+        if (tg3_tx_avail(tnapi) <= frag_cnt_est)
+                return NETDEV_TX_BUSY;
+
+4. Since all tg3_tso_bug() call sites directly return, the code updating
+   tnapi->prodmbox is skipped.
+
+5. The queue is stuck now. tg3_start_xmit() is not called while the queue
+   is stopped. The NIC is not processing new packets because
+   tnapi->prodmbox wasn't updated. tg3_tx() is not called by
+   tg3_poll_work() because the all TX descriptions that could be freed has
+   been freed:
+
+        /* run TX completion thread */
+        if (tnapi->hw_status->idx[0].tx_consumer != tnapi->tx_cons) {
+                tg3_tx(tnapi);
+
+6. Eventually, dev_watchdog() fires triggering a reset of the queue.
+
+This fix makes sure that the tnapi->prodmbox update happens regardless of
+the reason tg3_start_xmit() returned.
+
+Signed-off-by: Alex Pakhunov <alexey.pakhunov@spacex.com>
+Signed-off-by: Vincent Wong <vincent.wong2@spacex.com>
+Reviewed-by: Michael Chan <michael.chan@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/broadcom/tg3.c |   53 ++++++++++++++++++++++++++++--------
+ 1 file changed, 42 insertions(+), 11 deletions(-)
+
+--- a/drivers/net/ethernet/broadcom/tg3.c
++++ b/drivers/net/ethernet/broadcom/tg3.c
+@@ -6647,9 +6647,9 @@ static void tg3_tx(struct tg3_napi *tnap
+ 
+ 	tnapi->tx_cons = sw_idx;
+ 
+-	/* Need to make the tx_cons update visible to tg3_start_xmit()
++	/* Need to make the tx_cons update visible to __tg3_start_xmit()
+ 	 * before checking for netif_queue_stopped().  Without the
+-	 * memory barrier, there is a small possibility that tg3_start_xmit()
++	 * memory barrier, there is a small possibility that __tg3_start_xmit()
+ 	 * will miss it and cause the queue to be stopped forever.
+ 	 */
+ 	smp_mb();
+@@ -7889,7 +7889,7 @@ static bool tg3_tso_bug_gso_check(struct
+ 	return skb_shinfo(skb)->gso_segs < tnapi->tx_pending / 3;
+ }
+ 
+-static netdev_tx_t tg3_start_xmit(struct sk_buff *, struct net_device *);
++static netdev_tx_t __tg3_start_xmit(struct sk_buff *, struct net_device *);
+ 
+ /* Use GSO to workaround all TSO packets that meet HW bug conditions
+  * indicated in tg3_tx_frag_set()
+@@ -7923,7 +7923,7 @@ static int tg3_tso_bug(struct tg3 *tp, s
+ 
+ 	skb_list_walk_safe(segs, seg, next) {
+ 		skb_mark_not_on_list(seg);
+-		tg3_start_xmit(seg, tp->dev);
++		__tg3_start_xmit(seg, tp->dev);
+ 	}
+ 
+ tg3_tso_bug_end:
+@@ -7933,7 +7933,7 @@ tg3_tso_bug_end:
+ }
+ 
+ /* hard_start_xmit for all devices */
+-static netdev_tx_t tg3_start_xmit(struct sk_buff *skb, struct net_device *dev)
++static netdev_tx_t __tg3_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
+ 	struct tg3 *tp = netdev_priv(dev);
+ 	u32 len, entry, base_flags, mss, vlan = 0;
+@@ -8182,11 +8182,6 @@ static netdev_tx_t tg3_start_xmit(struct
+ 			netif_tx_wake_queue(txq);
+ 	}
+ 
+-	if (!netdev_xmit_more() || netif_xmit_stopped(txq)) {
+-		/* Packets are ready, update Tx producer idx on card. */
+-		tw32_tx_mbox(tnapi->prodmbox, entry);
+-	}
+-
+ 	return NETDEV_TX_OK;
+ 
+ dma_error:
+@@ -8199,6 +8194,42 @@ drop_nofree:
+ 	return NETDEV_TX_OK;
+ }
+ 
++static netdev_tx_t tg3_start_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++	struct netdev_queue *txq;
++	u16 skb_queue_mapping;
++	netdev_tx_t ret;
++
++	skb_queue_mapping = skb_get_queue_mapping(skb);
++	txq = netdev_get_tx_queue(dev, skb_queue_mapping);
++
++	ret = __tg3_start_xmit(skb, dev);
++
++	/* Notify the hardware that packets are ready by updating the TX ring
++	 * tail pointer. We respect netdev_xmit_more() thus avoiding poking
++	 * the hardware for every packet. To guarantee forward progress the TX
++	 * ring must be drained when it is full as indicated by
++	 * netif_xmit_stopped(). This needs to happen even when the current
++	 * skb was dropped or rejected with NETDEV_TX_BUSY. Otherwise packets
++	 * queued by previous __tg3_start_xmit() calls might get stuck in
++	 * the queue forever.
++	 */
++	if (!netdev_xmit_more() || netif_xmit_stopped(txq)) {
++		struct tg3_napi *tnapi;
++		struct tg3 *tp;
++
++		tp = netdev_priv(dev);
++		tnapi = &tp->napi[skb_queue_mapping];
++
++		if (tg3_flag(tp, ENABLE_TSS))
++			tnapi++;
++
++		tw32_tx_mbox(tnapi->prodmbox, tnapi->tx_prod);
++	}
++
++	return ret;
++}
++
+ static void tg3_mac_loopback(struct tg3 *tp, bool enable)
+ {
+ 	if (enable) {
+@@ -17729,7 +17760,7 @@ static int tg3_init_one(struct pci_dev *
+ 	 * device behind the EPB cannot support DMA addresses > 40-bit.
+ 	 * On 64-bit systems with IOMMU, use 40-bit dma_mask.
+ 	 * On 64-bit systems without IOMMU, use 64-bit dma_mask and
+-	 * do DMA address check in tg3_start_xmit().
++	 * do DMA address check in __tg3_start_xmit().
+ 	 */
+ 	if (tg3_flag(tp, IS_5788))
+ 		persist_dma_mask = dma_mask = DMA_BIT_MASK(32);

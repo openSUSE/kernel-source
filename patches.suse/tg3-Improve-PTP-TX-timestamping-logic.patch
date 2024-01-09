@@ -1,0 +1,196 @@
+From: Pavan Chebbi <pavan.chebbi@broadcom.com>
+Date: Fri, 13 Oct 2023 06:59:19 -0700
+Subject: tg3: Improve PTP TX timestamping logic
+Patch-mainline: v6.7-rc1
+Git-commit: b22f21f7a541419d454c5b7c254a9bd02bdd5d58
+References: jsc#PED-5736
+
+When we are trying to timestamp a TX packet, there may be
+occasions when the TX timestamp register is still not
+updated with the latest timestamp even if the timestamp
+packet descriptor is marked as complete.
+This usually happens in cases where the system is under
+stress or flow control is affecting the transmit side.
+
+We will solve this problem by saving the snapshot of the
+timestamp register when we are posting the TX descriptor.
+At this time, the register contains previously timestamped
+packet's value and valid timestamp of the current packet must
+be different than this.
+Upon completion of the current descriptor, we will check if
+the timestamp register is updated or not before timestamping
+the skb. If not updated, we will schedule the ptp worker to
+fetch the updated time later and timestamp the skb.
+Also now we restrict number of outstanding PTP TX packet
+requests to 1.
+
+Reported-by: Simon White <Simon.White@viavisolutions.com>
+Link: https://lore.kernel.org/netdev/CACKFLikGdN9XPtWk-fdrzxdcD=+bv-GHBvfVfSpJzHY7hrW39g@mail.gmail.com/
+Signed-off-by: Pavan Chebbi <pavan.chebbi@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Reviewed-by: Andy Gospodarek <gospo@broadcom.com>
+Reviewed-by: Kalesh AP <kalesh-anakkur.purayil@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/broadcom/tg3.c |   81 ++++++++++++++++++++++++++++--------
+ drivers/net/ethernet/broadcom/tg3.h |    3 +
+ 2 files changed, 68 insertions(+), 16 deletions(-)
+
+--- a/drivers/net/ethernet/broadcom/tg3.c
++++ b/drivers/net/ethernet/broadcom/tg3.c
+@@ -6314,6 +6314,46 @@ err_out:
+ 	return -EOPNOTSUPP;
+ }
+ 
++static void tg3_hwclock_to_timestamp(struct tg3 *tp, u64 hwclock,
++				     struct skb_shared_hwtstamps *timestamp)
++{
++	memset(timestamp, 0, sizeof(struct skb_shared_hwtstamps));
++	timestamp->hwtstamp  = ns_to_ktime((hwclock & TG3_TSTAMP_MASK) +
++					   tp->ptp_adjust);
++}
++
++static void tg3_read_tx_tstamp(struct tg3 *tp, u64 *hwclock)
++{
++	*hwclock = tr32(TG3_TX_TSTAMP_LSB);
++	*hwclock |= (u64)tr32(TG3_TX_TSTAMP_MSB) << 32;
++}
++
++static long tg3_ptp_ts_aux_work(struct ptp_clock_info *ptp)
++{
++	struct tg3 *tp = container_of(ptp, struct tg3, ptp_info);
++	struct skb_shared_hwtstamps timestamp;
++	u64 hwclock;
++
++	if (tp->ptp_txts_retrycnt > 2)
++		goto done;
++
++	tg3_read_tx_tstamp(tp, &hwclock);
++
++	if (hwclock != tp->pre_tx_ts) {
++		tg3_hwclock_to_timestamp(tp, hwclock, &timestamp);
++		skb_tstamp_tx(tp->tx_tstamp_skb, &timestamp);
++		goto done;
++	}
++	tp->ptp_txts_retrycnt++;
++	return HZ / 10;
++done:
++	dev_consume_skb_any(tp->tx_tstamp_skb);
++	tp->tx_tstamp_skb = NULL;
++	tp->ptp_txts_retrycnt = 0;
++	tp->pre_tx_ts = 0;
++	return -1;
++}
++
+ static const struct ptp_clock_info tg3_ptp_caps = {
+ 	.owner		= THIS_MODULE,
+ 	.name		= "tg3 clock",
+@@ -6325,19 +6365,12 @@ static const struct ptp_clock_info tg3_p
+ 	.pps		= 0,
+ 	.adjfine	= tg3_ptp_adjfine,
+ 	.adjtime	= tg3_ptp_adjtime,
++	.do_aux_work	= tg3_ptp_ts_aux_work,
+ 	.gettimex64	= tg3_ptp_gettimex,
+ 	.settime64	= tg3_ptp_settime,
+ 	.enable		= tg3_ptp_enable,
+ };
+ 
+-static void tg3_hwclock_to_timestamp(struct tg3 *tp, u64 hwclock,
+-				     struct skb_shared_hwtstamps *timestamp)
+-{
+-	memset(timestamp, 0, sizeof(struct skb_shared_hwtstamps));
+-	timestamp->hwtstamp  = ns_to_ktime((hwclock & TG3_TSTAMP_MASK) +
+-					   tp->ptp_adjust);
+-}
+-
+ /* tp->lock must be held */
+ static void tg3_ptp_init(struct tg3 *tp)
+ {
+@@ -6368,6 +6401,8 @@ static void tg3_ptp_fini(struct tg3 *tp)
+ 	ptp_clock_unregister(tp->ptp_clock);
+ 	tp->ptp_clock = NULL;
+ 	tp->ptp_adjust = 0;
++	dev_consume_skb_any(tp->tx_tstamp_skb);
++	tp->tx_tstamp_skb = NULL;
+ }
+ 
+ static inline int tg3_irq_sync(struct tg3 *tp)
+@@ -6538,6 +6573,7 @@ static void tg3_tx(struct tg3_napi *tnap
+ 
+ 	while (sw_idx != hw_idx) {
+ 		struct tg3_tx_ring_info *ri = &tnapi->tx_buffers[sw_idx];
++		bool complete_skb_later = false;
+ 		struct sk_buff *skb = ri->skb;
+ 		int i, tx_bug = 0;
+ 
+@@ -6548,12 +6584,17 @@ static void tg3_tx(struct tg3_napi *tnap
+ 
+ 		if (tnapi->tx_ring[sw_idx].len_flags & TXD_FLAG_HWTSTAMP) {
+ 			struct skb_shared_hwtstamps timestamp;
+-			u64 hwclock = tr32(TG3_TX_TSTAMP_LSB);
+-			hwclock |= (u64)tr32(TG3_TX_TSTAMP_MSB) << 32;
++			u64 hwclock;
+ 
+-			tg3_hwclock_to_timestamp(tp, hwclock, &timestamp);
+-
+-			skb_tstamp_tx(skb, &timestamp);
++			tg3_read_tx_tstamp(tp, &hwclock);
++			if (hwclock != tp->pre_tx_ts) {
++				tg3_hwclock_to_timestamp(tp, hwclock, &timestamp);
++				skb_tstamp_tx(skb, &timestamp);
++				tp->pre_tx_ts = 0;
++			} else {
++				tp->tx_tstamp_skb = skb;
++				complete_skb_later = true;
++			}
+ 		}
+ 
+ 		dma_unmap_single(&tp->pdev->dev, dma_unmap_addr(ri, mapping),
+@@ -6591,7 +6632,10 @@ static void tg3_tx(struct tg3_napi *tnap
+ 		pkts_compl++;
+ 		bytes_compl += skb->len;
+ 
+-		dev_consume_skb_any(skb);
++		if (!complete_skb_later)
++			dev_consume_skb_any(skb);
++		else
++			ptp_schedule_worker(tp->ptp_clock, 0);
+ 
+ 		if (unlikely(tx_bug)) {
+ 			tg3_tx_recover(tp);
+@@ -8028,8 +8072,13 @@ static netdev_tx_t tg3_start_xmit(struct
+ 
+ 	if ((unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP)) &&
+ 	    tg3_flag(tp, TX_TSTAMP_EN)) {
+-		skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
+-		base_flags |= TXD_FLAG_HWTSTAMP;
++		tg3_full_lock(tp, 0);
++		if (!tp->pre_tx_ts) {
++			skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
++			base_flags |= TXD_FLAG_HWTSTAMP;
++			tg3_read_tx_tstamp(tp, &tp->pre_tx_ts);
++		}
++		tg3_full_unlock(tp);
+ 	}
+ 
+ 	len = skb_headlen(skb);
+--- a/drivers/net/ethernet/broadcom/tg3.h
++++ b/drivers/net/ethernet/broadcom/tg3.h
+@@ -3190,6 +3190,7 @@ struct tg3 {
+ 	struct ptp_clock_info		ptp_info;
+ 	struct ptp_clock		*ptp_clock;
+ 	s64				ptp_adjust;
++	u8				ptp_txts_retrycnt;
+ 
+ 	/* begin "tx thread" cacheline section */
+ 	void				(*write32_tx_mbox) (struct tg3 *, u32,
+@@ -3372,6 +3373,8 @@ struct tg3 {
+ 	struct tg3_hw_stats		*hw_stats;
+ 	dma_addr_t			stats_mapping;
+ 	struct work_struct		reset_task;
++	struct sk_buff			*tx_tstamp_skb;
++	u64				pre_tx_ts;
+ 
+ 	int				nvram_lock_cnt;
+ 	u32				nvram_size;
