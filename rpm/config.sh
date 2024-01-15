@@ -1,7 +1,7 @@
 # The version of the main tarball to use
 SRCVERSION=6.6
 # variant of the kernel-source package, either empty or "-rt"
-VARIANT=
+VARIANT=-longterm
 # enable kernel module compression
 COMPRESS_MODULES="zstd"
 COMPRESS_VMLINUX="xz"
@@ -11,11 +11,6 @@ BUILD_DTBS="Yes"
 LIVEPATCH=livepatch
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:Factory
-OBS_PROJECT_ARM=openSUSE:Factory:ARM
-OBS_PROJECT_LEGACYX86=openSUSE:Factory:LegacyX86
-OBS_PROJECT_PPC=openSUSE:Factory:PowerPC
-OBS_PROJECT_RISCV=openSUSE:Factory:RISCV
-OBS_PROJECT_S390=openSUSE:Factory:zSystems
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
 BUGZILLA_PRODUCT="openSUSE Tumbleweed"
