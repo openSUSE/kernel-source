@@ -1,0 +1,220 @@
+From 68b957f64fca1930164bfc6d6d379acdccd547d7 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Mon, 11 Sep 2023 08:39:06 -0700
+Subject: [PATCH] xfs: load uncached unlinked inodes into memory on demand
+Git-commit: 68b957f64fca1930164bfc6d6d379acdccd547d7
+Patch-mainline: v6.6-rc3
+References: bsc#1218829
+
+shrikanth hegde reports that filesystems fail shortly after mount with
+the following failure:
+
+	WARNING: CPU: 56 PID: 12450 at fs/xfs/xfs_inode.c:1839 xfs_iunlink_lookup+0x58/0x80 [xfs]
+
+This of course is the WARN_ON_ONCE in xfs_iunlink_lookup:
+
+	ip = radix_tree_lookup(&pag->pag_ici_root, agino);
+	if (WARN_ON_ONCE(!ip || !ip->i_ino)) { ... }
+
+From diagnostic data collected by the bug reporters, it would appear
+that we cleanly mounted a filesystem that contained unlinked inodes.
+Unlinked inodes are only processed as a final step of log recovery,
+which means that clean mounts do not process the unlinked list at all.
+
+Prior to the introduction of the incore unlinked lists, this wasn't a
+problem because the unlink code would (very expensively) traverse the
+entire ondisk metadata iunlink chain to keep things up to date.
+However, the incore unlinked list code complains when it realizes that
+it is out of sync with the ondisk metadata and shuts down the fs, which
+is bad.
+
+Ritesh proposed to solve this problem by unconditionally parsing the
+unlinked lists at mount time, but this imposes a mount time cost for
+every filesystem to catch something that should be very infrequent.
+Instead, let's target the places where we can encounter a next_unlinked
+pointer that refers to an inode that is not in cache, and load it into
+cache.
+
+Note: This patch does not address the problem of iget loading an inode
+from the middle of the iunlink list and needing to set i_prev_unlinked
+correctly.
+
+Reported-by: shrikanth hegde <sshegde@linux.vnet.ibm.com>
+Triaged-by: Ritesh Harjani <ritesh.list@gmail.com>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Acked-by: Anthony Iliopoulos <ailiop@suse.com>
+
+---
+ fs/xfs/xfs_inode.c | 80 +++++++++++++++++++++++++++++++++++++++++++---
+ fs/xfs/xfs_trace.h | 25 +++++++++++++++
+ 2 files changed, 100 insertions(+), 5 deletions(-)
+
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index f7f8292347ab..7b11059067f7 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -1828,12 +1828,17 @@ xfs_iunlink_lookup(
+ 
+ 	rcu_read_lock();
+ 	ip = radix_tree_lookup(&pag->pag_ici_root, agino);
++	if (!ip) {
++		/* Caller can handle inode not being in memory. */
++		rcu_read_unlock();
++		return NULL;
++	}
+ 
+ 	/*
+-	 * Inode not in memory or in RCU freeing limbo should not happen.
+-	 * Warn about this and let the caller handle the failure.
++	 * Inode in RCU freeing limbo should not happen.  Warn about this and
++	 * let the caller handle the failure.
+ 	 */
+-	if (WARN_ON_ONCE(!ip || !ip->i_ino)) {
++	if (WARN_ON_ONCE(!ip->i_ino)) {
+ 		rcu_read_unlock();
+ 		return NULL;
+ 	}
+@@ -1842,7 +1847,10 @@ xfs_iunlink_lookup(
+ 	return ip;
+ }
+ 
+-/* Update the prev pointer of the next agino. */
++/*
++ * Update the prev pointer of the next agino.  Returns -ENOLINK if the inode
++ * is not in cache.
++ */
+ static int
+ xfs_iunlink_update_backref(
+ 	struct xfs_perag	*pag,
+@@ -1857,7 +1865,8 @@ xfs_iunlink_update_backref(
+ 
+ 	ip = xfs_iunlink_lookup(pag, next_agino);
+ 	if (!ip)
+-		return -EFSCORRUPTED;
++		return -ENOLINK;
++
+ 	ip->i_prev_unlinked = prev_agino;
+ 	return 0;
+ }
+@@ -1901,6 +1910,62 @@ xfs_iunlink_update_bucket(
+ 	return 0;
+ }
+ 
++/*
++ * Load the inode @next_agino into the cache and set its prev_unlinked pointer
++ * to @prev_agino.  Caller must hold the AGI to synchronize with other changes
++ * to the unlinked list.
++ */
++STATIC int
++xfs_iunlink_reload_next(
++	struct xfs_trans	*tp,
++	struct xfs_buf		*agibp,
++	xfs_agino_t		prev_agino,
++	xfs_agino_t		next_agino)
++{
++	struct xfs_perag	*pag = agibp->b_pag;
++	struct xfs_mount	*mp = pag->pag_mount;
++	struct xfs_inode	*next_ip = NULL;
++	xfs_ino_t		ino;
++	int			error;
++
++	ASSERT(next_agino != NULLAGINO);
++
++#ifdef DEBUG
++	rcu_read_lock();
++	next_ip = radix_tree_lookup(&pag->pag_ici_root, next_agino);
++	ASSERT(next_ip == NULL);
++	rcu_read_unlock();
++#endif
++
++	xfs_info_ratelimited(mp,
++ "Found unrecovered unlinked inode 0x%x in AG 0x%x.  Initiating recovery.",
++			next_agino, pag->pag_agno);
++
++	/*
++	 * Use an untrusted lookup just to be cautious in case the AGI has been
++	 * corrupted and now points at a free inode.  That shouldn't happen,
++	 * but we'd rather shut down now since we're already running in a weird
++	 * situation.
++	 */
++	ino = XFS_AGINO_TO_INO(mp, pag->pag_agno, next_agino);
++	error = xfs_iget(mp, tp, ino, XFS_IGET_UNTRUSTED, 0, &next_ip);
++	if (error)
++		return error;
++
++	/* If this is not an unlinked inode, something is very wrong. */
++	if (VFS_I(next_ip)->i_nlink != 0) {
++		error = -EFSCORRUPTED;
++		goto rele;
++	}
++
++	next_ip->i_prev_unlinked = prev_agino;
++	trace_xfs_iunlink_reload_next(next_ip);
++rele:
++	ASSERT(!(VFS_I(next_ip)->i_state & I_DONTCACHE));
++	xfs_irele(next_ip);
++	return error;
++}
++
+ static int
+ xfs_iunlink_insert_inode(
+ 	struct xfs_trans	*tp,
+@@ -1932,6 +1997,8 @@ xfs_iunlink_insert_inode(
+ 	 * inode.
+ 	 */
+ 	error = xfs_iunlink_update_backref(pag, agino, next_agino);
++	if (error == -ENOLINK)
++		error = xfs_iunlink_reload_next(tp, agibp, agino, next_agino);
+ 	if (error)
+ 		return error;
+ 
+@@ -2026,6 +2093,9 @@ xfs_iunlink_remove_inode(
+ 	 */
+ 	error = xfs_iunlink_update_backref(pag, ip->i_prev_unlinked,
+ 			ip->i_next_unlinked);
++	if (error == -ENOLINK)
++		error = xfs_iunlink_reload_next(tp, agibp, ip->i_prev_unlinked,
++				ip->i_next_unlinked);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/xfs/xfs_trace.h b/fs/xfs/xfs_trace.h
+index 902c7f67a117..7b1cb5d59d8f 100644
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -3824,6 +3824,31 @@ TRACE_EVENT(xfs_iunlink_update_dinode,
+ 		  __entry->new_ptr)
+ );
+ 
++TRACE_EVENT(xfs_iunlink_reload_next,
++	TP_PROTO(struct xfs_inode *ip),
++	TP_ARGS(ip),
++	TP_STRUCT__entry(
++		__field(dev_t, dev)
++		__field(xfs_agnumber_t, agno)
++		__field(xfs_agino_t, agino)
++		__field(xfs_agino_t, prev_agino)
++		__field(xfs_agino_t, next_agino)
++	),
++	TP_fast_assign(
++		__entry->dev = ip->i_mount->m_super->s_dev;
++		__entry->agno = XFS_INO_TO_AGNO(ip->i_mount, ip->i_ino);
++		__entry->agino = XFS_INO_TO_AGINO(ip->i_mount, ip->i_ino);
++		__entry->prev_agino = ip->i_prev_unlinked;
++		__entry->next_agino = ip->i_next_unlinked;
++	),
++	TP_printk("dev %d:%d agno 0x%x agino 0x%x prev_unlinked 0x%x next_unlinked 0x%x",
++		  MAJOR(__entry->dev), MINOR(__entry->dev),
++		  __entry->agno,
++		  __entry->agino,
++		  __entry->prev_agino,
++		  __entry->next_agino)
++);
++
+ DECLARE_EVENT_CLASS(xfs_ag_inode_class,
+ 	TP_PROTO(struct xfs_inode *ip),
+ 	TP_ARGS(ip),
+-- 
+2.43.0
+
