@@ -641,7 +641,6 @@ sub create_project {
 	for my $package (@{$options->{add_packages} || []}) {
 		$prjconf .= "Support: $package\n";
 	}
-	$prjconf .= "BuildFlags: allowrootforbuild\n" if $multibuild;
 	$prjconf .= "Macros:\n";
 	for my $macro (@{$options->{macros} || []}) {
 		$prjconf .= "$macro\n";
