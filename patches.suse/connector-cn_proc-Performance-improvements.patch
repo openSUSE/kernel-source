@@ -1,0 +1,216 @@
+From: Anjali Kulkarni <anjali.k.kulkarni@oracle.com>
+Date: Wed, 19 Jul 2023 13:18:19 -0700
+Subject: connector/cn_proc: Performance improvements
+Patch-mainline: v6.6-rc1
+Git-commit: 743acf351bae1ff7ff4aaadd6a406d4d6091d90b
+References: jsc#PED-7574
+
+This patch adds the capability to filter messages sent by the proc
+connector on the event type supplied in the message from the client
+to the connector. The client can register to listen for an event type
+given in struct proc_input.
+
+This event based filteting will greatly enhance performance - handling
+8K exits takes about 70ms, whereas 8K-forks + 8K-exits takes about 150ms
+& handling 8K-forks + 8K-exits + 8K-execs takes 200ms. There are currently
+9 different types of events, and we need to listen to all of them. Also,
+measuring the time using pidfds for monitoring 8K process exits took
+much longer - 200ms, as compared to 70ms using only exit notifications of
+proc connector.
+
+We also add a new event type - PROC_EVENT_NONZERO_EXIT, which is
+only sent by kernel to a listening application when any process exiting,
+has a non-zero exit status. This will help the clients like Oracle DB,
+where a monitoring process wants notfications for non-zero process exits
+so it can cleanup after them.
+
+This kind of a new event could also be useful to other applications like
+Google's lmkd daemon, which needs a killed process's exit notification.
+
+The patch takes care that existing clients using old mechanism of not
+sending the event type work without any changes.
+
+cn_filter function checks to see if the event type being notified via
+proc connector matches the event type requested by client, before
+sending(matches) or dropping(does not match) a packet.
+
+Signed-off-by: Anjali Kulkarni <anjali.k.kulkarni@oracle.com>
+Reviewed-by: Liam R. Howlett <Liam.Howlett@oracle.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/connector/cn_proc.c  |   62 ++++++++++++++++++++++++++++++++++++++-----
+ include/uapi/linux/cn_proc.h |   19 +++++++++++++
+ 2 files changed, 75 insertions(+), 6 deletions(-)
+
+--- a/drivers/connector/cn_proc.c
++++ b/drivers/connector/cn_proc.c
+@@ -50,21 +50,45 @@ static DEFINE_PER_CPU(struct local_event
+ 
+ static int cn_filter(struct sock *dsk, struct sk_buff *skb, void *data)
+ {
++	__u32 what, exit_code, *ptr;
+ 	enum proc_cn_mcast_op mc_op;
++	uintptr_t val;
+ 
+-	if (!dsk)
++	if (!dsk || !data)
+ 		return 0;
+ 
++	ptr = (__u32 *)data;
++	what = *ptr++;
++	exit_code = *ptr;
++	val = ((struct proc_input *)(dsk->sk_user_data))->event_type;
+ 	mc_op = ((struct proc_input *)(dsk->sk_user_data))->mcast_op;
+ 
+ 	if (mc_op == PROC_CN_MCAST_IGNORE)
+ 		return 1;
+ 
+-	return 0;
++	if ((__u32)val == PROC_EVENT_ALL)
++		return 0;
++
++	/*
++	 * Drop packet if we have to report only non-zero exit status
++	 * (PROC_EVENT_NONZERO_EXIT) and exit status is 0
++	 */
++	if (((__u32)val & PROC_EVENT_NONZERO_EXIT) &&
++	    (what == PROC_EVENT_EXIT)) {
++		if (exit_code)
++			return 0;
++	}
++
++	if ((__u32)val & what)
++		return 0;
++
++	return 1;
+ }
+ 
+ static inline void send_msg(struct cn_msg *msg)
+ {
++	__u32 filter_data[2];
++
+ 	local_lock(&local_event.lock);
+ 
+ 	msg->seq = __this_cpu_inc_return(local_event.count) - 1;
+@@ -76,8 +100,16 @@ static inline void send_msg(struct cn_ms
+ 	 *
+ 	 * If cn_netlink_send() fails, the data is not sent.
+ 	 */
++	filter_data[0] = ((struct proc_event *)msg->data)->what;
++	if (filter_data[0] == PROC_EVENT_EXIT) {
++		filter_data[1] =
++		((struct proc_event *)msg->data)->event_data.exit.exit_code;
++	} else {
++		filter_data[1] = 0;
++	}
++
+ 	cn_netlink_send_mult(msg, msg->len, 0, CN_IDX_PROC, GFP_NOWAIT,
+-			     cn_filter, NULL);
++			     cn_filter, (void *)filter_data);
+ 
+ 	local_unlock(&local_event.lock);
+ }
+@@ -357,12 +389,15 @@ static void cn_proc_ack(int err, int rcv
+ 
+ /**
+  * cn_proc_mcast_ctl
+- * @data: message sent from userspace via the connector
++ * @msg: message sent from userspace via the connector
++ * @nsp: NETLINK_CB of the client's socket buffer
+  */
+ static void cn_proc_mcast_ctl(struct cn_msg *msg,
+ 			      struct netlink_skb_parms *nsp)
+ {
+ 	enum proc_cn_mcast_op mc_op = 0, prev_mc_op = 0;
++	struct proc_input *pinput = NULL;
++	enum proc_cn_event ev_type = 0;
+ 	int err = 0, initial = 0;
+ 	struct sock *sk = NULL;
+ 
+@@ -381,10 +416,21 @@ static void cn_proc_mcast_ctl(struct cn_
+ 		goto out;
+ 	}
+ 
+-	if (msg->len == sizeof(mc_op))
++	if (msg->len == sizeof(*pinput)) {
++		pinput = (struct proc_input *)msg->data;
++		mc_op = pinput->mcast_op;
++		ev_type = pinput->event_type;
++	} else if (msg->len == sizeof(mc_op)) {
+ 		mc_op = *((enum proc_cn_mcast_op *)msg->data);
+-	else
++		ev_type = PROC_EVENT_ALL;
++	} else {
+ 		return;
++	}
++
++	ev_type = valid_event((enum proc_cn_event)ev_type);
++
++	if (ev_type == PROC_EVENT_NONE)
++		ev_type = PROC_EVENT_ALL;
+ 
+ 	if (nsp->sk) {
+ 		sk = nsp->sk;
+@@ -400,6 +446,8 @@ static void cn_proc_mcast_ctl(struct cn_
+ 			prev_mc_op =
+ 			((struct proc_input *)(sk->sk_user_data))->mcast_op;
+ 		}
++		((struct proc_input *)(sk->sk_user_data))->event_type =
++			ev_type;
+ 		((struct proc_input *)(sk->sk_user_data))->mcast_op = mc_op;
+ 	}
+ 
+@@ -411,6 +459,8 @@ static void cn_proc_mcast_ctl(struct cn_
+ 	case PROC_CN_MCAST_IGNORE:
+ 		if (!initial && (prev_mc_op != PROC_CN_MCAST_IGNORE))
+ 			atomic_dec(&proc_event_num_listeners);
++		((struct proc_input *)(sk->sk_user_data))->event_type =
++			PROC_EVENT_NONE;
+ 		break;
+ 	default:
+ 		err = EINVAL;
+--- a/include/uapi/linux/cn_proc.h
++++ b/include/uapi/linux/cn_proc.h
+@@ -30,6 +30,15 @@ enum proc_cn_mcast_op {
+ 	PROC_CN_MCAST_IGNORE = 2
+ };
+ 
++#define PROC_EVENT_ALL (PROC_EVENT_FORK | PROC_EVENT_EXEC | PROC_EVENT_UID |  \
++			PROC_EVENT_GID | PROC_EVENT_SID | PROC_EVENT_PTRACE | \
++			PROC_EVENT_COMM | PROC_EVENT_NONZERO_EXIT |           \
++			PROC_EVENT_COREDUMP | PROC_EVENT_EXIT)
++
++/*
++ * If you add an entry in proc_cn_event, make sure you add it in
++ * PROC_EVENT_ALL above as well.
++ */
+ enum proc_cn_event {
+ 	/* Use successive bits so the enums can be used to record
+ 	 * sets of events as well
+@@ -45,15 +54,25 @@ enum proc_cn_event {
+ 	/* "next" should be 0x00000400 */
+ 	/* "last" is the last process event: exit,
+ 	 * while "next to last" is coredumping event
++	 * before that is report only if process dies
++	 * with non-zero exit status
+ 	 */
++	PROC_EVENT_NONZERO_EXIT = 0x20000000,
+ 	PROC_EVENT_COREDUMP = 0x40000000,
+ 	PROC_EVENT_EXIT = 0x80000000
+ };
+ 
+ struct proc_input {
+ 	enum proc_cn_mcast_op mcast_op;
++	enum proc_cn_event event_type;
+ };
+ 
++static inline enum proc_cn_event valid_event(enum proc_cn_event ev_type)
++{
++	ev_type &= PROC_EVENT_ALL;
++	return ev_type;
++}
++
+ /*
+  * From the user's point of view, the process
+  * ID is the thread group ID and thread ID is the internal
