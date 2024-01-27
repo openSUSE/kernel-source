@@ -39,7 +39,6 @@ sub new {
 				}
 			}
 			my $package = $attr{package};
-			$package =~ s/^[^:]*://;
 			my $result = $attr{code};
 			$results{$cur_repo}{$cur_arch}{$package}  = $result;
 		}
