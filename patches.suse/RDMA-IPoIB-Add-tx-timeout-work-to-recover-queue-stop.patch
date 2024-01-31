@@ -1,0 +1,156 @@
+From: Jack Wang <jinpu.wang@ionos.com>
+Date: Tue, 21 Nov 2023 14:03:16 +0100
+Subject: RDMA/IPoIB: Add tx timeout work to recover queue stop situation
+Patch-mainline: v6.8-rc1
+Git-commit: 50af5d12f7e24b85fc10270d7700f4aa1b20b8e4
+References: jsc#PED-6864
+
+As we sometime run into TX timeout from IPoIB, queue seems stopped
+and can't recover. Diff with Mellanox OFED show Mellanox driver
+has timeout work to recover in such case.
+
+Add TX timeout work/NAPI work to recover such case.
+
+Also increase the watchdog_timeo to 10 seconds, so more tolerant to
+error.
+
+Signed-off-by: Jack Wang <jinpu.wang@ionos.com>
+Link: https://lore.kernel.org/r/20231121130316.126364-3-jinpu.wang@ionos.com
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/ulp/ipoib/ipoib.h      |    4 +++
+ drivers/infiniband/ulp/ipoib/ipoib_ib.c   |   26 ++++++++++++++++++++++-
+ drivers/infiniband/ulp/ipoib/ipoib_main.c |   33 ++++++++++++++++++++++++++++--
+ 3 files changed, 60 insertions(+), 3 deletions(-)
+
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -351,10 +351,12 @@ struct ipoib_dev_priv {
+ 	struct workqueue_struct *wq;
+ 	struct delayed_work mcast_task;
+ 	struct work_struct carrier_on_task;
++	struct work_struct reschedule_napi_work;
+ 	struct work_struct flush_light;
+ 	struct work_struct flush_normal;
+ 	struct work_struct flush_heavy;
+ 	struct work_struct restart_task;
++	struct work_struct tx_timeout_work;
+ 	struct delayed_work ah_reap_task;
+ 	struct delayed_work neigh_reap_task;
+ 	struct ib_device *ca;
+@@ -499,6 +501,7 @@ int ipoib_send(struct net_device *dev, s
+ 	       struct ib_ah *address, u32 dqpn);
+ void ipoib_reap_ah(struct work_struct *work);
+ 
++void ipoib_napi_schedule_work(struct work_struct *work);
+ struct ipoib_path *__path_find(struct net_device *dev, void *gid);
+ void ipoib_mark_paths_invalid(struct net_device *dev);
+ void ipoib_flush_paths(struct net_device *dev);
+@@ -510,6 +513,7 @@ void ipoib_ib_tx_timer_func(struct timer
+ void ipoib_ib_dev_flush_light(struct work_struct *work);
+ void ipoib_ib_dev_flush_normal(struct work_struct *work);
+ void ipoib_ib_dev_flush_heavy(struct work_struct *work);
++void ipoib_ib_tx_timeout_work(struct work_struct *work);
+ void ipoib_pkey_event(struct work_struct *work);
+ void ipoib_ib_dev_cleanup(struct net_device *dev);
+ 
+--- a/drivers/infiniband/ulp/ipoib/ipoib_ib.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+@@ -531,11 +531,35 @@ void ipoib_ib_rx_completion(struct ib_cq
+ 	napi_schedule(&priv->recv_napi);
+ }
+ 
++/* The function will force napi_schedule */
++void ipoib_napi_schedule_work(struct work_struct *work)
++{
++	struct ipoib_dev_priv *priv =
++		container_of(work, struct ipoib_dev_priv, reschedule_napi_work);
++	bool ret;
++
++	do {
++		ret = napi_schedule(&priv->send_napi);
++		if (!ret)
++			msleep(3);
++	} while (!ret && netif_queue_stopped(priv->dev) &&
++		 test_bit(IPOIB_FLAG_INITIALIZED, &priv->flags));
++}
++
+ void ipoib_ib_tx_completion(struct ib_cq *cq, void *ctx_ptr)
+ {
+ 	struct ipoib_dev_priv *priv = ctx_ptr;
++	bool ret;
+ 
+-	napi_schedule(&priv->send_napi);
++	ret = napi_schedule(&priv->send_napi);
++	/*
++	 * if the queue is closed the driver must be able to schedule napi,
++	 * otherwise we can end with closed queue forever, because no new
++	 * packets to send and napi callback might not get new event after
++	 * its re-arm of the napi.
++	 */
++	if (!ret && netif_queue_stopped(priv->dev))
++		schedule_work(&priv->reschedule_napi_work);
+ }
+ 
+ static inline int post_send(struct ipoib_dev_priv *priv,
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -1200,7 +1200,34 @@ static void ipoib_timeout(struct net_dev
+ 		   netif_queue_stopped(dev), priv->tx_head, priv->tx_tail,
+ 		   priv->global_tx_head, priv->global_tx_tail);
+ 
+-	/* XXX reset QP, etc. */
++
++	schedule_work(&priv->tx_timeout_work);
++}
++
++void ipoib_ib_tx_timeout_work(struct work_struct *work)
++{
++	struct ipoib_dev_priv *priv = container_of(work,
++						   struct ipoib_dev_priv,
++						   tx_timeout_work);
++	int err;
++
++	rtnl_lock();
++
++	if (!test_bit(IPOIB_FLAG_ADMIN_UP, &priv->flags))
++		goto unlock;
++
++	ipoib_stop(priv->dev);
++	err = ipoib_open(priv->dev);
++	if (err) {
++		ipoib_warn(priv, "ipoib_open failed recovering from a tx_timeout, err(%d).\n",
++				err);
++		goto unlock;
++	}
++
++	netif_tx_wake_all_queues(priv->dev);
++unlock:
++	rtnl_unlock();
++
+ }
+ 
+ static int ipoib_hard_header(struct sk_buff *skb,
+@@ -2112,7 +2139,7 @@ void ipoib_setup_common(struct net_devic
+ 
+ 	ipoib_set_ethtool_ops(dev);
+ 
+-	dev->watchdog_timeo	 = HZ;
++	dev->watchdog_timeo	 = 10 * HZ;
+ 
+ 	dev->flags		|= IFF_BROADCAST | IFF_MULTICAST;
+ 
+@@ -2150,10 +2177,12 @@ static void ipoib_build_priv(struct net_
+ 
+ 	INIT_DELAYED_WORK(&priv->mcast_task,   ipoib_mcast_join_task);
+ 	INIT_WORK(&priv->carrier_on_task, ipoib_mcast_carrier_on_task);
++	INIT_WORK(&priv->reschedule_napi_work, ipoib_napi_schedule_work);
+ 	INIT_WORK(&priv->flush_light,   ipoib_ib_dev_flush_light);
+ 	INIT_WORK(&priv->flush_normal,   ipoib_ib_dev_flush_normal);
+ 	INIT_WORK(&priv->flush_heavy,   ipoib_ib_dev_flush_heavy);
+ 	INIT_WORK(&priv->restart_task, ipoib_mcast_restart_task);
++	INIT_WORK(&priv->tx_timeout_work, ipoib_ib_tx_timeout_work);
+ 	INIT_DELAYED_WORK(&priv->ah_reap_task, ipoib_reap_ah);
+ 	INIT_DELAYED_WORK(&priv->neigh_reap_task, ipoib_reap_neigh);
+ }
