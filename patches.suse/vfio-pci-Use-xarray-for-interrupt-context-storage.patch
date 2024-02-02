@@ -1,0 +1,257 @@
+From: Reinette Chatre <reinette.chatre@intel.com>
+Date: Thu, 11 May 2023 08:44:32 -0700
+Subject: vfio/pci: Use xarray for interrupt context storage
+Git-commit: b156e48fffa9f1caea490e4812a1451adb5c0ef4
+Patch-mainline: 6.5-rc1
+References: jsc#PED-7785
+
+Interrupt context is statically allocated at the time interrupts
+are allocated. Following allocation, the context is managed by
+directly accessing the elements of the array using the vector
+as index. The storage is released when interrupts are disabled.
+
+It is possible to dynamically allocate a single MSI-X interrupt
+after MSI-X is enabled. A dynamic storage for interrupt context
+is needed to support this. Replace the interrupt context array with an
+xarray (similar to what the core uses as store for MSI descriptors)
+that can support the dynamic expansion while maintaining the
+custom that uses the vector as index.
+
+With a dynamic storage it is no longer required to pre-allocate
+interrupt contexts at the time the interrupts are allocated.
+MSI and MSI-X interrupt contexts are only used when interrupts are
+enabled. Their allocation can thus be delayed until interrupt enabling.
+Only enabled interrupts will have associated interrupt contexts.
+Whether an interrupt has been allocated (a Linux irq number exists
+for it) becomes the criteria for whether an interrupt can be enabled.
+
+Signed-off-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lore.kernel.org/lkml/20230404122444.59e36a99.alex.williamson@redhat.com/
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Acked-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Link: https://lore.kernel.org/r/40e235f38d427aff79ae35eda0ced42502aa0937.1683740667.git.reinette.chatre@intel.com
+Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/vfio/pci/vfio_pci_core.c  |    1 
+ drivers/vfio/pci/vfio_pci_intrs.c |   91 +++++++++++++++++++-------------------
+ include/linux/vfio_pci_core.h     |    2 
+ 3 files changed, 48 insertions(+), 46 deletions(-)
+
+--- a/drivers/vfio/pci/vfio_pci_core.c
++++ b/drivers/vfio/pci/vfio_pci_core.c
+@@ -2102,6 +2102,7 @@ int vfio_pci_core_init_dev(struct vfio_d
+ 	INIT_LIST_HEAD(&vdev->vma_list);
+ 	INIT_LIST_HEAD(&vdev->sriov_pfs_item);
+ 	init_rwsem(&vdev->memory_lock);
++	xa_init(&vdev->ctx);
+ 
+ 	return 0;
+ }
+--- a/drivers/vfio/pci/vfio_pci_intrs.c
++++ b/drivers/vfio/pci/vfio_pci_intrs.c
+@@ -52,25 +52,33 @@ static
+ struct vfio_pci_irq_ctx *vfio_irq_ctx_get(struct vfio_pci_core_device *vdev,
+ 					  unsigned long index)
+ {
+-	if (index >= vdev->num_ctx)
+-		return NULL;
+-	return &vdev->ctx[index];
++	return xa_load(&vdev->ctx, index);
+ }
+ 
+-static void vfio_irq_ctx_free_all(struct vfio_pci_core_device *vdev)
++static void vfio_irq_ctx_free(struct vfio_pci_core_device *vdev,
++			      struct vfio_pci_irq_ctx *ctx, unsigned long index)
+ {
+-	kfree(vdev->ctx);
++	xa_erase(&vdev->ctx, index);
++	kfree(ctx);
+ }
+ 
+-static int vfio_irq_ctx_alloc_num(struct vfio_pci_core_device *vdev,
+-				  unsigned long num)
++static struct vfio_pci_irq_ctx *
++vfio_irq_ctx_alloc(struct vfio_pci_core_device *vdev, unsigned long index)
+ {
+-	vdev->ctx = kcalloc(num, sizeof(struct vfio_pci_irq_ctx),
+-			    GFP_KERNEL_ACCOUNT);
+-	if (!vdev->ctx)
+-		return -ENOMEM;
++	struct vfio_pci_irq_ctx *ctx;
++	int ret;
+ 
+-	return 0;
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL_ACCOUNT);
++	if (!ctx)
++		return NULL;
++
++	ret = xa_insert(&vdev->ctx, index, ctx, GFP_KERNEL_ACCOUNT);
++	if (ret) {
++		kfree(ctx);
++		return NULL;
++	}
++
++	return ctx;
+ }
+ 
+ /*
+@@ -226,7 +234,6 @@ static irqreturn_t vfio_intx_handler(int
+ static int vfio_intx_enable(struct vfio_pci_core_device *vdev)
+ {
+ 	struct vfio_pci_irq_ctx *ctx;
+-	int ret;
+ 
+ 	if (!is_irq_none(vdev))
+ 		return -EINVAL;
+@@ -234,15 +241,9 @@ static int vfio_intx_enable(struct vfio_
+ 	if (!vdev->pdev->irq)
+ 		return -ENODEV;
+ 
+-	ret = vfio_irq_ctx_alloc_num(vdev, 1);
+-	if (ret)
+-		return ret;
+-
+-	ctx = vfio_irq_ctx_get(vdev, 0);
+-	if (!ctx) {
+-		vfio_irq_ctx_free_all(vdev);
+-		return -EINVAL;
+-	}
++	ctx = vfio_irq_ctx_alloc(vdev, 0);
++	if (!ctx)
++		return -ENOMEM;
+ 
+ 	vdev->num_ctx = 1;
+ 
+@@ -334,7 +335,7 @@ static void vfio_intx_disable(struct vfi
+ 	vfio_intx_set_signal(vdev, -1);
+ 	vdev->irq_type = VFIO_PCI_NUM_IRQS;
+ 	vdev->num_ctx = 0;
+-	vfio_irq_ctx_free_all(vdev);
++	vfio_irq_ctx_free(vdev, ctx, 0);
+ }
+ 
+ /*
+@@ -358,10 +359,6 @@ static int vfio_msi_enable(struct vfio_p
+ 	if (!is_irq_none(vdev))
+ 		return -EINVAL;
+ 
+-	ret = vfio_irq_ctx_alloc_num(vdev, nvec);
+-	if (ret)
+-		return ret;
+-
+ 	/* return the number of supported vectors if we can't get all: */
+ 	cmd = vfio_pci_memory_lock_and_enable(vdev);
+ 	ret = pci_alloc_irq_vectors(pdev, 1, nvec, flag);
+@@ -369,7 +366,6 @@ static int vfio_msi_enable(struct vfio_p
+ 		if (ret > 0)
+ 			pci_free_irq_vectors(pdev);
+ 		vfio_pci_memory_unlock_and_restore(vdev, cmd);
+-		vfio_irq_ctx_free_all(vdev);
+ 		return ret;
+ 	}
+ 	vfio_pci_memory_unlock_and_restore(vdev, cmd);
+@@ -401,12 +397,13 @@ static int vfio_msi_set_vector_signal(st
+ 	if (vector >= vdev->num_ctx)
+ 		return -EINVAL;
+ 
+-	ctx = vfio_irq_ctx_get(vdev, vector);
+-	if (!ctx)
+-		return -EINVAL;
+ 	irq = pci_irq_vector(pdev, vector);
++	if (irq < 0)
++		return -EINVAL;
+ 
+-	if (ctx->trigger) {
++	ctx = vfio_irq_ctx_get(vdev, vector);
++
++	if (ctx) {
+ 		irq_bypass_unregister_producer(&ctx->producer);
+ 
+ 		cmd = vfio_pci_memory_lock_and_enable(vdev);
+@@ -414,16 +411,22 @@ static int vfio_msi_set_vector_signal(st
+ 		vfio_pci_memory_unlock_and_restore(vdev, cmd);
+ 		kfree(ctx->name);
+ 		eventfd_ctx_put(ctx->trigger);
+-		ctx->trigger = NULL;
++		vfio_irq_ctx_free(vdev, ctx, vector);
+ 	}
+ 
+ 	if (fd < 0)
+ 		return 0;
+ 
++	ctx = vfio_irq_ctx_alloc(vdev, vector);
++	if (!ctx)
++		return -ENOMEM;
++
+ 	ctx->name = kasprintf(GFP_KERNEL_ACCOUNT, "vfio-msi%s[%d](%s)",
+ 			      msix ? "x" : "", vector, pci_name(pdev));
+-	if (!ctx->name)
+-		return -ENOMEM;
++	if (!ctx->name) {
++		ret = -ENOMEM;
++		goto out_free_ctx;
++	}
+ 
+ 	trigger = eventfd_ctx_fdget(fd);
+ 	if (IS_ERR(trigger)) {
+@@ -469,6 +472,8 @@ out_put_eventfd_ctx:
+ 	eventfd_ctx_put(trigger);
+ out_free_name:
+ 	kfree(ctx->name);
++out_free_ctx:
++	vfio_irq_ctx_free(vdev, ctx, vector);
+ 	return ret;
+ }
+ 
+@@ -498,16 +503,13 @@ static void vfio_msi_disable(struct vfio
+ {
+ 	struct pci_dev *pdev = vdev->pdev;
+ 	struct vfio_pci_irq_ctx *ctx;
+-	unsigned int i;
++	unsigned long i;
+ 	u16 cmd;
+ 
+-	for (i = 0; i < vdev->num_ctx; i++) {
+-		ctx = vfio_irq_ctx_get(vdev, i);
+-		if (ctx) {
+-			vfio_virqfd_disable(&ctx->unmask);
+-			vfio_virqfd_disable(&ctx->mask);
+-			vfio_msi_set_vector_signal(vdev, i, -1, msix);
+-		}
++	xa_for_each(&vdev->ctx, i, ctx) {
++		vfio_virqfd_disable(&ctx->unmask);
++		vfio_virqfd_disable(&ctx->mask);
++		vfio_msi_set_vector_signal(vdev, i, -1, msix);
+ 	}
+ 
+ 	cmd = vfio_pci_memory_lock_and_enable(vdev);
+@@ -523,7 +525,6 @@ static void vfio_msi_disable(struct vfio
+ 
+ 	vdev->irq_type = VFIO_PCI_NUM_IRQS;
+ 	vdev->num_ctx = 0;
+-	vfio_irq_ctx_free_all(vdev);
+ }
+ 
+ /*
+@@ -663,7 +664,7 @@ static int vfio_pci_set_msi_trigger(stru
+ 
+ 	for (i = start; i < start + count; i++) {
+ 		ctx = vfio_irq_ctx_get(vdev, i);
+-		if (!ctx || !ctx->trigger)
++		if (!ctx)
+ 			continue;
+ 		if (flags & VFIO_IRQ_SET_DATA_NONE) {
+ 			eventfd_signal(ctx->trigger, 1);
+--- a/include/linux/vfio_pci_core.h
++++ b/include/linux/vfio_pci_core.h
+@@ -59,7 +59,7 @@ struct vfio_pci_core_device {
+ 	struct perm_bits	*msi_perm;
+ 	spinlock_t		irqlock;
+ 	struct mutex		igate;
+-	struct vfio_pci_irq_ctx	*ctx;
++	struct xarray		ctx;
+ 	int			num_ctx;
+ 	int			irq_type;
+ 	int			num_regions;
