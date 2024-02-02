@@ -258,7 +258,7 @@ create_changelog_from_git () {
 	    exclude=(--fixups "$_" "${exclude[@]}")
     fi
     scripts/gitlog2changes "${exclude[@]}" $head -- >"$oldlog"
-    sed 1d rpm/kernel-source.changes.old >>"$oldlog"
+    sed 1d "$oldfile" >>"$oldlog"
     scripts/rpm-changes-merge.pl -1 "$oldlog"
 }
 
