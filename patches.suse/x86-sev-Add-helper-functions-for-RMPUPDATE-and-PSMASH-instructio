@@ -1,0 +1,187 @@
+From: Brijesh Singh <brijesh.singh@amd.com>
+Date: Thu, 25 Jan 2024 22:11:10 -0600
+Subject: x86/sev: Add helper functions for RMPUPDATE and PSMASH instruction
+Git-commit: 2c35819ee00b8893626914b3384cdef2afea7dbd
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git
+Patch-mainline: Queued
+References: jsc#PED-5122
+
+The RMPUPDATE instruction updates the access restrictions for a page via
+its corresponding entry in the RMP Table. The hypervisor will use the
+instruction to enforce various access restrictions on pages used for
+confidential guests and other specialized functionality. See APM3 for
+details on the instruction operations.
+
+The PSMASH instruction expands a 2MB RMP entry in the RMP table into a
+corresponding set of contiguous 4KB RMP entries while retaining the
+state of the validated bit from the original 2MB RMP entry. The
+hypervisor will use this instruction in cases where it needs to re-map a
+page as 4K rather than 2MB in a guest's nested page table.
+
+Add helpers to make use of these instructions.
+
+  [ mdr: add RMPUPDATE retry logic for transient FAIL_OVERLAP errors. ]
+
+Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+Signed-off-by: Ashish Kalra <ashish.kalra@amd.com>
+Signed-off-by: Michael Roth <michael.roth@amd.com>
+Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Reviewed-by: Liam Merwick <liam.merwick@oracle.com>
+Link: https://lore.kernel.org/r/20240126041126.1927228-11-michael.roth@amd.com
+
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ arch/x86/include/asm/sev.h | 23 ++++++++++++
+ arch/x86/virt/svm/sev.c    | 92 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 115 insertions(+)
+
+diff --git a/arch/x86/include/asm/sev.h b/arch/x86/include/asm/sev.h
+index 2c53e3de0b71..57fd95a5e6b2 100644
+--- a/arch/x86/include/asm/sev.h
++++ b/arch/x86/include/asm/sev.h
+@@ -87,10 +87,23 @@ extern bool handle_vc_boot_ghcb(struct pt_regs *regs);
+ /* Software defined (when rFlags.CF = 1) */
+ #define PVALIDATE_FAIL_NOUPDATE		255
+ 
++/* RMUPDATE detected 4K page and 2MB page overlap. */
++#define RMPUPDATE_FAIL_OVERLAP		4
++
+ /* RMP page size */
+ #define RMP_PG_SIZE_4K			0
+ #define RMP_PG_SIZE_2M			1
+ #define RMP_TO_PG_LEVEL(level)		(((level) == RMP_PG_SIZE_4K) ? PG_LEVEL_4K : PG_LEVEL_2M)
++#define PG_LEVEL_TO_RMP(level)		(((level) == PG_LEVEL_4K) ? RMP_PG_SIZE_4K : RMP_PG_SIZE_2M)
++
++struct rmp_state {
++	u64 gpa;
++	u8 assigned;
++	u8 pagesize;
++	u8 immutable;
++	u8 rsvd;
++	u32 asid;
++} __packed;
+ 
+ #define RMPADJUST_VMSA_PAGE_BIT		BIT(16)
+ 
+@@ -248,10 +261,20 @@ static inline u64 sev_get_status(void) { return 0; }
+ bool snp_probe_rmptable_info(void);
+ int snp_lookup_rmpentry(u64 pfn, bool *assigned, int *level);
+ void snp_dump_hva_rmpentry(unsigned long address);
++int psmash(u64 pfn);
++int rmp_make_private(u64 pfn, u64 gpa, enum pg_level level, u32 asid, bool immutable);
++int rmp_make_shared(u64 pfn, enum pg_level level);
+ #else
+ static inline bool snp_probe_rmptable_info(void) { return false; }
+ static inline int snp_lookup_rmpentry(u64 pfn, bool *assigned, int *level) { return -ENODEV; }
+ static inline void snp_dump_hva_rmpentry(unsigned long address) {}
++static inline int psmash(u64 pfn) { return -ENODEV; }
++static inline int rmp_make_private(u64 pfn, u64 gpa, enum pg_level level, u32 asid,
++				   bool immutable)
++{
++	return -ENODEV;
++}
++static inline int rmp_make_shared(u64 pfn, enum pg_level level) { return -ENODEV; }
+ #endif
+ 
+ #endif
+diff --git a/arch/x86/virt/svm/sev.c b/arch/x86/virt/svm/sev.c
+index c74266e039b2..dc18335a2b97 100644
+--- a/arch/x86/virt/svm/sev.c
++++ b/arch/x86/virt/svm/sev.c
+@@ -342,3 +342,95 @@ void snp_dump_hva_rmpentry(unsigned long hva)
+ 	paddr = PFN_PHYS(pte_pfn(*pte)) | (hva & ~page_level_mask(level));
+ 	dump_rmpentry(PHYS_PFN(paddr));
+ }
++
++/*
++ * PSMASH a 2MB aligned page into 4K pages in the RMP table while preserving the
++ * Validated bit.
++ */
++int psmash(u64 pfn)
++{
++	unsigned long paddr = pfn << PAGE_SHIFT;
++	int ret;
++
++	if (!cpu_feature_enabled(X86_FEATURE_SEV_SNP))
++		return -ENODEV;
++
++	if (!pfn_valid(pfn))
++		return -EINVAL;
++
++	/* Binutils version 2.36 supports the PSMASH mnemonic. */
++	asm volatile(".byte 0xF3, 0x0F, 0x01, 0xFF"
++		      : "=a" (ret)
++		      : "a" (paddr)
++		      : "memory", "cc");
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(psmash);
++
++/*
++ * It is expected that those operations are seldom enough so that no mutual
++ * exclusion of updaters is needed and thus the overlap error condition below
++ * should happen very rarely and would get resolved relatively quickly by
++ * the firmware.
++ *
++ * If not, one could consider introducing a mutex or so here to sync concurrent
++ * RMP updates and thus diminish the amount of cases where firmware needs to
++ * lock 2M ranges to protect against concurrent updates.
++ *
++ * The optimal solution would be range locking to avoid locking disjoint
++ * regions unnecessarily but there's no support for that yet.
++ */
++static int rmpupdate(u64 pfn, struct rmp_state *state)
++{
++	unsigned long paddr = pfn << PAGE_SHIFT;
++	int ret;
++
++	if (!cpu_feature_enabled(X86_FEATURE_SEV_SNP))
++		return -ENODEV;
++
++	do {
++		/* Binutils version 2.36 supports the RMPUPDATE mnemonic. */
++		asm volatile(".byte 0xF2, 0x0F, 0x01, 0xFE"
++			     : "=a" (ret)
++			     : "a" (paddr), "c" ((unsigned long)state)
++			     : "memory", "cc");
++	} while (ret == RMPUPDATE_FAIL_OVERLAP);
++
++	if (ret) {
++		pr_err("RMPUPDATE failed for PFN %llx, ret: %d\n", pfn, ret);
++		dump_rmpentry(pfn);
++		dump_stack();
++		return -EFAULT;
++	}
++
++	return 0;
++}
++
++/* Transition a page to guest-owned/private state in the RMP table. */
++int rmp_make_private(u64 pfn, u64 gpa, enum pg_level level, u32 asid, bool immutable)
++{
++	struct rmp_state state;
++
++	memset(&state, 0, sizeof(state));
++	state.assigned = 1;
++	state.asid = asid;
++	state.immutable = immutable;
++	state.gpa = gpa;
++	state.pagesize = PG_LEVEL_TO_RMP(level);
++
++	return rmpupdate(pfn, &state);
++}
++EXPORT_SYMBOL_GPL(rmp_make_private);
++
++/* Transition a page to hypervisor-owned/shared state in the RMP table. */
++int rmp_make_shared(u64 pfn, enum pg_level level)
++{
++	struct rmp_state state;
++
++	memset(&state, 0, sizeof(state));
++	state.pagesize = PG_LEVEL_TO_RMP(level);
++
++	return rmpupdate(pfn, &state);
++}
++EXPORT_SYMBOL_GPL(rmp_make_shared);
+

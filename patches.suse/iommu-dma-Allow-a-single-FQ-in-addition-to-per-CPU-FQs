@@ -1,0 +1,349 @@
+From: Niklas Schnelle <schnelle@linux.ibm.com>
+Date: Thu, 28 Sep 2023 16:31:39 +0200
+Subject: iommu/dma: Allow a single FQ in addition to per-CPU FQs
+Git-commit: 32d5bc8b09c7cc48c511809e7c3b1755c7ecc5fa
+Patch-mainline: v6.7-rc1
+References: jsc#PED-7779 jsc#PED-7780
+
+In some virtualized environments, including s390 paged memory guests,
+IOTLB flushes are used to update IOMMU shadow tables. Due to this, they
+are much more expensive than in typical bare metal environments or
+non-paged s390 guests. In addition they may parallelize poorly in
+virtualized environments. This changes the trade off for flushing IOVAs
+such that minimizing the number of IOTLB flushes trumps any benefit of
+cheaper queuing operations or increased paralellism.
+
+In this scenario per-CPU flush queues pose several problems. Firstly
+per-CPU memory is often quite limited prohibiting larger queues.
+Secondly collecting IOVAs per-CPU but flushing via a global timeout
+reduces the number of IOVAs flushed for each timeout especially on s390
+where PCI interrupts may not be bound to a specific CPU.
+
+Let's introduce a single flush queue mode that reuses the same queue
+logic but only allocates a single global queue. This mode is selected by
+dma-iommu if a newly introduced .shadow_on_flush flag is set in struct
+dev_iommu. As a first user the s390 IOMMU driver sets this flag during
+probe_device. With the unchanged small FQ size and timeouts this setting
+is worse than per-CPU queues but a follow up patch will make the FQ size
+and timeout variable. Together this allows the common IOVA flushing code
+to more closely resemble the global flush behavior used on s390's
+previous internal DMA API implementation.
+
+Link: https://lore.kernel.org/all/9a466109-01c5-96b0-bf03-304123f435ee@arm.com/
+Acked-by: Robin Murphy <robin.murphy@arm.com>
+Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com> #s390
+Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+Link: https://lore.kernel.org/r/20230928-dma_iommu-v13-5-9e5fc4dacc36@linux.ibm.com
+Signed-off-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/iommu/dma-iommu.c  |  168 ++++++++++++++++++++++++++++++++++-----------
+ drivers/iommu/s390-iommu.c |    3 
+ include/linux/iommu.h      |    2 
+ 3 files changed, 134 insertions(+), 39 deletions(-)
+
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@ -43,14 +43,26 @@ enum iommu_dma_cookie_type {
+ 	IOMMU_DMA_MSI_COOKIE,
+ };
+ 
++enum iommu_dma_queue_type {
++	IOMMU_DMA_OPTS_PER_CPU_QUEUE,
++	IOMMU_DMA_OPTS_SINGLE_QUEUE,
++};
++
++struct iommu_dma_options {
++	enum iommu_dma_queue_type qt;
++};
++
+ struct iommu_dma_cookie {
+ 	enum iommu_dma_cookie_type	type;
+ 	union {
+ 		/* Full allocator for IOMMU_DMA_IOVA_COOKIE */
+ 		struct {
+ 			struct iova_domain	iovad;
+-
+-			struct iova_fq __percpu *fq;	/* Flush queue */
++			/* Flush queue */
++			union {
++				struct iova_fq	*single_fq;
++				struct iova_fq	__percpu *percpu_fq;
++			};
+ 			/* Number of TLB flushes that have been started */
+ 			atomic64_t		fq_flush_start_cnt;
+ 			/* Number of TLB flushes that have been finished */
+@@ -67,6 +79,8 @@ struct iommu_dma_cookie {
+ 
+ 	/* Domain for flush queue callback; NULL if flush queue not in use */
+ 	struct iommu_domain		*fq_domain;
++	/* Options for dma-iommu use */
++	struct iommu_dma_options	options;
+ 	struct mutex			mutex;
+ };
+ 
+@@ -124,7 +138,7 @@ static inline unsigned int fq_ring_add(s
+ 	return idx;
+ }
+ 
+-static void fq_ring_free(struct iommu_dma_cookie *cookie, struct iova_fq *fq)
++static void fq_ring_free_locked(struct iommu_dma_cookie *cookie, struct iova_fq *fq)
+ {
+ 	u64 counter = atomic64_read(&cookie->fq_flush_finish_cnt);
+ 	unsigned int idx;
+@@ -145,6 +159,15 @@ static void fq_ring_free(struct iommu_dm
+ 	}
+ }
+ 
++static void fq_ring_free(struct iommu_dma_cookie *cookie, struct iova_fq *fq)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&fq->lock, flags);
++	fq_ring_free_locked(cookie, fq);
++	spin_unlock_irqrestore(&fq->lock, flags);
++}
++
+ static void fq_flush_iotlb(struct iommu_dma_cookie *cookie)
+ {
+ 	atomic64_inc(&cookie->fq_flush_start_cnt);
+@@ -160,14 +183,11 @@ static void fq_flush_timeout(struct time
+ 	atomic_set(&cookie->fq_timer_on, 0);
+ 	fq_flush_iotlb(cookie);
+ 
+-	for_each_possible_cpu(cpu) {
+-		unsigned long flags;
+-		struct iova_fq *fq;
+-
+-		fq = per_cpu_ptr(cookie->fq, cpu);
+-		spin_lock_irqsave(&fq->lock, flags);
+-		fq_ring_free(cookie, fq);
+-		spin_unlock_irqrestore(&fq->lock, flags);
++	if (cookie->options.qt == IOMMU_DMA_OPTS_SINGLE_QUEUE) {
++		fq_ring_free(cookie, cookie->single_fq);
++	} else {
++		for_each_possible_cpu(cpu)
++			fq_ring_free(cookie, per_cpu_ptr(cookie->percpu_fq, cpu));
+ 	}
+ }
+ 
+@@ -188,7 +208,11 @@ static void queue_iova(struct iommu_dma_
+ 	 */
+ 	smp_mb();
+ 
+-	fq = raw_cpu_ptr(cookie->fq);
++	if (cookie->options.qt == IOMMU_DMA_OPTS_SINGLE_QUEUE)
++		fq = cookie->single_fq;
++	else
++		fq = raw_cpu_ptr(cookie->percpu_fq);
++
+ 	spin_lock_irqsave(&fq->lock, flags);
+ 
+ 	/*
+@@ -196,11 +220,11 @@ static void queue_iova(struct iommu_dma_
+ 	 * flushed out on another CPU. This makes the fq_full() check below less
+ 	 * likely to be true.
+ 	 */
+-	fq_ring_free(cookie, fq);
++	fq_ring_free_locked(cookie, fq);
+ 
+ 	if (fq_full(fq)) {
+ 		fq_flush_iotlb(cookie);
+-		fq_ring_free(cookie, fq);
++		fq_ring_free_locked(cookie, fq);
+ 	}
+ 
+ 	idx = fq_ring_add(fq);
+@@ -219,31 +243,88 @@ static void queue_iova(struct iommu_dma_
+ 			  jiffies + msecs_to_jiffies(IOVA_FQ_TIMEOUT));
+ }
+ 
+-static void iommu_dma_free_fq(struct iommu_dma_cookie *cookie)
++static void iommu_dma_free_fq_single(struct iova_fq *fq)
+ {
+-	int cpu, idx;
++	int idx;
+ 
+-	if (!cookie->fq)
+-		return;
++	fq_ring_for_each(idx, fq)
++		put_pages_list(&fq->entries[idx].freelist);
++	vfree(fq);
++}
++
++static void iommu_dma_free_fq_percpu(struct iova_fq __percpu *percpu_fq)
++{
++	int cpu, idx;
+ 
+-	del_timer_sync(&cookie->fq_timer);
+ 	/* The IOVAs will be torn down separately, so just free our queued pages */
+ 	for_each_possible_cpu(cpu) {
+-		struct iova_fq *fq = per_cpu_ptr(cookie->fq, cpu);
++		struct iova_fq *fq = per_cpu_ptr(percpu_fq, cpu);
+ 
+ 		fq_ring_for_each(idx, fq)
+ 			put_pages_list(&fq->entries[idx].freelist);
+ 	}
+ 
+-	free_percpu(cookie->fq);
++	free_percpu(percpu_fq);
++}
++
++static void iommu_dma_free_fq(struct iommu_dma_cookie *cookie)
++{
++	if (!cookie->fq_domain)
++		return;
++
++	del_timer_sync(&cookie->fq_timer);
++	if (cookie->options.qt == IOMMU_DMA_OPTS_SINGLE_QUEUE)
++		iommu_dma_free_fq_single(cookie->single_fq);
++	else
++		iommu_dma_free_fq_percpu(cookie->percpu_fq);
++}
++
++static void iommu_dma_init_one_fq(struct iova_fq *fq)
++{
++	int i;
++
++	fq->head = 0;
++	fq->tail = 0;
++
++	spin_lock_init(&fq->lock);
++
++	for (i = 0; i < IOVA_FQ_SIZE; i++)
++		INIT_LIST_HEAD(&fq->entries[i].freelist);
++}
++
++static int iommu_dma_init_fq_single(struct iommu_dma_cookie *cookie)
++{
++	struct iova_fq *queue;
++
++	queue = vmalloc(sizeof(*queue));
++	if (!queue)
++		return -ENOMEM;
++	iommu_dma_init_one_fq(queue);
++	cookie->single_fq = queue;
++
++	return 0;
++}
++
++static int iommu_dma_init_fq_percpu(struct iommu_dma_cookie *cookie)
++{
++	struct iova_fq __percpu *queue;
++	int cpu;
++
++	queue = alloc_percpu(struct iova_fq);
++	if (!queue)
++		return -ENOMEM;
++
++	for_each_possible_cpu(cpu)
++		iommu_dma_init_one_fq(per_cpu_ptr(queue, cpu));
++	cookie->percpu_fq = queue;
++	return 0;
+ }
+ 
+ /* sysfs updates are serialised by the mutex of the group owning @domain */
+ int iommu_dma_init_fq(struct iommu_domain *domain)
+ {
+ 	struct iommu_dma_cookie *cookie = domain->iova_cookie;
+-	struct iova_fq __percpu *queue;
+-	int i, cpu;
++	int rc;
+ 
+ 	if (cookie->fq_domain)
+ 		return 0;
+@@ -251,26 +332,16 @@ int iommu_dma_init_fq(struct iommu_domai
+ 	atomic64_set(&cookie->fq_flush_start_cnt,  0);
+ 	atomic64_set(&cookie->fq_flush_finish_cnt, 0);
+ 
+-	queue = alloc_percpu(struct iova_fq);
+-	if (!queue) {
++	if (cookie->options.qt == IOMMU_DMA_OPTS_SINGLE_QUEUE)
++		rc = iommu_dma_init_fq_single(cookie);
++	else
++		rc = iommu_dma_init_fq_percpu(cookie);
++
++	if (rc) {
+ 		pr_warn("iova flush queue initialization failed\n");
+ 		return -ENOMEM;
+ 	}
+ 
+-	for_each_possible_cpu(cpu) {
+-		struct iova_fq *fq = per_cpu_ptr(queue, cpu);
+-
+-		fq->head = 0;
+-		fq->tail = 0;
+-
+-		spin_lock_init(&fq->lock);
+-
+-		for (i = 0; i < IOVA_FQ_SIZE; i++)
+-			INIT_LIST_HEAD(&fq->entries[i].freelist);
+-	}
+-
+-	cookie->fq = queue;
+-
+ 	timer_setup(&cookie->fq_timer, fq_flush_timeout, 0);
+ 	atomic_set(&cookie->fq_timer_on, 0);
+ 	/*
+@@ -526,6 +597,23 @@ static bool dev_use_swiotlb(struct devic
+ }
+ 
+ /**
++ * iommu_dma_init_options - Initialize dma-iommu options
++ * @options: The options to be initialized
++ * @dev: Device the options are set for
++ *
++ * This allows tuning dma-iommu specific to device properties
++ */
++static void iommu_dma_init_options(struct iommu_dma_options *options,
++				   struct device *dev)
++{
++	/* Shadowing IOTLB flushes do better with a single queue */
++	if (dev->iommu->shadow_on_flush)
++		options->qt = IOMMU_DMA_OPTS_SINGLE_QUEUE;
++	else
++		options->qt = IOMMU_DMA_OPTS_PER_CPU_QUEUE;
++}
++
++/**
+  * iommu_dma_init_domain - Initialise a DMA mapping domain
+  * @domain: IOMMU domain previously prepared by iommu_get_dma_cookie()
+  * @base: IOVA at which the mappable address space starts
+@@ -585,6 +673,8 @@ static int iommu_dma_init_domain(struct
+ 	if (ret)
+ 		goto done_unlock;
+ 
++	iommu_dma_init_options(&cookie->options, dev);
++
+ 	/* If the FQ fails we can simply fall back to strict mode */
+ 	if (domain->type == IOMMU_DOMAIN_DMA_FQ &&
+ 	    (!device_iommu_capable(dev, IOMMU_CAP_DEFERRED_FLUSH) || iommu_dma_init_fq(domain)))
+--- a/drivers/iommu/s390-iommu.c
++++ b/drivers/iommu/s390-iommu.c
+@@ -463,6 +463,9 @@ static struct iommu_device *s390_iommu_p
+ 	if (zdev->end_dma > ZPCI_TABLE_SIZE_RT - 1)
+ 		zdev->end_dma = ZPCI_TABLE_SIZE_RT - 1;
+ 
++	if (zdev->tlb_refresh)
++		dev->iommu->shadow_on_flush = 1;
++
+ 	return &zdev->iommu_dev;
+ }
+ 
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -534,6 +534,7 @@ struct iommu_fault_param {
+  * @max_pasids:  number of PASIDs this device can consume
+  * @attach_deferred: the dma domain attachment is deferred
+  * @require_direct: device requires IOMMU_RESV_DIRECT regions
++ * @shadow_on_flush: IOTLB flushes are used to sync shadow tables
+  * @pci_32bit_workaround: Limit DMA allocations to 32-bit IOVAs
+  *
+  * TODO: migrate other per device data pointers under iommu_dev_data, e.g.
+@@ -549,6 +550,7 @@ struct dev_iommu {
+ 	u32				max_pasids;
+ 	u32				attach_deferred:1;
+ 	u32				require_direct:1;
++	u32				shadow_on_flush:1;
+ 	u32				pci_32bit_workaround:1;
+ };
+ 
