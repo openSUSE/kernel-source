@@ -1,0 +1,200 @@
+From 93b8cc60c37b9d17732b7a297e5dca29b50a990d Mon Sep 17 00:00:00 2001
+From: Ming Lei <ming.lei@redhat.com>
+Date: Thu, 28 Sep 2023 20:43:25 +0800
+Subject: [PATCH] io_uring: cancelable uring_cmd
+Git-commit: 93b8cc60c37b9d17732b7a297e5dca29b50a990d
+Patch-mainline: v6.7-rc1
+References: bsc#1215211
+
+uring_cmd may never complete, such as ublk, in which uring cmd isn't
+completed until one new block request is coming from ublk block device.
+
+Add cancelable uring_cmd to provide mechanism to driver for cancelling
+pending commands in its own way.
+
+Add API of io_uring_cmd_mark_cancelable() for driver to mark one command as
+cancelable, then io_uring will cancel this command in
+io_uring_cancel_generic(). ->uring_cmd() callback is reused for canceling
+command in driver's way, then driver gets notified with the cancelling
+from io_uring.
+
+Add API of io_uring_cmd_get_task() to help driver cancel handler
+deal with the canceling.
+
+Reviewed-by: Gabriel Krisman Bertazi <krisman@suse.de>
+Suggested-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ include/linux/io_uring.h       |   12 ++++++++++
+ include/linux/io_uring_types.h |    6 +++++
+ io_uring/io_uring.c            |   33 ++++++++++++++++++++++++++++
+ io_uring/uring_cmd.c           |   47 +++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 98 insertions(+)
+
+--- a/include/linux/io_uring.h
++++ b/include/linux/io_uring.h
+@@ -20,9 +20,13 @@ enum io_uring_cmd_flags {
+ 	IO_URING_F_SQE128		= (1 << 8),
+ 	IO_URING_F_CQE32		= (1 << 9),
+ 	IO_URING_F_IOPOLL		= (1 << 10),
++
++	/* set when uring wants to cancel a previously issued command */
++	IO_URING_F_CANCEL		= (1 << 11),
+ };
+ 
+ /* only top 8 bits of sqe->uring_cmd_flags for kernel internal use */
++#define IORING_URING_CMD_CANCELABLE	(1U << 30)
+ #define IORING_URING_CMD_POLLED		(1U << 31)
+ 
+ struct io_uring_cmd {
+@@ -119,6 +123,14 @@ static inline const char *io_uring_get_o
+ {
+ 	return "";
+ }
++static inline void io_uring_cmd_mark_cancelable(struct io_uring_cmd *cmd,
++		unsigned int issue_flags)
++{
++}
++static inline struct task_struct *io_uring_cmd_get_task(struct io_uring_cmd *cmd)
++{
++	return NULL;
++}
+ #endif
+ 
+ #endif
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -265,6 +265,12 @@ struct io_ring_ctx {
+ 		 */
+ 		struct io_wq_work_list	iopoll_list;
+ 		bool			poll_multi_queue;
++
++		/*
++		 * Any cancelable uring_cmd is added to this list in
++		 * ->uring_cmd() by io_uring_cmd_insert_cancelable()
++		 */
++		struct hlist_head	cancelable_uring_cmd;
+ 	} ____cacheline_aligned_in_smp;
+ 
+ 	struct {
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -350,6 +350,7 @@ static __cold struct io_ring_ctx *io_rin
+ 	INIT_WQ_LIST(&ctx->locked_free_list);
+ 	INIT_DELAYED_WORK(&ctx->fallback_work, io_fallback_req_func);
+ 	INIT_WQ_LIST(&ctx->submit_state.compl_reqs);
++	INIT_HLIST_HEAD(&ctx->cancelable_uring_cmd);
+ 	return ctx;
+ err:
+ 	kfree(ctx->cancel_table.hbs);
+@@ -3276,6 +3277,37 @@ static __cold bool io_uring_try_cancel_i
+ 	return ret;
+ }
+ 
++static bool io_uring_try_cancel_uring_cmd(struct io_ring_ctx *ctx,
++		struct task_struct *task, bool cancel_all)
++{
++	struct hlist_node *tmp;
++	struct io_kiocb *req;
++	bool ret = false;
++
++	lockdep_assert_held(&ctx->uring_lock);
++
++	hlist_for_each_entry_safe(req, tmp, &ctx->cancelable_uring_cmd,
++			hash_node) {
++		struct io_uring_cmd *cmd = io_kiocb_to_cmd(req,
++				struct io_uring_cmd);
++		struct file *file = req->file;
++
++		if (!cancel_all && req->task != task)
++			continue;
++
++		if (cmd->flags & IORING_URING_CMD_CANCELABLE) {
++			/* ->sqe isn't available if no async data */
++			if (!req_has_async_data(req))
++				cmd->sqe = NULL;
++			file->f_op->uring_cmd(cmd, IO_URING_F_CANCEL);
++			ret = true;
++		}
++	}
++	io_submit_flush_completions(ctx);
++
++	return ret;
++}
++
+ static __cold bool io_uring_try_cancel_requests(struct io_ring_ctx *ctx,
+ 						struct task_struct *task,
+ 						bool cancel_all)
+@@ -3323,6 +3355,7 @@ static __cold bool io_uring_try_cancel_r
+ 	ret |= io_cancel_defer_files(ctx, task, cancel_all);
+ 	mutex_lock(&ctx->uring_lock);
+ 	ret |= io_poll_remove_all(ctx, task, cancel_all);
++	ret |= io_uring_try_cancel_uring_cmd(ctx, task, cancel_all);
+ 	mutex_unlock(&ctx->uring_lock);
+ 	ret |= io_kill_timeouts(ctx, task, cancel_all);
+ 	if (task)
+--- a/io_uring/uring_cmd.c
++++ b/io_uring/uring_cmd.c
+@@ -12,6 +12,51 @@
+ #include "rsrc.h"
+ #include "uring_cmd.h"
+ 
++static void io_uring_cmd_del_cancelable(struct io_uring_cmd *cmd,
++		unsigned int issue_flags)
++{
++	struct io_kiocb *req = cmd_to_io_kiocb(cmd);
++	struct io_ring_ctx *ctx = req->ctx;
++
++	if (!(cmd->flags & IORING_URING_CMD_CANCELABLE))
++		return;
++
++	cmd->flags &= ~IORING_URING_CMD_CANCELABLE;
++	io_ring_submit_lock(ctx, issue_flags);
++	hlist_del(&req->hash_node);
++	io_ring_submit_unlock(ctx, issue_flags);
++}
++
++/*
++ * Mark this command as concelable, then io_uring_try_cancel_uring_cmd()
++ * will try to cancel this issued command by sending ->uring_cmd() with
++ * issue_flags of IO_URING_F_CANCEL.
++ *
++ * The command is guaranteed to not be done when calling ->uring_cmd()
++ * with IO_URING_F_CANCEL, but it is driver's responsibility to deal
++ * with race between io_uring canceling and normal completion.
++ */
++void io_uring_cmd_mark_cancelable(struct io_uring_cmd *cmd,
++		unsigned int issue_flags)
++{
++	struct io_kiocb *req = cmd_to_io_kiocb(cmd);
++	struct io_ring_ctx *ctx = req->ctx;
++
++	if (!(cmd->flags & IORING_URING_CMD_CANCELABLE)) {
++		cmd->flags |= IORING_URING_CMD_CANCELABLE;
++		io_ring_submit_lock(ctx, issue_flags);
++		hlist_add_head(&req->hash_node, &ctx->cancelable_uring_cmd);
++		io_ring_submit_unlock(ctx, issue_flags);
++	}
++}
++EXPORT_SYMBOL_GPL(io_uring_cmd_mark_cancelable);
++
++struct task_struct *io_uring_cmd_get_task(struct io_uring_cmd *cmd)
++{
++	return cmd_to_io_kiocb(cmd)->task;
++}
++EXPORT_SYMBOL_GPL(io_uring_cmd_get_task);
++
+ static void io_uring_cmd_work(struct io_kiocb *req, struct io_tw_state *ts)
+ {
+ 	struct io_uring_cmd *ioucmd = io_kiocb_to_cmd(req, struct io_uring_cmd);
+@@ -55,6 +100,8 @@ void io_uring_cmd_done(struct io_uring_c
+ {
+ 	struct io_kiocb *req = cmd_to_io_kiocb(ioucmd);
+ 
++	io_uring_cmd_del_cancelable(ioucmd, issue_flags);
++
+ 	if (ret < 0)
+ 		req_set_fail(req);
+ 

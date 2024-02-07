@@ -1,0 +1,165 @@
+From 130443d60b1b8c7a609a2af3384dd8e60df97181 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Mon, 29 May 2023 21:20:35 +0800
+Subject: [PATCH] md: refactor idle/frozen_sync_thread() to fix deadlock
+Git-commit: 130443d60b1b8c7a609a2af3384dd8e60df97181
+Patch-mainline: v6.6-rc1
+References: jsc#PED-7542
+
+Our test found a following deadlock in raid10:
+
+1) Issue a normal write, and such write failed:
+
+  raid10_end_write_request
+   set_bit(R10BIO_WriteError, &r10_bio->state)
+   one_write_done
+    reschedule_retry
+
+  // later from md thread
+  raid10d
+   handle_write_completed
+    list_add(&r10_bio->retry_list, &conf->bio_end_io_list)
+
+  // later from md thread
+  raid10d
+   if (!test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags))
+    list_move(conf->bio_end_io_list.prev, &tmp)
+    r10_bio = list_first_entry(&tmp, struct r10bio, retry_list)
+    raid_end_bio_io(r10_bio)
+
+Dependency chain 1: normal io is waiting for updating superblock
+
+2) Trigger a recovery:
+
+  raid10_sync_request
+   raise_barrier
+
+Dependency chain 2: sync thread is waiting for normal io
+
+3) echo idle/frozen to sync_action:
+
+  action_store
+   mddev_lock
+    md_unregister_thread
+     kthread_stop
+
+Dependency chain 3: drop 'reconfig_mutex' is waiting for sync thread
+
+4) md thread can't update superblock:
+
+  raid10d
+   md_check_recovery
+    if (mddev_trylock(mddev))
+     md_update_sb
+
+Dependency chain 4: update superblock is waiting for 'reconfig_mutex'
+
+Hence cyclic dependency exist, in order to fix the problem, we must
+break one of them. Dependency 1 and 2 can't be broken because they are
+foundation design. Dependency 4 may be possible if it can be guaranteed
+that no io can be inflight, however, this requires a new mechanism which
+seems complex. Dependency 3 is a good choice, because idle/frozen only
+requires sync thread to finish, which can be done asynchronously that is
+already implemented, and 'reconfig_mutex' is not needed anymore.
+
+This patch switch 'idle' and 'frozen' to wait sync thread to be done
+asynchronously, and this patch also add a sequence counter to record how
+many times sync thread is done, so that 'idle' won't keep waiting on new
+started sync thread.
+
+Noted that raid456 has similiar deadlock([1]), and it's verified[2] this
+deadlock can be fixed by this patch as well.
+
+[1] https://lore.kernel.org/linux-raid/5ed54ffc-ce82-bf66-4eff-390cb23bc1ac@molgen.mpg.de/T/#t
+[2] https://lore.kernel.org/linux-raid/e9067438-d713-f5f3-0d3d-9e6b0e9efa0e@huaweicloud.com/
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Signed-off-by: Song Liu <song@kernel.org>
+Link: https://lore.kernel.org/r/20230529132037.2124527-5-yukuai1@huaweicloud.com
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/md.c | 23 +++++++++++++++++++----
+ drivers/md/md.h |  2 ++
+ 2 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 3d7e87cab8ad..920701ab9505 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -651,6 +651,7 @@ void mddev_init(struct mddev *mddev)
+ 	timer_setup(&mddev->safemode_timer, md_safemode_timeout, 0);
+ 	atomic_set(&mddev->active, 1);
+ 	atomic_set(&mddev->openers, 0);
++	atomic_set(&mddev->sync_seq, 0);
+ 	spin_lock_init(&mddev->lock);
+ 	atomic_set(&mddev->flush_pending, 0);
+ 	init_waitqueue_head(&mddev->sb_wait);
+@@ -4768,19 +4769,27 @@ static void stop_sync_thread(struct mddev *mddev)
+ 	if (work_pending(&mddev->del_work))
+ 		flush_workqueue(md_misc_wq);
+ 
+-	if (mddev->sync_thread) {
+-		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+-		md_reap_sync_thread(mddev);
+-	}
++	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
++	/*
++	 * Thread might be blocked waiting for metadata update which will now
++	 * never happen
++	 */
++	md_wakeup_thread_directly(mddev->sync_thread);
+ 
+ 	mddev_unlock(mddev);
+ }
+ 
+ static void idle_sync_thread(struct mddev *mddev)
+ {
++	int sync_seq = atomic_read(&mddev->sync_seq);
++
+ 	mutex_lock(&mddev->sync_mutex);
+ 	clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+ 	stop_sync_thread(mddev);
++
++	wait_event(resync_wait, sync_seq != atomic_read(&mddev->sync_seq) ||
++			!test_bit(MD_RECOVERY_RUNNING, &mddev->recovery));
++
+ 	mutex_unlock(&mddev->sync_mutex);
+ }
+ 
+@@ -4789,6 +4798,10 @@ static void frozen_sync_thread(struct mddev *mddev)
+ 	mutex_lock(&mddev->sync_mutex);
+ 	set_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+ 	stop_sync_thread(mddev);
++
++	wait_event(resync_wait, mddev->sync_thread == NULL &&
++			!test_bit(MD_RECOVERY_RUNNING, &mddev->recovery));
++
+ 	mutex_unlock(&mddev->sync_mutex);
+ }
+ 
+@@ -9463,6 +9476,8 @@ void md_reap_sync_thread(struct mddev *mddev)
+ 
+ 	/* resync has finished, collect result */
+ 	md_unregister_thread(&mddev->sync_thread);
++	atomic_inc(&mddev->sync_seq);
++
+ 	if (!test_bit(MD_RECOVERY_INTR, &mddev->recovery) &&
+ 	    !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery) &&
+ 	    mddev->degraded != mddev->raid_disks) {
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 18c168bf5fab..914e6ece9af2 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -537,6 +537,8 @@ struct mddev {
+ 
+ 	/* Used to synchronize idle and frozen for action_store() */
+ 	struct mutex			sync_mutex;
++	/* The sequence number for sync thread */
++	atomic_t sync_seq;
+ 
+ 	bool	has_superblocks:1;
+ 	bool	fail_last_dev:1;
+-- 
+2.35.3
+

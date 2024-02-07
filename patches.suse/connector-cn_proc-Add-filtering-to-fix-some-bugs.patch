@@ -1,0 +1,288 @@
+From: Anjali Kulkarni <anjali.k.kulkarni@oracle.com>
+Date: Wed, 19 Jul 2023 13:18:18 -0700
+Subject: connector/cn_proc: Add filtering to fix some bugs
+Patch-mainline: v6.6-rc1
+Git-commit: 2aa1f7a1f47ce8dac7593af605aaa859b3cf3bb1
+References: jsc#PED-7574
+
+The current proc connector code has the foll. bugs - if there are more
+than one listeners for the proc connector messages, and one of them
+deregisters for listening using PROC_CN_MCAST_IGNORE, they will still get
+all proc connector messages, as long as there is another listener.
+
+Another issue is if one client calls PROC_CN_MCAST_LISTEN, and another one
+calls PROC_CN_MCAST_IGNORE, then both will end up not getting any messages.
+
+This patch adds filtering and drops packet if client has sent
+PROC_CN_MCAST_IGNORE. This data is stored in the client socket's
+sk_user_data. In addition, we only increment or decrement
+proc_event_num_listeners once per client. This fixes the above issues.
+
+cn_release is the release function added for NETLINK_CONNECTOR. It uses
+the newly added netlink_release function added to netlink_sock. It will
+free sk_user_data.
+
+Signed-off-by: Anjali Kulkarni <anjali.k.kulkarni@oracle.com>
+Reviewed-by: Liam R. Howlett <Liam.Howlett@oracle.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/connector/cn_proc.c   |   57 ++++++++++++++++++++++++++++++++++--------
+ drivers/connector/connector.c |   21 ++++++++++++---
+ drivers/w1/w1_netlink.c       |    6 ++--
+ include/linux/connector.h     |    8 +++++
+ include/uapi/linux/cn_proc.h  |   43 ++++++++++++++++++-------------
+ 5 files changed, 100 insertions(+), 35 deletions(-)
+
+--- a/drivers/connector/cn_proc.c
++++ b/drivers/connector/cn_proc.c
+@@ -48,6 +48,21 @@ static DEFINE_PER_CPU(struct local_event
+ 	.lock = INIT_LOCAL_LOCK(lock),
+ };
+ 
++static int cn_filter(struct sock *dsk, struct sk_buff *skb, void *data)
++{
++	enum proc_cn_mcast_op mc_op;
++
++	if (!dsk)
++		return 0;
++
++	mc_op = ((struct proc_input *)(dsk->sk_user_data))->mcast_op;
++
++	if (mc_op == PROC_CN_MCAST_IGNORE)
++		return 1;
++
++	return 0;
++}
++
+ static inline void send_msg(struct cn_msg *msg)
+ {
+ 	local_lock(&local_event.lock);
+@@ -61,7 +76,8 @@ static inline void send_msg(struct cn_ms
+ 	 *
+ 	 * If cn_netlink_send() fails, the data is not sent.
+ 	 */
+-	cn_netlink_send(msg, 0, CN_IDX_PROC, GFP_NOWAIT);
++	cn_netlink_send_mult(msg, msg->len, 0, CN_IDX_PROC, GFP_NOWAIT,
++			     cn_filter, NULL);
+ 
+ 	local_unlock(&local_event.lock);
+ }
+@@ -346,11 +362,9 @@ static void cn_proc_ack(int err, int rcv
+ static void cn_proc_mcast_ctl(struct cn_msg *msg,
+ 			      struct netlink_skb_parms *nsp)
+ {
+-	enum proc_cn_mcast_op *mc_op = NULL;
+-	int err = 0;
+-
+-	if (msg->len != sizeof(*mc_op))
+-		return;
++	enum proc_cn_mcast_op mc_op = 0, prev_mc_op = 0;
++	int err = 0, initial = 0;
++	struct sock *sk = NULL;
+ 
+ 	/* 
+ 	 * Events are reported with respect to the initial pid
+@@ -367,13 +381,36 @@ static void cn_proc_mcast_ctl(struct cn_
+ 		goto out;
+ 	}
+ 
+-	mc_op = (enum proc_cn_mcast_op *)msg->data;
+-	switch (*mc_op) {
++	if (msg->len == sizeof(mc_op))
++		mc_op = *((enum proc_cn_mcast_op *)msg->data);
++	else
++		return;
++
++	if (nsp->sk) {
++		sk = nsp->sk;
++		if (sk->sk_user_data == NULL) {
++			sk->sk_user_data = kzalloc(sizeof(struct proc_input),
++						   GFP_KERNEL);
++			if (sk->sk_user_data == NULL) {
++				err = ENOMEM;
++				goto out;
++			}
++			initial = 1;
++		} else {
++			prev_mc_op =
++			((struct proc_input *)(sk->sk_user_data))->mcast_op;
++		}
++		((struct proc_input *)(sk->sk_user_data))->mcast_op = mc_op;
++	}
++
++	switch (mc_op) {
+ 	case PROC_CN_MCAST_LISTEN:
+-		atomic_inc(&proc_event_num_listeners);
++		if (initial || (prev_mc_op != PROC_CN_MCAST_LISTEN))
++			atomic_inc(&proc_event_num_listeners);
+ 		break;
+ 	case PROC_CN_MCAST_IGNORE:
+-		atomic_dec(&proc_event_num_listeners);
++		if (!initial && (prev_mc_op != PROC_CN_MCAST_IGNORE))
++			atomic_dec(&proc_event_num_listeners);
+ 		break;
+ 	default:
+ 		err = EINVAL;
+--- a/drivers/connector/connector.c
++++ b/drivers/connector/connector.c
+@@ -59,7 +59,9 @@ static int cn_already_initialized;
+  * both, or if both are zero then the group is looked up and sent there.
+  */
+ int cn_netlink_send_mult(struct cn_msg *msg, u16 len, u32 portid, u32 __group,
+-	gfp_t gfp_mask)
++	gfp_t gfp_mask,
++	int (*filter)(struct sock *dsk, struct sk_buff *skb, void *data),
++	void *filter_data)
+ {
+ 	struct cn_callback_entry *__cbq;
+ 	unsigned int size;
+@@ -110,8 +112,9 @@ int cn_netlink_send_mult(struct cn_msg *
+ 	NETLINK_CB(skb).dst_group = group;
+ 
+ 	if (group)
+-		return netlink_broadcast(dev->nls, skb, portid, group,
+-					 gfp_mask);
++		return netlink_broadcast_filtered(dev->nls, skb, portid, group,
++						  gfp_mask, filter,
++						  (void *)filter_data);
+ 	return netlink_unicast(dev->nls, skb, portid,
+ 			!gfpflags_allow_blocking(gfp_mask));
+ }
+@@ -121,7 +124,8 @@ EXPORT_SYMBOL_GPL(cn_netlink_send_mult);
+ int cn_netlink_send(struct cn_msg *msg, u32 portid, u32 __group,
+ 	gfp_t gfp_mask)
+ {
+-	return cn_netlink_send_mult(msg, msg->len, portid, __group, gfp_mask);
++	return cn_netlink_send_mult(msg, msg->len, portid, __group, gfp_mask,
++				    NULL, NULL);
+ }
+ EXPORT_SYMBOL_GPL(cn_netlink_send);
+ 
+@@ -162,6 +166,14 @@ static int cn_call_callback(struct sk_bu
+ 	return err;
+ }
+ 
++static void cn_release(struct sock *sk, unsigned long *groups)
++{
++	if (groups && test_bit(CN_IDX_PROC - 1, groups)) {
++		kfree(sk->sk_user_data);
++		sk->sk_user_data = NULL;
++	}
++}
++
+ /*
+  * Main netlink receiving function.
+  *
+@@ -249,6 +261,7 @@ static int cn_init(void)
+ 	struct netlink_kernel_cfg cfg = {
+ 		.groups	= CN_NETLINK_USERS + 0xf,
+ 		.input	= cn_rx_skb,
++		.release = cn_release,
+ 	};
+ 
+ 	dev->nls = netlink_kernel_create(&init_net, NETLINK_CONNECTOR, &cfg);
+--- a/drivers/w1/w1_netlink.c
++++ b/drivers/w1/w1_netlink.c
+@@ -65,7 +65,8 @@ static void w1_unref_block(struct w1_cb_
+ 		u16 len = w1_reply_len(block);
+ 		if (len) {
+ 			cn_netlink_send_mult(block->first_cn, len,
+-				block->portid, 0, GFP_KERNEL);
++					     block->portid, 0,
++					     GFP_KERNEL, NULL, NULL);
+ 		}
+ 		kfree(block);
+ 	}
+@@ -83,7 +84,8 @@ static void w1_reply_make_space(struct w
+ {
+ 	u16 len = w1_reply_len(block);
+ 	if (len + space >= block->maxlen) {
+-		cn_netlink_send_mult(block->first_cn, len, block->portid, 0, GFP_KERNEL);
++		cn_netlink_send_mult(block->first_cn, len, block->portid,
++				     0, GFP_KERNEL, NULL, NULL);
+ 		block->first_cn->len = 0;
+ 		block->cn = NULL;
+ 		block->msg = NULL;
+--- a/include/linux/connector.h
++++ b/include/linux/connector.h
+@@ -90,13 +90,19 @@ void cn_del_callback(const struct cb_id
+  *		If @group is not zero, then message will be delivered
+  *		to the specified group.
+  * @gfp_mask:	GFP mask.
++ * @filter:     Filter function to be used at netlink layer.
++ * @filter_data:Filter data to be supplied to the filter function
+  *
+  * It can be safely called from softirq context, but may silently
+  * fail under strong memory pressure.
+  *
+  * If there are no listeners for given group %-ESRCH can be returned.
+  */
+-int cn_netlink_send_mult(struct cn_msg *msg, u16 len, u32 portid, u32 group, gfp_t gfp_mask);
++int cn_netlink_send_mult(struct cn_msg *msg, u16 len, u32 portid,
++			 u32 group, gfp_t gfp_mask,
++			 int (*filter)(struct sock *dsk, struct sk_buff *skb,
++				       void *data),
++			 void *filter_data);
+ 
+ /**
+  * cn_netlink_send - Sends message to the specified groups.
+--- a/include/uapi/linux/cn_proc.h
++++ b/include/uapi/linux/cn_proc.h
+@@ -30,6 +30,30 @@ enum proc_cn_mcast_op {
+ 	PROC_CN_MCAST_IGNORE = 2
+ };
+ 
++enum proc_cn_event {
++	/* Use successive bits so the enums can be used to record
++	 * sets of events as well
++	 */
++	PROC_EVENT_NONE = 0x00000000,
++	PROC_EVENT_FORK = 0x00000001,
++	PROC_EVENT_EXEC = 0x00000002,
++	PROC_EVENT_UID  = 0x00000004,
++	PROC_EVENT_GID  = 0x00000040,
++	PROC_EVENT_SID  = 0x00000080,
++	PROC_EVENT_PTRACE = 0x00000100,
++	PROC_EVENT_COMM = 0x00000200,
++	/* "next" should be 0x00000400 */
++	/* "last" is the last process event: exit,
++	 * while "next to last" is coredumping event
++	 */
++	PROC_EVENT_COREDUMP = 0x40000000,
++	PROC_EVENT_EXIT = 0x80000000
++};
++
++struct proc_input {
++	enum proc_cn_mcast_op mcast_op;
++};
++
+ /*
+  * From the user's point of view, the process
+  * ID is the thread group ID and thread ID is the internal
+@@ -44,24 +68,7 @@ enum proc_cn_mcast_op {
+  */
+ 
+ struct proc_event {
+-	enum what {
+-		/* Use successive bits so the enums can be used to record
+-		 * sets of events as well
+-		 */
+-		PROC_EVENT_NONE = 0x00000000,
+-		PROC_EVENT_FORK = 0x00000001,
+-		PROC_EVENT_EXEC = 0x00000002,
+-		PROC_EVENT_UID  = 0x00000004,
+-		PROC_EVENT_GID  = 0x00000040,
+-		PROC_EVENT_SID  = 0x00000080,
+-		PROC_EVENT_PTRACE = 0x00000100,
+-		PROC_EVENT_COMM = 0x00000200,
+-		/* "next" should be 0x00000400 */
+-		/* "last" is the last process event: exit,
+-		 * while "next to last" is coredumping event */
+-		PROC_EVENT_COREDUMP = 0x40000000,
+-		PROC_EVENT_EXIT = 0x80000000
+-	} what;
++	enum proc_cn_event what;
+ 	__u32 cpu;
+ 	__u64 __attribute__((aligned(8))) timestamp_ns;
+ 		/* Number of nano seconds since system boot */
