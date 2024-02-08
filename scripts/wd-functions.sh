@@ -157,6 +157,9 @@ get_tarball()
         ;;
     tar.xz)
         compress="xz"
+        if command -v 'pixz' > /dev/null ; then
+            compress='pixz'
+        fi
         ;;
     *)
         echo "Unknown compression format: $suffix" >&2

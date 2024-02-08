@@ -1,0 +1,232 @@
+From: Jakub Kicinski <kuba@kernel.org>
+Date: Sun, 26 Nov 2023 15:07:30 -0800
+Subject: net: page_pool: record pools per netdev
+Patch-mainline: v6.8-rc1
+Git-commit: 083772c9f972dcc248913b52a0dec1025baa1e16
+References: jsc#PED-7574
+
+Link the page pools with netdevs. This needs to be netns compatible
+so we have two options. Either we record the pools per netns and
+have to worry about moving them as the netdev gets moved.
+Or we record them directly on the netdev so they move with the netdev
+without any extra work.
+
+Implement the latter option. Since pools may outlast netdev we need
+a place to store orphans. In time honored tradition use loopback
+for this purpose.
+
+Reviewed-by: Mina Almasry <almasrymina@google.com>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Acked-by: Jesper Dangaard Brouer <hawk@kernel.org>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/list.h          |   20 ++++++++++
+ include/linux/netdevice.h     |    4 ++
+ include/linux/poison.h        |    2 +
+ include/net/page_pool/types.h |    4 ++
+ net/core/page_pool_user.c     |   84 ++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 114 insertions(+)
+
+--- a/include/linux/list.h
++++ b/include/linux/list.h
+@@ -1030,6 +1030,26 @@ static inline void hlist_move_list(struc
+ 	old->first = NULL;
+ }
+ 
++/**
++ * hlist_splice_init() - move all entries from one list to another
++ * @from: hlist_head from which entries will be moved
++ * @last: last entry on the @from list
++ * @to:   hlist_head to which entries will be moved
++ *
++ * @to can be empty, @from must contain at least @last.
++ */
++static inline void hlist_splice_init(struct hlist_head *from,
++				     struct hlist_node *last,
++				     struct hlist_head *to)
++{
++	if (to->first)
++		to->first->pprev = &last->next;
++	last->next = to->first;
++	to->first = from->first;
++	from->first->pprev = &to->first;
++	from->first = NULL;
++}
++
+ #define hlist_entry(ptr, type, member) container_of(ptr,type,member)
+ 
+ #define hlist_for_each(pos, head) \
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2394,6 +2394,10 @@ struct net_device {
+ #if IS_ENABLED(CONFIG_DPLL)
+ 	struct dpll_pin		*dpll_pin;
+ #endif
++#if IS_ENABLED(CONFIG_PAGE_POOL)
++	/** @page_pools: page pools created for this netdevice */
++	struct hlist_head	page_pools;
++#endif
+ };
+ #define to_net_dev(d) container_of(d, struct net_device, dev)
+ 
+--- a/include/linux/poison.h
++++ b/include/linux/poison.h
+@@ -83,6 +83,8 @@
+ 
+ /********** net/core/skbuff.c **********/
+ #define SKB_LIST_POISON_NEXT	((void *)(0x800 + POISON_POINTER_DELTA))
++/********** net/ **********/
++#define NET_PTR_POISON		((void *)(0x801 + POISON_POINTER_DELTA))
+ 
+ /********** kernel/bpf/ **********/
+ #define BPF_PTR_POISON ((void *)(0xeB9FUL + POISON_POINTER_DELTA))
+--- a/include/net/page_pool/types.h
++++ b/include/net/page_pool/types.h
+@@ -5,6 +5,7 @@
+ 
+ #include <linux/dma-direction.h>
+ #include <linux/ptr_ring.h>
++#include <linux/types.h>
+ 
+ #define PP_FLAG_DMA_MAP		BIT(0) /* Should page_pool do the DMA
+ 					* map/unmap
+@@ -48,6 +49,7 @@ struct pp_alloc_cache {
+  * @pool_size:	size of the ptr_ring
+  * @nid:	NUMA node id to allocate from pages from
+  * @dev:	device, for DMA pre-mapping purposes
++ * @netdev:	netdev this pool will serve (leave as NULL if none or multiple)
+  * @napi:	NAPI which is the sole consumer of pages, otherwise NULL
+  * @dma_dir:	DMA mapping direction
+  * @max_len:	max DMA sync memory size for PP_FLAG_DMA_SYNC_DEV
+@@ -66,6 +68,7 @@ struct page_pool_params {
+ 		unsigned int	offset;
+ 	);
+ 	struct_group_tagged(page_pool_params_slow, slow,
++		struct net_device *netdev;
+ /* private: used by test code only */
+ 		void (*init_callback)(struct page *page, void *arg);
+ 		void *init_arg;
+@@ -189,6 +192,7 @@ struct page_pool {
+ 	struct page_pool_params_slow slow;
+ 	/* User-facing fields, protected by page_pools_lock */
+ 	struct {
++		struct hlist_node list;
+ 		u32 id;
+ 	} user;
+ };
+--- a/net/core/page_pool_user.c
++++ b/net/core/page_pool_user.c
+@@ -1,14 +1,31 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+ #include <linux/mutex.h>
++#include <linux/netdevice.h>
+ #include <linux/xarray.h>
++#include <net/net_debug.h>
+ #include <net/page_pool/types.h>
+ 
+ #include "page_pool_priv.h"
+ 
+ static DEFINE_XARRAY_FLAGS(page_pools, XA_FLAGS_ALLOC1);
++/* Protects: page_pools, netdevice->page_pools, pool->slow.netdev, pool->user.
++ * Ordering: inside rtnl_lock
++ */
+ static DEFINE_MUTEX(page_pools_lock);
+ 
++/* Page pools are only reachable from user space (via netlink) if they are
++ * linked to a netdev at creation time. Following page pool "visibility"
++ * states are possible:
++ *  - normal
++ *    - user.list: linked to real netdev, netdev: real netdev
++ *  - orphaned - real netdev has disappeared
++ *    - user.list: linked to lo, netdev: lo
++ *  - invisible - either (a) created without netdev linking, (b) unlisted due
++ *      to error, or (c) the entire namespace which owned this pool disappeared
++ *    - user.list: unhashed, netdev: unknown
++ */
++
+ int page_pool_list(struct page_pool *pool)
+ {
+ 	static u32 id_alloc_next;
+@@ -20,6 +37,10 @@ int page_pool_list(struct page_pool *poo
+ 	if (err < 0)
+ 		goto err_unlock;
+ 
++	if (pool->slow.netdev)
++		hlist_add_head(&pool->user.list,
++			       &pool->slow.netdev->page_pools);
++
+ 	mutex_unlock(&page_pools_lock);
+ 	return 0;
+ 
+@@ -32,5 +53,68 @@ void page_pool_unlist(struct page_pool *
+ {
+ 	mutex_lock(&page_pools_lock);
+ 	xa_erase(&page_pools, pool->user.id);
++	hlist_del(&pool->user.list);
++	mutex_unlock(&page_pools_lock);
++}
++
++static void page_pool_unreg_netdev_wipe(struct net_device *netdev)
++{
++	struct page_pool *pool;
++	struct hlist_node *n;
++
++	mutex_lock(&page_pools_lock);
++	hlist_for_each_entry_safe(pool, n, &netdev->page_pools, user.list) {
++		hlist_del_init(&pool->user.list);
++		pool->slow.netdev = NET_PTR_POISON;
++	}
++	mutex_unlock(&page_pools_lock);
++}
++
++static void page_pool_unreg_netdev(struct net_device *netdev)
++{
++	struct page_pool *pool, *last;
++	struct net_device *lo;
++
++	lo = dev_net(netdev)->loopback_dev;
++
++	mutex_lock(&page_pools_lock);
++	last = NULL;
++	hlist_for_each_entry(pool, &netdev->page_pools, user.list) {
++		pool->slow.netdev = lo;
++		last = pool;
++	}
++	if (last)
++		hlist_splice_init(&netdev->page_pools, &last->user.list,
++				  &lo->page_pools);
+ 	mutex_unlock(&page_pools_lock);
+ }
++
++static int
++page_pool_netdevice_event(struct notifier_block *nb,
++			  unsigned long event, void *ptr)
++{
++	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
++
++	if (event != NETDEV_UNREGISTER)
++		return NOTIFY_DONE;
++
++	if (hlist_empty(&netdev->page_pools))
++		return NOTIFY_OK;
++
++	if (netdev->ifindex != LOOPBACK_IFINDEX)
++		page_pool_unreg_netdev(netdev);
++	else
++		page_pool_unreg_netdev_wipe(netdev);
++	return NOTIFY_OK;
++}
++
++static struct notifier_block page_pool_netdevice_nb = {
++	.notifier_call = page_pool_netdevice_event,
++};
++
++static int __init page_pool_user_init(void)
++{
++	return register_netdevice_notifier(&page_pool_netdevice_nb);
++}
++
++subsys_initcall(page_pool_user_init);

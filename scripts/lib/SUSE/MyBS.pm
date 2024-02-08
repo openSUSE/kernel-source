@@ -473,7 +473,7 @@ sub get_repo_archs {
 			return if $attr{name} ne $repository;
 		}
 		if ($attr{name} eq "standard" || $attr{name} eq "pool" ||
-		    $attr{name} eq "ports" && $project !~ /\bopenSUSE:Factory\b/ ||
+		    $attr{name} eq "ports" && $project !~ /\bopenSUSE:Factory\b/ && $project !~ /\bALP\b/||
 		    $attr{name} =~ /^SUSE_.*_Update$/ && $project =~ /^SUSE:Maintenance:/) {
 			$self->{has_match} = 1;
 			$self->{repo_name} = $attr{name};
@@ -641,7 +641,6 @@ sub create_project {
 	for my $package (@{$options->{add_packages} || []}) {
 		$prjconf .= "Support: $package\n";
 	}
-	$prjconf .= "BuildFlags: allowrootforbuild\n" if $multibuild;
 	$prjconf .= "Macros:\n";
 	for my $macro (@{$options->{macros} || []}) {
 		$prjconf .= "$macro\n";
