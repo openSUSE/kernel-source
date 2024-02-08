@@ -216,10 +216,9 @@ fi
 rm -f "$build_dir/kernel-source.changes.old" "$build_dir/gitlog-fixups" "$build_dir/gitlog-excludes"
 rm -f "$build_dir/config-subst"
 
-changelog=$build_dir/kernel-source$VARIANT.changes
-if test -e kernel-source.changes; then
-    cat kernel-source.changes{,.old} >"$changelog"
-elif $using_git; then
+create_changelog_from_git () {
+    oldfile="$1"
+    oldlog="$2"
     exclude=()
     # Exclude commits in the scripts branch, these are rarely interesting for
     # users of the rpm packages.
@@ -238,10 +237,15 @@ elif $using_git; then
         echo "warning: no scripts or origin/scripts branch found" >&2
         echo "warning: rpm changelog will have some useless entries" >&2
     fi
-    changes_stop=$(sed 1q rpm/kernel-source.changes.old)
+    changes_stop=$(sed 1q $oldfile)
     case "$changes_stop" in
     last\ commit:\ *)
         exclude[${#exclude[@]}]=^${changes_stop#*: }
+	head="HEAD"
+        ;;
+    commit\ range:\ *)
+        exclude[${#exclude[@]}]=${changes_stop#*: }
+	head=
         ;;
     *)
         echo "expected \"last commit: <commit>\" in rpm/kernel-source.changes.old" >&2
@@ -253,9 +257,16 @@ elif $using_git; then
     if test -e rpm/gitlog-fixups; then
 	    exclude=(--fixups "$_" "${exclude[@]}")
     fi
-    scripts/gitlog2changes "${exclude[@]}" HEAD -- >"$changelog"
-    sed 1d rpm/kernel-source.changes.old >>"$changelog"
-    scripts/rpm-changes-merge.pl -1 "$changelog"
+    scripts/gitlog2changes "${exclude[@]}" $head -- >"$oldlog"
+    sed 1d "$oldfile" >>"$oldlog"
+    scripts/rpm-changes-merge.pl -1 "$oldlog"
+}
+
+changelog=$build_dir/kernel-source$VARIANT.changes
+if test -e kernel-source.changes; then
+    cat kernel-source.changes{,.old} >"$changelog"
+elif $using_git; then
+    create_changelog_from_git rpm/kernel-source.changes.old "$changelog"
 else
     touch "$changelog"
 fi
@@ -402,6 +413,14 @@ if [ -n "$ignore_kabi" ]; then
 fi
 if [ -n "$tolerate_unknown_new_config_options" ]; then
     echo > $build_dir/TOLERATE-UNKNOWN-NEW-CONFIG-OPTIONS
+fi
+
+if [ -s rpm/old_changelog.txt ]; then
+    echo "old_changelog.txt"
+    create_changelog_from_git rpm/old_changelog.txt $build_dir/old_changelog.txt
+else
+    echo "old_changelog.txt (empty)"
+    echo > $build_dir/old_changelog.txt
 fi
 
 echo "cd $build_dir; ./mkspec ${mkspec_args[@]}"
