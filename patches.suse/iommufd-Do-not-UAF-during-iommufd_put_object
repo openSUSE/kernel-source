@@ -1,0 +1,427 @@
+From: Jason Gunthorpe <jgg@nvidia.com>
+Date: Sun, 12 Nov 2023 15:44:08 -0400
+Subject: iommufd: Do not UAF during iommufd_put_object()
+Git-commit: 6f9c4d8c468c189d6dc470324bd52955f8aa0a10
+Patch-mainline: v6.7-rc5
+References: jsc#PED-7779 jsc#PED-7780
+
+The mixture of kernel and user space lifecycle objects continues to be
+complicated inside iommufd. The obj->destroy_rwsem is used to bring order
+to the kernel driver destruction sequence but it cannot be sequenced right
+with the other refcounts so we end up possibly UAF'ing:
+
+  BUG: KASAN: slab-use-after-free in __up_read+0x627/0x750 kernel/locking/rwsem.c:1342
+  Read of size 8 at addr ffff888073cde868 by task syz-executor934/6535
+
+  CPU: 1 PID: 6535 Comm: syz-executor934 Not tainted 6.6.0-rc7-syzkaller-00195-g2af9b20dbb39 #0
+  Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 10/09/2023
+  Call Trace:
+   <TASK>
+   __dump_stack lib/dump_stack.c:88 [inline]
+   dump_stack_lvl+0xd9/0x1b0 lib/dump_stack.c:106
+   print_address_description mm/kasan/report.c:364 [inline]
+   print_report+0xc4/0x620 mm/kasan/report.c:475
+   kasan_report+0xda/0x110 mm/kasan/report.c:588
+   __up_read+0x627/0x750 kernel/locking/rwsem.c:1342
+   iommufd_put_object drivers/iommu/iommufd/iommufd_private.h:149 [inline]
+   iommufd_vfio_ioas+0x46c/0x580 drivers/iommu/iommufd/vfio_compat.c:146
+   iommufd_fops_ioctl+0x347/0x4d0 drivers/iommu/iommufd/main.c:398
+   vfs_ioctl fs/ioctl.c:51 [inline]
+   __do_sys_ioctl fs/ioctl.c:871 [inline]
+   __se_sys_ioctl fs/ioctl.c:857 [inline]
+   __x64_sys_ioctl+0x18f/0x210 fs/ioctl.c:857
+   do_syscall_x64 arch/x86/entry/common.c:50 [inline]
+   do_syscall_64+0x38/0xb0 arch/x86/entry/common.c:80
+   entry_SYSCALL_64_after_hwframe+0x63/0xcd
+
+There are two races here, the more obvious one:
+
+     CPU 0                                 CPU 1
+ iommufd_put_object()
+                                          iommufd_destroy()
+  refcount_dec(&obj->users)
+
+ 	                                   iommufd_object_remove()
+					   kfree()
+  up_read(&obj->destroy_rwsem) // Boom
+
+And there is also perhaps some possibility that the rwsem could hit an
+issue:
+
+     CPU 0                                 CPU 1
+ iommufd_put_object()
+                                         iommufd_object_destroy_user()
+  refcount_dec(&obj->users);
+ 	                                  down_write(&obj->destroy_rwsem)
+  up_read(&obj->destroy_rwsem);
+                                             atomic_long_or(RWSEM_FLAG_WAITERS, &sem->count);
+      tmp = atomic_long_add_return_release()
+                                             rwsem_try_write_lock()
+ 	                                  iommufd_object_remove()
+	                                  up_write(&obj->destroy_rwsem)
+					  kfree()
+      clear_nonspinnable() // Boom
+
+Fix this by reorganizing this again so that two refcounts are used to keep
+track of things with a rule that users == 0 && shortterm_users == 0 means
+no other threads have that memory. Put a wait_queue in the iommufd_ctx
+object that is triggered when any sub object reaches a 0
+shortterm_users. This allows the same wait for userspace ioctls to finish
+behavior that the rwsem was providing.
+
+This is weaker still than the prior versions:
+
+ - There is no bias on shortterm_users so if some thread is waiting to
+   destroy other threads can continue to get new read sides
+
+ - If destruction fails, eg because of an active in-kernel user, then
+   shortterm_users will have cycled to zero momentarily blocking new users
+
+ - If userspace races destroy with other userspace operations they
+   continue to get an EBUSY since we still can't intermix looking up an ID
+   and sleeping for its unref
+
+In all cases these are things that userspace brings on itself, correct
+programs will not hit them.
+
+Fixes: 99f98a7c0d69 ("iommufd: IOMMUFD_DESTROY should not increase the refcount")
+Link: https://lore.kernel.org/all/2-v2-ca9e00171c5b+123-iommufd_syz4_jgg@nvidia.com/
+Reported-by: syzbot+d31adfb277377ef8fcba@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/r/00000000000055ef9a0609336580@google.com
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/iommu/iommufd/iommufd_private.h |  67 ++++++++++++---
+ drivers/iommu/iommufd/main.c            | 146 +++++++++++++++++---------------
+ 2 files changed, 135 insertions(+), 78 deletions(-)
+
+diff --git a/drivers/iommu/iommufd/iommufd_private.h b/drivers/iommu/iommufd/iommufd_private.h
+index f918a22f0d48..abae041e256f 100644
+--- a/drivers/iommu/iommufd/iommufd_private.h
++++ b/drivers/iommu/iommufd/iommufd_private.h
+@@ -21,6 +21,7 @@ struct iommufd_ctx {
+ 	struct file *file;
+ 	struct xarray objects;
+ 	struct xarray groups;
++	wait_queue_head_t destroy_wait;
+ 
+ 	u8 account_mode;
+ 	/* Compatibility with VFIO no iommu */
+@@ -135,7 +136,7 @@ enum iommufd_object_type {
+ 
+ /* Base struct for all objects with a userspace ID handle. */
+ struct iommufd_object {
+-	struct rw_semaphore destroy_rwsem;
++	refcount_t shortterm_users;
+ 	refcount_t users;
+ 	enum iommufd_object_type type;
+ 	unsigned int id;
+@@ -143,10 +144,15 @@ struct iommufd_object {
+ 
+ static inline bool iommufd_lock_obj(struct iommufd_object *obj)
+ {
+-	if (!down_read_trylock(&obj->destroy_rwsem))
++	if (!refcount_inc_not_zero(&obj->users))
+ 		return false;
+-	if (!refcount_inc_not_zero(&obj->users)) {
+-		up_read(&obj->destroy_rwsem);
++	if (!refcount_inc_not_zero(&obj->shortterm_users)) {
++		/*
++		 * If the caller doesn't already have a ref on obj this must be
++		 * called under the xa_lock. Otherwise the caller is holding a
++		 * ref on users. Thus it cannot be one before this decrement.
++		 */
++		refcount_dec(&obj->users);
+ 		return false;
+ 	}
+ 	return true;
+@@ -157,8 +163,13 @@ struct iommufd_object *iommufd_get_object(struct iommufd_ctx *ictx, u32 id,
+ static inline void iommufd_put_object(struct iommufd_ctx *ictx,
+ 				      struct iommufd_object *obj)
+ {
++	/*
++	 * Users first, then shortterm so that REMOVE_WAIT_SHORTTERM never sees
++	 * a spurious !0 users with a 0 shortterm_users.
++	 */
+ 	refcount_dec(&obj->users);
+-	up_read(&obj->destroy_rwsem);
++	if (refcount_dec_and_test(&obj->shortterm_users))
++		wake_up_interruptible_all(&ictx->destroy_wait);
+ }
+ 
+ void iommufd_object_abort(struct iommufd_ctx *ictx, struct iommufd_object *obj);
+@@ -166,17 +177,49 @@ void iommufd_object_abort_and_destroy(struct iommufd_ctx *ictx,
+ 				      struct iommufd_object *obj);
+ void iommufd_object_finalize(struct iommufd_ctx *ictx,
+ 			     struct iommufd_object *obj);
+-void __iommufd_object_destroy_user(struct iommufd_ctx *ictx,
+-				   struct iommufd_object *obj, bool allow_fail);
++
++enum {
++	REMOVE_WAIT_SHORTTERM = 1,
++};
++int iommufd_object_remove(struct iommufd_ctx *ictx,
++			  struct iommufd_object *to_destroy, u32 id,
++			  unsigned int flags);
++
++/*
++ * The caller holds a users refcount and wants to destroy the object. At this
++ * point the caller has no shortterm_users reference and at least the xarray
++ * will be holding one.
++ */
+ static inline void iommufd_object_destroy_user(struct iommufd_ctx *ictx,
+ 					       struct iommufd_object *obj)
+ {
+-	__iommufd_object_destroy_user(ictx, obj, false);
++	int ret;
++
++	ret = iommufd_object_remove(ictx, obj, obj->id, REMOVE_WAIT_SHORTTERM);
++
++	/*
++	 * If there is a bug and we couldn't destroy the object then we did put
++	 * back the caller's users refcount and will eventually try to free it
++	 * again during close.
++	 */
++	WARN_ON(ret);
+ }
+-static inline void iommufd_object_deref_user(struct iommufd_ctx *ictx,
+-					     struct iommufd_object *obj)
++
++/*
++ * The HWPT allocated by autodomains is used in possibly many devices and
++ * is automatically destroyed when its refcount reaches zero.
++ *
++ * If userspace uses the HWPT manually, even for a short term, then it will
++ * disrupt this refcounting and the auto-free in the kernel will not work.
++ * Userspace that tries to use the automatically allocated HWPT must be careful
++ * to ensure that it is consistently destroyed, eg by not racing accesses
++ * and by not attaching an automatic HWPT to a device manually.
++ */
++static inline void
++iommufd_object_put_and_try_destroy(struct iommufd_ctx *ictx,
++				   struct iommufd_object *obj)
+ {
+-	__iommufd_object_destroy_user(ictx, obj, true);
++	iommufd_object_remove(ictx, obj, obj->id, 0);
+ }
+ 
+ struct iommufd_object *_iommufd_object_alloc(struct iommufd_ctx *ictx,
+@@ -312,7 +355,7 @@ static inline void iommufd_hw_pagetable_put(struct iommufd_ctx *ictx,
+ 		lockdep_assert_not_held(&hwpt_paging->ioas->mutex);
+ 
+ 		if (hwpt_paging->auto_domain) {
+-			iommufd_object_deref_user(ictx, &hwpt->obj);
++			iommufd_object_put_and_try_destroy(ictx, &hwpt->obj);
+ 			return;
+ 		}
+ 	}
+diff --git a/drivers/iommu/iommufd/main.c b/drivers/iommu/iommufd/main.c
+index 45b9d40773b1..c9091e46d208 100644
+--- a/drivers/iommu/iommufd/main.c
++++ b/drivers/iommu/iommufd/main.c
+@@ -33,7 +33,6 @@ struct iommufd_object *_iommufd_object_alloc(struct iommufd_ctx *ictx,
+ 					     size_t size,
+ 					     enum iommufd_object_type type)
+ {
+-	static struct lock_class_key obj_keys[IOMMUFD_OBJ_MAX];
+ 	struct iommufd_object *obj;
+ 	int rc;
+ 
+@@ -41,15 +40,8 @@ struct iommufd_object *_iommufd_object_alloc(struct iommufd_ctx *ictx,
+ 	if (!obj)
+ 		return ERR_PTR(-ENOMEM);
+ 	obj->type = type;
+-	/*
+-	 * In most cases the destroy_rwsem is obtained with try so it doesn't
+-	 * interact with lockdep, however on destroy we have to sleep. This
+-	 * means if we have to destroy an object while holding a get on another
+-	 * object it triggers lockdep. Using one locking class per object type
+-	 * is a simple and reasonable way to avoid this.
+-	 */
+-	__init_rwsem(&obj->destroy_rwsem, "iommufd_object::destroy_rwsem",
+-		     &obj_keys[type]);
++	/* Starts out bias'd by 1 until it is removed from the xarray */
++	refcount_set(&obj->shortterm_users, 1);
+ 	refcount_set(&obj->users, 1);
+ 
+ 	/*
+@@ -129,92 +121,113 @@ struct iommufd_object *iommufd_get_object(struct iommufd_ctx *ictx, u32 id,
+ 	return obj;
+ }
+ 
++static int iommufd_object_dec_wait_shortterm(struct iommufd_ctx *ictx,
++					     struct iommufd_object *to_destroy)
++{
++	if (refcount_dec_and_test(&to_destroy->shortterm_users))
++		return 0;
++
++	if (wait_event_timeout(ictx->destroy_wait,
++				refcount_read(&to_destroy->shortterm_users) ==
++					0,
++				msecs_to_jiffies(10000)))
++		return 0;
++
++	pr_crit("Time out waiting for iommufd object to become free\n");
++	refcount_inc(&to_destroy->shortterm_users);
++	return -EBUSY;
++}
++
+ /*
+  * Remove the given object id from the xarray if the only reference to the
+- * object is held by the xarray. The caller must call ops destroy().
++ * object is held by the xarray.
+  */
+-static struct iommufd_object *iommufd_object_remove(struct iommufd_ctx *ictx,
+-						    u32 id, bool extra_put)
++int iommufd_object_remove(struct iommufd_ctx *ictx,
++			  struct iommufd_object *to_destroy, u32 id,
++			  unsigned int flags)
+ {
+ 	struct iommufd_object *obj;
+ 	XA_STATE(xas, &ictx->objects, id);
+-
+-	xa_lock(&ictx->objects);
+-	obj = xas_load(&xas);
+-	if (xa_is_zero(obj) || !obj) {
+-		obj = ERR_PTR(-ENOENT);
+-		goto out_xa;
+-	}
++	bool zerod_shortterm = false;
++	int ret;
+ 
+ 	/*
+-	 * If the caller is holding a ref on obj we put it here under the
+-	 * spinlock.
++	 * The purpose of the shortterm_users is to ensure deterministic
++	 * destruction of objects used by external drivers and destroyed by this
++	 * function. Any temporary increment of the refcount must increment
++	 * shortterm_users, such as during ioctl execution.
+ 	 */
+-	if (extra_put)
++	if (flags & REMOVE_WAIT_SHORTTERM) {
++		ret = iommufd_object_dec_wait_shortterm(ictx, to_destroy);
++		if (ret) {
++			/*
++			 * We have a bug. Put back the callers reference and
++			 * defer cleaning this object until close.
++			 */
++			refcount_dec(&to_destroy->users);
++			return ret;
++		}
++		zerod_shortterm = true;
++	}
++
++	xa_lock(&ictx->objects);
++	obj = xas_load(&xas);
++	if (to_destroy) {
++		/*
++		 * If the caller is holding a ref on obj we put it here under
++		 * the spinlock.
++		 */
+ 		refcount_dec(&obj->users);
+ 
++		if (WARN_ON(obj != to_destroy)) {
++			ret = -ENOENT;
++			goto err_xa;
++		}
++	} else if (xa_is_zero(obj) || !obj) {
++		ret = -ENOENT;
++		goto err_xa;
++	}
++
+ 	if (!refcount_dec_if_one(&obj->users)) {
+-		obj = ERR_PTR(-EBUSY);
+-		goto out_xa;
++		ret = -EBUSY;
++		goto err_xa;
+ 	}
+ 
+ 	xas_store(&xas, NULL);
+ 	if (ictx->vfio_ioas == container_of(obj, struct iommufd_ioas, obj))
+ 		ictx->vfio_ioas = NULL;
+-
+-out_xa:
+ 	xa_unlock(&ictx->objects);
+ 
+-	/* The returned object reference count is zero */
+-	return obj;
+-}
+-
+-/*
+- * The caller holds a users refcount and wants to destroy the object. Returns
+- * true if the object was destroyed. In all cases the caller no longer has a
+- * reference on obj.
+- */
+-void __iommufd_object_destroy_user(struct iommufd_ctx *ictx,
+-				   struct iommufd_object *obj, bool allow_fail)
+-{
+-	struct iommufd_object *ret;
+-
+ 	/*
+-	 * The purpose of the destroy_rwsem is to ensure deterministic
+-	 * destruction of objects used by external drivers and destroyed by this
+-	 * function. Any temporary increment of the refcount must hold the read
+-	 * side of this, such as during ioctl execution.
+-	 */
+-	down_write(&obj->destroy_rwsem);
+-	ret = iommufd_object_remove(ictx, obj->id, true);
+-	up_write(&obj->destroy_rwsem);
+-
+-	if (allow_fail && IS_ERR(ret))
+-		return;
+-
+-	/*
+-	 * If there is a bug and we couldn't destroy the object then we did put
+-	 * back the caller's refcount and will eventually try to free it again
+-	 * during close.
++	 * Since users is zero any positive users_shortterm must be racing
++	 * iommufd_put_object(), or we have a bug.
+ 	 */
+-	if (WARN_ON(IS_ERR(ret)))
+-		return;
++	if (!zerod_shortterm) {
++		ret = iommufd_object_dec_wait_shortterm(ictx, obj);
++		if (WARN_ON(ret))
++			return ret;
++	}
+ 
+ 	iommufd_object_ops[obj->type].destroy(obj);
+ 	kfree(obj);
++	return 0;
++
++err_xa:
++	if (zerod_shortterm) {
++		/* Restore the xarray owned reference */
++		refcount_set(&obj->shortterm_users, 1);
++	}
++	xa_unlock(&ictx->objects);
++
++	/* The returned object reference count is zero */
++	return ret;
+ }
+ 
+ static int iommufd_destroy(struct iommufd_ucmd *ucmd)
+ {
+ 	struct iommu_destroy *cmd = ucmd->cmd;
+-	struct iommufd_object *obj;
+ 
+-	obj = iommufd_object_remove(ucmd->ictx, cmd->id, false);
+-	if (IS_ERR(obj))
+-		return PTR_ERR(obj);
+-	iommufd_object_ops[obj->type].destroy(obj);
+-	kfree(obj);
+-	return 0;
++	return iommufd_object_remove(ucmd->ictx, NULL, cmd->id, 0);
+ }
+ 
+ static int iommufd_fops_open(struct inode *inode, struct file *filp)
+@@ -238,6 +251,7 @@ static int iommufd_fops_open(struct inode *inode, struct file *filp)
+ 	xa_init_flags(&ictx->objects, XA_FLAGS_ALLOC1 | XA_FLAGS_ACCOUNT);
+ 	xa_init(&ictx->groups);
+ 	ictx->file = filp;
++	init_waitqueue_head(&ictx->destroy_wait);
+ 	filp->private_data = ictx;
+ 	return 0;
+ }
+
