@@ -1,0 +1,143 @@
+Patch-mainline: v6.8-rc1
+Git-commit: 93d1c9f498a7505e0e0a0198f3b3d7f97fcc5fa6
+References: jsc#PED-7322
+From: Robert Hoo <robert.hu@linux.intel.com>
+Date: Wed, 13 Sep 2023 20:42:21 +0800
+Subject: [PATCH] KVM: x86: Virtualize LAM for supervisor pointer
+
+Add support to allow guests to set the new CR4 control bit for LAM and add
+implementation to get untagged address for supervisor pointers.
+
+LAM modifies the canonicality check applied to 64-bit linear addresses for
+data accesses, allowing software to use of the untranslated address bits for
+metadata and masks the metadata bits before using them as linear addresses
+to access memory. LAM uses CR4.LAM_SUP (bit 28) to configure and enable LAM
+for supervisor pointers. It also changes VMENTER to allow the bit to be set
+in VMCS's HOST_CR4 and GUEST_CR4 to support virtualization. Note CR4.LAM_SUP
+is allowed to be set even not in 64-bit mode, but it will not take effect
+since LAM only applies to 64-bit linear addresses.
+
+Move CR4.LAM_SUP out of CR4_RESERVED_BITS, its reservation depends on vcpu
+supporting LAM or not. Leave it intercepted to prevent guest from setting
+the bit if LAM is not exposed to guest as well as to avoid vmread every time
+when KVM fetches its value, with the expectation that guest won't toggle the
+bit frequently.
+
+Set CR4.LAM_SUP bit in the emulated IA32_VMX_CR4_FIXED1 MSR for guests to
+allow guests to enable LAM for supervisor pointers in nested VMX operation.
+
+Hardware is not required to do TLB flush when CR4.LAM_SUP toggled, KVM
+doesn't need to emulate TLB flush based on it.  There's no other features
+or vmx_exec_controls connection, and no other code needed in
+{kvm,vmx}_set_cr4().
+
+Skip address untag for instruction fetches (which includes branch targets),
+operand of INVLPG instructions, and implicit system accesses, all of which
+are not subject to untagging.  Note, get_untagged_addr() isn't invoked for
+implicit system accesses as there is no reason to do so, but check the
+flag anyways for documentation purposes.
+
+Signed-off-by: Robert Hoo <robert.hu@linux.intel.com>
+Co-developed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Signed-off-by: Binbin Wu <binbin.wu@linux.intel.com>
+Reviewed-by: Chao Gao <chao.gao@intel.com>
+Reviewed-by: Kai Huang <kai.huang@intel.com>
+Tested-by: Xuelian Guo <xuelian.guo@intel.com>
+Link: https://lore.kernel.org/r/20230913124227.12574-11-binbin.wu@linux.intel.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |  3 ++-
+ arch/x86/kvm/vmx/vmx.c          | 39 ++++++++++++++++++++++++++++++++-
+ arch/x86/kvm/x86.h              |  2 ++
+ 3 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 8d042f27d644..f96988f283d5 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -133,7 +133,8 @@
+ 			  | X86_CR4_PGE | X86_CR4_PCE | X86_CR4_OSFXSR | X86_CR4_PCIDE \
+ 			  | X86_CR4_OSXSAVE | X86_CR4_SMEP | X86_CR4_FSGSBASE \
+ 			  | X86_CR4_OSXMMEXCPT | X86_CR4_LA57 | X86_CR4_VMXE \
+-			  | X86_CR4_SMAP | X86_CR4_PKE | X86_CR4_UMIP))
++			  | X86_CR4_SMAP | X86_CR4_PKE | X86_CR4_UMIP \
++			  | X86_CR4_LAM_SUP))
+ 
+ #define CR8_RESERVED_BITS (~(unsigned long)X86_CR8_TPR)
+ 
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index d7ff06d77720..3bbe5a9362a9 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -7673,6 +7673,9 @@ static void nested_vmx_cr_fixed1_bits_update(struct kvm_vcpu *vcpu)
+ 	cr4_fixed1_update(X86_CR4_UMIP,       ecx, feature_bit(UMIP));
+ 	cr4_fixed1_update(X86_CR4_LA57,       ecx, feature_bit(LA57));
+ 
++	entry = kvm_find_cpuid_entry_index(vcpu, 0x7, 1);
++	cr4_fixed1_update(X86_CR4_LAM_SUP,    eax, feature_bit(LAM));
++
+ #undef cr4_fixed1_update
+ }
+ 
+@@ -8205,9 +8208,43 @@ static void vmx_vm_destroy(struct kvm *kvm)
+ 	free_pages((unsigned long)kvm_vmx->pid_table, vmx_get_pid_table_order(kvm));
+ }
+ 
++/*
++ * Note, the SDM states that the linear address is masked *after* the modified
++ * canonicality check, whereas KVM masks (untags) the address and then performs
++ * a "normal" canonicality check.  Functionally, the two methods are identical,
++ * and when the masking occurs relative to the canonicality check isn't visible
++ * to software, i.e. KVM's behavior doesn't violate the SDM.
++ */
+ gva_t vmx_get_untagged_addr(struct kvm_vcpu *vcpu, gva_t gva, unsigned int flags)
+ {
+-	return gva;
++	int lam_bit;
++
++	if (flags & (X86EMUL_F_FETCH | X86EMUL_F_IMPLICIT | X86EMUL_F_INVLPG))
++		return gva;
++
++	if (!is_64_bit_mode(vcpu))
++		return gva;
++
++	/*
++	 * Bit 63 determines if the address should be treated as user address
++	 * or a supervisor address.
++	 */
++	if (!(gva & BIT_ULL(63))) {
++		/* KVM doesn't yet virtualize LAM_U{48,57}. */
++		return gva;
++	} else {
++		if (!kvm_is_cr4_bit_set(vcpu, X86_CR4_LAM_SUP))
++			return gva;
++
++		lam_bit = kvm_is_cr4_bit_set(vcpu, X86_CR4_LA57) ? 56 : 47;
++	}
++
++	/*
++	 * Untag the address by sign-extending the lam_bit, but NOT to bit 63.
++	 * Bit 63 is retained from the raw virtual address so that untagging
++	 * doesn't change a user access to a supervisor access, and vice versa.
++	 */
++	return (sign_extend64(gva, lam_bit) & ~BIT_ULL(63)) | (gva & BIT_ULL(63));
+ }
+ 
+ static struct kvm_x86_ops vmx_x86_ops __initdata = {
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index 5184fde1dc54..2f7e19166658 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -530,6 +530,8 @@ bool kvm_msr_allowed(struct kvm_vcpu *vcpu, u32 index, u32 type);
+ 		__reserved_bits |= X86_CR4_VMXE;        \
+ 	if (!__cpu_has(__c, X86_FEATURE_PCID))          \
+ 		__reserved_bits |= X86_CR4_PCIDE;       \
++	if (!__cpu_has(__c, X86_FEATURE_LAM))           \
++		__reserved_bits |= X86_CR4_LAM_SUP;     \
+ 	__reserved_bits;                                \
+ })
+ 
+-- 
+2.35.3
+
