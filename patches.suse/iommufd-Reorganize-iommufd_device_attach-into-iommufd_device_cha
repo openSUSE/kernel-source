@@ -1,0 +1,237 @@
+From: Jason Gunthorpe <jgg@nvidia.com>
+Date: Mon, 17 Jul 2023 15:12:08 -0300
+Subject: iommufd: Reorganize iommufd_device_attach into
+ iommufd_device_change_pt
+Git-commit: ea2d6124b52389aa837403f5debf73620d3f441f
+Patch-mainline: v6.6-rc1
+References: jsc#PED-7779 jsc#PED-7780
+
+The code flow for first time attaching a PT and replacing a PT is very
+similar except for the lowest do_attach step.
+
+Reorganize this so that the do_attach step is a function pointer.
+
+Replace requires destroying the old HWPT once it is replaced. This
+destruction cannot be done under all the locks that are held in the
+function pointer, so the signature allows returning a HWPT which will be
+destroyed by the caller after everything is unlocked.
+
+Link: https://lore.kernel.org/r/12-v8-6659224517ea+532-iommufd_alloc_jgg@nvidia.com
+Reviewed-by: Lu Baolu <baolu.lu@linux.intel.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Tested-by: Nicolin Chen <nicolinc@nvidia.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/iommu/iommufd/device.c | 141 +++++++++++++++++++++++++++++------------
+ 1 file changed, 102 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/iommu/iommufd/device.c b/drivers/iommu/iommufd/device.c
+index 9b9244c5b0ce..138bcdb7f14f 100644
+--- a/drivers/iommu/iommufd/device.c
++++ b/drivers/iommu/iommufd/device.c
+@@ -396,16 +396,41 @@ iommufd_hw_pagetable_detach(struct iommufd_device *idev)
+ 	return hwpt;
+ }
+ 
++static struct iommufd_hw_pagetable *
++iommufd_device_do_attach(struct iommufd_device *idev,
++			 struct iommufd_hw_pagetable *hwpt)
++{
++	int rc;
++
++	rc = iommufd_hw_pagetable_attach(hwpt, idev);
++	if (rc)
++		return ERR_PTR(rc);
++	return NULL;
++}
++
++typedef struct iommufd_hw_pagetable *(*attach_fn)(
++	struct iommufd_device *idev, struct iommufd_hw_pagetable *hwpt);
++
+ /*
+  * When automatically managing the domains we search for a compatible domain in
+  * the iopt and if one is found use it, otherwise create a new domain.
+  * Automatic domain selection will never pick a manually created domain.
+  */
+-static int iommufd_device_auto_get_domain(struct iommufd_device *idev,
+-					  struct iommufd_ioas *ioas, u32 *pt_id)
++static struct iommufd_hw_pagetable *
++iommufd_device_auto_get_domain(struct iommufd_device *idev,
++			       struct iommufd_ioas *ioas, u32 *pt_id,
++			       attach_fn do_attach)
+ {
++	/*
++	 * iommufd_hw_pagetable_attach() is called by
++	 * iommufd_hw_pagetable_alloc() in immediate attachment mode, same as
++	 * iommufd_device_do_attach(). So if we are in this mode then we prefer
++	 * to use the immediate_attach path as it supports drivers that can't
++	 * directly allocate a domain.
++	 */
++	bool immediate_attach = do_attach == iommufd_device_do_attach;
++	struct iommufd_hw_pagetable *destroy_hwpt;
+ 	struct iommufd_hw_pagetable *hwpt;
+-	int rc;
+ 
+ 	/*
+ 	 * There is no differentiation when domains are allocated, so any domain
+@@ -419,52 +444,58 @@ static int iommufd_device_auto_get_domain(struct iommufd_device *idev,
+ 
+ 		if (!iommufd_lock_obj(&hwpt->obj))
+ 			continue;
+-		rc = iommufd_hw_pagetable_attach(hwpt, idev);
+-		iommufd_put_object(&hwpt->obj);
+-
+-		/*
+-		 * -EINVAL means the domain is incompatible with the device.
+-		 * Other error codes should propagate to userspace as failure.
+-		 * Success means the domain is attached.
+-		 */
+-		if (rc == -EINVAL)
+-			continue;
++		destroy_hwpt = (*do_attach)(idev, hwpt);
++		if (IS_ERR(destroy_hwpt)) {
++			iommufd_put_object(&hwpt->obj);
++			/*
++			 * -EINVAL means the domain is incompatible with the
++			 * device. Other error codes should propagate to
++			 * userspace as failure. Success means the domain is
++			 * attached.
++			 */
++			if (PTR_ERR(destroy_hwpt) == -EINVAL)
++				continue;
++			goto out_unlock;
++		}
+ 		*pt_id = hwpt->obj.id;
++		iommufd_put_object(&hwpt->obj);
+ 		goto out_unlock;
+ 	}
+ 
+-	hwpt = iommufd_hw_pagetable_alloc(idev->ictx, ioas, idev, true);
++	hwpt = iommufd_hw_pagetable_alloc(idev->ictx, ioas, idev,
++					  immediate_attach);
+ 	if (IS_ERR(hwpt)) {
+-		rc = PTR_ERR(hwpt);
++		destroy_hwpt = ERR_CAST(hwpt);
+ 		goto out_unlock;
+ 	}
++
++	if (!immediate_attach) {
++		destroy_hwpt = (*do_attach)(idev, hwpt);
++		if (IS_ERR(destroy_hwpt))
++			goto out_abort;
++	} else {
++		destroy_hwpt = NULL;
++	}
++
+ 	hwpt->auto_domain = true;
+ 	*pt_id = hwpt->obj.id;
+ 
+ 	iommufd_object_finalize(idev->ictx, &hwpt->obj);
+ 	mutex_unlock(&ioas->mutex);
+-	return 0;
++	return destroy_hwpt;
++
++out_abort:
++	iommufd_object_abort_and_destroy(idev->ictx, &hwpt->obj);
+ out_unlock:
+ 	mutex_unlock(&ioas->mutex);
+-	return rc;
++	return destroy_hwpt;
+ }
+ 
+-/**
+- * iommufd_device_attach - Connect a device from an iommu_domain
+- * @idev: device to attach
+- * @pt_id: Input a IOMMUFD_OBJ_IOAS, or IOMMUFD_OBJ_HW_PAGETABLE
+- *         Output the IOMMUFD_OBJ_HW_PAGETABLE ID
+- *
+- * This connects the device to an iommu_domain, either automatically or manually
+- * selected. Once this completes the device could do DMA.
+- *
+- * The caller should return the resulting pt_id back to userspace.
+- * This function is undone by calling iommufd_device_detach().
+- */
+-int iommufd_device_attach(struct iommufd_device *idev, u32 *pt_id)
++static int iommufd_device_change_pt(struct iommufd_device *idev, u32 *pt_id,
++				    attach_fn do_attach)
+ {
++	struct iommufd_hw_pagetable *destroy_hwpt;
+ 	struct iommufd_object *pt_obj;
+-	int rc;
+ 
+ 	pt_obj = iommufd_get_object(idev->ictx, *pt_id, IOMMUFD_OBJ_ANY);
+ 	if (IS_ERR(pt_obj))
+@@ -475,8 +506,8 @@ int iommufd_device_attach(struct iommufd_device *idev, u32 *pt_id)
+ 		struct iommufd_hw_pagetable *hwpt =
+ 			container_of(pt_obj, struct iommufd_hw_pagetable, obj);
+ 
+-		rc = iommufd_hw_pagetable_attach(hwpt, idev);
+-		if (rc)
++		destroy_hwpt = (*do_attach)(idev, hwpt);
++		if (IS_ERR(destroy_hwpt))
+ 			goto out_put_pt_obj;
+ 		break;
+ 	}
+@@ -484,22 +515,54 @@ int iommufd_device_attach(struct iommufd_device *idev, u32 *pt_id)
+ 		struct iommufd_ioas *ioas =
+ 			container_of(pt_obj, struct iommufd_ioas, obj);
+ 
+-		rc = iommufd_device_auto_get_domain(idev, ioas, pt_id);
+-		if (rc)
++		destroy_hwpt = iommufd_device_auto_get_domain(idev, ioas, pt_id,
++							      do_attach);
++		if (IS_ERR(destroy_hwpt))
+ 			goto out_put_pt_obj;
+ 		break;
+ 	}
+ 	default:
+-		rc = -EINVAL;
++		destroy_hwpt = ERR_PTR(-EINVAL);
+ 		goto out_put_pt_obj;
+ 	}
++	iommufd_put_object(pt_obj);
+ 
+-	refcount_inc(&idev->obj.users);
+-	rc = 0;
++	/* This destruction has to be after we unlock everything */
++	if (destroy_hwpt)
++		iommufd_hw_pagetable_put(idev->ictx, destroy_hwpt);
++	return 0;
+ 
+ out_put_pt_obj:
+ 	iommufd_put_object(pt_obj);
+-	return rc;
++	return PTR_ERR(destroy_hwpt);
++}
++
++/**
++ * iommufd_device_attach - Connect a device to an iommu_domain
++ * @idev: device to attach
++ * @pt_id: Input a IOMMUFD_OBJ_IOAS, or IOMMUFD_OBJ_HW_PAGETABLE
++ *         Output the IOMMUFD_OBJ_HW_PAGETABLE ID
++ *
++ * This connects the device to an iommu_domain, either automatically or manually
++ * selected. Once this completes the device could do DMA.
++ *
++ * The caller should return the resulting pt_id back to userspace.
++ * This function is undone by calling iommufd_device_detach().
++ */
++int iommufd_device_attach(struct iommufd_device *idev, u32 *pt_id)
++{
++	int rc;
++
++	rc = iommufd_device_change_pt(idev, pt_id, &iommufd_device_do_attach);
++	if (rc)
++		return rc;
++
++	/*
++	 * Pairs with iommufd_device_detach() - catches caller bugs attempting
++	 * to destroy a device with an attachment.
++	 */
++	refcount_inc(&idev->obj.users);
++	return 0;
+ }
+ EXPORT_SYMBOL_NS_GPL(iommufd_device_attach, IOMMUFD);
+ 
+
