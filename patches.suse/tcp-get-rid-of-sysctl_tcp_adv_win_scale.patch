@@ -1,0 +1,216 @@
+From dfa2f0483360d4d6f2324405464c9f281156bd87 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Mon, 17 Jul 2023 15:29:17 +0000
+Subject: [PATCH] tcp: get rid of sysctl_tcp_adv_win_scale
+Git-commit: dfa2f0483360d4d6f2324405464c9f281156bd87
+Patch-mainline: v6.6-rc1
+References: bsc#1220419
+
+With modern NIC drivers shifting to full page allocations per
+received frame, we face the following issue:
+
+TCP has one per-netns sysctl used to tweak how to translate
+a memory use into an expected payload (RWIN), in RX path.
+
+tcp_win_from_space() implementation is limited to few cases.
+
+For hosts dealing with various MSS, we either under estimate
+or over estimate the RWIN we send to the remote peers.
+
+For instance with the default sysctl_tcp_adv_win_scale value,
+we expect to store 50% of payload per allocated chunk of memory.
+
+For the typical use of MTU=1500 traffic, and order-0 pages allocations
+by NIC drivers, we are sending too big RWIN, leading to potential
+tcp collapse operations, which are extremely expensive and source
+of latency spikes.
+
+This patch makes sysctl_tcp_adv_win_scale obsolete, and instead
+uses a per socket scaling factor, so that we can precisely
+adjust the RWIN based on effective skb->len/skb->truesize ratio.
+
+This patch alone can double TCP receive performance when receivers
+are too slow to drain their receive queue, or by allowing
+a bigger RWIN when MSS is close to PAGE_SIZE.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Acked-by: Soheil Hassas Yeganeh <soheil@google.com>
+Link: https://lore.kernel.org/r/20230717152917.751987-1-edumazet@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Jiri Wiesner <jwiesner@suse.de>
+---
+ Documentation/networking/ip-sysctl.rst |  1 +
+ include/linux/tcp.h                    |  4 +++-
+ include/net/netns/ipv4.h               |  2 +-
+ include/net/tcp.h                      | 24 ++++++++++++++++++++----
+ net/ipv4/tcp.c                         | 11 ++++++-----
+ net/ipv4/tcp_input.c                   | 19 ++++++++++++-------
+ 6 files changed, 43 insertions(+), 18 deletions(-)
+
+diff --git a/Documentation/networking/ip-sysctl.rst b/Documentation/networking/ip-sysctl.rst
+index 4a010a7cde7f..82f2117cf2b3 100644
+--- a/Documentation/networking/ip-sysctl.rst
++++ b/Documentation/networking/ip-sysctl.rst
+@@ -321,6 +321,7 @@ tcp_abort_on_overflow - BOOLEAN
+ 	option can harm clients of your server.
+ 
+ tcp_adv_win_scale - INTEGER
++	Obsolete since linux-6.6
+ 	Count buffering overhead as bytes/2^tcp_adv_win_scale
+ 	(if tcp_adv_win_scale > 0) or bytes-bytes/2^(-tcp_adv_win_scale),
+ 	if it is <= 0.
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index b4c08ac86983..fbcb0ce13171 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -172,6 +172,8 @@ static inline struct tcp_request_sock *tcp_rsk(const struct request_sock *req)
+ 	return (struct tcp_request_sock *)req;
+ }
+ 
++#define TCP_RMEM_TO_WIN_SCALE 8
++
+ struct tcp_sock {
+ 	/* inet_connection_sock has to be the first member of tcp_sock */
+ 	struct inet_connection_sock	inet_conn;
+@@ -238,7 +240,7 @@ struct tcp_sock {
+ 
+ 	u32	window_clamp;	/* Maximal window to advertise		*/
+ 	u32	rcv_ssthresh;	/* Current window clamp			*/
+-
++	u8	scaling_ratio;	/* see tcp_win_from_space() */
+ 	/* Information of the most recently (s)acked skb */
+ 	struct tcp_rack {
+ 		u64 mstamp; /* (Re)sent time of the skb */
+diff --git a/include/net/netns/ipv4.h b/include/net/netns/ipv4.h
+index f00374718159..7a41c4791536 100644
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@ -152,7 +152,7 @@ struct netns_ipv4 {
+ 	u8 sysctl_tcp_abort_on_overflow;
+ 	u8 sysctl_tcp_fack; /* obsolete */
+ 	int sysctl_tcp_max_reordering;
+-	int sysctl_tcp_adv_win_scale;
++	int sysctl_tcp_adv_win_scale; /* obsolete */
+ 	u8 sysctl_tcp_dsack;
+ 	u8 sysctl_tcp_app_win;
+ 	u8 sysctl_tcp_frto;
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 226bce6d1e8c..2104a71c75ba 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -1434,11 +1434,27 @@ void tcp_select_initial_window(const struct sock *sk, int __space,
+ 
+ static inline int tcp_win_from_space(const struct sock *sk, int space)
+ {
+-	int tcp_adv_win_scale = READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_adv_win_scale);
++	s64 scaled_space = (s64)space * tcp_sk(sk)->scaling_ratio;
+ 
+-	return tcp_adv_win_scale <= 0 ?
+-		(space>>(-tcp_adv_win_scale)) :
+-		space - (space>>tcp_adv_win_scale);
++	return scaled_space >> TCP_RMEM_TO_WIN_SCALE;
++}
++
++/* inverse of tcp_win_from_space() */
++static inline int tcp_space_from_win(const struct sock *sk, int win)
++{
++	u64 val = (u64)win << TCP_RMEM_TO_WIN_SCALE;
++
++	do_div(val, tcp_sk(sk)->scaling_ratio);
++	return val;
++}
++
++static inline void tcp_scaling_ratio_init(struct sock *sk)
++{
++	/* Assume a conservative default of 1200 bytes of payload per 4K page.
++	 * This may be adjusted later in tcp_measure_rcv_mss().
++	 */
++	tcp_sk(sk)->scaling_ratio = (1200 << TCP_RMEM_TO_WIN_SCALE) /
++				    SKB_TRUESIZE(4096);
+ }
+ 
+ /* Note: caller must be prepared to deal with negative returns */
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index e03e08745308..88f4ebab12ac 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -457,6 +457,7 @@ void tcp_init_sock(struct sock *sk)
+ 
+ 	WRITE_ONCE(sk->sk_sndbuf, READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_wmem[1]));
+ 	WRITE_ONCE(sk->sk_rcvbuf, READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_rmem[1]));
++	tcp_scaling_ratio_init(sk);
+ 
+ 	set_bit(SOCK_SUPPORT_ZC, &sk->sk_socket->flags);
+ 	sk_sockets_allocated_inc(sk);
+@@ -1700,7 +1701,7 @@ EXPORT_SYMBOL(tcp_peek_len);
+ /* Make sure sk_rcvbuf is big enough to satisfy SO_RCVLOWAT hint */
+ int tcp_set_rcvlowat(struct sock *sk, int val)
+ {
+-	int cap;
++	int space, cap;
+ 
+ 	if (sk->sk_userlocks & SOCK_RCVBUF_LOCK)
+ 		cap = sk->sk_rcvbuf >> 1;
+@@ -1715,10 +1716,10 @@ int tcp_set_rcvlowat(struct sock *sk, int val)
+ 	if (sk->sk_userlocks & SOCK_RCVBUF_LOCK)
+ 		return 0;
+ 
+-	val <<= 1;
+-	if (val > sk->sk_rcvbuf) {
+-		WRITE_ONCE(sk->sk_rcvbuf, val);
+-		tcp_sk(sk)->window_clamp = tcp_win_from_space(sk, val);
++	space = tcp_space_from_win(sk, val);
++	if (space > sk->sk_rcvbuf) {
++		WRITE_ONCE(sk->sk_rcvbuf, space);
++		tcp_sk(sk)->window_clamp = val;
+ 	}
+ 	return 0;
+ }
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 57c8af1859c1..3cd92035e090 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -237,6 +237,16 @@ static void tcp_measure_rcv_mss(struct sock *sk, const struct sk_buff *skb)
+ 	 */
+ 	len = skb_shinfo(skb)->gso_size ? : skb->len;
+ 	if (len >= icsk->icsk_ack.rcv_mss) {
++		/* Note: divides are still a bit expensive.
++		 * For the moment, only adjust scaling_ratio
++		 * when we update icsk_ack.rcv_mss.
++		 */
++		if (unlikely(len != icsk->icsk_ack.rcv_mss)) {
++			u64 val = (u64)skb->len << TCP_RMEM_TO_WIN_SCALE;
++
++			do_div(val, skb->truesize);
++			tcp_sk(sk)->scaling_ratio = val ? val : 1;
++		}
+ 		icsk->icsk_ack.rcv_mss = min_t(unsigned int, len,
+ 					       tcp_sk(sk)->advmss);
+ 		/* Account for possibly-removed options */
+@@ -727,8 +737,8 @@ void tcp_rcv_space_adjust(struct sock *sk)
+ 
+ 	if (READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_moderate_rcvbuf) &&
+ 	    !(sk->sk_userlocks & SOCK_RCVBUF_LOCK)) {
+-		int rcvmem, rcvbuf;
+ 		u64 rcvwin, grow;
++		int rcvbuf;
+ 
+ 		/* minimal window to cope with packet losses, assuming
+ 		 * steady state. Add some cushion because of small variations.
+@@ -740,12 +750,7 @@ void tcp_rcv_space_adjust(struct sock *sk)
+ 		do_div(grow, tp->rcvq_space.space);
+ 		rcvwin += (grow << 1);
+ 
+-		rcvmem = SKB_TRUESIZE(tp->advmss + MAX_TCP_HEADER);
+-		while (tcp_win_from_space(sk, rcvmem) < tp->advmss)
+-			rcvmem += 128;
+-
+-		do_div(rcvwin, tp->advmss);
+-		rcvbuf = min_t(u64, rcvwin * rcvmem,
++		rcvbuf = min_t(u64, tcp_space_from_win(sk, rcvwin),
+ 			       READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_rmem[2]));
+ 		if (rcvbuf > sk->sk_rcvbuf) {
+ 			WRITE_ONCE(sk->sk_rcvbuf, rcvbuf);
+-- 
+2.35.3
+
