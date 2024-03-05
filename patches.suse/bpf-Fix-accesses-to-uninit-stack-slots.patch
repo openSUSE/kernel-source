@@ -1,0 +1,370 @@
+From: Andrei Matei <andreimatei1@gmail.com>
+Date: Thu, 7 Dec 2023 22:25:18 -0500
+Subject: bpf: Fix accesses to uninit stack slots
+Patch-mainline: v6.8-rc1
+Git-commit: 6b4a64bafd107e521c01eec3453ce94a3fb38529
+References: bsc#1220257 CVE-2023-52452
+X-Info: change to delayed_precision_mark() dropped because commit 389ede06c297 "selftests/bpf: tests with delayed read/precision makrs in loop body" is not backported
+
+Privileged programs are supposed to be able to read uninitialized stack
+memory (ever since 6715df8d5) but, before this patch, these accesses
+were permitted inconsistently. In particular, accesses were permitted
+above state->allocated_stack, but not below it. In other words, if the
+stack was already "large enough", the access was permitted, but
+otherwise the access was rejected instead of being allowed to "grow the
+stack". This undesired rejection was happening in two places:
+- in check_stack_slot_within_bounds()
+- in check_stack_range_initialized()
+This patch arranges for these accesses to be permitted. A bunch of tests
+that were relying on the old rejection had to change; all of them were
+changed to add also run unprivileged, in which case the old behavior
+persists. One tests couldn't be updated - global_func16 - because it
+can't run unprivileged for other reasons.
+
+This patch also fixes the tracking of the stack size for variable-offset
+reads. This second fix is bundled in the same commit as the first one
+because they're inter-related. Before this patch, writes to the stack
+using registers containing a variable offset (as opposed to registers
+with fixed, known values) were not properly contributing to the
+function's needed stack size. As a result, it was possible for a program
+to verify, but then to attempt to read out-of-bounds data at runtime
+because a too small stack had been allocated for it.
+
+Each function tracks the size of the stack it needs in
+bpf_subprog_info.stack_depth, which is maintained by
+update_stack_depth(). For regular memory accesses, check_mem_access()
+was calling update_state_depth() but it was passing in only the fixed
+part of the offset register, ignoring the variable offset. This was
+incorrect; the minimum possible value of that register should be used
+instead.
+
+This tracking is now fixed by centralizing the tracking of stack size in
+grow_stack_state(), and by lifting the calls to grow_stack_state() to
+check_stack_access_within_bounds() as suggested by Andrii. The code is
+now simpler and more convincingly tracks the correct maximum stack size.
+check_stack_range_initialized() can now rely on enough stack having been
+allocated for the access; this helps with the fix for the first issue.
+
+A few tests were changed to also check the stack depth computation. The
+one that fails without this patch is verifier_var_off:stack_write_priv_vs_unpriv.
+
+Fixes: 01f810ace9ed3 ("bpf: Allow variable-offset stack access")
+Reported-by: Hao Sun <sunhao.th@gmail.com>
+Signed-off-by: Andrei Matei <andreimatei1@gmail.com>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20231208032519.260451-3-andreimatei1@gmail.com
+
+Closes: https://lore.kernel.org/bpf/CABWLsev9g8UP_c3a=1qbuZUi20tGoUXoU07FPf-5FLvhOKOY+Q@mail.gmail.com/
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ kernel/bpf/verifier.c                                      |   66 +++++--------
+ tools/testing/selftests/bpf/prog_tests/test_global_funcs.c |    2 
+ tools/testing/selftests/bpf/verifier/atomic_cmpxchg.c      |   11 --
+ tools/testing/selftests/bpf/verifier/basic_stack.c         |   10 +
+ tools/testing/selftests/bpf/verifier/calls.c               |    4 
+ tools/testing/selftests/bpf/verifier/int_ptr.c             |    7 -
+ tools/testing/selftests/bpf/verifier/raw_stack.c           |    3 
+ tools/testing/selftests/bpf/verifier/var_off.c             |   14 +-
+ 8 files changed, 50 insertions(+), 67 deletions(-)
+
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -814,7 +814,10 @@ static int resize_reference_state(struct
+ 	return 0;
+ }
+ 
+-static int grow_stack_state(struct bpf_func_state *state, int size)
++/* Possibly update state->allocated_stack to be at least size bytes. Also
++ * possibly update the function's high-water mark in its bpf_subprog_info.
++ */
++static int grow_stack_state(struct bpf_verifier_env *env, struct bpf_func_state *state, int size)
+ {
+ 	size_t old_n = state->allocated_stack / BPF_REG_SIZE, n = size / BPF_REG_SIZE;
+ 
+@@ -826,6 +829,11 @@ static int grow_stack_state(struct bpf_f
+ 		return -ENOMEM;
+ 
+ 	state->allocated_stack = size;
++
++	/* update known max for given subprogram */
++	if (env->subprog_info[state->subprogno].stack_depth < size)
++		env->subprog_info[state->subprogno].stack_depth = size;
++
+ 	return 0;
+ }
+ 
+@@ -2569,9 +2577,6 @@ static int check_stack_write_fixed_off(s
+ 	u32 dst_reg = env->prog->insnsi[insn_idx].dst_reg;
+ 	struct bpf_reg_state *reg = NULL;
+ 
+-	err = grow_stack_state(state, round_up(slot + 1, BPF_REG_SIZE));
+-	if (err)
+-		return err;
+ 	/* caller checked that off % size == 0 and -MAX_BPF_STACK <= off < 0,
+ 	 * so it's aligned access and [off, off + size) are within stack limits
+ 	 */
+@@ -2707,11 +2712,6 @@ static int check_stack_write_var_off(str
+ 	if (value_reg && register_is_null(value_reg))
+ 		writing_zero = true;
+ 
+-	err = grow_stack_state(state, round_up(-min_off, BPF_REG_SIZE));
+-	if (err)
+-		return err;
+-
+-
+ 	/* Variable offset writes destroy any spilled pointers in range. */
+ 	for (i = min_off; i < max_off; i++) {
+ 		u8 new_type, *stype;
+@@ -3528,20 +3528,6 @@ static int check_ptr_alignment(struct bp
+ 					   strict);
+ }
+ 
+-static int update_stack_depth(struct bpf_verifier_env *env,
+-			      const struct bpf_func_state *func,
+-			      int off)
+-{
+-	u16 stack = env->subprog_info[func->subprogno].stack_depth;
+-
+-	if (stack >= -off)
+-		return 0;
+-
+-	/* update known max for given subprogram */
+-	env->subprog_info[func->subprogno].stack_depth = -off;
+-	return 0;
+-}
+-
+ /* starting from main bpf function walk all instructions of the function
+  * and recursively walk all callees that given function can call.
+  * Ignore jump and exit insns.
+@@ -3957,13 +3943,14 @@ static int check_ptr_to_map_access(struc
+  * The minimum valid offset is -MAX_BPF_STACK for writes, and
+  * -state->allocated_stack for reads.
+  */
+-static int check_stack_slot_within_bounds(s64 off,
+-					  struct bpf_func_state *state,
+-					  enum bpf_access_type t)
++static int check_stack_slot_within_bounds(struct bpf_verifier_env *env,
++                                          s64 off,
++                                          struct bpf_func_state *state,
++                                          enum bpf_access_type t)
+ {
+ 	int min_valid_off;
+ 
+-	if (t == BPF_WRITE)
++	if (t == BPF_WRITE || env->allow_uninit_stack)
+ 		min_valid_off = -MAX_BPF_STACK;
+ 	else
+ 		min_valid_off = -state->allocated_stack;
+@@ -4012,7 +3999,7 @@ static int check_stack_access_within_bou
+ 		max_off = reg->smax_value + off + access_size;
+ 	}
+ 
+-	err = check_stack_slot_within_bounds(min_off, state, type);
++	err = check_stack_slot_within_bounds(env, min_off, state, type);
+ 	if (!err && max_off > 0)
+ 		err = -EINVAL; /* out of stack access into non-negative offsets */
+ 
+@@ -4027,8 +4014,10 @@ static int check_stack_access_within_bou
+ 			verbose(env, "invalid variable-offset%s stack R%d var_off=%s size=%d\n",
+ 				err_extra, regno, tn_buf, access_size);
+ 		}
++		return err;
+ 	}
+-	return err;
++
++	return grow_stack_state(env, state, round_up(-min_off, BPF_REG_SIZE));
+ }
+ 
+ /* check whether memory at (regno + off) is accessible for t = (read | write)
+@@ -4043,7 +4032,6 @@ static int check_mem_access(struct bpf_v
+ {
+ 	struct bpf_reg_state *regs = cur_regs(env);
+ 	struct bpf_reg_state *reg = regs + regno;
+-	struct bpf_func_state *state;
+ 	int size, err = 0;
+ 
+ 	size = bpf_size_to_bytes(bpf_size);
+@@ -4176,11 +4164,6 @@ static int check_mem_access(struct bpf_v
+ 		if (err)
+ 			return err;
+ 
+-		state = func(env, reg);
+-		err = update_stack_depth(env, state, off);
+-		if (err)
+-			return err;
+-
+ 		if (t == BPF_READ)
+ 			err = check_stack_read(env, regno, off, size,
+ 					       value_regno);
+@@ -4374,7 +4357,8 @@ static int check_atomic(struct bpf_verif
+ 
+ /* When register 'regno' is used to read the stack (either directly or through
+  * a helper function) make sure that it's within stack boundary and, depending
+- * on the access type, that all elements of the stack are initialized.
++ * on the access type and privileges, that all elements of the stack are
++ * initialized.
+  *
+  * 'off' includes 'regno->off', but not its dynamic part (if any).
+  *
+@@ -4457,8 +4441,11 @@ static int check_stack_range_initialized
+ 
+ 		slot = -i - 1;
+ 		spi = slot / BPF_REG_SIZE;
+-		if (state->allocated_stack <= slot)
+-			goto err;
++		if (state->allocated_stack <= slot) {
++			verbose(env, "verifier bug: allocated_stack too small");
++			return -EFAULT;
++		}
++
+ 		stype = &state->stack[spi].slot_type[slot % BPF_REG_SIZE];
+ 		if (*stype == STACK_MISC)
+ 			goto mark;
+@@ -4485,7 +4472,6 @@ static int check_stack_range_initialized
+ 			goto mark;
+ 		}
+ 
+-err:
+ 		if (tnum_is_const(reg->var_off)) {
+ 			verbose(env, "invalid%s read from stack R%d off %d+%d size %d\n",
+ 				err_extra, regno, min_off, i - min_off, access_size);
+@@ -4505,7 +4491,7 @@ mark:
+ 			      state->stack[spi].spilled_ptr.parent,
+ 			      REG_LIVE_READ64);
+ 	}
+-	return update_stack_depth(env, state, min_off);
++	return 0;
+ }
+ 
+ static int check_helper_mem_access(struct bpf_verifier_env *env, int regno,
+--- a/tools/testing/selftests/bpf/prog_tests/test_global_funcs.c
++++ b/tools/testing/selftests/bpf/prog_tests/test_global_funcs.c
+@@ -68,7 +68,7 @@ void test_test_global_funcs(void)
+ 		{ "test_global_func13.o", "Caller passes invalid args into func#1" },
+ 		{ "test_global_func14.o", "reference type('FWD S') size cannot be determined" },
+ 		{ "test_global_func15.o", "At program exit the register R0 has value" },
+-		{ "test_global_func16.o", "invalid indirect read from stack" },
++		{ "test_global_func16.o" },
+ 	};
+ 	libbpf_print_fn_t old_print_fn = NULL;
+ 	int err, i, duration = 0;
+--- a/tools/testing/selftests/bpf/verifier/atomic_cmpxchg.c
++++ b/tools/testing/selftests/bpf/verifier/atomic_cmpxchg.c
+@@ -84,17 +84,6 @@
+ 	.errstr = "!read_ok",
+ },
+ {
+-	"Can't use cmpxchg on uninit memory",
+-	.insns = {
+-		BPF_MOV64_IMM(BPF_REG_0, 3),
+-		BPF_MOV64_IMM(BPF_REG_2, 4),
+-		BPF_ATOMIC_OP(BPF_DW, BPF_CMPXCHG, BPF_REG_10, BPF_REG_2, -8),
+-		BPF_EXIT_INSN(),
+-	},
+-	.result = REJECT,
+-	.errstr = "invalid read from stack",
+-},
+-{
+ 	"BPF_W cmpxchg should zero top 32 bits",
+ 	.insns = {
+ 		/* r0 = U64_MAX; */
+--- a/tools/testing/selftests/bpf/verifier/basic_stack.c
++++ b/tools/testing/selftests/bpf/verifier/basic_stack.c
+@@ -17,8 +17,9 @@
+ 	BPF_EXIT_INSN(),
+ 	},
+ 	.fixup_map_hash_8b = { 2 },
+-	.errstr = "invalid indirect read from stack",
+-	.result = REJECT,
++	.result = ACCEPT,
++	.errstr_unpriv = "invalid indirect read from stack",
++	.result_unpriv = REJECT,
+ },
+ {
+ 	"uninitialized stack2",
+@@ -27,8 +28,9 @@
+ 	BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_2, -8),
+ 	BPF_EXIT_INSN(),
+ 	},
+-	.errstr = "invalid read from stack",
+-	.result = REJECT,
++	.result = ACCEPT,
++	.errstr_unpriv = "invalid indirect read from stack",
++	.result_unpriv = REJECT,
+ },
+ {
+ 	"invalid fp arithmetic",
+--- a/tools/testing/selftests/bpf/verifier/calls.c
++++ b/tools/testing/selftests/bpf/verifier/calls.c
+@@ -1228,7 +1228,9 @@
+ 	.prog_type = BPF_PROG_TYPE_XDP,
+ 	.fixup_map_hash_8b = { 23 },
+ 	.result = REJECT,
+-	.errstr = "invalid read from stack R7 off=-16 size=8",
++	.errstr = "R0 invalid mem access 'scalar'",
++	.result_unpriv = REJECT,
++	.errstr_unpriv = "invalid read from stack R7 off=-16 size=8",
+ },
+ {
+ 	"calls: two calls that receive map_value via arg=ptr_stack_of_caller. test1",
+--- a/tools/testing/selftests/bpf/verifier/int_ptr.c
++++ b/tools/testing/selftests/bpf/verifier/int_ptr.c
+@@ -25,9 +25,10 @@
+ 		BPF_MOV64_IMM(BPF_REG_0, 1),
+ 		BPF_EXIT_INSN(),
+ 	},
+-	.result = REJECT,
+-	.prog_type = BPF_PROG_TYPE_CGROUP_SYSCTL,
+-	.errstr = "invalid indirect read from stack R4 off -16+0 size 8",
++	.result = ACCEPT,
++	.prog_type = BPF_PROG_TYPE_SOCKET_FILTER,
++	.result_unpriv = REJECT,
++	.errstr_unpriv = "invalid indirect read from stack R4 off -16+0 size 8",
+ },
+ {
+ 	"ARG_PTR_TO_LONG half-uninitialized",
+--- a/tools/testing/selftests/bpf/verifier/raw_stack.c
++++ b/tools/testing/selftests/bpf/verifier/raw_stack.c
+@@ -10,9 +10,10 @@
+ 	BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_6, 0),
+ 	BPF_EXIT_INSN(),
+ 	},
++	.result = ACCEPT,
++	.prog_type = BPF_PROG_TYPE_SOCKET_FILTER,
+ 	.result = REJECT,
+ 	.errstr = "invalid read from stack R6 off=-8 size=8",
+-	.prog_type = BPF_PROG_TYPE_SCHED_CLS,
+ },
+ {
+ 	"raw_stack: skb_load_bytes, negative len",
+--- a/tools/testing/selftests/bpf/verifier/var_off.c
++++ b/tools/testing/selftests/bpf/verifier/var_off.c
+@@ -58,9 +58,10 @@
+ 	BPF_MOV64_IMM(BPF_REG_0, 0),
+ 	BPF_EXIT_INSN(),
+ 	},
+-	.result = REJECT,
+-	.errstr = "invalid variable-offset read from stack R2",
+-	.prog_type = BPF_PROG_TYPE_LWT_IN,
++	.result = ACCEPT,
++	.prog_type = BPF_PROG_TYPE_CGROUP_SKB,
++	.result_unpriv = REJECT,
++	.errstr_unpriv = "R2 variable stack access prohibited for !root",
+ },
+ {
+ 	"variable-offset stack write, priv vs unpriv",
+@@ -258,9 +259,10 @@
+ 	BPF_EXIT_INSN(),
+ 	},
+ 	.fixup_map_hash_8b = { 5 },
+-	.errstr = "invalid indirect read from stack R2 var_off",
+-	.result = REJECT,
+-	.prog_type = BPF_PROG_TYPE_LWT_IN,
++	.result = ACCEPT,
++	.prog_type = BPF_PROG_TYPE_CGROUP_SKB,
++	.errstr_unpriv = "R2 variable stack access prohibited for !root",
++	.result_unpriv = REJECT,
+ },
+ {
+ 	"indirect variable-offset stack access, priv vs unpriv",
