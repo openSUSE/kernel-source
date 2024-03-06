@@ -1,0 +1,235 @@
+From 10a0580911b25165f48c702e954b412ac8b227c4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Tue, 6 Jun 2023 22:15:02 +0300
+Subject: drm/i915/dsb: Use DEwake to combat PkgC latency
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: f83b94d23770c234cdc51a1468b3ce9d7e42f20e
+Patch-mainline: v6.7-rc1
+References: jsc#PED-3527 jsc#PED-5475 jsc#PED-6068 jsc#PED-6070 jsc#PED-6116 jsc#PED-6120 jsc#PED-5065 jsc#PED-5477 jsc#PED-5511 jsc#PED-6041 jsc#PED-6069 jsc#PED-6071
+
+Normally we could be in a deep PkgC state all the way up to the
+point when DSB starts its execution at the transcoders undelayed
+vblank. The DSB will then have to wait for the hardware to
+wake up before it can execute anything. This will waste a huge
+chunk of the vblank time just waiting, and risks the DSB execution
+spilling into the vertical active period. That will be very bad,
+especially when programming the LUTs as the anti-collision logic
+will cause DSB to corrupt LUT writes during vertical active.
+
+To avoid these problems we can instruct the DSB to pre-wake the
+display engine on a specific scanline so that everything will
+be 100% ready to go when we hit the transcoder's undelayed vblank.
+
+One annoyance is that the scanline is specified as just that,
+a single scanline. So if we happen to start the DSB execution
+after passing said scanline no DEwake will happen and we may drop
+back into some PkgC state before reaching the transcoder's undelayed
+vblank. To prevent that we'll use the "force DEwake" bit to manually
+force the display engine to stay awake. We'll then have to clear
+the force bit again after the DSB is done (the force bit remains
+effective even when the DSB is otherwise disabled).
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20230606191504.18099-18-ville.syrjala@linux.intel.com
+Reviewed-by: Uma Shankar <uma.shankar@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/i915/display/intel_color.c |  2 +-
+ drivers/gpu/drm/i915/display/intel_dsb.c   | 91 +++++++++++++++++++---
+ drivers/gpu/drm/i915/display/intel_dsb.h   |  3 +-
+ 3 files changed, 82 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_color.c b/drivers/gpu/drm/i915/display/intel_color.c
+index 9f80228f96cb..4f92fc31059f 100644
+--- a/drivers/gpu/drm/i915/display/intel_color.c
++++ b/drivers/gpu/drm/i915/display/intel_color.c
+@@ -1905,7 +1905,7 @@ void intel_color_prepare_commit(struct intel_crtc_state *crtc_state)
+ 	if (!crtc_state->pre_csc_lut && !crtc_state->post_csc_lut)
+ 		return;
+ 
+-	crtc_state->dsb = intel_dsb_prepare(crtc, 1024);
++	crtc_state->dsb = intel_dsb_prepare(crtc_state, 1024);
+ 	if (!crtc_state->dsb)
+ 		return;
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_dsb.c b/drivers/gpu/drm/i915/display/intel_dsb.c
+index 73d609507f24..3e32aa49b8eb 100644
+--- a/drivers/gpu/drm/i915/display/intel_dsb.c
++++ b/drivers/gpu/drm/i915/display/intel_dsb.c
+@@ -7,11 +7,16 @@
+ #include "gem/i915_gem_internal.h"
+ 
+ #include "i915_drv.h"
++#include "i915_irq.h"
+ #include "i915_reg.h"
++#include "intel_crtc.h"
+ #include "intel_de.h"
+ #include "intel_display_types.h"
+ #include "intel_dsb.h"
+ #include "intel_dsb_regs.h"
++#include "intel_vblank.h"
++#include "intel_vrr.h"
++#include "skl_watermark.h"
+ 
+ struct i915_vma;
+ 
+@@ -47,6 +52,8 @@ struct intel_dsb {
+ 	 * register.
+ 	 */
+ 	unsigned int ins_start_offset;
++
++	int dewake_scanline;
+ };
+ 
+ /**
+@@ -297,17 +304,40 @@ static void intel_dsb_align_tail(struct intel_dsb *dsb)
+ 
+ void intel_dsb_finish(struct intel_dsb *dsb)
+ {
++	struct intel_crtc *crtc = dsb->crtc;
++
++	/*
++	 * DSB_FORCE_DEWAKE remains active even after DSB is
++	 * disabled, so make sure to clear it (if set during
++	 * intel_dsb_commit()).
++	 */
++	intel_dsb_reg_write_masked(dsb, DSB_PMCTRL_2(crtc->pipe, dsb->id),
++				   DSB_FORCE_DEWAKE, 0);
++
+ 	intel_dsb_align_tail(dsb);
+ }
+ 
+-/**
+- * intel_dsb_commit() - Trigger workload execution of DSB.
+- * @dsb: DSB context
+- * @wait_for_vblank: wait for vblank before executing
+- *
+- * This function is used to do actual write to hardware using DSB.
+- */
+-void intel_dsb_commit(struct intel_dsb *dsb, bool wait_for_vblank)
++static int intel_dsb_dewake_scanline(const struct intel_crtc_state *crtc_state)
++{
++	struct drm_i915_private *i915 = to_i915(crtc_state->uapi.crtc->dev);
++	const struct drm_display_mode *adjusted_mode = &crtc_state->hw.adjusted_mode;
++	unsigned int latency = skl_watermark_max_latency(i915);
++	int vblank_start;
++
++	if (crtc_state->vrr.enable) {
++		vblank_start = intel_vrr_vmin_vblank_start(crtc_state);
++	} else {
++		vblank_start = adjusted_mode->crtc_vblank_start;
++
++		if (adjusted_mode->flags & DRM_MODE_FLAG_INTERLACE)
++			vblank_start = DIV_ROUND_UP(vblank_start, 2);
++	}
++
++	return max(0, vblank_start - intel_usecs_to_scanlines(adjusted_mode, latency));
++}
++
++static void _intel_dsb_commit(struct intel_dsb *dsb, u32 ctrl,
++			      unsigned int dewake_scanline)
+ {
+ 	struct intel_crtc *crtc = dsb->crtc;
+ 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+@@ -325,14 +355,49 @@ void intel_dsb_commit(struct intel_dsb *dsb, bool wait_for_vblank)
+ 	}
+ 
+ 	intel_de_write_fw(dev_priv, DSB_CTRL(pipe, dsb->id),
+-			  (wait_for_vblank ? DSB_WAIT_FOR_VBLANK : 0) |
+-			  DSB_ENABLE);
++			  ctrl | DSB_ENABLE);
++
+ 	intel_de_write_fw(dev_priv, DSB_HEAD(pipe, dsb->id),
+ 			  i915_ggtt_offset(dsb->vma));
++
++	if (dewake_scanline >= 0) {
++		int diff, hw_dewake_scanline;
++
++		hw_dewake_scanline = intel_crtc_scanline_to_hw(crtc, dewake_scanline);
++
++		intel_de_write_fw(dev_priv, DSB_PMCTRL(pipe, dsb->id),
++				  DSB_ENABLE_DEWAKE |
++				  DSB_SCANLINE_FOR_DEWAKE(hw_dewake_scanline));
++
++		/*
++		 * Force DEwake immediately if we're already past
++		 * or close to racing past the target scanline.
++		 */
++		diff = dewake_scanline - intel_get_crtc_scanline(crtc);
++		intel_de_write_fw(dev_priv, DSB_PMCTRL_2(pipe, dsb->id),
++				  (diff >= 0 && diff < 5 ? DSB_FORCE_DEWAKE : 0) |
++				  DSB_BLOCK_DEWAKE_EXTENSION);
++	}
++
+ 	intel_de_write_fw(dev_priv, DSB_TAIL(pipe, dsb->id),
+ 			  i915_ggtt_offset(dsb->vma) + tail);
+ }
+ 
++/**
++ * intel_dsb_commit() - Trigger workload execution of DSB.
++ * @dsb: DSB context
++ * @wait_for_vblank: wait for vblank before executing
++ *
++ * This function is used to do actual write to hardware using DSB.
++ */
++void intel_dsb_commit(struct intel_dsb *dsb,
++		      bool wait_for_vblank)
++{
++	_intel_dsb_commit(dsb,
++			  wait_for_vblank ? DSB_WAIT_FOR_VBLANK : 0,
++			  wait_for_vblank ? dsb->dewake_scanline : -1);
++}
++
+ void intel_dsb_wait(struct intel_dsb *dsb)
+ {
+ 	struct intel_crtc *crtc = dsb->crtc;
+@@ -363,7 +428,7 @@ void intel_dsb_wait(struct intel_dsb *dsb)
+ 
+ /**
+  * intel_dsb_prepare() - Allocate, pin and map the DSB command buffer.
+- * @crtc: the CRTC
++ * @crtc_state: the CRTC state
+  * @max_cmds: number of commands we need to fit into command buffer
+  *
+  * This function prepare the command buffer which is used to store dsb
+@@ -372,9 +437,10 @@ void intel_dsb_wait(struct intel_dsb *dsb)
+  * Returns:
+  * DSB context, NULL on failure
+  */
+-struct intel_dsb *intel_dsb_prepare(struct intel_crtc *crtc,
++struct intel_dsb *intel_dsb_prepare(const struct intel_crtc_state *crtc_state,
+ 				    unsigned int max_cmds)
+ {
++	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+ 	struct drm_i915_private *i915 = to_i915(crtc->base.dev);
+ 	struct drm_i915_gem_object *obj;
+ 	intel_wakeref_t wakeref;
+@@ -420,6 +486,7 @@ struct intel_dsb *intel_dsb_prepare(struct intel_crtc *crtc,
+ 	dsb->size = size / 4; /* in dwords */
+ 	dsb->free_pos = 0;
+ 	dsb->ins_start_offset = 0;
++	dsb->dewake_scanline = intel_dsb_dewake_scanline(crtc_state);
+ 
+ 	return dsb;
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_dsb.h b/drivers/gpu/drm/i915/display/intel_dsb.h
+index 54e9e1dc31ee..16d80f434356 100644
+--- a/drivers/gpu/drm/i915/display/intel_dsb.h
++++ b/drivers/gpu/drm/i915/display/intel_dsb.h
+@@ -11,9 +11,10 @@
+ #include "i915_reg_defs.h"
+ 
+ struct intel_crtc;
++struct intel_crtc_state;
+ struct intel_dsb;
+ 
+-struct intel_dsb *intel_dsb_prepare(struct intel_crtc *crtc,
++struct intel_dsb *intel_dsb_prepare(const struct intel_crtc_state *crtc_state,
+ 				    unsigned int max_cmds);
+ void intel_dsb_finish(struct intel_dsb *dsb);
+ void intel_dsb_cleanup(struct intel_dsb *dsb);
+-- 
+2.43.0
+
