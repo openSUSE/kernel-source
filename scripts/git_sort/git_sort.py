@@ -225,7 +225,6 @@ remotes = (
     Head(RepoURL("mkp/scsi.git"), "fixes"),
     Head(RepoURL("mkp/scsi.git"), "for-next"),
     Head(RepoURL("git://git.kernel.dk/linux-block.git"), "for-next"),
-    Head(RepoURL("git://git.kernel.dk/linux-block.git"), "io_uring-6.3"),
     Head(RepoURL("git://git.kernel.org/pub/scm/virt/kvm/kvm.git"), "queue"),
     Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.15"),
     Head(RepoURL("dhowells/linux-fs.git")),
