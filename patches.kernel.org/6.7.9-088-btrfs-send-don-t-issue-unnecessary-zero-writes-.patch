@@ -1,0 +1,163 @@
+From: Filipe Manana <fdmanana@suse.com>
+Date: Fri, 16 Feb 2024 22:17:10 +0000
+Subject: [PATCH] btrfs: send: don't issue unnecessary zero writes for trailing
+ hole
+References: bsc#1012628
+Patch-mainline: 6.7.9
+Git-commit: 5897710b28cabab04ea6c7547f27b7989de646ae
+
+commit 5897710b28cabab04ea6c7547f27b7989de646ae upstream.
+
+If we have a sparse file with a trailing hole (from the last extent's end
+to i_size) and then create an extent in the file that ends before the
+file's i_size, then when doing an incremental send we will issue a write
+full of zeroes for the range that starts immediately after the new extent
+ends up to i_size. While this isn't incorrect because the file ends up
+with exactly the same data, it unnecessarily results in using extra space
+at the destination with one or more extents full of zeroes instead of
+having a hole. In same cases this results in using megabytes or even
+gigabytes of unnecessary space.
+
+Example, reproducer:
+
+   $ cat test.sh
+   #!/bin/bash
+
+   DEV=/dev/sdh
+   MNT=/mnt/sdh
+
+   mkfs.btrfs -f $DEV
+   mount $DEV $MNT
+
+   # Create 1G sparse file.
+   xfs_io -f -c "truncate 1G" $MNT/foobar
+
+   # Create base snapshot.
+   btrfs subvolume snapshot -r $MNT $MNT/mysnap1
+
+   # Create send stream (full send) for the base snapshot.
+   btrfs send -f /tmp/1.snap $MNT/mysnap1
+
+   # Now write one extent at the beginning of the file and one somewhere
+   # in the middle, leaving a gap between the end of this second extent
+   # and the file's size.
+   xfs_io -c "pwrite -S 0xab 0 128K" \
+          -c "pwrite -S 0xcd 512M 128K" \
+          $MNT/foobar
+
+   # Now create a second snapshot which is going to be used for an
+   # incremental send operation.
+   btrfs subvolume snapshot -r $MNT $MNT/mysnap2
+
+   # Create send stream (incremental send) for the second snapshot.
+   btrfs send -p $MNT/mysnap1 -f /tmp/2.snap $MNT/mysnap2
+
+   # Now recreate the filesystem by receiving both send streams and
+   # verify we get the same content that the original filesystem had
+   # and file foobar has only two extents with a size of 128K each.
+   umount $MNT
+   mkfs.btrfs -f $DEV
+   mount $DEV $MNT
+
+   btrfs receive -f /tmp/1.snap $MNT
+   btrfs receive -f /tmp/2.snap $MNT
+
+   echo -e "\nFile fiemap in the second snapshot:"
+   # Should have:
+   #
+   # 128K extent at file range [0, 128K[
+   # hole at file range [128K, 512M[
+   # 128K extent file range [512M, 512M + 128K[
+   # hole at file range [512M + 128K, 1G[
+   xfs_io -r -c "fiemap -v" $MNT/mysnap2/foobar
+
+   # File should be using 256K of data (two 128K extents).
+   echo -e "\nSpace used by the file: $(du -h $MNT/mysnap2/foobar | cut -f 1)"
+
+   umount $MNT
+
+Running the test, we can see with fiemap that we get an extent for the
+range [512M, 1G[, while in the source filesystem we have an extent for
+the range [512M, 512M + 128K[ and a hole for the rest of the file (the
+range [512M + 128K, 1G[):
+
+   $ ./test.sh
+   (...)
+   File fiemap in the second snapshot:
+   /mnt/sdh/mysnap2/foobar:
+    EXT: FILE-OFFSET        BLOCK-RANGE        TOTAL FLAGS
+      0: [0..255]:          26624..26879         256   0x0
+      1: [256..1048575]:    hole             1048320
+      2: [1048576..2097151]: 2156544..3205119 1048576   0x1
+
+   Space used by the file: 513M
+
+This happens because once we finish processing an inode, at
+finish_inode_if_needed(), we always issue a hole (write operations full
+of zeros) if there's a gap between the end of the last processed extent
+and the file's size, even if that range is already a hole in the parent
+snapshot. Fix this by issuing the hole only if the range is not already
+a hole.
+
+After this change, running the test above, we get the expected layout:
+
+   $ ./test.sh
+   (...)
+   File fiemap in the second snapshot:
+   /mnt/sdh/mysnap2/foobar:
+    EXT: FILE-OFFSET        BLOCK-RANGE      TOTAL FLAGS
+      0: [0..255]:          26624..26879       256   0x0
+      1: [256..1048575]:    hole             1048320
+      2: [1048576..1048831]: 26880..27135       256   0x1
+      3: [1048832..2097151]: hole             1048320
+
+   Space used by the file: 256K
+
+A test case for fstests will follow soon.
+
+CC: stable@vger.kernel.org # 6.1+
+Reported-by: Dorai Ashok S A <dash.btrfs@inix.me>
+Link: https://lore.kernel.org/linux-btrfs/c0bf7818-9c45-46a8-b3d3-513230d0c86e@inix.me/
+Reviewed-by: Sweet Tea Dorminy <sweettea-kernel@dorminy.me>
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/btrfs/send.c | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+index 77b18222..4d165479 100644
+--- a/fs/btrfs/send.c
++++ b/fs/btrfs/send.c
+@@ -6705,11 +6705,20 @@ static int finish_inode_if_needed(struct send_ctx *sctx, int at_end)
+ 				if (ret)
+ 					goto out;
+ 			}
+-			if (sctx->cur_inode_last_extent <
+-			    sctx->cur_inode_size) {
+-				ret = send_hole(sctx, sctx->cur_inode_size);
+-				if (ret)
++			if (sctx->cur_inode_last_extent < sctx->cur_inode_size) {
++				ret = range_is_hole_in_parent(sctx,
++						      sctx->cur_inode_last_extent,
++						      sctx->cur_inode_size);
++				if (ret < 0) {
+ 					goto out;
++				} else if (ret == 0) {
++					ret = send_hole(sctx, sctx->cur_inode_size);
++					if (ret < 0)
++						goto out;
++				} else {
++					/* Range is already a hole, skip. */
++					ret = 0;
++				}
+ 			}
+ 		}
+ 		if (need_truncate) {
+-- 
+2.44.0
+
