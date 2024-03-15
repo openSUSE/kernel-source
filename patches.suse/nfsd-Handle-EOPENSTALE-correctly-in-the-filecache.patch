@@ -1,0 +1,221 @@
+From: Trond Myklebust <trond.myklebust@hammerspace.com>
+Date: Mon, 11 Sep 2023 14:30:27 -0400
+Subject: [PATCH] nfsd: Handle EOPENSTALE correctly in the filecache
+Git-commit: d59b3515ab021e010fdc58a8f445ea62dd2f7f4c
+Patch-mainline: v6.7
+References: git-fixes
+
+The nfsd_open code handles EOPENSTALE correctly, by retrying the call to
+fh_verify() and __nfsd_open(). However the filecache just drops the
+error on the floor, and immediately returns nfserr_stale to the caller.
+
+This patch ensures that we propagate the EOPENSTALE code back to
+nfsd_file_do_acquire, and that we handle it correctly.
+
+Fixes: 65294c1f2c5e ("nfsd: add a new struct file caching facility to nfsd")
+Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+Reviewed-by: Jeff Layton <jlayton@kernel.org>
+Message-id: <20230911183027.11372-1-trond.myklebust@hammerspace.com>
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Acked-by: NeilBrown <neilb@suse.com>
+
+---
+ fs/nfsd/filecache.c |   27 +++++++++++++++++++--------
+ fs/nfsd/vfs.c       |   28 +++++++++++++---------------
+ fs/nfsd/vfs.h       |    4 ++--
+ 3 files changed, 34 insertions(+), 25 deletions(-)
+
+--- a/fs/nfsd/filecache.c
++++ b/fs/nfsd/filecache.c
+@@ -989,22 +989,21 @@ nfsd_file_do_acquire(struct svc_rqst *rq
+ 	unsigned char need = may_flags & NFSD_FILE_MAY_MASK;
+ 	struct net *net = SVC_NET(rqstp);
+ 	struct nfsd_file *new, *nf;
+-	const struct cred *cred;
++	bool stale_retry = true;
+ 	bool open_retry = true;
+ 	struct inode *inode;
+ 	__be32 status;
+ 	int ret;
+ 
++retry:
+ 	status = fh_verify(rqstp, fhp, S_IFREG,
+ 				may_flags|NFSD_MAY_OWNER_OVERRIDE);
+ 	if (status != nfs_ok)
+ 		return status;
+ 	inode = d_inode(fhp->fh_dentry);
+-	cred = get_current_cred();
+ 
+-retry:
+ 	rcu_read_lock();
+-	nf = nfsd_file_lookup_locked(net, cred, inode, need, want_gc);
++	nf = nfsd_file_lookup_locked(net, current_cred(), inode, need, want_gc);
+ 	rcu_read_unlock();
+ 
+ 	if (nf) {
+@@ -1026,7 +1025,7 @@ retry:
+ 
+ 	rcu_read_lock();
+ 	spin_lock(&inode->i_lock);
+-	nf = nfsd_file_lookup_locked(net, cred, inode, need, want_gc);
++	nf = nfsd_file_lookup_locked(net, current_cred(), inode, need, want_gc);
+ 	if (unlikely(nf)) {
+ 		spin_unlock(&inode->i_lock);
+ 		rcu_read_unlock();
+@@ -1058,6 +1057,7 @@ wait_for_construction:
+ 			goto construction_err;
+ 		}
+ 		open_retry = false;
++		fh_put(fhp);
+ 		goto retry;
+ 	}
+ 	this_cpu_inc(nfsd_file_cache_hits);
+@@ -1074,7 +1074,6 @@ out:
+ 		nfsd_file_check_write_error(nf);
+ 		*pnf = nf;
+ 	}
+-	put_cred(cred);
+ 	trace_nfsd_file_acquire(rqstp, inode, may_flags, nf, status);
+ 	return status;
+ 
+@@ -1088,8 +1087,20 @@ open_file:
+ 			status = nfs_ok;
+ 			trace_nfsd_file_opened(nf, status);
+ 		} else {
+-			status = nfsd_open_verified(rqstp, fhp, may_flags,
+-						    &nf->nf_file);
++			ret = nfsd_open_verified(rqstp, fhp, may_flags,
++						 &nf->nf_file);
++			if (ret == -EOPENSTALE && stale_retry) {
++				stale_retry = false;
++				nfsd_file_unhash(nf);
++				clear_and_wake_up_bit(NFSD_FILE_PENDING,
++						      &nf->nf_flags);
++				if (refcount_dec_and_test(&nf->nf_ref))
++					nfsd_file_free(nf);
++				nf = NULL;
++				fh_put(fhp);
++				goto retry;
++			}
++			status = nfserrno(ret);
+ 			trace_nfsd_file_open(nf, status);
+ 		}
+ 	} else
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -823,7 +823,7 @@ int nfsd_open_break_lease(struct inode *
+  * and additional flags.
+  * N.B. After this call fhp needs an fh_put
+  */
+-static __be32
++static int
+ __nfsd_open(struct svc_rqst *rqstp, struct svc_fh *fhp, umode_t type,
+ 			int may_flags, struct file **filp)
+ {
+@@ -831,14 +831,12 @@ __nfsd_open(struct svc_rqst *rqstp, stru
+ 	struct inode	*inode;
+ 	struct file	*file;
+ 	int		flags = O_RDONLY|O_LARGEFILE;
+-	__be32		err;
+-	int		host_err = 0;
++	int		host_err = -EPERM;
+ 
+ 	path.mnt = fhp->fh_export->ex_path.mnt;
+ 	path.dentry = fhp->fh_dentry;
+ 	inode = d_inode(path.dentry);
+ 
+-	err = nfserr_perm;
+ 	if (IS_APPEND(inode) && (may_flags & NFSD_MAY_WRITE))
+ 		goto out;
+ 
+@@ -847,7 +845,7 @@ __nfsd_open(struct svc_rqst *rqstp, stru
+ 
+ 	host_err = nfsd_open_break_lease(inode, may_flags);
+ 	if (host_err) /* NOMEM or WOULDBLOCK */
+-		goto out_nfserr;
++		goto out;
+ 
+ 	if (may_flags & NFSD_MAY_WRITE) {
+ 		if (may_flags & NFSD_MAY_READ)
+@@ -859,13 +857,13 @@ __nfsd_open(struct svc_rqst *rqstp, stru
+ 	file = dentry_open(&path, flags, current_cred());
+ 	if (IS_ERR(file)) {
+ 		host_err = PTR_ERR(file);
+-		goto out_nfserr;
++		goto out;
+ 	}
+ 
+ 	host_err = ima_file_check(file, may_flags);
+ 	if (host_err) {
+ 		fput(file);
+-		goto out_nfserr;
++		goto out;
+ 	}
+ 
+ 	if (may_flags & NFSD_MAY_64BIT_COOKIE)
+@@ -874,10 +872,8 @@ __nfsd_open(struct svc_rqst *rqstp, stru
+ 		file->f_mode |= FMODE_32BITHASH;
+ 
+ 	*filp = file;
+-out_nfserr:
+-	err = nfserrno(host_err);
+ out:
+-	return err;
++	return host_err;
+ }
+ 
+ __be32
+@@ -885,6 +881,7 @@ nfsd_open(struct svc_rqst *rqstp, struct
+ 		int may_flags, struct file **filp)
+ {
+ 	__be32 err;
++	int host_err;
+ 	bool retried = false;
+ 
+ 	validate_process_creds();
+@@ -904,12 +901,13 @@ nfsd_open(struct svc_rqst *rqstp, struct
+ retry:
+ 	err = fh_verify(rqstp, fhp, type, may_flags);
+ 	if (!err) {
+-		err = __nfsd_open(rqstp, fhp, type, may_flags, filp);
+-		if (err == nfserr_stale && !retried) {
++		host_err = __nfsd_open(rqstp, fhp, type, may_flags, filp);
++		if (host_err == -EOPENSTALE && !retried) {
+ 			retried = true;
+ 			fh_put(fhp);
+ 			goto retry;
+ 		}
++		err = nfserrno(host_err);
+ 	}
+ 	validate_process_creds();
+ 	return err;
+@@ -922,13 +920,13 @@ retry:
+  * @may_flags: internal permission flags
+  * @filp: OUT: open "struct file *"
+  *
+- * Returns an nfsstat value in network byte order.
++ * Returns zero on success, or a negative errno value.
+  */
+-__be32
++int
+ nfsd_open_verified(struct svc_rqst *rqstp, struct svc_fh *fhp, int may_flags,
+ 		   struct file **filp)
+ {
+-	__be32 err;
++	int err;
+ 
+ 	validate_process_creds();
+ 	err = __nfsd_open(rqstp, fhp, S_IFREG, may_flags, filp);
+--- a/fs/nfsd/vfs.h
++++ b/fs/nfsd/vfs.h
+@@ -104,8 +104,8 @@ __be32		nfsd_setxattr(struct svc_rqst *r
+ int 		nfsd_open_break_lease(struct inode *, int);
+ __be32		nfsd_open(struct svc_rqst *, struct svc_fh *, umode_t,
+ 				int, struct file **);
+-__be32		nfsd_open_verified(struct svc_rqst *, struct svc_fh *,
+-				int, struct file **);
++int		nfsd_open_verified(struct svc_rqst *rqstp, struct svc_fh *fhp,
++				   int may_flags, struct file **filp);
+ __be32		nfsd_splice_read(struct svc_rqst *rqstp, struct svc_fh *fhp,
+ 				struct file *file, loff_t offset,
+ 				unsigned long *count,
