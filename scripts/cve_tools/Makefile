@@ -1,6 +1,11 @@
 # Expects VULNS_GIT environment variable with a clone of https://git.kernel.org/pub/scm/linux/security/vulns.git
 # Expects KSOURCE_GIT environment variable
-CVE_TO_BUG=../cve-to-bug.py
+
+# URL of CVE
+CVE2BUG_URL=https://gitlab.suse.de/security/cve-database/-/raw/master/data/cve2bugzilla
+
+# cached data expiration in days
+EXPIRE=3
 
 ADD_REF=./add-missing-reference
 
@@ -12,18 +17,29 @@ YEAR=$(shell date +%Y)
 BRANCH=cve/linux-5.14
 branch=$(subst /,_,$(BRANCH))
 
-.PHONY: update_refs_history update_refs_$(branch)_$(YEAR)
+.PHONY: check_cache update_refs_history update_refs_$(branch)_$(YEAR)
+
+CACHESTAMP=cachestamp
+
+check_cache:
+	@test -n "$$(find "$(CACHESTAMP)" -mtime -$(EXPIRE) -print 2>/dev/null)" || touch "$(CACHESTAMP)"
+
+$(CACHESTAMP): check_cache
+
+cve2bugzilla: $(CACHESTAMP)
+	curl "$(CVE2BUG_URL)" >"$@"
+
 hash_cve_$(YEAR).dat: $(wildcard $(VULNS_GIT)/cve/published/$(YEAR)/*.sha1)
 	for f in $^ ; do \
 		echo $$(head -n1 $$f) $$(basename $${f%.sha1}) ; \
 	done | sort -k1 >"$@"
 
-cve_bug_$(YEAR).dat: hash_cve_$(YEAR).dat
-	for cve in $$(cut -d" " -f2 $<) ; do \
-		bug=$$($(CVE_TO_BUG) $$cve) ; \
-		sleep 0.3 ; \
-		echo $$cve $$bug ; \
-	done | sort -k 1b,1 >$@
+# cve2bugzilla contains multiple bugs for single CVE, use the heuristics of
+# lowest numerical bug being the primary bug
+cve_bug_$(YEAR).dat: cve2bugzilla
+	sed -n '/^CVE-$(YEAR)-.*BUGZILLA:/{s/^\(CVE-[^,]*\),.*BUGZILLA:\([0-9]*\).*$$/\1 \2/;p}' <"$<" | \
+	sort -n -k 2 | sort -k 1b,1 -s | uniq | \
+	awk '{ primary_bug=$$1 != cve; cve=$$1; print $$0, primary_bug; }' >"$@"
 
 hash_file_$(branch).dat:
 	git --git-dir="$(KSOURCE_GIT)/.git" --work-tree="$(KSOURCE_GIT)" grep -i "^git-commit[[:space:]]*:[[:space:]]*" origin/$(BRANCH) -- "$(KSOURCE_GIT)/patches.suse" |\
@@ -31,7 +47,7 @@ hash_file_$(branch).dat:
 
 hash_cve_bug_$(YEAR).dat: hash_cve_$(YEAR).dat cve_bug_$(YEAR).dat
 	sort -k 2b,2 hash_cve_$(YEAR).dat | \
-	join -1 2 -2 1 -o 1.1,1.2,2.2 - cve_bug_$(YEAR).dat | \
+	join -1 2 -2 1 -o 1.1,1.2,2.2,2.3 - cve_bug_$(YEAR).dat | \
 	sort -k 1 >"$@"
 
 update_refs: update_refs_$(branch)_$(YEAR)
@@ -47,7 +63,8 @@ update_refs_history:
 update_refs_$(branch)_$(YEAR): hash_file_$(branch).dat hash_cve_bug_$(YEAR).dat
 	set -e ; \
 	join hash_file_$(branch).dat hash_cve_bug_$(YEAR).dat | \
-	while read sha file cve bug ; do \
+	while read sha file cve bug primary; do \
+		[ "$$primary" -eq 0 ] && continue ; \
 		[ -z "$$bug" ] && echo "Unknown bug for $$cve" && continue ; \
 		$(ADD_REF) -r $$cve -r "bsc#"$$bug "$(KSOURCE_GIT)/$$file" ; \
 	done
