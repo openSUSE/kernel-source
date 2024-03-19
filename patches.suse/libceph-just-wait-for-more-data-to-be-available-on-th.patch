@@ -1,0 +1,171 @@
+From: Xiubo Li <xiubli@redhat.com>
+Date: Thu, 14 Dec 2023 16:01:03 +0800
+Subject: libceph: just wait for more data to be available on the socket
+Git-commit: 8e46a2d068c92a905d01cbb018b00d66991585ab
+Patch-mainline: v6.8-rc4
+References: bsc#1221390
+
+A short read may occur while reading the message footer from the
+socket.  Later, when the socket is ready for another read, the
+messenger invokes all read_partial_*() handlers, including
+read_partial_sparse_msg_data().  The expectation is that
+read_partial_sparse_msg_data() would bail, allowing the messenger to
+invoke read_partial() for the footer and pick up where it left off.
+
+However read_partial_sparse_msg_data() violates that and ends up
+calling into the state machine in the OSD client.  The sparse-read
+state machine assumes that it's a new op and interprets some piece of
+the footer as the sparse-read header and returns bogus extents/data
+length, etc.
+
+To determine whether read_partial_sparse_msg_data() should bail, let's
+reuse cursor->total_resid.  Because once it reaches to zero that means
+all the extents and data have been successfully received in last read,
+else it could break out when partially reading any of the extents and
+data.  And then osd_sparse_read() could continue where it left off.
+
+[ idryomov: changelog ]
+
+Link: https://tracker.ceph.com/issues/63586
+Fixes: d396f89db39a ("libceph: add sparse read support to msgr1")
+Signed-off-by: Xiubo Li <xiubli@redhat.com>
+Reviewed-by: Jeff Layton <jlayton@kernel.org>
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Acked-by: Luis Henriques <lhenriques@suse.de>
+
+---
+ include/linux/ceph/messenger.h |  2 +-
+ net/ceph/messenger_v1.c        | 25 +++++++++++++------------
+ net/ceph/messenger_v2.c        |  4 ++--
+ net/ceph/osd_client.c          |  9 +++------
+ 4 files changed, 19 insertions(+), 21 deletions(-)
+
+diff --git a/include/linux/ceph/messenger.h b/include/linux/ceph/messenger.h
+index 2eaaabbe98cb..1717cc57cdac 100644
+--- a/include/linux/ceph/messenger.h
++++ b/include/linux/ceph/messenger.h
+@@ -283,7 +283,7 @@ struct ceph_msg {
+ 	struct kref kref;
+ 	bool more_to_follow;
+ 	bool needs_out_seq;
+-	bool sparse_read;
++	u64 sparse_read_total;
+ 	int front_alloc_len;
+ 
+ 	struct ceph_msgpool *pool;
+diff --git a/net/ceph/messenger_v1.c b/net/ceph/messenger_v1.c
+index 4cb60bacf5f5..0cb61c76b9b8 100644
+--- a/net/ceph/messenger_v1.c
++++ b/net/ceph/messenger_v1.c
+@@ -160,8 +160,9 @@ static size_t sizeof_footer(struct ceph_connection *con)
+ static void prepare_message_data(struct ceph_msg *msg, u32 data_len)
+ {
+ 	/* Initialize data cursor if it's not a sparse read */
+-	if (!msg->sparse_read)
+-		ceph_msg_data_cursor_init(&msg->cursor, msg, data_len);
++	u64 len = msg->sparse_read_total ? : data_len;
++
++	ceph_msg_data_cursor_init(&msg->cursor, msg, len);
+ }
+ 
+ /*
+@@ -1036,7 +1037,7 @@ static int read_partial_sparse_msg_data(struct ceph_connection *con)
+ 	if (do_datacrc)
+ 		crc = con->in_data_crc;
+ 
+-	do {
++	while (cursor->total_resid) {
+ 		if (con->v1.in_sr_kvec.iov_base)
+ 			ret = read_partial_message_chunk(con,
+ 							 &con->v1.in_sr_kvec,
+@@ -1044,23 +1045,23 @@ static int read_partial_sparse_msg_data(struct ceph_connection *con)
+ 							 &crc);
+ 		else if (cursor->sr_resid > 0)
+ 			ret = read_partial_sparse_msg_extent(con, &crc);
+-
+-		if (ret <= 0) {
+-			if (do_datacrc)
+-				con->in_data_crc = crc;
+-			return ret;
+-		}
++		if (ret <= 0)
++			break;
+ 
+ 		memset(&con->v1.in_sr_kvec, 0, sizeof(con->v1.in_sr_kvec));
+ 		ret = con->ops->sparse_read(con, cursor,
+ 				(char **)&con->v1.in_sr_kvec.iov_base);
++		if (ret <= 0) {
++			ret = ret ? ret : 1;  /* must return > 0 to indicate success */
++			break;
++		}
+ 		con->v1.in_sr_len = ret;
+-	} while (ret > 0);
++	}
+ 
+ 	if (do_datacrc)
+ 		con->in_data_crc = crc;
+ 
+-	return ret < 0 ? ret : 1;  /* must return > 0 to indicate success */
++	return ret;
+ }
+ 
+ static int read_partial_msg_data(struct ceph_connection *con)
+@@ -1253,7 +1254,7 @@ static int read_partial_message(struct ceph_connection *con)
+ 		if (!m->num_data_items)
+ 			return -EIO;
+ 
+-		if (m->sparse_read)
++		if (m->sparse_read_total)
+ 			ret = read_partial_sparse_msg_data(con);
+ 		else if (ceph_test_opt(from_msgr(con->msgr), RXBOUNCE))
+ 			ret = read_partial_msg_data_bounce(con);
+diff --git a/net/ceph/messenger_v2.c b/net/ceph/messenger_v2.c
+index f8ec60e1aba3..a0ca5414b333 100644
+--- a/net/ceph/messenger_v2.c
++++ b/net/ceph/messenger_v2.c
+@@ -1128,7 +1128,7 @@ static int decrypt_tail(struct ceph_connection *con)
+ 	struct sg_table enc_sgt = {};
+ 	struct sg_table sgt = {};
+ 	struct page **pages = NULL;
+-	bool sparse = con->in_msg->sparse_read;
++	bool sparse = !!con->in_msg->sparse_read_total;
+ 	int dpos = 0;
+ 	int tail_len;
+ 	int ret;
+@@ -2060,7 +2060,7 @@ static int prepare_read_tail_plain(struct ceph_connection *con)
+ 	}
+ 
+ 	if (data_len(msg)) {
+-		if (msg->sparse_read)
++		if (msg->sparse_read_total)
+ 			con->v2.in_state = IN_S_PREPARE_SPARSE_DATA;
+ 		else
+ 			con->v2.in_state = IN_S_PREPARE_READ_DATA;
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index 2cea35e4ff8e..9d078b37fe0b 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -5510,7 +5510,7 @@ static struct ceph_msg *get_reply(struct ceph_connection *con,
+ 	}
+ 
+ 	m = ceph_msg_get(req->r_reply);
+-	m->sparse_read = (bool)srlen;
++	m->sparse_read_total = srlen;
+ 
+ 	dout("get_reply tid %lld %p\n", tid, m);
+ 
+@@ -5777,11 +5777,8 @@ static int prep_next_sparse_read(struct ceph_connection *con,
+ 	}
+ 
+ 	if (o->o_sparse_op_idx < 0) {
+-		u64 srlen = sparse_data_requested(req);
+-
+-		dout("%s: [%d] starting new sparse read req. srlen=0x%llx\n",
+-		     __func__, o->o_osd, srlen);
+-		ceph_msg_data_cursor_init(cursor, con->in_msg, srlen);
++		dout("%s: [%d] starting new sparse read req\n",
++		     __func__, o->o_osd);
+ 	} else {
+ 		u64 end;
+ 
+
