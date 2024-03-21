@@ -25,7 +25,7 @@ do
 	then
 		echo -n "$sha"
 		cvss="$(cve2cvss $cve)"
-		echo -n " $cvss"
+		echo -n " score:${cvss:-unknown}"
 		bsc="$(cve2bugzilla $cve)"
 		echo " $cve $bsc"
 	else
