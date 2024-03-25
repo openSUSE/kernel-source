@@ -499,7 +499,7 @@ fi
 # Create fresh $SCRATCH_AREA/linux-$SRCVERSION.
 if ! [ -d $ORIG_DIR ]; then
     unpack_tarball "$SRCVERSION" "$ORIG_DIR" "$URL"
-    find $ORIG_DIR -type f -exec chmod a-w,a+r +
+    find $ORIG_DIR -type f -exec chmod a-w,a+r {} +
 fi
 
 if $VANILLA; then
