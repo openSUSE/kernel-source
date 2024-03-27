@@ -1,0 +1,168 @@
+From 62ceb40b9cc5ed9aa5dec30f00d64a81ad2e9f3c Mon Sep 17 00:00:00 2001
+From: Florian Kauer <florian.kauer@linutronix.de>
+Date: Mon, 19 Feb 2024 10:08:43 +0100
+Subject: [PATCH 12/20] igc: avoid returning frame twice in XDP_REDIRECT
+Git-commit: ef27f655b438bed4c83680e4f01e1cde2739854b
+Patch-mainline: v6.8
+References: git-fixes
+
+When a frame can not be transmitted in XDP_REDIRECT
+(e.g. due to a full queue), it is necessary to free
+it by calling xdp_return_frame_rx_napi.
+
+However, this is the responsibility of the caller of
+the ndo_xdp_xmit (see for example bq_xmit_all in
+kernel/bpf/devmap.c) and thus calling it inside
+igc_xdp_xmit (which is the ndo_xdp_xmit of the igc
+driver) as well will lead to memory corruption.
+
+In fact, bq_xmit_all expects that it can return all
+frames after the last successfully transmitted one.
+Therefore, break for the first not transmitted frame,
+but do not call xdp_return_frame_rx_napi in igc_xdp_xmit.
+This is equally implemented in other Intel drivers
+such as the igb.
+
+There are two alternatives to this that were rejected:
+1. Return num_frames as all the frames would have been
+   transmitted and release them inside igc_xdp_xmit.
+   While it might work technically, it is not what
+   the return value is meant to represent (i.e. the
+   number of SUCCESSFULLY transmitted packets).
+2. Rework kernel/bpf/devmap.c and all drivers to
+   support non-consecutively dropped packets.
+   Besides being complex, it likely has a negative
+   performance impact without a significant gain
+   since it is anyway unlikely that the next frame
+   can be transmitted if the previous one was dropped.
+
+The memory corruption can be reproduced with
+the following script which leads to a kernel panic
+after a few seconds.  It basically generates more
+traffic than a i225 NIC can transmit and pushes it
+via XDP_REDIRECT from a virtual interface to the
+physical interface where frames get dropped.
+
+   #!/bin/bash
+   INTERFACE=enp4s0
+   INTERFACE_IDX=`cat /sys/class/net/$INTERFACE/ifindex`
+
+   sudo ip link add dev veth1 type veth peer name veth2
+   sudo ip link set up $INTERFACE
+   sudo ip link set up veth1
+   sudo ip link set up veth2
+
+   cat << EOF > redirect.bpf.c
+
+   SEC("prog")
+   int redirect(struct xdp_md *ctx)
+   {
+       return bpf_redirect($INTERFACE_IDX, 0);
+   }
+
+   char _license[] SEC("license") = "GPL";
+   EOF
+   clang -O2 -g -Wall -target bpf -c redirect.bpf.c -o redirect.bpf.o
+   sudo ip link set veth2 xdp obj redirect.bpf.o
+
+   cat << EOF > pass.bpf.c
+
+   SEC("prog")
+   int pass(struct xdp_md *ctx)
+   {
+       return XDP_PASS;
+   }
+
+   char _license[] SEC("license") = "GPL";
+   EOF
+   clang -O2 -g -Wall -target bpf -c pass.bpf.c -o pass.bpf.o
+   sudo ip link set $INTERFACE xdp obj pass.bpf.o
+
+   cat << EOF > trafgen.cfg
+
+   {
+     /* Ethernet Header */
+     0xe8, 0x6a, 0x64, 0x41, 0xbf, 0x46,
+     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+     const16(ETH_P_IP),
+
+     /* IPv4 Header */
+     0b01000101, 0,   # IPv4 version, IHL, TOS
+     const16(1028),   # IPv4 total length (UDP length + 20 bytes (IP header))
+     const16(2),      # IPv4 ident
+     0b01000000, 0,   # IPv4 flags, fragmentation off
+     64,              # IPv4 TTL
+     17,              # Protocol UDP
+     csumip(14, 33),  # IPv4 checksum
+
+     /* UDP Header */
+     10,  0, 1, 1,    # IP Src - adapt as needed
+     10,  0, 1, 2,    # IP Dest - adapt as needed
+     const16(6666),   # UDP Src Port
+     const16(6666),   # UDP Dest Port
+     const16(1008),   # UDP length (UDP header 8 bytes + payload length)
+     csumudp(14, 34), # UDP checksum
+
+     /* Payload */
+     fill('W', 1000),
+   }
+   EOF
+
+   sudo trafgen -i trafgen.cfg -b3000MB -o veth1 --cpp
+
+Fixes: 4ff320361092 ("igc: Add support for XDP_REDIRECT action")
+Signed-off-by: Florian Kauer <florian.kauer@linutronix.de>
+Reviewed-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+Tested-by: Naama Meir <naamax.meir@linux.intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Signed-off-by: Denis Kirjanov <denis.kirjanov@suse.com>
+---
+ drivers/net/ethernet/intel/igc/igc_main.c | 13 ++++++-------
+ 1 file changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/igc/igc_main.c b/drivers/net/ethernet/intel/igc/igc_main.c
+index ba8d3fe186ae..81c21a893ede 100644
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@ -6487,7 +6487,7 @@ static int igc_xdp_xmit(struct net_device *dev, int num_frames,
+ 	int cpu = smp_processor_id();
+ 	struct netdev_queue *nq;
+ 	struct igc_ring *ring;
+-	int i, drops;
++	int i, nxmit;
+ 
+ 	if (unlikely(!netif_carrier_ok(dev)))
+ 		return -ENETDOWN;
+@@ -6503,16 +6503,15 @@ static int igc_xdp_xmit(struct net_device *dev, int num_frames,
+ 	/* Avoid transmit queue timeout since we share it with the slow path */
+ 	txq_trans_cond_update(nq);
+ 
+-	drops = 0;
++	nxmit = 0;
+ 	for (i = 0; i < num_frames; i++) {
+ 		int err;
+ 		struct xdp_frame *xdpf = frames[i];
+ 
+ 		err = igc_xdp_init_tx_descriptor(ring, xdpf);
+-		if (err) {
+-			xdp_return_frame_rx_napi(xdpf);
+-			drops++;
+-		}
++		if (err)
++			break;
++		nxmit++;
+ 	}
+ 
+ 	if (flags & XDP_XMIT_FLUSH)
+@@ -6520,7 +6519,7 @@ static int igc_xdp_xmit(struct net_device *dev, int num_frames,
+ 
+ 	__netif_tx_unlock(nq);
+ 
+-	return num_frames - drops;
++	return nxmit;
+ }
+ 
+ static void igc_trigger_rxtxq_interrupt(struct igc_adapter *adapter,
+-- 
+2.16.4
+
