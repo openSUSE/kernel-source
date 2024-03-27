@@ -1,0 +1,246 @@
+From: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Date: Tue, 9 Jan 2024 13:45:40 -0500
+Subject: [PATCH] Bluetooth: hci_core: Cancel request on command timeout
+References: bsc#1218260
+Patch-mainline: 6.6.23
+Git-commit: 63298d6e752fc0ec7f5093860af8bc9f047b30c8
+
+[ Upstream commit 63298d6e752fc0ec7f5093860af8bc9f047b30c8 ]
+
+If command has timed out call __hci_cmd_sync_cancel to notify the
+hci_req since it will inevitably cause a timeout.
+
+This also rework the code around __hci_cmd_sync_cancel since it was
+wrongly assuming it needs to cancel timer as well, but sometimes the
+timers have not been started or in fact they already had timed out in
+which case they don't need to be cancel yet again.
+
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Stable-dep-of: 2615fd9a7c25 ("Bluetooth: hci_sync: Fix overwriting request callback")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/net/bluetooth/hci_sync.h |  2 +-
+ net/bluetooth/hci_core.c         | 84 ++++++++++++++++++++++----------
+ net/bluetooth/hci_request.c      |  2 +-
+ net/bluetooth/hci_sync.c         | 20 ++++----
+ net/bluetooth/mgmt.c             |  2 +-
+ 5 files changed, 71 insertions(+), 39 deletions(-)
+
+diff --git a/include/net/bluetooth/hci_sync.h b/include/net/bluetooth/hci_sync.h
+index 57eeb07aeb25..268145efbe4c 100644
+--- a/include/net/bluetooth/hci_sync.h
++++ b/include/net/bluetooth/hci_sync.h
+@@ -42,7 +42,7 @@ int __hci_cmd_sync_status_sk(struct hci_dev *hdev, u16 opcode, u32 plen,
+ void hci_cmd_sync_init(struct hci_dev *hdev);
+ void hci_cmd_sync_clear(struct hci_dev *hdev);
+ void hci_cmd_sync_cancel(struct hci_dev *hdev, int err);
+-void __hci_cmd_sync_cancel(struct hci_dev *hdev, int err);
++void hci_cmd_sync_cancel_sync(struct hci_dev *hdev, int err);
+ 
+ int hci_cmd_sync_submit(struct hci_dev *hdev, hci_cmd_sync_work_func_t func,
+ 			void *data, hci_cmd_sync_work_destroy_t destroy);
+diff --git a/net/bluetooth/hci_core.c b/net/bluetooth/hci_core.c
+index 2821a42cefdc..539305b9a0e2 100644
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@ -1492,10 +1492,11 @@ static void hci_cmd_timeout(struct work_struct *work)
+ 					    cmd_timer.work);
+ 
+ 	if (hdev->sent_cmd) {
+-		struct hci_command_hdr *sent = (void *) hdev->sent_cmd->data;
+-		u16 opcode = __le16_to_cpu(sent->opcode);
++		u16 opcode = hci_skb_opcode(hdev->sent_cmd);
+ 
+ 		bt_dev_err(hdev, "command 0x%4.4x tx timeout", opcode);
++
++		hci_cmd_sync_cancel_sync(hdev, ETIMEDOUT);
+ 	} else {
+ 		bt_dev_err(hdev, "command tx timeout");
+ 	}
+@@ -2826,6 +2827,23 @@ int hci_unregister_suspend_notifier(struct hci_dev *hdev)
+ 	return ret;
+ }
+ 
++/* Cancel ongoing command synchronously:
++ *
++ * - Cancel command timer
++ * - Reset command counter
++ * - Cancel command request
++ */
++static void hci_cancel_cmd_sync(struct hci_dev *hdev, int err)
++{
++	bt_dev_dbg(hdev, "err 0x%2.2x", err);
++
++	cancel_delayed_work_sync(&hdev->cmd_timer);
++	cancel_delayed_work_sync(&hdev->ncmd_timer);
++	atomic_set(&hdev->cmd_cnt, 1);
++
++	hci_cmd_sync_cancel_sync(hdev, -err);
++}
++
+ /* Suspend HCI device */
+ int hci_suspend_dev(struct hci_dev *hdev)
+ {
+@@ -2843,7 +2861,7 @@ int hci_suspend_dev(struct hci_dev *hdev)
+ 		return 0;
+ 
+ 	/* Cancel potentially blocking sync operation before suspend */
+-	__hci_cmd_sync_cancel(hdev, -EHOSTDOWN);
++	hci_cancel_cmd_sync(hdev, -EHOSTDOWN);
+ 
+ 	hci_req_sync_lock(hdev);
+ 	ret = hci_suspend_sync(hdev);
+@@ -4128,6 +4146,33 @@ static void hci_rx_work(struct work_struct *work)
+ 	}
+ }
+ 
++static void hci_send_cmd_sync(struct hci_dev *hdev, struct sk_buff *skb)
++{
++	int err;
++
++	bt_dev_dbg(hdev, "skb %p", skb);
++
++	kfree_skb(hdev->sent_cmd);
++
++	hdev->sent_cmd = skb_clone(skb, GFP_KERNEL);
++	if (!hdev->sent_cmd) {
++		skb_queue_head(&hdev->cmd_q, skb);
++		queue_work(hdev->workqueue, &hdev->cmd_work);
++		return;
++	}
++
++	err = hci_send_frame(hdev, skb);
++	if (err < 0) {
++		hci_cmd_sync_cancel_sync(hdev, err);
++		return;
++	}
++
++	if (hci_req_status_pend(hdev))
++		hci_dev_set_flag(hdev, HCI_CMD_PENDING);
++
++	atomic_dec(&hdev->cmd_cnt);
++}
++
+ static void hci_cmd_work(struct work_struct *work)
+ {
+ 	struct hci_dev *hdev = container_of(work, struct hci_dev, cmd_work);
+@@ -4142,30 +4187,15 @@ static void hci_cmd_work(struct work_struct *work)
+ 		if (!skb)
+ 			return;
+ 
+-		kfree_skb(hdev->sent_cmd);
+-
+-		hdev->sent_cmd = skb_clone(skb, GFP_KERNEL);
+-		if (hdev->sent_cmd) {
+-			int res;
+-			if (hci_req_status_pend(hdev))
+-				hci_dev_set_flag(hdev, HCI_CMD_PENDING);
+-			atomic_dec(&hdev->cmd_cnt);
++		hci_send_cmd_sync(hdev, skb);
+ 
+-			res = hci_send_frame(hdev, skb);
+-			if (res < 0)
+-				__hci_cmd_sync_cancel(hdev, -res);
+-
+-			rcu_read_lock();
+-			if (test_bit(HCI_RESET, &hdev->flags) ||
+-			    hci_dev_test_flag(hdev, HCI_CMD_DRAIN_WORKQUEUE))
+-				cancel_delayed_work(&hdev->cmd_timer);
+-			else
+-				queue_delayed_work(hdev->workqueue, &hdev->cmd_timer,
+-						   HCI_CMD_TIMEOUT);
+-			rcu_read_unlock();
+-		} else {
+-			skb_queue_head(&hdev->cmd_q, skb);
+-			queue_work(hdev->workqueue, &hdev->cmd_work);
+-		}
++		rcu_read_lock();
++		if (test_bit(HCI_RESET, &hdev->flags) ||
++		    hci_dev_test_flag(hdev, HCI_CMD_DRAIN_WORKQUEUE))
++			cancel_delayed_work(&hdev->cmd_timer);
++		else
++			queue_delayed_work(hdev->workqueue, &hdev->cmd_timer,
++					   HCI_CMD_TIMEOUT);
++		rcu_read_unlock();
+ 	}
+ }
+diff --git a/net/bluetooth/hci_request.c b/net/bluetooth/hci_request.c
+index 6e023b0104b0..00e02138003e 100644
+--- a/net/bluetooth/hci_request.c
++++ b/net/bluetooth/hci_request.c
+@@ -895,7 +895,7 @@ void hci_request_setup(struct hci_dev *hdev)
+ 
+ void hci_request_cancel_all(struct hci_dev *hdev)
+ {
+-	__hci_cmd_sync_cancel(hdev, ENODEV);
++	hci_cmd_sync_cancel_sync(hdev, ENODEV);
+ 
+ 	cancel_interleave_scan(hdev);
+ }
+diff --git a/net/bluetooth/hci_sync.c b/net/bluetooth/hci_sync.c
+index fef9ab95ad3d..3979c1cccb9f 100644
+--- a/net/bluetooth/hci_sync.c
++++ b/net/bluetooth/hci_sync.c
+@@ -652,7 +652,7 @@ void hci_cmd_sync_clear(struct hci_dev *hdev)
+ 	mutex_unlock(&hdev->cmd_sync_work_lock);
+ }
+ 
+-void __hci_cmd_sync_cancel(struct hci_dev *hdev, int err)
++void hci_cmd_sync_cancel(struct hci_dev *hdev, int err)
+ {
+ 	bt_dev_dbg(hdev, "err 0x%2.2x", err);
+ 
+@@ -660,15 +660,17 @@ void __hci_cmd_sync_cancel(struct hci_dev *hdev, int err)
+ 		hdev->req_result = err;
+ 		hdev->req_status = HCI_REQ_CANCELED;
+ 
+-		cancel_delayed_work_sync(&hdev->cmd_timer);
+-		cancel_delayed_work_sync(&hdev->ncmd_timer);
+-		atomic_set(&hdev->cmd_cnt, 1);
+-
+-		wake_up_interruptible(&hdev->req_wait_q);
++		queue_work(hdev->workqueue, &hdev->cmd_sync_cancel_work);
+ 	}
+ }
++EXPORT_SYMBOL(hci_cmd_sync_cancel);
+ 
+-void hci_cmd_sync_cancel(struct hci_dev *hdev, int err)
++/* Cancel ongoing command request synchronously:
++ *
++ * - Set result and mark status to HCI_REQ_CANCELED
++ * - Wakeup command sync thread
++ */
++void hci_cmd_sync_cancel_sync(struct hci_dev *hdev, int err)
+ {
+ 	bt_dev_dbg(hdev, "err 0x%2.2x", err);
+ 
+@@ -676,10 +678,10 @@ void hci_cmd_sync_cancel(struct hci_dev *hdev, int err)
+ 		hdev->req_result = err;
+ 		hdev->req_status = HCI_REQ_CANCELED;
+ 
+-		queue_work(hdev->workqueue, &hdev->cmd_sync_cancel_work);
++		wake_up_interruptible(&hdev->req_wait_q);
+ 	}
+ }
+-EXPORT_SYMBOL(hci_cmd_sync_cancel);
++EXPORT_SYMBOL(hci_cmd_sync_cancel_sync);
+ 
+ /* Submit HCI command to be run in as cmd_sync_work:
+  *
+diff --git a/net/bluetooth/mgmt.c b/net/bluetooth/mgmt.c
+index b21b981f15a3..2ffda2ffdbda 100644
+--- a/net/bluetooth/mgmt.c
++++ b/net/bluetooth/mgmt.c
+@@ -1404,7 +1404,7 @@ static int set_powered(struct sock *sk, struct hci_dev *hdev, void *data,
+ 
+ 	/* Cancel potentially blocking sync operation before power off */
+ 	if (cp->val == 0x00) {
+-		__hci_cmd_sync_cancel(hdev, -EHOSTDOWN);
++		hci_cmd_sync_cancel_sync(hdev, -EHOSTDOWN);
+ 		err = hci_cmd_sync_queue(hdev, set_powered_sync, cmd,
+ 					 mgmt_set_powered_complete);
+ 	} else {
+-- 
+2.43.0
+
