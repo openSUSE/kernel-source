@@ -29,7 +29,7 @@ do
 		bsc="$(cve2bugzilla $cve)"
 		echo " $cve $bsc"
 	else
-		echo $arg not CVE nor sha >&2
+		echo $arg cannot be resolved to a CVE >&2
 	fi
 	shift
 done
