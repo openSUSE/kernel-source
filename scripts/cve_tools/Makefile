@@ -1,5 +1,6 @@
 # Expects VULNS_GIT environment variable with a clone of https://git.kernel.org/pub/scm/linux/security/vulns.git
 # Expects KSOURCE_GIT environment variable
+mk_dir := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 # URL of CVE
 CVE2BUG_URL=https://gitlab.suse.de/security/cve-database/-/raw/master/data/cve2bugzilla
@@ -7,7 +8,7 @@ CVE2BUG_URL=https://gitlab.suse.de/security/cve-database/-/raw/master/data/cve2b
 # cached data expiration in days
 EXPIRE=3
 
-ADD_REF=./add-missing-reference
+ADD_REF=$(mk_dir)/add-missing-reference
 
 # oldest stable 4.19 when kernel.org CNA started is from 2018
 FIRST_YEAR=2018
@@ -57,7 +58,7 @@ update_refs_history:
 	git checkout -f -B users/$$USER/$(BRANCH)/cve-refs origin/$(BRANCH) 2>/dev/null ; \
 	popd >/dev/null
 	for y in $$(seq $(FIRST_YEAR) $(YEAR)) ; do \
-		make BRANCH=$(BRANCH) YEAR=$$y update_refs ; \
+		make -f $(mk_dir)/Makefile BRANCH=$(BRANCH) YEAR=$$y update_refs ; \
 	done
 
 update_refs_$(branch)_$(YEAR): hash_file_$(branch).dat hash_cve_bug_$(YEAR).dat
