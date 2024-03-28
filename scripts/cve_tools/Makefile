@@ -2,6 +2,9 @@
 # Expects KSOURCE_GIT environment variable
 mk_dir := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
+# URL of upstream vulns
+VULNS_GIT_URL=https://git.kernel.org/pub/scm/linux/security/vulns.git
+
 # URL of CVE
 CVE2BUG_URL=https://gitlab.suse.de/security/cve-database/-/raw/master/data/cve2bugzilla
 
@@ -30,10 +33,18 @@ $(CACHESTAMP): check_cache
 cve2bugzilla: $(CACHESTAMP)
 	curl "$(CVE2BUG_URL)" >"$@"
 
-hash_cve_$(YEAR).dat: $(wildcard $(VULNS_GIT)/cve/published/$(YEAR)/*.sha1)
+hash_cve_$(YEAR).dat: $(wildcard $(VULNS_GIT)/cve/published/$(YEAR)/*.sha1) $(VULNS_GIT)/.git/refs/heads/master
 	for f in $^ ; do \
-		echo $$(head -n1 $$f) $$(basename $${f%.sha1}) ; \
+		[[ $$f == *.sha1 ]] && \
+			echo $$(head -n1 $$f) $$(basename $${f%.sha1}) ; \
 	done | sort -k1 >"$@"
+
+$(wildcard $(VULNS_GIT)/cve/published/$(YEAR)/*.sha1): $(VULNS_GIT)/.git/refs/heads/master
+
+$(VULNS_GIT)/.git/refs/heads/master: $(CACHESTAMP)
+	test -d $(VULNS_GIT) || git clone "$(VULNS_GIT_URL)" "$(VULNS_GIT)"
+	git --git-dir="$(VULNS_GIT)/.git" pull
+	touch "$@"
 
 # cve2bugzilla contains multiple bugs for single CVE, use the heuristics of
 # lowest numerical bug being the primary bug
