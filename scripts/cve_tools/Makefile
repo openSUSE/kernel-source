@@ -1,5 +1,9 @@
-# Expects VULNS_GIT environment variable with a clone of https://git.kernel.org/pub/scm/linux/security/vulns.git
-# Expects KSOURCE_GIT environment variable
+ifndef VULNS_GIT
+$(error Please set VULNS_GIT to a clone of https://git.kernel.org/pub/scm/linux/security/vulns.git)
+endif
+ifndef KSOURCE_GIT
+$(error Please set KSOURCE_GIT to a clone of kernel-source)
+endif
 mk_dir := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 # URL of upstream vulns
