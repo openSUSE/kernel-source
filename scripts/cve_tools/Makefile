@@ -53,7 +53,7 @@ cve_bug_$(YEAR).dat: cve2bugzilla
 	sort -n -k 2 | sort -k 1b,1 -s | uniq | \
 	awk '{ primary_bug=$$1 != cve; cve=$$1; print $$0, primary_bug; }' >"$@"
 
-hash_file_$(branch).dat:
+hash_file_$(branch).dat: $(KSOURCE_GIT)/.git/refs/remotes/origin/$(BRANCH)
 	git --git-dir="$(KSOURCE_GIT)/.git" --work-tree="$(KSOURCE_GIT)" \
 		grep -i "^git-commit[[:space:]]*:[[:space:]]*[0-9a-f]*[[:space:]]*$$" origin/$(BRANCH) -- "$(KSOURCE_GIT)/patches.suse" |\
 		awk -vFS=":" '{gsub(" ", "", $$4); print $$4, $$2}' | sort -k1 >"$@"
