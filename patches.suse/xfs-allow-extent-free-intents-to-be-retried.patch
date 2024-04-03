@@ -1,0 +1,153 @@
+From 0853b5de42b471a92f4ff128a8757b87427d2431 Mon Sep 17 00:00:00 2001
+From: Dave Chinner <dchinner@redhat.com>
+Date: Wed, 28 Jun 2023 11:04:33 -0700
+Subject: [PATCH] xfs: allow extent free intents to be retried
+Git-commit: 0853b5de42b471a92f4ff128a8757b87427d2431
+Patch-mainline: v6.5-rc1
+References: git-fixes
+
+Extent freeing neeeds to be able to avoid a busy extent deadlock
+when the transaction itself holds the only busy extents in the
+allocation group. This may occur if we have an EFI that contains
+multiple extents to be freed, and the freeing the second intent
+requires the space the first extent free released to expand the
+AGFL. If we block on the busy extent at this point, we deadlock.
+
+We hold a dirty transaction that contains a entire atomic extent
+free operations within it, so if we can abort the extent free
+operation and commit the progress that we've made, the busy extent
+can be resolved by a log force. Hence we can restart the aborted
+extent free with a new transaction and continue to make
+progress without risking deadlocks.
+
+To enable this, we need the EFI processing code to be able to handle
+an -EAGAIN error to tell it to commit the current transaction and
+retry again. This mechanism is already built into the defer ops
+processing (used bythe refcount btree modification intents), so
+there's relatively little handling we need to add to the EFI code to
+enable this.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Chandan Babu R <chandan.babu@oracle.com>
+Acked-by: Anthony Iliopoulos <ailiop@suse.com>
+
+---
+ fs/xfs/xfs_extfree_item.c | 72 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 69 insertions(+), 3 deletions(-)
+
+diff --git a/fs/xfs/xfs_extfree_item.c b/fs/xfs/xfs_extfree_item.c
+index 873653b825e4..cdd8ebb6e7cb 100644
+--- a/fs/xfs/xfs_extfree_item.c
++++ b/fs/xfs/xfs_extfree_item.c
+@@ -336,6 +336,34 @@ xfs_trans_get_efd(
+ 	return efdp;
+ }
+ 
++/*
++ * Fill the EFD with all extents from the EFI when we need to roll the
++ * transaction and continue with a new EFI.
++ *
++ * This simply copies all the extents in the EFI to the EFD rather than make
++ * assumptions about which extents in the EFI have already been processed. We
++ * currently keep the xefi list in the same order as the EFI extent list, but
++ * that may not always be the case. Copying everything avoids leaving a landmine
++ * were we fail to cancel all the extents in an EFI if the xefi list is
++ * processed in a different order to the extents in the EFI.
++ */
++static void
++xfs_efd_from_efi(
++	struct xfs_efd_log_item	*efdp)
++{
++	struct xfs_efi_log_item *efip = efdp->efd_efip;
++	uint                    i;
++
++	ASSERT(efip->efi_format.efi_nextents > 0);
++	ASSERT(efdp->efd_next_extent < efip->efi_format.efi_nextents);
++
++	for (i = 0; i < efip->efi_format.efi_nextents; i++) {
++	       efdp->efd_format.efd_extents[i] =
++		       efip->efi_format.efi_extents[i];
++	}
++	efdp->efd_next_extent = efip->efi_format.efi_nextents;
++}
++
+ /*
+  * Free an extent and log it to the EFD. Note that the transaction is marked
+  * dirty regardless of whether the extent free succeeds or fails to support the
+@@ -378,6 +406,17 @@ xfs_trans_free_extent(
+ 	tp->t_flags |= XFS_TRANS_DIRTY | XFS_TRANS_HAS_INTENT_DONE;
+ 	set_bit(XFS_LI_DIRTY, &efdp->efd_item.li_flags);
+ 
++	/*
++	 * If we need a new transaction to make progress, the caller will log a
++	 * new EFI with the current contents. It will also log an EFD to cancel
++	 * the existing EFI, and so we need to copy all the unprocessed extents
++	 * in this EFI to the EFD so this works correctly.
++	 */
++	if (error == -EAGAIN) {
++		xfs_efd_from_efi(efdp);
++		return error;
++	}
++
+ 	next_extent = efdp->efd_next_extent;
+ 	ASSERT(next_extent < efdp->efd_format.efd_nextents);
+ 	extp = &(efdp->efd_format.efd_extents[next_extent]);
+@@ -495,6 +534,13 @@ xfs_extent_free_finish_item(
+ 
+ 	error = xfs_trans_free_extent(tp, EFD_ITEM(done), xefi);
+ 
++	/*
++	 * Don't free the XEFI if we need a new transaction to complete
++	 * processing of it.
++	 */
++	if (error == -EAGAIN)
++		return error;
++
+ 	xfs_extent_free_put_group(xefi);
+ 	kmem_cache_free(xfs_extfree_item_cache, xefi);
+ 	return error;
+@@ -620,6 +666,7 @@ xfs_efi_item_recover(
+ 	struct xfs_trans		*tp;
+ 	int				i;
+ 	int				error = 0;
++	bool				requeue_only = false;
+ 
+ 	/*
+ 	 * First check the validity of the extents described by the
+@@ -653,9 +700,28 @@ xfs_efi_item_recover(
+ 		fake.xefi_startblock = extp->ext_start;
+ 		fake.xefi_blockcount = extp->ext_len;
+ 
+-		xfs_extent_free_get_group(mp, &fake);
+-		error = xfs_trans_free_extent(tp, efdp, &fake);
+-		xfs_extent_free_put_group(&fake);
++		if (!requeue_only) {
++			xfs_extent_free_get_group(mp, &fake);
++			error = xfs_trans_free_extent(tp, efdp, &fake);
++			xfs_extent_free_put_group(&fake);
++		}
++
++		/*
++		 * If we can't free the extent without potentially deadlocking,
++		 * requeue the rest of the extents to a new so that they get
++		 * run again later with a new transaction context.
++		 */
++		if (error == -EAGAIN || requeue_only) {
++			error = xfs_free_extent_later(tp, fake.xefi_startblock,
++					fake.xefi_blockcount,
++					&XFS_RMAP_OINFO_ANY_OWNER,
++					fake.xefi_agresv);
++			if (!error) {
++				requeue_only = true;
++				continue;
++			}
++		};
++
+ 		if (error == -EFSCORRUPTED)
+ 			XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp,
+ 					extp, sizeof(*extp));
+-- 
+2.44.0
+
