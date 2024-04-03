@@ -38,7 +38,7 @@ cve2bugzilla: $(CACHESTAMP)
 	curl "$(CVE2BUG_URL)" >"$@"
 
 hash_cve_$(YEAR).dat: $(wildcard $(VULNS_GIT)/cve/published/$(YEAR)/*.sha1) $(VULNS_GIT)/.git/refs/heads/master
-	for f in $^ ; do \
+	@for f in $^ ; do \
 		[[ $$f == *.sha1 ]] && \
 			echo $$(head -n1 $$f) $$(basename $${f%.sha1}) ; \
 	done | sort -k1 >"$@"
@@ -53,17 +53,17 @@ $(VULNS_GIT)/.git/refs/heads/master: $(CACHESTAMP)
 # cve2bugzilla contains multiple bugs for single CVE, use the heuristics of
 # lowest numerical bug being the primary bug
 cve_bug_$(YEAR).dat: cve2bugzilla
-	sed -n '/^CVE-$(YEAR)-.*BUGZILLA:/{s/^\(CVE-[^,]*\),.*BUGZILLA:\([0-9]*\).*$$/\1 \2/;p}' <"$<" | \
+	@sed -n '/^CVE-$(YEAR)-.*BUGZILLA:/{s/^\(CVE-[^,]*\),.*BUGZILLA:\([0-9]*\).*$$/\1 \2/;p}' <"$<" | \
 	sort -n -k 2 | sort -k 1b,1 -s | uniq | \
 	awk '{ primary_bug=$$1 != cve; cve=$$1; print $$0, primary_bug; }' >"$@"
 
 hash_file_$(branch).dat: $(KSOURCE_GIT)/.git/refs/remotes/origin/$(BRANCH)
-	git --git-dir="$(KSOURCE_GIT)/.git" --work-tree="$(KSOURCE_GIT)" \
+	@git --git-dir="$(KSOURCE_GIT)/.git" --work-tree="$(KSOURCE_GIT)" \
 		grep -i "^git-commit[[:space:]]*:[[:space:]]*[0-9a-f]*[[:space:]]*$$" origin/$(BRANCH) -- "$(KSOURCE_GIT)/patches.suse" |\
 		awk -vFS=":" '{gsub(" ", "", $$4); print $$4, $$2}' | sort -k1 >"$@"
 
 hash_cve_bug_$(YEAR).dat: hash_cve_$(YEAR).dat cve_bug_$(YEAR).dat
-	sort -k 2b,2 hash_cve_$(YEAR).dat | \
+	@sort -k 2b,2 hash_cve_$(YEAR).dat | \
 	join -1 2 -2 1 -o 1.1,1.2,2.2,2.3 - cve_bug_$(YEAR).dat | \
 	sort -k 1 >"$@"
 
@@ -74,11 +74,12 @@ update_refs_history:
 	git checkout -f -B users/$$USER/$(BRANCH)/cve-refs origin/$(BRANCH) 2>/dev/null ; \
 	popd >/dev/null
 	for y in $$(seq $(FIRST_YEAR) $(YEAR)) ; do \
-		make -f $(mk_dir)/Makefile BRANCH=$(BRANCH) YEAR=$$y update_refs ; \
+		make --no-print-directory -f $(mk_dir)/Makefile BRANCH=$(BRANCH) YEAR=$$y update_refs ; \
 	done
 
 update_refs_$(branch)_$(YEAR): hash_file_$(branch).dat hash_cve_bug_$(YEAR).dat
-	set -e ; \
+	@echo -e "\n[ $(YEAR) ] processing..."
+	@set -e ; \
 	join hash_file_$(branch).dat hash_cve_bug_$(YEAR).dat | \
 	while read sha file cve bug primary; do \
 		[ "$$primary" -eq 0 ] && continue ; \
