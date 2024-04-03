@@ -1,0 +1,232 @@
+From: John Fastabend <john.fastabend@gmail.com>
+Date: Tue, 29 Aug 2023 22:35:17 -0700
+Subject: bpf, sockmap: Fix preempt_rt splat when using raw_spin_lock_t
+Patch-mainline: v6.6-rc1
+Git-commit: 35d2b7ffffc1d9b3dc6c761010aa3338da49165b
+References: git-fixes
+
+Sockmap and sockhash maps are a collection of psocks that are
+objects representing a socket plus a set of metadata needed
+to manage the BPF programs associated with the socket. These
+maps use the stab->lock to protect from concurrent operations
+on the maps, e.g. trying to insert to objects into the array
+at the same time in the same slot. Additionally, a sockhash map
+has a bucket lock to protect iteration and insert/delete into
+the hash entry.
+
+Each psock has a psock->link which is a linked list of all the
+maps that a psock is attached to. This allows a psock (socket)
+to be included in multiple sockmap and sockhash maps. This
+linked list is protected the psock->link_lock.
+
+They _must_ be nested correctly to avoid deadlock:
+
+  lock(stab->lock)
+    : do BPF map operations and psock insert/delete
+    lock(psock->link_lock)
+       : add map to psock linked list of maps
+    unlock(psock->link_lock)
+  unlock(stab->lock)
+
+For non PREEMPT_RT kernels both raw_spin_lock_t and spin_lock_t
+are guaranteed to not sleep. But, with PREEMPT_RT kernels the
+spin_lock_t variants may sleep. In the current code we have
+many patterns like this:
+
+   rcu_critical_section:
+      raw_spin_lock(stab->lock)
+         spin_lock(psock->link_lock) <- may sleep ouch
+         spin_unlock(psock->link_lock)
+      raw_spin_unlock(stab->lock)
+   rcu_critical_section
+
+Nesting spin_lock() inside a raw_spin_lock() violates locking
+rules for PREEMPT_RT kernels. And additionally we do alloc(GFP_ATOMICS)
+inside the stab->lock, but those might sleep on PREEMPT_RT kernels.
+The result is splats like this:
+
+./test_progs -t sockmap_basic
+[   33.344330] bpf_testmod: loading out-of-tree module taints kernel.
+[   33.441933]
+[   33.442089] =============================
+[   33.442421] [ BUG: Invalid wait context ]
+[   33.442763] 6.5.0-rc5-01731-gec0ded2e0282 #4958 Tainted: G           O
+[   33.443320] -----------------------------
+[   33.443624] test_progs/2073 is trying to lock:
+[   33.443960] ffff888102a1c290 (&psock->link_lock){....}-{3:3}, at: sock_map_update_common+0x2c2/0x3d0
+[   33.444636] other info that might help us debug this:
+[   33.444991] context-{5:5}
+[   33.445183] 3 locks held by test_progs/2073:
+[   33.445498]  #0: ffff88811a208d30 (sk_lock-AF_INET){+.+.}-{0:0}, at: sock_map_update_elem_sys+0xff/0x330
+[   33.446159]  #1: ffffffff842539e0 (rcu_read_lock){....}-{1:3}, at: sock_map_update_elem_sys+0xf5/0x330
+[   33.446809]  #2: ffff88810d687240 (&stab->lock){+...}-{2:2}, at: sock_map_update_common+0x177/0x3d0
+[   33.447445] stack backtrace:
+[   33.447655] CPU: 10 PID
+
+To fix observe we can't readily remove the allocations (for that
+we would need to use/create something similar to bpf_map_alloc). So
+convert raw_spin_lock_t to spin_lock_t. We note that sock_map_update
+that would trigger the allocate and potential sleep is only allowed
+through sys_bpf ops and via sock_ops which precludes hw interrupts
+and low level atomic sections in RT preempt kernel. On non RT
+preempt kernel there are no changes here and spin locks sections
+and alloc(GFP_ATOMIC) are still not sleepable.
+
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20230830053517.166611-1-john.fastabend@gmail.com
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ net/core/sock_map.c |   36 ++++++++++++++++++------------------
+ 1 file changed, 18 insertions(+), 18 deletions(-)
+
+--- a/net/core/sock_map.c
++++ b/net/core/sock_map.c
+@@ -18,7 +18,7 @@ struct bpf_stab {
+ 	struct bpf_map map;
+ 	struct sock **sks;
+ 	struct sk_psock_progs progs;
+-	raw_spinlock_t lock;
++	spinlock_t lock;
+ };
+ 
+ #define SOCK_CREATE_FLAG_MASK				\
+@@ -46,7 +46,7 @@ static struct bpf_map *sock_map_alloc(un
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	bpf_map_init_from_attr(&stab->map, attr);
+-	raw_spin_lock_init(&stab->lock);
++	spin_lock_init(&stab->lock);
+ 
+ 	stab->sks = bpf_map_area_alloc((u64) stab->map.max_entries *
+ 				       sizeof(struct sock *),
+@@ -413,7 +413,7 @@ static int __sock_map_delete(struct bpf_
+ 	struct sock *sk;
+ 	int err = 0;
+ 
+-	raw_spin_lock_bh(&stab->lock);
++	spin_lock_bh(&stab->lock);
+ 	sk = *psk;
+ 	if (!sk_test || sk_test == sk)
+ 		sk = xchg(psk, NULL);
+@@ -423,7 +423,7 @@ static int __sock_map_delete(struct bpf_
+ 	else
+ 		err = -EINVAL;
+ 
+-	raw_spin_unlock_bh(&stab->lock);
++	spin_unlock_bh(&stab->lock);
+ 	return err;
+ }
+ 
+@@ -489,7 +489,7 @@ static int sock_map_update_common(struct
+ 	psock = sk_psock(sk);
+ 	WARN_ON_ONCE(!psock);
+ 
+-	raw_spin_lock_bh(&stab->lock);
++	spin_lock_bh(&stab->lock);
+ 	osk = stab->sks[idx];
+ 	if (osk && flags == BPF_NOEXIST) {
+ 		ret = -EEXIST;
+@@ -503,10 +503,10 @@ static int sock_map_update_common(struct
+ 	stab->sks[idx] = sk;
+ 	if (osk)
+ 		sock_map_unref(osk, &stab->sks[idx]);
+-	raw_spin_unlock_bh(&stab->lock);
++	spin_unlock_bh(&stab->lock);
+ 	return 0;
+ out_unlock:
+-	raw_spin_unlock_bh(&stab->lock);
++	spin_unlock_bh(&stab->lock);
+ 	if (psock)
+ 		sk_psock_put(sk, psock);
+ out_free:
+@@ -819,7 +819,7 @@ struct bpf_shtab_elem {
+ 
+ struct bpf_shtab_bucket {
+ 	struct hlist_head head;
+-	raw_spinlock_t lock;
++	spinlock_t lock;
+ };
+ 
+ struct bpf_shtab {
+@@ -894,7 +894,7 @@ static void sock_hash_delete_from_link(s
+ 	 * is okay since it's going away only after RCU grace period.
+ 	 * However, we need to check whether it's still present.
+ 	 */
+-	raw_spin_lock_bh(&bucket->lock);
++	spin_lock_bh(&bucket->lock);
+ 	elem_probe = sock_hash_lookup_elem_raw(&bucket->head, elem->hash,
+ 					       elem->key, map->key_size);
+ 	if (elem_probe && elem_probe == elem) {
+@@ -902,7 +902,7 @@ static void sock_hash_delete_from_link(s
+ 		sock_map_unref(elem->sk, elem);
+ 		sock_hash_free_elem(htab, elem);
+ 	}
+-	raw_spin_unlock_bh(&bucket->lock);
++	spin_unlock_bh(&bucket->lock);
+ }
+ 
+ static int sock_hash_delete_elem(struct bpf_map *map, void *key)
+@@ -916,7 +916,7 @@ static int sock_hash_delete_elem(struct
+ 	hash = sock_hash_bucket_hash(key, key_size);
+ 	bucket = sock_hash_select_bucket(htab, hash);
+ 
+-	raw_spin_lock_bh(&bucket->lock);
++	spin_lock_bh(&bucket->lock);
+ 	elem = sock_hash_lookup_elem_raw(&bucket->head, hash, key, key_size);
+ 	if (elem) {
+ 		hlist_del_rcu(&elem->node);
+@@ -924,7 +924,7 @@ static int sock_hash_delete_elem(struct
+ 		sock_hash_free_elem(htab, elem);
+ 		ret = 0;
+ 	}
+-	raw_spin_unlock_bh(&bucket->lock);
++	spin_unlock_bh(&bucket->lock);
+ 	return ret;
+ }
+ 
+@@ -984,7 +984,7 @@ static int sock_hash_update_common(struc
+ 	hash = sock_hash_bucket_hash(key, key_size);
+ 	bucket = sock_hash_select_bucket(htab, hash);
+ 
+-	raw_spin_lock_bh(&bucket->lock);
++	spin_lock_bh(&bucket->lock);
+ 	elem = sock_hash_lookup_elem_raw(&bucket->head, hash, key, key_size);
+ 	if (elem && flags == BPF_NOEXIST) {
+ 		ret = -EEXIST;
+@@ -1010,10 +1010,10 @@ static int sock_hash_update_common(struc
+ 		sock_map_unref(elem->sk, elem);
+ 		sock_hash_free_elem(htab, elem);
+ 	}
+-	raw_spin_unlock_bh(&bucket->lock);
++	spin_unlock_bh(&bucket->lock);
+ 	return 0;
+ out_unlock:
+-	raw_spin_unlock_bh(&bucket->lock);
++	spin_unlock_bh(&bucket->lock);
+ 	sk_psock_put(sk, psock);
+ out_free:
+ 	sk_psock_free_link(link);
+@@ -1101,7 +1101,7 @@ static struct bpf_map *sock_hash_alloc(u
+ 
+ 	for (i = 0; i < htab->buckets_num; i++) {
+ 		INIT_HLIST_HEAD(&htab->buckets[i].head);
+-		raw_spin_lock_init(&htab->buckets[i].lock);
++		spin_lock_init(&htab->buckets[i].lock);
+ 	}
+ 
+ 	return &htab->map;
+@@ -1133,11 +1133,11 @@ static void sock_hash_free(struct bpf_ma
+ 		 * exists, psock exists and holds a ref to socket. That
+ 		 * lets us to grab a socket ref too.
+ 		 */
+-		raw_spin_lock_bh(&bucket->lock);
++		spin_lock_bh(&bucket->lock);
+ 		hlist_for_each_entry(elem, &bucket->head, node)
+ 			sock_hold(elem->sk);
+ 		hlist_move_list(&bucket->head, &unlink_list);
+-		raw_spin_unlock_bh(&bucket->lock);
++		spin_unlock_bh(&bucket->lock);
+ 
+ 		/* Process removed entries out of atomic context to
+ 		 * block for socket lock before deleting the psock's
