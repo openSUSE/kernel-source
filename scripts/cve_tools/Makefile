@@ -47,7 +47,7 @@ $(wildcard $(VULNS_GIT)/cve/published/$(YEAR)/*.sha1): $(VULNS_GIT)/.git/refs/he
 
 $(VULNS_GIT)/.git/refs/heads/master: $(CACHESTAMP)
 	test -d $(VULNS_GIT) || git clone "$(VULNS_GIT_URL)" "$(VULNS_GIT)"
-	git --git-dir="$(VULNS_GIT)/.git" pull
+	git -C "$(VULNS_GIT)" pull
 	touch "$@"
 
 # cve2bugzilla contains multiple bugs for single CVE, use the heuristics of
@@ -58,7 +58,7 @@ cve_bug_$(YEAR).dat: cve2bugzilla
 	awk '{ primary_bug=$$1 != cve; cve=$$1; print $$0, primary_bug; }' >"$@"
 
 hash_file_$(branch).dat: $(KSOURCE_GIT)/.git/refs/remotes/origin/$(BRANCH)
-	@git --git-dir="$(KSOURCE_GIT)/.git" --work-tree="$(KSOURCE_GIT)" \
+	@git -C "$(KSOURCE_GIT)" \
 		grep -i "^git-commit[[:space:]]*:[[:space:]]*[0-9a-f]*[[:space:]]*$$" origin/$(BRANCH) -- "$(KSOURCE_GIT)/patches.suse" |\
 		awk -vFS=":" '{gsub(" ", "", $$4); print $$4, $$2}' | sort -k1 >"$@"
 
