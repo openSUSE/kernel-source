@@ -64,13 +64,13 @@ done >"$series" < <($(dirname $0)/guards $EXTRA_SYMBOLS <series.conf)
 
 # Parse all the changes to KERNELRELEASE out of all patches and
 # convert them to shell code that can be evaluated. Evaluate it.
-eval "$(
+eval "$( {
     <"$series" xargs awk '
     /^--- |^\+\+\+ / \
 	{ M = match($2, /^[^\/]+\/Makefile( \t|$)/) }
     M && /^+(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)/ \
 	{ print }
-    ' \
+    ' || echo exit 1 ; } \
     | sed -e 's,^+,,' -e 's, *= *\(.*\),="\1",'
 )"
 
