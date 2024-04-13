@@ -1,0 +1,201 @@
+From: Tejun Heo <tj@kernel.org>
+Date: Tue, 9 Jan 2024 11:48:04 -1000
+Subject: [PATCH] kernfs: RCU protect kernfs_nodes and avoid kernfs_idr_lock in
+ kernfs_find_and_get_node_by_id()
+References: bsc#1218260
+Patch-mainline: 6.6.27
+Git-commit: 4207b556e62f0a8915afc5da4c5d5ad915a253a5
+
+[ Upstream commit 4207b556e62f0a8915afc5da4c5d5ad915a253a5 ]
+
+The BPF helper bpf_cgroup_from_id() calls kernfs_find_and_get_node_by_id()
+which acquires kernfs_idr_lock, which is an non-raw non-IRQ-safe lock. This
+can lead to deadlocks as bpf_cgroup_from_id() can be called from any BPF
+programs including e.g. the ones that attach to functions which are holding
+the scheduler rq lock.
+
+Consider the following BPF program:
+
+  SEC("fentry/__set_cpus_allowed_ptr_locked")
+  int BPF_PROG(__set_cpus_allowed_ptr_locked, struct task_struct *p,
+	       struct affinity_context *affn_ctx, struct rq *rq, struct rq_flags *rf)
+  {
+	  struct cgroup *cgrp = bpf_cgroup_from_id(p->cgroups->dfl_cgrp->kn->id);
+
+	  if (cgrp) {
+		  bpf_printk("%d[%s] in %s", p->pid, p->comm, cgrp->kn->name);
+		  bpf_cgroup_release(cgrp);
+	  }
+	  return 0;
+  }
+
+__set_cpus_allowed_ptr_locked() is called with rq lock held and the above
+BPF program calls bpf_cgroup_from_id() within leading to the following
+lockdep warning:
+
+  =====================================================
+  WARNING: HARDIRQ-safe -> HARDIRQ-unsafe lock order detected
+  6.7.0-rc3-work-00053-g07124366a1d7-dirty #147 Not tainted
+  -----------------------------------------------------
+  repro/1620 [HC0[0]:SC0[0]:HE0:SE1] is trying to acquire:
+  ffffffff833b3688 (kernfs_idr_lock){+.+.}-{2:2}, at: kernfs_find_and_get_node_by_id+0x1e/0x70
+
+		and this task is already holding:
+  ffff888237ced698 (&rq->__lock){-.-.}-{2:2}, at: task_rq_lock+0x4e/0xf0
+  which would create a new lock dependency:
+   (&rq->__lock){-.-.}-{2:2} -> (kernfs_idr_lock){+.+.}-{2:2}
+  ...
+   Possible interrupt unsafe locking scenario:
+
+	 CPU0                    CPU1
+	 ----                    ----
+    lock(kernfs_idr_lock);
+				 local_irq_disable();
+				 lock(&rq->__lock);
+				 lock(kernfs_idr_lock);
+    <Interrupt>
+      lock(&rq->__lock);
+
+		 *** DEADLOCK ***
+  ...
+  Call Trace:
+   dump_stack_lvl+0x55/0x70
+   dump_stack+0x10/0x20
+   __lock_acquire+0x781/0x2a40
+   lock_acquire+0xbf/0x1f0
+   _raw_spin_lock+0x2f/0x40
+   kernfs_find_and_get_node_by_id+0x1e/0x70
+   cgroup_get_from_id+0x21/0x240
+   bpf_cgroup_from_id+0xe/0x20
+   bpf_prog_98652316e9337a5a___set_cpus_allowed_ptr_locked+0x96/0x11a
+   bpf_trampoline_6442545632+0x4f/0x1000
+   __set_cpus_allowed_ptr_locked+0x5/0x5a0
+   sched_setaffinity+0x1b3/0x290
+   __x64_sys_sched_setaffinity+0x4f/0x60
+   do_syscall_64+0x40/0xe0
+   entry_SYSCALL_64_after_hwframe+0x46/0x4e
+
+Let's fix it by protecting kernfs_node and kernfs_root with RCU and making
+kernfs_find_and_get_node_by_id() acquire rcu_read_lock() instead of
+kernfs_idr_lock.
+
+This adds an rcu_head to kernfs_node making it larger by 16 bytes on 64bit.
+Combined with the preceding rearrange patch, the net increase is 8 bytes.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: Andrea Righi <andrea.righi@canonical.com>
+Cc: Geert Uytterhoeven <geert@linux-m68k.org>
+Link: https://lore.kernel.org/r/20240109214828.252092-4-tj@kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/kernfs/dir.c             | 31 ++++++++++++++++++++-----------
+ fs/kernfs/kernfs-internal.h |  2 ++
+ include/linux/kernfs.h      |  2 ++
+ 3 files changed, 24 insertions(+), 11 deletions(-)
+
+diff --git a/fs/kernfs/dir.c b/fs/kernfs/dir.c
+index 62d39ecf0a46..2405aeb39b9a 100644
+--- a/fs/kernfs/dir.c
++++ b/fs/kernfs/dir.c
+@@ -529,6 +529,20 @@ void kernfs_get(struct kernfs_node *kn)
+ }
+ EXPORT_SYMBOL_GPL(kernfs_get);
+ 
++static void kernfs_free_rcu(struct rcu_head *rcu)
++{
++	struct kernfs_node *kn = container_of(rcu, struct kernfs_node, rcu);
++
++	kfree_const(kn->name);
++
++	if (kn->iattr) {
++		simple_xattrs_free(&kn->iattr->xattrs, NULL);
++		kmem_cache_free(kernfs_iattrs_cache, kn->iattr);
++	}
++
++	kmem_cache_free(kernfs_node_cache, kn);
++}
++
+ /**
+  * kernfs_put - put a reference count on a kernfs_node
+  * @kn: the target kernfs_node
+@@ -557,16 +571,11 @@ void kernfs_put(struct kernfs_node *kn)
+ 	if (kernfs_type(kn) == KERNFS_LINK)
+ 		kernfs_put(kn->symlink.target_kn);
+ 
+-	kfree_const(kn->name);
+-
+-	if (kn->iattr) {
+-		simple_xattrs_free(&kn->iattr->xattrs, NULL);
+-		kmem_cache_free(kernfs_iattrs_cache, kn->iattr);
+-	}
+ 	spin_lock(&kernfs_idr_lock);
+ 	idr_remove(&root->ino_idr, (u32)kernfs_ino(kn));
+ 	spin_unlock(&kernfs_idr_lock);
+-	kmem_cache_free(kernfs_node_cache, kn);
++
++	call_rcu(&kn->rcu, kernfs_free_rcu);
+ 
+ 	kn = parent;
+ 	if (kn) {
+@@ -575,7 +584,7 @@ void kernfs_put(struct kernfs_node *kn)
+ 	} else {
+ 		/* just released the root kn, free @root too */
+ 		idr_destroy(&root->ino_idr);
+-		kfree(root);
++		kfree_rcu(root, rcu);
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(kernfs_put);
+@@ -715,7 +724,7 @@ struct kernfs_node *kernfs_find_and_get_node_by_id(struct kernfs_root *root,
+ 	ino_t ino = kernfs_id_ino(id);
+ 	u32 gen = kernfs_id_gen(id);
+ 
+-	spin_lock(&kernfs_idr_lock);
++	rcu_read_lock();
+ 
+ 	kn = idr_find(&root->ino_idr, (u32)ino);
+ 	if (!kn)
+@@ -739,10 +748,10 @@ struct kernfs_node *kernfs_find_and_get_node_by_id(struct kernfs_root *root,
+ 	if (unlikely(!__kernfs_active(kn) || !atomic_inc_not_zero(&kn->count)))
+ 		goto err_unlock;
+ 
+-	spin_unlock(&kernfs_idr_lock);
++	rcu_read_unlock();
+ 	return kn;
+ err_unlock:
+-	spin_unlock(&kernfs_idr_lock);
++	rcu_read_unlock();
+ 	return NULL;
+ }
+ 
+diff --git a/fs/kernfs/kernfs-internal.h b/fs/kernfs/kernfs-internal.h
+index a9b854cdfdb5..210dac7e9ee2 100644
+--- a/fs/kernfs/kernfs-internal.h
++++ b/fs/kernfs/kernfs-internal.h
+@@ -49,6 +49,8 @@ struct kernfs_root {
+ 	struct rw_semaphore	kernfs_rwsem;
+ 	struct rw_semaphore	kernfs_iattr_rwsem;
+ 	struct rw_semaphore	kernfs_supers_rwsem;
++
++	struct rcu_head		rcu;
+ };
+ 
+ /* +1 to avoid triggering overflow warning when negating it */
+diff --git a/include/linux/kernfs.h b/include/linux/kernfs.h
+index 2a36f3218b51..5a952d00ea15 100644
+--- a/include/linux/kernfs.h
++++ b/include/linux/kernfs.h
+@@ -223,6 +223,8 @@ struct kernfs_node {
+ 	unsigned short		flags;
+ 	umode_t			mode;
+ 	struct kernfs_iattrs	*iattr;
++
++	struct rcu_head		rcu;
+ };
+ 
+ /*
+-- 
+2.44.0
+
