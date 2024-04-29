@@ -1,0 +1,245 @@
+From: David Hildenbrand <david@redhat.com>
+Date: Thu, 14 Mar 2024 17:12:59 +0100
+Subject: [PATCH] mm/madvise: make MADV_POPULATE_(READ|WRITE) handle
+ VM_FAULT_RETRY properly
+References: bsc#1012628
+Patch-mainline: 6.8.8
+Git-commit: 631426ba1d45a8672b177ee85ad4cabe760dd131
+
+commit 631426ba1d45a8672b177ee85ad4cabe760dd131 upstream.
+
+Darrick reports that in some cases where pread() would fail with -EIO and
+mmap()+access would generate a SIGBUS signal, MADV_POPULATE_READ /
+MADV_POPULATE_WRITE will keep retrying forever and not fail with -EFAULT.
+
+While the madvise() call can be interrupted by a signal, this is not the
+desired behavior.  MADV_POPULATE_READ / MADV_POPULATE_WRITE should behave
+like page faults in that case: fail and not retry forever.
+
+A reproducer can be found at [1].
+
+The reason is that __get_user_pages(), as called by
+faultin_vma_page_range(), will not handle VM_FAULT_RETRY in a proper way:
+it will simply return 0 when VM_FAULT_RETRY happened, making
+madvise_populate()->faultin_vma_page_range() retry again and again, never
+setting FOLL_TRIED->FAULT_FLAG_TRIED for __get_user_pages().
+
+__get_user_pages_locked() does what we want, but duplicating that logic in
+faultin_vma_page_range() feels wrong.
+
+So let's use __get_user_pages_locked() instead, that will detect
+VM_FAULT_RETRY and set FOLL_TRIED when retrying, making the fault handler
+return VM_FAULT_SIGBUS (VM_FAULT_ERROR) at some point, propagating -EFAULT
+from faultin_page() to __get_user_pages(), all the way to
+madvise_populate().
+
+But, there is an issue: __get_user_pages_locked() will end up re-taking
+the MM lock and then __get_user_pages() will do another VMA lookup.  In
+the meantime, the VMA layout could have changed and we'd fail with
+different error codes than we'd want to.
+
+As __get_user_pages() will currently do a new VMA lookup either way, let
+it do the VMA handling in a different way, controlled by a new
+FOLL_MADV_POPULATE flag, effectively moving these checks from
+madvise_populate() + faultin_page_range() in there.
+
+With this change, Darricks reproducer properly fails with -EFAULT, as
+documented for MADV_POPULATE_READ / MADV_POPULATE_WRITE.
+
+[1] https://lore.kernel.org/all/20240313171936.GN1927156@frogsfrogsfrogs/
+
+Link: https://lkml.kernel.org/r/20240314161300.382526-1-david@redhat.com
+Link: https://lkml.kernel.org/r/20240314161300.382526-2-david@redhat.com
+Fixes: 4ca9b3859dac ("mm/madvise: introduce MADV_POPULATE_(READ|WRITE) to prefault page tables")
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Reported-by: Darrick J. Wong <djwong@kernel.org>
+Closes: https://lore.kernel.org/all/20240311223815.GW1927156@frogsfrogsfrogs/
+Cc: Darrick J. Wong <djwong@kernel.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ mm/gup.c      | 54 ++++++++++++++++++++++++++++++---------------------
+ mm/internal.h | 10 ++++++----
+ mm/madvise.c  | 17 ++--------------
+ 3 files changed, 40 insertions(+), 41 deletions(-)
+
+diff --git a/mm/gup.c b/mm/gup.c
+index df83182e..f6d55635 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -1206,6 +1206,22 @@ static long __get_user_pages(struct mm_struct *mm,
+ 
+ 		/* first iteration or cross vma bound */
+ 		if (!vma || start >= vma->vm_end) {
++			/*
++			 * MADV_POPULATE_(READ|WRITE) wants to handle VMA
++			 * lookups+error reporting differently.
++			 */
++			if (gup_flags & FOLL_MADV_POPULATE) {
++				vma = vma_lookup(mm, start);
++				if (!vma) {
++					ret = -ENOMEM;
++					goto out;
++				}
++				if (check_vma_flags(vma, gup_flags)) {
++					ret = -EINVAL;
++					goto out;
++				}
++				goto retry;
++			}
+ 			vma = gup_vma_lookup(mm, start);
+ 			if (!vma && in_gate_area(mm, start)) {
+ 				ret = get_gate_page(mm, start & PAGE_MASK,
+@@ -1683,35 +1699,35 @@ long populate_vma_page_range(struct vm_area_struct *vma,
+ }
+ 
+ /*
+- * faultin_vma_page_range() - populate (prefault) page tables inside the
+- *			      given VMA range readable/writable
++ * faultin_page_range() - populate (prefault) page tables inside the
++ *			  given range readable/writable
+  *
+  * This takes care of mlocking the pages, too, if VM_LOCKED is set.
+  *
+- * @vma: target vma
++ * @mm: the mm to populate page tables in
+  * @start: start address
+  * @end: end address
+  * @write: whether to prefault readable or writable
+  * @locked: whether the mmap_lock is still held
+  *
+- * Returns either number of processed pages in the vma, or a negative error
+- * code on error (see __get_user_pages()).
++ * Returns either number of processed pages in the MM, or a negative error
++ * code on error (see __get_user_pages()). Note that this function reports
++ * errors related to VMAs, such as incompatible mappings, as expected by
++ * MADV_POPULATE_(READ|WRITE).
+  *
+- * vma->vm_mm->mmap_lock must be held. The range must be page-aligned and
+- * covered by the VMA. If it's released, *@locked will be set to 0.
++ * The range must be page-aligned.
++ *
++ * mm->mmap_lock must be held. If it's released, *@locked will be set to 0.
+  */
+-long faultin_vma_page_range(struct vm_area_struct *vma, unsigned long start,
+-			    unsigned long end, bool write, int *locked)
++long faultin_page_range(struct mm_struct *mm, unsigned long start,
++			unsigned long end, bool write, int *locked)
+ {
+-	struct mm_struct *mm = vma->vm_mm;
+ 	unsigned long nr_pages = (end - start) / PAGE_SIZE;
+ 	int gup_flags;
+ 	long ret;
+ 
+ 	VM_BUG_ON(!PAGE_ALIGNED(start));
+ 	VM_BUG_ON(!PAGE_ALIGNED(end));
+-	VM_BUG_ON_VMA(start < vma->vm_start, vma);
+-	VM_BUG_ON_VMA(end > vma->vm_end, vma);
+ 	mmap_assert_locked(mm);
+ 
+ 	/*
+@@ -1723,19 +1739,13 @@ long faultin_vma_page_range(struct vm_area_struct *vma, unsigned long start,
+ 	 *		  a poisoned page.
+ 	 * !FOLL_FORCE: Require proper access permissions.
+ 	 */
+-	gup_flags = FOLL_TOUCH | FOLL_HWPOISON | FOLL_UNLOCKABLE;
++	gup_flags = FOLL_TOUCH | FOLL_HWPOISON | FOLL_UNLOCKABLE |
++		    FOLL_MADV_POPULATE;
+ 	if (write)
+ 		gup_flags |= FOLL_WRITE;
+ 
+-	/*
+-	 * We want to report -EINVAL instead of -EFAULT for any permission
+-	 * problems or incompatible mappings.
+-	 */
+-	if (check_vma_flags(vma, gup_flags))
+-		return -EINVAL;
+-
+-	ret = __get_user_pages(mm, start, nr_pages, gup_flags,
+-			       NULL, locked);
++	ret = __get_user_pages_locked(mm, start, nr_pages, NULL, locked,
++				      gup_flags);
+ 	lru_add_drain();
+ 	return ret;
+ }
+diff --git a/mm/internal.h b/mm/internal.h
+index f309a010..c3f3e0f1 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -590,9 +590,8 @@ struct anon_vma *folio_anon_vma(struct folio *folio);
+ void unmap_mapping_folio(struct folio *folio);
+ extern long populate_vma_page_range(struct vm_area_struct *vma,
+ 		unsigned long start, unsigned long end, int *locked);
+-extern long faultin_vma_page_range(struct vm_area_struct *vma,
+-				   unsigned long start, unsigned long end,
+-				   bool write, int *locked);
++extern long faultin_page_range(struct mm_struct *mm, unsigned long start,
++		unsigned long end, bool write, int *locked);
+ extern bool mlock_future_ok(struct mm_struct *mm, unsigned long flags,
+ 			       unsigned long bytes);
+ 
+@@ -1031,10 +1030,13 @@ enum {
+ 	FOLL_FAST_ONLY = 1 << 20,
+ 	/* allow unlocking the mmap lock */
+ 	FOLL_UNLOCKABLE = 1 << 21,
++	/* VMA lookup+checks compatible with MADV_POPULATE_(READ|WRITE) */
++	FOLL_MADV_POPULATE = 1 << 22,
+ };
+ 
+ #define INTERNAL_GUP_FLAGS (FOLL_TOUCH | FOLL_TRIED | FOLL_REMOTE | FOLL_PIN | \
+-			    FOLL_FAST_ONLY | FOLL_UNLOCKABLE)
++			    FOLL_FAST_ONLY | FOLL_UNLOCKABLE | \
++			    FOLL_MADV_POPULATE)
+ 
+ /*
+  * Indicates for which pages that are write-protected in the page table,
+diff --git a/mm/madvise.c b/mm/madvise.c
+index cfa5e728..f2c818af 100644
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@ -908,27 +908,14 @@ static long madvise_populate(struct vm_area_struct *vma,
+ {
+ 	const bool write = behavior == MADV_POPULATE_WRITE;
+ 	struct mm_struct *mm = vma->vm_mm;
+-	unsigned long tmp_end;
+ 	int locked = 1;
+ 	long pages;
+ 
+ 	*prev = vma;
+ 
+ 	while (start < end) {
+-		/*
+-		 * We might have temporarily dropped the lock. For example,
+-		 * our VMA might have been split.
+-		 */
+-		if (!vma || start >= vma->vm_end) {
+-			vma = vma_lookup(mm, start);
+-			if (!vma)
+-				return -ENOMEM;
+-		}
+-
+-		tmp_end = min_t(unsigned long, end, vma->vm_end);
+ 		/* Populate (prefault) page tables readable/writable. */
+-		pages = faultin_vma_page_range(vma, start, tmp_end, write,
+-					       &locked);
++		pages = faultin_page_range(mm, start, end, write, &locked);
+ 		if (!locked) {
+ 			mmap_read_lock(mm);
+ 			locked = 1;
+@@ -949,7 +936,7 @@ static long madvise_populate(struct vm_area_struct *vma,
+ 				pr_warn_once("%s: unhandled return value: %ld\n",
+ 					     __func__, pages);
+ 				fallthrough;
+-			case -ENOMEM:
++			case -ENOMEM: /* No VMA or out of memory. */
+ 				return -ENOMEM;
+ 			}
+ 		}
+-- 
+2.44.0
+
