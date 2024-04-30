@@ -4,6 +4,7 @@ endif
 ifndef KSOURCE_GIT
 $(error Please set KSOURCE_GIT to a clone of kernel-source)
 endif
+git_packed_refs:=$(shell git -C "$(KSOURCE_GIT)" rev-parse --path-format=absolute --git-path "packed-refs")
 mk_dir := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 # URL of upstream vulns
@@ -57,7 +58,7 @@ cve_bug_$(YEAR).dat: cve2bugzilla
 	sort -n -k 2 | sort -k 1b,1 -s | uniq | \
 	awk '{ primary_bug=$$1 != cve; cve=$$1; print $$0, primary_bug; }' >"$@"
 
-hash_file_$(branch).dat: $(KSOURCE_GIT)/.git/refs/remotes/origin/$(BRANCH)
+hash_file_$(branch).dat: $(git_packed_refs)
 	@git -C "$(KSOURCE_GIT)" \
 		grep -i "^git-commit[[:space:]]*:[[:space:]]*[0-9a-f]*[[:space:]]*$$" origin/$(BRANCH) -- "$(KSOURCE_GIT)/patches.suse" |\
 		awk -vFS=":" '{gsub(" ", "", $$4); print $$4, $$2}' | sort -k1 >"$@"

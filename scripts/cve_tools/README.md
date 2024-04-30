@@ -26,4 +26,3 @@ make -f path/to/scripts/cve_tools/Makefile BRANCH=cve/linux-5.14-LTSS update_ref
 * integrate with branches.conf so that list of "root" branches is extracted
 * integrate with branches.conf so that non-root branches are handled too (easy
   if we allow multiplicities of RPM changelog messages), provide BASE_BRANCH as stop-gap
-* fix bug when make won't see the branch ref file because of git-pack-refs(1)
