@@ -1,0 +1,601 @@
+From 056186d7b5505646b36a1354cbcb0b2cb27e08bc Mon Sep 17 00:00:00 2001
+From: Pablo Neira Ayuso <pablo@netfilter.org>
+Date: Wed, 9 Aug 2023 14:31:54 +0200
+Subject: [PATCH 2/2] netfilter: nf_tables: GC transaction API to avoid race
+ with control plane
+References: bsc#1215420 CVE-2023-4244
+Patch-mainline: v6.5-rc6
+Git-commit: 5f68718b34a531a556f2f50300ead2862278da26
+
+The set types rhashtable and rbtree use a GC worker to reclaim memory.
+From system work queue, in periodic intervals, a scan of the table is
+done.
+
+The major caveat here is that the nft transaction mutex is not held.
+This causes a race between control plane and GC when they attempt to
+delete the same element.
+
+We cannot grab the netlink mutex from the work queue, because the
+control plane has to wait for the GC work queue in case the set is to be
+removed, so we get following deadlock:
+
+   cpu 1                                cpu2
+     GC work                            transaction comes in , lock nft mutex
+       `acquire nft mutex // BLOCKS
+                                        transaction asks to remove the set
+                                        set destruction calls cancel_work_sync()
+
+cancel_work_sync will now block forever, because it is waiting for the
+mutex the caller already owns.
+
+This patch adds a new API that deals with garbage collection in two
+steps:
+
+1) Lockless GC of expired elements sets on the NFT_SET_ELEM_DEAD_BIT
+   so they are not visible via lookup. Annotate current GC sequence in
+   the GC transaction. Enqueue GC transaction work as soon as it is
+   full. If ruleset is updated, then GC transaction is aborted and
+   retried later.
+
+2) GC work grabs the mutex. If GC sequence has changed then this GC
+   transaction lost race with control plane, abort it as it contains
+   stale references to objects and let GC try again later. If the
+   ruleset is intact, then this GC transaction deactivates and removes
+   the elements and it uses call_rcu() to destroy elements.
+
+Note that no elements are removed from GC lockless path, the _DEAD bit
+is set and pointers are collected. GC catchall does not remove the
+elements anymore too. There is a new set->dead flag that is set on to
+abort the GC transaction to deal with set->ops->destroy() path which
+removes the remaining elements in the set from commit_release, where no
+mutex is held.
+
+To deal with GC when mutex is held, which allows safe deactivate and
+removal, add sync GC API which releases the set element object via
+call_rcu(). This is used by rbtree and pipapo backends which also
+perform garbage collection from control plane path.
+
+Since element removal from sets can happen from control plane and
+element garbage collection/timeout, it is necessary to keep the set
+structure alive until all elements have been deactivated and destroyed.
+
+We cannot do a cancel_work_sync or flush_work in nft_set_destroy because
+its called with the transaction mutex held, but the aforementioned async
+work queue might be blocked on the very mutex that nft_set_destroy()
+callchain is sitting on.
+
+This gives us the choice of ABBA deadlock or UaF.
+
+To avoid both, add set->refs refcount_t member. The GC API can then
+increment the set refcount and release it once the elements have been
+free'd.
+
+Set backends are adapted to use the GC transaction API in a follow up
+patch entitled:
+
+  ("netfilter: nf_tables: use gc transaction API in set backends")
+
+This is joint work with Florian Westphal.
+
+Fixes: cfed7e1b1f8e ("netfilter: nf_tables: add set garbage collection helpers")
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Signed-off-by: Denis Kirjanov <denis.kirjanov@suse.com>
+---
+ include/net/netfilter/nf_tables.h |  60 +++++++++-
+ include/net/netns/nftables.h      |   1 +
+ net/netfilter/nf_tables_api.c     | 244 ++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 294 insertions(+), 11 deletions(-)
+
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index 01bf498db74a6..264e597ba1024 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -377,6 +377,7 @@ void nft_unregister_set(struct nft_set_type *type);
+  *
+  *	@list: table set list node
+  *	@bindings: list of set bindings
++ *	@@refs: internal refcounting for async set destruction
+  *	@table: table this set belongs to
+  *	@net: netnamespace this set belongs to
+  * 	@name: name of the set
+@@ -403,6 +404,7 @@ void nft_unregister_set(struct nft_set_type *type);
+ struct nft_set {
+ 	struct list_head		list;
+ 	struct list_head		bindings;
++	refcount_t                      refs;
+ 	struct nft_table		*table;
+ 	possible_net_t			net;
+ 	char				*name;
+@@ -421,7 +423,8 @@ struct nft_set {
+ 	unsigned char			*udata;
+ 	/* runtime data below here */
+ 	const struct nft_set_ops	*ops ____cacheline_aligned;
+-	u16				flags:14,
++	u16                             flags:13,
++					dead:1,
+ 					genmask:2;
+ 	u8				klen;
+ 	u8				dlen;
+@@ -1320,6 +1323,32 @@ static inline void nft_set_elem_clear_busy(struct nft_set_ext *ext)
+ 	clear_bit(NFT_SET_ELEM_BUSY_BIT, word);
+ }
+ 
++#define NFT_SET_ELEM_DEAD_MASK (1 << 3)
++
++#if defined(__LITTLE_ENDIAN_BITFIELD)
++#define NFT_SET_ELEM_DEAD_BIT  3
++#elif defined(__BIG_ENDIAN_BITFIELD)
++#define NFT_SET_ELEM_DEAD_BIT  (BITS_PER_LONG - BITS_PER_BYTE + 3)
++#else
++#error
++#endif
++
++static inline void nft_set_elem_dead(struct nft_set_ext *ext)
++{
++	unsigned long *word = (unsigned long *)ext;
++
++	BUILD_BUG_ON(offsetof(struct nft_set_ext, genmask) != 0);
++	set_bit(NFT_SET_ELEM_DEAD_BIT, word);
++}
++
++static inline int nft_set_elem_is_dead(const struct nft_set_ext *ext)
++{
++	unsigned long *word = (unsigned long *)ext;
++
++	BUILD_BUG_ON(offsetof(struct nft_set_ext, genmask) != 0);
++	return test_bit(NFT_SET_ELEM_DEAD_BIT, word);
++}
++
+ /**
+  *	struct nft_trans - nf_tables object update in transaction
+  *
+@@ -1416,6 +1445,35 @@ struct nft_trans_flowtable {
+ #define nft_trans_flowtable(trans)	\
+ 	(((struct nft_trans_flowtable *)trans->data)->flowtable)
+ 
++#define NFT_TRANS_GC_BATCHCOUNT        256
++
++struct nft_trans_gc {
++	struct list_head        list;
++	struct net              *net;
++	struct nft_set          *set;
++	u32                     seq;
++	u8                      count;
++	void                    *priv[NFT_TRANS_GC_BATCHCOUNT];
++	struct rcu_head         rcu;
++};
++
++struct nft_trans_gc *nft_trans_gc_alloc(struct nft_set *set,
++                                       unsigned int gc_seq, gfp_t gfp);
++void nft_trans_gc_destroy(struct nft_trans_gc *trans);
++
++struct nft_trans_gc *nft_trans_gc_queue_async(struct nft_trans_gc *gc,
++                                             unsigned int gc_seq, gfp_t gfp);
++void nft_trans_gc_queue_async_done(struct nft_trans_gc *gc);
++
++struct nft_trans_gc *nft_trans_gc_queue_sync(struct nft_trans_gc *gc, gfp_t gfp);
++void nft_trans_gc_queue_sync_done(struct nft_trans_gc *trans);
++
++void nft_trans_gc_elem_add(struct nft_trans_gc *gc, void *priv);
++
++void nft_setelem_data_deactivate(const struct net *net,
++                                const struct nft_set *set,
++                                struct nft_set_elem *elem);
++
+ int __init nft_chain_filter_init(void);
+ void nft_chain_filter_fini(void);
+ 
+diff --git a/include/net/netns/nftables.h b/include/net/netns/nftables.h
+index a1a8d45adb42a..6f0b59f029c53 100644
+--- a/include/net/netns/nftables.h
++++ b/include/net/netns/nftables.h
+@@ -10,6 +10,7 @@ struct netns_nftables {
+ 	struct list_head	module_list;
+ 	struct mutex		commit_mutex;
+ 	unsigned int		base_seq;
++	unsigned int            gc_seq;
+ 	u8			gencursor;
+ 	u8			validate_state;
+ };
+diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
+index 7b448d5bff26f..1501d60791505 100644
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -28,7 +28,9 @@ static LIST_HEAD(nf_tables_expressions);
+ static LIST_HEAD(nf_tables_objects);
+ static LIST_HEAD(nf_tables_flowtables);
+ static LIST_HEAD(nf_tables_destroy_list);
++static LIST_HEAD(nf_tables_gc_list);
+ static DEFINE_SPINLOCK(nf_tables_destroy_list_lock);
++static DEFINE_SPINLOCK(nf_tables_gc_list_lock);
+ static u64 table_handle;
+ 
+ enum {
+@@ -83,6 +85,9 @@ static void nft_validate_state_update(struct net *net, u8 new_validate_state)
+ static void nf_tables_trans_destroy_work(struct work_struct *w);
+ static DECLARE_WORK(trans_destroy_work, nf_tables_trans_destroy_work);
+ 
++static void nft_trans_gc_work(struct work_struct *work);
++static DECLARE_WORK(trans_gc_work, nft_trans_gc_work);
++
+ static void nft_ctx_init(struct nft_ctx *ctx,
+ 			 struct net *net,
+ 			 const struct sk_buff *skb,
+@@ -662,7 +667,7 @@ static int nf_tables_dump_tables(struct sk_buff *skb,
+ 	int family = nfmsg->nfgen_family;
+ 
+ 	rcu_read_lock();
+-	cb->seq = net->nft.base_seq;
++	cb->seq = READ_ONCE(net->nft.base_seq);
+ 
+ 	list_for_each_entry_rcu(table, &net->nft.tables, list) {
+ 		if (family != NFPROTO_UNSPEC && family != table->family)
+@@ -1389,7 +1394,7 @@ static int nf_tables_dump_chains(struct sk_buff *skb,
+ 	int family = nfmsg->nfgen_family;
+ 
+ 	rcu_read_lock();
+-	cb->seq = net->nft.base_seq;
++	cb->seq = READ_ONCE(net->nft.base_seq);	
+ 
+ 	list_for_each_entry_rcu(table, &net->nft.tables, list) {
+ 		if (family != NFPROTO_UNSPEC && family != table->family)
+@@ -2510,7 +2515,7 @@ static int nf_tables_dump_rules(struct sk_buff *skb,
+ 	int family = nfmsg->nfgen_family;
+ 
+ 	rcu_read_lock();
+-	cb->seq = net->nft.base_seq;
++	cb->seq = READ_ONCE(net->nft.base_seq);
+ 
+ 	list_for_each_entry_rcu(table, &net->nft.tables, list) {
+ 		if (family != NFPROTO_UNSPEC && family != table->family)
+@@ -3447,7 +3452,7 @@ static int nf_tables_dump_sets(struct sk_buff *skb, struct netlink_callback *cb)
+ 		return skb->len;
+ 
+ 	rcu_read_lock();
+-	cb->seq = net->nft.base_seq;
++	cb->seq = READ_ONCE(net->nft.base_seq);
+ 
+ 	list_for_each_entry_rcu(table, &net->nft.tables, list) {
+ 		if (ctx->family != NFPROTO_UNSPEC &&
+@@ -3769,6 +3774,7 @@ static int nf_tables_newset(struct net *net, struct sock *nlsk,
+ 	}
+ 
+ 	INIT_LIST_HEAD(&set->bindings);
++	refcount_set(&set->refs, 1);
+ 	set->table = table;
+ 	write_pnet(&set->net, net);
+ 	set->ops   = ops;
+@@ -3809,6 +3815,14 @@ static int nf_tables_newset(struct net *net, struct sock *nlsk,
+ 	return err;
+ }
+ 
++static void nft_set_put(struct nft_set *set)
++{
++	if (refcount_dec_and_test(&set->refs)) {
++		kfree(set->name);
++		kvfree(set);
++	}
++}
++
+ static void nft_set_destroy(struct nft_set *set)
+ {
+ 	if (WARN_ON(set->use > 0))
+@@ -3816,8 +3830,7 @@ static void nft_set_destroy(struct nft_set *set)
+ 
+ 	set->ops->destroy(set);
+ 	module_put(to_set_type(set->ops)->owner);
+-	kfree(set->name);
+-	kvfree(set);
++	nft_set_put(set);
+ }
+ 
+ static int nf_tables_delset(struct net *net, struct sock *nlsk,
+@@ -4167,6 +4180,7 @@ static int nf_tables_dump_set(struct sk_buff *skb, struct netlink_callback *cb)
+ 	int event;
+ 
+ 	rcu_read_lock();
++	cb->seq = READ_ONCE(net->nft.base_seq);
+ 	list_for_each_entry_rcu(table, &net->nft.tables, list) {
+ 		if (dump_ctx->ctx.family != NFPROTO_UNSPEC &&
+ 		    dump_ctx->ctx.family != table->family)
+@@ -4839,7 +4853,7 @@ static void nft_set_elem_activate(const struct net *net,
+ 		(*nft_set_ext_obj(ext))->use++;
+ }
+ 
+-static void nft_set_elem_deactivate(const struct net *net,
++void nft_set_elem_deactivate(const struct net *net,
+ 				    const struct nft_set *set,
+ 				    struct nft_set_elem *elem)
+ {
+@@ -5369,7 +5383,7 @@ static int nf_tables_dump_obj(struct sk_buff *skb, struct netlink_callback *cb)
+ 		reset = true;
+ 
+ 	rcu_read_lock();
+-	cb->seq = net->nft.base_seq;
++	cb->seq = READ_ONCE(net->nft.base_seq);
+ 
+ 	list_for_each_entry_rcu(table, &net->nft.tables, list) {
+ 		if (family != NFPROTO_UNSPEC && family != table->family)
+@@ -6043,7 +6057,7 @@ static int nf_tables_dump_flowtable(struct sk_buff *skb,
+ 	const struct nft_table *table;
+ 
+ 	rcu_read_lock();
+-	cb->seq = net->nft.base_seq;
++	cb->seq = READ_ONCE(net->nft.base_seq);
+ 
+ 	list_for_each_entry_rcu(table, &net->nft.tables, list) {
+ 		if (family != NFPROTO_UNSPEC && family != table->family)
+@@ -6713,6 +6727,196 @@ static void nft_chain_del(struct nft_chain *chain)
+ 	list_del_rcu(&chain->list);
+ }
+ 
++void nft_setelem_data_deactivate(const struct net *net,
++                                 const struct nft_set *set,
++                                 struct nft_set_elem *elem_priv)
++{
++	const struct nft_set_ext *ext = nft_set_elem_ext(set, elem_priv);
++
++        if (nft_set_ext_exists(ext, NFT_SET_EXT_DATA))
++                nft_data_release(nft_set_ext_data(ext), set->dtype);
++        if (nft_set_ext_exists(ext, NFT_SET_EXT_OBJREF))
++		(*nft_set_ext_obj(ext))->use--;
++}
++
++static void nft_setelem_remove(const struct net *net,
++                              const struct nft_set *set,
++                              const struct nft_set_elem *elem)
++{
++	set->ops->remove(net, set, elem);
++}
++
++static void nft_trans_gc_setelem_remove(struct nft_ctx *ctx,
++                                       struct nft_trans_gc *trans)
++{
++	void **priv = trans->priv;
++
++	unsigned int i;
++
++	for (i = 0; i < trans->count; i++) {
++		struct nft_set_elem elem = {
++			.priv = priv[i],
++		};
++
++		nft_setelem_data_deactivate(ctx->net, trans->set, &elem);
++		nft_setelem_remove(ctx->net, trans->set, &elem);
++	}
++}
++
++void nft_trans_gc_destroy(struct nft_trans_gc *trans)
++{
++	nft_set_put(trans->set);
++	put_net(trans->net);
++	kfree(trans);
++}
++
++static void nft_trans_gc_trans_free(struct rcu_head *rcu)
++{
++	struct nft_set_elem elem = {};
++	struct nft_trans_gc *trans;
++	struct nft_ctx ctx = {};
++	unsigned int i;
++
++	trans = container_of(rcu, struct nft_trans_gc, rcu);
++	ctx.net = read_pnet(&trans->set->net);
++
++	for (i = 0; i < trans->count; i++) {
++		elem.priv = trans->priv[i];
++			atomic_dec(&trans->set->nelems);
++
++		nf_tables_set_elem_destroy(&ctx, trans->set, elem.priv);
++	}
++
++	nft_trans_gc_destroy(trans);
++}
++
++static bool nft_trans_gc_work_done(struct nft_trans_gc *trans)
++{
++	struct nft_ctx ctx = {};
++
++	mutex_lock(&trans->net->nft.commit_mutex);
++
++	/* Check for race with transaction, otherwise this batch refers to
++	  * stale objects that might not be there anymore. Skip transaction if
++          * set has been destroyed from control plane transaction in case gc
++          * worker loses race.
++	  */
++	if (READ_ONCE(trans->net->nft.gc_seq) != trans->seq || trans->set->dead) {
++               mutex_unlock(&trans->net->nft.commit_mutex);
++               return false;
++       }
++
++       ctx.net = trans->net;
++       ctx.table = trans->set->table;
++
++       nft_trans_gc_setelem_remove(&ctx, trans);
++       mutex_unlock(&trans->net->nft.commit_mutex);
++
++       return true;
++}
++
++static void nft_trans_gc_work(struct work_struct *work)
++{
++	struct nft_trans_gc *trans, *next;
++	LIST_HEAD(trans_gc_list);
++
++	spin_lock(&nf_tables_destroy_list_lock);
++	list_splice_init(&nf_tables_gc_list, &trans_gc_list);
++	spin_unlock(&nf_tables_destroy_list_lock);
++
++	list_for_each_entry_safe(trans, next, &trans_gc_list, list) {
++		list_del(&trans->list);
++		if (!nft_trans_gc_work_done(trans)) {
++			nft_trans_gc_destroy(trans);
++			continue;
++		}
++		call_rcu(&trans->rcu, nft_trans_gc_trans_free);
++	}
++}
++
++struct nft_trans_gc *nft_trans_gc_alloc(struct nft_set *set,
++                                       unsigned int gc_seq, gfp_t gfp)
++{
++	struct net *net = read_pnet(&set->net);
++	struct nft_trans_gc *trans;
++
++	trans = kzalloc(sizeof(*trans), gfp);
++	if (!trans)
++		return NULL;
++
++	refcount_inc(&set->refs);
++	trans->set = set;
++	trans->net = get_net(net);
++	trans->seq = gc_seq;
++
++	return trans;
++}
++
++void nft_trans_gc_elem_add(struct nft_trans_gc *trans, void *priv)
++{
++	trans->priv[trans->count++] = priv;
++}
++
++static void nft_trans_gc_queue_work(struct nft_trans_gc *trans)
++{
++	spin_lock(&nf_tables_gc_list_lock);
++	list_add_tail(&trans->list, &nf_tables_gc_list);
++	spin_unlock(&nf_tables_gc_list_lock);
++
++	schedule_work(&trans_gc_work);
++}
++
++static int nft_trans_gc_space(struct nft_trans_gc *trans)
++{
++	return NFT_TRANS_GC_BATCHCOUNT - trans->count;
++}
++
++struct nft_trans_gc *nft_trans_gc_queue_async(struct nft_trans_gc *gc,
++                                             unsigned int gc_seq, gfp_t gfp)
++{
++	if (nft_trans_gc_space(gc))
++		return gc;
++
++	nft_trans_gc_queue_work(gc);
++
++	return nft_trans_gc_alloc(gc->set, gc_seq, gfp);
++}
++
++void nft_trans_gc_queue_async_done(struct nft_trans_gc *trans)
++{
++	if (trans->count == 0) {
++		nft_trans_gc_destroy(trans);
++		return;
++	}
++
++	nft_trans_gc_queue_work(trans);
++}
++
++struct nft_trans_gc *nft_trans_gc_queue_sync(struct nft_trans_gc *gc, gfp_t gfp)
++{
++	if (WARN_ON_ONCE(!lockdep_commit_lock_is_held(gc->net)))
++		return NULL;
++
++	if (nft_trans_gc_space(gc))
++		return gc;
++
++	call_rcu(&gc->rcu, nft_trans_gc_trans_free);
++
++	return nft_trans_gc_alloc(gc->set, 0, gfp);
++}
++
++void nft_trans_gc_queue_sync_done(struct nft_trans_gc *trans)
++{
++	WARN_ON_ONCE(!lockdep_commit_lock_is_held(trans->net));
++
++	if (trans->count == 0) {
++		nft_trans_gc_destroy(trans);
++		return;
++	}
++
++	call_rcu(&trans->rcu, nft_trans_gc_trans_free);
++}
++
+ static void nf_tables_module_autoload_cleanup(struct net *net)
+ {
+ 	struct nft_module_request *req, *next;
+@@ -6761,6 +6965,7 @@ static void nf_tables_commit_release(struct net *net)
+ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
+ {
+ 	struct nft_trans *trans, *next;
++	unsigned int base_seq, gc_seq;
+ 	struct nft_trans_elem *te;
+ 	struct nft_chain *chain;
+ 	struct nft_table *table;
+@@ -6805,7 +7010,15 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
+ 	 * Bump generation counter, invalidate any dump in progress.
+ 	 * Cannot fail after this point.
+ 	 */
+-	while (++net->nft.base_seq == 0);
++	base_seq = READ_ONCE(net->nft.base_seq);
++	while (++base_seq == 0)
++                ;
++ 
++	WRITE_ONCE(net->nft.base_seq, base_seq);
++
++	/* Bump gc counter, it becomes odd, this is the busy mark. */
++	gc_seq = READ_ONCE(net->nft.gc_seq);
++	WRITE_ONCE(net->nft.gc_seq, ++gc_seq);
+ 
+ 	/* step 3. Start new generation, rules_gen_X now in use. */
+ 	net->nft.gencursor = nft_gencursor_next(net);
+@@ -6878,6 +7091,7 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
+ 			nft_trans_destroy(trans);
+ 			break;
+ 		case NFT_MSG_DELSET:
++			nft_trans_set(trans)->dead = 1;
+ 			list_del_rcu(&nft_trans_set(trans)->list);
+ 			nf_tables_set_notify(&trans->ctx, nft_trans_set(trans),
+ 					     NFT_MSG_DELSET, GFP_KERNEL);
+@@ -6931,6 +7145,8 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
+ 	}
+ 
+ 	nf_tables_gen_notify(net, skb, NFT_MSG_NEWGEN);
++
++	WRITE_ONCE(net->nft.gc_seq, ++gc_seq);
+ 	nf_tables_commit_release(net);
+ 
+ 	return 0;
+@@ -7706,6 +7922,7 @@ static int __net_init nf_tables_init_net(struct net *net)
+ 	INIT_LIST_HEAD(&net->nft.module_list);
+ 	mutex_init(&net->nft.commit_mutex);
+ 	net->nft.base_seq = 1;
++	net->nft.gc_seq = 0;
+ 	net->nft.validate_state = NFT_VALIDATE_SKIP;
+ 
+ 	return 0;
+@@ -7722,9 +7939,15 @@ static void __net_exit nf_tables_exit_net(struct net *net)
+ 	WARN_ON_ONCE(!list_empty(&net->nft.module_list));
+ }
+ 
++static void nf_tables_exit_batch(struct list_head *net_exit_list)
++{
++	flush_work(&trans_gc_work);
++}
++
+ static struct pernet_operations nf_tables_net_ops = {
+ 	.init	= nf_tables_init_net,
+ 	.exit	= nf_tables_exit_net,
++	.exit_batch     = nf_tables_exit_batch,
+ };
+ 
+ static int __init nf_tables_module_init(void)
+@@ -7779,6 +8002,7 @@ static void __exit nf_tables_module_exit(void)
+ 	nft_chain_filter_fini();
+ 	nft_chain_route_fini();
+ 	unregister_pernet_subsys(&nf_tables_net_ops);
++	cancel_work_sync(&trans_gc_work);
+ 	cancel_work_sync(&trans_destroy_work);
+ 	rcu_barrier();
+ 	rhltable_destroy(&nft_objname_ht);
+-- 
+2.16.4
+
