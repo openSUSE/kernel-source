@@ -38,7 +38,7 @@ check_cache:
 $(CACHESTAMP): check_cache
 
 cve2bugzilla: $(CACHESTAMP)
-	curl "$(CVE2BUG_URL)" >"$@"
+	curl "$(CVE2BUG_URL)" -o "$@"
 
 hash_cve_$(YEAR).dat: $(wildcard $(VULNS_GIT)/cve/published/$(YEAR)/*.sha1) $(VULNS_GIT)/.git/refs/heads/master
 	@for f in $^ ; do \
@@ -76,7 +76,7 @@ update_refs_history:
 	set -e; pushd "$(KSOURCE_GIT)" >/dev/null ; \
 	git checkout -f -B users/$$USER/$(BRANCH)/cve-refs origin/$(BRANCH) 2>/dev/null ; \
 	popd >/dev/null
-	for y in $$(seq $(FIRST_YEAR) $(YEAR)) ; do \
+	set -e ; for y in $$(seq $(FIRST_YEAR) $(YEAR)) ; do \
 		make --no-print-directory -f $(mk_dir)/Makefile BRANCH=$(BRANCH) YEAR=$$y update_refs ; \
 	done
 
