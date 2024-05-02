@@ -13,8 +13,7 @@ make -f path/to/scripts/cve_tools/Makefile BRANCH=cve/linux-5.14-LTSS update_ref
 
 * that will create a new git branch in `KSOURCE_GIT` and add commits with new
   references
-* it is recommended that `KSOURCE_GIT` is not same directory where
-  scripts/cve_tools/Makefile resides (e.g. use git worktrees)
+* it will create git worktree in the `WD`
   * conversely `KSOURCE_GIT` cannot be a worktree (implementation issue)
 * it will store processed data files in the `WD`
 * the data can be reused with different BRANCH=

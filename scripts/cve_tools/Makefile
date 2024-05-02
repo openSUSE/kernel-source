@@ -18,6 +18,8 @@ EXPIRE=3
 
 ADD_REF=$(mk_dir)/add-missing-reference
 
+WORKTREE=$(CURDIR)/git-worktree
+
 # oldest stable 4.19 when kernel.org CNA started is from 2018
 FIRST_YEAR=2018
 # Outer parameter, can be overriden
@@ -27,6 +29,8 @@ ifndef BRANCH
 $(error Please specify branch to annotate in BRANCH parameter)
 endif
 branch=$(subst /,_,$(BRANCH))
+branch_user=users/$$USER/$(BRANCH)/cve-refs
+branch_base=origin/$(BRANCH)
 
 .PHONY: check_cache update_refs_history update_refs_$(branch)_$(YEAR)
 
@@ -73,12 +77,15 @@ hash_cve_bug_$(YEAR).dat: hash_cve_$(YEAR).dat cve_bug_$(YEAR).dat
 update_refs: update_refs_$(branch)_$(YEAR)
 
 update_refs_history:
-	set -e; pushd "$(KSOURCE_GIT)" >/dev/null ; \
-	git checkout -f -B users/$$USER/$(BRANCH)/cve-refs origin/$(BRANCH) 2>/dev/null ; \
-	popd >/dev/null
+	@git -C "$(KSOURCE_GIT)" worktree add -f -B $(branch_user) "$(WORKTREE)" $(branch_base) 2>/dev/null || \
+		git -C "$(WORKTREE)" checkout -f -B $(branch_user) $(branch_base) 2>/dev/null || \
+		( echo "git worktree failed, run 'make clean' in old workdir? $$(git -C "$(KSOURCE_GIT)" worktree list | grep git-worktree)" && false )
+	@cd "$(WORKTREE)" >/dev/null ; \
+	scripts/install-git-hooks >/dev/null || echo "WARNING: git-hooks not installed"
 	set -e ; for y in $$(seq $(FIRST_YEAR) $(YEAR)) ; do \
 		make --no-print-directory -f $(mk_dir)/Makefile BRANCH=$(BRANCH) YEAR=$$y update_refs ; \
 	done
+	@echo -e "\nResults in $(branch_user)"
 
 update_refs_$(branch)_$(YEAR): hash_file_$(branch).dat hash_cve_bug_$(YEAR).dat
 	@echo -e "\n[ $(YEAR) ] processing..."
@@ -87,14 +94,14 @@ update_refs_$(branch)_$(YEAR): hash_file_$(branch).dat hash_cve_bug_$(YEAR).dat
 	while read sha file cve bug primary; do \
 		[ "$$primary" -eq 0 ] && continue ; \
 		[ -z "$$bug" ] && echo "Unknown bug for $$cve" && continue ; \
-		$(ADD_REF) -r $$cve -r "bsc#"$$bug "$(KSOURCE_GIT)/$$file" ; \
+		$(ADD_REF) -r $$cve -r "bsc#"$$bug "$(WORKTREE)/$$file" ; \
 	done
-	set -e ; pushd "$(KSOURCE_GIT)" >/dev/null ; \
-	scripts/log2 --no-edit || true ; \
-	popd >/dev/null
+	cd "$(WORKTREE)" >/dev/null ; \
+	scripts/log2 --no-edit || true
 
 clean:
 	rm -f *_$(branch).dat
 	for y in $$(seq $(FIRST_YEAR) $(YEAR)) ; do \
 		rm -f *_$$y.dat ; \
 	done
+	-git -C "$(KSOURCE_GIT)" worktree remove -f "$(WORKTREE)"
