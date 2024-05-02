@@ -23,7 +23,9 @@ FIRST_YEAR=2018
 # Outer parameter, can be overriden
 YEAR=$(shell date +%Y)
 # Outer parameter, can be overriden
-BRANCH=cve/linux-5.14
+ifndef BRANCH
+$(error Please specify branch to annotate in BRANCH parameter)
+endif
 branch=$(subst /,_,$(BRANCH))
 
 .PHONY: check_cache update_refs_history update_refs_$(branch)_$(YEAR)
