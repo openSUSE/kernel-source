@@ -29,7 +29,8 @@ ifndef BRANCH
 $(error Please specify branch to annotate in BRANCH parameter)
 endif
 branch=$(subst /,_,$(BRANCH))
-branch_user=users/$$USER/$(BRANCH)/cve-refs
+user=$(if $(KBUILD_USER),$(KBUILD_USER),$(USER))
+branch_user=users/$(user)/$(BRANCH)/cve-refs
 branch_base=origin/$(BRANCH)
 
 .PHONY: check_cache update_refs_history update_refs_$(branch)_$(YEAR)
