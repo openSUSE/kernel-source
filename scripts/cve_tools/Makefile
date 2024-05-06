@@ -4,6 +4,7 @@ endif
 ifndef KSOURCE_GIT
 $(error Please set KSOURCE_GIT to a clone of kernel-source)
 endif
+SHELL=/bin/bash
 git_packed_refs:=$(shell git -C "$(KSOURCE_GIT)" rev-parse --path-format=absolute --git-path "packed-refs")
 mk_dir := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
