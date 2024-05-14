@@ -247,6 +247,7 @@ remotes = (
     Head(RepoURL("jarkko/linux-tpmdd"), "next"),
     Head(RepoURL("jarkko/linux-tpmdd"), "master"),
     Head(RepoURL("rafael/linux-pm.git")),
+    Head(RepoURL("rafael/linux-pm.git"), "linux-next"),
     Head(RepoURL("git://git.linux-nfs.org/~bfields/linux.git"), "nfsd-next"),
     Head(RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"), "for-next"),
     Head(RepoURL("vkoul/soundwire.git"),"fixes"),
