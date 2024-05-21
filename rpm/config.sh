@@ -13,6 +13,7 @@ MULTIBUILD="Yes"
 LIVEPATCH=livepatch
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:Factory
+OBS_PROJECT_ARM=openSUSE:Factory:ARM
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
 BUGZILLA_PRODUCT="openSUSE Tumbleweed"
