@@ -6,6 +6,7 @@ import re
 import sys
 
 import suse_git.exc as exc
+import util
 
 class ValidationError(Exception):
     pass
@@ -154,3 +155,28 @@ class Patch(object):
             self.head = new_head
         else:
             raise KeyError("Tag \"%s\" not found" % (tag,))
+
+class References(util.OrderedSet):
+    """
+    Class represents set of patch references, it is case insensitive and
+    order-preserving to avoid unnecessary changes touching patches.
+    """
+    def __init__(self, iterable=None):
+        self.__ci_set = set()
+        super().__init__(iterable)
+
+    def add(self, key):
+        if key not in self:
+            self.__ci_set.add(References._canon(key))
+            super().add(key)
+
+    def __contains__(self, key):
+        return References._canon(key) in self.__ci_set
+
+    def __eq__(self, other):
+        if isinstance(other, References):
+            return self.__ci_set == other.__ci_set
+        return super().__eq__(other)
+
+    def _canon(val):
+        return val.lower()
