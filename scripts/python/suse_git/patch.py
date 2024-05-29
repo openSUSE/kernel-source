@@ -107,6 +107,15 @@ class Patch(object):
                 for line in self.head
                 if line.lower().startswith(start)]
 
+    def get_list_normalized(self, tag):
+        """
+        Treat tag value (in all instances) as a list of tokens delimited by
+        whitespace or commas.
+
+        Returns normalized set of tokens.
+        """
+        tokens = " ".join(self.get(tag)).replace(",", " ").split()
+        return References(tokens)
 
     def remove(self, tag):
         """
