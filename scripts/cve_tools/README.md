@@ -9,6 +9,10 @@
 ```
 cd $WD
 make -f path/to/scripts/cve_tools/Makefile BRANCH=cve/linux-5.14-LTSS update_refs_history
+
+* Optionally with BASE_BRANCH (when different from origin/$BRANCH)
+```
+make -f path/to/scripts/cve_tools/Makefile BRANCH=SLE15-SP5 BASE_BRANCH=SLE15-SP5-with-cve-merged update_refs_history
 ```
 
 * that will create a new git branch in `KSOURCE_GIT` and add commits with new
@@ -24,4 +28,4 @@ make -f path/to/scripts/cve_tools/Makefile BRANCH=cve/linux-5.14-LTSS update_ref
   other utils
 * integrate with branches.conf so that list of "root" branches is extracted
 * integrate with branches.conf so that non-root branches are handled too (easy
-  if we allow multiplicities of RPM changelog messages), provide BASE_BRANCH as stop-gap
+  if we allow multiplicities of RPM changelog messages)
