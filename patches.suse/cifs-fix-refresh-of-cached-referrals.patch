@@ -1,0 +1,336 @@
+From: Paulo Alcantara <pc@cjr.nz>
+Date: Tue, 13 Dec 2022 01:23:16 -0300
+Subject: [PATCH] cifs: fix refresh of cached referrals
+Git-commit: 6916881f443f67f6893b504fa2171468c8aed915
+References: bsc#1213476
+Patch-mainline: v6.2-rc1
+
+We can't rely on cifs_tcon::ses to refresh cached referral as the
+server target might not respond to referrals, e.g. share is not hosted
+in a DFS root server.  Consider the following
+
+  mount //dom/dfs/link -> /root1/dfs/link -> /fs0/share
+
+where fs0 can't get a referral for "/root1/dfs/link".
+
+To simplify and fix the access of dfs root sessions, store the dfs
+root session pointer directly to new sessions so making it easier to
+select the appropriate ipc connection and use it for failover or cache
+refresh.
+
+Signed-off-by: Paulo Alcantara (SUSE) <pc@cjr.nz>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Acked-by: Enzo Matsumiya <ematsumiya@suse.de>
+---
+ fs/cifs/cifsglob.h  |    3 +
+ fs/cifs/connect.c   |    5 +
+ fs/cifs/dfs.c       |    6 ++
+ fs/cifs/dfs_cache.c |  140 +++++++++-------------------------------------------
+ 4 files changed, 37 insertions(+), 117 deletions(-)
+
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -102,6 +102,8 @@
+ 
+ #define CIFS_MAX_WORKSTATION_LEN  (__NEW_UTS_LEN + 1)  /* reasonable max for client */
+ 
++#define CIFS_DFS_ROOT_SES(ses) ((ses)->dfs_root_ses ?: (ses))
++
+ /*
+  * CIFS vfs client Status information (based on what we know.)
+  */
+@@ -1036,6 +1038,7 @@ struct cifs_ses {
+ 	 */
+ 	unsigned long chans_need_reconnect;
+ 	/* ========= end: protected by chan_lock ======== */
++	struct cifs_ses *dfs_root_ses;
+ };
+ 
+ static inline bool
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -4097,7 +4097,8 @@ static int __tree_connect_dfs_target(con
+ 	int rc;
+ 	struct TCP_Server_Info *server = tcon->ses->server;
+ 	const struct smb_version_operations *ops = server->ops;
+-	struct cifs_tcon *ipc = tcon->ses->tcon_ipc;
++	struct cifs_ses *root_ses = CIFS_DFS_ROOT_SES(tcon->ses);
++	struct cifs_tcon *ipc = root_ses->tcon_ipc;
+ 	char *share = NULL, *prefix = NULL;
+ 	const char *tcp_host;
+ 	size_t tcp_host_len;
+@@ -4155,7 +4156,7 @@ static int __tree_connect_dfs_target(con
+ 		 * reconnect so either the demultiplex thread or the echo worker will reconnect to
+ 		 * newly resolved target.
+ 		 */
+-		if (dfs_cache_find(xid, tcon->ses, cifs_sb->local_nls, cifs_remap(cifs_sb), target,
++		if (dfs_cache_find(xid, root_ses, cifs_sb->local_nls, cifs_remap(cifs_sb), target,
+ 				   NULL, &ntl)) {
+ 			rc = ops->tree_connect(xid, tcon->ses, tree, tcon, cifs_sb->local_nls);
+ 			if (rc)
+--- a/fs/cifs/dfs.c
++++ b/fs/cifs/dfs.c
+@@ -117,7 +117,13 @@ static int get_session(struct cifs_mount
+ 	ctx->leaf_fullpath = (char *)full_path;
+ 	rc = cifs_mount_get_session(mnt_ctx);
+ 	ctx->leaf_fullpath = NULL;
++	if (!rc) {
++		struct cifs_ses *ses = mnt_ctx->ses;
+ 
++		mutex_lock(&ses->session_mutex);
++		ses->dfs_root_ses = mnt_ctx->root_ses;
++		mutex_unlock(&ses->session_mutex);
++	}
+ 	return rc;
+ }
+ 
+--- a/fs/cifs/dfs_cache.c
++++ b/fs/cifs/dfs_cache.c
+@@ -82,27 +82,6 @@ static void refresh_cache_worker(struct
+ 
+ static DECLARE_DELAYED_WORK(refresh_task, refresh_cache_worker);
+ 
+-static void get_ipc_unc(const char *ref_path, char *ipc, size_t ipclen)
+-{
+-	const char *host;
+-	size_t len;
+-
+-	extract_unc_hostname(ref_path, &host, &len);
+-	scnprintf(ipc, ipclen, "\\\\%.*s\\IPC$", (int)len, host);
+-}
+-
+-static struct cifs_ses *find_ipc_from_server_path(struct cifs_ses **ses, const char *path)
+-{
+-	char unc[SERVER_NAME_LENGTH + sizeof("//x/IPC$")] = {0};
+-
+-	get_ipc_unc(path, unc, sizeof(unc));
+-	for (; *ses; ses++) {
+-		if (!strcasecmp(unc, (*ses)->tcon_ipc->treeName))
+-			return *ses;
+-	}
+-	return ERR_PTR(-ENOENT);
+-}
+-
+ static void __mount_group_release(struct mount_group *mg)
+ {
+ 	int i;
+@@ -759,8 +738,6 @@ static int get_dfs_referral(const unsign
+ 	int rc;
+ 	int i;
+ 
+-	cifs_dbg(FYI, "%s: get an DFS referral for %s\n", __func__, path);
+-
+ 	*refs = NULL;
+ 	*numrefs = 0;
+ 
+@@ -769,6 +746,7 @@ static int get_dfs_referral(const unsign
+ 	if (unlikely(!cache_cp))
+ 		return -EINVAL;
+ 
++	cifs_dbg(FYI, "%s: ipc=%s referral=%s\n", __func__, ses->tcon_ipc->treeName, path);
+ 	rc =  ses->server->ops->get_dfs_refer(xid, ses, path, refs, numrefs, cache_cp,
+ 					      NO_MAP_UNI_RSVD);
+ 	if (!rc) {
+@@ -1372,10 +1350,9 @@ static void mark_for_reconnect_if_needed
+ }
+ 
+ /* Refresh dfs referral of tcon and mark it for reconnect if needed */
+-static int __refresh_tcon(const char *path, struct cifs_ses **sessions, struct cifs_tcon *tcon,
+-			  bool force_refresh)
++static int __refresh_tcon(const char *path, struct cifs_tcon *tcon, bool force_refresh)
+ {
+-	struct cifs_ses *ses;
++	struct cifs_ses *ses = CIFS_DFS_ROOT_SES(tcon->ses);
+ 	struct cache_entry *ce;
+ 	struct dfs_info3_param *refs = NULL;
+ 	int numrefs = 0;
+@@ -1384,11 +1361,7 @@ static int __refresh_tcon(const char *pa
+ 	int rc = 0;
+ 	unsigned int xid;
+ 
+-	ses = find_ipc_from_server_path(sessions, path);
+-	if (IS_ERR(ses)) {
+-		cifs_dbg(FYI, "%s: could not find ipc session\n", __func__);
+-		return PTR_ERR(ses);
+-	}
++	xid = get_xid();
+ 
+ 	down_read(&htable_rw_lock);
+ 	ce = lookup_cache_entry(path);
+@@ -1405,12 +1378,9 @@ static int __refresh_tcon(const char *pa
+ 		goto out;
+ 	}
+ 
+-	xid = get_xid();
+ 	rc = get_dfs_referral(xid, ses, path, &refs, &numrefs);
+-	free_xid(xid);
+-
+-	/* Create or update a cache entry with the new referral */
+ 	if (!rc) {
++		/* Create or update a cache entry with the new referral */
+ 		dump_refs(refs, numrefs);
+ 
+ 		down_write(&htable_rw_lock);
+@@ -1425,24 +1395,20 @@ static int __refresh_tcon(const char *pa
+ 	}
+ 
+ out:
++	free_xid(xid);
+ 	dfs_cache_free_tgts(&tl);
+ 	free_dfs_info_array(refs, numrefs);
+ 	return rc;
+ }
+ 
+-static int refresh_tcon(struct cifs_ses **sessions, struct cifs_tcon *tcon, bool force_refresh)
++static int refresh_tcon(struct cifs_tcon *tcon, bool force_refresh)
+ {
+ 	struct TCP_Server_Info *server = tcon->ses->server;
+ 
+ 	mutex_lock(&server->refpath_lock);
+-	if (server->origin_fullpath) {
+-		if (server->leaf_fullpath && strcasecmp(server->leaf_fullpath,
+-							server->origin_fullpath))
+-			__refresh_tcon(server->leaf_fullpath + 1, sessions, tcon, force_refresh);
+-		__refresh_tcon(server->origin_fullpath + 1, sessions, tcon, force_refresh);
+-	}
++	if (server->leaf_fullpath)
++		__refresh_tcon(server->leaf_fullpath + 1, tcon, force_refresh);
+ 	mutex_unlock(&server->refpath_lock);
+-
+ 	return 0;
+ }
+ 
+@@ -1460,9 +1426,6 @@ int dfs_cache_remount_fs(struct cifs_sb_
+ {
+ 	struct cifs_tcon *tcon;
+ 	struct TCP_Server_Info *server;
+-	struct mount_group *mg;
+-	struct cifs_ses *sessions[CACHE_MAX_ENTRIES + 1] = {NULL};
+-	int rc;
+ 
+ 	if (!cifs_sb || !cifs_sb->master_tlink)
+ 		return -EINVAL;
+@@ -1479,21 +1442,6 @@ int dfs_cache_remount_fs(struct cifs_sb_
+ 		cifs_dbg(FYI, "%s: no dfs mount group id\n", __func__);
+ 		return -EINVAL;
+ 	}
+-
+-	mutex_lock(&mount_group_list_lock);
+-	mg = find_mount_group_locked(&cifs_sb->dfs_mount_id);
+-	if (IS_ERR(mg)) {
+-		mutex_unlock(&mount_group_list_lock);
+-		cifs_dbg(FYI, "%s: no ipc session for refreshing referral\n", __func__);
+-		return PTR_ERR(mg);
+-	}
+-	kref_get(&mg->refcount);
+-	mutex_unlock(&mount_group_list_lock);
+-
+-	spin_lock(&mg->lock);
+-	memcpy(&sessions, mg->sessions, mg->num_sessions * sizeof(mg->sessions[0]));
+-	spin_unlock(&mg->lock);
+-
+ 	/*
+ 	 * After reconnecting to a different server, unique ids won't match anymore, so we disable
+ 	 * serverino. This prevents dentry revalidation to think the dentry are stale (ESTALE).
+@@ -1504,17 +1452,15 @@ int dfs_cache_remount_fs(struct cifs_sb_
+ 	 * that have different prefix paths.
+ 	 */
+ 	cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_USE_PREFIX_PATH;
+-	rc = refresh_tcon(sessions, tcon, true);
+ 
+-	kref_put(&mg->refcount, mount_group_release);
+-	return rc;
++	return refresh_tcon(tcon, true);
+ }
+ 
+ /*
+- * Refresh all active dfs mounts regardless of whether they are in cache or not.
+- * (cache can be cleared)
++ * Worker that will refresh DFS cache from all active mounts based on lowest TTL value
++ * from a DFS referral.
+  */
+-static void refresh_mounts(struct cifs_ses **sessions)
++static void refresh_cache_worker(struct work_struct *work)
+ {
+ 	struct TCP_Server_Info *server;
+ 	struct cifs_ses *ses;
+@@ -1529,9 +1475,19 @@ static void refresh_mounts(struct cifs_s
+ 			continue;
+ 
+ 		list_for_each_entry(ses, &server->smb_ses_list, smb_ses_list) {
++			struct cifs_ses *root_ses = CIFS_DFS_ROOT_SES(ses);
++
++			spin_lock(&root_ses->ses_lock);
++			if (root_ses->ses_status != SES_GOOD) {
++				spin_unlock(&root_ses->ses_lock);
++				continue;
++			}
++			spin_unlock(&root_ses->ses_lock);
++
+ 			list_for_each_entry(tcon, &ses->tcon_list, tcon_list) {
+ 				spin_lock(&tcon->tc_lock);
+-				if (!tcon->ipc && !tcon->need_reconnect) {
++				if (!tcon->ipc && tcon->status != TID_NEW &&
++				    tcon->status != TID_NEED_TCON) {
+ 					tcon->tc_count++;
+ 					list_add_tail(&tcon->ulist, &tcons);
+ 				}
+@@ -1548,57 +1504,11 @@ static void refresh_mounts(struct cifs_s
+ 
+ 		mutex_lock(&server->refpath_lock);
+ 		if (server->leaf_fullpath)
+-			__refresh_tcon(server->leaf_fullpath + 1, sessions, tcon, false);
++			__refresh_tcon(server->leaf_fullpath + 1, tcon, false);
+ 		mutex_unlock(&server->refpath_lock);
+ 
+ 		cifs_put_tcon(tcon);
+ 	}
+-}
+-
+-/*
+- * Worker that will refresh DFS cache and active mounts based on lowest TTL value from a DFS
+- * referral.
+- */
+-static void refresh_cache_worker(struct work_struct *work)
+-{
+-	struct list_head mglist;
+-	struct mount_group *mg, *tmp_mg;
+-	struct cifs_ses *sessions[CACHE_MAX_ENTRIES + 1] = {NULL};
+-	int max_sessions = ARRAY_SIZE(sessions) - 1;
+-	int i = 0, count;
+-
+-	INIT_LIST_HEAD(&mglist);
+-
+-	/* Get refereces of mount groups */
+-	mutex_lock(&mount_group_list_lock);
+-	list_for_each_entry(mg, &mount_group_list, list) {
+-		kref_get(&mg->refcount);
+-		list_add(&mg->refresh_list, &mglist);
+-	}
+-	mutex_unlock(&mount_group_list_lock);
+-
+-	/* Fill in local array with an NULL-terminated list of all referral server sessions */
+-	list_for_each_entry(mg, &mglist, refresh_list) {
+-		if (i >= max_sessions)
+-			break;
+-
+-		spin_lock(&mg->lock);
+-		if (i + mg->num_sessions > max_sessions)
+-			count = max_sessions - i;
+-		else
+-			count = mg->num_sessions;
+-		memcpy(&sessions[i], mg->sessions, count * sizeof(mg->sessions[0]));
+-		spin_unlock(&mg->lock);
+-		i += count;
+-	}
+-
+-	if (sessions[0])
+-		refresh_mounts(sessions);
+-
+-	list_for_each_entry_safe(mg, tmp_mg, &mglist, refresh_list) {
+-		list_del_init(&mg->refresh_list);
+-		kref_put(&mg->refcount, mount_group_release);
+-	}
+ 
+ 	spin_lock(&cache_ttl_lock);
+ 	queue_delayed_work(dfscache_wq, &refresh_task, cache_ttl * HZ);
