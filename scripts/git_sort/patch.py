@@ -18,6 +18,7 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
 # USA.
 
+from enum import Enum
 import io
 import re
 import sys
@@ -99,9 +100,13 @@ class Patch(object):
                          if not line.lower().startswith(start)]
 
 
-    def change(self, tag, value):
+    class ChangeMode(Enum):
+        EACH = 1        # change value of each instance
+        ALL_WITH_ONE = 2# change value of first instance, drop other
+
+    def change(self, tag, value, mode=ChangeMode.EACH):
         """
-        Changes the value of all instances of the tag.
+        Changes the value of instances of the tag based on mode.
 
         tag does not contain the terminal ": ". It is case insensitive.
         """
@@ -112,12 +117,16 @@ class Patch(object):
             self.modified = True
             start = "%s: " % (tag.lower(),)
 
-            def change_value(line):
-                if line.lower().startswith(start):
-                    return "%s%s\n" % (line[:len(start)], value.strip(),)
-                else:
-                    return line
-
-            self.head = [change_value(line) for line in self.head]
+            replaced = False
+            new_head = []
+            for line in self.head:
+                if not line.lower().startswith(start):
+                    new_head.append(line)
+                    continue
+                if replaced and mode == Patch.ChangeMode.ALL_WITH_ONE:
+                    continue
+                new_head.append("%s%s\n" % (line[:len(start)], value.strip(),))
+                replaced = True
+            self.head = new_head
         else:
             raise KeyError("Tag \"%s\" not found" % (tag,))
