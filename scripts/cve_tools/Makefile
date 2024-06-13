@@ -32,7 +32,7 @@ endif
 branch=$(subst /,_,$(BRANCH))
 user=$(if $(KBUILD_USER),$(KBUILD_USER),$(USER))
 branch_user=users/$(user)/$(BRANCH)/cve-refs
-branch_base=origin/$(BRANCH)
+branch_base=$(if $(BASE_BRANCH),$(BASE_BRANCH),origin/$(BRANCH))
 
 .PHONY: check_cache update_refs_history update_refs_$(branch)_$(YEAR)
 
@@ -68,7 +68,7 @@ cve_bug_$(YEAR).dat: cve2bugzilla
 
 hash_file_$(branch).dat: $(git_packed_refs)
 	@git -C "$(KSOURCE_GIT)" \
-		grep -i "^git-commit[[:space:]]*:[[:space:]]*[0-9a-f]*[[:space:]]*$$" origin/$(BRANCH) -- "$(KSOURCE_GIT)/patches.suse" |\
+		grep -i "^git-commit[[:space:]]*:[[:space:]]*[0-9a-f]*[[:space:]]*$$" $(branch_base) -- "$(KSOURCE_GIT)/patches.suse" |\
 		awk -vFS=":" '{gsub(" ", "", $$4); print $$4, $$2}' | sort -k1 >"$@"
 
 hash_cve_bug_$(YEAR).dat: hash_cve_$(YEAR).dat cve_bug_$(YEAR).dat
