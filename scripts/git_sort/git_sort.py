@@ -276,7 +276,6 @@ remotes = (
     Head(RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/thierry.reding/linux-pwm.git"), "for-next"),
     Head(RepoURL("kvmarm/kvmarm.git"), "next"),
     Head(RepoURL("lenb/linux.git"), "turbostat"),
-    Head(RepoURL("git://git.linux-nfs.org/projects/trondmy/nfs-2.6.git"), "linux-next"),
 )
 
 
