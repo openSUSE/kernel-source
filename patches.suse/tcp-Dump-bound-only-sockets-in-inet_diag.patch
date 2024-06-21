@@ -1,0 +1,183 @@
+From: Guillaume Nault <gnault@redhat.com>
+Date: Fri, 1 Dec 2023 15:49:52 +0100
+Subject: tcp: Dump bound-only sockets in inet_diag.
+Patch-mainline: v6.8-rc1
+Git-commit: 91051f003948432f83b5d2766eeb83b2b4993649
+References: bsc#1204562
+
+Walk the hashinfo->bhash2 table so that inet_diag can dump TCP sockets
+that are bound but haven't yet called connect() or listen().
+
+The code is inspired by the ->lhash2 loop. However there's no manual
+test of the source port, since this kind of filtering is already
+handled by inet_diag_bc_sk(). Also, a maximum of 16 sockets are dumped
+at a time, to avoid running with bh disabled for too long.
+
+There's no TCP state for bound but otherwise inactive sockets. Such
+sockets normally map to TCP_CLOSE. However, "ss -l", which is supposed
+to only dump listening sockets, actually requests the kernel to dump
+sockets in either the TCP_LISTEN or TCP_CLOSE states. To avoid dumping
+bound-only sockets with "ss -l", we therefore need to define a new
+pseudo-state (TCP_BOUND_INACTIVE) that user space will be able to set
+explicitly.
+
+With an IPv4, an IPv6 and an IPv6-only socket, bound respectively to
+40000, 64000, 60000, an updated version of iproute2 could work as
+follow:
+
+  $ ss -t state bound-inactive
+  Recv-Q   Send-Q     Local Address:Port       Peer Address:Port   Process
+  0        0                0.0.0.0:40000           0.0.0.0:*
+  0        0                   [::]:60000              [::]:*
+  0        0                      *:64000                 *:*
+
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Guillaume Nault <gnault@redhat.com>
+Reviewed-by: Kuniyuki Iwashima <kuniyu@amazon.com>
+Link: https://lore.kernel.org/r/b3a84ae61e19c06806eea9c602b3b66e8f0cfc81.1701362867.git.gnault@redhat.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Michal Kubecek <mkubecek@suse.cz>
+
+---
+ include/net/tcp_states.h |  2 +
+ include/uapi/linux/bpf.h |  1 +
+ net/ipv4/inet_diag.c     | 86 +++++++++++++++++++++++++++++++++++++++-
+ net/ipv4/tcp.c           |  1 +
+ 4 files changed, 89 insertions(+), 1 deletion(-)
+
+--- a/include/net/tcp_states.h
++++ b/include/net/tcp_states.h
+@@ -22,6 +22,7 @@ enum {
+ 	TCP_LISTEN,
+ 	TCP_CLOSING,	/* Now a valid state */
+ 	TCP_NEW_SYN_RECV,
++	TCP_BOUND_INACTIVE, /* Pseudo-state for inet_diag */
+ 
+ 	TCP_MAX_STATES	/* Leave at the end! */
+ };
+@@ -43,6 +44,7 @@ enum {
+ 	TCPF_LISTEN	 = (1 << TCP_LISTEN),
+ 	TCPF_CLOSING	 = (1 << TCP_CLOSING),
+ 	TCPF_NEW_SYN_RECV = (1 << TCP_NEW_SYN_RECV),
++	TCPF_BOUND_INACTIVE = (1 << TCP_BOUND_INACTIVE),
+ };
+ 
+ #endif	/* _LINUX_TCP_STATES_H */
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -6851,6 +6851,7 @@ enum {
+ 	BPF_TCP_LISTEN,
+ 	BPF_TCP_CLOSING,	/* Now a valid state */
+ 	BPF_TCP_NEW_SYN_RECV,
++	BPF_TCP_BOUND_INACTIVE,
+ 
+ 	BPF_TCP_MAX_STATES	/* Leave at the end! */
+ };
+--- a/net/ipv4/inet_diag.c
++++ b/net/ipv4/inet_diag.c
+@@ -1077,10 +1077,94 @@ void inet_diag_dump_icsk(struct inet_hashinfo *hashinfo, struct sk_buff *skb,
+ 		s_i = num = s_num = 0;
+ 	}
+ 
++/* Process a maximum of SKARR_SZ sockets at a time when walking hash buckets
++ * with bh disabled.
++ */
++#define SKARR_SZ 16
++
++	/* Dump bound but inactive (not listening, connecting, etc.) sockets */
++	if (cb->args[0] == 1) {
++		if (!(idiag_states & TCPF_BOUND_INACTIVE))
++			goto skip_bind_ht;
++
++		for (i = s_i; i < hashinfo->bhash_size; i++) {
++			struct inet_bind_hashbucket *ibb;
++			struct inet_bind2_bucket *tb2;
++			struct sock *sk_arr[SKARR_SZ];
++			int num_arr[SKARR_SZ];
++			int idx, accum, res;
++
++resume_bind_walk:
++			num = 0;
++			accum = 0;
++			ibb = &hashinfo->bhash2[i];
++
++			spin_lock_bh(&ibb->lock);
++			inet_bind_bucket_for_each(tb2, &ibb->chain) {
++				if (!net_eq(ib2_net(tb2), net))
++					continue;
++
++				sk_for_each_bound_bhash2(sk, &tb2->owners) {
++					struct inet_sock *inet = inet_sk(sk);
++
++					if (num < s_num)
++						goto next_bind;
++
++					if (sk->sk_state != TCP_CLOSE ||
++					    !inet->inet_num)
++						goto next_bind;
++
++					if (r->sdiag_family != AF_UNSPEC &&
++					    r->sdiag_family != sk->sk_family)
++						goto next_bind;
++
++					if (!inet_diag_bc_sk(bc, sk))
++						goto next_bind;
++
++					sock_hold(sk);
++					num_arr[accum] = num;
++					sk_arr[accum] = sk;
++					if (++accum == SKARR_SZ)
++						goto pause_bind_walk;
++next_bind:
++					num++;
++				}
++			}
++pause_bind_walk:
++			spin_unlock_bh(&ibb->lock);
++
++			res = 0;
++			for (idx = 0; idx < accum; idx++) {
++				if (res >= 0) {
++					res = inet_sk_diag_fill(sk_arr[idx],
++								NULL, skb, cb,
++								r, NLM_F_MULTI,
++								net_admin);
++					if (res < 0)
++						num = num_arr[idx];
++				}
++				sock_put(sk_arr[idx]);
++			}
++			if (res < 0)
++				goto done;
++
++			cond_resched();
++
++			if (accum == SKARR_SZ) {
++				s_num = num + 1;
++				goto resume_bind_walk;
++			}
++
++			s_num = 0;
++		}
++skip_bind_ht:
++		cb->args[0] = 2;
++		s_i = num = s_num = 0;
++	}
++
+ 	if (!(idiag_states & ~TCPF_LISTEN))
+ 		goto out;
+ 
+-#define SKARR_SZ 16
+ 	for (i = s_i; i <= hashinfo->ehash_mask; i++) {
+ 		struct inet_ehash_bucket *head = &hashinfo->ehash[i];
+ 		spinlock_t *lock = inet_ehash_lockp(hashinfo, i);
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -2575,6 +2575,7 @@ void tcp_set_state(struct sock *sk, int state)
+ 	BUILD_BUG_ON((int)BPF_TCP_LISTEN != (int)TCP_LISTEN);
+ 	BUILD_BUG_ON((int)BPF_TCP_CLOSING != (int)TCP_CLOSING);
+ 	BUILD_BUG_ON((int)BPF_TCP_NEW_SYN_RECV != (int)TCP_NEW_SYN_RECV);
++	BUILD_BUG_ON((int)BPF_TCP_BOUND_INACTIVE != (int)TCP_BOUND_INACTIVE);
+ 	BUILD_BUG_ON((int)BPF_TCP_MAX_STATES != (int)TCP_MAX_STATES);
+ 
+ 	/* bpf uapi header bpf.h defines an anonymous enum with values
