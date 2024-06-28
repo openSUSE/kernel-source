@@ -1,0 +1,147 @@
+From: Akiva Goldberger <agoldberger@nvidia.com>
+Date: Thu, 9 May 2024 14:29:50 +0300
+Subject: net/mlx5: Add a timeout to acquire the command queue semaphore
+Patch-mainline: v6.10-rc1
+Git-commit: 485d65e1357123a697c591a5aeb773994b247ad7
+References: CVE-2024-38556 bsc#1226774
+
+Prevent forced completion handling on an entry that has not yet been
+assigned an index, causing an out of bounds access on idx = -22.
+Instead of waiting indefinitely for the sem, blocking flow now waits for
+index to be allocated or a sem acquisition timeout before beginning the
+timer for FW completion.
+
+Kernel log example:
+mlx5_core 0000:06:00.0: wait_func_handle_exec_timeout:1128:(pid 185911): cmd[-22]: CREATE_UCTX(0xa04) No done completion
+
+Fixes: 8e715cd613a1 ("net/mlx5: Set command entry semaphore up once got index free")
+Signed-off-by: Akiva Goldberger <agoldberger@nvidia.com>
+Reviewed-by: Moshe Shemesh <moshe@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://lore.kernel.org/r/20240509112951.590184-5-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/cmd.c |   41 ++++++++++++++++++++------
+ include/linux/mlx5/driver.h                   |    1 
+ 2 files changed, 33 insertions(+), 9 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/cmd.c
+@@ -969,19 +969,32 @@ static void cmd_work_handler(struct work
+ 	bool poll_cmd = ent->polling;
+ 	struct mlx5_cmd_layout *lay;
+ 	struct mlx5_core_dev *dev;
+-	unsigned long cb_timeout;
+-	struct semaphore *sem;
++	unsigned long timeout;
+ 	unsigned long flags;
+ 	int alloc_ret;
+ 	int cmd_mode;
+ 
++	complete(&ent->handling);
++
+ 	dev = container_of(cmd, struct mlx5_core_dev, cmd);
+-	cb_timeout = msecs_to_jiffies(mlx5_tout_ms(dev, CMD));
++	timeout = msecs_to_jiffies(mlx5_tout_ms(dev, CMD));
+ 
+-	complete(&ent->handling);
+-	sem = ent->page_queue ? &cmd->vars.pages_sem : &cmd->vars.sem;
+-	down(sem);
+ 	if (!ent->page_queue) {
++		if (down_timeout(&cmd->vars.sem, timeout)) {
++			mlx5_core_warn(dev, "%s(0x%x) timed out while waiting for a slot.\n",
++				       mlx5_command_str(ent->op), ent->op);
++			if (ent->callback) {
++				ent->callback(-EBUSY, ent->context);
++				mlx5_free_cmd_msg(dev, ent->out);
++				free_msg(dev, ent->in);
++				cmd_ent_put(ent);
++			} else {
++				ent->ret = -EBUSY;
++				complete(&ent->done);
++			}
++			complete(&ent->slotted);
++			return;
++		}
+ 		alloc_ret = cmd_alloc_index(cmd, ent);
+ 		if (alloc_ret < 0) {
+ 			mlx5_core_err_rl(dev, "failed to allocate command entry\n");
+@@ -994,10 +1007,11 @@ static void cmd_work_handler(struct work
+ 				ent->ret = -EAGAIN;
+ 				complete(&ent->done);
+ 			}
+-			up(sem);
++			up(&cmd->vars.sem);
+ 			return;
+ 		}
+ 	} else {
++		down(&cmd->vars.pages_sem);
+ 		ent->idx = cmd->vars.max_reg_cmds;
+ 		spin_lock_irqsave(&cmd->alloc_lock, flags);
+ 		clear_bit(ent->idx, &cmd->vars.bitmask);
+@@ -1005,6 +1019,8 @@ static void cmd_work_handler(struct work
+ 		spin_unlock_irqrestore(&cmd->alloc_lock, flags);
+ 	}
+ 
++	complete(&ent->slotted);
++
+ 	lay = get_inst(cmd, ent->idx);
+ 	ent->lay = lay;
+ 	memset(lay, 0, sizeof(*lay));
+@@ -1023,7 +1039,7 @@ static void cmd_work_handler(struct work
+ 	ent->ts1 = ktime_get_ns();
+ 	cmd_mode = cmd->mode;
+ 
+-	if (ent->callback && schedule_delayed_work(&ent->cb_timeout_work, cb_timeout))
++	if (ent->callback && schedule_delayed_work(&ent->cb_timeout_work, timeout))
+ 		cmd_ent_get(ent);
+ 	set_bit(MLX5_CMD_ENT_STATE_PENDING_COMP, &ent->state);
+ 
+@@ -1143,6 +1159,9 @@ static int wait_func(struct mlx5_core_de
+ 		ent->ret = -ECANCELED;
+ 		goto out_err;
+ 	}
++
++	wait_for_completion(&ent->slotted);
++
+ 	if (cmd->mode == CMD_MODE_POLLING || ent->polling)
+ 		wait_for_completion(&ent->done);
+ 	else if (!wait_for_completion_timeout(&ent->done, timeout))
+@@ -1157,6 +1176,9 @@ out_err:
+ 	} else if (err == -ECANCELED) {
+ 		mlx5_core_warn(dev, "%s(0x%x) canceled on out of queue timeout.\n",
+ 			       mlx5_command_str(ent->op), ent->op);
++	} else if (err == -EBUSY) {
++		mlx5_core_warn(dev, "%s(0x%x) timeout while waiting for command semaphore.\n",
++			       mlx5_command_str(ent->op), ent->op);
+ 	}
+ 	mlx5_core_dbg(dev, "err %d, delivery status %s(%d)\n",
+ 		      err, deliv_status_to_str(ent->status), ent->status);
+@@ -1208,6 +1230,7 @@ static int mlx5_cmd_invoke(struct mlx5_c
+ 	ent->polling = force_polling;
+ 
+ 	init_completion(&ent->handling);
++	init_completion(&ent->slotted);
+ 	if (!callback)
+ 		init_completion(&ent->done);
+ 
+@@ -1225,7 +1248,7 @@ static int mlx5_cmd_invoke(struct mlx5_c
+ 		return 0; /* mlx5_cmd_comp_handler() will put(ent) */
+ 
+ 	err = wait_func(dev, ent);
+-	if (err == -ETIMEDOUT || err == -ECANCELED)
++	if (err == -ETIMEDOUT || err == -ECANCELED || err == -EBUSY)
+ 		goto out_free;
+ 
+ 	ds = ent->ts2 - ent->ts1;
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -862,6 +862,7 @@ struct mlx5_cmd_work_ent {
+ 	void		       *context;
+ 	int			idx;
+ 	struct completion	handling;
++	struct completion	slotted;
+ 	struct completion	done;
+ 	struct mlx5_cmd        *cmd;
+ 	struct work_struct	work;
