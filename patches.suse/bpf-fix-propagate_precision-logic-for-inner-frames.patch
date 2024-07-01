@@ -1,0 +1,174 @@
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Thu, 4 May 2023 21:33:13 -0700
+Subject: bpf: fix propagate_precision() logic for inner frames
+Patch-mainline: v6.5-rc1
+Git-commit: f655badf2a8fc028433d9583bf86a6b473721f09
+References: bsc#1225903
+
+Fix propagate_precision() logic to perform propagation of all necessary
+registers and stack slots across all active frames *in one batch step*.
+
+Doing this for each register/slot in each individual frame is wasteful,
+but the main problem is that backtracking of instruction in any frame
+except the deepest one just doesn't work. This is due to backtracking
+logic relying on jump history, and available jump history always starts
+(or ends, depending how you view it) in current frame. So, if
+prog A (frame #0) called subprog B (frame #1) and we need to propagate
+precision of, say, register R6 (callee-saved) within frame #0, we
+actually don't even know where jump history that corresponds to prog
+A even starts. We'd need to skip subprog part of jump history first to
+be able to do this.
+
+Luckily, with struct backtrack_state and __mark_chain_precision()
+handling bitmasks tracking/propagation across all active frames at the
+same time (added in previous patch), propagate_precision() can be both
+fixed and sped up by setting all the necessary bits across all frames
+and then performing one __mark_chain_precision() pass. This makes it
+unnecessary to skip subprog parts of jump history.
+
+We also improve logging along the way, to clearly specify which
+registers' and slots' precision markings are propagated within which
+frame. Each frame will have dedicated line and all registers and stack
+slots from that frame will be reported in format similar to precision
+backtrack regs/stack logging. E.g.:
+
+frame 1: propagating r1,r2,r3,fp-8,fp-16
+frame 0: propagating r3,r9,fp-120
+
+Fixes: 529409ea92d5 ("bpf: propagate precision across all frames, not just the last one")
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/r/20230505043317.3629845-7-andrii@kernel.org
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ kernel/bpf/verifier.c |   65 ++++++++++++++++++++++++++------------------------
+ 1 file changed, 35 insertions(+), 30 deletions(-)
+
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -3280,8 +3280,7 @@ static void mark_all_scalars_imprecise(s
+  * mark_all_scalars_imprecise() to hopefully get more permissive and generic
+  * finalized states which help in short circuiting more future states.
+  */
+-static int __mark_chain_precision(struct bpf_verifier_env *env, int frame, int regno,
+-				  int spi)
++static int __mark_chain_precision(struct bpf_verifier_env *env, int regno)
+ {
+ 	struct backtrack_state *bt = &env->bt;
+ 	struct bpf_verifier_state *st = env->cur_state;
+@@ -3296,13 +3295,13 @@ static int __mark_chain_precision(struct
+ 		return 0;
+ 
+ 	/* set frame number from which we are starting to backtrack */
+-	bt_init(bt, frame);
++	bt_init(bt, env->cur_state->curframe);
+ 
+ 	/* Do sanity checks against current state of register and/or stack
+ 	 * slot, but don't set precise flag in current state, as precision
+ 	 * tracking in the current state is unnecessary.
+ 	 */
+-	func = st->frame[frame];
++	func = st->frame[bt->frame];
+ 	if (regno >= 0) {
+ 		reg = &func->regs[regno];
+ 		if (reg->type != SCALAR_VALUE) {
+@@ -3312,13 +3311,6 @@ static int __mark_chain_precision(struct
+ 		bt_set_reg(bt, regno);
+ 	}
+ 
+-	while (spi >= 0) {
+-		if (!is_spilled_scalar_reg(&func->stack[spi]))
+-			break;
+-		bt_set_slot(bt, spi);
+-		break;
+-	}
+-
+ 	if (bt_empty(bt))
+ 		return 0;
+ 
+@@ -3468,17 +3460,15 @@ static int __mark_chain_precision(struct
+ 
+ static int mark_chain_precision(struct bpf_verifier_env *env, int regno)
+ {
+-	return __mark_chain_precision(env, env->cur_state->curframe, regno, -1);
++	return __mark_chain_precision(env, regno);
+ }
+ 
+-static int mark_chain_precision_frame(struct bpf_verifier_env *env, int frame, int regno)
+-{
+-	return __mark_chain_precision(env, frame, regno, -1);
+-}
+-
+-static int mark_chain_precision_stack_frame(struct bpf_verifier_env *env, int frame, int spi)
++/* mark_chain_precision_batch() assumes that env->bt is set in the caller to
++ * desired reg and stack masks across all relevant frames
++ */
++static int mark_chain_precision_batch(struct bpf_verifier_env *env)
+ {
+-	return __mark_chain_precision(env, frame, -1, spi);
++	return __mark_chain_precision(env, -1);
+ }
+ 
+ static bool is_spillable_regtype(enum bpf_reg_type type)
+@@ -12406,20 +12396,25 @@ static int propagate_precision(struct bp
+ 	struct bpf_reg_state *state_reg;
+ 	struct bpf_func_state *state;
+ 	int i, err = 0, fr;
++	bool first;
+ 
+ 	for (fr = old->curframe; fr >= 0; fr--) {
+ 		state = old->frame[fr];
+ 		state_reg = state->regs;
++		first = true;
+ 		for (i = 0; i < BPF_REG_FP; i++, state_reg++) {
+ 			if (state_reg->type != SCALAR_VALUE ||
+ 			    !state_reg->precise ||
+ 			    !(state_reg->live & REG_LIVE_READ))
+ 				continue;
+-			if (env->log.level & BPF_LOG_LEVEL2)
+-				verbose(env, "frame %d: propagating r%d\n", fr, i);
+-			err = mark_chain_precision_frame(env, fr, i);
+-			if (err < 0)
+-				return err;
++			if (env->log.level & BPF_LOG_LEVEL2) {
++				if (first)
++					verbose(env, "frame %d: propagating r%d", fr, i);
++				else
++					verbose(env, ",r%d", i);
++			}
++			bt_set_frame_reg(&env->bt, fr, i);
++			first = false;
+ 		}
+ 
+ 		for (i = 0; i < state->allocated_stack / BPF_REG_SIZE; i++) {
+@@ -12430,14 +12425,24 @@ static int propagate_precision(struct bp
+ 			    !state_reg->precise ||
+ 			    !(state_reg->live & REG_LIVE_READ))
+ 				continue;
+-			if (env->log.level & BPF_LOG_LEVEL2)
+-				verbose(env, "frame %d: propagating fp%d\n",
+-					fr, (-i - 1) * BPF_REG_SIZE);
+-			err = mark_chain_precision_stack_frame(env, fr, i);
+-			if (err < 0)
+-				return err;
++			if (env->log.level & BPF_LOG_LEVEL2) {
++				if (first)
++					verbose(env, "frame %d: propagating fp%d",
++						fr, (-i - 1) * BPF_REG_SIZE);
++				else
++					verbose(env, ",fp%d", (-i - 1) * BPF_REG_SIZE);
++			}
++			bt_set_frame_slot(&env->bt, fr, i);
++			first = false;
+ 		}
++		if (!first)
++			verbose(env, "\n");
+ 	}
++
++	err = mark_chain_precision_batch(env);
++	if (err < 0)
++		return err;
++
+ 	return 0;
+ }
+ 
