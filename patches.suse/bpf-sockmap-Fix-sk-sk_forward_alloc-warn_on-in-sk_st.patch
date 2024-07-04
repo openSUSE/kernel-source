@@ -1,0 +1,135 @@
+From: Wang Yufen <wangyufen@huawei.com>
+Date: Tue, 24 May 2022 15:53:11 +0800
+Subject: bpf, sockmap: Fix sk->sk_forward_alloc warn_on in
+ sk_stream_kill_queues
+Patch-mainline: v6.0-rc1
+Git-commit: d8616ee2affcff37c5d315310da557a694a3303d
+References: bsc#1225475 CVE-2023-52735
+X-Info: backported for sock_map_destroy(), context for commit 5b4a79ba65a1 "bpf, sockmap: Don't let sock_map_{close,destroy,unhash} call itself"
+
+During TCP sockmap redirect pressure test, the following warning is triggered:
+
+WARNING: CPU: 3 PID: 2145 at net/core/stream.c:205 sk_stream_kill_queues+0xbc/0xd0
+CPU: 3 PID: 2145 Comm: iperf Kdump: loaded Tainted: G        W         5.10.0+ #9
+Call Trace:
+ inet_csk_destroy_sock+0x55/0x110
+ inet_csk_listen_stop+0xbb/0x380
+ tcp_close+0x41b/0x480
+ inet_release+0x42/0x80
+ __sock_release+0x3d/0xa0
+ sock_close+0x11/0x20
+ __fput+0x9d/0x240
+ task_work_run+0x62/0x90
+ exit_to_user_mode_prepare+0x110/0x120
+ syscall_exit_to_user_mode+0x27/0x190
+ entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+The reason we observed is that:
+
+When the listener is closing, a connection may have completed the three-way
+handshake but not accepted, and the client has sent some packets. The child
+sks in accept queue release by inet_child_forget()->inet_csk_destroy_sock(),
+but psocks of child sks have not released.
+
+To fix, add sock_map_destroy to release psocks.
+
+Signed-off-by: Wang Yufen <wangyufen@huawei.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: Jakub Sitnicki <jakub@cloudflare.com>
+Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20220524075311.649153-1-wangyufen@huawei.com
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/linux/bpf.h   |  1 +
+ include/linux/skmsg.h |  1 +
+ net/core/skmsg.c      |  1 +
+ net/core/sock_map.c   | 23 +++++++++++++++++++++++
+ net/ipv4/tcp_bpf.c    |  1 +
+ 5 files changed, 27 insertions(+)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 2b914a56a2c5..8e6092d0ea95 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -2104,6 +2104,7 @@ int sock_map_bpf_prog_query(const union bpf_attr *attr,
+ 			    union bpf_attr __user *uattr);
+ 
+ void sock_map_unhash(struct sock *sk);
++void sock_map_destroy(struct sock *sk);
+ void sock_map_close(struct sock *sk, long timeout);
+ #else
+ static inline int bpf_prog_offload_init(struct bpf_prog *prog,
+diff --git a/include/linux/skmsg.h b/include/linux/skmsg.h
+index c5a2d6f50f25..153b6dec9b6a 100644
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@ -95,6 +95,7 @@ struct sk_psock {
+ 	spinlock_t			link_lock;
+ 	refcount_t			refcnt;
+ 	void (*saved_unhash)(struct sock *sk);
++	void (*saved_destroy)(struct sock *sk);
+ 	void (*saved_close)(struct sock *sk, long timeout);
+ 	void (*saved_write_space)(struct sock *sk);
+ 	void (*saved_data_ready)(struct sock *sk);
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 22b983ade0e7..7e03f96e441b 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -715,6 +715,7 @@ struct sk_psock *sk_psock_init(struct sock *sk, int node)
+ 	psock->eval = __SK_NONE;
+ 	psock->sk_proto = prot;
+ 	psock->saved_unhash = prot->unhash;
++	psock->saved_destroy = prot->destroy;
+ 	psock->saved_close = prot->close;
+ 	psock->saved_write_space = sk->sk_write_space;
+ 
+diff --git a/net/core/sock_map.c b/net/core/sock_map.c
+index 81d4b4756a02..9f08ccfaf6da 100644
+--- a/net/core/sock_map.c
++++ b/net/core/sock_map.c
+@@ -1561,6 +1561,29 @@ void sock_map_unhash(struct sock *sk)
+ }
+ EXPORT_SYMBOL_GPL(sock_map_unhash);
+ 
++void sock_map_destroy(struct sock *sk)
++{
++	void (*saved_destroy)(struct sock *sk);
++	struct sk_psock *psock;
++
++	rcu_read_lock();
++	psock = sk_psock_get(sk);
++	if (unlikely(!psock)) {
++		rcu_read_unlock();
++		if (sk->sk_prot->destroy)
++			sk->sk_prot->destroy(sk);
++		return;
++	}
++
++	saved_destroy = psock->saved_destroy;
++	sock_map_remove_links(sk, psock);
++	rcu_read_unlock();
++	sk_psock_stop(psock, true);
++	sk_psock_put(sk, psock);
++	saved_destroy(sk);
++}
++EXPORT_SYMBOL_GPL(sock_map_destroy);
++
+ void sock_map_close(struct sock *sk, long timeout)
+ {
+ 	void (*saved_close)(struct sock *sk, long timeout);
+diff --git a/net/ipv4/tcp_bpf.c b/net/ipv4/tcp_bpf.c
+index be3947e70fec..38550bb1b90b 100644
+--- a/net/ipv4/tcp_bpf.c
++++ b/net/ipv4/tcp_bpf.c
+@@ -540,6 +540,7 @@ static void tcp_bpf_rebuild_protos(struct proto prot[TCP_BPF_NUM_CFGS],
+ 				   struct proto *base)
+ {
+ 	prot[TCP_BPF_BASE]			= *base;
++	prot[TCP_BPF_BASE].destroy		= sock_map_destroy;
+ 	prot[TCP_BPF_BASE].close		= sock_map_close;
+ 	prot[TCP_BPF_BASE].recvmsg		= tcp_bpf_recvmsg;
+ 	prot[TCP_BPF_BASE].sock_is_readable	= sk_msg_is_readable;
+-- 
+2.45.1
+
