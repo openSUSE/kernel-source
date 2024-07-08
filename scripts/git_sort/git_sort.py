@@ -237,6 +237,7 @@ remotes = (
     Head(RepoURL("nvdimm/nvdimm.git"), "libnvdimm-for-next"),
     Head(RepoURL("nvdimm/nvdimm.git"), "libnvdimm-fixes"),
     Head(RepoURL("djbw/nvdimm.git"), "libnvdimm-pending"),
+    Head(RepoURL("git://git.linux-nfs.org/projects/trondmy/nfs-2.6.git"), "linux-next"),
     Head(RepoURL("git://git.linux-nfs.org/projects/anna/linux-nfs.git"), "linux-next"),
     Head(RepoURL("acme/linux.git"), "perf/core"),
     Head(RepoURL("acme/linux.git"), "perf-tools"),
