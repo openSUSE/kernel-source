@@ -1,0 +1,208 @@
+From 2c389d488b05a25963f18c13e239e240929c7d6c Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 10 Oct 2023 20:57:39 +0200
+Subject: [PATCH] sched: Fix stop_one_cpu_nowait() vs hotplug
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+References: git fixes (sched)
+Patch-mainline: v6.7-rc1
+Git-commit: f0498d2a54e7966ce23cd7c7ff42c64fa0059b07
+
+Kuyo reported sporadic failures on a sched_setaffinity() vs CPU
+hotplug stress-test -- notably affine_move_task() remains stuck in
+wait_for_completion(), leading to a hung-task detector warning.
+
+Specifically, it was reported that stop_one_cpu_nowait(.fn =
+migration_cpu_stop) returns false -- this stopper is responsible for
+the matching complete().
+
+The race scenario is:
+
+	CPU0					CPU1
+
+					// doing _cpu_down()
+
+  __set_cpus_allowed_ptr()
+    task_rq_lock();
+					takedown_cpu()
+					  stop_machine_cpuslocked(take_cpu_down..)
+
+					<PREEMPT: cpu_stopper_thread()
+					  MULTI_STOP_PREPARE
+					  ...
+    __set_cpus_allowed_ptr_locked()
+      affine_move_task()
+        task_rq_unlock();
+
+  <PREEMPT: cpu_stopper_thread()\>
+    ack_state()
+					  MULTI_STOP_RUN
+					    take_cpu_down()
+					      __cpu_disable();
+					      stop_machine_park();
+						stopper->enabled = false;
+					 />
+   />
+	stop_one_cpu_nowait(.fn = migration_cpu_stop);
+          if (stopper->enabled) // false!!!
+
+That is, by doing stop_one_cpu_nowait() after dropping rq-lock, the
+stopper thread gets a chance to preempt and allows the cpu-down for
+the target CPU to complete.
+
+OTOH, since stop_one_cpu_nowait() / cpu_stop_queue_work() needs to
+issue a wakeup, it must not be ran under the scheduler locks.
+
+Solve this apparent contradiction by keeping preemption disabled over
+the unlock + queue_stopper combination:
+
+	preempt_disable();
+	task_rq_unlock(...);
+	if (!stop_pending)
+	  stop_one_cpu_nowait(...)
+	preempt_enable();
+
+This respects the lock ordering contraints while still avoiding the
+above race. That is, if we find the CPU is online under rq-lock, the
+targeted stop_one_cpu_nowait() must succeed.
+
+Apply this pattern to all similar stop_one_cpu_nowait() invocations.
+
+Fixes: 6d337eab041d ("sched: Fix migrate_disable() vs set_cpus_allowed_ptr()")
+Reported-by: "Kuyo Chang (張建文)" <Kuyo.Chang@mediatek.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Tested-by: "Kuyo Chang (張建文)" <Kuyo.Chang@mediatek.com>
+Link: https://lkml.kernel.org/r/20231010200442.GA16515@noisy.programming.kicks-ass.net
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ kernel/sched/core.c     | 10 ++++++++--
+ kernel/sched/deadline.c |  2 ++
+ kernel/sched/fair.c     |  4 +++-
+ kernel/sched/rt.c       |  4 ++++
+ 4 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 06ddfbf3703d..02c69f46382b 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2408,9 +2408,11 @@ static int migration_cpu_stop(void *data)
+ 		 * it.
+ 		 */
+ 		WARN_ON_ONCE(!pending->stop_pending);
++		preempt_disable();
+ 		task_rq_unlock(rq, p, &rf);
+ 		stop_one_cpu_nowait(task_cpu(p), migration_cpu_stop,
+ 				    &pending->arg, &pending->stop_work);
++		preempt_enable();
+ 		return 0;
+ 	}
+ out:
+@@ -2634,12 +2636,13 @@ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flag
+ 			complete = true;
+ 		}
+ 
++		preempt_disable();
+ 		task_rq_unlock(rq, p, rf);
+-
+ 		if (push_task) {
+ 			stop_one_cpu_nowait(rq->cpu, push_cpu_stop,
+ 					    p, &rq->push_work);
+ 		}
++		preempt_enable();
+ 
+ 		if (complete)
+ 			complete_all(&pending->done);
+@@ -2705,12 +2708,13 @@ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flag
+ 		if (flags & SCA_MIGRATE_ENABLE)
+ 			p->migration_flags &= ~MDF_PUSH;
+ 
++		preempt_disable();
+ 		task_rq_unlock(rq, p, rf);
+-
+ 		if (!stop_pending) {
+ 			stop_one_cpu_nowait(cpu_of(rq), migration_cpu_stop,
+ 					    &pending->arg, &pending->stop_work);
+ 		}
++		preempt_enable();
+ 
+ 		if (flags & SCA_MIGRATE_ENABLE)
+ 			return 0;
+@@ -8756,9 +8760,11 @@ static void balance_push(struct rq *rq)
+ 	 * Temporarily drop rq->lock such that we can wake-up the stop task.
+ 	 * Both preemption and IRQs are still disabled.
+ 	 */
++	preempt_disable();
+ 	raw_spin_rq_unlock(rq);
+ 	stop_one_cpu_nowait(rq->cpu, __balance_push_cpu_stop, push_task,
+ 			    this_cpu_ptr(&push_work));
++	preempt_enable();
+ 	/*
+ 	 * At this point need_resched() is true and we'll take the loop in
+ 	 * schedule(). The next pick is obviously going to be the stop task
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 3aad381f42ed..0f7b48bde3e7 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -2306,9 +2306,11 @@ static void pull_dl_task(struct rq *this_rq)
+ 		double_unlock_balance(this_rq, src_rq);
+ 
+ 		if (push_task) {
++			preempt_disable();
+ 			raw_spin_rq_unlock(this_rq);
+ 			stop_one_cpu_nowait(src_rq->cpu, push_cpu_stop,
+ 					    push_task, &src_rq->push_work);
++			preempt_enable();
+ 			raw_spin_rq_lock(this_rq);
+ 		}
+ 	}
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index d22ff430f3bc..91f020c2de81 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -10516,13 +10516,15 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+ 				busiest->push_cpu = this_cpu;
+ 				active_balance = 1;
+ 			}
+-			raw_spin_rq_unlock_irqrestore(busiest, flags);
+ 
++			preempt_disable();
++			raw_spin_rq_unlock_irqrestore(busiest, flags);
+ 			if (active_balance) {
+ 				stop_one_cpu_nowait(cpu_of(busiest),
+ 					active_load_balance_cpu_stop, busiest,
+ 					&busiest->active_balance_work);
+ 			}
++			preempt_enable();
+ 		}
+ 	} else {
+ 		sd->nr_balance_failed = 0;
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 81de2d7f2698..c6a7cc367fa8 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -1947,9 +1947,11 @@ static int push_rt_task(struct rq *rq, bool pull)
+ 		 */
+ 		push_task = get_push_task(rq);
+ 		if (push_task) {
++			preempt_disable();
+ 			raw_spin_rq_unlock(rq);
+ 			stop_one_cpu_nowait(rq->cpu, push_cpu_stop,
+ 					    push_task, &rq->push_work);
++			preempt_enable();
+ 			raw_spin_rq_lock(rq);
+ 		}
+ 
+@@ -2286,9 +2288,11 @@ static void pull_rt_task(struct rq *this_rq)
+ 		double_unlock_balance(this_rq, src_rq);
+ 
+ 		if (push_task) {
++			preempt_disable();
+ 			raw_spin_rq_unlock(this_rq);
+ 			stop_one_cpu_nowait(src_rq->cpu, push_cpu_stop,
+ 					    push_task, &src_rq->push_work);
++			preempt_enable();
+ 			raw_spin_rq_lock(this_rq);
+ 		}
+ 	}
