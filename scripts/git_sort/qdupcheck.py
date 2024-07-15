@@ -26,7 +26,8 @@ import sys
 
 import pygit2_wrapper as pygit2
 
-import exc
+sys.path.append(os.path.join(os.path.dirname(__file__), "../python"))
+import suse_git.exc as exc
 import lib
 import series_conf
 
