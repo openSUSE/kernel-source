@@ -1,0 +1,288 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Wed, 24 May 2023 17:03:16 +0200
+Git-commit: 71df088c1cc090d232eb691d8f42284a2c6409eb
+Patch-mainline: v6.5-rc1
+References: bsc#1223731 CVE-2024-26944
+Subject: [PATCH] btrfs: defer splitting of ordered extents until I/O
+ completion
+
+The btrfs zoned completion code currently needs an ordered_extent and
+extent_map per bio so that it can account for the non-predictable
+write location from Zone Append.  To archive that it currently splits
+the ordered_extent and extent_map at I/O submission time, and then
+records the actual physical address in the ->physical field of the
+ordered_extent.
+
+This patch instead switches to record the "original" physical address
+that the btrfs allocator assigned in spare space in the btrfs_bio,
+and then rewrites the logical address in the btrfs_ordered_sum
+structure at I/O completion time.  This allows the ordered extent
+completion handler to simply walk the list of ordered csums and
+split the ordered extent as needed.  This removes an extra ordered
+extent and extent_map lookup and manipulation during the I/O
+submission path, and instead batches it in the I/O completion path
+where we need to touch these anyway.
+
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/bio.c          | 17 ----------
+ fs/btrfs/btrfs_inode.h  |  2 --
+ fs/btrfs/inode.c        | 18 +++++++----
+ fs/btrfs/ordered-data.h |  1 +
+ fs/btrfs/zoned.c        | 70 ++++++++++++++++++++++++++++++++++-------
+ fs/btrfs/zoned.h        |  6 ++--
+ 6 files changed, 73 insertions(+), 41 deletions(-)
+
+diff --git a/fs/btrfs/bio.c b/fs/btrfs/bio.c
+index b1cdd145aada..1b4d8d60c66f 100644
+--- a/fs/btrfs/bio.c
++++ b/fs/btrfs/bio.c
+@@ -61,20 +61,6 @@ struct btrfs_bio *btrfs_bio_alloc(unsigned int nr_vecs, blk_opf_t opf,
+ 	return bbio;
+ }
+ 
+-static blk_status_t btrfs_bio_extract_ordered_extent(struct btrfs_bio *bbio)
+-{
+-	struct btrfs_ordered_extent *ordered;
+-	int ret;
+-
+-	ordered = btrfs_lookup_ordered_extent(bbio->inode, bbio->file_offset);
+-	if (WARN_ON_ONCE(!ordered))
+-		return BLK_STS_IOERR;
+-	ret = btrfs_extract_ordered_extent(bbio, ordered);
+-	btrfs_put_ordered_extent(ordered);
+-
+-	return errno_to_blk_status(ret);
+-}
+-
+ static struct btrfs_bio *btrfs_split_bio(struct btrfs_fs_info *fs_info,
+ 					 struct btrfs_bio *orig_bbio,
+ 					 u64 map_length, bool use_append)
+@@ -668,9 +654,6 @@ static bool btrfs_submit_chunk(struct btrfs_bio *bbio, int mirror_num)
+ 		if (use_append) {
+ 			bio->bi_opf &= ~REQ_OP_WRITE;
+ 			bio->bi_opf |= REQ_OP_ZONE_APPEND;
+-			ret = btrfs_bio_extract_ordered_extent(bbio);
+-			if (ret)
+-				goto fail_put_bio;
+ 		}
+ 
+ 		/*
+diff --git a/fs/btrfs/btrfs_inode.h b/fs/btrfs/btrfs_inode.h
+index 08c996023394..8abf96cfea8f 100644
+--- a/fs/btrfs/btrfs_inode.h
++++ b/fs/btrfs/btrfs_inode.h
+@@ -410,8 +410,6 @@ static inline bool btrfs_inode_can_compress(const struct btrfs_inode *inode)
+ 
+ int btrfs_check_sector_csum(struct btrfs_fs_info *fs_info, struct page *page,
+ 			    u32 pgoff, u8 *csum, const u8 * const csum_expected);
+-int btrfs_extract_ordered_extent(struct btrfs_bio *bbio,
+-				 struct btrfs_ordered_extent *ordered);
+ bool btrfs_data_csum_ok(struct btrfs_bio *bbio, struct btrfs_device *dev,
+ 			u32 bio_offset, struct bio_vec *bv);
+ noinline int can_nocow_extent(struct inode *inode, u64 offset, u64 *len,
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 9f026e632bf7..ff3110a2b4e6 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -2714,8 +2714,8 @@ void btrfs_clear_delalloc_extent(struct btrfs_inode *inode,
+ 	}
+ }
+ 
+-int btrfs_extract_ordered_extent(struct btrfs_bio *bbio,
+-				 struct btrfs_ordered_extent *ordered)
++static int btrfs_extract_ordered_extent(struct btrfs_bio *bbio,
++					struct btrfs_ordered_extent *ordered)
+ {
+ 	u64 start = (u64)bbio->bio.bi_iter.bi_sector << SECTOR_SHIFT;
+ 	u64 len = bbio->bio.bi_iter.bi_size;
+@@ -3180,7 +3180,7 @@ static int insert_ordered_extent_file_extent(struct btrfs_trans_handle *trans,
+  * an ordered extent if the range of bytes in the file it covers are
+  * fully written.
+  */
+-int btrfs_finish_ordered_io(struct btrfs_ordered_extent *ordered_extent)
++int btrfs_finish_one_ordered(struct btrfs_ordered_extent *ordered_extent)
+ {
+ 	struct btrfs_inode *inode = BTRFS_I(ordered_extent->inode);
+ 	struct btrfs_root *root = inode->root;
+@@ -3215,11 +3215,9 @@ int btrfs_finish_ordered_io(struct btrfs_ordered_extent *ordered_extent)
+ 		goto out;
+ 	}
+ 
+-	if (btrfs_is_zoned(fs_info)) {
+-		btrfs_rewrite_logical_zoned(ordered_extent);
++	if (btrfs_is_zoned(fs_info))
+ 		btrfs_zone_finish_endio(fs_info, ordered_extent->disk_bytenr,
+ 					ordered_extent->disk_num_bytes);
+-	}
+ 
+ 	if (test_bit(BTRFS_ORDERED_TRUNCATED, &ordered_extent->flags)) {
+ 		truncated = true;
+@@ -3387,6 +3385,14 @@ int btrfs_finish_ordered_io(struct btrfs_ordered_extent *ordered_extent)
+ 	return ret;
+ }
+ 
++int btrfs_finish_ordered_io(struct btrfs_ordered_extent *ordered)
++{
++	if (btrfs_is_zoned(btrfs_sb(ordered->inode->i_sb)) &&
++	    !test_bit(BTRFS_ORDERED_IOERR, &ordered->flags))
++		btrfs_finish_ordered_zoned(ordered);
++	return btrfs_finish_one_ordered(ordered);
++}
++
+ void btrfs_writepage_endio_finish_ordered(struct btrfs_inode *inode,
+ 					  struct page *page, u64 start,
+ 					  u64 end, bool uptodate)
+diff --git a/fs/btrfs/ordered-data.h b/fs/btrfs/ordered-data.h
+index 0ae0f52c148f..828bb039634a 100644
+--- a/fs/btrfs/ordered-data.h
++++ b/fs/btrfs/ordered-data.h
+@@ -161,6 +161,7 @@ btrfs_ordered_inode_tree_init(struct btrfs_ordered_inode_tree *t)
+ 	t->last = NULL;
+ }
+ 
++int btrfs_finish_one_ordered(struct btrfs_ordered_extent *ordered_extent);
+ int btrfs_finish_ordered_io(struct btrfs_ordered_extent *ordered_extent);
+ 
+ void btrfs_put_ordered_extent(struct btrfs_ordered_extent *entry);
+diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+index b55b0d4ee86f..b4dd018ba332 100644
+--- a/fs/btrfs/zoned.c
++++ b/fs/btrfs/zoned.c
+@@ -15,6 +15,7 @@
+ #include "transaction.h"
+ #include "dev-replace.h"
+ #include "space-info.h"
++#include "super.h"
+ #include "fs.h"
+ #include "accessors.h"
+ #include "bio.h"
+@@ -1665,17 +1666,11 @@ void btrfs_record_physical_zoned(struct btrfs_bio *bbio)
+ 		sum->logical += physical - bbio->orig_physical;
+ }
+ 
+-void btrfs_rewrite_logical_zoned(struct btrfs_ordered_extent *ordered)
++static void btrfs_rewrite_logical_zoned(struct btrfs_ordered_extent *ordered,
++					u64 logical)
+ {
+-	struct btrfs_inode *inode = BTRFS_I(ordered->inode);
+-	struct extent_map_tree *em_tree = &inode->extent_tree;
++	struct extent_map_tree *em_tree = &BTRFS_I(ordered->inode)->extent_tree;
+ 	struct extent_map *em;
+-	struct btrfs_ordered_sum *sum =
+-		list_first_entry(&ordered->list, typeof(*sum), list);
+-	u64 logical = sum->logical;
+-
+-	if (ordered->disk_bytenr == logical)
+-		goto out;
+ 
+ 	ordered->disk_bytenr = logical;
+ 
+@@ -1685,6 +1680,54 @@ void btrfs_rewrite_logical_zoned(struct btrfs_ordered_extent *ordered)
+ 	em->block_start = logical;
+ 	free_extent_map(em);
+ 	write_unlock(&em_tree->lock);
++}
++
++static bool btrfs_zoned_split_ordered(struct btrfs_ordered_extent *ordered,
++				      u64 logical, u64 len)
++{
++	struct btrfs_ordered_extent *new;
++
++	if (!test_bit(BTRFS_ORDERED_NOCOW, &ordered->flags) &&
++	    split_extent_map(BTRFS_I(ordered->inode), ordered->file_offset,
++			     ordered->num_bytes, len))
++		return false;
++
++	new = btrfs_split_ordered_extent(ordered, len);
++	if (IS_ERR(new))
++		return false;
++
++	if (new->disk_bytenr != logical)
++		btrfs_rewrite_logical_zoned(new, logical);
++	btrfs_finish_one_ordered(new);
++	return true;
++}
++
++void btrfs_finish_ordered_zoned(struct btrfs_ordered_extent *ordered)
++{
++	struct btrfs_inode *inode = BTRFS_I(ordered->inode);
++	struct btrfs_fs_info *fs_info = inode->root->fs_info;
++	struct btrfs_ordered_sum *sum =
++		list_first_entry(&ordered->list, typeof(*sum), list);
++	u64 logical = sum->logical;
++	u64 len = sum->len;
++
++	while (len < ordered->disk_num_bytes) {
++		sum = list_next_entry(sum, list);
++		if (sum->logical == logical + len) {
++			len += sum->len;
++			continue;
++		}
++		if (!btrfs_zoned_split_ordered(ordered, logical, len)) {
++			set_bit(BTRFS_ORDERED_IOERR, &ordered->flags);
++			btrfs_err(fs_info, "failed to split ordered extent");
++			goto out;
++		}
++		logical = sum->logical;
++		len = sum->len;
++	}
++
++	if (ordered->disk_bytenr != logical)
++		btrfs_rewrite_logical_zoned(ordered, logical);
+ 
+ out:
+ 	/*
+@@ -1694,9 +1737,12 @@ void btrfs_rewrite_logical_zoned(struct btrfs_ordered_extent *ordered)
+ 	 * here so that we don't attempt to log the csums later.
+ 	 */
+ 	if ((inode->flags & BTRFS_INODE_NODATASUM) ||
+-	    test_bit(BTRFS_FS_STATE_NO_CSUMS, &inode->root->fs_info->fs_state)) {
+-		list_del(&sum->list);
+-		kfree(sum);
++	    test_bit(BTRFS_FS_STATE_NO_CSUMS, &fs_info->fs_state)) {
++		while ((sum = list_first_entry_or_null(&ordered->list,
++						       typeof(*sum), list))) {
++			list_del(&sum->list);
++			kfree(sum);
++		}
+ 	}
+ }
+ 
+diff --git a/fs/btrfs/zoned.h b/fs/btrfs/zoned.h
+index 3058ef559c98..27322b926038 100644
+--- a/fs/btrfs/zoned.h
++++ b/fs/btrfs/zoned.h
+@@ -30,6 +30,8 @@ struct btrfs_zoned_device_info {
+ 	struct blk_zone sb_zones[2 * BTRFS_SUPER_MIRROR_MAX];
+ };
+ 
++void btrfs_finish_ordered_zoned(struct btrfs_ordered_extent *ordered);
++
+ #ifdef CONFIG_BLK_DEV_ZONED
+ int btrfs_get_dev_zone(struct btrfs_device *device, u64 pos,
+ 		       struct blk_zone *zone);
+@@ -56,7 +58,6 @@ void btrfs_redirty_list_add(struct btrfs_transaction *trans,
+ 			    struct extent_buffer *eb);
+ bool btrfs_use_zone_append(struct btrfs_bio *bbio);
+ void btrfs_record_physical_zoned(struct btrfs_bio *bbio);
+-void btrfs_rewrite_logical_zoned(struct btrfs_ordered_extent *ordered);
+ bool btrfs_check_meta_write_pointer(struct btrfs_fs_info *fs_info,
+ 				    struct extent_buffer *eb,
+ 				    struct btrfs_block_group **cache_ret);
+@@ -188,9 +189,6 @@ static inline void btrfs_record_physical_zoned(struct btrfs_bio *bbio)
+ {
+ }
+ 
+-static inline void btrfs_rewrite_logical_zoned(
+-				struct btrfs_ordered_extent *ordered) { }
+-
+ static inline bool btrfs_check_meta_write_pointer(struct btrfs_fs_info *fs_info,
+ 			       struct extent_buffer *eb,
+ 			       struct btrfs_block_group **cache_ret)
+-- 
+2.35.3
+
