@@ -1,0 +1,223 @@
+From: Wen Gu <guwen@linux.alibaba.com>
+Date: Sat, 22 Jan 2022 17:43:09 +0800
+Subject: [PATCH] net/smc: Transitional solution for clcsock race issue
+Git-commit: c0bf3d8a943b6f2e912b7c1de03e2ef28e76f760
+Patch-mainline: v5.17-rc2
+References: CVE-2022-48751 bsc#1226653
+
+We encountered a crash in smc_setsockopt() and it is caused by
+accessing smc->clcsock after clcsock was released.
+
+ BUG: kernel NULL pointer dereference, address: 0000000000000020
+ #PF: supervisor read access in kernel mode
+ #PF: error_code(0x0000) - not-present page
+ PGD 0 P4D 0
+ Oops: 0000 [#1] PREEMPT SMP PTI
+ CPU: 1 PID: 50309 Comm: nginx Kdump: loaded Tainted: G E     5.16.0-rc4+ #53
+ RIP: 0010:smc_setsockopt+0x59/0x280 [smc]
+ Call Trace:
+  <TASK>
+  __sys_setsockopt+0xfc/0x190
+  __x64_sys_setsockopt+0x20/0x30
+  do_syscall_64+0x34/0x90
+  entry_SYSCALL_64_after_hwframe+0x44/0xae
+ RIP: 0033:0x7f16ba83918e
+  </TASK>
+
+This patch tries to fix it by holding clcsock_release_lock and
+checking whether clcsock has already been released before access.
+
+In case that a crash of the same reason happens in smc_getsockopt()
+or smc_switch_to_fallback(), this patch also checkes smc->clcsock
+in them too. And the caller of smc_switch_to_fallback() will identify
+whether fallback succeeds according to the return value.
+
+[hare: ported to SLE12-SP5]
+
+Fixes: fd57770dd198 ("net/smc: wait for pending work before clcsock release_sock")
+Link: https://lore.kernel.org/lkml/5dd7ffd1-28e2-24cc-9442-1defec27375e@linux.ibm.com/T/
+Signed-off-by: Wen Gu <guwen@linux.alibaba.com>
+Acked-by: Karsten Graul <kgraul@linux.ibm.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ net/sched/act_mirred.c |  8 ++++--
+ net/smc/af_smc.c       | 61 +++++++++++++++++++++++++++++++++---------
+ 2 files changed, 55 insertions(+), 14 deletions(-)
+
+diff --git a/net/sched/act_mirred.c b/net/sched/act_mirred.c
+index f8e49d7c3816f..01808b0722b4d 100644
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@ -201,6 +201,7 @@ static int tcf_mirred_act(struct sk_buff *skb, const struct tc_action *a,
+ 	bool use_reinsert;
+ 	bool want_ingress;
+ 	bool is_redirect;
++	bool at_ingress;
+ 	int m_eaction;
+ 	int mac_len;
+ 
+@@ -239,9 +240,10 @@ static int tcf_mirred_act(struct sk_buff *skb, const struct tc_action *a,
+ 	 * and devices expect a mac header on xmit, then mac push/pull is
+ 	 * needed.
+ 	 */
++	at_ingress = skb_at_tc_ingress(skb);
+ 	want_ingress = tcf_mirred_act_wants_ingress(m_eaction);
+-	if (skb_at_tc_ingress(skb) != want_ingress && m_mac_header_xmit) {
+-		if (!skb_at_tc_ingress(skb)) {
++	if (at_ingress != want_ingress && m_mac_header_xmit) {
++		if (!at_ingress) {
+ 			/* caught at egress, act ingress: pull mac */
+ 			mac_len = skb_network_header(skb) - skb_mac_header(skb);
+ 			skb_pull_rcsum(skb2, mac_len);
+@@ -270,6 +272,8 @@ static int tcf_mirred_act(struct sk_buff *skb, const struct tc_action *a,
+ 
+ 	if (!want_ingress)
+ 		err = dev_queue_xmit(skb2);
++	else if (!at_ingress)
++		err = netif_rx(skb);
+ 	else
+ 		err = netif_receive_skb(skb2);
+ 
+diff --git a/net/smc/af_smc.c b/net/smc/af_smc.c
+index 9d2c763535fad..148f5dee5814a 100644
+--- a/net/smc/af_smc.c
++++ b/net/smc/af_smc.c
+@@ -452,8 +452,13 @@ static void smc_link_save_peer_info(struct smc_link *link,
+ 	link->peer_mtu = clc->qp_mtu;
+ }
+ 
+-static void smc_switch_to_fallback(struct smc_sock *smc)
++static int smc_switch_to_fallback(struct smc_sock *smc)
+ {
++	mutex_lock(&smc->clcsock_release_lock);
++	if (!smc->clcsock) {
++		mutex_unlock(&smc->clcsock_release_lock);
++		return -EBADF;
++	}
+ 	smc->use_fallback = true;
+ 	if (smc->sk.sk_socket && smc->sk.sk_socket->file) {
+ 		smc->clcsock->file = smc->sk.sk_socket->file;
+@@ -461,12 +466,22 @@ static void smc_switch_to_fallback(struct smc_sock *smc)
+ 		smc->clcsock->wq->fasync_list =
+ 			smc->sk.sk_socket->wq->fasync_list;
+ 	}
++	mutex_unlock(&smc->clcsock_release_lock);
++	return 0;
+ }
+ 
+ /* fall back during connect */
+ static int smc_connect_fallback(struct smc_sock *smc, int reason_code)
+ {
+-	smc_switch_to_fallback(smc);
++	struct net *net = sock_net(&smc->sk);
++	int rc = 0;
++
++	rc = smc_switch_to_fallback(smc);
++	if (rc) { /* fallback fails */
++		if (smc->sk.sk_state == SMC_INIT)
++			sock_put(&smc->sk); /* passive closing */
++		return rc;
++	}
+ 	smc->fallback_rsn = reason_code;
+ 	smc_copy_sock_settings_to_clc(smc);
+ 	smc->connect_nonblock = 0;
+@@ -1112,11 +1127,12 @@ static void smc_listen_decline(struct smc_sock *new_smc, int reason_code,
+ 		smc_lgr_cleanup_early(&new_smc->conn);
+ 	else
+ 		smc_conn_free(&new_smc->conn);
+-	if (reason_code < 0) { /* error, no fallback possible */
++	if (reason_code < 0 ||
++	    smc_switch_to_fallback(new_smc)) {
++		/* error, no fallback possible */
+ 		smc_listen_out_err(new_smc);
+ 		return;
+ 	}
+-	smc_switch_to_fallback(new_smc);
+ 	new_smc->fallback_rsn = reason_code;
+ 	if (reason_code && reason_code != SMC_CLC_DECL_PEERDECL) {
+ 		if (smc_clc_send_decline(new_smc, reason_code) < 0) {
+@@ -1266,9 +1282,13 @@ static void smc_listen_work(struct work_struct *work)
+ 
+ 	/* check if peer is smc capable */
+ 	if (!tcp_sk(newclcsock->sk)->syn_smc) {
+-		smc_switch_to_fallback(new_smc);
+-		new_smc->fallback_rsn = SMC_CLC_DECL_PEERNOSMC;
+-		smc_listen_out_connected(new_smc);
++		rc = smc_switch_to_fallback(new_smc);
++		if (rc)
++			smc_listen_out_err(new_smc);
++		else {
++			new_smc->fallback_rsn = SMC_CLC_DECL_PEERNOSMC;
++			smc_listen_out_connected(new_smc);
++		}
+ 		return;
+ 	}
+ 
+@@ -1545,7 +1565,9 @@ static int smc_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+ 
+ 	if (msg->msg_flags & MSG_FASTOPEN) {
+ 		if (sk->sk_state == SMC_INIT && !smc->connect_nonblock) {
+-			smc_switch_to_fallback(smc);
++			rc = smc_switch_to_fallback(smc);
++			if (rc)
++				goto out;
+ 			smc->fallback_rsn = SMC_CLC_DECL_OPTUNSUPP;
+ 		} else {
+ 			rc = -EINVAL;
+@@ -1735,12 +1757,18 @@ static int smc_setsockopt(struct socket *sock, int level, int optname,
+ 	/* generic setsockopts reaching us here always apply to the
+ 	 * CLC socket
+ 	 */
++	mutex_lock(&smc->clcsock_release_lock);
++	if (!smc->clcsock) {
++		mutex_unlock(&smc->clcsock_release_lock);
++		return -EBADF;
++	}
+ 	rc = smc->clcsock->ops->setsockopt(smc->clcsock, level, optname,
+ 					   optval, optlen);
+ 	if (smc->clcsock->sk->sk_err) {
+ 		sk->sk_err = smc->clcsock->sk->sk_err;
+ 		sk->sk_error_report(sk);
+ 	}
++	mutex_unlock(&smc->clcsock_release_lock);
+ 
+ 	if (optlen < sizeof(int))
+ 		return -EINVAL;
+@@ -1755,8 +1783,9 @@ static int smc_setsockopt(struct socket *sock, int level, int optname,
+ 	case TCP_FASTOPEN_CONNECT:
+ 		/* option not supported by SMC */
+ 		if (sk->sk_state == SMC_INIT && !smc->connect_nonblock) {
+-			smc_switch_to_fallback(smc);
+-			smc->fallback_rsn = SMC_CLC_DECL_OPTUNSUPP;
++			rc = smc_switch_to_fallback(smc);
++			if (!rc)
++				smc->fallback_rsn = SMC_CLC_DECL_OPTUNSUPP;
+ 		} else {
+ 			rc = -EINVAL;
+ 		}
+@@ -1795,11 +1824,19 @@ static int smc_getsockopt(struct socket *sock, int level, int optname,
+ 			  char __user *optval, int __user *optlen)
+ {
+ 	struct smc_sock *smc;
++	int rc;
+ 
+ 	smc = smc_sk(sock->sk);
++	mutex_lock(&smc->clcsock_release_lock);
++	if (!smc->clcsock) {
++		mutex_unlock(&smc->clcsock_release_lock);
++		return -EBADF;
++	}
+ 	/* socket options apply to the CLC socket */
+-	return smc->clcsock->ops->getsockopt(smc->clcsock, level, optname,
+-					     optval, optlen);
++	rc = smc->clcsock->ops->getsockopt(smc->clcsock, level, optname,
++					   optval, optlen);
++	mutex_unlock(&smc->clcsock_release_lock);
++	return rc;
+ }
+ 
+ static int smc_ioctl(struct socket *sock, unsigned int cmd,
+-- 
+2.35.3
+
