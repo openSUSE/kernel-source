@@ -295,6 +295,11 @@ class InputEntry(object):
                     "manually maintained section below sorted section." % (
                         name, mainline,))
             return
+        elif re.match("^(Not yet)", mainline_tags[0], re.IGNORECASE):
+            print("Ignoring Git-commit since patch is out-of-tree "
+                  "(\"Patch-mainline: %s\")" % (mainline_tags[0],))
+            self.dest_head = git_sort.oot
+            return
 
         class BadTag(Exception):
             pass

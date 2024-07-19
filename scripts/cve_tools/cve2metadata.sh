@@ -13,6 +13,11 @@ then
 	exit 1
 fi
 
+if [ -z "$CVEKERNELTREE" ]
+then
+	export CVEKERNELTREE=$LINUX_GIT
+fi
+
 . scripts/common-functions
 
 while [ $# -gt 0 ]
