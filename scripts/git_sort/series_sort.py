@@ -39,7 +39,7 @@ import sys
 
 import pygit2_wrapper as pygit2
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "../python"))
+sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), "../python"))
 import suse_git.exc as exc
 import git_sort
 import lib
