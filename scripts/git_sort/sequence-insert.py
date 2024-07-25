@@ -28,9 +28,11 @@ prints out which patch that is. Use in conjunction with sequence-patch.sh:
 
 import argparse
 import os
+import os.path
 import sys
 
-import exc
+sys.path.append(os.path.join(os.path.dirname(__file__), "../python"))
+import suse_git.exc as exc
 import lib
 
 
