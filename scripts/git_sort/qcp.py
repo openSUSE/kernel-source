@@ -29,9 +29,10 @@ import tempfile
 
 import pygit2_wrapper as pygit2
 
-import exc
+sys.path.append(os.path.join(os.path.dirname(__file__), "../python"))
+import suse_git.exc as exc
+from suse_git.patch import Patch
 import lib
-from patch import Patch
 import series_conf
 
 
