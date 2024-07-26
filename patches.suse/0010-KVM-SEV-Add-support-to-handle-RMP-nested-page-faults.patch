@@ -1,0 +1,326 @@
+From: Brijesh Singh <brijesh.singh@amd.com>
+Date: Wed, 1 May 2024 03:52:01 -0500
+Subject: [PATCH 10/19] KVM: SEV: Add support to handle RMP nested page faults
+Git-commit: c63cf135cc996fc88be95a9ba8b80e3cff8d275b
+Patch-mainline: v6.11-rc1
+References: jsc#PED-5122
+
+When SEV-SNP is enabled in the guest, the hardware places restrictions
+on all memory accesses based on the contents of the RMP table. When
+hardware encounters RMP check failure caused by the guest memory access
+it raises the #NPF. The error code contains additional information on
+the access type. See the APM volume 2 for additional information.
+
+When using gmem, RMP faults resulting from mismatches between the state
+in the RMP table vs. what the guest expects via its page table result
+in KVM_EXIT_MEMORY_FAULTs being forwarded to userspace to handle. This
+means the only expected case that needs to be handled in the kernel is
+when the page size of the entry in the RMP table is larger than the
+mapping in the nested page table, in which case a PSMASH instruction
+needs to be issued to split the large RMP entry into individual 4K
+entries so that subsequent accesses can succeed.
+
+Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+Co-developed-by: Michael Roth <michael.roth@amd.com>
+Signed-off-by: Michael Roth <michael.roth@amd.com>
+Signed-off-by: Ashish Kalra <ashish.kalra@amd.com>
+Message-ID: <20240501085210.2213060-12-michael.roth@amd.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ arch/x86/include/asm/kvm_host.h |   1 +
+ arch/x86/include/asm/sev.h      |   3 +
+ arch/x86/kvm/mmu.h              |   2 -
+ arch/x86/kvm/mmu/mmu.c          |   1 +
+ arch/x86/kvm/svm/sev.c          | 109 ++++++++++++++++++++++++++++++++
+ arch/x86/kvm/svm/svm.c          |  14 ++--
+ arch/x86/kvm/svm/svm.h          |   3 +
+ arch/x86/kvm/trace.h            |  31 +++++++++
+ arch/x86/kvm/x86.c              |   1 +
+ 9 files changed, 159 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 8340fe9c4459..80dfcdab87eb 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1942,6 +1942,7 @@ void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
+ 				   const struct kvm_memory_slot *memslot);
+ void kvm_mmu_invalidate_mmio_sptes(struct kvm *kvm, u64 gen);
+ void kvm_mmu_change_mmu_pages(struct kvm *kvm, unsigned long kvm_nr_mmu_pages);
++void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end);
+ 
+ int load_pdptrs(struct kvm_vcpu *vcpu, unsigned long cr3);
+ 
+diff --git a/arch/x86/include/asm/sev.h b/arch/x86/include/asm/sev.h
+index 93ed60080cfe..14394407245c 100644
+--- a/arch/x86/include/asm/sev.h
++++ b/arch/x86/include/asm/sev.h
+@@ -91,6 +91,9 @@ extern bool handle_vc_boot_ghcb(struct pt_regs *regs);
+ /* RMUPDATE detected 4K page and 2MB page overlap. */
+ #define RMPUPDATE_FAIL_OVERLAP		4
+ 
++/* PSMASH failed due to concurrent access by another CPU */
++#define PSMASH_FAIL_INUSE		3
++
+ /* RMP page size */
+ #define RMP_PG_SIZE_4K			0
+ #define RMP_PG_SIZE_2M			1
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index 2e454316f2a2..dc80e72e4848 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -253,8 +253,6 @@ static inline bool kvm_mmu_honors_guest_mtrrs(struct kvm *kvm)
+ 	return __kvm_mmu_honors_guest_mtrrs(kvm_arch_has_noncoherent_dma(kvm));
+ }
+ 
+-void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end);
+-
+ int kvm_arch_write_log_dirty(struct kvm_vcpu *vcpu);
+ 
+ int kvm_mmu_post_init_vm(struct kvm *kvm);
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index b68151eec4b4..5095fb46713e 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -6802,6 +6802,7 @@ static bool kvm_mmu_zap_collapsible_spte(struct kvm *kvm,
+ 
+ 	return need_tlb_flush;
+ }
++EXPORT_SYMBOL_GPL(kvm_zap_gfn_range);
+ 
+ static void kvm_rmap_zap_collapsible_sptes(struct kvm *kvm,
+ 					   const struct kvm_memory_slot *slot)
+diff --git a/arch/x86/kvm/svm/sev.c b/arch/x86/kvm/svm/sev.c
+index 122219b3d3b7..f01cee8278ab 100644
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@ -3465,6 +3465,23 @@ static void set_ghcb_msr(struct vcpu_svm *svm, u64 value)
+ 	svm->vmcb->control.ghcb_gpa = value;
+ }
+ 
++static int snp_rmptable_psmash(kvm_pfn_t pfn)
++{
++	int ret;
++
++	pfn = pfn & ~(KVM_PAGES_PER_HPAGE(PG_LEVEL_2M) - 1);
++
++	/*
++	 * PSMASH_FAIL_INUSE indicates another processor is modifying the
++	 * entry, so retry until that's no longer the case.
++	 */
++	do {
++		ret = psmash(pfn);
++	} while (ret == PSMASH_FAIL_INUSE);
++
++	return ret;
++}
++
+ static int snp_complete_psc_msr(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+@@ -4229,3 +4246,95 @@ struct page *snp_safe_alloc_page(struct kvm_vcpu *vcpu)
+ 
+ 	return p;
+ }
++
++void sev_handle_rmp_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code)
++{
++	struct kvm_memory_slot *slot;
++	struct kvm *kvm = vcpu->kvm;
++	int order, rmp_level, ret;
++	bool assigned;
++	kvm_pfn_t pfn;
++	gfn_t gfn;
++
++	gfn = gpa >> PAGE_SHIFT;
++
++	/*
++	 * The only time RMP faults occur for shared pages is when the guest is
++	 * triggering an RMP fault for an implicit page-state change from
++	 * shared->private. Implicit page-state changes are forwarded to
++	 * userspace via KVM_EXIT_MEMORY_FAULT events, however, so RMP faults
++	 * for shared pages should not end up here.
++	 */
++	if (!kvm_mem_is_private(kvm, gfn)) {
++		pr_warn_ratelimited("SEV: Unexpected RMP fault for non-private GPA 0x%llx\n",
++				    gpa);
++		return;
++	}
++
++	slot = gfn_to_memslot(kvm, gfn);
++	if (!kvm_slot_can_be_private(slot)) {
++		pr_warn_ratelimited("SEV: Unexpected RMP fault, non-private slot for GPA 0x%llx\n",
++				    gpa);
++		return;
++	}
++
++	ret = kvm_gmem_get_pfn(kvm, slot, gfn, &pfn, &order);
++	if (ret) {
++		pr_warn_ratelimited("SEV: Unexpected RMP fault, no backing page for private GPA 0x%llx\n",
++				    gpa);
++		return;
++	}
++
++	ret = snp_lookup_rmpentry(pfn, &assigned, &rmp_level);
++	if (ret || !assigned) {
++		pr_warn_ratelimited("SEV: Unexpected RMP fault, no assigned RMP entry found for GPA 0x%llx PFN 0x%llx error %d\n",
++				    gpa, pfn, ret);
++		goto out_no_trace;
++	}
++
++	/*
++	 * There are 2 cases where a PSMASH may be needed to resolve an #NPF
++	 * with PFERR_GUEST_RMP_BIT set:
++	 *
++	 * 1) RMPADJUST/PVALIDATE can trigger an #NPF with PFERR_GUEST_SIZEM
++	 *    bit set if the guest issues them with a smaller granularity than
++	 *    what is indicated by the page-size bit in the 2MB RMP entry for
++	 *    the PFN that backs the GPA.
++	 *
++	 * 2) Guest access via NPT can trigger an #NPF if the NPT mapping is
++	 *    smaller than what is indicated by the 2MB RMP entry for the PFN
++	 *    that backs the GPA.
++	 *
++	 * In both these cases, the corresponding 2M RMP entry needs to
++	 * be PSMASH'd to 512 4K RMP entries.  If the RMP entry is already
++	 * split into 4K RMP entries, then this is likely a spurious case which
++	 * can occur when there are concurrent accesses by the guest to a 2MB
++	 * GPA range that is backed by a 2MB-aligned PFN who's RMP entry is in
++	 * the process of being PMASH'd into 4K entries. These cases should
++	 * resolve automatically on subsequent accesses, so just ignore them
++	 * here.
++	 */
++	if (rmp_level == PG_LEVEL_4K)
++		goto out;
++
++	ret = snp_rmptable_psmash(pfn);
++	if (ret) {
++		/*
++		 * Look it up again. If it's 4K now then the PSMASH may have
++		 * raced with another process and the issue has already resolved
++		 * itself.
++		 */
++		if (!snp_lookup_rmpentry(pfn, &assigned, &rmp_level) &&
++		    assigned && rmp_level == PG_LEVEL_4K)
++			goto out;
++
++		pr_warn_ratelimited("SEV: Unable to split RMP entry for GPA 0x%llx PFN 0x%llx ret %d\n",
++				    gpa, pfn, ret);
++	}
++
++	kvm_zap_gfn_range(kvm, gfn, gfn + PTRS_PER_PMD);
++out:
++	trace_kvm_rmp_fault(vcpu, gpa, pfn, error_code, rmp_level, ret);
++out_no_trace:
++	put_page(pfn_to_page(pfn));
++}
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 66d5e2e46a66..bdaf39571817 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -2044,6 +2044,7 @@ static int pf_interception(struct kvm_vcpu *vcpu)
+ static int npf_interception(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
++	int rc;
+ 
+ 	u64 fault_address = svm->vmcb->control.exit_info_2;
+ 	u64 error_code = svm->vmcb->control.exit_info_1;
+@@ -2061,10 +2062,15 @@ static int npf_interception(struct kvm_vcpu *vcpu)
+ 		error_code |= PFERR_PRIVATE_ACCESS;
+ 
+ 	trace_kvm_page_fault(vcpu, fault_address, error_code);
+-	return kvm_mmu_page_fault(vcpu, fault_address, error_code,
+-			static_cpu_has(X86_FEATURE_DECODEASSISTS) ?
+-			svm->vmcb->control.insn_bytes : NULL,
+-			svm->vmcb->control.insn_len);
++	rc = kvm_mmu_page_fault(vcpu, fault_address, error_code,
++				static_cpu_has(X86_FEATURE_DECODEASSISTS) ?
++				svm->vmcb->control.insn_bytes : NULL,
++				svm->vmcb->control.insn_len);
++
++	if (rc > 0 && error_code & PFERR_GUEST_RMP_MASK)
++		sev_handle_rmp_fault(vcpu, fault_address, error_code);
++
++	return rc;
+ }
+ 
+ static int db_interception(struct kvm_vcpu *vcpu)
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index 32d37ef5f580..36b573427b85 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -728,6 +728,7 @@ void sev_hardware_unsetup(void);
+ int sev_cpu_init(struct svm_cpu_data *sd);
+ int sev_dev_get_attr(u32 group, u64 attr, u64 *val);
+ extern unsigned int max_sev_asid;
++void sev_handle_rmp_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code);
+ #else
+ static inline struct page *snp_safe_alloc_page(struct kvm_vcpu *vcpu) {
+ 	return alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+@@ -741,6 +742,8 @@ static inline void sev_hardware_unsetup(void) {}
+ static inline int sev_cpu_init(struct svm_cpu_data *sd) { return 0; }
+ static inline int sev_dev_get_attr(u32 group, u64 attr, u64 *val) { return -ENXIO; }
+ #define max_sev_asid 0
++static inline void sev_handle_rmp_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code) {}
++
+ #endif
+ 
+ /* vmenter.S */
+diff --git a/arch/x86/kvm/trace.h b/arch/x86/kvm/trace.h
+index 9d0b02ef307e..f2ff6cc96854 100644
+--- a/arch/x86/kvm/trace.h
++++ b/arch/x86/kvm/trace.h
+@@ -1834,6 +1834,37 @@ TRACE_EVENT(kvm_vmgexit_msr_protocol_exit,
+ 		  __entry->vcpu_id, __entry->ghcb_gpa, __entry->result)
+ );
+ 
++/*
++ * Tracepoint for #NPFs due to RMP faults.
++ */
++TRACE_EVENT(kvm_rmp_fault,
++	TP_PROTO(struct kvm_vcpu *vcpu, u64 gpa, u64 pfn, u64 error_code,
++		 int rmp_level, int psmash_ret),
++	TP_ARGS(vcpu, gpa, pfn, error_code, rmp_level, psmash_ret),
++
++	TP_STRUCT__entry(
++		__field(unsigned int, vcpu_id)
++		__field(u64, gpa)
++		__field(u64, pfn)
++		__field(u64, error_code)
++		__field(int, rmp_level)
++		__field(int, psmash_ret)
++	),
++
++	TP_fast_assign(
++		__entry->vcpu_id	= vcpu->vcpu_id;
++		__entry->gpa		= gpa;
++		__entry->pfn		= pfn;
++		__entry->error_code	= error_code;
++		__entry->rmp_level	= rmp_level;
++		__entry->psmash_ret	= psmash_ret;
++	),
++
++	TP_printk("vcpu %u gpa %016llx pfn 0x%llx error_code 0x%llx rmp_level %d psmash_ret %d",
++		  __entry->vcpu_id, __entry->gpa, __entry->pfn,
++		  __entry->error_code, __entry->rmp_level, __entry->psmash_ret)
++);
++
+ #endif /* _TRACE_KVM_H */
+ 
+ #undef TRACE_INCLUDE_PATH
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 4b9ee2ca5675..a143c26a9221 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -13997,6 +13997,7 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_enter);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_exit);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_enter);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_exit);
++EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_rmp_fault);
+ 
+ static int __init kvm_x86_init(void)
+ {
+-- 
+2.45.1
+
