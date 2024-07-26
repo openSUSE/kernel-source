@@ -648,10 +648,10 @@ class SortIndex(object):
                            (self.repo.revparse_single(tag), tag[10:],)
                            for tag in self.repo.listall_references()
                            if self.version_match.match(tag)
-                       ] if obj_tag.type == pygit2.GIT_OBJ_TAG]
+                       ] if obj_tag.type == pygit2.GIT_OBJECT_TAG]
             revs = [(history[str(obj.id)], tag,)
                     for obj, tag in objects
-                    if obj.type == pygit2.GIT_OBJ_COMMIT]
+                    if obj.type == pygit2.GIT_OBJECT_COMMIT]
             revs.sort(key=operator.itemgetter(0))
             self.version_indexes = list(zip(*revs))
 
