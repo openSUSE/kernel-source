@@ -1,0 +1,184 @@
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 7 May 2024 12:54:03 -0400
+Subject: [PATCH 5/9] KVM: guest_memfd: Add hook for initializing memory
+Git-commit: 3bb2531e20bff99f9cd8719ee7aea8bd82687173
+Patch-mainline: v6.11-rc1
+References: jsc#PED-5122
+
+guest_memfd pages are generally expected to be in some arch-defined
+initial state prior to using them for guest memory. For SEV-SNP this
+initial state is 'private', or 'guest-owned', and requires additional
+operations to move these pages into a 'private' state by updating the
+corresponding entries the RMP table.
+
+Allow for an arch-defined hook to handle updates of this sort, and go
+ahead and implement one for x86 so KVM implementations like AMD SVM can
+register a kvm_x86_ops callback to handle these updates for SEV-SNP
+guests.
+
+The preparation callback is always called when allocating/grabbing
+folios via gmem, and it is up to the architecture to keep track of
+whether or not the pages are already in the expected state (e.g. the RMP
+table in the case of SEV-SNP).
+
+In some cases, it is necessary to defer the preparation of the pages to
+handle things like in-place encryption of initial guest memory payloads
+before marking these pages as 'private'/'guest-owned'.  Add an argument
+(always true for now) to kvm_gmem_get_folio() that allows for the
+preparation callback to be bypassed.  To detect possible issues in
+the way userspace initializes memory, it is only possible to add an
+unprepared page if it is not already included in the filemap.
+
+Link: https://lore.kernel.org/lkml/ZLqVdvsF11Ddo7Dq@google.com/
+Co-developed-by: Michael Roth <michael.roth@amd.com>
+Signed-off-by: Michael Roth <michael.roth@amd.com>
+Message-Id: <20231230172351.574091-5-michael.roth@amd.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ arch/x86/include/asm/kvm-x86-ops.h |    1 
+ arch/x86/include/asm/kvm_host.h    |    1 
+ arch/x86/kvm/x86.c                 |    6 ++++
+ include/linux/kvm_host.h           |    5 +++
+ virt/kvm/Kconfig                   |    4 ++
+ virt/kvm/guest_memfd.c             |   51 ++++++++++++++++++++++++++++++++++---
+ 6 files changed, 65 insertions(+), 3 deletions(-)
+
+--- a/arch/x86/include/asm/kvm-x86-ops.h
++++ b/arch/x86/include/asm/kvm-x86-ops.h
+@@ -140,6 +140,7 @@ KVM_X86_OP(vcpu_deliver_sipi_vector)
+ KVM_X86_OP_OPTIONAL_RET0(vcpu_get_apicv_inhibit_reasons);
+ KVM_X86_OP_OPTIONAL(get_untagged_addr)
+ KVM_X86_OP_OPTIONAL(alloc_apic_backing_page)
++KVM_X86_OP_OPTIONAL_RET0(gmem_prepare)
+ 
+ #undef KVM_X86_OP
+ #undef KVM_X86_OP_OPTIONAL
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1805,6 +1805,7 @@ struct kvm_x86_ops {
+ 	gva_t (*get_untagged_addr)(struct kvm_vcpu *vcpu, gva_t gva, unsigned int flags);
+ 
+ 	void *(*alloc_apic_backing_page)(struct kvm_vcpu *vcpu);
++	int (*gmem_prepare)(struct kvm *kvm, kvm_pfn_t pfn, gfn_t gfn, int max_order);
+ };
+ 
+ struct kvm_x86_nested_ops {
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -13631,6 +13631,12 @@ bool kvm_arch_no_poll(struct kvm_vcpu *v
+ }
+ EXPORT_SYMBOL_GPL(kvm_arch_no_poll);
+ 
++#ifdef CONFIG_HAVE_KVM_GMEM_PREPARE
++int kvm_arch_gmem_prepare(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn, int max_order)
++{
++	return static_call(kvm_x86_gmem_prepare)(kvm, pfn, gfn, max_order);
++}
++#endif
+ 
+ int kvm_spec_ctrl_test_value(u64 value)
+ {
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -2387,4 +2387,9 @@ static inline int kvm_gmem_get_pfn(struc
+ }
+ #endif /* CONFIG_KVM_PRIVATE_MEM */
+ 
++#ifdef CONFIG_HAVE_KVM_GMEM_PREPARE
++int kvm_arch_gmem_prepare(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn, int max_order);
++bool kvm_arch_gmem_prepare_needed(struct kvm *kvm);
++#endif
++
+ #endif
+--- a/virt/kvm/Kconfig
++++ b/virt/kvm/Kconfig
+@@ -111,3 +111,7 @@ config KVM_GENERIC_PRIVATE_MEM
+        select KVM_GENERIC_MEMORY_ATTRIBUTES
+        select KVM_PRIVATE_MEM
+        bool
++
++config HAVE_KVM_GMEM_PREPARE
++       bool
++       depends on KVM_PRIVATE_MEM
+--- a/virt/kvm/guest_memfd.c
++++ b/virt/kvm/guest_memfd.c
+@@ -13,7 +13,43 @@ struct kvm_gmem {
+ 	struct list_head entry;
+ };
+ 
+-static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
++static int kvm_gmem_prepare_folio(struct inode *inode, pgoff_t index, struct folio *folio)
++{
++#ifdef CONFIG_HAVE_KVM_GMEM_PREPARE
++	struct list_head *gmem_list = &inode->i_mapping->private_list;
++	struct kvm_gmem *gmem;
++
++	list_for_each_entry(gmem, gmem_list, entry) {
++		struct kvm_memory_slot *slot;
++		struct kvm *kvm = gmem->kvm;
++		struct page *page;
++		kvm_pfn_t pfn;
++		gfn_t gfn;
++		int rc;
++
++		if (!kvm_arch_gmem_prepare_needed(kvm))
++			continue;
++
++		slot = xa_load(&gmem->bindings, index);
++		if (!slot)
++			continue;
++
++		page = folio_file_page(folio, index);
++		pfn = page_to_pfn(page);
++		gfn = slot->base_gfn + index - slot->gmem.pgoff;
++		rc = kvm_arch_gmem_prepare(kvm, gfn, pfn, compound_order(compound_head(page)));
++		if (rc) {
++			pr_warn_ratelimited("gmem: Failed to prepare folio for index %lx, error %d.\n",
++					    index, rc);
++			return rc;
++		}
++	}
++
++#endif
++	return 0;
++}
++
++static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index, bool prepare)
+ {
+ 	struct folio *folio;
+ 
+@@ -41,6 +77,15 @@ static struct folio *kvm_gmem_get_folio(
+ 		folio_mark_uptodate(folio);
+ 	}
+ 
++	if (prepare) {
++		int r =	kvm_gmem_prepare_folio(inode, index, folio);
++		if (r < 0) {
++			folio_unlock(folio);
++			folio_put(folio);
++			return ERR_PTR(r);
++		}
++	}
++
+ 	/*
+ 	 * Ignore accessed, referenced, and dirty flags.  The memory is
+ 	 * unevictable and there is no storage to write back to.
+@@ -145,7 +190,7 @@ static long kvm_gmem_allocate(struct ino
+ 			break;
+ 		}
+ 
+-		folio = kvm_gmem_get_folio(inode, index);
++		folio = kvm_gmem_get_folio(inode, index, true);
+ 		if (IS_ERR(folio)) {
+ 			r = PTR_ERR(folio);
+ 			break;
+@@ -509,7 +554,7 @@ int kvm_gmem_get_pfn(struct kvm *kvm, st
+ 		goto out_fput;
+ 	}
+ 
+-	folio = kvm_gmem_get_folio(file_inode(file), index);
++	folio = kvm_gmem_get_folio(file_inode(file), index, true);
+ 	if (IS_ERR(folio)) {
+ 		r = PTR_ERR(folio);
+ 		goto out_fput;
