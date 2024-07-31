@@ -43,7 +43,7 @@ def _find_config(obj_path, deep):
             continue
 
         # target found, check if this one with config
-        target = line.split(' ')[0]
+        target = line.split()[0]
         if target.startswith('obj-'):
             return _sanitize_config(target)
 
