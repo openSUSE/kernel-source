@@ -1,0 +1,179 @@
+From fc627dad3f01c98e4bd424195140b2dccf204e54 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Pouiller?= <jerome.pouiller@silabs.com>
+Date: Wed, 4 Oct 2023 19:28:43 +0200
+Subject: [PATCH] wifi: wfx: implement wfx_remain_on_channel()
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: fc627dad3f01c98e4bd424195140b2dccf204e54
+Patch-mainline: v6.7-rc1
+References: bsc#1227149
+
+With some conditions, the device is able to send/receive frames during
+scan operation. So, it is possible to use it implement the "remain on
+channel" feature. We just ask for a passive scan (without sending any
+probe request) on one channel.
+
+This architecture allows to leverage some interesting features:
+  - if the device is AP, the device switches channel just after the next
+    beacon and the beacons are stopped during the off-channel interval.
+  - if the device is connected, it advertises it is asleep before to
+    switch channel (so the AP should stop to try to send data)
+
+Signed-off-by: Jérôme Pouiller <jerome.pouiller@silabs.com>
+Signed-off-by: Kalle Valo <kvalo@kernel.org>
+Link: https://lore.kernel.org/r/20231004172843.195332-9-jerome.pouiller@silabs.com
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/net/wireless/silabs/wfx/main.c |  3 ++
+ drivers/net/wireless/silabs/wfx/scan.c | 62 ++++++++++++++++++++++++++
+ drivers/net/wireless/silabs/wfx/scan.h |  6 +++
+ drivers/net/wireless/silabs/wfx/sta.c  |  1 +
+ drivers/net/wireless/silabs/wfx/wfx.h  |  5 ++-
+ 5 files changed, 76 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/silabs/wfx/main.c b/drivers/net/wireless/silabs/wfx/main.c
+index 4bf16bceb0bb..e7198520bdff 100644
+--- a/drivers/net/wireless/silabs/wfx/main.c
++++ b/drivers/net/wireless/silabs/wfx/main.c
+@@ -151,6 +151,8 @@ static const struct ieee80211_ops wfx_ops = {
+ 	.change_chanctx          = wfx_change_chanctx,
+ 	.assign_vif_chanctx      = wfx_assign_vif_chanctx,
+ 	.unassign_vif_chanctx    = wfx_unassign_vif_chanctx,
++	.remain_on_channel       = wfx_remain_on_channel,
++	.cancel_remain_on_channel = wfx_cancel_remain_on_channel,
+ };
+ 
+ bool wfx_api_older_than(struct wfx_dev *wdev, int major, int minor)
+@@ -289,6 +291,7 @@ struct wfx_dev *wfx_init_common(struct device *dev, const struct wfx_platform_da
+ 	hw->wiphy->features |= NL80211_FEATURE_AP_SCAN;
+ 	hw->wiphy->flags |= WIPHY_FLAG_AP_PROBE_RESP_OFFLOAD;
+ 	hw->wiphy->flags |= WIPHY_FLAG_AP_UAPSD;
++	hw->wiphy->max_remain_on_channel_duration = 5000;
+ 	hw->wiphy->max_ap_assoc_sta = HIF_LINK_ID_MAX;
+ 	hw->wiphy->max_scan_ssids = 2;
+ 	hw->wiphy->max_scan_ie_len = IEEE80211_MAX_DATA_LEN;
+diff --git a/drivers/net/wireless/silabs/wfx/scan.c b/drivers/net/wireless/silabs/wfx/scan.c
+index d6f98035f684..c3c103ff88cc 100644
+--- a/drivers/net/wireless/silabs/wfx/scan.c
++++ b/drivers/net/wireless/silabs/wfx/scan.c
+@@ -145,3 +145,65 @@ void wfx_scan_complete(struct wfx_vif *wvif, int nb_chan_done)
+ 	wvif->scan_nb_chan_done = nb_chan_done;
+ 	complete(&wvif->scan_complete);
+ }
++
++void wfx_remain_on_channel_work(struct work_struct *work)
++{
++	struct wfx_vif *wvif = container_of(work, struct wfx_vif, remain_on_channel_work);
++	struct ieee80211_channel *chan = wvif->remain_on_channel_chan;
++	int duration = wvif->remain_on_channel_duration;
++	int ret;
++
++	/* Hijack scan request to implement Remain-On-Channel */
++	mutex_lock(&wvif->wdev->conf_mutex);
++	mutex_lock(&wvif->wdev->scan_lock);
++	if (wvif->join_in_progress) {
++		dev_info(wvif->wdev->dev, "abort in-progress REQ_JOIN");
++		wfx_reset(wvif);
++	}
++	wfx_tx_flush(wvif->wdev);
++
++	reinit_completion(&wvif->scan_complete);
++	ret = wfx_hif_scan_uniq(wvif, chan, duration);
++	if (ret)
++		goto end;
++	ieee80211_ready_on_channel(wvif->wdev->hw);
++	ret = wait_for_completion_timeout(&wvif->scan_complete,
++					  msecs_to_jiffies(duration * 120 / 100));
++	if (!ret) {
++		wfx_hif_stop_scan(wvif);
++		ret = wait_for_completion_timeout(&wvif->scan_complete, 1 * HZ);
++		dev_dbg(wvif->wdev->dev, "roc timeout\n");
++	}
++	if (!ret)
++		dev_err(wvif->wdev->dev, "roc didn't stop\n");
++	ieee80211_remain_on_channel_expired(wvif->wdev->hw);
++end:
++	mutex_unlock(&wvif->wdev->scan_lock);
++	mutex_unlock(&wvif->wdev->conf_mutex);
++	wfx_bh_request_tx(wvif->wdev);
++}
++
++int wfx_remain_on_channel(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++			  struct ieee80211_channel *chan, int duration,
++			  enum ieee80211_roc_type type)
++{
++	struct wfx_dev *wdev = hw->priv;
++	struct wfx_vif *wvif = (struct wfx_vif *)vif->drv_priv;
++
++	if (wfx_api_older_than(wdev, 3, 10))
++		return -EOPNOTSUPP;
++
++	wvif->remain_on_channel_duration = duration;
++	wvif->remain_on_channel_chan = chan;
++	schedule_work(&wvif->remain_on_channel_work);
++	return 0;
++}
++
++int wfx_cancel_remain_on_channel(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
++{
++	struct wfx_vif *wvif = (struct wfx_vif *)vif->drv_priv;
++
++	wfx_hif_stop_scan(wvif);
++	flush_work(&wvif->remain_on_channel_work);
++	return 0;
++}
+diff --git a/drivers/net/wireless/silabs/wfx/scan.h b/drivers/net/wireless/silabs/wfx/scan.h
+index 78e3b984f375..995ab8c6cb5e 100644
+--- a/drivers/net/wireless/silabs/wfx/scan.h
++++ b/drivers/net/wireless/silabs/wfx/scan.h
+@@ -19,4 +19,10 @@ int wfx_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ void wfx_cancel_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif);
+ void wfx_scan_complete(struct wfx_vif *wvif, int nb_chan_done);
+ 
++void wfx_remain_on_channel_work(struct work_struct *work);
++int wfx_remain_on_channel(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++			  struct ieee80211_channel *chan, int duration,
++			  enum ieee80211_roc_type type);
++int wfx_cancel_remain_on_channel(struct ieee80211_hw *hw, struct ieee80211_vif *vif);
++
+ #endif
+diff --git a/drivers/net/wireless/silabs/wfx/sta.c b/drivers/net/wireless/silabs/wfx/sta.c
+index 8533bad6caea..1b6c158457b4 100644
+--- a/drivers/net/wireless/silabs/wfx/sta.c
++++ b/drivers/net/wireless/silabs/wfx/sta.c
+@@ -728,6 +728,7 @@ int wfx_add_interface(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
+ 
+ 	init_completion(&wvif->scan_complete);
+ 	INIT_WORK(&wvif->scan_work, wfx_hw_scan_work);
++	INIT_WORK(&wvif->remain_on_channel_work, wfx_remain_on_channel_work);
+ 
+ 	wfx_tx_queues_init(wvif);
+ 	wfx_tx_policy_init(wvif);
+diff --git a/drivers/net/wireless/silabs/wfx/wfx.h b/drivers/net/wireless/silabs/wfx/wfx.h
+index a41b2c35fa41..bd0df2e1ea99 100644
+--- a/drivers/net/wireless/silabs/wfx/wfx.h
++++ b/drivers/net/wireless/silabs/wfx/wfx.h
+@@ -70,6 +70,7 @@ struct wfx_vif {
+ 
+ 	bool                       after_dtim_tx_allowed;
+ 	bool                       join_in_progress;
++	struct completion          set_pm_mode_complete;
+ 
+ 	struct delayed_work        beacon_loss_work;
+ 
+@@ -87,7 +88,9 @@ struct wfx_vif {
+ 	bool                       scan_abort;
+ 	struct ieee80211_scan_request *scan_req;
+ 
+-	struct completion          set_pm_mode_complete;
++	struct ieee80211_channel   *remain_on_channel_chan;
++	int                        remain_on_channel_duration;
++	struct work_struct         remain_on_channel_work;
+ };
+ 
+ static inline struct ieee80211_vif *wvif_to_vif(struct wfx_vif *wvif)
+-- 
+2.43.0
+
