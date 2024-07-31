@@ -24,7 +24,7 @@ def _load_makefile(make_file: str) -> list:
 
 
 def _sanitize_config(target):
-    config = target.strip('+=').strip().strip('obj-$():').strip()
+    config = target.strip('+=').strip().strip('obj-$(){}:').strip()
     return config
 
 
