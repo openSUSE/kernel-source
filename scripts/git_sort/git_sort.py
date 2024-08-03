@@ -250,7 +250,7 @@ remotes = (
     Head(RepoURL("rafael/linux-pm.git")),
     Head(RepoURL("rafael/linux-pm.git"), "linux-next"),
     Head(RepoURL("git://git.linux-nfs.org/~bfields/linux.git"), "nfsd-next"),
-    Head(RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"), "for-next"),
+    Head(RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"), "nfsd-next"),
     Head(RepoURL("vkoul/soundwire.git"),"fixes"),
     Head(RepoURL("vkoul/soundwire.git"),"next"),
     Head(RepoURL("arm64/linux.git"), "for-next/core"),
@@ -648,10 +648,10 @@ class SortIndex(object):
                            (self.repo.revparse_single(tag), tag[10:],)
                            for tag in self.repo.listall_references()
                            if self.version_match.match(tag)
-                       ] if obj_tag.type == pygit2.GIT_OBJ_TAG]
+                       ] if obj_tag.type == pygit2.GIT_OBJECT_TAG]
             revs = [(history[str(obj.id)], tag,)
                     for obj, tag in objects
-                    if obj.type == pygit2.GIT_OBJ_COMMIT]
+                    if obj.type == pygit2.GIT_OBJECT_COMMIT]
             revs.sort(key=operator.itemgetter(0))
             self.version_indexes = list(zip(*revs))
 
