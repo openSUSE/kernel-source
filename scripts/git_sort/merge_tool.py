@@ -39,9 +39,11 @@ import sys
 
 import pygit2_wrapper as pygit2
 
-import exc
+sys.path.append(os.path.join(os.path.dirname(__file__), "../python"))
+import suse_git.exc as exc
 import lib
 import series_conf
+import util
 
 
 def splice(series, inside, output_path):
@@ -63,7 +65,7 @@ if __name__ == "__main__":
 
     # (before, inside, after, set(inside),)
     local, base, remote = (
-        (s[0], s[1], s[2], lib.OrderedSet([series_conf.firstword(l)
+        (s[0], s[1], s[2], util.OrderedSet([series_conf.firstword(l)
                                            for l in s[1]
                                            if series_conf.filter_patches(l)]),)
         for s in [
@@ -74,7 +76,7 @@ if __name__ == "__main__":
 
     added = remote[3] - base[3]
     removed = base[3] - remote[3]
-    moved = lib.OrderedSet(lib.list_moved_patches(base[1], remote[1]))
+    moved = util.OrderedSet(lib.list_moved_patches(base[1], remote[1]))
 
     if added or removed:
         print("%d commits added, %d commits removed from base to remote." %
