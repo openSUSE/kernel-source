@@ -1,0 +1,231 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Wed, 31 May 2023 09:54:02 +0200
+Git-commit: ec63b84d4611b2f07e9242080f3e8de4a011820b
+Patch-mainline: v6.10-rc1
+References: git-fixes
+Subject: [PATCH] btrfs: add an ordered_extent pointer to struct btrfs_bio
+
+Add a pointer to the ordered_extent to the existing union in struct
+btrfs_bio, so all code dealing with data write bios can just use a
+pointer dereference to retrieve the ordered_extent instead of doing
+multiple rbtree lookups per I/O.
+
+The reference to this ordered_extent is dropped at end I/O time,
+which implies that an extra one must be acquired when the bio is split.
+This also requires moving the btrfs_extract_ordered_extent call into
+btrfs_split_bio so that the invariant of always having a valid
+ordered_extent reference for the btrfs_bio is kept.
+
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/bio.c         | 42 ++++++++++++++++++++++++++++++++++++++----
+ fs/btrfs/bio.h         |  9 +++------
+ fs/btrfs/compression.c |  2 +-
+ fs/btrfs/extent_io.c   |  2 +-
+ fs/btrfs/file-item.c   |  9 +--------
+ fs/btrfs/inode.c       |  8 +++++---
+ 6 files changed, 49 insertions(+), 23 deletions(-)
+
+diff --git a/fs/btrfs/bio.c b/fs/btrfs/bio.c
+index 41a152e87429..12b12443efaa 100644
+--- a/fs/btrfs/bio.c
++++ b/fs/btrfs/bio.c
+@@ -33,6 +33,11 @@ static inline bool is_data_bbio(struct btrfs_bio *bbio)
+ 	return bbio->inode && is_data_inode(&bbio->inode->vfs_inode);
+ }
+ 
++static bool bbio_has_ordered_extent(struct btrfs_bio *bbio)
++{
++	return is_data_bbio(bbio) && btrfs_op(&bbio->bio) == BTRFS_MAP_WRITE;
++}
++
+ /*
+  * Initialize a btrfs_bio structure.  This skips the embedded bio itself as it
+  * is already initialized by the block layer.
+@@ -88,11 +93,40 @@ static struct btrfs_bio *btrfs_split_bio(struct btrfs_fs_info *fs_info,
+ 	bbio->inode = orig_bbio->inode;
+ 	bbio->file_offset = orig_bbio->file_offset;
+ 	orig_bbio->file_offset += map_length;
+-
++	if (bbio_has_ordered_extent(bbio)) {
++		refcount_inc(&orig_bbio->ordered->refs);
++		bbio->ordered = orig_bbio->ordered;
++	}
+ 	atomic_inc(&orig_bbio->pending_ios);
+ 	return bbio;
+ }
+ 
++/* Free a bio that was never submitted to the underlying device. */
++static void btrfs_cleanup_bio(struct btrfs_bio *bbio)
++{
++	if (bbio_has_ordered_extent(bbio))
++		btrfs_put_ordered_extent(bbio->ordered);
++	bio_put(&bbio->bio);
++}
++
++static void __btrfs_bio_end_io(struct btrfs_bio *bbio)
++{
++	if (bbio_has_ordered_extent(bbio)) {
++		struct btrfs_ordered_extent *ordered = bbio->ordered;
++
++		bbio->end_io(bbio);
++		btrfs_put_ordered_extent(ordered);
++	} else {
++		bbio->end_io(bbio);
++	}
++}
++
++void btrfs_bio_end_io(struct btrfs_bio *bbio, blk_status_t status)
++{
++	bbio->bio.bi_status = status;
++	__btrfs_bio_end_io(bbio);
++}
++
+ static void btrfs_orig_write_end_io(struct bio *bio);
+ 
+ static void btrfs_bbio_propagate_error(struct btrfs_bio *bbio,
+@@ -121,12 +155,12 @@ static void btrfs_orig_bbio_end_io(struct btrfs_bio *bbio)
+ 
+ 		if (bbio->bio.bi_status)
+ 			btrfs_bbio_propagate_error(bbio, orig_bbio);
+-		bio_put(&bbio->bio);
++		btrfs_cleanup_bio(bbio);
+ 		bbio = orig_bbio;
+ 	}
+ 
+ 	if (atomic_dec_and_test(&bbio->pending_ios))
+-		bbio->end_io(bbio);
++		__btrfs_bio_end_io(bbio);
+ }
+ 
+ static int next_repair_mirror(struct btrfs_failed_bio *fbio, int cur_mirror)
+@@ -684,7 +718,7 @@ static bool btrfs_submit_chunk(struct btrfs_bio *bbio, int mirror_num)
+ 
+ fail_put_bio:
+ 	if (map_length < length)
+-		bio_put(bio);
++		btrfs_cleanup_bio(bbio);
+ fail:
+ 	btrfs_bio_counter_dec(fs_info);
+ 	btrfs_bio_end_io(orig_bbio, ret);
+diff --git a/fs/btrfs/bio.h b/fs/btrfs/bio.h
+index 52e7962103ff..ca79decee060 100644
+--- a/fs/btrfs/bio.h
++++ b/fs/btrfs/bio.h
+@@ -50,11 +50,13 @@ struct btrfs_bio {
+ 
+ 		/*
+ 		 * For data writes:
++		 * - ordered extent covering the bio
+ 		 * - pointer to the checksums for this bio
+ 		 * - original physical address from the allocator
+ 		 *   (for zone append only)
+ 		 */
+ 		struct {
++			struct btrfs_ordered_extent *ordered;
+ 			struct btrfs_ordered_sum *sums;
+ 			u64 orig_physical;
+ 		};
+@@ -95,12 +97,7 @@ void btrfs_bio_init(struct btrfs_bio *bbio, struct btrfs_fs_info *fs_info,
+ struct btrfs_bio *btrfs_bio_alloc(unsigned int nr_vecs, blk_opf_t opf,
+ 				  struct btrfs_fs_info *fs_info,
+ 				  btrfs_bio_end_io_t end_io, void *private);
+-
+-static inline void btrfs_bio_end_io(struct btrfs_bio *bbio, blk_status_t status)
+-{
+-	bbio->bio.bi_status = status;
+-	bbio->end_io(bbio);
+-}
++void btrfs_bio_end_io(struct btrfs_bio *bbio, blk_status_t status);
+ 
+ /* Submit using blkcg_punt_bio_submit. */
+ #define REQ_BTRFS_CGROUP_PUNT			REQ_FS_PRIVATE
+diff --git a/fs/btrfs/compression.c b/fs/btrfs/compression.c
+index aafc846bcd4f..ce4be0f21c5c 100644
+--- a/fs/btrfs/compression.c
++++ b/fs/btrfs/compression.c
+@@ -303,10 +303,10 @@ void btrfs_submit_compressed_write(struct btrfs_ordered_extent *ordered,
+ 	INIT_WORK(&cb->write_end_work, btrfs_finish_compressed_write_work);
+ 	cb->nr_pages = nr_pages;
+ 	cb->bbio.bio.bi_iter.bi_sector = ordered->disk_bytenr >> SECTOR_SHIFT;
++	cb->bbio.ordered = ordered;
+ 	btrfs_add_compressed_bio_pages(cb);
+ 
+ 	btrfs_submit_bio(&cb->bbio, 0);
+-	btrfs_put_ordered_extent(ordered);
+ }
+ 
+ /*
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 35141a223a3e..ad536eaf02b0 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -835,7 +835,7 @@ static void alloc_new_bio(struct btrfs_inode *inode,
+ 			bio_ctrl->len_to_oe_boundary = min_t(u32, U32_MAX,
+ 					ordered->file_offset +
+ 					ordered->disk_num_bytes - file_offset);
+-			btrfs_put_ordered_extent(ordered);
++			bbio->ordered = ordered;
+ 		}
+ 
+ 		/*
+diff --git a/fs/btrfs/file-item.c b/fs/btrfs/file-item.c
+index 782bbf081c26..cbacaa80526c 100644
+--- a/fs/btrfs/file-item.c
++++ b/fs/btrfs/file-item.c
+@@ -799,19 +799,12 @@ blk_status_t btrfs_csum_one_bio(struct btrfs_bio *bbio)
+  */
+ blk_status_t btrfs_alloc_dummy_sum(struct btrfs_bio *bbio)
+ {
+-	struct btrfs_ordered_extent *ordered =
+-		btrfs_lookup_ordered_extent(bbio->inode, bbio->file_offset);
+-
+-	if (WARN_ON_ONCE(!ordered))
+-		return BLK_STS_IOERR;
+-
+ 	bbio->sums = kmalloc(sizeof(*bbio->sums), GFP_NOFS);
+ 	if (!bbio->sums)
+ 		return BLK_STS_RESOURCE;
+ 	bbio->sums->len = bbio->bio.bi_iter.bi_size;
+ 	bbio->sums->logical = bbio->bio.bi_iter.bi_sector << SECTOR_SHIFT;
+-	btrfs_add_ordered_sum(ordered, bbio->sums);
+-	btrfs_put_ordered_extent(ordered);
++	btrfs_add_ordered_sum(bbio->ordered, bbio->sums);
+ 	return 0;
+ }
+ 
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 020d871bb135..b8ec3d95e659 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -2716,8 +2716,11 @@ static int btrfs_extract_ordered_extent(struct btrfs_bio *bbio,
+ 		return -EINVAL;
+ 
+ 	/* No need to split if the ordered extent covers the entire bio. */
+-	if (ordered->disk_num_bytes == len)
++	if (ordered->disk_num_bytes == len) {
++		refcount_inc(&ordered->refs);
++		bbio->ordered = ordered;
+ 		return 0;
++	}
+ 
+ 	/*
+ 	 * Don't split the extent_map for NOCOW extents, as we're writing into
+@@ -2734,8 +2737,7 @@ static int btrfs_extract_ordered_extent(struct btrfs_bio *bbio,
+ 	new = btrfs_split_ordered_extent(ordered, len);
+ 	if (IS_ERR(new))
+ 		return PTR_ERR(new);
+-	btrfs_put_ordered_extent(new);
+-
++	bbio->ordered = new;
+ 	return 0;
+ }
+ 
+-- 
+2.35.3
+
