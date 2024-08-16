@@ -5,7 +5,7 @@ RUN zypper -n ref
 
 FROM base AS packages
 
-RUN zypper -n in git python3 python3-dbm rcs
+RUN zypper -n in git python3 python3-dbm rcs gawk python3-pygit2
 
 RUN git config --global user.email "you@example.com"
 RUN git config --global user.name "Your Name"
@@ -13,7 +13,7 @@ RUN git config --global user.name "Your Name"
 COPY Kernel.gpg /tmp
 RUN rpmkeys --import /tmp/Kernel.gpg
 RUN zypper -n ar -f https://download.opensuse.org/repositories/Kernel:/tools/SLE_15_SP6/Kernel:tools.repo
-RUN zypper -n in python3-pygit2 quilt
+RUN zypper -n in --from Kernel_tools quilt
 
 FROM packages
 
