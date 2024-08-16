@@ -79,10 +79,11 @@ def find_configs_for_files(linux_dir: str, file_paths: list):
         config = _find_config(Path(obj_file), 0)
         if not config:
             missing.append(path)
-        elif config == 'y':
+        elif config == 'y' or config == 'm':
             build_ins.append(path)
-        else:
+        elif config.startswith('CONFIG_'):
             configs[path] = config
+        # else there is garbage like 'subst', 'vds' for wrongly parsed input
 
     return configs, build_ins, missing
 
