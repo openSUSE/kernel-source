@@ -94,6 +94,7 @@ if __name__ == '__main__':
 
     help = 'Linux source tree directory'
     parser.add_argument('--linux', type=str, required=True, help=help)
+    parser.add_argument('--skip-missing', action='store_true')
     parser.add_argument('--verbose', action='store_true')
     parser.add_argument('filename', nargs='+')
 
@@ -110,7 +111,8 @@ if __name__ == '__main__':
             config = configs[file_name]
             print('{:32} {}'.format(config, file_name))
 
-        print('\nCan not find configuration for these files:')
+        if not args.skip_missing:
+            print('\nCan not find configuration for these files:')
 
-        for file_name in missing:
-            print(file_name)
+            for file_name in missing:
+                print(file_name)
