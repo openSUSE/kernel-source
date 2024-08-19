@@ -1,8 +1,6 @@
 # https://hub.docker.com/r/opensuse/leap/
 FROM opensuse/leap:15.6 AS base
 
-RUN zypper -n ref
-
 FROM base AS packages
 
 RUN zypper -n in git python3 python3-dbm rcs gawk python3-pygit2

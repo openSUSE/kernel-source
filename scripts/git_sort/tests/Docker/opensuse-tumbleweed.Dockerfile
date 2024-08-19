@@ -1,8 +1,6 @@
 # https://hub.docker.com/r/opensuse/tumbleweed/
 FROM opensuse/tumbleweed AS base
 
-RUN zypper -n ref
-
 FROM base AS packages
 
 RUN zypper -n in git python3 python3-dbm python3-pygit2 rcs util-linux gawk

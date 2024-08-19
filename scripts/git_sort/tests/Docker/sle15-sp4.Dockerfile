@@ -12,7 +12,6 @@ RUN zypper -n ar -f http://download.suse.de/ibs/SUSE:/SLE-15-SP3:/GA/standard/SU
 RUN zypper -n ar -f http://download.suse.de/ibs/SUSE:/SLE-15-SP3:/Update/standard/SUSE:SLE-15-SP3:Update.repo
 RUN zypper -n ar -f http://download.suse.de/ibs/SUSE:/SLE-15-SP4:/GA/standard/SUSE:SLE-15-SP4:GA.repo
 RUN zypper -n ar -f http://download.suse.de/ibs/SUSE:/SLE-15-SP4:/Update/standard/SUSE:SLE-15-SP4:Update.repo
-RUN zypper -n ref
 
 FROM base AS packages
 
