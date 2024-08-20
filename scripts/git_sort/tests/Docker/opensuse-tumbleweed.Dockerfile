@@ -3,7 +3,7 @@ FROM opensuse/tumbleweed AS base
 
 FROM base AS packages
 
-RUN zypper -n in git python3 python3-dbm python3-pygit2 rcs util-linux gawk
+RUN zypper -n in git python3 python3-dbm python3-pygit2 rcs util-linux gawk python3-PyYAML
 
 RUN git config --global user.email "you@example.com"
 RUN git config --global user.name "Your Name"

@@ -15,7 +15,7 @@ RUN zypper -n ar -f http://download.suse.de/ibs/SUSE:/SLE-15-SP4:/Update/standar
 
 FROM base AS packages
 
-RUN zypper -n in git-core python3 python3-dbm rcs gawk
+RUN zypper -n in git-core python3 python3-dbm rcs gawk python3-PyYAML
 
 RUN git config --global user.email "you@example.com"
 RUN git config --global user.name "Your Name"

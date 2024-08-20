@@ -3,7 +3,7 @@ FROM opensuse/leap:15.6 AS base
 
 FROM base AS packages
 
-RUN zypper -n in git python3 python3-dbm rcs gawk python3-pygit2
+RUN zypper -n in git python3 python3-dbm rcs gawk python3-pygit2 python3-PyYAML
 
 RUN git config --global user.email "you@example.com"
 RUN git config --global user.name "Your Name"
