@@ -17,6 +17,7 @@ import series_conf
 import tests.support
 
 
+@unittest.skip("Patched quilt not maintained")
 class TestQuiltMode(unittest.TestCase):
     def setUp(self):
         os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
@@ -572,6 +573,7 @@ class TestMergeTool(unittest.TestCase):
         self.assertEqual(retval.decode().strip(), "M  series.conf")
 
 
+@unittest.skip("Patched quilt not maintained")
 class TestQCP(unittest.TestCase):
     def setUp(self):
         os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
