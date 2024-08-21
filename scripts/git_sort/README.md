@@ -3,8 +3,8 @@ Installation Requirements
 `git-sort` and the related series.conf sorting scripts depend on the python3
 `dbm`, `pygit2`, and `PyYAML` modules.
 
-The For SLE12 SP5 python3-pygit2 package is available from the Kernel:tools OBS
-project except for Tumbleweed where it's available from the normal OSS
+For SLE12 SP5 python3-pygit2 package is available from the Kernel:tools OBS
+project, for SLE15 and later where it's available from the OS update
 repository.
 ```
 https://build.opensuse.org/package/show/Kernel:tools/python-pygit2
@@ -17,19 +17,12 @@ The functions in `quilt-mode.sh` are meant to be used with a modified `quilt`
 that can use kernel-source.git's series.conf directly instead of a shadow
 copy.
 
-Packages are available in the following OBS project
-https://build.opensuse.org/package/show/home:benjamin_poirier:series_sort/quilt-ks
+Packages are available Kernel:tools OBS project.
 Source is avaible from
 https://github.com/gobenji/quilt
 
-The packages in home:benjamin_poirier:series_sort are signed with the key
-from home:benjamin_poirier which has the following fingerprint:
-6075 E129 2ACD 9732 A079  7B40 3F6E 17FC 4A3D 5625
-
 quilt depends on diffstat from the package with the same name. For SLE12-SP2
-and SLE12-SP3, the diffstat package is available in the SDK module. For
-openSUSE 42.3 and Tumbleweed, the diffstat package is available in the normal
-OSS repository.
+and SLE12-SP3, the diffstat package is available in the SDK module.
 
 Configuration Requirements
 ==========================
