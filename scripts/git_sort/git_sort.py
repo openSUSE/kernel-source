@@ -32,8 +32,18 @@ import shelve
 import subprocess
 import sys
 import types
+from pathlib import Path
 
 import pygit2_wrapper as pygit2
+
+try:
+    import yaml
+except ImportError as err:
+    print("Error: %s" % (err,), file=sys.stderr)
+    print("Please install the \"PyYAML\" python3 module. For more details, "
+          "please refer to the \"Installation Requirements\" section of "
+          "\"scripts/git_sort/README.md\".", file=sys.stderr)
+    sys.exit(1)
 
 
 class GSException(BaseException):
@@ -171,113 +181,21 @@ class Head(object):
             return result.strip()
 
 
-# a list of each remote head which is indexed by this script
-# If the working repository is a clone of linux.git (it fetches from mainline,
-# the first remote) and a commit does not appear in one of these remotes, it is
-# considered "not upstream" and cannot be sorted.
-# Repositories that come first in the list should be pulling/merging from
-# repositories lower down in the list. Said differently, commits should trickle
-# up from repositories at the end of the list to repositories higher up. For
-# example, network commits usually follow "net-next" -> "net" -> "linux.git".
-#
-# linux-next is not a good reference because it gets rebased. If a commit is in
-# linux-next, it comes from some other tree. Please tag the patch accordingly.
-#
-# Head(RepoURL(remote url), remote branch name)[]
-# Note that "remote url" can be abbreviated if it starts with one of the usual
-# kernel.org prefixes and "remote branch name" can be omitted if it is "master".
-remotes = (
-    Head(RepoURL("torvalds/linux.git")),
-    Head(RepoURL("netdev/net.git"), "main"),
-    Head(RepoURL("davem/net.git"), "main"),
-    Head(RepoURL("netdev/net-next.git"), "main"),
-    Head(RepoURL("davem/net-next.git"), "main"),
-    Head(RepoURL("rdma/rdma.git"), "for-rc"),
-    Head(RepoURL("rdma/rdma.git"), "for-next"),
-    Head(RepoURL("dledford/rdma.git"), "k.o/for-next"),
-    Head(RepoURL("jejb/scsi.git"), "for-next"),
-    Head(RepoURL("bp/bp.git"), "for-next"),
-    Head(RepoURL("tiwai/sound.git")),
-    Head(RepoURL("git://linuxtv.org/media_tree.git")),
-    Head(RepoURL("powerpc/linux.git"), "fixes"),
-    Head(RepoURL("powerpc/linux.git"), "next"),
-    Head(RepoURL("tip/tip.git")),
-    Head(RepoURL("shli/md.git"), "for-next"),
-    Head(RepoURL("dhowells/linux-fs.git"), "keys-uefi"),
-    Head(RepoURL("tytso/ext4.git"), "dev"),
-    Head(RepoURL("s390/linux.git"), "fixes"),
-    Head(RepoURL("https://github.com/kdave/btrfs-devel.git"), "misc-next"),
-    Head(RepoURL("git://anongit.freedesktop.org/drm/drm"), "drm-next"),
-    Head(RepoURL("git://anongit.freedesktop.org/drm/drm-misc"), "drm-misc-next"),
-    Head(RepoURL("gregkh/driver-core.git"), "driver-core-next"),
-    Head(RepoURL("gregkh/tty.git"), "tty-next"),
-    Head(RepoURL("gregkh/usb.git"), "usb-next"),
-    Head(RepoURL("gregkh/usb.git"), "usb-linus"),
-    Head(RepoURL("jj/linux-apparmor.git"), "apparmor-next"),
-    Head(RepoURL("netfilter/nf.git")),
-    Head(RepoURL("netfilter/nf-next.git")),
-    Head(RepoURL("horms/ipvs.git"), "main"),
-    Head(RepoURL("horms/ipvs-next.git"), "main"),
-    Head(RepoURL("klassert/ipsec.git")),
-    Head(RepoURL("klassert/ipsec-next.git")),
-    Head(RepoURL("kvalo/wireless-drivers-next.git")),
-    Head(RepoURL("mkp/scsi.git"), "queue"),
-    Head(RepoURL("mkp/scsi.git"), "fixes"),
-    Head(RepoURL("mkp/scsi.git"), "for-next"),
-    Head(RepoURL("git://git.kernel.dk/linux-block.git"), "for-next"),
-    Head(RepoURL("git://git.kernel.org/pub/scm/virt/kvm/kvm.git"), "queue"),
-    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.15"),
-    Head(RepoURL("dhowells/linux-fs.git")),
-    Head(RepoURL("herbert/cryptodev-2.6.git")),
-    Head(RepoURL("helgaas/pci.git"), "next"),
-    Head(RepoURL("viro/vfs.git"), "for-linus"),
-    Head(RepoURL("viro/vfs.git"), "fixes"),
-    Head(RepoURL("jeyu/linux.git"), "modules-next"),
-    Head(RepoURL("joro/iommu.git"), "next"),
-    Head(RepoURL("nvdimm/nvdimm.git"), "libnvdimm-for-next"),
-    Head(RepoURL("nvdimm/nvdimm.git"), "libnvdimm-fixes"),
-    Head(RepoURL("djbw/nvdimm.git"), "libnvdimm-pending"),
-    Head(RepoURL("git://git.linux-nfs.org/projects/trondmy/nfs-2.6.git"), "linux-next"),
-    Head(RepoURL("git://git.linux-nfs.org/projects/anna/linux-nfs.git"), "linux-next"),
-    Head(RepoURL("acme/linux.git"), "perf/core"),
-    Head(RepoURL("acme/linux.git"), "perf-tools"),
-    Head(RepoURL("perf/perf-tools.git"), "perf-tools"),
-    Head(RepoURL("perf/perf-tools-next.git"), "perf-tools-next"),
-    Head(RepoURL("will/linux.git"), "for-joerg/arm-smmu/updates"),
-    Head(RepoURL("herbert/crypto-2.6.git"), "master"),
-    Head(RepoURL("jarkko/linux-tpmdd"), "next"),
-    Head(RepoURL("jarkko/linux-tpmdd"), "master"),
-    Head(RepoURL("rafael/linux-pm.git")),
-    Head(RepoURL("rafael/linux-pm.git"), "linux-next"),
-    Head(RepoURL("git://git.linux-nfs.org/~bfields/linux.git"), "nfsd-next"),
-    Head(RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"), "nfsd-next"),
-    Head(RepoURL("vkoul/soundwire.git"),"fixes"),
-    Head(RepoURL("vkoul/soundwire.git"),"next"),
-    Head(RepoURL("arm64/linux.git"), "for-next/core"),
-    Head(RepoURL("robh/linux.git"), "dt/linus"),
-    Head(RepoURL("robh/linux.git"), "for-next"),
-    Head(RepoURL("git://git.infradead.org/users/hch/dma-mapping.git"), "for-next"),
-    Head(RepoURL("thermal/linux.git"), "thermal/linux-next"),
-    Head(RepoURL("git://github.com/cminyard/linux-ipmi.git"), "for-next"),
-    Head(RepoURL("ras/ras.git"), "edac-for-next"),
-    Head(RepoURL("linusw/linux-pinctrl.git"), "for-next"),
-    Head(RepoURL("efi/efi.git"), "next"),
-    Head(RepoURL("ulfh/mmc.git"), "next"),
-    Head(RepoURL("masahiroy/linux-kbuild.git"), "for-next"),
-    Head(RepoURL("bluetooth/bluetooth-next.git")),
-    Head(RepoURL("clk/linux.git"), "clk-next"),
-    Head(RepoURL("git://github.com/ceph/ceph-client"), "testing"),
-    Head(RepoURL("bpf/bpf.git")),
-    Head(RepoURL("bpf/bpf-next.git")),
-    Head(RepoURL("linusw/linux-gpio.git"), "for-next"),
-    Head(RepoURL("soc/soc.git"), "for-next"),
-    Head(RepoURL("https://gitlab.freedesktop.org/drm/tegra.git"), "for-next"),
-    Head(RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/thierry.reding/linux-pwm.git"), "for-next"),
-    Head(RepoURL("kvmarm/kvmarm.git"), "next"),
-    Head(RepoURL("lenb/linux.git"), "turbostat"),
-)
+remotes = ()
 
+file = os.environ.get('GIT_SORT_REPOSITORIES')
+if file:
+    file = Path(file)
+else:
+    this_file = Path(__file__)
+    file = this_file.parent / (this_file.stem + '.yaml')
+with file.open() as fd:
+    remotes = yaml.safe_load(fd)
 
+def construct_head(x):
+    return Head(RepoURL(x[0]), *x[1:])
+
+remotes = tuple(map(construct_head, remotes))
 remote_index = dict(zip(remotes, list(range(len(remotes)))))
 oot = Head(RepoURL(None), "out-of-tree patches")
 
