@@ -1,20 +1,11 @@
 Installation Requirements
 =========================
 `git-sort` and the related series.conf sorting scripts depend on the python3
-`dbm` and `pygit2` modules.
+`dbm`, `pygit2`, and `PyYAML` modules.
 
-For SLE12-SP2 and SLE12-SP3, the python3-dbm package is available in the
-SUSE:SLE-12:Update IBS project:
-```
-https://build.suse.de/project/show/SUSE:SLE-12:Update
-http://download.suse.de/ibs/SUSE:/SLE-12:/Update/standard/SUSE:SLE-12:Update.repo
-```
-
-For openSUSE 42.3 and Tumbleweed, the python3-dbm package is available in the
-normal OSS repository.
-
-The python3-pygit2 package is available from the Kernel:tools OBS project
-except for Tumbleweed where it's available from the normal OSS repository.
+The For SLE12 SP5 python3-pygit2 package is available from the Kernel:tools OBS
+project except for Tumbleweed where it's available from the normal OSS
+repository.
 ```
 https://build.opensuse.org/package/show/Kernel:tools/python-pygit2
 ```

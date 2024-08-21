@@ -10,7 +10,6 @@ grep_branch()
 	shift
 	args="$@"
 
-	echo $branch
 	git --no-pager grep $args origin/$branch
 	return 0
 }

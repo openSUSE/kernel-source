@@ -22,6 +22,12 @@ import sys
 
 try:
     from pygit2 import *
+    if 'GIT_OBJ_TAG' in dir() and 'GIT_OBJECT_TAG' not in dir():
+        GIT_OBJECT_TAG = GIT_OBJ_TAG
+        GIT_OBJECT_COMMIT = GIT_OBJ_COMMIT
+    if 'enums' in dir():
+        if hasattr(enums.ReferenceType, 'DIRECT'):
+            GIT_REF_OID = enums.ReferenceType.DIRECT
 except ImportError as err:
     print("Error: %s" % (err,), file=sys.stderr)
     print("Please install the \"pygit2\" python3 module. For more details, "
