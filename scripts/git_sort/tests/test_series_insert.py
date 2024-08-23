@@ -10,6 +10,9 @@ import sys
 
 import pygit2_wrapper as pygit2
 
+from pathlib import Path
+os.environ['GIT_SORT_REPOSITORIES'] = str(Path(__file__).parent / 'git_sort.yaml')
+
 import git_sort
 import lib
 import tests.support
