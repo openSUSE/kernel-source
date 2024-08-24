@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
+import os
 import os.path
 import shutil
 import subprocess
@@ -9,7 +10,7 @@ import unittest
 import stat
 import sys
 
-import lib
+from . import lib
 
 
 class TestSpliceSeries(unittest.TestCase):
@@ -20,16 +21,17 @@ class TestSpliceSeries(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        print("Coverage report in %s. Press enter when done with it." %
-              (cls.covdir,))
-        sys.stdin.readline()
+        if os.isatty(sys.stdin.fileno()):
+            print("Coverage report in %s. Press enter when done with it." %
+                  (cls.covdir,))
+            sys.stdin.readline()
         shutil.rmtree(cls.covdir)
 
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="gs_log2")
         os.chdir(self.tmpdir)
-        self.log2_path = os.path.join( lib.libdir(), "../log2")
+        self.log2_path = os.path.join( lib.libdir(), "../../log2")
 
 
     def tearDown(self):
