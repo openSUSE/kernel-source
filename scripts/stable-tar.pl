@@ -28,7 +28,7 @@ use warnings;
 
 my $USAGE = "Usage: $0 --mtime=<decimal timestamp> [--exclude=<pattern] [-C directory] file|directory ... >archive.tar\n";
 
-use Getopt::Long;
+use Getopt::Long qw(:config no_ignore_case);
 use File::Find;
 use File::Copy;
 use Fcntl ':mode';
