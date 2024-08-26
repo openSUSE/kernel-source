@@ -7,13 +7,13 @@ import subprocess
 import tempfile
 import unittest
 
-import lib
+from . import lib
 
 
 class TestLinuxGit(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="ks_linux_git")
-        self.lg_path = os.path.join(lib.libdir(), "../linux_git.sh")
+        self.lg_path = os.path.join(lib.libdir(), "../../linux_git.sh")
 
 
     def tearDown(self):
