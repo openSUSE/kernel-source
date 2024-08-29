@@ -1,0 +1,171 @@
+From: Xin Li <xin3.li@intel.com>
+Date: Tue, 5 Dec 2023 02:50:18 -0800
+Subject: x86/fred: Fixup fault on ERETU by jumping to fred_entrypoint_user
+Git-commit: 5105e7687ad3dffde77f6e4393b5530e83d672dc
+Patch-mainline: v6.9-rc1
+References: jsc#PED-10236
+
+If the stack frame contains an invalid user context (e.g. due to invalid SS,
+a non-canonical RIP, etc.) the ERETU instruction will trap (#SS or #GP).
+
+From a Linux point of view, this really should be considered a user space
+failure, so use the standard fault fixup mechanism to intercept the fault,
+fix up the exception frame, and redirect execution to fred_entrypoint_user.
+The end result is that it appears just as if the hardware had taken the
+exception immediately after completing the transition to user space.
+
+Suggested-by: H. Peter Anvin (Intel) <hpa@zytor.com>
+Signed-off-by: Xin Li <xin3.li@intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Tested-by: Shan Kang <shan.kang@intel.com>
+Link: https://lore.kernel.org/r/20231205105030.8698-30-xin3.li@intel.com
+
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/entry/entry_64_fred.S             |  5 +-
+ arch/x86/include/asm/extable_fixup_types.h |  4 +-
+ arch/x86/mm/extable.c                      | 78 ++++++++++++++++++++++++++++++
+ 3 files changed, 85 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/entry/entry_64_fred.S b/arch/x86/entry/entry_64_fred.S
+index 2271a1c690dc..7fe2722ad90c 100644
+--- a/arch/x86/entry/entry_64_fred.S
++++ b/arch/x86/entry/entry_64_fred.S
+@@ -3,6 +3,7 @@
+  * The actual FRED entry points.
+  */
+ 
++#include <asm/asm.h>
+ #include <asm/fred.h>
+ 
+ #include "calling.h"
+@@ -34,7 +35,9 @@ SYM_CODE_START_NOALIGN(asm_fred_entrypoint_user)
+ 	call	fred_entry_from_user
+ SYM_INNER_LABEL(asm_fred_exit_user, SYM_L_GLOBAL)
+ 	FRED_EXIT
+-	ERETU
++1:	ERETU
++
++	_ASM_EXTABLE_TYPE(1b, asm_fred_entrypoint_user, EX_TYPE_ERETU)
+ SYM_CODE_END(asm_fred_entrypoint_user)
+ 
+ /*
+diff --git a/arch/x86/include/asm/extable_fixup_types.h b/arch/x86/include/asm/extable_fixup_types.h
+index fe6312045042..7acf0383be80 100644
+--- a/arch/x86/include/asm/extable_fixup_types.h
++++ b/arch/x86/include/asm/extable_fixup_types.h
+@@ -64,6 +64,8 @@
+ #define	EX_TYPE_UCOPY_LEN4		(EX_TYPE_UCOPY_LEN | EX_DATA_IMM(4))
+ #define	EX_TYPE_UCOPY_LEN8		(EX_TYPE_UCOPY_LEN | EX_DATA_IMM(8))
+ 
+-#define EX_TYPE_ZEROPAD			20 /* longword load with zeropad on fault */
++#define	EX_TYPE_ZEROPAD			20 /* longword load with zeropad on fault */
++
++#define	EX_TYPE_ERETU			21
+ 
+ #endif
+diff --git a/arch/x86/mm/extable.c b/arch/x86/mm/extable.c
+index 271dcb2deabc..b522933bfa56 100644
+--- a/arch/x86/mm/extable.c
++++ b/arch/x86/mm/extable.c
+@@ -6,6 +6,7 @@
+ #include <xen/xen.h>
+ 
+ #include <asm/fpu/api.h>
++#include <asm/fred.h>
+ #include <asm/sev.h>
+ #include <asm/traps.h>
+ #include <asm/kdebug.h>
+@@ -223,6 +224,79 @@ static bool ex_handler_ucopy_len(const struct exception_table_entry *fixup,
+ 	return ex_handler_uaccess(fixup, regs, trapnr, fault_address);
+ }
+ 
++#ifdef CONFIG_X86_FRED
++static bool ex_handler_eretu(const struct exception_table_entry *fixup,
++			     struct pt_regs *regs, unsigned long error_code)
++{
++	struct pt_regs *uregs = (struct pt_regs *)(regs->sp - offsetof(struct pt_regs, orig_ax));
++	unsigned short ss = uregs->ss;
++	unsigned short cs = uregs->cs;
++
++	/*
++	 * Move the NMI bit from the invalid stack frame, which caused ERETU
++	 * to fault, to the fault handler's stack frame, thus to unblock NMI
++	 * with the fault handler's ERETS instruction ASAP if NMI is blocked.
++	 */
++	regs->fred_ss.nmi = uregs->fred_ss.nmi;
++
++	/*
++	 * Sync event information to uregs, i.e., the ERETU return frame, but
++	 * is it safe to write to the ERETU return frame which is just above
++	 * current event stack frame?
++	 *
++	 * The RSP used by FRED to push a stack frame is not the value in %rsp,
++	 * it is calculated from %rsp with the following 2 steps:
++	 * 1) RSP = %rsp - (IA32_FRED_CONFIG & 0x1c0)	// Reserve N*64 bytes
++	 * 2) RSP = RSP & ~0x3f		// Align to a 64-byte cache line
++	 * when an event delivery doesn't trigger a stack level change.
++	 *
++	 * Here is an example with N*64 (N=1) bytes reserved:
++	 *
++	 *  64-byte cache line ==>  ______________
++	 *                         |___Reserved___|
++	 *                         |__Event_data__|
++	 *                         |_____SS_______|
++	 *                         |_____RSP______|
++	 *                         |_____FLAGS____|
++	 *                         |_____CS_______|
++	 *                         |_____IP_______|
++	 *  64-byte cache line ==> |__Error_code__| <== ERETU return frame
++	 *                         |______________|
++	 *                         |______________|
++	 *                         |______________|
++	 *                         |______________|
++	 *                         |______________|
++	 *                         |______________|
++	 *                         |______________|
++	 *  64-byte cache line ==> |______________| <== RSP after step 1) and 2)
++	 *                         |___Reserved___|
++	 *                         |__Event_data__|
++	 *                         |_____SS_______|
++	 *                         |_____RSP______|
++	 *                         |_____FLAGS____|
++	 *                         |_____CS_______|
++	 *                         |_____IP_______|
++	 *  64-byte cache line ==> |__Error_code__| <== ERETS return frame
++	 *
++	 * Thus a new FRED stack frame will always be pushed below a previous
++	 * FRED stack frame ((N*64) bytes may be reserved between), and it is
++	 * safe to write to a previous FRED stack frame as they never overlap.
++	 */
++	fred_info(uregs)->edata = fred_event_data(regs);
++	uregs->ssx = regs->ssx;
++	uregs->fred_ss.ss = ss;
++	/* The NMI bit was moved away above */
++	uregs->fred_ss.nmi = 0;
++	uregs->csx = regs->csx;
++	uregs->fred_cs.sl = 0;
++	uregs->fred_cs.wfe = 0;
++	uregs->cs = cs;
++	uregs->orig_ax = error_code;
++
++	return ex_handler_default(fixup, regs);
++}
++#endif
++
+ int ex_get_fixup_type(unsigned long ip)
+ {
+ 	const struct exception_table_entry *e = search_exception_tables(ip);
+@@ -300,6 +374,10 @@ int fixup_exception(struct pt_regs *regs, int trapnr, unsigned long error_code,
+ 		return ex_handler_ucopy_len(e, regs, trapnr, fault_addr, reg, imm);
+ 	case EX_TYPE_ZEROPAD:
+ 		return ex_handler_zeropad(e, regs, fault_addr);
++#ifdef CONFIG_X86_FRED
++	case EX_TYPE_ERETU:
++		return ex_handler_eretu(e, regs, error_code);
++#endif
+ 	}
+ 	BUG();
+ }
+
