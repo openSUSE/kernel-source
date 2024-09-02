@@ -2,7 +2,7 @@
 use strict;
 use warnings;
 
-use Getopt::Long;
+use Getopt::Long qw(:config no_ignore_case);
 use Data::Dumper;
 
 # ( { sym => regexp, mod => regexp, fail => 0/1 }, ... )
