@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 import os
-import os.path
 import shutil
 import subprocess
 import sys
@@ -11,12 +10,16 @@ import unittest
 
 import pygit2_wrapper as pygit2
 
+from pathlib import Path
+os.environ['GIT_SORT_REPOSITORIES'] = str(Path(__file__).parent / 'git_sort.yaml')
+
 import git_sort
 import lib
 import series_conf
 import tests.support
 
 
+@unittest.skip("Patched quilt not maintained")
 class TestQuiltMode(unittest.TestCase):
     def setUp(self):
         os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
@@ -129,11 +132,10 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
                                     self.commits[-1])
 
         # setup stub kernel-source content
-        self.ks_dir = tempfile.mkdtemp(prefix="gs_ks")
-        patch_dir = os.path.join(self.ks_dir, "patches.suse")
-        os.mkdir(patch_dir)
-        os.chdir(patch_dir)
-        with open(os.path.join(self.ks_dir, "series.conf"), mode="w") as f:
+        self.ks_dir = Path(tempfile.mkdtemp(prefix="gs_ks"))
+        patch_dir = self.ks_dir / "patches.suse"
+        patch_dir.mkdir()
+        with (self.ks_dir / 'series.conf').open('w') as f:
             f.write(
 """# Kernel patches configuration file
 
@@ -147,7 +149,8 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
             ):
                 f.write("\tpatches.suse/%s\n" % (
                     tests.support.format_patch(self.repo.get(commit),
-                                               mainline=tag),))
+                                               directory=patch_dir,
+                                               mainline=tag).relative_to(patch_dir),))
             f.write(
 """
 	########################################################
@@ -155,29 +158,26 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
 	########################################################
 """)
 
-        ss_path = os.path.join(lib.libdir(), "series_sort.py")
-        os.chdir(self.ks_dir)
+        ss_path = Path(lib.libdir(), "series_sort.py")
 
         # This overlaps what is tested by test_series_sort, hence, not put in a
         # test of its own.
-        subprocess.check_call([ss_path, "-c", "series.conf"])
-        with open("series.conf") as f:
-            content1 = f.read()
-        subprocess.check_call([ss_path, "series.conf"])
-        with open("series.conf") as f:
-            content2 = f.read()
+        subprocess.check_call([ss_path, "-c", "series.conf"], cwd=self.ks_dir)
+        content1 = (self.ks_dir / 'series.conf').read_text()
+        subprocess.check_call([ss_path, "series.conf"], cwd=self.ks_dir)
+        content2 = (self.ks_dir / 'series.conf').read_text()
         self.assertEqual(content2, content1)
 
-        pygit2.init_repository("./")
+        pygit2.init_repository(self.ks_dir)
         subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
         subprocess.check_call(("git", "commit", "-m", "import",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
-        os.makedirs("tmp/current")
-        os.chdir("tmp/current")
+        self.current = self.ks_dir / 'tmp/current'
+        self.current.mkdir(parents=True)
         subprocess.check_call(
-            ["quilt", "setup", "--sourcedir", "../../", "../../series.conf"])
+            ["quilt", "setup", "--sourcedir", "../../", "../../series.conf"], cwd=self.current)
 
 
     def tearDown(self):
@@ -187,46 +187,47 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
 
 
     def test_quilt_mode(self):
-        qm_path = os.path.join(lib.libdir(), "quilt-mode.sh")
+        qm_path = Path(lib.libdir(), "quilt-mode.sh")
+        series = self.current / 'series'
 
         # test series file replacement
-        with open("series") as f:
+        with series.open() as f:
             entries = ["%s\n" % (l,) for l in
                        [line.strip() for line in f.readlines()]
                        if l and not l.startswith("#")]
         # remove the symlink
-        os.unlink("series")
-        with open("series", mode="w") as f:
+        series.unlink()
+        with series.open('w') as f:
             f.writelines(entries)
         subprocess.check_call(
-            (os.path.join(lib.libdir(), "qgoto.py"), str(self.commits[0]),),
-            stdout=subprocess.DEVNULL)
+            (str(Path(lib.libdir(), "qgoto.py")), str(self.commits[0]),),
+            cwd=self.current, stdout=subprocess.DEVNULL)
 
         # test qgoto
         subprocess.check_call(
             ". %s; qgoto %s" % (qm_path, str(self.commits[0])), shell=True,
-            stdout=subprocess.DEVNULL, executable="/bin/bash")
+            cwd=self.current, stdout=subprocess.DEVNULL, executable="/bin/bash")
 
         # test qdupcheck
         try:
             subprocess.check_output(
                 ". %s; qdupcheck %s" % (qm_path, str(self.commits[1])),
-                shell=True, executable="/bin/bash")
+                cwd=self.current, shell=True, executable="/bin/bash")
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
             self.assertEqual(err.output.decode().splitlines()[-1].strip(),
                              "patches.suse/Linux-4.10-rc5.patch")
         else:
             self.assertTrue(False)
-        
+
         subprocess.check_call(
             ". %s; qgoto %s" % (qm_path, str(self.commits[1])), shell=True,
-            stdout=subprocess.DEVNULL, executable="/bin/bash")
+            cwd=self.current, stdout=subprocess.DEVNULL, executable="/bin/bash")
 
         try:
             subprocess.check_output(
                 ". %s; qdupcheck %s" % (qm_path, str(self.commits[1])),
-                shell=True, executable="/bin/bash")
+                cwd=self.current, shell=True, executable="/bin/bash")
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
             self.assertEqual(err.output.decode().splitlines()[-1].strip(),
@@ -237,18 +238,18 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
         # import commits[2]
         subprocess.check_call(
             ". %s; qgoto %s" % (qm_path, str(self.commits[2])), shell=True,
-            executable="/bin/bash")
+            cwd=self.current, executable="/bin/bash")
         subprocess.check_call(
             """. %s; qcp -r "bsc#1077761" -d patches.suse %s""" % (
                 qm_path, str(self.commits[2])),
-            shell=True, stdout=subprocess.DEVNULL, executable="/bin/bash")
+            cwd=self.current, shell=True, stdout=subprocess.DEVNULL, executable="/bin/bash")
 
-        retval = subprocess.check_output(("quilt", "--quiltrc", "-", "next",))
+        retval = subprocess.check_output(("quilt", "--quiltrc", "-", "next",), cwd=self.current)
         name = "patches.suse/KVM-arm-arm64-vgic-v3-Add-accessors-for-the-ICH_APxR.patch"
         self.assertEqual(retval.decode().strip(), name)
 
         try:
-            with open(os.path.join(self.ks_dir, name)) as f:
+            with (self.ks_dir / name).open() as f:
                 retval = f.readlines().index(
                     "Acked-by: Alexander Graf <agraf@suse.de>\n")
         except ValueError:
@@ -256,11 +257,11 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
         self.assertNotEqual(retval, -1)
 
         subprocess.check_call(("quilt", "--quiltrc", "-", "push",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.current, stdout=subprocess.DEVNULL)
 
         try:
             subprocess.check_output(("quilt", "--quiltrc", "-", "pop",),
-                                    stderr=subprocess.STDOUT)
+                                    cwd=self.current, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
             self.assertTrue(err.output.decode().endswith(
@@ -269,54 +270,51 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
             self.assertTrue(False)
 
         subprocess.check_call(("quilt", "--quiltrc", "-", "refresh",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.current, stdout=subprocess.DEVNULL)
         subprocess.check_call(("quilt", "--quiltrc", "-", "pop",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.current, stdout=subprocess.DEVNULL)
         subprocess.check_call(("quilt", "--quiltrc", "-", "push",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.current, stdout=subprocess.DEVNULL)
 
         # prepare repository
-        os.chdir(self.ks_dir)
         subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
-                       stdout=subprocess.DEVNULL)
+                       cwd=self.ks_dir, stdout=subprocess.DEVNULL)
         subprocess.check_call(
             ("git", "commit", "-m",
              "KVM: arm/arm64: vgic-v3: Add accessors for the ICH_APxRn_EL2 registers",),
-            stdout=subprocess.DEVNULL)
+            cwd=self.ks_dir, stdout=subprocess.DEVNULL)
         subprocess.check_call(("git", "checkout", "-q", "-b", "other",
-                               "HEAD^",))
-        shutil.rmtree("tmp/current")
-        os.makedirs("tmp/current")
-        os.chdir("tmp/current")
+                               "HEAD^",), cwd=self.ks_dir)
+        shutil.rmtree(self.current)
+        self.current.mkdir()
         subprocess.check_call(("quilt", "setup", "--sourcedir", "../../",
-                               "../../series.conf",),)
+                               "../../series.conf",), cwd=self.current)
 
         # import commits[3]
         subprocess.check_call(
             ". %s; qgoto %s" % (qm_path, str(self.commits[3])), shell=True,
-            stdout=subprocess.DEVNULL, executable="/bin/bash")
+            cwd=self.current, stdout=subprocess.DEVNULL, executable="/bin/bash")
         subprocess.check_call(
             """. %s; qcp -r "bsc#123" -d patches.suse %s""" % (
                 qm_path, str(self.commits[3])),
-            shell=True, stdout=subprocess.DEVNULL, executable="/bin/bash")
+            cwd=self.current, shell=True, stdout=subprocess.DEVNULL, executable="/bin/bash")
 
         subprocess.check_call(("quilt", "--quiltrc", "-", "push",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.current, stdout=subprocess.DEVNULL)
         subprocess.check_call(("quilt", "--quiltrc", "-", "refresh",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.current, stdout=subprocess.DEVNULL)
         name = subprocess.check_output(
-            ("quilt", "--quiltrc", "-", "top",)).decode().strip()
+            ("quilt", "--quiltrc", "-", "top",), cwd=self.current).decode().strip()
 
-        os.chdir(self.ks_dir)
         subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
         # test pre-commit.sh
-        pc_path = os.path.join(lib.libdir(), "pre-commit.sh")
+        pc_path = Path(lib.libdir(), "pre-commit.sh")
 
-        subprocess.check_call(pc_path, stdout=subprocess.DEVNULL)
+        subprocess.check_call(pc_path, cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
-        with open("series.conf") as f:
+        with (self.ks_dir / 'series.conf').open() as f:
             content = f.readlines()
 
         content2 = list(content)
@@ -324,18 +322,18 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
         content2[middle], content2[middle + 1] = \
             content2[middle + 1], content2[middle]
 
-        with open("series.conf", mode="w") as f:
+        with (self.ks_dir / 'series.conf').open('w') as f:
             f.writelines(content2)
 
         # check should be done against index, not working tree
-        subprocess.check_call(pc_path, stdout=subprocess.DEVNULL)
+        subprocess.check_call(pc_path, cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
         subprocess.check_call(("git", "add", "series.conf",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
         # ... test a bad sorted section
         try:
-            subprocess.check_output(pc_path, stderr=subprocess.STDOUT)
+            subprocess.check_output(pc_path, cwd=self.ks_dir, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
             self.assertTrue(err.output.decode().startswith(
@@ -343,30 +341,30 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
         else:
             self.assertTrue(False)
 
-        with open("series.conf", mode="w") as f:
+        with (self.ks_dir / 'series.conf').open('w') as f:
             f.writelines(content)
 
         subprocess.check_call(("git", "add", "series.conf",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
         subprocess.check_call(("git", "commit", "-m",
                                "sched/debug: Ignore TASK_IDLE for SysRq-W",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
         # ... test a bad sorted patch
-        with open(name) as f:
+        with (self.ks_dir / name).open() as f:
             content = f.readlines()
         content2 = list(content)
         for i in range(len(content2)):
             if content2[i].startswith("Git-commit: "):
                 content2[i] = "Git-commit: cb329c2e40cf6cfc7bcd7c36ce5547f95e972ea5\n"
                 break
-        with open(name, mode="w") as f:
+        with (self.ks_dir / name).open('w') as f:
             f.writelines(content2)
-        subprocess.check_call(("git", "add", name,), stdout=subprocess.DEVNULL)
+        subprocess.check_call(("git", "add", name,), cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
         try:
-            subprocess.check_output(pc_path, stderr=subprocess.STDOUT)
+            subprocess.check_output(pc_path, cwd=self.ks_dir, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
             self.assertTrue(err.output.decode().startswith(
@@ -374,29 +372,29 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
         else:
             self.assertTrue(False)
 
-        with open(name, mode="w") as f:
+        with (self.ks_dir / name).open('w') as f:
             f.writelines(content)
-        subprocess.check_call(("git", "add", name,), stdout=subprocess.DEVNULL)
+        subprocess.check_call(("git", "add", name,), cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
         # test merge_tool.py
-        subprocess.check_call(("git", "checkout", "-q", "master",))
-        shutil.rmtree("tmp/current")
+        subprocess.check_call(("git", "checkout", "-q", "master",), cwd=self.ks_dir)
+        shutil.rmtree(self.current)
         subprocess.check_call(
             ("git", "config", "--add", "mergetool.git-sort.cmd",
              "%s $LOCAL $BASE $REMOTE $MERGED" % (
-                 os.path.join(lib.libdir(), "merge_tool.py"),),))
+                 os.path.join(lib.libdir(), "merge_tool.py"),),), cwd=self.ks_dir)
         subprocess.check_call(("git", "config", "--add",
-                               "mergetool.git-sort.trustexitcode", "true",))
-        retval = subprocess.call(("git", "merge", "other",),
+                               "mergetool.git-sort.trustexitcode", "true",), cwd=self.ks_dir)
+        retval = subprocess.call(("git", "merge", "other",), cwd=self.ks_dir,
                                        stdout=subprocess.DEVNULL,
                                        stderr=subprocess.DEVNULL)
         self.assertEqual(retval, 1)
         retval = subprocess.check_output(
-            ("git", "mergetool", "--tool=git-sort", "series.conf",))
+            ("git", "mergetool", "--tool=git-sort", "series.conf",), cwd=self.ks_dir)
         self.assertEqual(
             retval.decode().splitlines()[-1].strip(),
             "1 commits added, 0 commits removed from base to remote.")
-        with open("series.conf") as f:
+        with (self.ks_dir / 'series.conf').open() as f:
             entries = series_conf.filter_series(f.readlines())
         self.assertEqual(entries,
                          ["patches.suse/%s.patch" %
@@ -404,174 +402,11 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
                               self.repo.get(commit).message),)
                           for commit in self.commits[:4]])
         retval = subprocess.check_output(("git", "status", "--porcelain",
-                                          "series.conf",))
+                                          "series.conf",), cwd=self.ks_dir)
         self.assertEqual(retval.decode().strip(), "M  series.conf")
 
 
-class TestMergeTool(unittest.TestCase):
-    def setUp(self):
-        os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
-
-        # setup stub linux repository
-        os.environ["LINUX_GIT"] = tempfile.mkdtemp(prefix="gs_repo")
-        self.repo = pygit2.init_repository(os.environ["LINUX_GIT"])
-
-        author = pygit2.Signature("Alice Author", "alice@authors.tld")
-        committer = pygit2.Signature("Cecil Committer", "cecil@committers.tld")
-        tree = self.repo.TreeBuilder()
-
-        k_org_canon_prefix = "git://git.kernel.org/pub/scm/linux/kernel/git/"
-        self.mainline_repo = k_org_canon_prefix + "torvalds/linux.git"
-        self.repo.remotes.create("origin", self.mainline_repo)
-
-        self.commits = {}
-        self.commits["mainline 0"] = self.repo.create_commit(
-            "refs/heads/mainline",
-            author,
-            committer,
-            "mainline 0\n\nlog",
-            tree.write(),
-            []
-        )
-
-        self.commits["mainline 1"] = self.repo.create_commit(
-            "refs/heads/mainline",
-            author,
-            committer,
-            "mainline 1\n\nlog",
-            tree.write(),
-            [self.commits["mainline 0"]]
-        )
-
-        self.commits["mainline 2"] = self.repo.create_commit(
-            "refs/heads/mainline",
-            author,
-            committer,
-            "mainline 2\n\nlog",
-            tree.write(),
-            [self.commits["mainline 1"]]
-        )
-        self.repo.references.create("refs/remotes/origin/master",
-                                    self.commits["mainline 2"])
-
-        self.repo.checkout("refs/heads/mainline")
-
-        # setup stub kernel-source content
-        self.ks_dir = tempfile.mkdtemp(prefix="gs_ks")
-        os.chdir(self.ks_dir)
-
-        pygit2.init_repository("./")
-        subprocess.check_call(
-            ("git", "config", "--add", "mergetool.git-sort.cmd",
-             "%s $LOCAL $BASE $REMOTE $MERGED" % (
-                 os.path.join(lib.libdir(), "merge_tool.py"),),))
-        subprocess.check_call(("git", "config", "--add",
-                               "mergetool.git-sort.trustexitcode", "true",))
-
-        self.patch_dir = "patches.suse"
-        os.mkdir(self.patch_dir)
-
-
-    def tearDown(self):
-        shutil.rmtree(os.environ["XDG_CACHE_HOME"])
-        shutil.rmtree(os.environ["LINUX_GIT"])
-        shutil.rmtree(self.ks_dir)
-
-
-    def test_moved(self):
-        names = {}
-
-        # local branch
-        names["mainline 0"] = tests.support.format_patch(
-            self.repo.get(self.commits["mainline 0"]), mainline="v0",
-            directory=self.patch_dir)
-        names["mainline 1"] = tests.support.format_patch(
-            self.repo.get(self.commits["mainline 1"]),
-            directory=self.patch_dir)
-
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
-                (None, (
-                    names["mainline 0"],
-                )),
-                ("out-of-tree patches", (
-                    names["mainline 1"],
-                )),
-            )))
-
-        subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
-                              stdout=subprocess.DEVNULL)
-        subprocess.check_call(("git", "commit", "-m", "mainline 0",),
-                              stdout=subprocess.DEVNULL)
-
-        names["mainline 2"] = tests.support.format_patch(
-            self.repo.get(self.commits["mainline 2"]), mainline="v0",
-            directory=self.patch_dir)
-
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
-                (None, (
-                    names["mainline 0"],
-                    names["mainline 2"],
-                )),
-                ("out-of-tree patches", (
-                    names["mainline 1"],
-                )),
-            )))
-
-        subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
-                              stdout=subprocess.DEVNULL)
-        subprocess.check_call(("git", "commit", "-m", "mainline 2",),
-                              stdout=subprocess.DEVNULL)
-
-        # remote branch
-        subprocess.check_call(("git", "checkout", "-q", "-b", "other",
-                               "HEAD^",))
-        names["mainline 1"] = tests.support.format_patch(
-            self.repo.get(self.commits["mainline 1"]), mainline="v0",
-            directory=self.patch_dir)
-
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
-                (None, (
-                    names["mainline 0"],
-                    names["mainline 1"],
-                )),
-            )))
-
-        subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
-                              stdout=subprocess.DEVNULL)
-        subprocess.check_call(("git", "commit", "-m", "Refresh mainline 1",),
-                              stdout=subprocess.DEVNULL)
-
-        # test merge_tool.py
-        subprocess.check_call(("git", "checkout", "-q", "master",))
-        retval = subprocess.call(("git", "merge", "other",),
-                                       stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL)
-        self.assertEqual(retval, 1)
-        #sys.stdin.readline()
-        retval = subprocess.check_output(
-            ("git", "mergetool", "--tool=git-sort", "series.conf",),
-            stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.assertEqual(
-            "1 commits changed section from base to remote.",
-            retval.decode().splitlines()[-1].strip())
-        with open("series.conf") as f:
-            self.assertEqual(
-                tests.support.format_series((
-                    (None, (
-                        names["mainline 0"],
-                        names["mainline 1"],
-                        names["mainline 2"],
-                    )),
-                )),
-                f.read())
-        retval = subprocess.check_output(("git", "status", "--porcelain",
-                                          "series.conf",))
-        self.assertEqual(retval.decode().strip(), "M  series.conf")
-
-
+@unittest.skip("Patched quilt not maintained")
 class TestQCP(unittest.TestCase):
     def setUp(self):
         os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
@@ -656,11 +491,10 @@ Signed-off-by: Maintainer One <maintainer@example.com>
                                     self.commits[-1])
 
         # setup stub kernel-source content
-        self.ks_dir = tempfile.mkdtemp(prefix="gs_ks")
-        patch_dir = os.path.join(self.ks_dir, "patches.suse")
-        os.mkdir(patch_dir)
-        os.chdir(patch_dir)
-        with open(os.path.join(self.ks_dir, "series.conf"), mode="w") as f:
+        self.ks_dir = Path(tempfile.mkdtemp(prefix="gs_ks"))
+        patch_dir = self.ks_dir / 'patches.suse'
+        patch_dir.mkdir()
+        with (self.ks_dir / "series.conf").open('w') as f:
             f.write(
 """# Kernel patches configuration file
 
@@ -671,7 +505,8 @@ Signed-off-by: Maintainer One <maintainer@example.com>
             f.write("\tpatches.suse/%s\n" % (
                 tests.support.format_patch(self.repo.get(self.commits[0]),
                                            mainline="v4.9",
-                                           references="bsc#123"),))
+                                           directory=patch_dir,
+                                           references="bsc#123").relative_to(patch_dir),))
             f.write(
 """
 	########################################################
@@ -679,23 +514,20 @@ Signed-off-by: Maintainer One <maintainer@example.com>
 	########################################################
 """)
 
-        ss_path = os.path.join(lib.libdir(), "series_sort.py")
-        os.chdir(self.ks_dir)
+        ss_path = Path(lib.libdir(), "series_sort.py")
 
         # This overlaps what is tested by test_series_sort, hence, not put in a
         # test of its own.
-        subprocess.check_call([ss_path, "-c", "series.conf"])
-        with open("series.conf") as f:
-            content1 = f.read()
-        subprocess.check_call([ss_path, "series.conf"])
-        with open("series.conf") as f:
-            content2 = f.read()
+        subprocess.check_call([ss_path, "-c", "series.conf"], cwd=self.ks_dir)
+        content1 = (self.ks_dir / 'series.conf').read_text()
+        subprocess.check_call([ss_path, "series.conf"], cwd=self.ks_dir)
+        content2 = (self.ks_dir / 'series.conf').read_text()
         self.assertEqual(content2, content1)
 
-        os.makedirs("tmp/current")
-        os.chdir("tmp/current")
+        self.current = self.ks_dir / 'tmp/current'
+        self.current.mkdir(parents=True)
         subprocess.check_call(
-            ["quilt", "setup", "--sourcedir", "../../", "../../series.conf"])
+            ["quilt", "setup", "--sourcedir", "../../", "../../series.conf"], cwd=self.current)
 
 
     def tearDown(self):
@@ -705,18 +537,18 @@ Signed-off-by: Maintainer One <maintainer@example.com>
 
 
     def test_fixup(self):
-        qm_path = os.path.join(lib.libdir(), "quilt-mode.sh")
+        qm_path = Path(lib.libdir(), "quilt-mode.sh")
 
         # import commits[1]
         subprocess.check_call(
             ". %s; qgoto %s" % (qm_path, str(self.commits[1])), shell=True,
-            stdout=subprocess.DEVNULL, executable="/bin/bash")
+            cwd=self.current, stdout=subprocess.DEVNULL, executable="/bin/bash")
         subprocess.check_call(
             """. %s; qcp -f %s""" % (
                 qm_path, str(self.commits[1])),
-            shell=True, stdout=subprocess.DEVNULL, executable="/bin/bash")
+            cwd=self.current, shell=True, stdout=subprocess.DEVNULL, executable="/bin/bash")
 
-        retval = subprocess.check_output(("quilt", "--quiltrc", "-", "next",))
+        retval = subprocess.check_output(("quilt", "--quiltrc", "-", "next",), cwd=self.current)
         name = "patches.suse/Fix-the-very-small-module.patch"
         self.assertEqual(retval.decode().strip(), name)
 
