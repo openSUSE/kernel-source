@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 import os
-import os.path
 import shutil
 import subprocess
 import sys
@@ -69,19 +68,18 @@ class TestMergeTool(unittest.TestCase):
         self.repo.checkout("refs/heads/mainline")
 
         # setup stub kernel-source content
-        self.ks_dir = tempfile.mkdtemp(prefix="gs_ks")
-        os.chdir(self.ks_dir)
+        self.ks_dir = Path(tempfile.mkdtemp(prefix="gs_ks"))
 
-        pygit2.init_repository("./")
+        pygit2.init_repository(self.ks_dir)
         subprocess.check_call(
             ("git", "config", "--add", "mergetool.git-sort.cmd",
              "%s $LOCAL $BASE $REMOTE $MERGED" % (
-                 os.path.join(lib.libdir(), "merge_tool.py"),),))
+                 Path(lib.libdir(), "merge_tool.py"),),), cwd=self.ks_dir)
         subprocess.check_call(("git", "config", "--add",
-                               "mergetool.git-sort.trustexitcode", "true",))
+                               "mergetool.git-sort.trustexitcode", "true",), cwd=self.ks_dir)
 
-        self.patch_dir = "patches.suse"
-        os.mkdir(self.patch_dir)
+        self.patch_dir = self.ks_dir / 'patches.suse'
+        self.patch_dir.mkdir()
 
 
     def tearDown(self):
@@ -101,8 +99,8 @@ class TestMergeTool(unittest.TestCase):
             self.repo.get(self.commits["mainline 1"]),
             directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 (None, (
                     names["mainline 0"],
                 )),
@@ -112,16 +110,16 @@ class TestMergeTool(unittest.TestCase):
             )))
 
         subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
         subprocess.check_call(("git", "commit", "-m", "mainline 0",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
         names["mainline 2"] = tests.support.format_patch(
             self.repo.get(self.commits["mainline 2"]), mainline="v0",
             directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 (None, (
                     names["mainline 0"],
                     names["mainline 2"],
@@ -132,19 +130,19 @@ class TestMergeTool(unittest.TestCase):
             )))
 
         subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
         subprocess.check_call(("git", "commit", "-m", "mainline 2",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
         # remote branch
         subprocess.check_call(("git", "checkout", "-q", "-b", "other",
-                               "HEAD^",))
+                               "HEAD^",), cwd=self.ks_dir)
         names["mainline 1"] = tests.support.format_patch(
             self.repo.get(self.commits["mainline 1"]), mainline="v0",
             directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 (None, (
                     names["mainline 0"],
                     names["mainline 1"],
@@ -152,25 +150,24 @@ class TestMergeTool(unittest.TestCase):
             )))
 
         subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
         subprocess.check_call(("git", "commit", "-m", "Refresh mainline 1",),
-                              stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
         # test merge_tool.py
-        subprocess.check_call(("git", "checkout", "-q", "master",))
-        retval = subprocess.call(("git", "merge", "other",),
+        subprocess.check_call(("git", "checkout", "-q", "master",), cwd=self.ks_dir)
+        retval = subprocess.call(("git", "merge", "other",), cwd=self.ks_dir,
                                        stdout=subprocess.DEVNULL,
                                        stderr=subprocess.DEVNULL)
         self.assertEqual(retval, 1)
         #sys.stdin.readline()
         retval = subprocess.check_output(
-            ("git", "mergetool", "--tool=git-sort", "series.conf",),
+            ("git", "mergetool", "--tool=git-sort", "series.conf",), cwd=self.ks_dir,
             stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.assertEqual(
             "1 commits changed section from base to remote.",
             retval.decode().splitlines()[-1].strip())
-        with open("series.conf") as f:
-            self.assertEqual(
+        self.assertEqual(
                 tests.support.format_series((
                     (None, (
                         names["mainline 0"],
@@ -178,7 +175,7 @@ class TestMergeTool(unittest.TestCase):
                         names["mainline 2"],
                     )),
                 )),
-                f.read())
+                (self.ks_dir / 'series.conf').read_text())
         retval = subprocess.check_output(("git", "status", "--porcelain",
-                                          "series.conf",))
+                                          "series.conf",), cwd=self.ks_dir)
         self.assertEqual(retval.decode().strip(), "M  series.conf")
