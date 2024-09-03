@@ -1,0 +1,249 @@
+From: Thomas Song <tsong@purestorage.com>
+Date: Tue, 25 Jun 2024 08:26:05 -0400
+Subject: nvme-multipath: implement "queue-depth" iopolicy
+Patch-mainline: v6.11-rc1
+Git-commit: f227345f0a70f011647ae7ae12778bf258ff71f2
+References: bsc#1227706
+
+The round-robin path selector is inefficient in cases where there is a
+difference in latency between paths.  In the presence of one or more
+high latency paths the round-robin selector continues to use the high
+latency path equally. This results in a bias towards the highest latency
+path and can cause a significant decrease in overall performance as IOs
+pile on the highest latency path. This problem is acute with NVMe-oF
+controllers.
+
+The queue-depth path selector sends I/O down the path with the lowest
+number of requests in its request queue. Paths with lower latency will
+clear requests more quickly and have less requests queued compared to
+higher latency paths. The goal of this path selector is to make more use
+of lower latency paths which will bring down overall IO latency and
+increase throughput and performance.
+
+Signed-off-by: Thomas Song <tsong@purestorage.com>
+[emilne: commandeered patch developed by Thomas Song @ Pure Storage]
+Co-developed-by: Ewan D. Milne <emilne@redhat.com>
+Signed-off-by: Ewan D. Milne <emilne@redhat.com>
+Co-developed-by: John Meneghini <jmeneghi@redhat.com>
+Signed-off-by: John Meneghini <jmeneghi@redhat.com>
+Link: https://lore.kernel.org/linux-nvme/20240509202929.831680-1-jmeneghi@redhat.com/
+Tested-by: Marco Patalano <mpatalan@redhat.com>
+Tested-by: Jyoti Rani <jrani@purestorage.com>
+Tested-by: John Meneghini <jmeneghi@redhat.com>
+Reviewed-by: Randy Jennings <randyj@purestorage.com>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+Reviewed-by: Chaitanya Kulkarni <kch@nvidia.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Keith Busch <kbusch@kernel.org>
+Acked-by: Daniel Wagner <dwagner@suse.de>
+---
+ drivers/nvme/host/core.c      |    2 
+ drivers/nvme/host/multipath.c |   86 ++++++++++++++++++++++++++++++++++++++++--
+ drivers/nvme/host/nvme.h      |    4 +
+ 3 files changed, 87 insertions(+), 5 deletions(-)
+
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -109,7 +109,7 @@ struct workqueue_struct *nvme_delete_wq;
+ EXPORT_SYMBOL_GPL(nvme_delete_wq);
+ 
+ static LIST_HEAD(nvme_subsystems);
+-static DEFINE_MUTEX(nvme_subsystems_lock);
++DEFINE_MUTEX(nvme_subsystems_lock);
+ 
+ static DEFINE_IDA(nvme_instance_ida);
+ static dev_t nvme_ctrl_base_chr_devt;
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@ -17,6 +17,7 @@ MODULE_PARM_DESC(multipath,
+ static const char *nvme_iopolicy_names[] = {
+ 	[NVME_IOPOLICY_NUMA]	= "numa",
+ 	[NVME_IOPOLICY_RR]	= "round-robin",
++	[NVME_IOPOLICY_QD]      = "queue-depth",
+ };
+ 
+ static int iopolicy = NVME_IOPOLICY_NUMA;
+@@ -29,6 +30,8 @@ static int nvme_set_iopolicy(const char
+ 		iopolicy = NVME_IOPOLICY_NUMA;
+ 	else if (!strncmp(val, "round-robin", 11))
+ 		iopolicy = NVME_IOPOLICY_RR;
++	else if (!strncmp(val, "queue-depth", 11))
++		iopolicy = NVME_IOPOLICY_QD;
+ 	else
+ 		return -EINVAL;
+ 
+@@ -43,7 +46,7 @@ static int nvme_get_iopolicy(char *buf,
+ module_param_call(iopolicy, nvme_set_iopolicy, nvme_get_iopolicy,
+ 	&iopolicy, 0644);
+ MODULE_PARM_DESC(iopolicy,
+-	"Default multipath I/O policy; 'numa' (default) or 'round-robin'");
++	"Default multipath I/O policy; 'numa' (default), 'round-robin' or 'queue-depth'");
+ 
+ void nvme_mpath_default_iopolicy(struct nvme_subsystem *subsys)
+ {
+@@ -128,6 +131,11 @@ void nvme_mpath_start_request(struct req
+ 	struct nvme_ns *ns = rq->q->queuedata;
+ 	struct gendisk *disk = ns->head->disk;
+ 
++	if (READ_ONCE(ns->head->subsys->iopolicy) == NVME_IOPOLICY_QD) {
++		atomic_inc(&ns->ctrl->nr_active);
++		nvme_req(rq)->flags |= NVME_MPATH_CNT_ACTIVE;
++	}
++
+ 	if (!blk_queue_io_stat(disk->queue) || blk_rq_is_passthrough(rq))
+ 		return;
+ 
+@@ -141,6 +149,9 @@ void nvme_mpath_end_request(struct reque
+ {
+ 	struct nvme_ns *ns = rq->q->queuedata;
+ 
++	if (nvme_req(rq)->flags & NVME_MPATH_CNT_ACTIVE)
++		atomic_dec_if_positive(&ns->ctrl->nr_active);
++
+ 	if (!(nvme_req(rq)->flags & NVME_MPATH_IO_STATS))
+ 		return;
+ 	bdev_end_io_acct(ns->head->disk->part0, req_op(rq),
+@@ -337,6 +348,42 @@ static struct nvme_ns *nvme_round_robin_
+ 	return found;
+ }
+ 
++static struct nvme_ns *nvme_queue_depth_path(struct nvme_ns_head *head)
++{
++	struct nvme_ns *best_opt = NULL, *best_nonopt = NULL, *ns;
++	unsigned int min_depth_opt = UINT_MAX, min_depth_nonopt = UINT_MAX;
++	unsigned int depth;
++
++	list_for_each_entry_rcu(ns, &head->list, siblings) {
++		if (nvme_path_is_disabled(ns))
++			continue;
++
++		depth = atomic_read(&ns->ctrl->nr_active);
++
++		switch (ns->ana_state) {
++		case NVME_ANA_OPTIMIZED:
++			if (depth < min_depth_opt) {
++				min_depth_opt = depth;
++				best_opt = ns;
++			}
++			break;
++		case NVME_ANA_NONOPTIMIZED:
++			if (depth < min_depth_nonopt) {
++				min_depth_nonopt = depth;
++				best_nonopt = ns;
++			}
++			break;
++		default:
++			break;
++		}
++
++		if (min_depth_opt == 0)
++			return best_opt;
++	}
++
++	return best_opt ? best_opt : best_nonopt;
++}
++
+ static inline bool nvme_path_is_optimized(struct nvme_ns *ns)
+ {
+ 	return nvme_ctrl_state(ns->ctrl) == NVME_CTRL_LIVE &&
+@@ -358,9 +405,14 @@ static struct nvme_ns *nvme_numa_path(st
+ 
+ inline struct nvme_ns *nvme_find_path(struct nvme_ns_head *head)
+ {
+-	if (READ_ONCE(head->subsys->iopolicy) == NVME_IOPOLICY_RR)
++	switch (READ_ONCE(head->subsys->iopolicy)) {
++	case NVME_IOPOLICY_QD:
++		return nvme_queue_depth_path(head);
++	case NVME_IOPOLICY_RR:
+ 		return nvme_round_robin_path(head);
+-	return nvme_numa_path(head);
++	default:
++		return nvme_numa_path(head);
++	}
+ }
+ 
+ static bool nvme_available_path(struct nvme_ns_head *head)
+@@ -808,6 +860,29 @@ static ssize_t nvme_subsys_iopolicy_show
+ 			  nvme_iopolicy_names[READ_ONCE(subsys->iopolicy)]);
+ }
+ 
++static void nvme_subsys_iopolicy_update(struct nvme_subsystem *subsys,
++		int iopolicy)
++{
++	struct nvme_ctrl *ctrl;
++	int old_iopolicy = READ_ONCE(subsys->iopolicy);
++
++	if (old_iopolicy == iopolicy)
++		return;
++
++	WRITE_ONCE(subsys->iopolicy, iopolicy);
++
++	/* iopolicy changes clear the mpath by design */
++	mutex_lock(&nvme_subsystems_lock);
++	list_for_each_entry(ctrl, &subsys->ctrls, subsys_entry)
++		nvme_mpath_clear_ctrl_paths(ctrl);
++	mutex_unlock(&nvme_subsystems_lock);
++
++	pr_notice("subsysnqn %s iopolicy changed from %s to %s\n",
++			subsys->subnqn,
++			nvme_iopolicy_names[old_iopolicy],
++			nvme_iopolicy_names[iopolicy]);
++}
++
+ static ssize_t nvme_subsys_iopolicy_store(struct device *dev,
+ 		struct device_attribute *attr, const char *buf, size_t count)
+ {
+@@ -817,7 +892,7 @@ static ssize_t nvme_subsys_iopolicy_stor
+ 
+ 	for (i = 0; i < ARRAY_SIZE(nvme_iopolicy_names); i++) {
+ 		if (sysfs_streq(buf, nvme_iopolicy_names[i])) {
+-			WRITE_ONCE(subsys->iopolicy, i);
++			nvme_subsys_iopolicy_update(subsys, i);
+ 			return count;
+ 		}
+ 	}
+@@ -928,6 +1003,9 @@ int nvme_mpath_init_identify(struct nvme
+ 	    !(ctrl->subsys->cmic & NVME_CTRL_CMIC_ANA))
+ 		return 0;
+ 
++	/* initialize this in the identify path to cover controller resets */
++	atomic_set(&ctrl->nr_active, 0);
++
+ 	if (!ctrl->max_namespaces ||
+ 	    ctrl->max_namespaces > le32_to_cpu(id->nn)) {
+ 		dev_err(ctrl->device,
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -48,6 +48,7 @@ extern unsigned int admin_timeout;
+ extern struct workqueue_struct *nvme_wq;
+ extern struct workqueue_struct *nvme_reset_wq;
+ extern struct workqueue_struct *nvme_delete_wq;
++extern struct mutex nvme_subsystems_lock;
+ 
+ /*
+  * List of workarounds for devices that required behavior not specified in
+@@ -194,6 +195,7 @@ enum {
+ 	NVME_REQ_CANCELLED		= (1 << 0),
+ 	NVME_REQ_USERCMD		= (1 << 1),
+ 	NVME_MPATH_IO_STATS		= (1 << 2),
++	NVME_MPATH_CNT_ACTIVE		= (1 << 3),
+ };
+ 
+ static inline struct nvme_request *nvme_req(struct request *req)
+@@ -357,6 +359,7 @@ struct nvme_ctrl {
+ 	size_t ana_log_size;
+ 	struct timer_list anatt_timer;
+ 	struct work_struct ana_work;
++	atomic_t nr_active;
+ #endif
+ 
+ #ifdef CONFIG_NVME_HOST_AUTH
+@@ -405,6 +408,7 @@ static inline enum nvme_ctrl_state nvme_
+ enum nvme_iopolicy {
+ 	NVME_IOPOLICY_NUMA,
+ 	NVME_IOPOLICY_RR,
++	NVME_IOPOLICY_QD,
+ };
+ 
+ struct nvme_subsystem {

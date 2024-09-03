@@ -1,11 +1,9 @@
 # https://hub.docker.com/r/opensuse/tumbleweed/
 FROM opensuse/tumbleweed AS base
 
-RUN zypper -n ref
-
 FROM base AS packages
 
-RUN zypper -n in git python3 python3-dbm python3-pygit2 rcs util-linux
+RUN zypper -n in git python3 python3-dbm python3-pygit2 rcs util-linux gawk python3-PyYAML
 
 RUN git config --global user.email "you@example.com"
 RUN git config --global user.name "Your Name"

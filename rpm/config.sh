@@ -24,3 +24,5 @@ SUPPORTED_MODULES_CHECK=Yes
 BUILD_HTML=Yes
 # build documentation in PDF format
 BUILD_PDF=No
+# Generate compile_commands.json
+GENERATE_COMPILE_COMMANDS=Yes
