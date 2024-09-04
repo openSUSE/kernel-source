@@ -6,7 +6,7 @@ import re
 import sys
 
 import suse_git.exc as exc
-import util
+import suse_git.util as util
 
 class ValidationError(Exception):
     pass
