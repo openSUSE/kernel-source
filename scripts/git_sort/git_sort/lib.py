@@ -31,11 +31,11 @@ import sys
 import os
 import re
 
-import pygit2_wrapper as pygit2
-import suse_git.exc as exc
+from . import pygit2_wrapper as pygit2
+from . import series_conf
+from . import git_sort
 from suse_git.patch import Patch
-import git_sort
-import series_conf
+from suse_git import exc
 
 # fixups for python 3.6, works flawlessly in python 3.11
 if sys.version_info.minor < 11:  # SLE15
@@ -109,8 +109,8 @@ if sys.version_info.minor < 11:  # SLE15
 
 # https://stackoverflow.com/a/952952
 flatten = lambda l: [item for sublist in l for item in sublist]
-bindir = Path(__file__).parent
-gs_path = bindir / 'git_sort.py'
+bindir = Path(__file__).parent.parent
+gs_path = bindir / 'git_sort_debug'
 ss_path = bindir / 'series_sort'
 si_path = bindir / 'series_insert'
 qm_path = bindir / 'quilt-mode.sh'

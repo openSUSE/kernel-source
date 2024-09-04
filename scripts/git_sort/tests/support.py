@@ -1,14 +1,13 @@
-#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import pygit2_wrapper as pygit2
+from git_sort import pygit2_wrapper as pygit2
 from pathlib import Path
 import datetime
 import re
 import os
 
 os.environ['GIT_SORT_REPOSITORIES'] = str(Path(__file__).parent / 'git_sort.yaml')
-import lib
+import git_sort.lib
 
 # from http://www.pygit2.org/recipes/git-show.html
 class FixedOffset(datetime.tzinfo):

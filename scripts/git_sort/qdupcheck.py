@@ -24,10 +24,10 @@ import os.path
 import subprocess
 import sys
 
-import pygit2_wrapper as pygit2
-import suse_git.exc as exc
-import lib
-import series_conf
+from git_sort import pygit2_wrapper as pygit2
+from git_sort import series_conf
+from git_sort import lib
+from suse_git import exc
 
 
 if __name__ == "__main__":

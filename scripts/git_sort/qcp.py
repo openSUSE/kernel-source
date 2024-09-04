@@ -27,11 +27,11 @@ import subprocess
 import sys
 import tempfile
 
-import pygit2_wrapper as pygit2
-import suse_git.exc as exc
+from git_sort import pygit2_wrapper as pygit2
 from suse_git.patch import Patch
-import lib
-import series_conf
+from git_sort import series_conf
+from git_sort import lib
+from suse_git import exc
 
 
 def format_import(references, tmpdir, dstdir, rev, poi=[]):

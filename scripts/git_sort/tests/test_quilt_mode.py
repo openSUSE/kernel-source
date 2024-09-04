@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 
-import pygit2_wrapper as pygit2
 from pathlib import Path
 import subprocess
 import tempfile
@@ -12,9 +11,10 @@ import sys
 import os
 
 import tests.support  # before git_sort
-import series_conf
-import git_sort
-import lib
+from git_sort import pygit2_wrapper as pygit2
+from git_sort import series_conf
+from git_sort import git_sort
+from git_sort import lib
 
 
 @unittest.skip("Patched quilt not maintained")

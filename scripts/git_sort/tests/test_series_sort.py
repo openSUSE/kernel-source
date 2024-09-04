@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 
-import pygit2_wrapper as pygit2
 from pathlib import Path
 import subprocess
 import tempfile
@@ -12,8 +11,9 @@ import sys
 import os
 
 import tests.support  # before git_sort
-import git_sort
-import lib
+from git_sort import pygit2_wrapper as pygit2
+from git_sort import git_sort
+from git_sort import lib
 
 
 class TestSeriesSort(unittest.TestCase):

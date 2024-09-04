@@ -20,11 +20,10 @@
 
 import argparse
 import os
-import os.path
 import subprocess
 import sys
-import suse_git.exc as exc
-import lib
+from git_sort import lib
+from suse_git import exc
 
 
 if __name__ == "__main__":
