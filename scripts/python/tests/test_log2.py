@@ -10,7 +10,7 @@ import stat
 import sys
 import os
 
-from . import lib
+from . import support
 
 
 class TestSpliceSeries(unittest.TestCase):
@@ -30,7 +30,7 @@ class TestSpliceSeries(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = Path(tempfile.mkdtemp(prefix="gs_log2"))
-        self.log2_path = Path(lib.libdir(), "../../log2")
+        self.log2_path = support.testdir() / '../../log2'
         self.testscript = """#!/bin/bash
 
                           . %s
