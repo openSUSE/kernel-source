@@ -341,7 +341,7 @@ class InputEntry(object):
                         "not available locally) or an entry for this "
                         "repository is missing from \"remotes\". In the last "
                         "case, please edit \"remotes\" in "
-                        "\"scripts/git_sort/git_sort.py\" and commit the "
+                        "\"scripts/git_sort/git_sort.yaml\" and commit the "
                         "result. Manual intervention is required." % (name,))
             else: # repo is indexed
                 if repo == current_head.repo_url: # good tag

@@ -946,7 +946,7 @@ class TestFromPatch(unittest.TestCase):
             )))
 
         self.check_failure(
-"Error: There is a problem with patch \"%s\". The Git-repo tag is incorrect or the patch is in the wrong section of series.conf and (the Git-commit tag is incorrect or the relevant remote is outdated or not available locally) or an entry for this repository is missing from \"remotes\". In the last case, please edit \"remotes\" in \"scripts/git_sort/git_sort.py\" and commit the result. Manual intervention is required.\n" % (name,))
+"Error: There is a problem with patch \"%s\". The Git-repo tag is incorrect or the patch is in the wrong section of series.conf and (the Git-commit tag is incorrect or the relevant remote is outdated or not available locally) or an entry for this repository is missing from \"remotes\". In the last case, please edit \"remotes\" in \"scripts/git_sort/git_sort.yaml\" and commit the result. Manual intervention is required.\n" % (name,))
 
 
     def test_malformed(self):
