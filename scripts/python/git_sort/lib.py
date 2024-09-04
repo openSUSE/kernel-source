@@ -1,4 +1,3 @@
-#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 # Copyright (C) 2018 SUSE LLC
@@ -109,7 +108,7 @@ if sys.version_info.minor < 11:  # SLE15
 
 # https://stackoverflow.com/a/952952
 flatten = lambda l: [item for sublist in l for item in sublist]
-bindir = Path(__file__).parent.parent
+bindir = Path(__file__).parents[2] / 'git_sort'
 gs_path = bindir / 'git_sort_debug'
 ss_path = bindir / 'series_sort'
 si_path = bindir / 'series_insert'

@@ -28,7 +28,7 @@ class TestLinuxGit(unittest.TestCase):
 
         subprocess.check_call(args, env={})
 
-        retval = subprocess.check_output((self.lg_path,),
+        retval = subprocess.check_output([self.lg_path],
                                          env={"LINUX_GIT" : var})
         self.assertEqual(output, retval.decode())
 

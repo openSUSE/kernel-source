@@ -72,7 +72,7 @@ class TestMergeTool(unittest.TestCase):
         subprocess.check_call(
             ("git", "config", "--add", "mergetool.git-sort.cmd",
              "%s $LOCAL $BASE $REMOTE $MERGED" % (
-                 lib.bindir / 'merge_tool.py',),), cwd=self.ks_dir)
+                 lib.bindir / 'series_merge_tool',),), cwd=self.ks_dir)
         subprocess.check_call(("git", "config", "--add",
                                "mergetool.git-sort.trustexitcode", "true",), cwd=self.ks_dir)
 
