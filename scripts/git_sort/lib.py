@@ -28,8 +28,6 @@ import subprocess
 import sys
 
 import pygit2_wrapper as pygit2
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "../python"))
 import suse_git.exc as exc
 from suse_git.patch import Patch
 import git_sort

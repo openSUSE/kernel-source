@@ -163,7 +163,7 @@ class TestMergeTool(unittest.TestCase):
         #sys.stdin.readline()
         retval = subprocess.check_output(
             ("git", "mergetool", "--tool=git-sort", "series.conf",), cwd=self.ks_dir,
-            stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdin=subprocess.DEVNULL)
         self.assertEqual(
             "1 commits changed section from base to remote.",
             retval.decode().splitlines()[-1].strip())

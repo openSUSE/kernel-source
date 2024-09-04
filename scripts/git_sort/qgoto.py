@@ -23,8 +23,6 @@ import os
 import os.path
 import subprocess
 import sys
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "../python"))
 import suse_git.exc as exc
 import lib
 

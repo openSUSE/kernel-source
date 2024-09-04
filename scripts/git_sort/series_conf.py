@@ -31,8 +31,6 @@ import contextlib
 import errno
 import os.path
 import sys
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "../python"))
 import suse_git.exc as exc
 from suse_git.patch import Patch
 
