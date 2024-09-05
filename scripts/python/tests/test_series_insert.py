@@ -1,21 +1,18 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import os
-import shutil
+from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import shutil
 import sys
+import os
 
-import pygit2_wrapper as pygit2
-
-from pathlib import Path
-os.environ['GIT_SORT_REPOSITORIES'] = str(Path(__file__).parent / 'git_sort.yaml')
-
-import git_sort
-import lib
-import tests.support
+import tests.support  # before git_sort
+from git_sort import pygit2_wrapper as pygit2
+from git_sort import git_sort
+from git_sort import lib
 
 
 class TestSeriesInsert(unittest.TestCase):
@@ -56,7 +53,6 @@ class TestSeriesInsert(unittest.TestCase):
         # setup stub kernel-source content
         self.ks_dir = Path(tempfile.mkdtemp(prefix="gs_ks"))
         patch_dir = self.ks_dir / 'patches.suse'
-        self.si_path = Path(lib.libdir(), "series_insert.py")
         patch_dir.mkdir()
         for commit in commits:
             tests.support.format_patch(self.repo.get(commit),
@@ -79,7 +75,7 @@ class TestSeriesInsert(unittest.TestCase):
 
         series = self.ks_dir / 'series.conf'
 
-        subprocess.check_call([self.si_path, "patches.suse/mainline-1.patch"], cwd=self.ks_dir)
+        subprocess.check_call([lib.si_path, 'patches.suse/mainline-1.patch'], cwd=self.ks_dir)
         content = series.read_text()
         self.assertEqual(content,
             tests.support.format_series((
@@ -99,7 +95,7 @@ class TestSeriesInsert(unittest.TestCase):
             f.writelines(content)
 
         try:
-            subprocess.check_output([self.si_path, "patches.suse/mainline-1.patch"],
+            subprocess.check_output([lib.si_path, 'patches.suse/mainline-1.patch'],
                                    cwd=self.ks_dir, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
@@ -121,7 +117,7 @@ class TestSeriesInsert(unittest.TestCase):
             f.writelines(content)
 
         try:
-            subprocess.check_output([self.si_path, "patches.suse/mainline-1.patch"],
+            subprocess.check_output([lib.si_path, 'patches.suse/mainline-1.patch'],
                                    cwd=self.ks_dir, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
