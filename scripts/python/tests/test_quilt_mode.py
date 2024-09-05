@@ -1,22 +1,20 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import os
-import shutil
-import subprocess
-import sys
-import tempfile
-import unittest
-
-import pygit2_wrapper as pygit2
 
 from pathlib import Path
-os.environ['GIT_SORT_REPOSITORIES'] = str(Path(__file__).parent / 'git_sort.yaml')
+import subprocess
+import tempfile
+import unittest
+import shutil
+import sys
+import os
 
-import git_sort
-import lib
-import series_conf
-import tests.support
+import tests.support  # before git_sort
+from git_sort import pygit2_wrapper as pygit2
+from git_sort import series_conf
+from git_sort import git_sort
+from git_sort import lib
 
 
 @unittest.skip("Patched quilt not maintained")
@@ -158,13 +156,12 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
 	########################################################
 """)
 
-        ss_path = Path(lib.libdir(), "series_sort.py")
 
         # This overlaps what is tested by test_series_sort, hence, not put in a
         # test of its own.
-        subprocess.check_call([ss_path, "-c", "series.conf"], cwd=self.ks_dir)
+        subprocess.check_call([lib.ss_path, '-c', 'series.conf'], cwd=self.ks_dir)
         content1 = (self.ks_dir / 'series.conf').read_text()
-        subprocess.check_call([ss_path, "series.conf"], cwd=self.ks_dir)
+        subprocess.check_call([lib.ss_path, 'series.conf'], cwd=self.ks_dir)
         content2 = (self.ks_dir / 'series.conf').read_text()
         self.assertEqual(content2, content1)
 
@@ -187,7 +184,6 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
 
 
     def test_quilt_mode(self):
-        qm_path = Path(lib.libdir(), "quilt-mode.sh")
         series = self.current / 'series'
 
         # test series file replacement
@@ -200,18 +196,18 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
         with series.open('w') as f:
             f.writelines(entries)
         subprocess.check_call(
-            (str(Path(lib.libdir(), "qgoto.py")), str(self.commits[0]),),
+            [lib.bindir / 'qgoto.py', str(self.commits[0])],
             cwd=self.current, stdout=subprocess.DEVNULL)
 
         # test qgoto
         subprocess.check_call(
-            ". %s; qgoto %s" % (qm_path, str(self.commits[0])), shell=True,
+            ". %s; qgoto %s" % (lib.qm_path, str(self.commits[0])), shell=True,
             cwd=self.current, stdout=subprocess.DEVNULL, executable="/bin/bash")
 
         # test qdupcheck
         try:
             subprocess.check_output(
-                ". %s; qdupcheck %s" % (qm_path, str(self.commits[1])),
+                ". %s; qdupcheck %s" % (lib.qm_path, str(self.commits[1])),
                 cwd=self.current, shell=True, executable="/bin/bash")
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
@@ -221,12 +217,12 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
             self.assertTrue(False)
 
         subprocess.check_call(
-            ". %s; qgoto %s" % (qm_path, str(self.commits[1])), shell=True,
+            ". %s; qgoto %s" % (lib.qm_path, str(self.commits[1])), shell=True,
             cwd=self.current, stdout=subprocess.DEVNULL, executable="/bin/bash")
 
         try:
             subprocess.check_output(
-                ". %s; qdupcheck %s" % (qm_path, str(self.commits[1])),
+                ". %s; qdupcheck %s" % (lib.qm_path, str(self.commits[1])),
                 cwd=self.current, shell=True, executable="/bin/bash")
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
@@ -237,11 +233,11 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
 
         # import commits[2]
         subprocess.check_call(
-            ". %s; qgoto %s" % (qm_path, str(self.commits[2])), shell=True,
+            ". %s; qgoto %s" % (lib.qm_path, str(self.commits[2])), shell=True,
             cwd=self.current, executable="/bin/bash")
         subprocess.check_call(
             """. %s; qcp -r "bsc#1077761" -d patches.suse %s""" % (
-                qm_path, str(self.commits[2])),
+                lib.qm_path, str(self.commits[2])),
             cwd=self.current, shell=True, stdout=subprocess.DEVNULL, executable="/bin/bash")
 
         retval = subprocess.check_output(("quilt", "--quiltrc", "-", "next",), cwd=self.current)
@@ -292,11 +288,11 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
 
         # import commits[3]
         subprocess.check_call(
-            ". %s; qgoto %s" % (qm_path, str(self.commits[3])), shell=True,
+            ". %s; qgoto %s" % (lib.qm_path, str(self.commits[3])), shell=True,
             cwd=self.current, stdout=subprocess.DEVNULL, executable="/bin/bash")
         subprocess.check_call(
             """. %s; qcp -r "bsc#123" -d patches.suse %s""" % (
-                qm_path, str(self.commits[3])),
+                lib.qm_path, str(self.commits[3])),
             cwd=self.current, shell=True, stdout=subprocess.DEVNULL, executable="/bin/bash")
 
         subprocess.check_call(("quilt", "--quiltrc", "-", "push",),
@@ -310,9 +306,7 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
                               cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
         # test pre-commit.sh
-        pc_path = Path(lib.libdir(), "pre-commit.sh")
-
-        subprocess.check_call(pc_path, cwd=self.ks_dir, stdout=subprocess.DEVNULL)
+        subprocess.check_call(lib.pc_path, cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
         with (self.ks_dir / 'series.conf').open() as f:
             content = f.readlines()
@@ -326,14 +320,14 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
             f.writelines(content2)
 
         # check should be done against index, not working tree
-        subprocess.check_call(pc_path, cwd=self.ks_dir, stdout=subprocess.DEVNULL)
+        subprocess.check_call(lib.pc_path, cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
         subprocess.check_call(("git", "add", "series.conf",),
                               cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
         # ... test a bad sorted section
         try:
-            subprocess.check_output(pc_path, cwd=self.ks_dir, stderr=subprocess.STDOUT)
+            subprocess.check_output(lib.pc_path, cwd=self.ks_dir, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
             self.assertTrue(err.output.decode().startswith(
@@ -364,7 +358,7 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
         subprocess.check_call(("git", "add", name,), cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
         try:
-            subprocess.check_output(pc_path, cwd=self.ks_dir, stderr=subprocess.STDOUT)
+            subprocess.check_output(lib.pc_path, cwd=self.ks_dir, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
             self.assertTrue(err.output.decode().startswith(
@@ -382,7 +376,7 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
         subprocess.check_call(
             ("git", "config", "--add", "mergetool.git-sort.cmd",
              "%s $LOCAL $BASE $REMOTE $MERGED" % (
-                 os.path.join(lib.libdir(), "merge_tool.py"),),), cwd=self.ks_dir)
+                 lib.bindir / 'merge_tool.py',),), cwd=self.ks_dir)
         subprocess.check_call(("git", "config", "--add",
                                "mergetool.git-sort.trustexitcode", "true",), cwd=self.ks_dir)
         retval = subprocess.call(("git", "merge", "other",), cwd=self.ks_dir,
@@ -514,13 +508,11 @@ Signed-off-by: Maintainer One <maintainer@example.com>
 	########################################################
 """)
 
-        ss_path = Path(lib.libdir(), "series_sort.py")
-
         # This overlaps what is tested by test_series_sort, hence, not put in a
         # test of its own.
-        subprocess.check_call([ss_path, "-c", "series.conf"], cwd=self.ks_dir)
+        subprocess.check_call([lib.ss_path, '-c', 'series.conf'], cwd=self.ks_dir)
         content1 = (self.ks_dir / 'series.conf').read_text()
-        subprocess.check_call([ss_path, "series.conf"], cwd=self.ks_dir)
+        subprocess.check_call([lib.ss_path, 'series.conf'], cwd=self.ks_dir)
         content2 = (self.ks_dir / 'series.conf').read_text()
         self.assertEqual(content2, content1)
 
@@ -537,15 +529,14 @@ Signed-off-by: Maintainer One <maintainer@example.com>
 
 
     def test_fixup(self):
-        qm_path = Path(lib.libdir(), "quilt-mode.sh")
 
         # import commits[1]
         subprocess.check_call(
-            ". %s; qgoto %s" % (qm_path, str(self.commits[1])), shell=True,
+            ". %s; qgoto %s" % (lib.qm_path, str(self.commits[1])), shell=True,
             cwd=self.current, stdout=subprocess.DEVNULL, executable="/bin/bash")
         subprocess.check_call(
             """. %s; qcp -f %s""" % (
-                qm_path, str(self.commits[1])),
+                lib.qm_path, str(self.commits[1])),
             cwd=self.current, shell=True, stdout=subprocess.DEVNULL, executable="/bin/bash")
 
         retval = subprocess.check_output(("quilt", "--quiltrc", "-", "next",), cwd=self.current)

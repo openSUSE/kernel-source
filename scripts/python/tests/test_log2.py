@@ -10,18 +10,21 @@ import stat
 import sys
 import os
 
-from . import lib
+from . import support
 
 
 class TestSpliceSeries(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.covdir = tempfile.mkdtemp(prefix="gs_log2_cov")
+        cls.kcov = shutil.which('kcov')
+        if not cls.kcov:
+            sys.stderr.write("kcov is not available\n")
 
 
     @classmethod
     def tearDownClass(cls):
-        if os.isatty(sys.stdin.fileno()):
+        if cls.kcov and os.isatty(sys.stdin.fileno()):
             print("Coverage report in %s Press enter when done with it." %
                   (cls.covdir,))
             sys.stdin.readline()
@@ -30,7 +33,11 @@ class TestSpliceSeries(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = Path(tempfile.mkdtemp(prefix="gs_log2"))
-        self.log2_path = Path(lib.libdir(), "../../log2")
+        self.log2_path = support.testdir() / '../../log2'
+        self.cmd = ['./test.sh']
+        if self.kcov:
+            self.cmd = [self.kcov, "--include-path=%s" % (self.log2_path,),
+                        self.covdir] + self.cmd
         self.testscript = """#!/bin/bash
 
                           . %s
@@ -94,9 +101,7 @@ class TestSpliceSeries(unittest.TestCase):
                 (self.tmpdir / 'test.sh').write_text(self.testscript % (patch,))
                 (self.tmpdir / 'test.sh').chmod(stat.S_IRWXU)
 
-                sp = subprocess.Popen(
-                    ["kcov", "--include-path=%s" % (self.log2_path,),
-                     self.__class__.covdir, "test.sh"],
+                sp = subprocess.Popen(self.cmd,
                     cwd=self.tmpdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 out, err = sp.communicate()
                 retval = sp.wait()
@@ -193,9 +198,7 @@ class TestSpliceSeries(unittest.TestCase):
                 (self.tmpdir / 'test.sh').write_text(self.testscript % (patch,))
                 (self.tmpdir / 'test.sh').chmod(stat.S_IRWXU)
 
-                retval = subprocess.check_output(
-                    ["kcov", "--include-path=%s" % (self.log2_path,),
-                     self.__class__.covdir, "test.sh"], cwd=self.tmpdir)
+                retval = subprocess.check_output(self.cmd, cwd=self.tmpdir)
                 self.assertEqual(new, retval.decode())
 
 
@@ -535,9 +538,7 @@ class TestSpliceSeries(unittest.TestCase):
                 (self.tmpdir / 'test.sh').write_text(self.testscript % (patch,))
                 (self.tmpdir / 'test.sh').chmod(stat.S_IRWXU)
 
-                retval = subprocess.check_output(
-                    ["kcov", "--include-path=%s" % (self.log2_path,),
-                     self.__class__.covdir, "test.sh"], cwd=self.tmpdir)
+                retval = subprocess.check_output(self.cmd, cwd=self.tmpdir)
                 self.assertEqual(intermediate, retval.decode())
 
 
