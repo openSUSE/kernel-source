@@ -17,7 +17,7 @@ RUN zypper -n ar -f http://download.suse.de/ibs/SUSE:/SLE-12-SP5:/Update/standar
 
 FROM base AS packages
 
-RUN zypper -n in git-core python3 python3-dbm rcs gawk python3-PyYAML
+RUN zypper -n in git-core python3 python3-dbm python3-requests rcs util-linux gawk python3-PyYAML
 
 RUN git config --global user.email "you@example.com"
 RUN git config --global user.name "Your Name"
@@ -31,6 +31,6 @@ FROM packages
 
 VOLUME /scripts
 
-WORKDIR /scripts/git_sort
+WORKDIR /scripts/python
 
 CMD python3 -m unittest discover -v
