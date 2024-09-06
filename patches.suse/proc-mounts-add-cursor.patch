@@ -1,0 +1,309 @@
+From: Miklos Szeredi <mszeredi@redhat.com>
+Date: Thu, 14 May 2020 16:44:24 +0200
+Subject: [PATCH] proc/mounts: add cursor
+Git-commit: 9f6c61f96f2d97cbb5f7fa85607bc398f843ff0f
+Patch-mainline: v5.8
+References: bsc#1207341
+
+If mounts are deleted after a read(2) call on /proc/self/mounts (or its
+kin), the subsequent read(2) could miss a mount that comes after the
+deleted one in the list.  This is because the file position is interpreted
+as the number mount entries from the start of the list.
+
+E.g. first read gets entries #0 to #9; the seq file index will be 10.  Then
+entry #5 is deleted, resulting in #10 becoming #9 and #11 becoming #10,
+etc...  The next read will continue from entry #10, and #9 is missed.
+
+Solve this by adding a cursor entry for each open instance.  Taking the
+global namespace_sem for write seems excessive, since we are only dealing
+with a per-namespace list.  Instead add a per-namespace spinlock and use
+that together with namespace_sem taken for read to protect against
+concurrent modification of the mount list.  This may reduce parallelism of
+is_local_mountpoint(), but it's hardly a big contention point.  We could
+also use RCU freeing of cursors to make traversal not need additional
+locks, if that turns out to be neceesary.
+
+Only move the cursor once for each read (cursor is not added on open) to
+minimize cacheline invalidation.  When EOF is reached, the cursor is taken
+off the list, in order to prevent an excessive number of cursors due to
+inactive open file descriptors.
+
+Reported-by: Karel Zak <kzak@redhat.com>
+Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+Acked-by: NeilBrown <neilb@suse.com>
+
+---
+ fs/mount.h            |   12 ++++-
+ fs/namespace.c        |  110 ++++++++++++++++++++++++++++++++++++++++++--------
+ fs/proc_namespace.c   |    4 +
+ include/linux/mount.h |    4 +
+ 4 files changed, 109 insertions(+), 21 deletions(-)
+
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -8,7 +8,13 @@ struct mnt_namespace {
+ 	atomic_t		count;
+ 	struct ns_common	ns;
+ 	struct mount *	root;
++	/*
++	 * Traversal and modification of .list is protected by either
++	 * - taking namespace_sem for write, OR
++	 * - taking namespace_sem for read AND taking .ns_lock.
++	 */
+ 	struct list_head	list;
++	spinlock_t		ns_lock;
+ 	struct user_namespace	*user_ns;
+ 	struct ucounts		*ucounts;
+ 	u64			seq;	/* Sequence number to prevent loops */
+@@ -130,9 +136,7 @@ struct proc_mounts {
+ 	struct mnt_namespace *ns;
+ 	struct path root;
+ 	int (*show)(struct seq_file *, struct vfsmount *);
+-	void *cached_mount;
+-	u64 cached_event;
+-	loff_t cached_index;
++	struct mount cursor;
+ };
+ 
+ extern const struct seq_operations mounts_op;
+@@ -145,3 +149,5 @@ static inline bool is_local_mountpoint(s
+ 
+ 	return __is_local_mountpoint(dentry);
+ }
++
++extern void mnt_cursor_del(struct mnt_namespace *ns, struct mount *cursor);
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -679,6 +679,21 @@ struct vfsmount *lookup_mnt(const struct
+ 	return m;
+ }
+ 
++static inline void lock_ns_list(struct mnt_namespace *ns)
++{
++	spin_lock(&ns->ns_lock);
++}
++
++static inline void unlock_ns_list(struct mnt_namespace *ns)
++{
++	spin_unlock(&ns->ns_lock);
++}
++
++static inline bool mnt_is_cursor(struct mount *mnt)
++{
++	return mnt->mnt.mnt_flags & MNT_CURSOR;
++}
++
+ /*
+  * __is_local_mountpoint - Test to see if dentry is a mountpoint in the
+  *                         current mount namespace.
+@@ -704,11 +719,15 @@ bool __is_local_mountpoint(struct dentry
+ 		goto out;
+ 
+ 	down_read(&namespace_sem);
++	lock_ns_list(ns);
+ 	list_for_each_entry(mnt, &ns->list, mnt_list) {
++		if (mnt_is_cursor(mnt))
++			continue;
+ 		is_covered = (mnt->mnt_mountpoint == dentry);
+ 		if (is_covered)
+ 			break;
+ 	}
++	unlock_ns_list(ns);
+ 	up_read(&namespace_sem);
+ out:
+ 	return is_covered;
+@@ -1323,47 +1342,91 @@ void replace_mount_options(struct super_
+ }
+ EXPORT_SYMBOL(replace_mount_options);
+ 
++/**
++ * list_is_head - tests whether @list is the list @head
++ * @list: the entry to test
++ * @head: the head of the list
++ */
++static inline int list_is_head(const struct list_head *list, const struct list_head *head)
++{
++	return list == head;
++}
++/**
++ * list_for_each_continue - continue iteration over a list
++ * @pos:	the &struct list_head to use as a loop cursor.
++ * @head:	the head for your list.
++ *
++ * Continue to iterate over a list, continuing after the current position.
++ */
++#define list_for_each_continue(pos, head) \
++	for (pos = pos->next; !list_is_head(pos, (head)); pos = pos->next)
++
+ #ifdef CONFIG_PROC_FS
++static struct mount *mnt_list_next(struct mnt_namespace *ns,
++				   struct list_head *p)
++{
++	struct mount *mnt, *ret = NULL;
++
++	lock_ns_list(ns);
++	list_for_each_continue(p, &ns->list) {
++		mnt = list_entry(p, typeof(*mnt), mnt_list);
++		if (!mnt_is_cursor(mnt)) {
++			ret = mnt;
++			break;
++		}
++	}
++	unlock_ns_list(ns);
++
++	return ret;
++}
++
+ /* iterator; we want it to have access to namespace_sem, thus here... */
+ static void *m_start(struct seq_file *m, loff_t *pos)
+ {
+ 	struct proc_mounts *p = m->private;
++	struct list_head *prev;
+ 
+ 	down_read(&namespace_sem);
+-	if (p->cached_event == p->ns->event) {
+-		void *v = p->cached_mount;
+-		if (*pos == p->cached_index)
+-			return v;
+-		if (*pos == p->cached_index + 1) {
+-			v = seq_list_next(v, &p->ns->list, &p->cached_index);
+-			return p->cached_mount = v;
+-		}
++	if (!*pos) {
++		prev = &p->ns->list;
++	} else {
++		prev = &p->cursor.mnt_list;
++
++		/* Read after we'd reached the end? */
++		if (list_empty(prev))
++			return NULL;
+ 	}
+ 
+-	p->cached_event = p->ns->event;
+-	p->cached_mount = seq_list_start(&p->ns->list, *pos);
+-	p->cached_index = *pos;
+-	return p->cached_mount;
++	return mnt_list_next(p->ns, prev);
+ }
+ 
+ static void *m_next(struct seq_file *m, void *v, loff_t *pos)
+ {
+ 	struct proc_mounts *p = m->private;
++	struct mount *mnt = v;
+ 
+-	p->cached_mount = seq_list_next(v, &p->ns->list, pos);
+-	p->cached_index = *pos;
+-	return p->cached_mount;
++	++*pos;
++	return mnt_list_next(p->ns, &mnt->mnt_list);
+ }
+ 
+ static void m_stop(struct seq_file *m, void *v)
+ {
++	struct proc_mounts *p = m->private;
++	struct mount *mnt = v;
++
++	lock_ns_list(p->ns);
++	if (mnt)
++		list_move_tail(&p->cursor.mnt_list, &mnt->mnt_list);
++	else
++		list_del_init(&p->cursor.mnt_list);
++	unlock_ns_list(p->ns);
+ 	up_read(&namespace_sem);
+ }
+ 
+ static int m_show(struct seq_file *m, void *v)
+ {
+ 	struct proc_mounts *p = m->private;
+-	struct mount *r = list_entry(v, struct mount, mnt_list);
++	struct mount *r = v;
+ 	return p->show(m, &r->mnt);
+ }
+ 
+@@ -1373,6 +1436,15 @@ const struct seq_operations mounts_op =
+ 	.stop	= m_stop,
+ 	.show	= m_show,
+ };
++
++void mnt_cursor_del(struct mnt_namespace *ns, struct mount *cursor)
++{
++	down_read(&namespace_sem);
++	lock_ns_list(ns);
++	list_del(&cursor->mnt_list);
++	unlock_ns_list(ns);
++	up_read(&namespace_sem);
++}
+ #endif  /* CONFIG_PROC_FS */
+ 
+ /**
+@@ -2955,6 +3027,7 @@ static struct mnt_namespace *alloc_mnt_n
+ 	INIT_LIST_HEAD(&new_ns->list);
+ 	init_waitqueue_head(&new_ns->poll);
+ 	new_ns->event = 0;
++	spin_lock_init(&new_ns->ns_lock);
+ 	new_ns->user_ns = get_user_ns(user_ns);
+ 	new_ns->ucounts = ucounts;
+ 	new_ns->mounts = 0;
+@@ -3403,10 +3476,14 @@ static bool mnt_already_visible(struct m
+ 	bool visible = false;
+ 
+ 	down_read(&namespace_sem);
++	lock_ns_list(ns);
+ 	list_for_each_entry(mnt, &ns->list, mnt_list) {
+ 		struct mount *child;
+ 		int mnt_flags;
+ 
++		if (mnt_is_cursor(mnt))
++			continue;
++
+ 		if (mnt->mnt.mnt_sb->s_type != new->mnt_sb->s_type)
+ 			continue;
+ 
+@@ -3454,6 +3531,7 @@ static bool mnt_already_visible(struct m
+ 	next:	;
+ 	}
+ found:
++	unlock_ns_list(ns);
+ 	up_read(&namespace_sem);
+ 	return visible;
+ }
+--- a/fs/proc_namespace.c
++++ b/fs/proc_namespace.c
+@@ -279,7 +279,8 @@ static int mounts_open_common(struct ino
+ 	p->ns = ns;
+ 	p->root = root;
+ 	p->show = show;
+-	p->cached_event = ~0ULL;
++	INIT_LIST_HEAD(&p->cursor.mnt_list);
++	p->cursor.mnt.mnt_flags = MNT_CURSOR;
+ 
+ 	return 0;
+ 
+@@ -296,6 +297,7 @@ static int mounts_release(struct inode *
+ 	struct seq_file *m = file->private_data;
+ 	struct proc_mounts *p = m->private;
+ 	path_put(&p->root);
++	mnt_cursor_del(p->ns, &p->cursor);
+ 	put_mnt_ns(p->ns);
+ 	return seq_release_private(inode, file);
+ }
+--- a/include/linux/mount.h
++++ b/include/linux/mount.h
+@@ -48,7 +48,8 @@ struct mnt_namespace;
+ #define MNT_ATIME_MASK (MNT_NOATIME | MNT_NODIRATIME | MNT_RELATIME )
+ 
+ #define MNT_INTERNAL_FLAGS (MNT_SHARED | MNT_WRITE_HOLD | MNT_INTERNAL | \
+-			    MNT_DOOMED | MNT_SYNC_UMOUNT | MNT_MARKED)
++			    MNT_DOOMED | MNT_SYNC_UMOUNT | MNT_MARKED | \
++			    MNT_CURSOR)
+ 
+ #define MNT_INTERNAL	0x4000
+ 
+@@ -62,6 +63,7 @@ struct mnt_namespace;
+ #define MNT_SYNC_UMOUNT		0x2000000
+ #define MNT_MARKED		0x4000000
+ #define MNT_UMOUNT		0x8000000
++#define MNT_CURSOR		0x10000000
+ 
+ struct vfsmount {
+ 	struct dentry *mnt_root;	/* root of the mounted tree */
