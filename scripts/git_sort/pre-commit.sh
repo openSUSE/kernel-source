@@ -32,10 +32,10 @@ sorted_section_changed () {
 		M)
 			diff -q <(
 				git cat-file blob HEAD:series.conf |
-					"$_libdir"/series_conf.py
+					"$_libdir"/series_conf
 				) <(
 				git cat-file blob :series.conf |
-					"$_libdir"/series_conf.py
+					"$_libdir"/series_conf
 				) > /dev/null
 			if [ $? -eq 1 ]; then
 				return 0
@@ -55,7 +55,7 @@ sorted_patches_changed () {
 		git diff-index --cached --name-only --diff-filter=AMD HEAD | sort
 		) <(
 		git cat-file blob :series.conf |
-			"$_libdir"/series_conf.py --name-only | sort
+			"$_libdir"/series_conf --name-only | sort
 		) | wc -l)
 	
 	if ! [ "$common" -eq "$common" ] 2>/dev/stderr; then
@@ -79,7 +79,7 @@ if sorted_section_changed || sorted_patches_changed; then
 	# series_sort.py should examine the patches in the index, not the
 	# working tree. Check them out.
 	git cat-file blob :series.conf |
-		"$_libdir"/series_conf.py --name-only |
+		"$_libdir"/series_conf --name-only |
 		git checkout-index --quiet --prefix="$tmpdir/" --stdin
 
 	git cat-file blob :series.conf |

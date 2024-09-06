@@ -1,35 +1,48 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import os.path
-import shutil
+from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import shutil
 import stat
 import sys
+import os
 
-import lib
+from . import support
 
 
 class TestSpliceSeries(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.covdir = tempfile.mkdtemp(prefix="gs_log2_cov")
+        cls.kcov = shutil.which('kcov')
+        if not cls.kcov:
+            sys.stderr.write("kcov is not available\n")
 
 
     @classmethod
     def tearDownClass(cls):
-        print("Coverage report in %s. Press enter when done with it." %
-              (cls.covdir,))
-        sys.stdin.readline()
+        if cls.kcov and os.isatty(sys.stdin.fileno()):
+            print("Coverage report in %s Press enter when done with it." %
+                  (cls.covdir,))
+            sys.stdin.readline()
         shutil.rmtree(cls.covdir)
 
 
     def setUp(self):
-        self.tmpdir = tempfile.mkdtemp(prefix="gs_log2")
-        os.chdir(self.tmpdir)
-        self.log2_path = os.path.join( lib.libdir(), "../log2")
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="gs_log2"))
+        self.log2_path = support.testdir() / '../../log2'
+        self.cmd = ['./test.sh']
+        if self.kcov:
+            self.cmd = [self.kcov, "--include-path=%s" % (self.log2_path,),
+                        self.covdir] + self.cmd
+        self.testscript = """#!/bin/bash
+
+                          . %s
+                          splice_series %%s 3<old 4<new\n""" % (
+                                  self.log2_path,)
 
 
     def tearDown(self):
@@ -83,25 +96,13 @@ class TestSpliceSeries(unittest.TestCase):
         for i in range(len(vectors)):
             old, new, patch, msg = vectors[i]
             with self.subTest(vector=i):
-                with open("old", mode="w") as f:
-                    f.write(old)
+                (self.tmpdir / 'old').write_text(old)
+                (self.tmpdir / 'new').write_text(new)
+                (self.tmpdir / 'test.sh').write_text(self.testscript % (patch,))
+                (self.tmpdir / 'test.sh').chmod(stat.S_IRWXU)
 
-                with open("new", mode="w") as f:
-                    f.write(new)
-
-                with open("test.sh", mode="w") as f:
-                    f.write(
-                        """#!/bin/bash
-
-                        . %s
-                        splice_series %s 3<old 4<new\n""" % (
-                            self.log2_path, patch,))
-                os.chmod("test.sh", stat.S_IRWXU)
-
-                sp = subprocess.Popen(
-                    ["kcov", "--include-path=%s" % (self.log2_path,),
-                     self.__class__.covdir, "test.sh"],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                sp = subprocess.Popen(self.cmd,
+                    cwd=self.tmpdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 out, err = sp.communicate()
                 retval = sp.wait()
 
@@ -192,24 +193,12 @@ class TestSpliceSeries(unittest.TestCase):
         for i in range(len(vectors)):
             old, new, patch = vectors[i]
             with self.subTest(vector=i):
-                with open("old", mode="w") as f:
-                    f.write(old)
+                (self.tmpdir / 'old').write_text(old)
+                (self.tmpdir / 'new').write_text(new)
+                (self.tmpdir / 'test.sh').write_text(self.testscript % (patch,))
+                (self.tmpdir / 'test.sh').chmod(stat.S_IRWXU)
 
-                with open("new", mode="w") as f:
-                    f.write(new)
-
-                with open("test.sh", mode="w") as f:
-                    f.write(
-                        """#!/bin/bash
-
-                        . %s
-                        splice_series %s 3<old 4<new\n""" % (
-                            self.log2_path, patch,))
-                os.chmod("test.sh", stat.S_IRWXU)
-
-                retval = subprocess.check_output(
-                    ["kcov", "--include-path=%s" % (self.log2_path,),
-                     self.__class__.covdir, "test.sh"])
+                retval = subprocess.check_output(self.cmd, cwd=self.tmpdir)
                 self.assertEqual(new, retval.decode())
 
 
@@ -544,24 +533,12 @@ class TestSpliceSeries(unittest.TestCase):
         for i in range(len(vectors)):
             old, new, patch, intermediate = vectors[i]
             with self.subTest(vector=i):
-                with open("old", mode="w") as f:
-                    f.write(old)
+                (self.tmpdir / 'old').write_text(old)
+                (self.tmpdir / 'new').write_text(new)
+                (self.tmpdir / 'test.sh').write_text(self.testscript % (patch,))
+                (self.tmpdir / 'test.sh').chmod(stat.S_IRWXU)
 
-                with open("new", mode="w") as f:
-                    f.write(new)
-
-                with open("test.sh", mode="w") as f:
-                    f.write(
-                        """#!/bin/bash
-
-                        . %s
-                        splice_series %s 3<old 4<new\n""" % (
-                            self.log2_path, patch,))
-                os.chmod("test.sh", stat.S_IRWXU)
-
-                retval = subprocess.check_output(
-                    ["kcov", "--include-path=%s" % (self.log2_path,),
-                     self.__class__.covdir, "test.sh"])
+                retval = subprocess.check_output(self.cmd, cwd=self.tmpdir)
                 self.assertEqual(intermediate, retval.decode())
 
 

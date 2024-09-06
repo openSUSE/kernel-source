@@ -1,11 +1,17 @@
-#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
+from git_sort import pygit2_wrapper as pygit2
+from pathlib import Path
 import datetime
-import os.path
 import re
+import os
 
-import pygit2_wrapper as pygit2
+os.environ['GIT_SORT_REPOSITORIES'] = str(Path(__file__).parent / 'git_sort.yaml')
+import git_sort.lib
+
+
+def testdir():
+    return Path(__file__).parent
 
 
 # from http://www.pygit2.org/recipes/git-show.html
@@ -60,10 +66,10 @@ def format_sanitized_subject(message):
 
 def format_patch(commit, mainline=None, repo=None, references=None,
                  directory=""):
-    name = os.path.join(directory, format_sanitized_subject(commit.message) +
+    name = Path(directory, format_sanitized_subject(commit.message) +
                         ".patch")
 
-    with open(name, mode="w") as f:
+    with name.open('w') as f:
         f.write("From: %s <%s>\n" % (commit.author.name, commit.author.email,))
         tzinfo = FixedOffset(commit.author.offset)
         dt = datetime.datetime.fromtimestamp(float(commit.author.time), tzinfo)
