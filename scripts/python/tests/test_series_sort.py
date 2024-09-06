@@ -1,28 +1,23 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import os
-import os.path
-import shutil
-import subprocess
-import sys
-import tempfile
-import unittest
-
-import pygit2_wrapper as pygit2
 
 from pathlib import Path
-os.environ['GIT_SORT_REPOSITORIES'] = str(Path(__file__).parent / 'git_sort.yaml')
+import subprocess
+import tempfile
+import unittest
+import shutil
+import sys
+import os
 
-import git_sort
-import lib
-import tests.support
+import tests.support  # before git_sort
+from git_sort import pygit2_wrapper as pygit2
+from git_sort import git_sort
+from git_sort import lib
 
 
 class TestSeriesSort(unittest.TestCase):
     def setUp(self):
-        self.ss_path = os.path.join(lib.libdir(), "series_sort.py")
-
         os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
 
         # setup stub linux repository
@@ -119,16 +114,14 @@ class TestSeriesSort(unittest.TestCase):
 
         # setup stub kernel-source content
         self.ks_dir = tempfile.mkdtemp(prefix="gs_ks")
-        patch_dir = os.path.join(self.ks_dir, "patches.suse")
-        os.mkdir(patch_dir)
-        os.chdir(patch_dir)
-        tests.support.format_patch(self.repo.get(m0), mainline="v3.45-rc6")
-        tests.support.format_patch(self.repo.get(n0), mainline="v3.45-rc6")
-        tests.support.format_patch(self.repo.get(n1), repo=net_repo)
-        tests.support.format_patch(self.repo.get(n2), repo=net_repo)
-        tests.support.format_patch(self.repo.get(oot0))
-        tests.support.format_patch(self.repo.get(oot1), mainline="Submitted http://lore.kernel.org/somelist/somemessage")
-        os.chdir(self.ks_dir)
+        patch_dir = Path(self.ks_dir, "patches.suse")
+        patch_dir.mkdir()
+        tests.support.format_patch(self.repo.get(m0), directory=patch_dir, mainline="v3.45-rc6")
+        tests.support.format_patch(self.repo.get(n0), directory=patch_dir, mainline="v3.45-rc6")
+        tests.support.format_patch(self.repo.get(n1), directory=patch_dir, repo=net_repo)
+        tests.support.format_patch(self.repo.get(n2), directory=patch_dir, repo=net_repo)
+        tests.support.format_patch(self.repo.get(oot0), directory=patch_dir)
+        tests.support.format_patch(self.repo.get(oot1), directory=patch_dir, mainline="Submitted http://lore.kernel.org/somelist/somemessage")
 
 
     def tearDown(self):
@@ -139,8 +132,8 @@ class TestSeriesSort(unittest.TestCase):
 
     def test_nofile(self):
         try:
-            subprocess.check_output([self.ss_path, "aaa"],
-                                    stderr=subprocess.STDOUT)
+            subprocess.check_output([lib.ss_path, 'aaa'],
+                                    cwd=self.ks_dir, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
             self.assertEqual(
@@ -159,8 +152,8 @@ class TestSeriesSort(unittest.TestCase):
 """)
 
         try:
-            subprocess.check_output([self.ss_path, series],
-                                    stderr=subprocess.STDOUT)
+            subprocess.check_output([lib.ss_path, series],
+                                    cwd=self.ks_dir, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.output.decode(), "Error: Sorted subseries not found.\n")
         else:
@@ -179,10 +172,10 @@ class TestSeriesSort(unittest.TestCase):
                 )),
             )))
 
-        subprocess.check_call([self.ss_path, "-c", series])
+        subprocess.check_call([lib.ss_path, '-c', series], cwd=self.ks_dir)
         with open(series) as f:
             content1 = f.read()
-        subprocess.check_call([self.ss_path, series])
+        subprocess.check_call([lib.ss_path, series], cwd=self.ks_dir)
         with open(series) as f:
             content2 = f.read()
         self.assertEqual(content2, content1)
@@ -218,10 +211,10 @@ class TestSeriesSort(unittest.TestCase):
 	patches.suse/unsorted-after.patch
 """)
 
-        subprocess.check_call([self.ss_path, "-c", series])
+        subprocess.check_call([lib.ss_path, '-c', series], cwd=self.ks_dir)
         with open(series) as f:
             content1 = f.read()
-        subprocess.check_call([self.ss_path, series])
+        subprocess.check_call([lib.ss_path, series], cwd=self.ks_dir)
         with open(series) as f:
             content2 = f.read()
         self.assertEqual(content2, content1)
@@ -247,10 +240,10 @@ class TestSeriesSort(unittest.TestCase):
 	patches.suse/unsorted-after.patch
 """)
 
-        subprocess.check_call([self.ss_path, "-c", series])
+        subprocess.check_call([lib.ss_path, '-c', series], cwd=self.ks_dir)
         with open(series) as f:
             content1 = f.read()
-        subprocess.check_call([self.ss_path, series])
+        subprocess.check_call([lib.ss_path, series], cwd=self.ks_dir)
         with open(series) as f:
             content2 = f.read()
         self.assertEqual(content2, content1)
@@ -272,7 +265,6 @@ class TestFromPatch(unittest.TestCase):
 
     def setUp(self):
         self.maxDiff = None
-        self.ss_path = os.path.join(lib.libdir(), "series_sort.py")
 
         os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
 
@@ -420,10 +412,9 @@ class TestFromPatch(unittest.TestCase):
         self.repo.checkout("refs/heads/mainline")
 
         # setup stub kernel-source content
-        self.ks_dir = tempfile.mkdtemp(prefix="gs_ks")
-        os.chdir(self.ks_dir)
-        self.patch_dir = "patches.suse"
-        os.mkdir(self.patch_dir)
+        self.ks_dir = Path(tempfile.mkdtemp(prefix="gs_ks"))
+        self.patch_dir = self.ks_dir / "patches.suse"
+        self.patch_dir.mkdir()
 
 
     def tearDown(self):
@@ -433,7 +424,7 @@ class TestFromPatch(unittest.TestCase):
 
 
     def check_tag(self, patch, tag, value):
-        with open(patch) as f:
+        with patch.open() as f:
             for line in f:
                 if line.startswith(tag):
                     self.assertEqual(line[len(tag):-1], value)
@@ -452,8 +443,8 @@ class TestFromPatch(unittest.TestCase):
         for extra_arg in self.__class__._transform_arg(move_upstream):
             try:
                 subprocess.check_output(
-                    [self.ss_path] + extra_arg + ["-c", "series.conf"],
-                    stderr=subprocess.STDOUT)
+                    [lib.ss_path] + extra_arg + ['-c', 'series.conf'],
+                    cwd=self.ks_dir, stderr=subprocess.STDOUT)
             except subprocess.CalledProcessError as err:
                 self.assertEqual(err.returncode, 1)
                 self.assertTrue(err.output.decode(), msg)
@@ -462,8 +453,8 @@ class TestFromPatch(unittest.TestCase):
 
             try:
                 subprocess.check_output(
-                    [self.ss_path] + extra_arg + ["series.conf"],
-                    stderr=subprocess.STDOUT)
+                    [lib.ss_path] + extra_arg + ['series.conf'],
+                    cwd=self.ks_dir, stderr=subprocess.STDOUT)
             except subprocess.CalledProcessError as err:
                 self.assertEqual(err.returncode, 1)
                 self.assertEqual(err.output.decode(), msg)
@@ -474,17 +465,13 @@ class TestFromPatch(unittest.TestCase):
     def check_constant(self, name, move_upstream=None):
         for extra_arg in self.__class__._transform_arg(move_upstream):
             subprocess.check_call(
-                [self.ss_path] + extra_arg + ["-c", "series.conf"])
+                [lib.ss_path] + extra_arg + ['-c', 'series.conf'], cwd=self.ks_dir)
 
-            with open("series.conf") as f:
-                series1 = f.read()
-            with open(name) as f:
-                patch1 = f.read()
-            subprocess.check_call([self.ss_path] + extra_arg + ["series.conf"])
-            with open("series.conf") as f:
-                series2 = f.read()
-            with open(name) as f:
-                patch2 = f.read()
+            series1 = (self.ks_dir / 'series.conf').read_text()
+            patch1 = (self.ks_dir / name).read_text()
+            subprocess.check_call([lib.ss_path] + extra_arg + ['series.conf'], cwd=self.ks_dir)
+            series2 = (self.ks_dir / 'series.conf').read_text()
+            patch2 = (self.ks_dir / name).read_text()
             self.assertEqual(series2, series1)
             self.assertEqual(patch2, patch1)
 
@@ -498,16 +485,16 @@ class TestFromPatch(unittest.TestCase):
             shutil.copy(patch, name)
             try:
                 subprocess.check_output(
-                    [self.ss_path] + extra_arg + ["-c", "series.conf"],
-                    stderr=subprocess.STDOUT)
+                    [lib.ss_path] + extra_arg + ['-c', 'series.conf'],
+                    cwd=self.ks_dir, stderr=subprocess.STDOUT)
             except subprocess.CalledProcessError as err:
                 self.assertEqual(err.returncode, 2)
                 self.assertEqual(err.output.decode(), msg)
             else:
                 self.assertTrue(False)
 
-            shutil.copy("series.conf", series)
-            subprocess.check_call([self.ss_path] + extra_arg + [series])
+            shutil.copy(self.ks_dir / 'series.conf', series)
+            subprocess.check_call([lib.ss_path] + extra_arg + [series], cwd=self.ks_dir)
             with open(series) as f:
                 content2 = f.read()
             self.assertEqual(content2, series2)
@@ -533,8 +520,8 @@ class TestFromPatch(unittest.TestCase):
             self.repo.get(self.commits["net-next 0"]), mainline="v0",
             directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 (None, (
                     name,
                 )),
@@ -559,8 +546,8 @@ class TestFromPatch(unittest.TestCase):
             self.repo.get(self.commits["net-next 0"]), repo=self.net_next_repo,
             directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 (None, (
                     name,
                 )),
@@ -579,8 +566,8 @@ class TestFromPatch(unittest.TestCase):
             self.repo.get(self.commits["net-next 0"]), repo=self.net_next_repo,
             directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 ("davem/net-next", (
                     name,
                 )),
@@ -604,8 +591,7 @@ class TestFromPatch(unittest.TestCase):
                 name,
             )),
         ))
-        with open("series.conf", mode="w") as f:
-            f.write(series1)
+        (self.ks_dir / 'series.conf').write_text(series1)
 
         self.check_outdated(name, "Git-repo tags are outdated.\n", series1)
         self.check_tag(name, "Git-repo: ", self.net_next_repo)
@@ -616,8 +602,8 @@ class TestFromPatch(unittest.TestCase):
             self.repo.get(self.commits["rdma for-next 0"]), repo=self.rdma_repo,
             directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 ("rdma/rdma for-next", (
                     name,
                 )),
@@ -663,8 +649,8 @@ class TestFromPatch(unittest.TestCase):
             self.repo.get(self.commits["dledford/rdma k.o/for-next 0"]),
             repo=alt_repo, directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 ("dledford/rdma k.o/for-next", (
                     name,
                 )),
@@ -719,8 +705,8 @@ class TestFromPatch(unittest.TestCase):
             self.repo.get(self.commits["net-next 0"]), repo=self.net_repo,
             directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 ("davem/net", (
                     name,
                 )),
@@ -742,8 +728,8 @@ class TestFromPatch(unittest.TestCase):
             self.repo.get(self.commits["net-next 0"]), repo=self.rdma_repo,
             directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 ("davem/net", (
                     name,
                 )),
@@ -762,8 +748,8 @@ class TestFromPatch(unittest.TestCase):
             self.repo.get(self.commits["net 0"]), repo=self.net_repo,
             directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 ("davem/net", (
                     name,
                 )),
@@ -780,7 +766,7 @@ class TestFromPatch(unittest.TestCase):
 
     @staticmethod
     def filter_out_tags(name):
-        with open(name) as f:
+        with name.open() as f:
             result = [line
                       for line in f
                       if not line.startswith(("Git-repo", "Patch-mainline",))]
@@ -823,8 +809,8 @@ class TestFromPatch(unittest.TestCase):
             self.repo.get(self.commits["nf 0"]), repo=alt_repo,
             directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 ("netfilter/nf-next", (
                     name,
                 )),
@@ -882,8 +868,8 @@ class TestFromPatch(unittest.TestCase):
         name = tests.support.format_patch(commit, repo=self.net_next_repo,
                                           directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 ("davem/net-next", (
                     name,
                 )),
@@ -903,8 +889,8 @@ class TestFromPatch(unittest.TestCase):
             self.repo.get(self.commits["other 0"]), repo=self.rdma_repo,
             directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 ("davem/net-next", (
                     name,
                 )),
@@ -923,8 +909,8 @@ class TestFromPatch(unittest.TestCase):
             self.repo.get(self.commits["net 1"]), repo=self.net_repo,
             directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 ("davem/net", (
                     name,
                 )),
@@ -947,15 +933,15 @@ class TestFromPatch(unittest.TestCase):
             self.repo.get(self.commits["net 1"]), repo=self.rdma_repo,
             directory=self.patch_dir)
 
-        with open("series.conf", mode="w") as f:
-            f.write(tests.support.format_series((
+        (self.ks_dir / 'series.conf').write_text(
+            tests.support.format_series((
                 ("davem/net", (
                     name,
                 )),
             )))
 
         self.check_failure(
-"Error: There is a problem with patch \"%s\". The Git-repo tag is incorrect or the patch is in the wrong section of series.conf and (the Git-commit tag is incorrect or the relevant remote is outdated or not available locally) or an entry for this repository is missing from \"remotes\". In the last case, please edit \"remotes\" in \"scripts/git_sort/git_sort.py\" and commit the result. Manual intervention is required.\n" % (name,))
+"Error: There is a problem with patch \"%s\". The Git-repo tag is incorrect or the patch is in the wrong section of series.conf and (the Git-commit tag is incorrect or the relevant remote is outdated or not available locally) or an entry for this repository is missing from \"remotes\". In the last case, please edit \"remotes\" in \"scripts/git_sort/git_sort.yaml\" and commit the result. Manual intervention is required.\n" % (name,))
 
 
     def test_malformed(self):
@@ -965,7 +951,7 @@ class TestFromPatch(unittest.TestCase):
         """
 
         name, series2 = self.prepare_found_indexed_upstream_good()
-        subprocess.call(['sed', '-i', '-e', 's/commit/comit/', name])
+        subprocess.call(['sed', '-i', '-e', 's/commit/comit/', name], cwd='/')
         self.check_failure(
 'Error: There is a problem with patch "%s". The Patch-mainline tag "Queued in subsystem maintainer repository" requires Git-commit.\n' % (name))
 
