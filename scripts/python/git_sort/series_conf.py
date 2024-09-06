@@ -1,4 +1,3 @@
-#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 # Copyright (C) 2018 SUSE LLC
@@ -26,14 +25,8 @@
 # force developers to install pygit2 just to commit unrelated changes to
 # kernel-source.
 
-import argparse
 import contextlib
-import errno
-import os.path
-import sys
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "../python"))
-import suse_git.exc as exc
+from suse_git import exc
 from suse_git.patch import Patch
 
 
@@ -133,39 +126,3 @@ def find_commit(commit, series, mode="rb"):
         if found:
             return
     raise exc.KSNotFound()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Extract the sorted patches section of a series.conf file.")
-    parser.add_argument("-n", "--name-only", action="store_true",
-                        help="Print only patch names.")
-    parser.add_argument("series", nargs="?", metavar="series.conf",
-                        help="series.conf file. Default: read input from stdin.")
-    args = parser.parse_args()
-
-    if args.series is not None:
-        f = open(args.series)
-    else:
-        f = sys.stdin
-    lines = f.readlines()
-
-    try:
-        before, inside, after = split(lines)
-    except exc.KSNotFound:
-        pass
-    else:
-        if args.name_only:
-            inside = filter_series(inside)
-            inside = [line + "\n" for line in inside]
-
-        try:
-            sys.stdout.writelines(inside)
-            # Avoid an unsightly error that may occur when not all output is
-            # read:
-            # Exception ignored in: <_io.TextIOWrapper name='<stdout>' mode='w' encoding='UTF-8'>
-            # BrokenPipeError: [Errno 32] Broken pipe
-            sys.stdout.flush()
-        except BrokenPipeError:
-            sys.stderr.close()
-            sys.exit()

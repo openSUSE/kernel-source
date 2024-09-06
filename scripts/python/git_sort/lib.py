@@ -1,4 +1,3 @@
-#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 # Copyright (C) 2018 SUSE LLC
@@ -18,36 +17,109 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
 # USA.
 
+from pathlib import Path
 import collections
-import operator
-import os
-import os.path
-import re
-import signal
 import subprocess
+import operator
+import tempfile
+import pathlib
+import signal
+import shelve
+import shutil
 import sys
+import os
+import re
 
-import pygit2_wrapper as pygit2
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "../python"))
-import suse_git.exc as exc
+from . import pygit2_wrapper as pygit2
+from . import series_conf
+from . import git_sort
 from suse_git.patch import Patch
-import git_sort
-import series_conf
+from suse_git import exc
+
+# fixups for python 3.6, works flawlessly in python 3.11
+if sys.version_info.minor < 11:  # SLE15
+    _shelve_open = shelve.open
+    def _fix_shelve(*args, **kwargs):
+        args = [str(a) if isinstance(a, pathlib.PurePath) else a for a in args]
+        return _shelve_open(*args, **kwargs)
+
+    shelve.open = _fix_shelve
+
+    if sys.version_info.minor >= 6:
+        class _FixPopen(subprocess.Popen):
+            def __init__(self, *args, **kwargs):
+                args = [str(a) if isinstance(a, pathlib.PurePath) else a for a in args]
+                super().__init__(*args, **kwargs)
+
+    else:  # SLE12
+        class _FixPopen(subprocess.Popen):
+            def __init__(self, *args, **kwargs):
+                args = [str(a) if isinstance(a, pathlib.PurePath) else a if not isinstance(a, list) else [str(elt) if isinstance(elt, pathlib.PurePath) else elt for elt in a ] for a in args]
+                new_kwargs = {}
+                for key in kwargs:
+                    value = kwargs[key]
+                    new_kwargs[key] = str(value) if isinstance(value, pathlib.PurePath) else value
+                super().__init__(*args, **new_kwargs)
+
+        def _write_text(self, text):
+            with self.open('w') as f: f.write(text)
+
+        pathlib.PurePath.write_text = _write_text
+
+        def _read_text(self):
+            with self.open() as f: return f.read()
+
+        pathlib.PurePath.read_text = _read_text
+
+        _os_stat = os.stat
+        def _fix_stat(*args, **kwargs):
+            args = [str(a) if isinstance(a, pathlib.PurePath) else a for a in args]
+            return _os_stat(*args, **kwargs)
+
+        os.stat = _fix_stat
+
+        _shutil_copy = shutil.copy
+        def _fix_copy(*args, **kwargs):
+            args = [str(a) if isinstance(a, pathlib.PurePath) else a for a in args]
+            return _shutil_copy(*args, **kwargs)
+
+        shutil.copy = _fix_copy
+
+        _shutil_rmtree = shutil.rmtree
+        def _fix_rmtree(*args, **kwargs):
+            args = [str(a) if isinstance(a, pathlib.PurePath) else a for a in args]
+            return _shutil_rmtree(*args, **kwargs)
+
+        shutil.rmtree = _fix_rmtree
+
+        _tempfile_mkstemp = tempfile.mkstemp
+        def _fix_mkstemp(*args, **kwargs):
+            args = [str(a) if isinstance(a, pathlib.PurePath) else a for a in args]
+            new_kwargs = {}
+            for key in kwargs:
+                value = kwargs[key]
+                new_kwargs[key] = str(value) if isinstance(value, pathlib.PurePath) else value
+            return _tempfile_mkstemp(*args, **new_kwargs)
+
+        tempfile.mkstemp = _fix_mkstemp
+
+    subprocess.Popen = _FixPopen
 
 
 # https://stackoverflow.com/a/952952
 flatten = lambda l: [item for sublist in l for item in sublist]
+bindir = Path(__file__).parents[2] / 'git_sort'
+gs_path = bindir / 'git_sort_debug'
+ss_path = bindir / 'series_sort'
+si_path = bindir / 'series_insert'
+qm_path = bindir / 'quilt-mode.sh'
+pc_path = bindir / 'pre-commit.sh'
 
 
 # http://stackoverflow.com/questions/1158076/implement-touch-using-python
 def touch(fname, times=None):
     with open(fname, 'a'):
         os.utime(fname, times)
-
-
-def libdir():
-    return os.path.dirname(os.path.realpath(__file__))
 
 
 def check_series():
@@ -93,9 +165,7 @@ def repo_path():
     Typically obtained from the LINUX_GIT environment variable.
     """
     try:
-        search_path = subprocess.check_output(
-            os.path.join(libdir(), "..",
-                         "linux_git.sh")).decode().strip()
+        search_path = subprocess.check_output(bindir / '..' / 'linux_git.sh').decode().strip()
     except subprocess.CalledProcessError:
         print("Error: Could not determine mainline linux git repository path.",
               file=sys.stderr)
@@ -343,7 +413,7 @@ class InputEntry(object):
                         "not available locally) or an entry for this "
                         "repository is missing from \"remotes\". In the last "
                         "case, please edit \"remotes\" in "
-                        "\"scripts/git_sort/git_sort.py\" and commit the "
+                        "\"scripts/git_sort/git_sort.yaml\" and commit the "
                         "result. Manual intervention is required." % (name,))
             else: # repo is indexed
                 if repo == current_head.repo_url: # good tag
