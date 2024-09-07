@@ -1,23 +1,20 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import tests.support
+from pathlib import Path
 import collections
-import os
-import shelve
-import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
+import shelve
+import shutil
+import sys
+import os
 
-import pygit2_wrapper as pygit2
-
-from pathlib import Path
-os.environ['GIT_SORT_REPOSITORIES'] = str(Path(__file__).parent / 'git_sort.yaml')
-
-import git_sort
-import lib
+import tests.support  # before git_sort
+from git_sort import pygit2_wrapper as pygit2
+from git_sort import git_sort
+from git_sort import lib
 
 
 class TestRepoURL(unittest.TestCase):
@@ -167,8 +164,7 @@ class TestIndex(unittest.TestCase):
 
 
     def test_empty_input(self):
-        gs_path = Path(lib.libdir(), "git_sort.py")
-        subprocess.check_output(gs_path, cwd=self.repo_dir, input="\n".encode())
+        subprocess.check_output(lib.gs_path, cwd=self.repo_dir, input="\n".encode())
 
 
 class TestIndexLinux(unittest.TestCase):
@@ -288,12 +284,11 @@ class TestCache(unittest.TestCase):
 
 
     def test_cache(self):
-        gs_path = Path(lib.libdir(), "git_sort.py")
         cache_path = Path(os.environ["XDG_CACHE_HOME"], "git-sort")
 
         input_text = "\n".join(self.commits)
 
-        output = subprocess.check_output([gs_path, "-d"], cwd=self.repo_dir).decode().splitlines()
+        output = subprocess.check_output([lib.gs_path, "-d"], cwd=self.repo_dir).decode().splitlines()
         self.assertEqual(output[-1], "Will rebuild history")
 
         # "-d" should not create a cache
@@ -305,10 +300,10 @@ class TestCache(unittest.TestCase):
         self.assertEqual(retval, 2)
 
         output_ref = subprocess.check_output(
-            gs_path, cwd=self.repo_dir, input=input_text.encode()).decode()
+            lib.gs_path, cwd=self.repo_dir, input=input_text.encode()).decode()
         time1 = os.stat(cache_path).st_mtime
 
-        output = subprocess.check_output([gs_path, "-d"], cwd=self.repo_dir).decode().splitlines()
+        output = subprocess.check_output([lib.gs_path, "-d"], cwd=self.repo_dir).decode().splitlines()
         self.assertEqual(output[-1], "Will not rebuild history")
 
         # "-d" should not modify a cache
@@ -317,21 +312,21 @@ class TestCache(unittest.TestCase):
         # test that git-sort action is the same as "-d" states (no cache
         # rebuild)
         output = subprocess.check_output(
-            gs_path, cwd=self.repo_dir, input=input_text.encode()).decode()
+            lib.gs_path, cwd=self.repo_dir, input=input_text.encode()).decode()
         self.assertEqual(output, output_ref)
         self.assertEqual(os.stat(cache_path).st_mtime, time1)
 
         # test version number change
         shelve.open(cache_path)["version"] = 1
-        output = subprocess.check_output([gs_path, "-d"], cwd=self.repo_dir).decode().splitlines()
+        output = subprocess.check_output([lib.gs_path, "-d"], cwd=self.repo_dir).decode().splitlines()
         self.assertEqual(output[1], "Unsupported cache version")
         self.assertEqual(output[-1], "Will rebuild history")
 
         output = subprocess.check_output(
-            gs_path, cwd=self.repo_dir, input=input_text.encode()).decode()
+            lib.gs_path, cwd=self.repo_dir, input=input_text.encode()).decode()
         self.assertEqual(output, output_ref)
 
-        output = subprocess.check_output([gs_path, "-d"], cwd=self.repo_dir).decode().splitlines()
+        output = subprocess.check_output([lib.gs_path, "-d"], cwd=self.repo_dir).decode().splitlines()
         self.assertEqual(output[-1], "Will not rebuild history")
 
         # corrupt the cache structure
@@ -340,15 +335,15 @@ class TestCache(unittest.TestCase):
             "net" : ["abc", "abc", "abc"],
             "net-next" : ["abc", "abc", "abc"],
         }
-        output = subprocess.check_output([gs_path, "-d"], cwd=self.repo_dir).decode().splitlines()
+        output = subprocess.check_output([lib.gs_path, "-d"], cwd=self.repo_dir).decode().splitlines()
         self.assertEqual(output[1], "Inconsistent cache content")
         self.assertEqual(output[-1], "Will rebuild history")
 
         output = subprocess.check_output(
-            gs_path, cwd=self.repo_dir, input=input_text.encode()).decode()
+            lib.gs_path, cwd=self.repo_dir, input=input_text.encode()).decode()
         self.assertEqual(output, output_ref)
 
-        output = subprocess.check_output([gs_path, "-d"], cwd=self.repo_dir).decode().splitlines()
+        output = subprocess.check_output([lib.gs_path, "-d"], cwd=self.repo_dir).decode().splitlines()
         self.assertEqual(output[-1], "Will not rebuild history")
 
 
@@ -362,10 +357,8 @@ class TestErrors(unittest.TestCase):
 
 
     def test_errors(self):
-        gs_path = Path(lib.libdir(), "git_sort.py")
-
         try:
-            subprocess.check_output([gs_path, "-d"], cwd=self.repo_dir, stderr=subprocess.STDOUT)
+            subprocess.check_output([lib.gs_path, "-d"], cwd=self.repo_dir, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
             self.assertEqual(err.output.decode().strip(),
@@ -374,7 +367,7 @@ class TestErrors(unittest.TestCase):
             self.assertTrue(False)
 
         try:
-            subprocess.check_output([gs_path], cwd=self.repo_dir, stderr=subprocess.STDOUT)
+            subprocess.check_output([lib.gs_path], cwd=self.repo_dir, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
             self.assertEqual(err.output.decode().strip(),

@@ -1,27 +1,23 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import os
-import shutil
-import subprocess
-import sys
-import tempfile
-import unittest
-
-import pygit2_wrapper as pygit2
 
 from pathlib import Path
-os.environ['GIT_SORT_REPOSITORIES'] = str(Path(__file__).parent / 'git_sort.yaml')
+import subprocess
+import tempfile
+import unittest
+import shutil
+import sys
+import os
 
-import git_sort
-import lib
-import tests.support
+import tests.support  # before git_sort
+from git_sort import pygit2_wrapper as pygit2
+from git_sort import git_sort
+from git_sort import lib
 
 
 class TestSeriesSort(unittest.TestCase):
     def setUp(self):
-        self.ss_path = Path(lib.libdir(), "series_sort.py")
-
         os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
 
         # setup stub linux repository
@@ -136,7 +132,7 @@ class TestSeriesSort(unittest.TestCase):
 
     def test_nofile(self):
         try:
-            subprocess.check_output([self.ss_path, "aaa"],
+            subprocess.check_output([lib.ss_path, 'aaa'],
                                     cwd=self.ks_dir, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
@@ -156,7 +152,7 @@ class TestSeriesSort(unittest.TestCase):
 """)
 
         try:
-            subprocess.check_output([self.ss_path, series],
+            subprocess.check_output([lib.ss_path, series],
                                     cwd=self.ks_dir, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.output.decode(), "Error: Sorted subseries not found.\n")
@@ -176,10 +172,10 @@ class TestSeriesSort(unittest.TestCase):
                 )),
             )))
 
-        subprocess.check_call([self.ss_path, "-c", series], cwd=self.ks_dir)
+        subprocess.check_call([lib.ss_path, '-c', series], cwd=self.ks_dir)
         with open(series) as f:
             content1 = f.read()
-        subprocess.check_call([self.ss_path, series], cwd=self.ks_dir)
+        subprocess.check_call([lib.ss_path, series], cwd=self.ks_dir)
         with open(series) as f:
             content2 = f.read()
         self.assertEqual(content2, content1)
@@ -215,10 +211,10 @@ class TestSeriesSort(unittest.TestCase):
 	patches.suse/unsorted-after.patch
 """)
 
-        subprocess.check_call([self.ss_path, "-c", series], cwd=self.ks_dir)
+        subprocess.check_call([lib.ss_path, '-c', series], cwd=self.ks_dir)
         with open(series) as f:
             content1 = f.read()
-        subprocess.check_call([self.ss_path, series], cwd=self.ks_dir)
+        subprocess.check_call([lib.ss_path, series], cwd=self.ks_dir)
         with open(series) as f:
             content2 = f.read()
         self.assertEqual(content2, content1)
@@ -244,10 +240,10 @@ class TestSeriesSort(unittest.TestCase):
 	patches.suse/unsorted-after.patch
 """)
 
-        subprocess.check_call([self.ss_path, "-c", series], cwd=self.ks_dir)
+        subprocess.check_call([lib.ss_path, '-c', series], cwd=self.ks_dir)
         with open(series) as f:
             content1 = f.read()
-        subprocess.check_call([self.ss_path, series], cwd=self.ks_dir)
+        subprocess.check_call([lib.ss_path, series], cwd=self.ks_dir)
         with open(series) as f:
             content2 = f.read()
         self.assertEqual(content2, content1)
@@ -269,7 +265,6 @@ class TestFromPatch(unittest.TestCase):
 
     def setUp(self):
         self.maxDiff = None
-        self.ss_path = Path(lib.libdir(), "series_sort.py")
 
         os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
 
@@ -448,7 +443,7 @@ class TestFromPatch(unittest.TestCase):
         for extra_arg in self.__class__._transform_arg(move_upstream):
             try:
                 subprocess.check_output(
-                    [self.ss_path] + extra_arg + ["-c", "series.conf"],
+                    [lib.ss_path] + extra_arg + ['-c', 'series.conf'],
                     cwd=self.ks_dir, stderr=subprocess.STDOUT)
             except subprocess.CalledProcessError as err:
                 self.assertEqual(err.returncode, 1)
@@ -458,7 +453,7 @@ class TestFromPatch(unittest.TestCase):
 
             try:
                 subprocess.check_output(
-                    [self.ss_path] + extra_arg + ["series.conf"],
+                    [lib.ss_path] + extra_arg + ['series.conf'],
                     cwd=self.ks_dir, stderr=subprocess.STDOUT)
             except subprocess.CalledProcessError as err:
                 self.assertEqual(err.returncode, 1)
@@ -470,11 +465,11 @@ class TestFromPatch(unittest.TestCase):
     def check_constant(self, name, move_upstream=None):
         for extra_arg in self.__class__._transform_arg(move_upstream):
             subprocess.check_call(
-                [self.ss_path] + extra_arg + ["-c", "series.conf"], cwd=self.ks_dir)
+                [lib.ss_path] + extra_arg + ['-c', 'series.conf'], cwd=self.ks_dir)
 
             series1 = (self.ks_dir / 'series.conf').read_text()
             patch1 = (self.ks_dir / name).read_text()
-            subprocess.check_call([self.ss_path] + extra_arg + ["series.conf"], cwd=self.ks_dir)
+            subprocess.check_call([lib.ss_path] + extra_arg + ['series.conf'], cwd=self.ks_dir)
             series2 = (self.ks_dir / 'series.conf').read_text()
             patch2 = (self.ks_dir / name).read_text()
             self.assertEqual(series2, series1)
@@ -490,7 +485,7 @@ class TestFromPatch(unittest.TestCase):
             shutil.copy(patch, name)
             try:
                 subprocess.check_output(
-                    [self.ss_path] + extra_arg + ["-c", "series.conf"],
+                    [lib.ss_path] + extra_arg + ['-c', 'series.conf'],
                     cwd=self.ks_dir, stderr=subprocess.STDOUT)
             except subprocess.CalledProcessError as err:
                 self.assertEqual(err.returncode, 2)
@@ -499,7 +494,7 @@ class TestFromPatch(unittest.TestCase):
                 self.assertTrue(False)
 
             shutil.copy(self.ks_dir / 'series.conf', series)
-            subprocess.check_call([self.ss_path] + extra_arg + [series], cwd=self.ks_dir)
+            subprocess.check_call([lib.ss_path] + extra_arg + [series], cwd=self.ks_dir)
             with open(series) as f:
                 content2 = f.read()
             self.assertEqual(content2, series2)
@@ -946,7 +941,7 @@ class TestFromPatch(unittest.TestCase):
             )))
 
         self.check_failure(
-"Error: There is a problem with patch \"%s\". The Git-repo tag is incorrect or the patch is in the wrong section of series.conf and (the Git-commit tag is incorrect or the relevant remote is outdated or not available locally) or an entry for this repository is missing from \"remotes\". In the last case, please edit \"remotes\" in \"scripts/git_sort/git_sort.py\" and commit the result. Manual intervention is required.\n" % (name,))
+"Error: There is a problem with patch \"%s\". The Git-repo tag is incorrect or the patch is in the wrong section of series.conf and (the Git-commit tag is incorrect or the relevant remote is outdated or not available locally) or an entry for this repository is missing from \"remotes\". In the last case, please edit \"remotes\" in \"scripts/git_sort/git_sort.yaml\" and commit the result. Manual intervention is required.\n" % (name,))
 
 
     def test_malformed(self):
