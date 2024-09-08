@@ -1,22 +1,20 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import os
-import shutil
-import subprocess
-import sys
-import tempfile
-import unittest
-
-import pygit2_wrapper as pygit2
 
 from pathlib import Path
-os.environ['GIT_SORT_REPOSITORIES'] = str(Path(__file__).parent / 'git_sort.yaml')
+import subprocess
+import tempfile
+import unittest
+import shutil
+import sys
+import os
 
-import git_sort
-import lib
-import series_conf
-import tests.support
+import tests.support  # before git_sort
+from git_sort import pygit2_wrapper as pygit2
+from git_sort import series_conf
+from git_sort import git_sort
+from git_sort import lib
 
 
 class TestMergeTool(unittest.TestCase):
@@ -74,7 +72,7 @@ class TestMergeTool(unittest.TestCase):
         subprocess.check_call(
             ("git", "config", "--add", "mergetool.git-sort.cmd",
              "%s $LOCAL $BASE $REMOTE $MERGED" % (
-                 Path(lib.libdir(), "merge_tool.py"),),), cwd=self.ks_dir)
+                 lib.bindir / 'series_merge_tool',),), cwd=self.ks_dir)
         subprocess.check_call(("git", "config", "--add",
                                "mergetool.git-sort.trustexitcode", "true",), cwd=self.ks_dir)
 
@@ -163,7 +161,7 @@ class TestMergeTool(unittest.TestCase):
         #sys.stdin.readline()
         retval = subprocess.check_output(
             ("git", "mergetool", "--tool=git-sort", "series.conf",), cwd=self.ks_dir,
-            stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdin=subprocess.DEVNULL)
         self.assertEqual(
             "1 commits changed section from base to remote.",
             retval.decode().splitlines()[-1].strip())
