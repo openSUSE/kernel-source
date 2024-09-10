@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright (C) 2019 SUSE LLC
@@ -22,12 +21,20 @@ import sys
 
 try:
     from pygit2 import *
+    from pygit2 import __version__
     if 'GIT_OBJ_TAG' in dir() and 'GIT_OBJECT_TAG' not in dir():
         GIT_OBJECT_TAG = GIT_OBJ_TAG
         GIT_OBJECT_COMMIT = GIT_OBJ_COMMIT
     if 'enums' in dir():
         if hasattr(enums.ReferenceType, 'DIRECT'):
             GIT_REF_OID = enums.ReferenceType.DIRECT
+    if __version__ < '1':
+        import pathlib
+        _old_init_repository = init_repository
+        def _fix_init_repository(*args, **kwargs):
+            args = [str(a) if isinstance(a, pathlib.PurePath) else a for a in args]
+            return _old_init_repository(*args, **kwargs)
+        init_repository = _fix_init_repository
 except ImportError as err:
     print("Error: %s" % (err,), file=sys.stderr)
     print("Please install the \"pygit2\" python3 module. For more details, "
