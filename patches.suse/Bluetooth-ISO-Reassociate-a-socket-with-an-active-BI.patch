@@ -1,0 +1,264 @@
+From fa224d0c094a458e9ebf5ea9b1c696136b7af427 Mon Sep 17 00:00:00 2001
+From: Iulia Tanasescu <iulia.tanasescu@nxp.com>
+Date: Mon, 13 Nov 2023 17:38:00 +0200
+Subject: [PATCH] Bluetooth: ISO: Reassociate a socket with an active BIS
+Git-commit: fa224d0c094a458e9ebf5ea9b1c696136b7af427
+Patch-mainline: v6.8-rc1
+References: jsc#PED-10412
+
+For ISO Broadcast, all BISes from a BIG have the same lifespan - they
+cannot be created or terminated independently from each other.
+
+This links together all BIS hcons that are part of the same BIG, so all
+hcons are kept alive as long as the BIG is active.
+
+If multiple BIS sockets are opened for a BIG handle, and only part of
+them are closed at some point, the associated hcons will be marked as
+open. If new sockets will later be opened for the same BIG, they will
+be reassociated with the open BIS hcons.
+
+All BIS hcons will be cleaned up and the BIG will be terminated when
+the last BIS socket is closed from userspace.
+
+Signed-off-by: Iulia Tanasescu <iulia.tanasescu@nxp.com>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ include/net/bluetooth/hci_core.h | 24 ++++++++++
+ net/bluetooth/hci_conn.c         | 32 ++++++++++++-
+ net/bluetooth/iso.c              | 79 +++++++++++++++++++++++++++++++-
+ 3 files changed, 131 insertions(+), 4 deletions(-)
+
+diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
+index a3a1ea2696a8..6a32c06d7fdc 100644
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -1297,6 +1297,30 @@ static inline struct hci_conn *hci_conn_hash_lookup_big(struct hci_dev *hdev,
+ 	return NULL;
+ }
+ 
++static inline struct hci_conn *
++hci_conn_hash_lookup_big_state(struct hci_dev *hdev, __u8 handle,  __u16 state)
++{
++	struct hci_conn_hash *h = &hdev->conn_hash;
++	struct hci_conn  *c;
++
++	rcu_read_lock();
++
++	list_for_each_entry_rcu(c, &h->list, list) {
++		if (bacmp(&c->dst, BDADDR_ANY) || c->type != ISO_LINK ||
++			c->state != state)
++			continue;
++
++		if (handle == c->iso_qos.bcast.big) {
++			rcu_read_unlock();
++			return c;
++		}
++	}
++
++	rcu_read_unlock();
++
++	return NULL;
++}
++
+ static inline struct hci_conn *
+ hci_conn_hash_lookup_pa_sync_big_handle(struct hci_dev *hdev, __u8 big)
+ {
+diff --git a/net/bluetooth/hci_conn.c b/net/bluetooth/hci_conn.c
+index 2cee330188ce..a09071059214 100644
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@ -1086,8 +1086,9 @@ static void hci_conn_cleanup_child(struct hci_conn *conn, u8 reason)
+ 			hci_conn_failed(conn, reason);
+ 		break;
+ 	case ISO_LINK:
+-		if (conn->state != BT_CONNECTED &&
+-		    !test_bit(HCI_CONN_CREATE_CIS, &conn->flags))
++		if ((conn->state != BT_CONNECTED &&
++		    !test_bit(HCI_CONN_CREATE_CIS, &conn->flags)) ||
++		    test_bit(HCI_CONN_BIG_CREATED, &conn->flags))
+ 			hci_conn_failed(conn, reason);
+ 		break;
+ 	}
+@@ -2228,7 +2229,17 @@ struct hci_conn *hci_bind_bis(struct hci_dev *hdev, bdaddr_t *dst,
+ 			      __u8 base_len, __u8 *base)
+ {
+ 	struct hci_conn *conn;
++	struct hci_conn *parent;
+ 	__u8 eir[HCI_MAX_PER_AD_LENGTH];
++	struct hci_link *link;
++
++	/* Look for any BIS that is open for rebinding */
++	conn = hci_conn_hash_lookup_big_state(hdev, qos->bcast.big, BT_OPEN);
++	if (conn) {
++		memcpy(qos, &conn->iso_qos, sizeof(*qos));
++		conn->state = BT_CONNECTED;
++		return conn;
++	}
+ 
+ 	if (base_len && base)
+ 		base_len = eir_append_service_data(eir, 0,  0x1851,
+@@ -2256,6 +2267,20 @@ struct hci_conn *hci_bind_bis(struct hci_dev *hdev, bdaddr_t *dst,
+ 	conn->iso_qos = *qos;
+ 	conn->state = BT_BOUND;
+ 
++	/* Link BISes together */
++	parent = hci_conn_hash_lookup_big(hdev,
++					  conn->iso_qos.bcast.big);
++	if (parent && parent != conn) {
++		link = hci_conn_link(parent, conn);
++		if (!link) {
++			hci_conn_drop(conn);
++			return ERR_PTR(-ENOLINK);
++		}
++
++		/* Link takes the refcount */
++		hci_conn_drop(conn);
++	}
++
+ 	return conn;
+ }
+ 
+@@ -2287,6 +2312,9 @@ struct hci_conn *hci_connect_bis(struct hci_dev *hdev, bdaddr_t *dst,
+ 	if (IS_ERR(conn))
+ 		return conn;
+ 
++	if (conn->state == BT_CONNECTED)
++		return conn;
++
+ 	data.big = qos->bcast.big;
+ 	data.bis = qos->bcast.bis;
+ 
+diff --git a/net/bluetooth/iso.c b/net/bluetooth/iso.c
+index e01b6abe36fb..e49f00e8a6a6 100644
+--- a/net/bluetooth/iso.c
++++ b/net/bluetooth/iso.c
+@@ -574,19 +574,68 @@ static struct sock *iso_get_sock_listen(bdaddr_t *src, bdaddr_t *dst,
+ 			continue;
+ 
+ 		/* Exact match. */
+-		if (!bacmp(&iso_pi(sk)->src, src))
++		if (!bacmp(&iso_pi(sk)->src, src)) {
++			sock_hold(sk);
+ 			break;
++		}
+ 
+ 		/* Closest match */
+-		if (!bacmp(&iso_pi(sk)->src, BDADDR_ANY))
++		if (!bacmp(&iso_pi(sk)->src, BDADDR_ANY)) {
++			if (sk1)
++				sock_put(sk1);
++
+ 			sk1 = sk;
++			sock_hold(sk1);
++		}
+ 	}
+ 
++	if (sk && sk1)
++		sock_put(sk1);
++
+ 	read_unlock(&iso_sk_list.lock);
+ 
+ 	return sk ? sk : sk1;
+ }
+ 
++static struct sock *iso_get_sock_big(struct sock *match_sk, bdaddr_t *src,
++				     bdaddr_t *dst, uint8_t big)
++{
++	struct sock *sk = NULL;
++
++	read_lock(&iso_sk_list.lock);
++
++	sk_for_each(sk, &iso_sk_list.head) {
++		if (match_sk == sk)
++			continue;
++
++		/* Look for sockets that have already been
++		 * connected to the BIG
++		 */
++		if (sk->sk_state != BT_CONNECTED &&
++		    sk->sk_state != BT_CONNECT)
++			continue;
++
++		/* Match Broadcast destination */
++		if (bacmp(&iso_pi(sk)->dst, dst))
++			continue;
++
++		/* Match BIG handle */
++		if (iso_pi(sk)->qos.bcast.big != big)
++			continue;
++
++		/* Match source address */
++		if (bacmp(&iso_pi(sk)->src, src))
++			continue;
++
++		sock_hold(sk);
++		break;
++	}
++
++	read_unlock(&iso_sk_list.lock);
++
++	return sk;
++}
++
+ static void iso_sock_destruct(struct sock *sk)
+ {
+ 	BT_DBG("sk %p", sk);
+@@ -639,6 +688,28 @@ static void iso_sock_kill(struct sock *sk)
+ 
+ static void iso_sock_disconn(struct sock *sk)
+ {
++	struct sock *bis_sk;
++	struct hci_conn *hcon = iso_pi(sk)->conn->hcon;
++
++	if (test_bit(HCI_CONN_BIG_CREATED, &hcon->flags)) {
++		bis_sk = iso_get_sock_big(sk, &iso_pi(sk)->src,
++					  &iso_pi(sk)->dst,
++					  iso_pi(sk)->qos.bcast.big);
++
++		/* If there are any other connected sockets for the
++		 * same BIG, just delete the sk and leave the bis
++		 * hcon active, in case later rebinding is needed.
++		 */
++		if (bis_sk) {
++			hcon->state = BT_OPEN;
++			iso_pi(sk)->conn->hcon = NULL;
++			iso_sock_clear_timer(sk);
++			iso_chan_del(sk, bt_to_errno(hcon->abort_reason));
++			sock_put(bis_sk);
++			return;
++		}
++	}
++
+ 	sk->sk_state = BT_DISCONN;
+ 	iso_sock_set_timer(sk, ISO_DISCONN_TIMEOUT);
+ 	iso_conn_lock(iso_pi(sk)->conn);
+@@ -1751,6 +1822,7 @@ static void iso_conn_ready(struct iso_conn *conn)
+ 		parent->sk_data_ready(parent);
+ 
+ 		release_sock(parent);
++		sock_put(parent);
+ 	}
+ }
+ 
+@@ -1835,6 +1907,7 @@ int iso_connect_ind(struct hci_dev *hdev, bdaddr_t *bdaddr, __u8 *flags)
+ 				if (err) {
+ 					bt_dev_err(hdev, "hci_le_big_create_sync: %d",
+ 						   err);
++					sock_put(sk);
+ 					sk = NULL;
+ 				}
+ 			}
+@@ -1867,6 +1940,8 @@ int iso_connect_ind(struct hci_dev *hdev, bdaddr_t *bdaddr, __u8 *flags)
+ 	if (test_bit(BT_SK_DEFER_SETUP, &bt_sk(sk)->flags))
+ 		*flags |= HCI_PROTO_DEFER;
+ 
++	sock_put(sk);
++
+ 	return lm;
+ }
+ 
+-- 
+2.43.0
+
