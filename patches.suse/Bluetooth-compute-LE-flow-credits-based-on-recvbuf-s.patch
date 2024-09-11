@@ -1,0 +1,388 @@
+From ce60b9231b66710b6ee24042ded26efee120ecfc Mon Sep 17 00:00:00 2001
+From: Sebastian Urban <surban@surban.net>
+Date: Wed, 1 May 2024 12:08:58 +0200
+Subject: [PATCH] Bluetooth: compute LE flow credits based on recvbuf space
+Git-commit: ce60b9231b66710b6ee24042ded26efee120ecfc
+Patch-mainline: v6.10-rc1
+References: jsc#PED-10412
+
+Previously LE flow credits were returned to the
+sender even if the socket's receive buffer was
+full. This meant that no back-pressure
+was applied to the sender, thus it continued to
+send data, resulting in data loss without any
+error being reported. Furthermore, the amount
+of credits was essentially fixed to a small
+amount, leading to reduced performance.
+
+This is fixed by computing the number of returned
+LE flow credits based on the estimated available
+space in the receive buffer of an L2CAP socket.
+Consequently, if the receive buffer is full, no
+credits are returned until the buffer is read and
+thus cleared by user-space.
+
+Since the computation of available receive buffer
+space can only be performed approximately (due to
+sk_buff overhead) and the receive buffer size may
+be changed by user-space after flow credits have
+been sent, superfluous received data is temporary
+stored within l2cap_pinfo. This is necessary
+because Bluetooth LE provides no retransmission
+mechanism once the data has been acked by the
+physical layer.
+
+If receive buffer space estimation is not possible
+at the moment, we fall back to providing credits
+for one full packet as before. This is currently
+the case during connection setup, when MPS is not
+yet available.
+
+Fixes: b1c325c23d75 ("Bluetooth: Implement returning of LE L2CAP credits")
+Signed-off-by: Sebastian Urban <surban@surban.net>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ include/net/bluetooth/l2cap.h | 11 ++++-
+ net/bluetooth/l2cap_core.c    | 56 ++++++++++++++++++---
+ net/bluetooth/l2cap_sock.c    | 91 ++++++++++++++++++++++++++++-------
+ 3 files changed, 132 insertions(+), 26 deletions(-)
+
+diff --git a/include/net/bluetooth/l2cap.h b/include/net/bluetooth/l2cap.h
+index 7d4a3e766e7b..5cfdc813491a 100644
+--- a/include/net/bluetooth/l2cap.h
++++ b/include/net/bluetooth/l2cap.h
+@@ -554,6 +554,9 @@ struct l2cap_chan {
+ 	__u16		tx_credits;
+ 	__u16		rx_credits;
+ 
++	/* estimated available receive buffer space or -1 if unknown */
++	ssize_t		rx_avail;
++
+ 	__u8		tx_state;
+ 	__u8		rx_state;
+ 
+@@ -688,10 +691,15 @@ struct l2cap_user {
+ /* ----- L2CAP socket info ----- */
+ #define l2cap_pi(sk) ((struct l2cap_pinfo *) sk)
+ 
++struct l2cap_rx_busy {
++	struct list_head	list;
++	struct sk_buff		*skb;
++};
++
+ struct l2cap_pinfo {
+ 	struct bt_sock		bt;
+ 	struct l2cap_chan	*chan;
+-	struct sk_buff		*rx_busy_skb;
++	struct list_head	rx_busy;
+ };
+ 
+ enum {
+@@ -949,6 +957,7 @@ int l2cap_chan_connect(struct l2cap_chan *chan, __le16 psm, u16 cid,
+ int l2cap_chan_reconfigure(struct l2cap_chan *chan, __u16 mtu);
+ int l2cap_chan_send(struct l2cap_chan *chan, struct msghdr *msg, size_t len);
+ void l2cap_chan_busy(struct l2cap_chan *chan, int busy);
++void l2cap_chan_rx_avail(struct l2cap_chan *chan, ssize_t rx_avail);
+ int l2cap_chan_check_security(struct l2cap_chan *chan, bool initiator);
+ void l2cap_chan_set_defaults(struct l2cap_chan *chan);
+ int l2cap_ertm_init(struct l2cap_chan *chan);
+diff --git a/net/bluetooth/l2cap_core.c b/net/bluetooth/l2cap_core.c
+index fa714f5bd0b3..443423538a4c 100644
+--- a/net/bluetooth/l2cap_core.c
++++ b/net/bluetooth/l2cap_core.c
+@@ -457,6 +457,9 @@ struct l2cap_chan *l2cap_chan_create(void)
+ 	/* Set default lock nesting level */
+ 	atomic_set(&chan->nesting, L2CAP_NESTING_NORMAL);
+ 
++	/* Available receive buffer space is initially unknown */
++	chan->rx_avail = -1;
++
+ 	write_lock(&chan_list_lock);
+ 	list_add(&chan->global_l, &chan_list);
+ 	write_unlock(&chan_list_lock);
+@@ -538,6 +541,28 @@ void l2cap_chan_set_defaults(struct l2cap_chan *chan)
+ }
+ EXPORT_SYMBOL_GPL(l2cap_chan_set_defaults);
+ 
++static __u16 l2cap_le_rx_credits(struct l2cap_chan *chan)
++{
++	size_t sdu_len = chan->sdu ? chan->sdu->len : 0;
++
++	if (chan->mps == 0)
++		return 0;
++
++	/* If we don't know the available space in the receiver buffer, give
++	 * enough credits for a full packet.
++	 */
++	if (chan->rx_avail == -1)
++		return (chan->imtu / chan->mps) + 1;
++
++	/* If we know how much space is available in the receive buffer, give
++	 * out as many credits as would fill the buffer.
++	 */
++	if (chan->rx_avail <= sdu_len)
++		return 0;
++
++	return DIV_ROUND_UP(chan->rx_avail - sdu_len, chan->mps);
++}
++
+ static void l2cap_le_flowctl_init(struct l2cap_chan *chan, u16 tx_credits)
+ {
+ 	chan->sdu = NULL;
+@@ -546,8 +571,7 @@ static void l2cap_le_flowctl_init(struct l2cap_chan *chan, u16 tx_credits)
+ 	chan->tx_credits = tx_credits;
+ 	/* Derive MPS from connection MTU to stop HCI fragmentation */
+ 	chan->mps = min_t(u16, chan->imtu, chan->conn->mtu - L2CAP_HDR_SIZE);
+-	/* Give enough credits for a full packet */
+-	chan->rx_credits = (chan->imtu / chan->mps) + 1;
++	chan->rx_credits = l2cap_le_rx_credits(chan);
+ 
+ 	skb_queue_head_init(&chan->tx_q);
+ }
+@@ -559,7 +583,7 @@ static void l2cap_ecred_init(struct l2cap_chan *chan, u16 tx_credits)
+ 	/* L2CAP implementations shall support a minimum MPS of 64 octets */
+ 	if (chan->mps < L2CAP_ECRED_MIN_MPS) {
+ 		chan->mps = L2CAP_ECRED_MIN_MPS;
+-		chan->rx_credits = (chan->imtu / chan->mps) + 1;
++		chan->rx_credits = l2cap_le_rx_credits(chan);
+ 	}
+ }
+ 
+@@ -6512,9 +6536,7 @@ static void l2cap_chan_le_send_credits(struct l2cap_chan *chan)
+ {
+ 	struct l2cap_conn *conn = chan->conn;
+ 	struct l2cap_le_credits pkt;
+-	u16 return_credits;
+-
+-	return_credits = (chan->imtu / chan->mps) + 1;
++	u16 return_credits = l2cap_le_rx_credits(chan);
+ 
+ 	if (chan->rx_credits >= return_credits)
+ 		return;
+@@ -6533,6 +6555,19 @@ static void l2cap_chan_le_send_credits(struct l2cap_chan *chan)
+ 	l2cap_send_cmd(conn, chan->ident, L2CAP_LE_CREDITS, sizeof(pkt), &pkt);
+ }
+ 
++void l2cap_chan_rx_avail(struct l2cap_chan *chan, ssize_t rx_avail)
++{
++	if (chan->rx_avail == rx_avail)
++		return;
++
++	BT_DBG("chan %p has %zd bytes avail for rx", chan, rx_avail);
++
++	chan->rx_avail = rx_avail;
++
++	if (chan->state == BT_CONNECTED)
++		l2cap_chan_le_send_credits(chan);
++}
++
+ static int l2cap_ecred_recv(struct l2cap_chan *chan, struct sk_buff *skb)
+ {
+ 	int err;
+@@ -6542,6 +6577,12 @@ static int l2cap_ecred_recv(struct l2cap_chan *chan, struct sk_buff *skb)
+ 	/* Wait recv to confirm reception before updating the credits */
+ 	err = chan->ops->recv(chan, skb);
+ 
++	if (err < 0 && chan->rx_avail != -1) {
++		BT_ERR("Queueing received LE L2CAP data failed");
++		l2cap_send_disconn_req(chan, ECONNRESET);
++		return err;
++	}
++
+ 	/* Update credits whenever an SDU is received */
+ 	l2cap_chan_le_send_credits(chan);
+ 
+@@ -6564,7 +6605,8 @@ static int l2cap_ecred_data_rcv(struct l2cap_chan *chan, struct sk_buff *skb)
+ 	}
+ 
+ 	chan->rx_credits--;
+-	BT_DBG("rx_credits %u -> %u", chan->rx_credits + 1, chan->rx_credits);
++	BT_DBG("chan %p: rx_credits %u -> %u",
++	       chan, chan->rx_credits + 1, chan->rx_credits);
+ 
+ 	/* Update if remote had run out of credits, this should only happens
+ 	 * if the remote is not using the entire MPS.
+diff --git a/net/bluetooth/l2cap_sock.c b/net/bluetooth/l2cap_sock.c
+index 5cc83f906c12..8645461d45e8 100644
+--- a/net/bluetooth/l2cap_sock.c
++++ b/net/bluetooth/l2cap_sock.c
+@@ -1131,6 +1131,34 @@ static int l2cap_sock_sendmsg(struct socket *sock, struct msghdr *msg,
+ 	return err;
+ }
+ 
++static void l2cap_publish_rx_avail(struct l2cap_chan *chan)
++{
++	struct sock *sk = chan->data;
++	ssize_t avail = sk->sk_rcvbuf - atomic_read(&sk->sk_rmem_alloc);
++	int expected_skbs, skb_overhead;
++
++	if (avail <= 0) {
++		l2cap_chan_rx_avail(chan, 0);
++		return;
++	}
++
++	if (!chan->mps) {
++		l2cap_chan_rx_avail(chan, -1);
++		return;
++	}
++
++	/* Correct available memory by estimated sk_buff overhead.
++	 * This is significant due to small transfer sizes. However, accept
++	 * at least one full packet if receive space is non-zero.
++	 */
++	expected_skbs = DIV_ROUND_UP(avail, chan->mps);
++	skb_overhead = expected_skbs * sizeof(struct sk_buff);
++	if (skb_overhead < avail)
++		l2cap_chan_rx_avail(chan, avail - skb_overhead);
++	else
++		l2cap_chan_rx_avail(chan, -1);
++}
++
+ static int l2cap_sock_recvmsg(struct socket *sock, struct msghdr *msg,
+ 			      size_t len, int flags)
+ {
+@@ -1167,28 +1195,33 @@ static int l2cap_sock_recvmsg(struct socket *sock, struct msghdr *msg,
+ 	else
+ 		err = bt_sock_recvmsg(sock, msg, len, flags);
+ 
+-	if (pi->chan->mode != L2CAP_MODE_ERTM)
++	if (pi->chan->mode != L2CAP_MODE_ERTM &&
++	    pi->chan->mode != L2CAP_MODE_LE_FLOWCTL &&
++	    pi->chan->mode != L2CAP_MODE_EXT_FLOWCTL)
+ 		return err;
+ 
+-	/* Attempt to put pending rx data in the socket buffer */
+-
+ 	lock_sock(sk);
+ 
+-	if (!test_bit(CONN_LOCAL_BUSY, &pi->chan->conn_state))
+-		goto done;
++	l2cap_publish_rx_avail(pi->chan);
+ 
+-	if (pi->rx_busy_skb) {
+-		if (!__sock_queue_rcv_skb(sk, pi->rx_busy_skb))
+-			pi->rx_busy_skb = NULL;
+-		else
++	/* Attempt to put pending rx data in the socket buffer */
++	while (!list_empty(&pi->rx_busy)) {
++		struct l2cap_rx_busy *rx_busy =
++			list_first_entry(&pi->rx_busy,
++					 struct l2cap_rx_busy,
++					 list);
++		if (__sock_queue_rcv_skb(sk, rx_busy->skb) < 0)
+ 			goto done;
++		list_del(&rx_busy->list);
++		kfree(rx_busy);
+ 	}
+ 
+ 	/* Restore data flow when half of the receive buffer is
+ 	 * available.  This avoids resending large numbers of
+ 	 * frames.
+ 	 */
+-	if (atomic_read(&sk->sk_rmem_alloc) <= sk->sk_rcvbuf >> 1)
++	if (test_bit(CONN_LOCAL_BUSY, &pi->chan->conn_state) &&
++	    atomic_read(&sk->sk_rmem_alloc) <= sk->sk_rcvbuf >> 1)
+ 		l2cap_chan_busy(pi->chan, 0);
+ 
+ done:
+@@ -1449,17 +1482,20 @@ static struct l2cap_chan *l2cap_sock_new_connection_cb(struct l2cap_chan *chan)
+ static int l2cap_sock_recv_cb(struct l2cap_chan *chan, struct sk_buff *skb)
+ {
+ 	struct sock *sk = chan->data;
++	struct l2cap_pinfo *pi = l2cap_pi(sk);
+ 	int err;
+ 
+ 	lock_sock(sk);
+ 
+-	if (l2cap_pi(sk)->rx_busy_skb) {
++	if (chan->mode == L2CAP_MODE_ERTM && !list_empty(&pi->rx_busy)) {
+ 		err = -ENOMEM;
+ 		goto done;
+ 	}
+ 
+ 	if (chan->mode != L2CAP_MODE_ERTM &&
+-	    chan->mode != L2CAP_MODE_STREAMING) {
++	    chan->mode != L2CAP_MODE_STREAMING &&
++	    chan->mode != L2CAP_MODE_LE_FLOWCTL &&
++	    chan->mode != L2CAP_MODE_EXT_FLOWCTL) {
+ 		/* Even if no filter is attached, we could potentially
+ 		 * get errors from security modules, etc.
+ 		 */
+@@ -1470,7 +1506,9 @@ static int l2cap_sock_recv_cb(struct l2cap_chan *chan, struct sk_buff *skb)
+ 
+ 	err = __sock_queue_rcv_skb(sk, skb);
+ 
+-	/* For ERTM, handle one skb that doesn't fit into the recv
++	l2cap_publish_rx_avail(chan);
++
++	/* For ERTM and LE, handle a skb that doesn't fit into the recv
+ 	 * buffer.  This is important to do because the data frames
+ 	 * have already been acked, so the skb cannot be discarded.
+ 	 *
+@@ -1479,8 +1517,18 @@ static int l2cap_sock_recv_cb(struct l2cap_chan *chan, struct sk_buff *skb)
+ 	 * acked and reassembled until there is buffer space
+ 	 * available.
+ 	 */
+-	if (err < 0 && chan->mode == L2CAP_MODE_ERTM) {
+-		l2cap_pi(sk)->rx_busy_skb = skb;
++	if (err < 0 &&
++	    (chan->mode == L2CAP_MODE_ERTM ||
++	     chan->mode == L2CAP_MODE_LE_FLOWCTL ||
++	     chan->mode == L2CAP_MODE_EXT_FLOWCTL)) {
++		struct l2cap_rx_busy *rx_busy =
++			kmalloc(sizeof(*rx_busy), GFP_KERNEL);
++		if (!rx_busy) {
++			err = -ENOMEM;
++			goto done;
++		}
++		rx_busy->skb = skb;
++		list_add_tail(&rx_busy->list, &pi->rx_busy);
+ 		l2cap_chan_busy(chan, 1);
+ 		err = 0;
+ 	}
+@@ -1706,6 +1754,8 @@ static const struct l2cap_ops l2cap_chan_ops = {
+ 
+ static void l2cap_sock_destruct(struct sock *sk)
+ {
++	struct l2cap_rx_busy *rx_busy, *next;
++
+ 	BT_DBG("sk %p", sk);
+ 
+ 	if (l2cap_pi(sk)->chan) {
+@@ -1713,9 +1763,10 @@ static void l2cap_sock_destruct(struct sock *sk)
+ 		l2cap_chan_put(l2cap_pi(sk)->chan);
+ 	}
+ 
+-	if (l2cap_pi(sk)->rx_busy_skb) {
+-		kfree_skb(l2cap_pi(sk)->rx_busy_skb);
+-		l2cap_pi(sk)->rx_busy_skb = NULL;
++	list_for_each_entry_safe(rx_busy, next, &l2cap_pi(sk)->rx_busy, list) {
++		kfree_skb(rx_busy->skb);
++		list_del(&rx_busy->list);
++		kfree(rx_busy);
+ 	}
+ 
+ 	skb_queue_purge(&sk->sk_receive_queue);
+@@ -1799,6 +1850,8 @@ static void l2cap_sock_init(struct sock *sk, struct sock *parent)
+ 
+ 	chan->data = sk;
+ 	chan->ops = &l2cap_chan_ops;
++
++	l2cap_publish_rx_avail(chan);
+ }
+ 
+ static struct proto l2cap_proto = {
+@@ -1820,6 +1873,8 @@ static struct sock *l2cap_sock_alloc(struct net *net, struct socket *sock,
+ 	sk->sk_destruct = l2cap_sock_destruct;
+ 	sk->sk_sndtimeo = L2CAP_CONN_TIMEOUT;
+ 
++	INIT_LIST_HEAD(&l2cap_pi(sk)->rx_busy);
++
+ 	chan = l2cap_chan_create();
+ 	if (!chan) {
+ 		sk_free(sk);
+-- 
+2.43.0
+
