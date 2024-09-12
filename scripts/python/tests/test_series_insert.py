@@ -1,21 +1,18 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import os
-import shutil
+from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import shutil
 import sys
+import os
 
-import pygit2_wrapper as pygit2
-
-from pathlib import Path
-os.environ['GIT_SORT_REPOSITORIES'] = str(Path(__file__).parent / 'git_sort.yaml')
-
-import git_sort
-import lib
-import tests.support
+import tests.support  # before git_sort
+from git_sort import pygit2_wrapper as pygit2
+from git_sort import git_sort
+from git_sort import lib
 
 
 class TestSeriesInsert(unittest.TestCase):
@@ -54,21 +51,19 @@ class TestSeriesInsert(unittest.TestCase):
         self.index = git_sort.SortIndex(self.repo)
 
         # setup stub kernel-source content
-        self.ks_dir = tempfile.mkdtemp(prefix="gs_ks")
-        patch_dir = os.path.join(self.ks_dir, "patches.suse")
-        self.si_path = os.path.join(lib.libdir(), "series_insert.py")
-        os.mkdir(patch_dir)
-        os.chdir(patch_dir)
+        self.ks_dir = Path(tempfile.mkdtemp(prefix="gs_ks"))
+        patch_dir = self.ks_dir / 'patches.suse'
+        patch_dir.mkdir()
         for commit in commits:
             tests.support.format_patch(self.repo.get(commit),
+                                       directory=patch_dir,
                                        mainline="v3.45-rc6")
-        series = os.path.join(self.ks_dir, "series.conf");
+        series = self.ks_dir / 'series.conf'
         content = tests.support.format_series((
             (None,
              ("patches.suse/mainline-%d.patch" % (i,) for i in (0, 2,))),
         ))
-        with open(series, mode="w") as f:
-            f.write(content)
+        series.write_text(content)
 
     def tearDown(self):
         shutil.rmtree(os.environ["XDG_CACHE_HOME"])
@@ -77,13 +72,11 @@ class TestSeriesInsert(unittest.TestCase):
 
 
     def test_simple(self):
-        os.chdir(self.ks_dir)
 
-        series = "series.conf"
+        series = self.ks_dir / 'series.conf'
 
-        subprocess.check_call([self.si_path, "patches.suse/mainline-1.patch"])
-        with open(series) as f:
-            content = f.read()
+        subprocess.check_call([lib.si_path, 'patches.suse/mainline-1.patch'], cwd=self.ks_dir)
+        content = series.read_text()
         self.assertEqual(content,
             tests.support.format_series((
                 (None,
@@ -91,20 +84,19 @@ class TestSeriesInsert(unittest.TestCase):
             )))
 
     def test_invalid(self):
-        os.chdir(self.ks_dir)
 
         content = []
-        with open("patches.suse/mainline-1.patch") as f:
+        with (self.ks_dir / 'patches.suse/mainline-1.patch').open() as f:
             for line in f:
                 if line.startswith("Git-commit: "):
                     line = "Git-commit: invalid\n"
                 content.append(line)
-        with open("patches.suse/mainline-1.patch", mode="w+") as f:
+        with (self.ks_dir / 'patches.suse/mainline-1.patch').open('w') as f:
             f.writelines(content)
 
         try:
-            subprocess.check_output([self.si_path, "patches.suse/mainline-1.patch"],
-                                   stderr=subprocess.STDOUT)
+            subprocess.check_output([lib.si_path, 'patches.suse/mainline-1.patch'],
+                                   cwd=self.ks_dir, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
             self.assertEqual(
@@ -115,19 +107,18 @@ class TestSeriesInsert(unittest.TestCase):
             self.assertTrue(False)
 
     def test_noheader(self):
-        os.chdir(self.ks_dir)
 
         content = []
-        with open("patches.suse/mainline-1.patch") as f:
+        with (self.ks_dir / 'patches.suse/mainline-1.patch').open() as f:
             for line in f:
                 if not line.startswith("Git-commit: ") and not line.startswith("Patch-mainline: "):
                     content.append(line)
-        with open("patches.suse/mainline-1.patch", mode="w+") as f:
+        with (self.ks_dir / 'patches.suse/mainline-1.patch').open('w') as f:
             f.writelines(content)
 
         try:
-            subprocess.check_output([self.si_path, "patches.suse/mainline-1.patch"],
-                                   stderr=subprocess.STDOUT)
+            subprocess.check_output([lib.si_path, 'patches.suse/mainline-1.patch'],
+                                   cwd=self.ks_dir, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as err:
             self.assertEqual(err.returncode, 1)
             self.assertEqual(
