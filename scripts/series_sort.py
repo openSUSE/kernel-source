@@ -1,1 +1,1 @@
-git_sort/series_sort.py
+series_sort

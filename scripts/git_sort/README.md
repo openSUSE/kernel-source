@@ -1,44 +1,28 @@
 Installation Requirements
 =========================
 `git-sort` and the related series.conf sorting scripts depend on the python3
-`dbm` and `pygit2` modules.
+`dbm`, `pygit2`, and `PyYAML` modules.
 
-For SLE12-SP2 and SLE12-SP3, the python3-dbm package is available in the
-SUSE:SLE-12:Update IBS project:
-```
-https://build.suse.de/project/show/SUSE:SLE-12:Update
-http://download.suse.de/ibs/SUSE:/SLE-12:/Update/standard/SUSE:SLE-12:Update.repo
-```
-
-For openSUSE 42.3 and Tumbleweed, the python3-dbm package is available in the
-normal OSS repository.
-
-The python3-pygit2 package is available from the Kernel:tools OBS project
-except for Tumbleweed where it's available from the normal OSS repository.
+For SLE12 SP5 python3-pygit2 package is available from the Kernel:tools OBS
+project, for SLE15 and later where it's available from the OS update
+repository.
 ```
 https://build.opensuse.org/package/show/Kernel:tools/python-pygit2
 ```
 
-merge_tool.py depends on `merge` from the rcs package, available in standard
-repositories.
+series_merge_tool depends on `merge` from the rcs package, available in
+standard repositories.
 
 The functions in `quilt-mode.sh` are meant to be used with a modified `quilt`
 that can use kernel-source.git's series.conf directly instead of a shadow
 copy.
 
-Packages are available in the following OBS project
-https://build.opensuse.org/package/show/home:benjamin_poirier:series_sort/quilt-ks
+Packages are available Kernel:tools OBS project.
 Source is avaible from
 https://github.com/gobenji/quilt
 
-The packages in home:benjamin_poirier:series_sort are signed with the key
-from home:benjamin_poirier which has the following fingerprint:
-6075 E129 2ACD 9732 A079  7B40 3F6E 17FC 4A3D 5625
-
 quilt depends on diffstat from the package with the same name. For SLE12-SP2
-and SLE12-SP3, the diffstat package is available in the SDK module. For
-openSUSE 42.3 and Tumbleweed, the diffstat package is available in the normal
-OSS repository.
+and SLE12-SP3, the diffstat package is available in the SDK module.
 
 Configuration Requirements
 ==========================
@@ -70,7 +54,7 @@ For a patch file, `<patch>` which is a backport of an upstream commit:
 
 Then run:
 ```
-kernel-source$ ./scripts/git_sort/series_insert.py <patch>
+kernel-source$ ./scripts/series_insert <patch>
 ```
 
 This script can also be called with multiple patches at once.
@@ -88,7 +72,7 @@ Refreshing the order of patches in series.conf
 As upstream maintainers pull from each other, the order of patches in
 series.conf needs to be refreshed. In that case, run:
 ```
-kernel-source$ ./scripts/series_sort.py --upstream series.conf
+kernel-source$ ./scripts/series_sort --upstream series.conf
 ```
 
 In case of unexpected trouble, you can also move patch entries to the
@@ -191,8 +175,8 @@ kernel-source$ cat /tmp/list | refs_in_series.sh "drivers/net/ethernet/emulex/be
 Generate the work tree with patches applied up to the first patch in the
 list of commits to backport:
 ```
-# adjust the path to `sequence-insert.py` according to your environment
-kernel-source$ ./scripts/sequence-patch.sh $(./scripts/git_sort/sequence-insert.py $(head -n1 /tmp/list | awk '{print $1}'))
+# adjust the path to `sequence-insert` according to your environment
+kernel-source$ ./scripts/sequence-patch.sh $(./scripts/git_sort/sequence-insert $(head -n1 /tmp/list | awk '{print $1}'))
 ```
 
 It is preferable to check that the driver builds before getting started:
@@ -292,11 +276,11 @@ Example of a merge conflict resolution involving sorted patches in series.conf
 When merging or rebasing between commits in kernel-source it is possible that
 there is a conflict involving sorted patches in series.conf. This type of
 conflict can be solved automatically using the git mergetool interface with
-the script merge_tool.py. To set up the merge tool, add a section like this
+the script series_merge_tool. To set up the merge tool, add a section like this
 to git config:
 
     [mergetool "git-sort"]
-        cmd = scripts/git_sort/merge_tool.py $LOCAL $BASE $REMOTE $MERGED
+        cmd = scripts/series_merge_tool $LOCAL $BASE $REMOTE $MERGED
         trustExitCode = true
 
 When using the merge tool, the LINUX_GIT reference repository must fetch from
@@ -305,13 +289,13 @@ the remote branch of the merge (the `<commit>` argument to `git merge`) or
 which are in different subsystem maintainer sections between the local and
 remote revisions. A simple way to satisfy that condition is to fetch from all
 remotes configured for git-sort before doing a merge resolution. The script
-`scripts/git_sort/update_clone.py` can be used to create or update the
+`scripts/git_sort/update_clone` can be used to create or update the
 configuration of a repository so that it contains all of the remotes
 configured for git-sort. Please see the help message of that script for more
 information.
 
 As an example, the merge in kernel-source commit da87d04b3b needed conflict
-resolution. Let's redo this resolution using merge_tool:
+resolution. Let's redo this resolution using series_merge_tool:
 ```
 ben@f1:~/local/src/kernel-source$ git log -n1 da87d04b3b
 commit da87d04b3bc6edf2b58a10e27c77352a5eb7b3d9
@@ -376,4 +360,4 @@ report to <kernel@suse.de> which includes the following information:
   "users/<user>/SLE15/bugreport1") so that others can examine the tree and try
   to reproduce the issue.
 * the output of
-  kernel-source$ GIT_DIR=$LINUX_GIT scripts/git_sort/git_sort.py -d
+  kernel-source$ GIT_DIR=$LINUX_GIT scripts/git_sort/git_sort_debug -d

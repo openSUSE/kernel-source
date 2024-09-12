@@ -257,7 +257,7 @@ qadd () {
 		(
 			[ ${#series[@]} -gt 0 ] && printf "%s\n" "${series[@]}"
 			[ -n "$_series" ] && echo "$_series"
-		) | GIT_DIR=$git_dir "$_libdir"/git_sort.py
+		) | GIT_DIR=$git_dir "$_libdir"/git_sort_debug
 	)"
 
 	if [ -z "${series[0]}" ]; then
@@ -281,7 +281,7 @@ qedit () {
 	${EDITOR:-${VISUAL:-vi}} "$tmpfile"
 
 	mapfile -t series <<< "$(grep . "$tmpfile" |
-		GIT_DIR=$git_dir $_libdir/git_sort.py)"
+		GIT_DIR=$git_dir $_libdir/git_sort_debug)"
 
 	if [ -z "${series[0]}" ]; then
 		unset series[0]
