@@ -1,0 +1,147 @@
+From: David Howells <dhowells@redhat.com>
+Date: Tue, 3 Sep 2024 11:15:41 +0100
+Subject: [PATCH] cifs: Fix SMB1 readv/writev callback in the same way as
+ SMB2/3
+References: bsc#1012628
+Patch-mainline: 6.10.10
+Git-commit: a68c74865f517e26728735aba0ae05055eaff76c
+
+[ Upstream commit a68c74865f517e26728735aba0ae05055eaff76c ]
+
+Port a number of SMB2/3 async readv/writev fixes to the SMB1 transport:
+
+    commit a88d60903696c01de577558080ec4fc738a70475
+    cifs: Don't advance the I/O iterator before terminating subrequest
+
+    commit ce5291e56081730ec7d87bc9aa41f3de73ff3256
+    cifs: Defer read completion
+
+    commit 1da29f2c39b67b846b74205c81bf0ccd96d34727
+    netfs, cifs: Fix handling of short DIO read
+
+Fixes: 3ee1a1fc3981 ("cifs: Cut over to using netfslib")
+Signed-off-by: David Howells <dhowells@redhat.com>
+Reported-by: Steve French <stfrench@microsoft.com>
+Reviewed-by: Paulo Alcantara <pc@manguebit.com>
+cc: Jeff Layton <jlayton@kernel.org>
+cc: linux-cifs@vger.kernel.org
+cc: netfs@lists.linux.dev
+cc: linux-fsdevel@vger.kernel.org
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/smb/client/cifssmb.c | 54 +++++++++++++++++++++++++++++++++++------
+ 1 file changed, 46 insertions(+), 8 deletions(-)
+
+diff --git a/fs/smb/client/cifssmb.c b/fs/smb/client/cifssmb.c
+index 6dce70f1..cfae2e91 100644
+--- a/fs/smb/client/cifssmb.c
++++ b/fs/smb/client/cifssmb.c
+@@ -1261,16 +1261,32 @@ CIFS_open(const unsigned int xid, struct cifs_open_parms *oparms, int *oplock,
+ 	return rc;
+ }
+ 
++static void cifs_readv_worker(struct work_struct *work)
++{
++	struct cifs_io_subrequest *rdata =
++		container_of(work, struct cifs_io_subrequest, subreq.work);
++
++	netfs_subreq_terminated(&rdata->subreq,
++				(rdata->result == 0 || rdata->result == -EAGAIN) ?
++				rdata->got_bytes : rdata->result, true);
++}
++
+ static void
+ cifs_readv_callback(struct mid_q_entry *mid)
+ {
+ 	struct cifs_io_subrequest *rdata = mid->callback_data;
++	struct netfs_inode *ictx = netfs_inode(rdata->rreq->inode);
+ 	struct cifs_tcon *tcon = tlink_tcon(rdata->req->cfile->tlink);
+ 	struct TCP_Server_Info *server = tcon->ses->server;
+ 	struct smb_rqst rqst = { .rq_iov = rdata->iov,
+ 				 .rq_nvec = 2,
+ 				 .rq_iter = rdata->subreq.io_iter };
+-	struct cifs_credits credits = { .value = 1, .instance = 0 };
++	struct cifs_credits credits = {
++		.value = 1,
++		.instance = 0,
++		.rreq_debug_id = rdata->rreq->debug_id,
++		.rreq_debug_index = rdata->subreq.debug_index,
++	};
+ 
+ 	cifs_dbg(FYI, "%s: mid=%llu state=%d result=%d bytes=%zu\n",
+ 		 __func__, mid->mid, mid->mid_state, rdata->result,
+@@ -1282,6 +1298,7 @@ cifs_readv_callback(struct mid_q_entry *mid)
+ 		if (server->sign) {
+ 			int rc = 0;
+ 
++			iov_iter_truncate(&rqst.rq_iter, rdata->got_bytes);
+ 			rc = cifs_verify_signature(&rqst, server,
+ 						  mid->sequence_number);
+ 			if (rc)
+@@ -1306,13 +1323,21 @@ cifs_readv_callback(struct mid_q_entry *mid)
+ 		rdata->result = -EIO;
+ 	}
+ 
+-	if (rdata->result == 0 || rdata->result == -EAGAIN)
+-		iov_iter_advance(&rdata->subreq.io_iter, rdata->got_bytes);
++	if (rdata->result == -ENODATA) {
++		__set_bit(NETFS_SREQ_HIT_EOF, &rdata->subreq.flags);
++		rdata->result = 0;
++	} else {
++		if (rdata->got_bytes < rdata->actual_len &&
++		    rdata->subreq.start + rdata->subreq.transferred + rdata->got_bytes ==
++		    ictx->remote_i_size) {
++			__set_bit(NETFS_SREQ_HIT_EOF, &rdata->subreq.flags);
++			rdata->result = 0;
++		}
++	}
++
+ 	rdata->credits.value = 0;
+-	netfs_subreq_terminated(&rdata->subreq,
+-				(rdata->result == 0 || rdata->result == -EAGAIN) ?
+-				rdata->got_bytes : rdata->result,
+-				false);
++	INIT_WORK(&rdata->subreq.work, cifs_readv_worker);
++	queue_work(cifsiod_wq, &rdata->subreq.work);
+ 	release_mid(mid);
+ 	add_credits(server, &credits, 0);
+ }
+@@ -1619,9 +1644,15 @@ static void
+ cifs_writev_callback(struct mid_q_entry *mid)
+ {
+ 	struct cifs_io_subrequest *wdata = mid->callback_data;
++	struct TCP_Server_Info *server = wdata->server;
+ 	struct cifs_tcon *tcon = tlink_tcon(wdata->req->cfile->tlink);
+ 	WRITE_RSP *smb = (WRITE_RSP *)mid->resp_buf;
+-	struct cifs_credits credits = { .value = 1, .instance = 0 };
++	struct cifs_credits credits = {
++		.value = 1,
++		.instance = 0,
++		.rreq_debug_id = wdata->rreq->debug_id,
++		.rreq_debug_index = wdata->subreq.debug_index,
++	};
+ 	ssize_t result;
+ 	size_t written;
+ 
+@@ -1657,9 +1688,16 @@ cifs_writev_callback(struct mid_q_entry *mid)
+ 		break;
+ 	}
+ 
++	trace_smb3_rw_credits(credits.rreq_debug_id, credits.rreq_debug_index,
++			      wdata->credits.value,
++			      server->credits, server->in_flight,
++			      0, cifs_trace_rw_credits_write_response_clear);
+ 	wdata->credits.value = 0;
+ 	cifs_write_subrequest_terminated(wdata, result, true);
+ 	release_mid(mid);
++	trace_smb3_rw_credits(credits.rreq_debug_id, credits.rreq_debug_index, 0,
++			      server->credits, server->in_flight,
++			      credits.value, cifs_trace_rw_credits_write_response_add);
+ 	add_credits(tcon->ses->server, &credits, 0);
+ }
+ 
+-- 
+2.46.0
+

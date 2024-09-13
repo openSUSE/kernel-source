@@ -1,0 +1,150 @@
+From: Markus Schneider-Pargmann <msp@baylibre.com>
+Date: Mon, 5 Aug 2024 20:30:44 +0200
+Subject: [PATCH] can: m_can: Do not cancel timer from within timer
+References: bsc#1012628
+Patch-mainline: 6.10.10
+Git-commit: 4d5159bfafa8d1a205d8213b7434e0402588b9ed
+
+[ Upstream commit 4d5159bfafa8d1a205d8213b7434e0402588b9ed ]
+
+On setups without interrupts, the interrupt handler is called from a
+timer callback. For non-peripheral receives napi is scheduled,
+interrupts are disabled and the timer is canceled with a blocking call.
+In case of an error this can happen as well.
+
+Check if napi is scheduled in the timer callback after the interrupt
+handler executed. If napi is scheduled, the timer is disabled. It will
+be reenabled by m_can_poll().
+
+Return error values from the interrupt handler so that interrupt threads
+and timer callback can deal differently with it. In case of the timer
+we only disable the timer. The rest will be done when stopping the
+interface.
+
+Fixes: b382380c0d2d ("can: m_can: Add hrtimer to generate software interrupt")
+Fixes: a163c5761019 ("can: m_can: Start/Cancel polling timer together with interrupts")
+Signed-off-by: Markus Schneider-Pargmann <msp@baylibre.com>
+Link: https://lore.kernel.org/all/20240805183047.305630-5-msp@baylibre.com
+Signed-off-by: Marc Kleine-Budde <mkl@pengutronix.de>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/net/can/m_can/m_can.c | 57 ++++++++++++++++++++++++++---------
+ 1 file changed, 42 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/net/can/m_can/m_can.c b/drivers/net/can/m_can/m_can.c
+index 2d73fa7f..d15655df 100644
+--- a/drivers/net/can/m_can/m_can.c
++++ b/drivers/net/can/m_can/m_can.c
+@@ -453,7 +453,7 @@ static inline void m_can_disable_all_interrupts(struct m_can_classdev *cdev)
+ 
+ 	if (!cdev->net->irq) {
+ 		dev_dbg(cdev->dev, "Stop hrtimer\n");
+-		hrtimer_cancel(&cdev->hrtimer);
++		hrtimer_try_to_cancel(&cdev->hrtimer);
+ 	}
+ }
+ 
+@@ -1167,11 +1167,15 @@ static void m_can_coalescing_update(struct m_can_classdev *cdev, u32 ir)
+ 			      HRTIMER_MODE_REL);
+ }
+ 
+-static irqreturn_t m_can_isr(int irq, void *dev_id)
++/* This interrupt handler is called either from the interrupt thread or a
++ * hrtimer. This has implications like cancelling a timer won't be possible
++ * blocking.
++ */
++static int m_can_interrupt_handler(struct m_can_classdev *cdev)
+ {
+-	struct net_device *dev = (struct net_device *)dev_id;
+-	struct m_can_classdev *cdev = netdev_priv(dev);
++	struct net_device *dev = cdev->net;
+ 	u32 ir;
++	int ret;
+ 
+ 	if (pm_runtime_suspended(cdev->dev))
+ 		return IRQ_NONE;
+@@ -1198,11 +1202,9 @@ static irqreturn_t m_can_isr(int irq, void *dev_id)
+ 			m_can_disable_all_interrupts(cdev);
+ 			napi_schedule(&cdev->napi);
+ 		} else {
+-			int pkts;
+-
+-			pkts = m_can_rx_handler(dev, NAPI_POLL_WEIGHT, ir);
+-			if (pkts < 0)
+-				goto out_fail;
++			ret = m_can_rx_handler(dev, NAPI_POLL_WEIGHT, ir);
++			if (ret < 0)
++				return ret;
+ 		}
+ 	}
+ 
+@@ -1220,8 +1222,9 @@ static irqreturn_t m_can_isr(int irq, void *dev_id)
+ 	} else  {
+ 		if (ir & (IR_TEFN | IR_TEFW)) {
+ 			/* New TX FIFO Element arrived */
+-			if (m_can_echo_tx_event(dev) != 0)
+-				goto out_fail;
++			ret = m_can_echo_tx_event(dev);
++			if (ret != 0)
++				return ret;
+ 		}
+ 	}
+ 
+@@ -1229,16 +1232,31 @@ static irqreturn_t m_can_isr(int irq, void *dev_id)
+ 		can_rx_offload_threaded_irq_finish(&cdev->offload);
+ 
+ 	return IRQ_HANDLED;
++}
+ 
+-out_fail:
+-	m_can_disable_all_interrupts(cdev);
+-	return IRQ_HANDLED;
++static irqreturn_t m_can_isr(int irq, void *dev_id)
++{
++	struct net_device *dev = (struct net_device *)dev_id;
++	struct m_can_classdev *cdev = netdev_priv(dev);
++	int ret;
++
++	ret =  m_can_interrupt_handler(cdev);
++	if (ret < 0) {
++		m_can_disable_all_interrupts(cdev);
++		return IRQ_HANDLED;
++	}
++
++	return ret;
+ }
+ 
+ static enum hrtimer_restart m_can_coalescing_timer(struct hrtimer *timer)
+ {
+ 	struct m_can_classdev *cdev = container_of(timer, struct m_can_classdev, hrtimer);
+ 
++	if (cdev->can.state == CAN_STATE_BUS_OFF ||
++	    cdev->can.state == CAN_STATE_STOPPED)
++		return HRTIMER_NORESTART;
++
+ 	irq_wake_thread(cdev->net->irq, cdev->net);
+ 
+ 	return HRTIMER_NORESTART;
+@@ -1930,8 +1948,17 @@ static enum hrtimer_restart hrtimer_callback(struct hrtimer *timer)
+ {
+ 	struct m_can_classdev *cdev = container_of(timer, struct
+ 						   m_can_classdev, hrtimer);
++	int ret;
++
++	if (cdev->can.state == CAN_STATE_BUS_OFF ||
++	    cdev->can.state == CAN_STATE_STOPPED)
++		return HRTIMER_NORESTART;
++
++	ret = m_can_interrupt_handler(cdev);
+ 
+-	m_can_isr(0, cdev->net);
++	/* On error or if napi is scheduled to read, stop the timer */
++	if (ret < 0 || napi_is_scheduled(&cdev->napi))
++		return HRTIMER_NORESTART;
+ 
+ 	hrtimer_forward_now(timer, ms_to_ktime(HRTIMER_POLL_INTERVAL_MS));
+ 
+-- 
+2.46.0
+
