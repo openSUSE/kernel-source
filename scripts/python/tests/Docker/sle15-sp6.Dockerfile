@@ -1,4 +1,4 @@
-FROM registry.opensuse.org/kernel/tools/images/opensuse_factory/kernel-scripts:latest AS base
+FROM registry.opensuse.org/kernel/tools/images/sle_15_sp6/kernel-scripts:latest AS base
 
 RUN git config --global user.email "you@example.com"
 RUN git config --global user.name "Your Name"
