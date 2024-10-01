@@ -7,13 +7,13 @@ import subprocess
 import tempfile
 import unittest
 
-from . import lib
+from . import support
 
 
 class TestLinuxGit(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="ks_linux_git")
-        self.lg_path = os.path.join(lib.libdir(), "../../linux_git.sh")
+        self.lg_path = support.testdir() /  '../../linux_git.sh'
 
 
     def tearDown(self):
@@ -28,7 +28,7 @@ class TestLinuxGit(unittest.TestCase):
 
         subprocess.check_call(args, env={})
 
-        retval = subprocess.check_output((self.lg_path,),
+        retval = subprocess.check_output([self.lg_path],
                                          env={"LINUX_GIT" : var})
         self.assertEqual(output, retval.decode())
 
