@@ -160,8 +160,7 @@ done
     $build_dir/series.conf
 
 inconsistent=false
-check_for_merge_conflicts $referenced_files kernel-source.changes{,.old} || \
-	inconsistent=true
+check_for_merge_conflicts $referenced_files || inconsistent=true
 scripts/check-conf || inconsistent=true
 scripts/check-cvs-add --committed || inconsistent=true
 
@@ -217,9 +216,7 @@ fi
 rm -f "$build_dir/config-subst"
 
 changelog=$build_dir/kernel-source$VARIANT.changes
-if test -e kernel-source.changes; then
-    cat kernel-source.changes{,.old} >"$changelog"
-elif $using_git; then
+if $using_git; then
     exclude=()
     # Exclude commits in the scripts branch, these are rarely interesting for
     # users of the rpm packages.
