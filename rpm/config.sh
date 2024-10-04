@@ -1,7 +1,7 @@
 # The version of the main tarball to use
 SRCVERSION=6.4
 # variant of the kernel-source package, either empty or "-rt"
-VARIANT=
+VARIANT=-azure
 # enable kernel module compression
 COMPRESS_MODULES="zstd"
 # Use new style livepatch package names
