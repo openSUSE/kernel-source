@@ -1,0 +1,152 @@
+From: Yosry Ahmed <yosryahmed@google.com>
+Date: Tue, 2 Jul 2024 13:21:37 +0000
+Subject: [PATCH] x86/mm: Use IPIs to synchronize LAM enablement
+References: bsc#1218260
+Patch-mainline: 6.6.54
+Git-commit: 3b299b99556c1753923f8d9bbd9304bcd139282f
+
+[ Upstream commit 3b299b99556c1753923f8d9bbd9304bcd139282f ]
+
+LAM can only be enabled when a process is single-threaded.  But _kernel_
+threads can temporarily use a single-threaded process's mm.
+
+If LAM is enabled by a userspace process while a kthread is using its
+mm, the kthread will not observe LAM enablement (i.e.  LAM will be
+disabled in CR3). This could be fine for the kthread itself, as LAM only
+affects userspace addresses. However, if the kthread context switches to
+a thread in the same userspace process, CR3 may or may not be updated
+because the mm_struct doesn't change (based on pending TLB flushes). If
+CR3 is not updated, the userspace thread will run incorrectly with LAM
+disabled, which may cause page faults when using tagged addresses.
+Example scenario:
+
+CPU 1                                   CPU 2
+/* kthread */
+kthread_use_mm()
+                                        /* user thread */
+                                        prctl_enable_tagged_addr()
+                                        /* LAM enabled on CPU 2 */
+/* LAM disabled on CPU 1 */
+                                        context_switch() /* to CPU 1 */
+/* Switching to user thread */
+switch_mm_irqs_off()
+/* CR3 not updated */
+/* LAM is still disabled on CPU 1 */
+
+Synchronize LAM enablement by sending an IPI to all CPUs running with
+the mm_struct to enable LAM. This makes sure LAM is enabled on CPU 1
+in the above scenario before prctl_enable_tagged_addr() returns and
+userspace starts using tagged addresses, and before it's possible to
+run the userspace process on CPU 1.
+
+In switch_mm_irqs_off(), move reading the LAM mask until after
+mm_cpumask() is updated. This ensures that if an outdated LAM mask is
+written to CR3, an IPI is received to update it right after IRQs are
+re-enabled.
+
+[ dhansen: Add a LAM enabling helper and comment it ]
+
+Fixes: 82721d8b25d7 ("x86/mm: Handle LAM on context switch")
+Suggested-by: Andy Lutomirski <luto@kernel.org>
+Signed-off-by: Yosry Ahmed <yosryahmed@google.com>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Link: https://lore.kernel.org/all/20240702132139.3332013-2-yosryahmed%40google.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ arch/x86/kernel/process_64.c | 29 ++++++++++++++++++++++++++---
+ arch/x86/mm/tlb.c            |  7 +++----
+ 2 files changed, 29 insertions(+), 7 deletions(-)
+
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index 4989095ab769..d595ef7c1de0 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -750,6 +750,27 @@ static long prctl_map_vdso(const struct vdso_image *image, unsigned long addr)
+ 
+ #define LAM_U57_BITS 6
+ 
++static void enable_lam_func(void *__mm)
++{
++	struct mm_struct *mm = __mm;
++
++	if (this_cpu_read(cpu_tlbstate.loaded_mm) == mm) {
++		write_cr3(__read_cr3() | mm->context.lam_cr3_mask);
++		set_tlbstate_lam_mode(mm);
++	}
++}
++
++static void mm_enable_lam(struct mm_struct *mm)
++{
++	/*
++	 * Even though the process must still be single-threaded at this
++	 * point, kernel threads may be using the mm.  IPI those kernel
++	 * threads if they exist.
++	 */
++	on_each_cpu_mask(mm_cpumask(mm), enable_lam_func, mm, true);
++	set_bit(MM_CONTEXT_LOCK_LAM, &mm->context.flags);
++}
++
+ static int prctl_enable_tagged_addr(struct mm_struct *mm, unsigned long nr_bits)
+ {
+ 	if (!cpu_feature_enabled(X86_FEATURE_LAM))
+@@ -766,6 +787,10 @@ static int prctl_enable_tagged_addr(struct mm_struct *mm, unsigned long nr_bits)
+ 	if (mmap_write_lock_killable(mm))
+ 		return -EINTR;
+ 
++	/*
++	 * MM_CONTEXT_LOCK_LAM is set on clone.  Prevent LAM from
++	 * being enabled unless the process is single threaded:
++	 */
+ 	if (test_bit(MM_CONTEXT_LOCK_LAM, &mm->context.flags)) {
+ 		mmap_write_unlock(mm);
+ 		return -EBUSY;
+@@ -782,9 +807,7 @@ static int prctl_enable_tagged_addr(struct mm_struct *mm, unsigned long nr_bits)
+ 		return -EINVAL;
+ 	}
+ 
+-	write_cr3(__read_cr3() | mm->context.lam_cr3_mask);
+-	set_tlbstate_lam_mode(mm);
+-	set_bit(MM_CONTEXT_LOCK_LAM, &mm->context.flags);
++	mm_enable_lam(mm);
+ 
+ 	mmap_write_unlock(mm);
+ 
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index 453ea95b667d..2fbae48f0b47 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -497,9 +497,9 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
+ {
+ 	struct mm_struct *real_prev = this_cpu_read(cpu_tlbstate.loaded_mm);
+ 	u16 prev_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
+-	unsigned long new_lam = mm_lam_cr3_mask(next);
+ 	bool was_lazy = this_cpu_read(cpu_tlbstate_shared.is_lazy);
+ 	unsigned cpu = smp_processor_id();
++	unsigned long new_lam;
+ 	u64 next_tlb_gen;
+ 	bool need_flush;
+ 	u16 new_asid;
+@@ -622,9 +622,7 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
+ 			cpumask_clear_cpu(cpu, mm_cpumask(real_prev));
+ 		}
+ 
+-		/*
+-		 * Start remote flushes and then read tlb_gen.
+-		 */
++		/* Start receiving IPIs and then read tlb_gen (and LAM below) */
+ 		if (next != &init_mm)
+ 			cpumask_set_cpu(cpu, mm_cpumask(next));
+ 		next_tlb_gen = atomic64_read(&next->context.tlb_gen);
+@@ -636,6 +634,7 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
+ 		barrier();
+ 	}
+ 
++	new_lam = mm_lam_cr3_mask(next);
+ 	set_tlbstate_lam_mode(next);
+ 	if (need_flush) {
+ 		this_cpu_write(cpu_tlbstate.ctxs[new_asid].ctx_id, next->context.ctx_id);
+-- 
+2.46.0
+
