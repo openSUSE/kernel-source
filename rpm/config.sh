@@ -17,7 +17,7 @@ OBS_PROJECT_ARM=openSUSE:Factory:ARM
 IBS_PROJECT=SUSE:ALP:Source:Standard:Core:1.0:Build
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
-BUGZILLA_PRODUCT="ALP"
+BUGZILLA_PRODUCT="SUSE Linux Enterprise Micro 6.0"
 SPLIT_OPTIONAL=No
 SUPPORTED_MODULES_CHECK=Yes
 # build documentation in HTML format
