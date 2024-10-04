@@ -22,11 +22,6 @@
 
 # generate a kernel-source rpm package
 
-# if this is SLE11_BRANCH and earlier, hand over to scripts/tar-up-old.sh
-if test ! -x rpm/mkspec; then
-    exec ${0%.sh}-old.sh "$@"
-fi
-
 . ${0%/*}/wd-functions.sh
 
 sort()
