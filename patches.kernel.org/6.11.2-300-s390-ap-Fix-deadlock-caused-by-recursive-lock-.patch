@@ -1,0 +1,127 @@
+From: Harald Freudenberger <freude@linux.ibm.com>
+Date: Wed, 28 Aug 2024 14:25:08 +0200
+Subject: [PATCH] s390/ap: Fix deadlock caused by recursive lock of the AP bus
+ scan mutex
+References: bsc#1012628
+Patch-mainline: 6.11.2
+Git-commit: 56199bb956c3ea82e39c72d2972ebf8c18c6a8c0
+
+[ Upstream commit 56199bb956c3ea82e39c72d2972ebf8c18c6a8c0 ]
+
+There is a possibility to deadlock with an recursive
+lock of the AP bus scan mutex ap_scan_bus_mutex:
+
+  ... kernel: ============================================
+  ... kernel: WARNING: possible recursive locking detected
+  ... kernel: 5.14.0-496.el9.s390x #3 Not tainted
+  ... kernel: --------------------------------------------
+  ... kernel: kworker/12:1/130 is trying to acquire lock:
+  ... kernel: 0000000358bc1510 (ap_scan_bus_mutex){+.+.}-{3:3}, at: ap_bus_force_rescan+0x92/0x108
+  ... kernel:
+	      but task is already holding lock:
+  ... kernel: 0000000358bc1510 (ap_scan_bus_mutex){+.+.}-{3:3}, at: ap_scan_bus_wq_callback+0x28/0x60
+  ... kernel:
+	      other info that might help us debug this:
+  ... kernel:  Possible unsafe locking scenario:
+  ... kernel:        CPU0
+  ... kernel:        ----
+  ... kernel:   lock(ap_scan_bus_mutex);
+  ... kernel:   lock(ap_scan_bus_mutex);
+  ... kernel:
+	      *** DEADLOCK ***
+
+Here is how the callstack looks like:
+
+  ... [<00000003576fe9ce>] process_one_work+0x2a6/0x748
+  ... [<0000000358150c00>] ap_scan_bus_wq_callback+0x40/0x60   <- mutex locked
+  ... [<00000003581506e2>] ap_scan_bus+0x5a/0x3b0
+  ... [<000000035815037c>] ap_scan_adapter+0x5b4/0x8c0
+  ... [<000000035814fa34>] ap_scan_domains+0x2d4/0x668
+  ... [<0000000357d989b4>] device_add+0x4a4/0x6b8
+  ... [<0000000357d9bb54>] bus_probe_device+0xb4/0xc8
+  ... [<0000000357d9daa8>] __device_attach+0x120/0x1b0
+  ... [<0000000357d9a632>] bus_for_each_drv+0x8a/0xd0
+  ... [<0000000357d9d548>] __device_attach_driver+0xc0/0x140
+  ... [<0000000357d9d3d8>] driver_probe_device+0x40/0xf0
+  ... [<0000000357d9cec2>] really_probe+0xd2/0x460
+  ... [<000000035814d7b0>] ap_device_probe+0x150/0x208
+  ... [<000003ff802a5c46>] zcrypt_cex4_queue_probe+0xb6/0x1c0 [zcrypt_cex4]
+  ... [<000003ff7fb2d36e>] zcrypt_queue_register+0xe6/0x1b0 [zcrypt]
+  ... [<000003ff7fb2c8ac>] zcrypt_rng_device_add+0x94/0xd8 [zcrypt]
+  ... [<0000000357d7bc52>] hwrng_register+0x212/0x228
+  ... [<0000000357d7b8c2>] add_early_randomness+0x102/0x110
+  ... [<000003ff7fb29c94>] zcrypt_rng_data_read+0x94/0xb8 [zcrypt]
+  ... [<0000000358150aca>] ap_bus_force_rescan+0x92/0x108
+  ... [<0000000358177572>] mutex_lock_interruptible_nested+0x32/0x40  <- lock again
+
+Note this only happens when the very first random data providing
+crypto card appears via hot plug in the system AND is in disabled
+state ("deconfig"). Then the initial pull of random data fails and
+a re-scan of the AP bus is triggered while already in the middle
+of an AP bus scan caused by the appearing new hardware.
+
+The fix is relatively simple once the scenario us understood:
+The AP bus force rescan function will immediately return if there
+is currently an AP bus scan running with the very same thread id.
+
+Fixes: eacf5b3651c5 ("s390/ap: introduce mutex to lock the AP bus scan")
+Signed-off-by: Harald Freudenberger <freude@linux.ibm.com>
+Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/s390/crypto/ap_bus.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/drivers/s390/crypto/ap_bus.c b/drivers/s390/crypto/ap_bus.c
+index f9f682f19415..3ba4e1c5e15d 100644
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@ -107,6 +107,7 @@ debug_info_t *ap_dbf_info;
+ static bool ap_scan_bus(void);
+ static bool ap_scan_bus_result; /* result of last ap_scan_bus() */
+ static DEFINE_MUTEX(ap_scan_bus_mutex); /* mutex ap_scan_bus() invocations */
++static struct task_struct *ap_scan_bus_task; /* thread holding the scan mutex */
+ static atomic64_t ap_scan_bus_count; /* counter ap_scan_bus() invocations */
+ static int ap_scan_bus_time = AP_CONFIG_TIME;
+ static struct timer_list ap_scan_bus_timer;
+@@ -1006,11 +1007,25 @@ bool ap_bus_force_rescan(void)
+ 	if (scan_counter <= 0)
+ 		goto out;
+ 
++	/*
++	 * There is one unlikely but nevertheless valid scenario where the
++	 * thread holding the mutex may try to send some crypto load but
++	 * all cards are offline so a rescan is triggered which causes
++	 * a recursive call of ap_bus_force_rescan(). A simple return if
++	 * the mutex is already locked by this thread solves this.
++	 */
++	if (mutex_is_locked(&ap_scan_bus_mutex)) {
++		if (ap_scan_bus_task == current)
++			goto out;
++	}
++
+ 	/* Try to acquire the AP scan bus mutex */
+ 	if (mutex_trylock(&ap_scan_bus_mutex)) {
+ 		/* mutex acquired, run the AP bus scan */
++		ap_scan_bus_task = current;
+ 		ap_scan_bus_result = ap_scan_bus();
+ 		rc = ap_scan_bus_result;
++		ap_scan_bus_task = NULL;
+ 		mutex_unlock(&ap_scan_bus_mutex);
+ 		goto out;
+ 	}
+@@ -2284,7 +2299,9 @@ static void ap_scan_bus_wq_callback(struct work_struct *unused)
+ 	 * system_long_wq which invokes this function here again.
+ 	 */
+ 	if (mutex_trylock(&ap_scan_bus_mutex)) {
++		ap_scan_bus_task = current;
+ 		ap_scan_bus_result = ap_scan_bus();
++		ap_scan_bus_task = NULL;
+ 		mutex_unlock(&ap_scan_bus_mutex);
+ 	}
+ }
+-- 
+2.46.1
+
