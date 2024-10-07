@@ -16,7 +16,7 @@ from . import support
 class TestSpliceSeries(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.covdir = tempfile.mkdtemp(prefix="gs_log2_cov")
+        cls.covdir = tempfile.mkdtemp(prefix="gs_log_cov")
         cls.kcov = shutil.which('kcov')
         if not cls.kcov:
             sys.stderr.write("kcov is not available\n")
@@ -32,17 +32,17 @@ class TestSpliceSeries(unittest.TestCase):
 
 
     def setUp(self):
-        self.tmpdir = Path(tempfile.mkdtemp(prefix="gs_log2"))
-        self.log2_path = support.testdir() / '../../log2'
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="gs_log"))
+        self.log_path = support.testdir() / '../../log'
         self.cmd = ['./test.sh']
         if self.kcov:
-            self.cmd = [self.kcov, "--include-path=%s" % (self.log2_path,),
+            self.cmd = [self.kcov, "--include-path=%s" % (self.log_path,),
                         self.covdir] + self.cmd
         self.testscript = """#!/bin/bash
 
                           . %s
                           splice_series %%s 3<old 4<new\n""" % (
-                                  self.log2_path,)
+                                  self.log_path,)
 
 
     def tearDown(self):
