@@ -99,7 +99,7 @@ update_refs_$(branch)_$(YEAR): hash_file_$(branch).dat hash_cve_bug_$(YEAR).dat
 		$(ADD_REF) -r $$cve -r "bsc#"$$bug "$(WORKTREE)/$$file" ; \
 	done
 	cd "$(WORKTREE)" >/dev/null ; \
-	scripts/log2 --no-edit || true
+	scripts/log --no-edit || true
 
 clean:
 	rm -f *_$(branch).dat
