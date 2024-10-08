@@ -1,0 +1,251 @@
+From: Namhyung Kim <namhyung@kernel.org>
+Date: Tue, 27 Feb 2024 21:33:35 -0800
+Subject: perf lock contention: Account contending locks too
+Git-commit: b44d66536859393772c67cb1da65345127f692e0
+Patch-mainline: v6.9-rc1
+References: perf-sp7-v6.11-userspace-update
+
+Currently it accounts the contention using delta between timestamps in
+lock:contention_begin and lock:contention_end tracepoints.  But it means
+the lock should see the both events during the monitoring period.
+
+Actually there are 4 cases that happen with the monitoring:
+
+                monitoring period
+            /                       \
+            |                       |
+ 1:  B------+-----------------------+--------E
+ 2:    B----+-------------E         |
+ 3:         |           B-----------+----E
+ 4:         |     B-------------E   |
+            |                       |
+            t0                      t1
+
+where B and E mean contention BEGIN and END, respectively.  So it only
+accounts the case 4 for now.  It seems there's no way to handle the case
+1.  The case 2 might be handled if it saved the timestamp (t0), but it
+lacks the information from the B notably the flags which shows the lock
+types.  Also it could be a nested lock which it currently ignores.  So
+I think we should ignore the case 2.
+
+However we can handle the case 3 if we save the timestamp (t1) at the
+end of the period.  And then it can iterate the map entries in the
+userspace and update the lock stat accordinly.
+
+Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+Reviewed-by: Ian Rogers <irogers@google.com>
+Reviwed-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Song Liu <song@kernel.org>
+Cc: bpf@vger.kernel.org
+Link: https://lore.kernel.org/r/20240228053335.312776-1-namhyung@kernel.org
+
+Signed-off-by: Tony Jones <tonyj@suse.de>
+---
+ tools/perf/util/bpf_lock_contention.c          | 120 +++++++++++++++++++++++++
+ tools/perf/util/bpf_skel/lock_contention.bpf.c |  16 ++--
+ tools/perf/util/bpf_skel/lock_data.h           |   7 ++
+ 3 files changed, 136 insertions(+), 7 deletions(-)
+
+diff --git a/tools/perf/util/bpf_lock_contention.c b/tools/perf/util/bpf_lock_contention.c
+index 31ff19afc20c..3549180c7885 100644
+--- a/tools/perf/util/bpf_lock_contention.c
++++ b/tools/perf/util/bpf_lock_contention.c
+@@ -179,6 +179,123 @@ int lock_contention_prepare(struct lock_contention *con)
+ 	return 0;
+ }
+ 
++/*
++ * Run the BPF program directly using BPF_PROG_TEST_RUN to update the end
++ * timestamp in ktime so that it can calculate delta easily.
++ */
++static void mark_end_timestamp(void)
++{
++	DECLARE_LIBBPF_OPTS(bpf_test_run_opts, opts,
++		.flags = BPF_F_TEST_RUN_ON_CPU,
++	);
++	int prog_fd = bpf_program__fd(skel->progs.end_timestamp);
++
++	bpf_prog_test_run_opts(prog_fd, &opts);
++}
++
++static void update_lock_stat(int map_fd, int pid, u64 end_ts,
++			     enum lock_aggr_mode aggr_mode,
++			     struct tstamp_data *ts_data)
++{
++	u64 delta;
++	struct contention_key stat_key = {};
++	struct contention_data stat_data;
++
++	if (ts_data->timestamp >= end_ts)
++		return;
++
++	delta = end_ts - ts_data->timestamp;
++
++	switch (aggr_mode) {
++	case LOCK_AGGR_CALLER:
++		stat_key.stack_id = ts_data->stack_id;
++		break;
++	case LOCK_AGGR_TASK:
++		stat_key.pid = pid;
++		break;
++	case LOCK_AGGR_ADDR:
++		stat_key.lock_addr_or_cgroup = ts_data->lock;
++		break;
++	case LOCK_AGGR_CGROUP:
++		/* TODO */
++		return;
++	default:
++		return;
++	}
++
++	if (bpf_map_lookup_elem(map_fd, &stat_key, &stat_data) < 0)
++		return;
++
++	stat_data.total_time += delta;
++	stat_data.count++;
++
++	if (delta > stat_data.max_time)
++		stat_data.max_time = delta;
++	if (delta < stat_data.min_time)
++		stat_data.min_time = delta;
++
++	bpf_map_update_elem(map_fd, &stat_key, &stat_data, BPF_EXIST);
++}
++
++/*
++ * Account entries in the tstamp map (which didn't see the corresponding
++ * lock:contention_end tracepoint) using end_ts.
++ */
++static void account_end_timestamp(struct lock_contention *con)
++{
++	int ts_fd, stat_fd;
++	int *prev_key, key;
++	u64 end_ts = skel->bss->end_ts;
++	int total_cpus;
++	enum lock_aggr_mode aggr_mode = con->aggr_mode;
++	struct tstamp_data ts_data, *cpu_data;
++
++	/* Iterate per-task tstamp map (key = TID) */
++	ts_fd = bpf_map__fd(skel->maps.tstamp);
++	stat_fd = bpf_map__fd(skel->maps.lock_stat);
++
++	prev_key = NULL;
++	while (!bpf_map_get_next_key(ts_fd, prev_key, &key)) {
++		if (bpf_map_lookup_elem(ts_fd, &key, &ts_data) == 0) {
++			int pid = key;
++
++			if (aggr_mode == LOCK_AGGR_TASK && con->owner)
++				pid = ts_data.flags;
++
++			update_lock_stat(stat_fd, pid, end_ts, aggr_mode,
++					 &ts_data);
++		}
++
++		prev_key = &key;
++	}
++
++	/* Now it'll check per-cpu tstamp map which doesn't have TID. */
++	if (aggr_mode == LOCK_AGGR_TASK || aggr_mode == LOCK_AGGR_CGROUP)
++		return;
++
++	total_cpus = cpu__max_cpu().cpu;
++	ts_fd = bpf_map__fd(skel->maps.tstamp_cpu);
++
++	cpu_data = calloc(total_cpus, sizeof(*cpu_data));
++	if (cpu_data == NULL)
++		return;
++
++	prev_key = NULL;
++	while (!bpf_map_get_next_key(ts_fd, prev_key, &key)) {
++		if (bpf_map_lookup_elem(ts_fd, &key, cpu_data) < 0)
++			goto next;
++
++		for (int i = 0; i < total_cpus; i++) {
++			update_lock_stat(stat_fd, -1, end_ts, aggr_mode,
++					 &cpu_data[i]);
++		}
++
++next:
++		prev_key = &key;
++	}
++	free(cpu_data);
++}
++
+ int lock_contention_start(void)
+ {
+ 	skel->bss->enabled = 1;
+@@ -188,6 +305,7 @@ int lock_contention_start(void)
+ int lock_contention_stop(void)
+ {
+ 	skel->bss->enabled = 0;
++	mark_end_timestamp();
+ 	return 0;
+ }
+ 
+@@ -301,6 +419,8 @@ int lock_contention_read(struct lock_contention *con)
+ 	if (stack_trace == NULL)
+ 		return -1;
+ 
++	account_end_timestamp(con);
++
+ 	if (con->aggr_mode == LOCK_AGGR_TASK) {
+ 		struct thread *idle = __machine__findnew_thread(machine,
+ 								/*pid=*/0,
+diff --git a/tools/perf/util/bpf_skel/lock_contention.bpf.c b/tools/perf/util/bpf_skel/lock_contention.bpf.c
+index 95cd8414f6ef..fb54bd38e7d0 100644
+--- a/tools/perf/util/bpf_skel/lock_contention.bpf.c
++++ b/tools/perf/util/bpf_skel/lock_contention.bpf.c
+@@ -19,13 +19,6 @@
+ #define LCB_F_PERCPU	(1U << 4)
+ #define LCB_F_MUTEX	(1U << 5)
+ 
+-struct tstamp_data {
+-	__u64 timestamp;
+-	__u64 lock;
+-	__u32 flags;
+-	__s32 stack_id;
+-};
+-
+ /* callstack storage  */
+ struct {
+ 	__uint(type, BPF_MAP_TYPE_STACK_TRACE);
+@@ -140,6 +133,8 @@ int perf_subsys_id = -1;
+ /* determine the key of lock stat */
+ int aggr_mode;
+ 
++__u64 end_ts;
++
+ /* error stat */
+ int task_fail;
+ int stack_fail;
+@@ -559,4 +554,11 @@ int BPF_PROG(collect_lock_syms)
+ 	return 0;
+ }
+ 
++SEC("raw_tp/bpf_test_finish")
++int BPF_PROG(end_timestamp)
++{
++	end_ts = bpf_ktime_get_ns();
++	return 0;
++}
++
+ char LICENSE[] SEC("license") = "Dual BSD/GPL";
+diff --git a/tools/perf/util/bpf_skel/lock_data.h b/tools/perf/util/bpf_skel/lock_data.h
+index 08482daf61be..36af11faad03 100644
+--- a/tools/perf/util/bpf_skel/lock_data.h
++++ b/tools/perf/util/bpf_skel/lock_data.h
+@@ -3,6 +3,13 @@
+ #ifndef UTIL_BPF_SKEL_LOCK_DATA_H
+ #define UTIL_BPF_SKEL_LOCK_DATA_H
+ 
++struct tstamp_data {
++	u64 timestamp;
++	u64 lock;
++	u32 flags;
++	u32 stack_id;
++};
++
+ struct contention_key {
+ 	u32 stack_id;
+ 	u32 pid;
+
