@@ -11,6 +11,8 @@ BUILD_DTBS="Yes"
 MULTIBUILD="Yes"
 # Use new style livepatch package names
 LIVEPATCH=livepatch
+# Enable livepatching related packages on -rt variant
+LIVEPATCH_RT=1
 # buildservice projects to build the kernel against
 OBS_PROJECT=SUSE:ALP:Source:Standard:Core:1.0:Build
 OBS_PROJECT_ARM=openSUSE:Factory:ARM
