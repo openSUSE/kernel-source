@@ -1,0 +1,252 @@
+From 4d54fac2ba6be98ebe6401e8a322cacfec89e356 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Mon, 20 Nov 2023 16:38:51 -0800
+Subject: drm/msm/gem: Convert to drm_exec
+Git-commit: a6397e63877e82528c67058e6e6e8d700682df50
+Patch-mainline: v6.8-rc1
+References: drm-backport-placeholder
+
+Replace the ww_mutex locking dance with the drm_exec helper.
+
+v2: Error path fixes, move drm_exec_fini so we only call it once (and
+    only if we have drm_exec_init()
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Patchwork: https://patchwork.freedesktop.org/patch/568342/
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/msm/Kconfig          |   1 +
+ drivers/gpu/drm/msm/msm_gem.h        |   5 +-
+ drivers/gpu/drm/msm/msm_gem_submit.c | 119 +++++----------------------
+ 3 files changed, 24 insertions(+), 101 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/Kconfig b/drivers/gpu/drm/msm/Kconfig
+index ad70b611b44f..f202f26adab2 100644
+--- a/drivers/gpu/drm/msm/Kconfig
++++ b/drivers/gpu/drm/msm/Kconfig
+@@ -17,6 +17,7 @@ config DRM_MSM
+ 	select DRM_DP_AUX_BUS
+ 	select DRM_DISPLAY_DP_HELPER
+ 	select DRM_DISPLAY_HELPER
++	select DRM_EXEC
+ 	select DRM_KMS_HELPER
+ 	select DRM_PANEL
+ 	select DRM_BRIDGE
+diff --git a/drivers/gpu/drm/msm/msm_gem.h b/drivers/gpu/drm/msm/msm_gem.h
+index 80f4207120ea..8d414b072c29 100644
+--- a/drivers/gpu/drm/msm/msm_gem.h
++++ b/drivers/gpu/drm/msm/msm_gem.h
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/kref.h>
+ #include <linux/dma-resv.h>
++#include "drm/drm_exec.h"
+ #include "drm/gpu_scheduler.h"
+ #include "msm_drv.h"
+ 
+@@ -258,7 +259,7 @@ struct msm_gem_submit {
+ 	struct msm_gpu *gpu;
+ 	struct msm_gem_address_space *aspace;
+ 	struct list_head node;   /* node in ring submit list */
+-	struct ww_acquire_ctx ticket;
++	struct drm_exec exec;
+ 	uint32_t seqno;		/* Sequence number of the submit on the ring */
+ 
+ 	/* Hw fence, which is created when the scheduler executes the job, and
+@@ -291,8 +292,6 @@ struct msm_gem_submit {
+ 		struct drm_msm_gem_submit_reloc *relocs;
+ 	} *cmd;  /* array of size nr_cmds */
+ 	struct {
+-/* make sure these don't conflict w/ MSM_SUBMIT_BO_x */
+-#define BO_LOCKED	0x4000	/* obj lock is held */
+ 		uint32_t flags;
+ 		union {
+ 			struct drm_gem_object *obj;
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 2bb5d13726d5..fba78193127d 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -248,85 +248,30 @@ static int submit_lookup_cmds(struct msm_gem_submit *submit,
+ 	return ret;
+ }
+ 
+-static void submit_unlock_bo(struct msm_gem_submit *submit, int i)
+-{
+-	struct drm_gem_object *obj = submit->bos[i].obj;
+-	unsigned cleanup_flags = BO_LOCKED;
+-	unsigned flags = submit->bos[i].flags & cleanup_flags;
+-
+-	/*
+-	 * Clear flags bit before dropping lock, so that the msm_job_run()
+-	 * path isn't racing with submit_cleanup() (ie. the read/modify/
+-	 * write is protected by the obj lock in all paths)
+-	 */
+-	submit->bos[i].flags &= ~cleanup_flags;
+-
+-	if (flags & BO_LOCKED)
+-		dma_resv_unlock(obj->resv);
+-}
+-
+ /* This is where we make sure all the bo's are reserved and pin'd: */
+ static int submit_lock_objects(struct msm_gem_submit *submit)
+ {
+-	int contended, slow_locked = -1, i, ret = 0;
+-
+-retry:
+-	for (i = 0; i < submit->nr_bos; i++) {
+-		struct drm_gem_object *obj = submit->bos[i].obj;
+-
+-		if (slow_locked == i)
+-			slow_locked = -1;
++	int ret;
+ 
+-		contended = i;
++	drm_exec_init(&submit->exec, DRM_EXEC_INTERRUPTIBLE_WAIT, submit->nr_bos);
+ 
+-		if (!(submit->bos[i].flags & BO_LOCKED)) {
+-			ret = dma_resv_lock_interruptible(obj->resv,
+-							  &submit->ticket);
++	drm_exec_until_all_locked (&submit->exec) {
++		for (unsigned i = 0; i < submit->nr_bos; i++) {
++			struct drm_gem_object *obj = submit->bos[i].obj;
++			ret = drm_exec_prepare_obj(&submit->exec, obj, 1);
++			drm_exec_retry_on_contention(&submit->exec);
+ 			if (ret)
+-				goto fail;
+-			submit->bos[i].flags |= BO_LOCKED;
++				goto error;
+ 		}
+ 	}
+ 
+-	ww_acquire_done(&submit->ticket);
+-
+ 	return 0;
+ 
+-fail:
+-	if (ret == -EALREADY) {
+-		SUBMIT_ERROR(submit, "handle %u at index %u already on submit list\n",
+-			     submit->bos[i].handle, i);
+-		ret = -EINVAL;
+-	}
+-
+-	for (; i >= 0; i--)
+-		submit_unlock_bo(submit, i);
+-
+-	if (slow_locked > 0)
+-		submit_unlock_bo(submit, slow_locked);
+-
+-	if (ret == -EDEADLK) {
+-		struct drm_gem_object *obj = submit->bos[contended].obj;
+-		/* we lost out in a seqno race, lock and retry.. */
+-		ret = dma_resv_lock_slow_interruptible(obj->resv,
+-						       &submit->ticket);
+-		if (!ret) {
+-			submit->bos[contended].flags |= BO_LOCKED;
+-			slow_locked = contended;
+-			goto retry;
+-		}
+-
+-		/* Not expecting -EALREADY here, if the bo was already
+-		 * locked, we should have gotten -EALREADY already from
+-		 * the dma_resv_lock_interruptable() call.
+-		 */
+-		WARN_ON_ONCE(ret == -EALREADY);
+-	}
+-
++error:
+ 	return ret;
+ }
+ 
+-static int submit_fence_sync(struct msm_gem_submit *submit, bool no_implicit)
++static int submit_fence_sync(struct msm_gem_submit *submit)
+ {
+ 	int i, ret = 0;
+ 
+@@ -334,22 +279,6 @@ static int submit_fence_sync(struct msm_gem_submit *submit, bool no_implicit)
+ 		struct drm_gem_object *obj = submit->bos[i].obj;
+ 		bool write = submit->bos[i].flags & MSM_SUBMIT_BO_WRITE;
+ 
+-		/* NOTE: _reserve_shared() must happen before
+-		 * _add_shared_fence(), which makes this a slightly
+-		 * strange place to call it.  OTOH this is a
+-		 * convenient can-fail point to hook it in.
+-		 */
+-		ret = dma_resv_reserve_fences(obj->resv, 1);
+-		if (ret)
+-			return ret;
+-
+-		/* If userspace has determined that explicit fencing is
+-		 * used, it can disable implicit sync on the entire
+-		 * submit:
+-		 */
+-		if (no_implicit)
+-			continue;
+-
+ 		/* Otherwise userspace can ask for implicit sync to be
+ 		 * disabled on specific buffers.  This is useful for internal
+ 		 * usermode driver managed buffers, suballocation, etc.
+@@ -529,17 +458,14 @@ static int submit_reloc(struct msm_gem_submit *submit, struct drm_gem_object *ob
+  */
+ static void submit_cleanup(struct msm_gem_submit *submit, bool error)
+ {
+-	unsigned i;
+-
+-	if (error)
++	if (error) {
+ 		submit_unpin_objects(submit);
+-
+-	for (i = 0; i < submit->nr_bos; i++) {
+-		struct drm_gem_object *obj = submit->bos[i].obj;
+-		submit_unlock_bo(submit, i);
+-		if (error)
+-			drm_gem_object_put(obj);
++		/* job wasn't enqueued to scheduler, so early retirement: */
++		msm_submit_retire(submit);
+ 	}
++
++	if (submit->exec.objects)
++		drm_exec_fini(&submit->exec);
+ }
+ 
+ void msm_submit_retire(struct msm_gem_submit *submit)
+@@ -733,7 +659,6 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	struct msm_submit_post_dep *post_deps = NULL;
+ 	struct drm_syncobj **syncobjs_to_reset = NULL;
+ 	int out_fence_fd = -1;
+-	bool has_ww_ticket = false;
+ 	unsigned i;
+ 	int ret;
+ 
+@@ -839,15 +764,15 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		goto out;
+ 
+ 	/* copy_*_user while holding a ww ticket upsets lockdep */
+-	ww_acquire_init(&submit->ticket, &reservation_ww_class);
+-	has_ww_ticket = true;
+ 	ret = submit_lock_objects(submit);
+ 	if (ret)
+ 		goto out;
+ 
+-	ret = submit_fence_sync(submit, !!(args->flags & MSM_SUBMIT_NO_IMPLICIT));
+-	if (ret)
+-		goto out;
++	if (!(args->flags & MSM_SUBMIT_NO_IMPLICIT)) {
++		ret = submit_fence_sync(submit);
++		if (ret)
++			goto out;
++	}
+ 
+ 	ret = submit_pin_objects(submit);
+ 	if (ret)
+@@ -975,8 +900,6 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 
+ out:
+ 	submit_cleanup(submit, !!ret);
+-	if (has_ww_ticket)
+-		ww_acquire_fini(&submit->ticket);
+ out_unlock:
+ 	mutex_unlock(&queue->lock);
+ out_post_unlock:
+-- 
+2.46.1
+
