@@ -1,0 +1,427 @@
+From: Keith Busch <kbusch@kernel.org>
+Date: Tue, 21 May 2024 06:41:45 -0700
+Subject: nvme: use srcu for iterating namespace list
+Patch-mainline: v6.10-rc2
+Git-commit: be647e2c76b27f409cdd520f66c95be888b553a3
+References: git-fixes
+
+The nvme pci driver synchronizes with all the namespace queues during a
+reset to ensure that there's no pending timeout work.
+
+Meanwhile the timeout work potentially iterates those same namespaces to
+freeze their queues.
+
+Each of those namespace iterations use the same read lock. If a write
+lock should somehow get between the synchronize and freeze steps, then
+forward progress is deadlocked.
+
+We had been relying on the nvme controller state machine to ensure the
+reset work wouldn't conflict with timeout work. That guarantee may be a
+bit fragile to rely on, so iterate the namespace lists without taking
+potentially circular locks, as reported by lockdep.
+
+Link: https://lore.kernel.org/all/20220930001943.zdbvolc3gkekfmcv@shindev/
+Reported-by: Shinichiro Kawasaki <shinichiro.kawasaki@wdc.com>
+Tested-by: Shinichiro Kawasaki <shinichiro.kawasaki@wdc.com>
+Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Keith Busch <kbusch@kernel.org>
+Acked-by: Daniel Wagner <dwagner@suse.de>
+---
+ drivers/nvme/host/core.c      |   99 +++++++++++++++++++++++++-----------------
+ drivers/nvme/host/ioctl.c     |   15 +++---
+ drivers/nvme/host/multipath.c |   21 +++++---
+ drivers/nvme/host/nvme.h      |    4 +
+ 4 files changed, 83 insertions(+), 56 deletions(-)
+
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -637,7 +637,7 @@ static void nvme_free_ns(struct kref *kr
+ 	kfree(ns);
+ }
+ 
+-static inline bool nvme_get_ns(struct nvme_ns *ns)
++bool nvme_get_ns(struct nvme_ns *ns)
+ {
+ 	return kref_get_unless_zero(&ns->kref);
+ }
+@@ -3563,9 +3563,10 @@ static int nvme_init_ns_head(struct nvme
+ struct nvme_ns *nvme_find_get_ns(struct nvme_ctrl *ctrl, unsigned nsid)
+ {
+ 	struct nvme_ns *ns, *ret = NULL;
++	int srcu_idx;
+ 
+-	down_read(&ctrl->namespaces_rwsem);
+-	list_for_each_entry(ns, &ctrl->namespaces, list) {
++	srcu_idx = srcu_read_lock(&ctrl->srcu);
++	list_for_each_entry_rcu(ns, &ctrl->namespaces, list) {
+ 		if (ns->head->ns_id == nsid) {
+ 			if (!nvme_get_ns(ns))
+ 				continue;
+@@ -3575,7 +3576,7 @@ struct nvme_ns *nvme_find_get_ns(struct
+ 		if (ns->head->ns_id > nsid)
+ 			break;
+ 	}
+-	up_read(&ctrl->namespaces_rwsem);
++	srcu_read_unlock(&ctrl->srcu, srcu_idx);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_NS_GPL(nvme_find_get_ns, NVME_TARGET_PASSTHRU);
+@@ -3589,7 +3590,7 @@ static void nvme_ns_add_to_ctrl_list(str
+ 
+ 	list_for_each_entry_reverse(tmp, &ns->ctrl->namespaces, list) {
+ 		if (tmp->head->ns_id < ns->head->ns_id) {
+-			list_add(&ns->list, &tmp->list);
++			list_add_rcu(&ns->list, &tmp->list);
+ 			return;
+ 		}
+ 	}
+@@ -3655,17 +3656,18 @@ static void nvme_alloc_ns(struct nvme_ct
+ 	if (nvme_update_ns_info(ns, info))
+ 		goto out_unlink_ns;
+ 
+-	down_write(&ctrl->namespaces_rwsem);
++	mutex_lock(&ctrl->namespaces_lock);
+ 	/*
+ 	 * Ensure that no namespaces are added to the ctrl list after the queues
+ 	 * are frozen, thereby avoiding a deadlock between scan and reset.
+ 	 */
+ 	if (test_bit(NVME_CTRL_FROZEN, &ctrl->flags)) {
+-		up_write(&ctrl->namespaces_rwsem);
++		mutex_unlock(&ctrl->namespaces_lock);
+ 		goto out_unlink_ns;
+ 	}
+ 	nvme_ns_add_to_ctrl_list(ns);
+-	up_write(&ctrl->namespaces_rwsem);
++	mutex_unlock(&ctrl->namespaces_lock);
++	synchronize_srcu(&ctrl->srcu);
+ 	nvme_get_ctrl(ctrl);
+ 
+ 	if (device_add_disk(ctrl->device, ns->disk, nvme_ns_id_attr_groups))
+@@ -3681,9 +3683,10 @@ static void nvme_alloc_ns(struct nvme_ct
+ 
+  out_cleanup_ns_from_list:
+ 	nvme_put_ctrl(ctrl);
+-	down_write(&ctrl->namespaces_rwsem);
+-	list_del_init(&ns->list);
+-	up_write(&ctrl->namespaces_rwsem);
++	mutex_lock(&ctrl->namespaces_lock);
++	list_del_rcu(&ns->list);
++	mutex_unlock(&ctrl->namespaces_lock);
++	synchronize_srcu(&ctrl->srcu);
+  out_unlink_ns:
+ 	mutex_lock(&ctrl->subsys->lock);
+ 	list_del_rcu(&ns->siblings);
+@@ -3733,9 +3736,10 @@ static void nvme_ns_remove(struct nvme_n
+ 		nvme_cdev_del(&ns->cdev, &ns->cdev_device);
+ 	del_gendisk(ns->disk);
+ 
+-	down_write(&ns->ctrl->namespaces_rwsem);
+-	list_del_init(&ns->list);
+-	up_write(&ns->ctrl->namespaces_rwsem);
++	mutex_lock(&ns->ctrl->namespaces_lock);
++	list_del_rcu(&ns->list);
++	mutex_unlock(&ns->ctrl->namespaces_lock);
++	synchronize_srcu(&ns->ctrl->srcu);
+ 
+ 	if (last_path)
+ 		nvme_mpath_shutdown_disk(ns->head);
+@@ -3825,16 +3829,17 @@ static void nvme_remove_invalid_namespac
+ 	struct nvme_ns *ns, *next;
+ 	LIST_HEAD(rm_list);
+ 
+-	down_write(&ctrl->namespaces_rwsem);
++	mutex_lock(&ctrl->namespaces_lock);
+ 	list_for_each_entry_safe(ns, next, &ctrl->namespaces, list) {
+ 		if (ns->head->ns_id > nsid)
+-			list_move_tail(&ns->list, &rm_list);
++			list_splice_init_rcu(&ns->list, &rm_list,
++					     synchronize_rcu);
+ 	}
+-	up_write(&ctrl->namespaces_rwsem);
++	mutex_unlock(&ctrl->namespaces_lock);
++	synchronize_srcu(&ctrl->srcu);
+ 
+ 	list_for_each_entry_safe(ns, next, &rm_list, list)
+ 		nvme_ns_remove(ns);
+-
+ }
+ 
+ static int nvme_scan_ns_list(struct nvme_ctrl *ctrl)
+@@ -4004,9 +4009,10 @@ void nvme_remove_namespaces(struct nvme_
+ 	/* this is a no-op when called from the controller reset handler */
+ 	nvme_change_ctrl_state(ctrl, NVME_CTRL_DELETING_NOIO);
+ 
+-	down_write(&ctrl->namespaces_rwsem);
+-	list_splice_init(&ctrl->namespaces, &ns_list);
+-	up_write(&ctrl->namespaces_rwsem);
++	mutex_lock(&ctrl->namespaces_lock);
++	list_splice_init_rcu(&ctrl->namespaces, &ns_list, synchronize_rcu);
++	mutex_unlock(&ctrl->namespaces_lock);
++	synchronize_srcu(&ctrl->srcu);
+ 
+ 	list_for_each_entry_safe(ns, next, &ns_list, list)
+ 		nvme_ns_remove(ns);
+@@ -4453,6 +4459,7 @@ static void nvme_free_ctrl(struct device
+ 	key_put(ctrl->tls_key);
+ 	nvme_free_cels(ctrl);
+ 	nvme_mpath_uninit(ctrl);
++	cleanup_srcu_struct(&ctrl->srcu);
+ 	nvme_auth_stop(ctrl);
+ 	nvme_auth_free(ctrl);
+ 	__free_page(ctrl->discard_page);
+@@ -4484,10 +4491,15 @@ int nvme_init_ctrl(struct nvme_ctrl *ctr
+ 	WRITE_ONCE(ctrl->state, NVME_CTRL_NEW);
+ 	clear_bit(NVME_CTRL_FAILFAST_EXPIRED, &ctrl->flags);
+ 	spin_lock_init(&ctrl->lock);
++	mutex_init(&ctrl->namespaces_lock);
++
++	ret = init_srcu_struct(&ctrl->srcu);
++	if (ret)
++		return ret;
++
+ 	mutex_init(&ctrl->scan_lock);
+ 	INIT_LIST_HEAD(&ctrl->namespaces);
+ 	xa_init(&ctrl->cels);
+-	init_rwsem(&ctrl->namespaces_rwsem);
+ 	ctrl->dev = dev;
+ 	ctrl->ops = ops;
+ 	ctrl->quirks = quirks;
+@@ -4567,6 +4579,7 @@ int nvme_init_ctrl(struct nvme_ctrl *ctr
+ out:
+ 	if (ctrl->discard_page)
+ 		__free_page(ctrl->discard_page);
++	cleanup_srcu_struct(&ctrl->srcu);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(nvme_init_ctrl);
+@@ -4575,22 +4588,24 @@ EXPORT_SYMBOL_GPL(nvme_init_ctrl);
+ void nvme_mark_namespaces_dead(struct nvme_ctrl *ctrl)
+ {
+ 	struct nvme_ns *ns;
++	int srcu_idx;
+ 
+-	down_read(&ctrl->namespaces_rwsem);
+-	list_for_each_entry(ns, &ctrl->namespaces, list)
++	srcu_idx = srcu_read_lock(&ctrl->srcu);
++	list_for_each_entry_rcu(ns, &ctrl->namespaces, list)
+ 		blk_mark_disk_dead(ns->disk);
+-	up_read(&ctrl->namespaces_rwsem);
++	srcu_read_unlock(&ctrl->srcu, srcu_idx);
+ }
+ EXPORT_SYMBOL_GPL(nvme_mark_namespaces_dead);
+ 
+ void nvme_unfreeze(struct nvme_ctrl *ctrl)
+ {
+ 	struct nvme_ns *ns;
++	int srcu_idx;
+ 
+-	down_read(&ctrl->namespaces_rwsem);
+-	list_for_each_entry(ns, &ctrl->namespaces, list)
++	srcu_idx = srcu_read_lock(&ctrl->srcu);
++	list_for_each_entry_rcu(ns, &ctrl->namespaces, list)
+ 		blk_mq_unfreeze_queue(ns->queue);
+-	up_read(&ctrl->namespaces_rwsem);
++	srcu_read_unlock(&ctrl->srcu, srcu_idx);
+ 	clear_bit(NVME_CTRL_FROZEN, &ctrl->flags);
+ }
+ EXPORT_SYMBOL_GPL(nvme_unfreeze);
+@@ -4598,14 +4613,15 @@ EXPORT_SYMBOL_GPL(nvme_unfreeze);
+ int nvme_wait_freeze_timeout(struct nvme_ctrl *ctrl, long timeout)
+ {
+ 	struct nvme_ns *ns;
++	int srcu_idx;
+ 
+-	down_read(&ctrl->namespaces_rwsem);
+-	list_for_each_entry(ns, &ctrl->namespaces, list) {
++	srcu_idx = srcu_read_lock(&ctrl->srcu);
++	list_for_each_entry_rcu(ns, &ctrl->namespaces, list) {
+ 		timeout = blk_mq_freeze_queue_wait_timeout(ns->queue, timeout);
+ 		if (timeout <= 0)
+ 			break;
+ 	}
+-	up_read(&ctrl->namespaces_rwsem);
++	srcu_read_unlock(&ctrl->srcu, srcu_idx);
+ 	return timeout;
+ }
+ EXPORT_SYMBOL_GPL(nvme_wait_freeze_timeout);
+@@ -4613,23 +4629,25 @@ EXPORT_SYMBOL_GPL(nvme_wait_freeze_timeo
+ void nvme_wait_freeze(struct nvme_ctrl *ctrl)
+ {
+ 	struct nvme_ns *ns;
++	int srcu_idx;
+ 
+-	down_read(&ctrl->namespaces_rwsem);
+-	list_for_each_entry(ns, &ctrl->namespaces, list)
++	srcu_idx = srcu_read_lock(&ctrl->srcu);
++	list_for_each_entry_rcu(ns, &ctrl->namespaces, list)
+ 		blk_mq_freeze_queue_wait(ns->queue);
+-	up_read(&ctrl->namespaces_rwsem);
++	srcu_read_unlock(&ctrl->srcu, srcu_idx);
+ }
+ EXPORT_SYMBOL_GPL(nvme_wait_freeze);
+ 
+ void nvme_start_freeze(struct nvme_ctrl *ctrl)
+ {
+ 	struct nvme_ns *ns;
++	int srcu_idx;
+ 
+ 	set_bit(NVME_CTRL_FROZEN, &ctrl->flags);
+-	down_read(&ctrl->namespaces_rwsem);
+-	list_for_each_entry(ns, &ctrl->namespaces, list)
++	srcu_idx = srcu_read_lock(&ctrl->srcu);
++	list_for_each_entry_rcu(ns, &ctrl->namespaces, list)
+ 		blk_freeze_queue_start(ns->queue);
+-	up_read(&ctrl->namespaces_rwsem);
++	srcu_read_unlock(&ctrl->srcu, srcu_idx);
+ }
+ EXPORT_SYMBOL_GPL(nvme_start_freeze);
+ 
+@@ -4672,11 +4690,12 @@ EXPORT_SYMBOL_GPL(nvme_unquiesce_admin_q
+ void nvme_sync_io_queues(struct nvme_ctrl *ctrl)
+ {
+ 	struct nvme_ns *ns;
++	int srcu_idx;
+ 
+-	down_read(&ctrl->namespaces_rwsem);
+-	list_for_each_entry(ns, &ctrl->namespaces, list)
++	srcu_idx = srcu_read_lock(&ctrl->srcu);
++	list_for_each_entry_rcu(ns, &ctrl->namespaces, list)
+ 		blk_sync_queue(ns->queue);
+-	up_read(&ctrl->namespaces_rwsem);
++	srcu_read_unlock(&ctrl->srcu, srcu_idx);
+ }
+ EXPORT_SYMBOL_GPL(nvme_sync_io_queues);
+ 
+--- a/drivers/nvme/host/ioctl.c
++++ b/drivers/nvme/host/ioctl.c
+@@ -782,15 +782,15 @@ static int nvme_dev_user_cmd(struct nvme
+ 		bool open_for_write)
+ {
+ 	struct nvme_ns *ns;
+-	int ret;
++	int ret, srcu_idx;
+ 
+-	down_read(&ctrl->namespaces_rwsem);
++	srcu_idx = srcu_read_lock(&ctrl->srcu);
+ 	if (list_empty(&ctrl->namespaces)) {
+ 		ret = -ENOTTY;
+ 		goto out_unlock;
+ 	}
+ 
+-	ns = list_first_entry(&ctrl->namespaces, struct nvme_ns, list);
++	ns = list_first_or_null_rcu(&ctrl->namespaces, struct nvme_ns, list);
+ 	if (ns != list_last_entry(&ctrl->namespaces, struct nvme_ns, list)) {
+ 		dev_warn(ctrl->device,
+ 			"NVME_IOCTL_IO_CMD not supported when multiple namespaces present!\n");
+@@ -800,15 +800,18 @@ static int nvme_dev_user_cmd(struct nvme
+ 
+ 	dev_warn(ctrl->device,
+ 		"using deprecated NVME_IOCTL_IO_CMD ioctl on the char device!\n");
+-	kref_get(&ns->kref);
+-	up_read(&ctrl->namespaces_rwsem);
++	if (!nvme_get_ns(ns)) {
++		ret = -ENXIO;
++		goto out_unlock;
++	}
++	srcu_read_unlock(&ctrl->srcu, srcu_idx);
+ 
+ 	ret = nvme_user_cmd(ctrl, ns, argp, 0, open_for_write);
+ 	nvme_put_ns(ns);
+ 	return ret;
+ 
+ out_unlock:
+-	up_read(&ctrl->namespaces_rwsem);
++	srcu_read_unlock(&ctrl->srcu, srcu_idx);
+ 	return ret;
+ }
+ 
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@ -151,16 +151,17 @@ void nvme_mpath_end_request(struct reque
+ void nvme_kick_requeue_lists(struct nvme_ctrl *ctrl)
+ {
+ 	struct nvme_ns *ns;
++	int srcu_idx;
+ 
+-	down_read(&ctrl->namespaces_rwsem);
+-	list_for_each_entry(ns, &ctrl->namespaces, list) {
++	srcu_idx = srcu_read_lock(&ctrl->srcu);
++	list_for_each_entry_rcu(ns, &ctrl->namespaces, list) {
+ 		if (!ns->head->disk)
+ 			continue;
+ 		kblockd_schedule_work(&ns->head->requeue_work);
+ 		if (nvme_ctrl_state(ns->ctrl) == NVME_CTRL_LIVE)
+ 			disk_uevent(ns->head->disk, KOBJ_CHANGE);
+ 	}
+-	up_read(&ctrl->namespaces_rwsem);
++	srcu_read_unlock(&ctrl->srcu, srcu_idx);
+ }
+ 
+ static const char *nvme_ana_state_names[] = {
+@@ -194,13 +195,14 @@ bool nvme_mpath_clear_current_path(struc
+ void nvme_mpath_clear_ctrl_paths(struct nvme_ctrl *ctrl)
+ {
+ 	struct nvme_ns *ns;
++	int srcu_idx;
+ 
+-	down_read(&ctrl->namespaces_rwsem);
+-	list_for_each_entry(ns, &ctrl->namespaces, list) {
++	srcu_idx = srcu_read_lock(&ctrl->srcu);
++	list_for_each_entry_rcu(ns, &ctrl->namespaces, list) {
+ 		nvme_mpath_clear_current_path(ns);
+ 		kblockd_schedule_work(&ns->head->requeue_work);
+ 	}
+-	up_read(&ctrl->namespaces_rwsem);
++	srcu_read_unlock(&ctrl->srcu, srcu_idx);
+ }
+ 
+ void nvme_mpath_revalidate_paths(struct nvme_ns *ns)
+@@ -680,6 +682,7 @@ static int nvme_update_ana_state(struct
+ 	u32 nr_nsids = le32_to_cpu(desc->nnsids), n = 0;
+ 	unsigned *nr_change_groups = data;
+ 	struct nvme_ns *ns;
++	int srcu_idx;
+ 
+ 	dev_dbg(ctrl->device, "ANA group %d: %s.\n",
+ 			le32_to_cpu(desc->grpid),
+@@ -691,8 +694,8 @@ static int nvme_update_ana_state(struct
+ 	if (!nr_nsids)
+ 		return 0;
+ 
+-	down_read(&ctrl->namespaces_rwsem);
+-	list_for_each_entry(ns, &ctrl->namespaces, list) {
++	srcu_idx = srcu_read_lock(&ctrl->srcu);
++	list_for_each_entry_rcu(ns, &ctrl->namespaces, list) {
+ 		unsigned nsid;
+ again:
+ 		nsid = le32_to_cpu(desc->nsids[n]);
+@@ -705,7 +708,7 @@ static int nvme_update_ana_state(struct
+ 		if (ns->head->ns_id > nsid)
+ 			goto again;
+ 	}
+-	up_read(&ctrl->namespaces_rwsem);
++	srcu_read_unlock(&ctrl->srcu, srcu_idx);
+ 	return 0;
+ }
+ 
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -280,7 +280,8 @@ struct nvme_ctrl {
+ 	struct blk_mq_tag_set *tagset;
+ 	struct blk_mq_tag_set *admin_tagset;
+ 	struct list_head namespaces;
+-	struct rw_semaphore namespaces_rwsem;
++	struct mutex namespaces_lock;
++	struct srcu_struct srcu;
+ 	struct device ctrl_device;
+ 	struct device *device;	/* char device */
+ #ifdef CONFIG_NVME_HWMON
+@@ -1142,6 +1143,7 @@ void nvme_passthru_end(struct nvme_ctrl
+ 		       struct nvme_command *cmd, int status);
+ struct nvme_ctrl *nvme_ctrl_from_file(struct file *file);
+ struct nvme_ns *nvme_find_get_ns(struct nvme_ctrl *ctrl, unsigned nsid);
++bool nvme_get_ns(struct nvme_ns *ns);
+ void nvme_put_ns(struct nvme_ns *ns);
+ 
+ static inline bool nvme_multi_css(struct nvme_ctrl *ctrl)
