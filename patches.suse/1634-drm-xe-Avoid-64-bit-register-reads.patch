@@ -1,0 +1,192 @@
+From 687d0fb3a036ea3325776627641278761457c093 Mon Sep 17 00:00:00 2001
+From: Matt Roper <matthew.d.roper@intel.com>
+Date: Tue, 22 Aug 2023 17:33:13 -0700
+Subject: drm/xe: Avoid 64-bit register reads
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 07431945d8ae805746bbd01b052eeefb919911db
+Patch-mainline: v6.8-rc1
+References: drm-backport-placeholder
+
+Intel hardware officially only supports GTTMMADR register accesses of
+32-bits or less (although 64-bit accesses to device memory and PTEs in
+the GSM are fine).  Even though we do usually seem to get back
+reasonable values when performing readq() operations on registers in
+BAR0, we shouldn't rely on this violation of the spec working
+consistently.  It's likely that even when we do get proper register
+values back the hardware is internally satisfying the request via a
+non-atomic sequence of two 32-bit reads, which can be problematic for
+timestamps and counters if rollover of the lower bits is not considered.
+
+Replace xe_mmio_read64() with xe_mmio_read64_2x32() that implements
+64-bit register reads as two 32-bit reads and attempts to ensure that
+the upper dword has stabilized to avoid problematic rollovers for
+counter and timestamp registers.
+
+v2:
+ - Move function from xe_mmio.h to xe_mmio.c.  (Lucas)
+ - Convert comment to kerneldoc and note that it shouldn't be used on
+   registers where reads may trigger side effects.  (Lucas)
+
+Bspec: 60027
+Reviewed-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Reviewed-by: José Roberto de Souza <jose.souza@intel.com>
+Link: https://lore.kernel.org/r/20230823003312.1356779-3-matthew.d.roper@intel.com
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/xe/xe_mmio.c           | 56 ++++++++++++++++++++++++--
+ drivers/gpu/drm/xe/xe_mmio.h           | 12 +-----
+ drivers/gpu/drm/xe/xe_ttm_stolen_mgr.c |  6 +--
+ 3 files changed, 58 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_mmio.c b/drivers/gpu/drm/xe/xe_mmio.c
+index bb6823db14d4..c2ec52eefb2e 100644
+--- a/drivers/gpu/drm/xe/xe_mmio.c
++++ b/drivers/gpu/drm/xe/xe_mmio.c
+@@ -228,7 +228,7 @@ int xe_mmio_tile_vram_size(struct xe_tile *tile, u64 *vram_size, u64 *tile_size,
+ 		reg = xe_gt_mcr_unicast_read_any(gt, XEHP_FLAT_CCS_BASE_ADDR);
+ 		offset = (u64)REG_FIELD_GET(GENMASK(31, 8), reg) * SZ_64K;
+ 	} else {
+-		offset = xe_mmio_read64(gt, GSMBASE);
++		offset = xe_mmio_read64_2x32(gt, GSMBASE);
+ 	}
+ 
+ 	/* remove the tile offset so we have just the available size */
+@@ -326,7 +326,7 @@ static void xe_mmio_probe_tiles(struct xe_device *xe)
+ 	if (xe->info.tile_count == 1)
+ 		return;
+ 
+-	mtcfg = xe_mmio_read64(gt, XEHP_MTCFG_ADDR);
++	mtcfg = xe_mmio_read64_2x32(gt, XEHP_MTCFG_ADDR);
+ 	adj_tile_count = xe->info.tile_count =
+ 		REG_FIELD_GET(TILE_COUNT, mtcfg) + 1;
+ 
+@@ -509,7 +509,7 @@ int xe_mmio_ioctl(struct drm_device *dev, void *data,
+ 			args->value = xe_mmio_read32(gt, reg);
+ 			break;
+ 		case DRM_XE_MMIO_64BIT:
+-			args->value = xe_mmio_read64(gt, reg);
++			args->value = xe_mmio_read64_2x32(gt, reg);
+ 			break;
+ 		default:
+ 			drm_dbg(&xe->drm, "Invalid MMIO bit size");
+@@ -526,3 +526,53 @@ int xe_mmio_ioctl(struct drm_device *dev, void *data,
+ 
+ 	return ret;
+ }
++
++/**
++ * xe_mmio_read64_2x32() - Read a 64-bit register as two 32-bit reads
++ * @gt: MMIO target GT
++ * @reg: register to read value from
++ *
++ * Although Intel GPUs have some 64-bit registers, the hardware officially
++ * only supports GTTMMADR register reads of 32 bits or smaller.  Even if
++ * a readq operation may return a reasonable value, that violation of the
++ * spec shouldn't be relied upon and all 64-bit register reads should be
++ * performed as two 32-bit reads of the upper and lower dwords.
++ *
++ * When reading registers that may be changing (such as
++ * counters), a rollover of the lower dword between the two 32-bit reads
++ * can be problematic.  This function attempts to ensure the upper dword has
++ * stabilized before returning the 64-bit value.
++ *
++ * Note that because this function may re-read the register multiple times
++ * while waiting for the value to stabilize it should not be used to read
++ * any registers where read operations have side effects.
++ *
++ * Returns the value of the 64-bit register.
++ */
++u64 xe_mmio_read64_2x32(struct xe_gt *gt, struct xe_reg reg)
++{
++	struct xe_reg reg_udw = { .addr = reg.addr + 0x4 };
++	u32 ldw, udw, oldudw, retries;
++
++	if (reg.addr < gt->mmio.adj_limit) {
++		reg.addr += gt->mmio.adj_offset;
++		reg_udw.addr += gt->mmio.adj_offset;
++	}
++
++	oldudw = xe_mmio_read32(gt, reg_udw);
++	for (retries = 5; retries; --retries) {
++		ldw = xe_mmio_read32(gt, reg);
++		udw = xe_mmio_read32(gt, reg_udw);
++
++		if (udw == oldudw)
++			break;
++
++		oldudw = udw;
++	}
++
++	xe_gt_WARN(gt, retries == 0,
++		   "64-bit read of %#x did not stabilize\n", reg.addr);
++
++	return (u64)udw << 32 | ldw;
++}
++
+diff --git a/drivers/gpu/drm/xe/xe_mmio.h b/drivers/gpu/drm/xe/xe_mmio.h
+index d24badca8677..f72c34c7d1d0 100644
+--- a/drivers/gpu/drm/xe/xe_mmio.h
++++ b/drivers/gpu/drm/xe/xe_mmio.h
+@@ -11,6 +11,7 @@
+ 
+ #include "regs/xe_reg_defs.h"
+ #include "xe_device_types.h"
++#include "xe_gt_printk.h"
+ #include "xe_gt_types.h"
+ 
+ struct drm_device;
+@@ -85,16 +86,6 @@ static inline void xe_mmio_write64(struct xe_gt *gt,
+ 	writeq(val, tile->mmio.regs + reg.addr);
+ }
+ 
+-static inline u64 xe_mmio_read64(struct xe_gt *gt, struct xe_reg reg)
+-{
+-	struct xe_tile *tile = gt_to_tile(gt);
+-
+-	if (reg.addr < gt->mmio.adj_limit)
+-		reg.addr += gt->mmio.adj_offset;
+-
+-	return readq(tile->mmio.regs + reg.addr);
+-}
+-
+ static inline int xe_mmio_write32_and_verify(struct xe_gt *gt,
+ 					     struct xe_reg reg, u32 val,
+ 					     u32 mask, u32 eval)
+@@ -155,5 +146,6 @@ static inline bool xe_mmio_in_range(const struct xe_mmio_range *range,
+ 
+ int xe_mmio_probe_vram(struct xe_device *xe);
+ int xe_mmio_tile_vram_size(struct xe_tile *tile, u64 *vram_size, u64 *tile_size, u64 *tile_base);
++u64 xe_mmio_read64_2x32(struct xe_gt *gt, struct xe_reg reg);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/xe/xe_ttm_stolen_mgr.c b/drivers/gpu/drm/xe/xe_ttm_stolen_mgr.c
+index be0a25e23929..6ba6b1b7f34b 100644
+--- a/drivers/gpu/drm/xe/xe_ttm_stolen_mgr.c
++++ b/drivers/gpu/drm/xe/xe_ttm_stolen_mgr.c
+@@ -67,7 +67,7 @@ static s64 detect_bar2_dgfx(struct xe_device *xe, struct xe_ttm_stolen_mgr *mgr)
+ 	}
+ 
+ 	/* Use DSM base address instead for stolen memory */
+-	mgr->stolen_base = (xe_mmio_read64(mmio, DSMBASE) & BDSM_MASK) - tile_offset;
++	mgr->stolen_base = (xe_mmio_read64_2x32(mmio, DSMBASE) & BDSM_MASK) - tile_offset;
+ 	if (drm_WARN_ON(&xe->drm, tile_size < mgr->stolen_base))
+ 		return 0;
+ 
+@@ -126,8 +126,8 @@ static u32 detect_bar2_integrated(struct xe_device *xe, struct xe_ttm_stolen_mgr
+ 
+ 	/* Carve out the top of DSM as it contains the reserved WOPCM region */
+ 	wopcm_size = REG_FIELD_GET64(WOPCM_SIZE_MASK,
+-				     xe_mmio_read64(xe_root_mmio_gt(xe),
+-						    STOLEN_RESERVED));
++				     xe_mmio_read64_2x32(xe_root_mmio_gt(xe),
++							 STOLEN_RESERVED));
+ 	stolen_size -= (1U << wopcm_size) * SZ_1M;
+ 
+ 	if (drm_WARN_ON(&xe->drm, stolen_size + SZ_8M > pci_resource_len(pdev, 2)))
+-- 
+2.46.1
+
