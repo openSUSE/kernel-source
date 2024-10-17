@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 
 use File::Spec;
-use Getopt::Long;
+use Getopt::Long qw(:config no_ignore_case);
 use strict;
 
 &main();

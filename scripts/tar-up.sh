@@ -22,11 +22,6 @@
 
 # generate a kernel-source rpm package
 
-# if this is SLE11_BRANCH and earlier, hand over to scripts/tar-up-old.sh
-if test ! -x rpm/mkspec; then
-    exec ${0%.sh}-old.sh "$@"
-fi
-
 . ${0%/*}/wd-functions.sh
 
 sort()
@@ -165,8 +160,7 @@ done
     $build_dir/series.conf
 
 inconsistent=false
-check_for_merge_conflicts $referenced_files kernel-source.changes{,.old} || \
-	inconsistent=true
+check_for_merge_conflicts $referenced_files || inconsistent=true
 scripts/check-conf || inconsistent=true
 scripts/check-cvs-add --committed || inconsistent=true
 
