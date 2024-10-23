@@ -1,0 +1,252 @@
+From: Lu Baolu <baolu.lu@linux.intel.com>
+Date: Tue, 2 Jul 2024 14:34:37 +0800
+Subject: iommu: Add attach handle to struct iopf_group
+Git-commit: 06cdcc32d65759d42c6340700796e2906045b6a5
+Patch-mainline: v6.11-rc1
+References: jsc#PED-10539
+
+Previously, the domain that a page fault targets is stored in an
+iopf_group, which represents a minimal set of page faults. With the
+introduction of attach handle, replace the domain with the handle
+so that the fault handler can obtain more information as needed
+when handling the faults.
+
+iommu_report_device_fault() is currently used for SVA page faults,
+which handles the page fault in an internal cycle. The domain is retrieved
+with iommu_get_domain_for_dev_pasid() if the pasid in the fault message
+is valid. This doesn't work in IOMMUFD case, where if the pasid table of
+a device is wholly managed by user space, there is no domain attached to
+the PASID of the device, and all page faults are forwarded through a
+NESTING domain attaching to RID.
+
+Add a static flag in iommu ops, which indicates if the IOMMU driver
+supports user-managed PASID tables. In the iopf deliver path, if no
+attach handle found for the iopf PASID, roll back to RID domain when
+the IOMMU driver supports this capability.
+
+iommu_get_domain_for_dev_pasid() is no longer used and can be removed.
+
+Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Link: https://lore.kernel.org/r/20240702063444.105814-4-baolu.lu@linux.intel.com
+Signed-off-by: Will Deacon <will@kernel.org>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/iommu/io-pgfault.c | 61 ++++++++++++++++++++++++++--------------------
+ drivers/iommu/iommu-sva.c  |  3 ++-
+ drivers/iommu/iommu.c      | 39 -----------------------------
+ include/linux/iommu.h      | 17 +++++--------
+ 4 files changed, 42 insertions(+), 78 deletions(-)
+
+diff --git a/drivers/iommu/io-pgfault.c b/drivers/iommu/io-pgfault.c
+index 06d78fcc79fd..7c9011992d3f 100644
+--- a/drivers/iommu/io-pgfault.c
++++ b/drivers/iommu/io-pgfault.c
+@@ -59,30 +59,6 @@ void iopf_free_group(struct iopf_group *group)
+ }
+ EXPORT_SYMBOL_GPL(iopf_free_group);
+ 
+-static struct iommu_domain *get_domain_for_iopf(struct device *dev,
+-						struct iommu_fault *fault)
+-{
+-	struct iommu_domain *domain;
+-
+-	if (fault->prm.flags & IOMMU_FAULT_PAGE_REQUEST_PASID_VALID) {
+-		domain = iommu_get_domain_for_dev_pasid(dev, fault->prm.pasid, 0);
+-		if (IS_ERR(domain))
+-			domain = NULL;
+-	} else {
+-		domain = iommu_get_domain_for_dev(dev);
+-	}
+-
+-	if (!domain || !domain->iopf_handler) {
+-		dev_warn_ratelimited(dev,
+-			"iopf (pasid %d) without domain attached or handler installed\n",
+-			 fault->prm.pasid);
+-
+-		return NULL;
+-	}
+-
+-	return domain;
+-}
+-
+ /* Non-last request of a group. Postpone until the last one. */
+ static int report_partial_fault(struct iommu_fault_param *fault_param,
+ 				struct iommu_fault *fault)
+@@ -206,20 +182,51 @@ void iommu_report_device_fault(struct device *dev, struct iopf_fault *evt)
+ 	if (group == &abort_group)
+ 		goto err_abort;
+ 
+-	group->domain = get_domain_for_iopf(dev, fault);
+-	if (!group->domain)
++	if (fault->prm.flags & IOMMU_FAULT_PAGE_REQUEST_PASID_VALID) {
++		group->attach_handle = iommu_attach_handle_get(dev->iommu_group,
++							       fault->prm.pasid,
++							       0);
++		if (IS_ERR(group->attach_handle)) {
++			const struct iommu_ops *ops = dev_iommu_ops(dev);
++
++			if (!ops->user_pasid_table)
++				goto err_abort;
++
++			/*
++			 * The iommu driver for this device supports user-
++			 * managed PASID table. Therefore page faults for
++			 * any PASID should go through the NESTING domain
++			 * attached to the device RID.
++			 */
++			group->attach_handle =
++				iommu_attach_handle_get(dev->iommu_group,
++							IOMMU_NO_PASID,
++							IOMMU_DOMAIN_NESTED);
++			if (IS_ERR(group->attach_handle))
++				goto err_abort;
++		}
++	} else {
++		group->attach_handle =
++			iommu_attach_handle_get(dev->iommu_group, IOMMU_NO_PASID, 0);
++		if (IS_ERR(group->attach_handle))
++			goto err_abort;
++	}
++
++	if (!group->attach_handle->domain->iopf_handler)
+ 		goto err_abort;
+ 
+ 	/*
+ 	 * On success iopf_handler must call iopf_group_response() and
+ 	 * iopf_free_group()
+ 	 */
+-	if (group->domain->iopf_handler(group))
++	if (group->attach_handle->domain->iopf_handler(group))
+ 		goto err_abort;
+ 
+ 	return;
+ 
+ err_abort:
++	dev_warn_ratelimited(dev, "iopf with pasid %d aborted\n",
++			     fault->prm.pasid);
+ 	iopf_group_response(group, IOMMU_PAGE_RESP_FAILURE);
+ 	if (group == &abort_group)
+ 		__iopf_free_group(group);
+diff --git a/drivers/iommu/iommu-sva.c b/drivers/iommu/iommu-sva.c
+index 9b7f62517419..69cde094440e 100644
+--- a/drivers/iommu/iommu-sva.c
++++ b/drivers/iommu/iommu-sva.c
+@@ -272,7 +272,8 @@ static void iommu_sva_handle_iopf(struct work_struct *work)
+ 		if (status != IOMMU_PAGE_RESP_SUCCESS)
+ 			break;
+ 
+-		status = iommu_sva_handle_mm(&iopf->fault, group->domain->mm);
++		status = iommu_sva_handle_mm(&iopf->fault,
++					     group->attach_handle->domain->mm);
+ 	}
+ 
+ 	iopf_group_response(group, status);
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+index 7890bd21dff6..5a7e874abb36 100644
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -3421,45 +3421,6 @@ void iommu_detach_device_pasid(struct iommu_domain *domain, struct device *dev,
+ }
+ EXPORT_SYMBOL_GPL(iommu_detach_device_pasid);
+ 
+-/*
+- * iommu_get_domain_for_dev_pasid() - Retrieve domain for @pasid of @dev
+- * @dev: the queried device
+- * @pasid: the pasid of the device
+- * @type: matched domain type, 0 for any match
+- *
+- * This is a variant of iommu_get_domain_for_dev(). It returns the existing
+- * domain attached to pasid of a device. Callers must hold a lock around this
+- * function, and both iommu_attach/detach_dev_pasid() whenever a domain of
+- * type is being manipulated. This API does not internally resolve races with
+- * attach/detach.
+- *
+- * Return: attached domain on success, NULL otherwise.
+- */
+-struct iommu_domain *iommu_get_domain_for_dev_pasid(struct device *dev,
+-						    ioasid_t pasid,
+-						    unsigned int type)
+-{
+-	/* Caller must be a probed driver on dev */
+-	struct iommu_group *group = dev->iommu_group;
+-	struct iommu_attach_handle *handle;
+-	struct iommu_domain *domain = NULL;
+-
+-	if (!group)
+-		return NULL;
+-
+-	xa_lock(&group->pasid_array);
+-	handle = xa_load(&group->pasid_array, pasid);
+-	if (handle)
+-		domain = handle->domain;
+-
+-	if (type && domain && domain->type != type)
+-		domain = NULL;
+-	xa_unlock(&group->pasid_array);
+-
+-	return domain;
+-}
+-EXPORT_SYMBOL_GPL(iommu_get_domain_for_dev_pasid);
+-
+ ioasid_t iommu_alloc_global_pasid(struct device *dev)
+ {
+ 	int ret;
+diff --git a/include/linux/iommu.h b/include/linux/iommu.h
+index 87ebcc29020e..910aec80886e 100644
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -127,7 +127,7 @@ struct iopf_group {
+ 	/* list node for iommu_fault_param::faults */
+ 	struct list_head pending_node;
+ 	struct work_struct work;
+-	struct iommu_domain *domain;
++	struct iommu_attach_handle *attach_handle;
+ 	/* The device's fault data parameter. */
+ 	struct iommu_fault_param *fault_param;
+ };
+@@ -547,6 +547,10 @@ static inline int __iommu_copy_struct_from_user_array(
+  * @default_domain: If not NULL this will always be set as the default domain.
+  *                  This should be an IDENTITY/BLOCKED/PLATFORM domain.
+  *                  Do not use in new drivers.
++ * @user_pasid_table: IOMMU driver supports user-managed PASID table. There is
++ *                    no user domain for each PASID and the I/O page faults are
++ *                    forwarded through the user domain attached to the device
++ *                    RID.
+  */
+ struct iommu_ops {
+ 	bool (*capable)(struct device *dev, enum iommu_cap);
+@@ -590,6 +594,7 @@ struct iommu_ops {
+ 	struct iommu_domain *blocked_domain;
+ 	struct iommu_domain *release_domain;
+ 	struct iommu_domain *default_domain;
++	u8 user_pasid_table:1;
+ };
+ 
+ /**
+@@ -1064,9 +1069,6 @@ int iommu_attach_device_pasid(struct iommu_domain *domain,
+ 			      struct iommu_attach_handle *handle);
+ void iommu_detach_device_pasid(struct iommu_domain *domain,
+ 			       struct device *dev, ioasid_t pasid);
+-struct iommu_domain *
+-iommu_get_domain_for_dev_pasid(struct device *dev, ioasid_t pasid,
+-			       unsigned int type);
+ ioasid_t iommu_alloc_global_pasid(struct device *dev);
+ void iommu_free_global_pasid(ioasid_t pasid);
+ #else /* CONFIG_IOMMU_API */
+@@ -1408,13 +1410,6 @@ static inline void iommu_detach_device_pasid(struct iommu_domain *domain,
+ {
+ }
+ 
+-static inline struct iommu_domain *
+-iommu_get_domain_for_dev_pasid(struct device *dev, ioasid_t pasid,
+-			       unsigned int type)
+-{
+-	return NULL;
+-}
+-
+ static inline ioasid_t iommu_alloc_global_pasid(struct device *dev)
+ {
+ 	return IOMMU_PASID_INVALID;
+
