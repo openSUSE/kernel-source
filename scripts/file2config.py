@@ -39,11 +39,12 @@ def _find_config(obj_path, deep):
 
     obj_name = PurePath(obj_path).name
     for line in lines:
-        if obj_name not in line:
+        sep = line.split()
+        if obj_name not in sep:
             continue
 
         # target found, check if this one with config
-        target = line.split()[0]
+        target = sep[0]
         if target.startswith('obj-'):
             return _sanitize_config(target)
 

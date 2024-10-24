@@ -1,0 +1,208 @@
+From: Joao Martins <joao.m.martins@oracle.com>
+Date: Thu, 27 Jun 2024 12:01:04 +0100
+Subject: iommufd/iova_bitmap: Dynamic pinning on iova_bitmap_set()
+Git-commit: 7a7bba16244a5c55861d8fefea72cdbb8b05323e
+Patch-mainline: v6.11-rc1
+References: jsc#PED-10539
+
+Today zerocopy iova bitmaps use a static iteration scheme where it walks
+the bitmap data in a max iteration size of 2M of bitmap of data at a time.
+That translates to a fixed window of IOVA space that can span up to 64G
+(e.g.  base pages, x86). Here 'window' refers to the IOVA space represented
+by the bitmap data it is iterating. This static scheme is the ideal one
+where the reported page-size is the same as the one behind the dirty
+tracker.
+
+However, problems start to appear when the dirty tracker may
+dirty in many PTE sizes beyond or unaligned at the boundaries of the
+iteration window. Such is the case for the IOMMU and
+commit 2780025e01e2 ("iommufd/iova_bitmap: Handle recording beyond the mapped pages")
+tried to fix the problem by handling the PTEs that get dirty which
+surprass the end of the iteration. But the fix was incomplete and it
+didn't handle all the data structure issues namely:
+
+1) when there's nothing to dirty but the end of the iteration IOVA range is
+a IOMMU hugepage PTE that crosses iterations, when it goes to the next
+iteration it finds the other end of the said hugepage but don't account that
+it had checked for that IOPTE already. iommu driver then walk the IOVA
+space as if it is a new page without accounting that it is past the start
+of a bigger page which ends up setting (future) dirty bits slightly
+offset-ed. Note that the partial ranges here are self induced
+due as a result of the fixed 'window' scheme being unaligned to this
+hugepage IOPTE.
+
+2) on the same line of thinking between pinning pages of different
+iterations it could allow DMA to mark PTEs as dirty on the second part of
+this previously mentioned partial hugepage. This leads to marking part of
+the hugepage as dirty but still clearing IOPTE leading to missed dirty
+data.
+
+So to fix these problems more fundamentally and avoid future ones: instead
+of iterating the whole bitmap in fixed chunks, instead only pin the bitmap
+pages when it has dirty bits to set. The logic is simple in
+iova_bitmap_set(): check where the current iova range to be marked as dirty
+is pinned and pin the bitmap pages where to-be-recorded @iova starts if
+it's not. If it's partially mapped out of the whole set, continue pinning
+it and set bits until the whole dirty-size is covered. The latter is more
+relevant with AMD iommu pgtable v1 format where you can have up
+64G/128G/256G page sizes and thus you can set 64G at a time. Code also gets
+simpler and easier to follow.
+
+Fixing this without changing this iteration scheme means changing iommu
+drivers to ignore any partial pages and not clear dirty bits, which is a
+bit hacky. Though getting to walk only part of a IOMMU hugepage is a
+self-induced due to this iteration scheme as it doesn't (and can't) align the
+iteration boundary to the huge IOPTE at the end. Thus it can't know what
+the hugepage size the iteration should align to until it walks the begin/end.
+
+Dynamically pinning adds some comparisons inside iova_bitmap_set() to check
+if something needs to be pinned if the IOVA range is out of range. Though
+it has the benefit that non-dirty IOVA ranges only walk page tables without
+needing to pin any bitmap pages. This dynamic scheme should be better for IOMMUs
+where upper layers don't need or know what PTE sizes IOVAs map into (and there
+could be more than one PTE size[*]) until they walk the IOMMU page tables.
+
+A follow-up change will remove the iteration logic.
+
+[*] Specially on AMD v1 iommu pgtable format where most powers of two are
+supported as page-size.
+
+Link: https://lore.kernel.org/linux-iommu/6b90f949-48da-4cb3-ad9a-ed54f1351a9a@oracle.com/
+Fixes: 2780025e01e2 ("iommufd/iova_bitmap: Handle recording beyond the mapped pages")
+Link: https://lore.kernel.org/r/20240627110105.62325-11-joao.m.martins@oracle.com
+Signed-off-by: Joao Martins <joao.m.martins@oracle.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Tested-by: Matt Ochs <mochs@nvidia.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/iommu/iommufd/iova_bitmap.c | 73 +++++++++++++++++++++++++++++++++----
+ 1 file changed, 66 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/iommu/iommufd/iova_bitmap.c b/drivers/iommu/iommufd/iova_bitmap.c
+index be97bb464f6b..b047e1e180be 100644
+--- a/drivers/iommu/iommufd/iova_bitmap.c
++++ b/drivers/iommu/iommufd/iova_bitmap.c
+@@ -119,6 +119,9 @@ struct iova_bitmap {
+ 
+ 	/* length of the IOVA range set ahead the pinned pages */
+ 	unsigned long set_ahead_length;
++
++	/* true if it using the iterator otherwise it pins dynamically */
++	bool iterator;
+ };
+ 
+ /*
+@@ -340,6 +343,17 @@ static unsigned long iova_bitmap_mapped_length(struct iova_bitmap *bitmap)
+ 	return remaining;
+ }
+ 
++/*
++ * Returns true if [@iova..@iova+@length-1] is part of the mapped IOVA range.
++ */
++static bool iova_bitmap_mapped_range(struct iova_bitmap_map *mapped,
++				     unsigned long iova, size_t length)
++{
++	return mapped->npages &&
++		(iova >= mapped->iova &&
++		 (iova + length - 1) <= (mapped->iova + mapped->length - 1));
++}
++
+ /*
+  * Returns true if there's not more data to iterate.
+  */
+@@ -374,6 +388,27 @@ static int iova_bitmap_set_ahead(struct iova_bitmap *bitmap,
+ 	return ret;
+ }
+ 
++/*
++ * Advances to a selected range, releases the current pinned
++ * pages and pins the next set of bitmap pages.
++ * Returns 0 on success or otherwise errno.
++ */
++static int iova_bitmap_advance_to(struct iova_bitmap *bitmap,
++				  unsigned long iova)
++{
++	unsigned long index;
++
++	index = iova_bitmap_offset_to_index(bitmap, iova - bitmap->iova);
++	if (index >= bitmap->mapped_total_index)
++		return -EINVAL;
++	bitmap->mapped_base_index = index;
++
++	iova_bitmap_put(bitmap);
++
++	/* Pin the next set of bitmap pages */
++	return iova_bitmap_get(bitmap);
++}
++
+ /*
+  * Advances to the next range, releases the current pinned
+  * pages and pins the next set of bitmap pages.
+@@ -426,6 +461,7 @@ int iova_bitmap_for_each(struct iova_bitmap *bitmap, void *opaque,
+ 	if (ret)
+ 		return ret;
+ 
++	bitmap->iterator = true;
+ 	for (; !iova_bitmap_done(bitmap) && !ret;
+ 	     ret = iova_bitmap_advance(bitmap)) {
+ 		ret = fn(bitmap, iova_bitmap_mapped_iova(bitmap),
+@@ -433,6 +469,7 @@ int iova_bitmap_for_each(struct iova_bitmap *bitmap, void *opaque,
+ 		if (ret)
+ 			break;
+ 	}
++	bitmap->iterator = false;
+ 
+ 	return ret;
+ }
+@@ -452,11 +489,28 @@ void iova_bitmap_set(struct iova_bitmap *bitmap,
+ 		     unsigned long iova, size_t length)
+ {
+ 	struct iova_bitmap_map *mapped = &bitmap->mapped;
+-	unsigned long cur_bit = ((iova - mapped->iova) >>
+-			mapped->pgshift) + mapped->pgoff * BITS_PER_BYTE;
+-	unsigned long last_bit = (((iova + length - 1) - mapped->iova) >>
+-			mapped->pgshift) + mapped->pgoff * BITS_PER_BYTE;
+-	unsigned long last_page_idx = mapped->npages - 1;
++	unsigned long cur_bit, last_bit, last_page_idx;
++
++update_indexes:
++	if (unlikely(!bitmap->iterator &&
++		     !iova_bitmap_mapped_range(mapped, iova, length))) {
++
++		/*
++		 * The attempt to advance the base index to @iova
++		 * may fail if it's out of bounds, or pinning the pages
++		 * returns an error.
++		 *
++		 * It is a no-op if within a iova_bitmap_for_each() closure.
++		 */
++		if (iova_bitmap_advance_to(bitmap, iova))
++			return;
++	}
++
++	last_page_idx = mapped->npages - 1;
++	cur_bit = ((iova - mapped->iova) >>
++		mapped->pgshift) + mapped->pgoff * BITS_PER_BYTE;
++	last_bit = (((iova + length - 1) - mapped->iova) >>
++		mapped->pgshift) + mapped->pgoff * BITS_PER_BYTE;
+ 
+ 	do {
+ 		unsigned int page_idx = cur_bit / BITS_PER_PAGE;
+@@ -469,8 +523,13 @@ void iova_bitmap_set(struct iova_bitmap *bitmap,
+ 			unsigned long left =
+ 				((last_bit - cur_bit + 1) << mapped->pgshift);
+ 
+-			bitmap->set_ahead_length = left;
+-			break;
++			if (bitmap->iterator) {
++				bitmap->set_ahead_length = left;
++				return;
++			}
++			iova += (length - left);
++			length = left;
++			goto update_indexes;
+ 		}
+ 
+ 		kaddr = kmap_local_page(mapped->pages[page_idx]);
+

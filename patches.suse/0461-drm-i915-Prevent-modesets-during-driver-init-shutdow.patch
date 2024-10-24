@@ -1,0 +1,368 @@
+From 137c7fb32d53f4403c6cc4074069f803c1fa678b Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Thu, 4 Jan 2024 15:23:35 +0200
+Subject: drm/i915: Prevent modesets during driver init/shutdown
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: bd738d859e71acb9315634cf38676fd0585d4668
+Patch-mainline: v6.9-rc1
+References: jsc#PED-9898 jsc#PED-10191 jsc#PED-10197 jsc#PED-10226 jsc#PED-10237 jsc#PED-10340 jsc#PED-10852 jsc#PED-11022
+
+An unexpected modeset or connector detection by a user (user space or FB
+console) during the initialization/shutdown sequence is possible either
+via a hotplug IRQ handling work or via the connector sysfs
+(status/detect) interface. These modesets/detections should be prevented
+by disabling/flushing all related hotplug handling work and
+unregistering the interfaces that can start them at the beginning of the
+shutdown sequence. Some of this - disabling all related intel_hotplug
+work - will be done by the next patch, but others - for instance
+disabling the MST hotplug works - require a bigger rework.
+
+It makes sense - for diagnostic purpose, even with all the above work and
+interface disabled - to detect and reject any such user access. This
+patch does that for modeset accesses and a follow-up patch for connector
+detection.
+
+During driver loading/unloading/system suspend/shutdown and during
+system resume after calling intel_display_driver_disable_user_access()
+or intel_display_driver_resume_access() correspondigly, the current
+thread is allowed to modeset (as this thread requires to do an
+initial/restoring modeset or a disabling modeset), other threads (the
+user threads) are not allowed to modeset.
+
+During driver loading/system resume after calling
+intel_display_driver_enable_user_access() all threads are allowed to
+modeset.
+
+During driver unloading/system suspend/shutdown after calling
+intel_display_driver_suspend_access() no threads are allowed to modeset
+(as the HW got disabled and should stay in this state).
+
+v2: Call intel_display_driver_suspend_access()/resume_access() only
+    for HAS_DISPLAY(). (CI)
+v3: (Jouni)
+- Add commit log comments explaining how the permission of modeset
+  changes during HW init/deinit wrt. to the current and other user
+  processes.
+
+Link: https://patchwork.freedesktop.org/patch/msgid/20240104132335.2766434-1-imre.deak@intel.com
+Reviewed-by: Jouni Högander <jouni.hogander@intel.com>
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/i915/display/intel_display.c  |   3 +
+ .../gpu/drm/i915/display/intel_display_core.h |   7 +
+ .../drm/i915/display/intel_display_driver.c   | 138 ++++++++++++++++++
+ .../drm/i915/display/intel_display_driver.h   |   6 +
+ drivers/gpu/drm/i915/i915_driver.c            |  19 ++-
+ 5 files changed, 171 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 927d124457b6..31a6a82c1261 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -6310,6 +6310,9 @@ int intel_atomic_check(struct drm_device *dev,
+ 	int ret, i;
+ 	bool any_ms = false;
+ 
++	if (!intel_display_driver_check_access(dev_priv))
++		return -ENODEV;
++
+ 	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state,
+ 					    new_crtc_state, i) {
+ 		/*
+diff --git a/drivers/gpu/drm/i915/display/intel_display_core.h b/drivers/gpu/drm/i915/display/intel_display_core.h
+index 47297ed85822..0b130ca9e669 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_core.h
++++ b/drivers/gpu/drm/i915/display/intel_display_core.h
+@@ -28,6 +28,8 @@
+ #include "intel_opregion.h"
+ #include "intel_wm_types.h"
+ 
++struct task_struct;
++
+ struct drm_i915_private;
+ struct drm_property;
+ struct drm_property_blob;
+@@ -298,6 +300,11 @@ struct intel_display {
+ 		const struct intel_audio_funcs *audio;
+ 	} funcs;
+ 
++	struct {
++		bool any_task_allowed;
++		struct task_struct *allowed_task;
++	} access;
++
+ 	struct {
+ 		/* backlight registers and fields in struct intel_panel */
+ 		struct mutex lock;
+diff --git a/drivers/gpu/drm/i915/display/intel_display_driver.c b/drivers/gpu/drm/i915/display/intel_display_driver.c
+index 1974f2394a51..dcdd26eefaaf 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_driver.c
++++ b/drivers/gpu/drm/i915/display/intel_display_driver.c
+@@ -45,6 +45,7 @@
+ #include "intel_hdcp.h"
+ #include "intel_hotplug.h"
+ #include "intel_hti.h"
++#include "intel_modeset_lock.h"
+ #include "intel_modeset_setup.h"
+ #include "intel_opregion.h"
+ #include "intel_overlay.h"
+@@ -276,6 +277,135 @@ int intel_display_driver_probe_noirq(struct drm_i915_private *i915)
+ 	return ret;
+ }
+ 
++static void set_display_access(struct drm_i915_private *i915,
++			       bool any_task_allowed,
++			       struct task_struct *allowed_task)
++{
++	struct drm_modeset_acquire_ctx ctx;
++	int err;
++
++	intel_modeset_lock_ctx_retry(&ctx, NULL, 0, err) {
++		err = drm_modeset_lock_all_ctx(&i915->drm, &ctx);
++		if (err)
++			continue;
++
++		i915->display.access.any_task_allowed = any_task_allowed;
++		i915->display.access.allowed_task = allowed_task;
++	}
++
++	drm_WARN_ON(&i915->drm, err);
++}
++
++/**
++ * intel_display_driver_enable_user_access - Enable display HW access for all threads
++ * @i915: i915 device instance
++ *
++ * Enable the display HW access for all threads. Examples for such accesses
++ * are modeset commits and connector probing.
++ *
++ * This function should be called during driver loading and system resume once
++ * all the HW initialization steps are done.
++ */
++void intel_display_driver_enable_user_access(struct drm_i915_private *i915)
++{
++	set_display_access(i915, true, NULL);
++}
++
++/**
++ * intel_display_driver_disable_user_access - Disable display HW access for user threads
++ * @i915: i915 device instance
++ *
++ * Disable the display HW access for user threads. Examples for such accesses
++ * are modeset commits and connector probing. For the current thread the
++ * access is still enabled, which should only perform HW init/deinit
++ * programming (as the initial modeset during driver loading or the disabling
++ * modeset during driver unloading and system suspend/shutdown). This function
++ * should be followed by calling either intel_display_driver_enable_user_access()
++ * after completing the HW init programming or
++ * intel_display_driver_suspend_access() after completing the HW deinit
++ * programming.
++ *
++ * This function should be called during driver loading/unloading and system
++ * suspend/shutdown before starting the HW init/deinit programming.
++ */
++void intel_display_driver_disable_user_access(struct drm_i915_private *i915)
++{
++	set_display_access(i915, false, current);
++}
++
++/**
++ * intel_display_driver_suspend_access - Suspend display HW access for all threads
++ * @i915: i915 device instance
++ *
++ * Disable the display HW access for all threads. Examples for such accesses
++ * are modeset commits and connector probing. This call should be either
++ * followed by calling intel_display_driver_resume_access(), or the driver
++ * should be unloaded/shutdown.
++ *
++ * This function should be called during driver unloading and system
++ * suspend/shutdown after completing the HW deinit programming.
++ */
++void intel_display_driver_suspend_access(struct drm_i915_private *i915)
++{
++	set_display_access(i915, false, NULL);
++}
++
++/**
++ * intel_display_driver_resume_access - Resume display HW access for the resume thread
++ * @i915: i915 device instance
++ *
++ * Enable the display HW access for the current resume thread, keeping the
++ * access disabled for all other (user) threads. Examples for such accesses
++ * are modeset commits and connector probing. The resume thread should only
++ * perform HW init programming (as the restoring modeset). This function
++ * should be followed by calling intel_display_driver_enable_user_access(),
++ * after completing the HW init programming steps.
++ *
++ * This function should be called during system resume before starting the HW
++ * init steps.
++ */
++void intel_display_driver_resume_access(struct drm_i915_private *i915)
++{
++	set_display_access(i915, false, current);
++}
++
++/**
++ * intel_display_driver_check_access - Check if the current thread has disaplay HW access
++ * @i915: i915 device instance
++ *
++ * Check whether the current thread has display HW access, print a debug
++ * message if it doesn't. Such accesses are modeset commits and connector
++ * probing. If the function returns %false any HW access should be prevented.
++ *
++ * Returns %true if the current thread has display HW access, %false
++ * otherwise.
++ */
++bool intel_display_driver_check_access(struct drm_i915_private *i915)
++{
++	char comm[TASK_COMM_LEN];
++	char current_task[TASK_COMM_LEN + 16];
++	char allowed_task[TASK_COMM_LEN + 16] = "none";
++
++	if (i915->display.access.any_task_allowed ||
++	    i915->display.access.allowed_task == current)
++		return true;
++
++	snprintf(current_task, sizeof(current_task), "%s[%d]",
++		 get_task_comm(comm, current),
++		 task_pid_vnr(current));
++
++	if (i915->display.access.allowed_task)
++		snprintf(allowed_task, sizeof(allowed_task), "%s[%d]",
++			 get_task_comm(comm, i915->display.access.allowed_task),
++			 task_pid_vnr(i915->display.access.allowed_task));
++
++	drm_dbg_kms(&i915->drm,
++		    "Reject display access from task %s (allowed to %s)\n",
++		    current_task, allowed_task);
++
++	return false;
++}
++
+ /* part #2: call after irq install, but before gem init */
+ int intel_display_driver_probe_nogem(struct drm_i915_private *i915)
+ {
+@@ -326,6 +456,8 @@ int intel_display_driver_probe_nogem(struct drm_i915_private *i915)
+ 	intel_vga_disable(i915);
+ 	intel_setup_outputs(i915);
+ 
++	intel_display_driver_disable_user_access(i915);
++
+ 	drm_modeset_lock_all(dev);
+ 	intel_modeset_setup_hw_state(i915, dev->mode_config.acquire_ctx);
+ 	intel_acpi_assign_connector_fwnodes(i915);
+@@ -393,6 +525,8 @@ void intel_display_driver_register(struct drm_i915_private *i915)
+ 
+ 	intel_audio_init(i915);
+ 
++	intel_display_driver_enable_user_access(i915);
++
+ 	intel_display_debugfs_register(i915);
+ 
+ 	/*
+@@ -440,6 +574,8 @@ void intel_display_driver_remove_noirq(struct drm_i915_private *i915)
+ 	if (!HAS_DISPLAY(i915))
+ 		return;
+ 
++	intel_display_driver_suspend_access(i915);
++
+ 	/*
+ 	 * Due to the hpd irq storm handling the hotplug work can re-arm the
+ 	 * poll handlers. Hence disable polling after hpd handling is shut down.
+@@ -493,6 +629,8 @@ void intel_display_driver_unregister(struct drm_i915_private *i915)
+ 	 */
+ 	drm_kms_helper_poll_fini(&i915->drm);
+ 
++	intel_display_driver_disable_user_access(i915);
++
+ 	intel_audio_deinit(i915);
+ 
+ 	drm_atomic_helper_shutdown(&i915->drm);
+diff --git a/drivers/gpu/drm/i915/display/intel_display_driver.h b/drivers/gpu/drm/i915/display/intel_display_driver.h
+index c276a58ee329..42cc4af6d3fd 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_driver.h
++++ b/drivers/gpu/drm/i915/display/intel_display_driver.h
+@@ -32,5 +32,11 @@ int __intel_display_driver_resume(struct drm_i915_private *i915,
+ 				  struct drm_atomic_state *state,
+ 				  struct drm_modeset_acquire_ctx *ctx);
+ 
++void intel_display_driver_enable_user_access(struct drm_i915_private *i915);
++void intel_display_driver_disable_user_access(struct drm_i915_private *i915);
++void intel_display_driver_suspend_access(struct drm_i915_private *i915);
++void intel_display_driver_resume_access(struct drm_i915_private *i915);
++bool intel_display_driver_check_access(struct drm_i915_private *i915);
++
+ #endif /* __INTEL_DISPLAY_DRIVER_H__ */
+ 
+diff --git a/drivers/gpu/drm/i915/i915_driver.c b/drivers/gpu/drm/i915/i915_driver.c
+index 166476948c89..a951050f6a75 100644
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -1006,6 +1006,7 @@ void i915_driver_shutdown(struct drm_i915_private *i915)
+ 	intel_fbdev_set_suspend(&i915->drm, FBINFO_STATE_SUSPENDED, true);
+ 	if (HAS_DISPLAY(i915)) {
+ 		drm_kms_helper_poll_disable(&i915->drm);
++		intel_display_driver_disable_user_access(i915);
+ 
+ 		drm_atomic_helper_shutdown(&i915->drm);
+ 	}
+@@ -1015,6 +1016,9 @@ void i915_driver_shutdown(struct drm_i915_private *i915)
+ 	intel_runtime_pm_disable_interrupts(i915);
+ 	intel_hpd_cancel_work(i915);
+ 
++	if (HAS_DISPLAY(i915))
++		intel_display_driver_suspend_access(i915);
++
+ 	intel_suspend_encoders(i915);
+ 	intel_shutdown_encoders(i915);
+ 
+@@ -1082,8 +1086,10 @@ static int i915_drm_suspend(struct drm_device *dev)
+ 	 * properly. */
+ 	intel_power_domains_disable(dev_priv);
+ 	intel_fbdev_set_suspend(dev, FBINFO_STATE_SUSPENDED, true);
+-	if (HAS_DISPLAY(dev_priv))
++	if (HAS_DISPLAY(dev_priv)) {
+ 		drm_kms_helper_poll_disable(dev);
++		intel_display_driver_disable_user_access(dev_priv);
++	}
+ 
+ 	pci_save_state(pdev);
+ 
+@@ -1094,6 +1100,9 @@ static int i915_drm_suspend(struct drm_device *dev)
+ 	intel_runtime_pm_disable_interrupts(dev_priv);
+ 	intel_hpd_cancel_work(dev_priv);
+ 
++	if (HAS_DISPLAY(dev_priv))
++		intel_display_driver_suspend_access(dev_priv);
++
+ 	intel_suspend_encoders(dev_priv);
+ 
+ 	/* Must be called before GGTT is suspended. */
+@@ -1243,14 +1252,20 @@ static int i915_drm_resume(struct drm_device *dev)
+ 	intel_display_driver_init_hw(dev_priv);
+ 
+ 	intel_clock_gating_init(dev_priv);
++
++	if (HAS_DISPLAY(dev_priv))
++		intel_display_driver_resume_access(dev_priv);
++
+ 	intel_hpd_init(dev_priv);
+ 
+ 	/* MST sideband requires HPD interrupts enabled */
+ 	intel_dp_mst_resume(dev_priv);
+ 	intel_display_driver_resume(dev_priv);
+ 
+-	if (HAS_DISPLAY(dev_priv))
++	if (HAS_DISPLAY(dev_priv)) {
++		intel_display_driver_enable_user_access(dev_priv);
+ 		drm_kms_helper_poll_enable(dev);
++	}
+ 	intel_hpd_poll_disable(dev_priv);
+ 
+ 	intel_opregion_resume(dev_priv);
+-- 
+2.46.1
+

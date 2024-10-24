@@ -1,0 +1,288 @@
+From: Namhyung Kim <namhyung@kernel.org>
+Date: Tue, 12 Dec 2023 16:13:09 -0800
+Subject: perf annotate-data: Add find_data_type() to get type from memory
+ access
+Git-commit: b9c87f536c6f28c75ace8a014646faad00f0e1ec
+Patch-mainline: v6.8-rc1
+References: perf-sp7-v6.11-userspace-update
+
+The find_data_type() is to get a data type from the memory access at the
+given address (IP) using a register and an offset.
+
+It requires DWARF debug info in the DSO and searches the list of
+variables and function parameters in the scope.
+
+In a pseudo code, it does basically the following:
+
+  find_data_type(dso, ip, reg, offset)
+  {
+      pc = map__rip_2objdump(ip);
+      CU = dwarf_addrdie(dso->dwarf, pc);
+      scopes = die_get_scopes(CU, pc);
+      for_each_scope(S, scopes) {
+          V = die_find_variable_by_reg(S, pc, reg);
+          if (V && V.type == pointer_type) {
+              T = die_get_real_type(V);
+              if (offset < T.size)
+                  return T;
+          }
+      }
+      return NULL;
+  }
+
+Committer notes:
+
+The 'size' variable in check_variable() is 64-bit, so use PRIu64 and
+inttypes.h to debug it.
+
+Ditto at find_data_type_die().
+
+Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+Cc: Adrian Hunter <adrian.hunter@intel.com>
+Cc: Ian Rogers <irogers@google.com>
+Cc: Ingo Molnar <mingo@kernel.org>
+Cc: Jiri Olsa <jolsa@kernel.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Stephane Eranian <eranian@google.com>
+Cc: linux-toolchains@vger.kernel.org
+Cc: linux-trace-devel@vger.kernel.org
+Link: https://lore.kernel.org/r/20231213001323.718046-4-namhyung@kernel.org
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Tony Jones <tonyj@suse.de>
+---
+ tools/perf/util/Build           |   1 +
+ tools/perf/util/annotate-data.c | 164 ++++++++++++++++++++++++++++++++++++++++
+ tools/perf/util/annotate-data.h |  40 ++++++++++
+ 3 files changed, 205 insertions(+)
+
+diff --git a/tools/perf/util/Build b/tools/perf/util/Build
+index 132508ebe125..8027f450fa3e 100644
+--- a/tools/perf/util/Build
++++ b/tools/perf/util/Build
+@@ -196,6 +196,7 @@ perf-$(CONFIG_DWARF) += probe-finder.o
+ perf-$(CONFIG_DWARF) += dwarf-aux.o
+ perf-$(CONFIG_DWARF) += dwarf-regs.o
+ perf-$(CONFIG_DWARF) += debuginfo.o
++perf-$(CONFIG_DWARF) += annotate-data.o
+ 
+ perf-$(CONFIG_LIBDW_DWARF_UNWIND) += unwind-libdw.o
+ perf-$(CONFIG_LOCAL_LIBUNWIND)    += unwind-libunwind-local.o
+diff --git a/tools/perf/util/annotate-data.c b/tools/perf/util/annotate-data.c
+new file mode 100644
+index 000000000000..9739ecc841ee
+--- /dev/null
++++ b/tools/perf/util/annotate-data.c
+@@ -0,0 +1,164 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Convert sample address to data type using DWARF debug info.
++ *
++ * Written by Namhyung Kim <namhyung@kernel.org>
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <inttypes.h>
++
++#include "annotate-data.h"
++#include "debuginfo.h"
++#include "debug.h"
++#include "dso.h"
++#include "map.h"
++#include "map_symbol.h"
++#include "strbuf.h"
++#include "symbol.h"
++
++static bool find_cu_die(struct debuginfo *di, u64 pc, Dwarf_Die *cu_die)
++{
++	Dwarf_Off off, next_off;
++	size_t header_size;
++
++	if (dwarf_addrdie(di->dbg, pc, cu_die) != NULL)
++		return cu_die;
++
++	/*
++	 * There are some kernels don't have full aranges and contain only a few
++	 * aranges entries.  Fallback to iterate all CU entries in .debug_info
++	 * in case it's missing.
++	 */
++	off = 0;
++	while (dwarf_nextcu(di->dbg, off, &next_off, &header_size,
++			    NULL, NULL, NULL) == 0) {
++		if (dwarf_offdie(di->dbg, off + header_size, cu_die) &&
++		    dwarf_haspc(cu_die, pc))
++			return true;
++
++		off = next_off;
++	}
++	return false;
++}
++
++/* The type info will be saved in @type_die */
++static int check_variable(Dwarf_Die *var_die, Dwarf_Die *type_die, int offset)
++{
++	Dwarf_Word size;
++
++	/* Get the type of the variable */
++	if (die_get_real_type(var_die, type_die) == NULL) {
++		pr_debug("variable has no type\n");
++		return -1;
++	}
++
++	/*
++	 * It expects a pointer type for a memory access.
++	 * Convert to a real type it points to.
++	 */
++	if (dwarf_tag(type_die) != DW_TAG_pointer_type ||
++	    die_get_real_type(type_die, type_die) == NULL) {
++		pr_debug("no pointer or no type\n");
++		return -1;
++	}
++
++	/* Get the size of the actual type */
++	if (dwarf_aggregate_size(type_die, &size) < 0) {
++		pr_debug("type size is unknown\n");
++		return -1;
++	}
++
++	/* Minimal sanity check */
++	if ((unsigned)offset >= size) {
++		pr_debug("offset: %d is bigger than size: %" PRIu64 "\n", offset, size);
++		return -1;
++	}
++
++	return 0;
++}
++
++/* The result will be saved in @type_die */
++static int find_data_type_die(struct debuginfo *di, u64 pc,
++			      int reg, int offset, Dwarf_Die *type_die)
++{
++	Dwarf_Die cu_die, var_die;
++	Dwarf_Die *scopes = NULL;
++	int ret = -1;
++	int i, nr_scopes;
++
++	/* Get a compile_unit for this address */
++	if (!find_cu_die(di, pc, &cu_die)) {
++		pr_debug("cannot find CU for address %" PRIx64 "\n", pc);
++		return -1;
++	}
++
++	/* Get a list of nested scopes - i.e. (inlined) functions and blocks. */
++	nr_scopes = die_get_scopes(&cu_die, pc, &scopes);
++
++	/* Search from the inner-most scope to the outer */
++	for (i = nr_scopes - 1; i >= 0; i--) {
++		/* Look up variables/parameters in this scope */
++		if (!die_find_variable_by_reg(&scopes[i], pc, reg, &var_die))
++			continue;
++
++		/* Found a variable, see if it's correct */
++		ret = check_variable(&var_die, type_die, offset);
++		break;
++	}
++
++	free(scopes);
++	return ret;
++}
++
++/**
++ * find_data_type - Return a data type at the location
++ * @ms: map and symbol at the location
++ * @ip: instruction address of the memory access
++ * @reg: register that holds the base address
++ * @offset: offset from the base address
++ *
++ * This functions searches the debug information of the binary to get the data
++ * type it accesses.  The exact location is expressed by (ip, reg, offset).
++ * It return %NULL if not found.
++ */
++struct annotated_data_type *find_data_type(struct map_symbol *ms, u64 ip,
++					   int reg, int offset)
++{
++	struct annotated_data_type *result = NULL;
++	struct dso *dso = map__dso(ms->map);
++	struct debuginfo *di;
++	Dwarf_Die type_die;
++	struct strbuf sb;
++	u64 pc;
++
++	di = debuginfo__new(dso->long_name);
++	if (di == NULL) {
++		pr_debug("cannot get the debug info\n");
++		return NULL;
++	}
++
++	/*
++	 * IP is a relative instruction address from the start of the map, as
++	 * it can be randomized/relocated, it needs to translate to PC which is
++	 * a file address for DWARF processing.
++	 */
++	pc = map__rip_2objdump(ms->map, ip);
++	if (find_data_type_die(di, pc, reg, offset, &type_die) < 0)
++		goto out;
++
++	result = zalloc(sizeof(*result));
++	if (result == NULL)
++		goto out;
++
++	strbuf_init(&sb, 32);
++	if (die_get_typename_from_type(&type_die, &sb) < 0)
++		strbuf_add(&sb, "(unknown type)", 14);
++
++	result->type_name = strbuf_detach(&sb, NULL);
++
++out:
++	debuginfo__delete(di);
++	return result;
++}
+diff --git a/tools/perf/util/annotate-data.h b/tools/perf/util/annotate-data.h
+new file mode 100644
+index 000000000000..633147f78ca5
+--- /dev/null
++++ b/tools/perf/util/annotate-data.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _PERF_ANNOTATE_DATA_H
++#define _PERF_ANNOTATE_DATA_H
++
++#include <errno.h>
++#include <linux/compiler.h>
++#include <linux/types.h>
++
++struct map_symbol;
++
++/**
++ * struct annotated_data_type - Data type to profile
++ * @type_name: Name of the data type
++ * @type_size: Size of the data type
++ *
++ * This represents a data type accessed by samples in the profile data.
++ */
++struct annotated_data_type {
++	char *type_name;
++	int type_size;
++};
++
++#ifdef HAVE_DWARF_SUPPORT
++
++/* Returns data type at the location (ip, reg, offset) */
++struct annotated_data_type *find_data_type(struct map_symbol *ms, u64 ip,
++					   int reg, int offset);
++
++#else /* HAVE_DWARF_SUPPORT */
++
++static inline struct annotated_data_type *
++find_data_type(struct map_symbol *ms __maybe_unused, u64 ip __maybe_unused,
++	       int reg __maybe_unused, int offset __maybe_unused)
++{
++	return NULL;
++}
++
++#endif /* HAVE_DWARF_SUPPORT */
++
++#endif /* _PERF_ANNOTATE_DATA_H */
+

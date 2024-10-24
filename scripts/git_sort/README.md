@@ -360,4 +360,4 @@ report to <kernel@suse.de> which includes the following information:
   "users/<user>/SLE15/bugreport1") so that others can examine the tree and try
   to reproduce the issue.
 * the output of
-  kernel-source$ GIT_DIR=$LINUX_GIT scripts/git_sort/git_sort.py -d
+  kernel-source$ GIT_DIR=$LINUX_GIT scripts/git_sort/git_sort_debug -d

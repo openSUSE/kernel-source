@@ -1,0 +1,299 @@
+From: Feng Liu <feliu@nvidia.com>
+Date: Tue, 19 Dec 2023 11:32:41 +0200
+Subject: virtio-pci: Introduce admin command sending function
+Git-commit: 92792ac752aa80d5ee71bc291d90edd06cd76bd1
+Patch-mainline: v6.8-rc1
+References: jsc#PED-10968
+
+Add support for sending admin command through admin virtqueue interface.
+Abort any inflight admin commands once device reset completes. Activate
+admin queue when device becomes ready; deactivate on device reset.
+
+To comply to the below specification statement [1], the admin virtqueue
+is activated for upper layer users only after setting DRIVER_OK status.
+
+[1] The driver MUST NOT send any buffer available notifications to the
+device before setting DRIVER_OK.
+
+Signed-off-by: Feng Liu <feliu@nvidia.com>
+Reviewed-by: Parav Pandit <parav@nvidia.com>
+Acked-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Yishai Hadas <yishaih@nvidia.com>
+Link: https://lore.kernel.org/r/20231219093247.170936-4-yishaih@nvidia.com
+Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/virtio/virtio_pci_common.h |    6 +
+ drivers/virtio/virtio_pci_modern.c |  143 ++++++++++++++++++++++++++++++++++++-
+ include/linux/virtio.h             |    8 ++
+ include/uapi/linux/virtio_pci.h    |   22 +++++
+ 4 files changed, 177 insertions(+), 2 deletions(-)
+
+--- a/drivers/virtio/virtio_pci_common.h
++++ b/drivers/virtio/virtio_pci_common.h
+@@ -29,6 +29,7 @@
+ #include <linux/virtio_pci_modern.h>
+ #include <linux/highmem.h>
+ #include <linux/spinlock.h>
++#include <linux/mutex.h>
+ 
+ struct virtio_pci_vq_info {
+ 	/* the actual virtqueue */
+@@ -44,6 +45,8 @@ struct virtio_pci_vq_info {
+ struct virtio_pci_admin_vq {
+ 	/* Virtqueue info associated with this admin queue. */
+ 	struct virtio_pci_vq_info info;
++	/* serializing admin commands execution and virtqueue deletion */
++	struct mutex cmd_lock;
+ 	/* Name of the admin queue: avq.$vq_index. */
+ 	char name[10];
+ 	u16 vq_index;
+@@ -151,4 +154,7 @@ static inline void virtio_pci_legacy_rem
+ int virtio_pci_modern_probe(struct virtio_pci_device *);
+ void virtio_pci_modern_remove(struct virtio_pci_device *);
+ 
++int vp_modern_admin_cmd_exec(struct virtio_device *vdev,
++			     struct virtio_admin_cmd *cmd);
++
+ #endif
+--- a/drivers/virtio/virtio_pci_modern.c
++++ b/drivers/virtio/virtio_pci_modern.c
+@@ -38,6 +38,132 @@ static bool vp_is_avq(struct virtio_devi
+ 	return index == vp_dev->admin_vq.vq_index;
+ }
+ 
++static int virtqueue_exec_admin_cmd(struct virtio_pci_admin_vq *admin_vq,
++				    struct scatterlist **sgs,
++				    unsigned int out_num,
++				    unsigned int in_num,
++				    void *data)
++{
++	struct virtqueue *vq;
++	int ret, len;
++
++	vq = admin_vq->info.vq;
++	if (!vq)
++		return -EIO;
++
++	ret = virtqueue_add_sgs(vq, sgs, out_num, in_num, data, GFP_KERNEL);
++	if (ret < 0)
++		return -EIO;
++
++	if (unlikely(!virtqueue_kick(vq)))
++		return -EIO;
++
++	while (!virtqueue_get_buf(vq, &len) &&
++	       !virtqueue_is_broken(vq))
++		cpu_relax();
++
++	if (virtqueue_is_broken(vq))
++		return -EIO;
++
++	return 0;
++}
++
++int vp_modern_admin_cmd_exec(struct virtio_device *vdev,
++			     struct virtio_admin_cmd *cmd)
++{
++	struct scatterlist *sgs[VIRTIO_AVQ_SGS_MAX], hdr, stat;
++	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
++	struct virtio_admin_cmd_status *va_status;
++	unsigned int out_num = 0, in_num = 0;
++	struct virtio_admin_cmd_hdr *va_hdr;
++	u16 status;
++	int ret;
++
++	if (!virtio_has_feature(vdev, VIRTIO_F_ADMIN_VQ))
++		return -EOPNOTSUPP;
++
++	va_status = kzalloc(sizeof(*va_status), GFP_KERNEL);
++	if (!va_status)
++		return -ENOMEM;
++
++	va_hdr = kzalloc(sizeof(*va_hdr), GFP_KERNEL);
++	if (!va_hdr) {
++		ret = -ENOMEM;
++		goto err_alloc;
++	}
++
++	va_hdr->opcode = cmd->opcode;
++	va_hdr->group_type = cmd->group_type;
++	va_hdr->group_member_id = cmd->group_member_id;
++
++	/* Add header */
++	sg_init_one(&hdr, va_hdr, sizeof(*va_hdr));
++	sgs[out_num] = &hdr;
++	out_num++;
++
++	if (cmd->data_sg) {
++		sgs[out_num] = cmd->data_sg;
++		out_num++;
++	}
++
++	/* Add return status */
++	sg_init_one(&stat, va_status, sizeof(*va_status));
++	sgs[out_num + in_num] = &stat;
++	in_num++;
++
++	if (cmd->result_sg) {
++		sgs[out_num + in_num] = cmd->result_sg;
++		in_num++;
++	}
++
++	mutex_lock(&vp_dev->admin_vq.cmd_lock);
++	ret = virtqueue_exec_admin_cmd(&vp_dev->admin_vq, sgs,
++				       out_num, in_num, sgs);
++	mutex_unlock(&vp_dev->admin_vq.cmd_lock);
++
++	if (ret) {
++		dev_err(&vdev->dev,
++			"Failed to execute command on admin vq: %d\n.", ret);
++		goto err_cmd_exec;
++	}
++
++	status = le16_to_cpu(va_status->status);
++	if (status != VIRTIO_ADMIN_STATUS_OK) {
++		dev_err(&vdev->dev,
++			"admin command error: status(%#x) qualifier(%#x)\n",
++			status, le16_to_cpu(va_status->status_qualifier));
++		ret = -status;
++	}
++
++err_cmd_exec:
++	kfree(va_hdr);
++err_alloc:
++	kfree(va_status);
++	return ret;
++}
++
++static void vp_modern_avq_activate(struct virtio_device *vdev)
++{
++	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
++	struct virtio_pci_admin_vq *admin_vq = &vp_dev->admin_vq;
++
++	if (!virtio_has_feature(vdev, VIRTIO_F_ADMIN_VQ))
++		return;
++
++	__virtqueue_unbreak(admin_vq->info.vq);
++}
++
++static void vp_modern_avq_deactivate(struct virtio_device *vdev)
++{
++	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
++	struct virtio_pci_admin_vq *admin_vq = &vp_dev->admin_vq;
++
++	if (!virtio_has_feature(vdev, VIRTIO_F_ADMIN_VQ))
++		return;
++
++	__virtqueue_break(admin_vq->info.vq);
++}
++
+ static void vp_transport_features(struct virtio_device *vdev, u64 features)
+ {
+ 	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+@@ -177,6 +303,8 @@ static void vp_set_status(struct virtio_
+ 	/* We should never be setting status to 0. */
+ 	BUG_ON(status == 0);
+ 	vp_modern_set_status(&vp_dev->mdev, status);
++	if (status & VIRTIO_CONFIG_S_DRIVER_OK)
++		vp_modern_avq_activate(vdev);
+ }
+ 
+ static void vp_reset(struct virtio_device *vdev)
+@@ -193,6 +321,9 @@ static void vp_reset(struct virtio_devic
+ 	 */
+ 	while (vp_modern_get_status(mdev))
+ 		msleep(1);
++
++	vp_modern_avq_deactivate(vdev);
++
+ 	/* Flush pending VQ/configuration callbacks. */
+ 	vp_synchronize_vectors(vdev);
+ }
+@@ -368,8 +499,11 @@ static struct virtqueue *setup_vq(struct
+ 		goto err;
+ 	}
+ 
+-	if (is_avq)
++	if (is_avq) {
++		mutex_lock(&vp_dev->admin_vq.cmd_lock);
+ 		vp_dev->admin_vq.info.vq = vq;
++		mutex_unlock(&vp_dev->admin_vq.cmd_lock);
++	}
+ 
+ 	return vq;
+ 
+@@ -406,8 +540,11 @@ static void del_vq(struct virtio_pci_vq_
+ 	struct virtio_pci_device *vp_dev = to_vp_device(vq->vdev);
+ 	struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
+ 
+-	if (vp_is_avq(&vp_dev->vdev, vq->index))
++	if (vp_is_avq(&vp_dev->vdev, vq->index)) {
++		mutex_lock(&vp_dev->admin_vq.cmd_lock);
+ 		vp_dev->admin_vq.info.vq = NULL;
++		mutex_unlock(&vp_dev->admin_vq.cmd_lock);
++	}
+ 
+ 	if (vp_dev->msix_enabled)
+ 		vp_modern_queue_vector(mdev, vq->index,
+@@ -626,6 +763,7 @@ int virtio_pci_modern_probe(struct virti
+ 	vp_dev->isr = mdev->isr;
+ 	vp_dev->vdev.id = mdev->id;
+ 
++	mutex_init(&vp_dev->admin_vq.cmd_lock);
+ 	return 0;
+ }
+ 
+@@ -633,5 +771,6 @@ void virtio_pci_modern_remove(struct vir
+ {
+ 	struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
+ 
++	mutex_destroy(&vp_dev->admin_vq.cmd_lock);
+ 	vp_modern_remove(mdev);
+ }
+--- a/include/linux/virtio.h
++++ b/include/linux/virtio.h
+@@ -96,6 +96,14 @@ dma_addr_t virtqueue_get_used_addr(const
+ int virtqueue_resize(struct virtqueue *vq, u32 num,
+ 		     void (*recycle)(struct virtqueue *vq, void *buf));
+ 
++struct virtio_admin_cmd {
++	__le16 opcode;
++	__le16 group_type;
++	__le64 group_member_id;
++	struct scatterlist *data_sg;
++	struct scatterlist *result_sg;
++};
++
+ /**
+  * struct virtio_device - representation of a device using virtio
+  * @index: unique position on the virtio bus
+--- a/include/uapi/linux/virtio_pci.h
++++ b/include/uapi/linux/virtio_pci.h
+@@ -223,4 +223,26 @@ struct virtio_pci_cfg_cap {
+ 
+ #endif /* VIRTIO_PCI_NO_MODERN */
+ 
++/* Admin command status. */
++#define VIRTIO_ADMIN_STATUS_OK		0
++
++struct __packed virtio_admin_cmd_hdr {
++	__le16 opcode;
++	/*
++	 * 1 - SR-IOV
++	 * 2-65535 - reserved
++	 */
++	__le16 group_type;
++	/* Unused, reserved for future extensions. */
++	__u8 reserved1[12];
++	__le64 group_member_id;
++};
++
++struct __packed virtio_admin_cmd_status {
++	__le16 status;
++	__le16 status_qualifier;
++	/* Unused, reserved for future extensions. */
++	__u8 reserved2[4];
++};
++
+ #endif

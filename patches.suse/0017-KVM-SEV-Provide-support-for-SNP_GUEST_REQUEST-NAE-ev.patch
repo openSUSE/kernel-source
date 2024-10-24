@@ -1,23 +1,45 @@
 From: Brijesh Singh <brijesh.singh@amd.com>
-Date: Wed, 1 May 2024 03:52:08 -0500
-Subject: [PATCH 17/19] KVM: SEV: Provide support for SNP_GUEST_REQUEST NAE
- event
+Date: Mon, 1 Jul 2024 17:31:46 -0500
+Subject: KVM: SEV: Provide support for SNP_GUEST_REQUEST NAE event
 Git-commit: 88caf544c9305313e1c48ac1a437faa5df8fff06
 Patch-mainline: v6.11-rc1
-References: jsc#PED-5122
+References: jsc#PED-5865
 
 Version 2 of GHCB specification added support for the SNP Guest Request
 Message NAE event. The event allows for an SEV-SNP guest to make
-requests to the SEV-SNP firmware through hypervisor using the
+requests to the SEV-SNP firmware through the hypervisor using the
 SNP_GUEST_REQUEST API defined in the SEV-SNP firmware specification.
 
 This is used by guests primarily to request attestation reports from
 firmware. There are other request types are available as well, but the
-specifics of what guest requests are being made are opaque to the
-hypervisor, which only serves as a proxy for the guest requests and
-firmware responses.
+specifics of what guest requests are being made generally does not
+affect how they are handled by the hypervisor, which only serves as a
+proxy for the guest requests and firmware responses.
 
 Implement handling for these events.
+
+When an SNP Guest Request is issued, the guest will provide its own
+request/response pages, which could in theory be passed along directly
+to firmware. However, these pages would need special care:
+
+  - Both pages are from shared guest memory, so they need to be
+    protected from migration/etc. occurring while firmware reads/writes
+    to them. At a minimum, this requires elevating the ref counts and
+    potentially needing an explicit pinning of the memory. This places
+    additional restrictions on what type of memory backends userspace
+    can use for shared guest memory since there would be some reliance
+    on using refcounted pages.
+
+  - The response page needs to be switched to Firmware-owned state
+    before the firmware can write to it, which can lead to potential
+    host RMP #PFs if the guest is misbehaved and hands the host a
+    guest page that KVM is writing to for other reasons (e.g. virtio
+    buffers).
+
+Both of these issues can be avoided completely by using
+separately-allocated bounce pages for both the request/response pages
+and passing those to firmware instead. So that's the approach taken
+here.
 
 Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
 Co-developed-by: Alexey Kardashevskiy <aik@amd.com>
@@ -25,19 +47,21 @@ Signed-off-by: Alexey Kardashevskiy <aik@amd.com>
 Co-developed-by: Ashish Kalra <ashish.kalra@amd.com>
 Signed-off-by: Ashish Kalra <ashish.kalra@amd.com>
 Reviewed-by: Tom Lendacky <thomas.lendacky@amd.com>
+Reviewed-by: Liam Merwick <liam.merwick@oracle.com>
 [mdr: ensure FW command failures are indicated to guest, drop extended
  request handling to be re-written as separate patch, massage commit]
 Signed-off-by: Michael Roth <michael.roth@amd.com>
-Message-ID: <20240501085210.2213060-19-michael.roth@amd.com>
+Message-ID: <20240701223148.3798365-2-michael.roth@amd.com>
 Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
 Acked-by: Joerg Roedel <jroedel@suse.de>
 ---
- arch/x86/kvm/svm/sev.c         | 86 ++++++++++++++++++++++++++++++++++
- include/uapi/linux/sev-guest.h |  9 ++++
- 2 files changed, 95 insertions(+)
+ arch/x86/kvm/svm/sev.c         | 134 +++++++++++++++++++++++++++++++++++++++++
+ arch/x86/kvm/svm/svm.h         |   3 +
+ include/uapi/linux/sev-guest.h |   3 +
+ 3 files changed, 140 insertions(+)
 
 diff --git a/arch/x86/kvm/svm/sev.c b/arch/x86/kvm/svm/sev.c
-index 176ba117413a..f3419c2412e4 100644
+index 20b92f4b0906..fdf3ba7dda07 100644
 --- a/arch/x86/kvm/svm/sev.c
 +++ b/arch/x86/kvm/svm/sev.c
 @@ -19,6 +19,7 @@
@@ -48,117 +72,200 @@ index 176ba117413a..f3419c2412e4 100644
  
  #include <asm/pkru.h>
  #include <asm/trapnr.h>
-@@ -3292,6 +3293,10 @@ static int sev_es_validate_vmgexit(struct vcpu_svm *svm)
+@@ -326,6 +327,78 @@ static void sev_unbind_asid(struct kvm *kvm, unsigned int handle)
+ 	sev_decommission(handle);
+ }
+ 
++/*
++ * This sets up bounce buffers/firmware pages to handle SNP Guest Request
++ * messages (e.g. attestation requests). See "SNP Guest Request" in the GHCB
++ * 2.0 specification for more details.
++ *
++ * Technically, when an SNP Guest Request is issued, the guest will provide its
++ * own request/response pages, which could in theory be passed along directly
++ * to firmware rather than using bounce pages. However, these pages would need
++ * special care:
++ *
++ *   - Both pages are from shared guest memory, so they need to be protected
++ *     from migration/etc. occurring while firmware reads/writes to them. At a
++ *     minimum, this requires elevating the ref counts and potentially needing
++ *     an explicit pinning of the memory. This places additional restrictions
++ *     on what type of memory backends userspace can use for shared guest
++ *     memory since there is some reliance on using refcounted pages.
++ *
++ *   - The response page needs to be switched to Firmware-owned[1] state
++ *     before the firmware can write to it, which can lead to potential
++ *     host RMP #PFs if the guest is misbehaved and hands the host a
++ *     guest page that KVM might write to for other reasons (e.g. virtio
++ *     buffers/etc.).
++ *
++ * Both of these issues can be avoided completely by using separately-allocated
++ * bounce pages for both the request/response pages and passing those to
++ * firmware instead. So that's what is being set up here.
++ *
++ * Guest requests rely on message sequence numbers to ensure requests are
++ * issued to firmware in the order the guest issues them, so concurrent guest
++ * requests generally shouldn't happen. But a misbehaved guest could issue
++ * concurrent guest requests in theory, so a mutex is used to serialize
++ * access to the bounce buffers.
++ *
++ * [1] See the "Page States" section of the SEV-SNP Firmware ABI for more
++ *     details on Firmware-owned pages, along with "RMP and VMPL Access Checks"
++ *     in the APM for details on the related RMP restrictions.
++ */
++static int snp_guest_req_init(struct kvm *kvm)
++{
++	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
++	struct page *req_page;
++
++	req_page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
++	if (!req_page)
++		return -ENOMEM;
++
++	sev->guest_resp_buf = snp_alloc_firmware_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
++	if (!sev->guest_resp_buf) {
++		__free_page(req_page);
++		return -EIO;
++	}
++
++	sev->guest_req_buf = page_address(req_page);
++	mutex_init(&sev->guest_req_mutex);
++
++	return 0;
++}
++
++static void snp_guest_req_cleanup(struct kvm *kvm)
++{
++	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
++
++	if (sev->guest_resp_buf)
++		snp_free_firmware_page(sev->guest_resp_buf);
++
++	if (sev->guest_req_buf)
++		__free_page(virt_to_page(sev->guest_req_buf));
++
++	sev->guest_req_buf = NULL;
++	sev->guest_resp_buf = NULL;
++}
++
+ static int __sev_guest_init(struct kvm *kvm, struct kvm_sev_cmd *argp,
+ 			    struct kvm_sev_init *data,
+ 			    unsigned long vm_type)
+@@ -376,6 +449,10 @@ static int __sev_guest_init(struct kvm *kvm, struct kvm_sev_cmd *argp,
+ 	if (ret)
+ 		goto e_free;
+ 
++	/* This needs to happen after SEV/SNP firmware initialization. */
++	if (vm_type == KVM_X86_SNP_VM && snp_guest_req_init(kvm))
++		goto e_free;
++
+ 	INIT_LIST_HEAD(&sev->regions_list);
+ 	INIT_LIST_HEAD(&sev->mirror_vms);
+ 	sev->need_init = false;
+@@ -2834,6 +2911,8 @@ void sev_vm_destroy(struct kvm *kvm)
+ 	}
+ 
+ 	if (sev_snp_guest(kvm)) {
++		snp_guest_req_cleanup(kvm);
++
+ 		/*
+ 		 * Decomission handles unbinding of the ASID. If it fails for
+ 		 * some unexpected reason, just leak the ASID.
+@@ -3299,6 +3378,13 @@ static int sev_es_validate_vmgexit(struct vcpu_svm *svm)
  		if (!sev_snp_guest(vcpu->kvm) || !kvm_ghcb_sw_scratch_is_valid(svm))
  			goto vmgexit_err;
  		break;
 +	case SVM_VMGEXIT_GUEST_REQUEST:
-+		if (!sev_snp_guest(vcpu->kvm))
++		if (!sev_snp_guest(vcpu->kvm) ||
++		    !PAGE_ALIGNED(control->exit_info_1) ||
++		    !PAGE_ALIGNED(control->exit_info_2) ||
++		    control->exit_info_1 == control->exit_info_2)
 +			goto vmgexit_err;
 +		break;
  	default:
  		reason = GHCB_ERR_INVALID_EVENT;
  		goto vmgexit_err;
-@@ -3914,6 +3919,83 @@ static int sev_snp_ap_creation(struct vcpu_svm *svm)
+@@ -3917,6 +4003,51 @@ static int sev_snp_ap_creation(struct vcpu_svm *svm)
  	return ret;
  }
  
-+static int snp_setup_guest_buf(struct kvm *kvm, struct sev_data_snp_guest_request *data,
-+			       gpa_t req_gpa, gpa_t resp_gpa)
-+{
-+	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
-+	kvm_pfn_t req_pfn, resp_pfn;
-+
-+	if (!PAGE_ALIGNED(req_gpa) || !PAGE_ALIGNED(resp_gpa))
-+		return -EINVAL;
-+
-+	req_pfn = gfn_to_pfn(kvm, gpa_to_gfn(req_gpa));
-+	if (is_error_noslot_pfn(req_pfn))
-+		return -EINVAL;
-+
-+	resp_pfn = gfn_to_pfn(kvm, gpa_to_gfn(resp_gpa));
-+	if (is_error_noslot_pfn(resp_pfn))
-+		return -EINVAL;
-+
-+	if (rmp_make_private(resp_pfn, 0, PG_LEVEL_4K, 0, true))
-+		return -EINVAL;
-+
-+	data->gctx_paddr = __psp_pa(sev->snp_context);
-+	data->req_paddr = __sme_set(req_pfn << PAGE_SHIFT);
-+	data->res_paddr = __sme_set(resp_pfn << PAGE_SHIFT);
-+
-+	return 0;
-+}
-+
-+static int snp_cleanup_guest_buf(struct sev_data_snp_guest_request *data)
-+{
-+	u64 pfn = __sme_clr(data->res_paddr) >> PAGE_SHIFT;
-+
-+	if (snp_page_reclaim(pfn) || rmp_make_shared(pfn, PG_LEVEL_4K))
-+		return -EINVAL;
-+
-+	return 0;
-+}
-+
-+static int __snp_handle_guest_req(struct kvm *kvm, gpa_t req_gpa, gpa_t resp_gpa,
-+				  sev_ret_code *fw_err)
++static int snp_handle_guest_req(struct vcpu_svm *svm, gpa_t req_gpa, gpa_t resp_gpa)
 +{
 +	struct sev_data_snp_guest_request data = {0};
-+	struct kvm_sev_info *sev;
++	struct kvm *kvm = svm->vcpu.kvm;
++	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
++	sev_ret_code fw_err = 0;
 +	int ret;
 +
 +	if (!sev_snp_guest(kvm))
 +		return -EINVAL;
 +
-+	sev = &to_kvm_svm(kvm)->sev_info;
++	mutex_lock(&sev->guest_req_mutex);
 +
-+	ret = snp_setup_guest_buf(kvm, &data, req_gpa, resp_gpa);
-+	if (ret)
-+		return ret;
++	if (kvm_read_guest(kvm, req_gpa, sev->guest_req_buf, PAGE_SIZE)) {
++		ret = -EIO;
++		goto out_unlock;
++	}
 +
-+	ret = sev_issue_cmd(kvm, SEV_CMD_SNP_GUEST_REQUEST, &data, fw_err);
-+	if (ret)
-+		return ret;
++	data.gctx_paddr = __psp_pa(sev->snp_context);
++	data.req_paddr = __psp_pa(sev->guest_req_buf);
++	data.res_paddr = __psp_pa(sev->guest_resp_buf);
 +
-+	ret = snp_cleanup_guest_buf(&data);
-+	if (ret)
-+		return ret;
++	/*
++	 * Firmware failures are propagated on to guest, but any other failure
++	 * condition along the way should be reported to userspace. E.g. if
++	 * the PSP is dead and commands are timing out.
++	 */
++	ret = sev_issue_cmd(kvm, SEV_CMD_SNP_GUEST_REQUEST, &data, &fw_err);
++	if (ret && !fw_err)
++		goto out_unlock;
 +
-+	return 0;
-+}
++	if (kvm_write_guest(kvm, resp_gpa, sev->guest_resp_buf, PAGE_SIZE)) {
++		ret = -EIO;
++		goto out_unlock;
++	}
 +
-+static void snp_handle_guest_req(struct vcpu_svm *svm, gpa_t req_gpa, gpa_t resp_gpa)
-+{
-+	struct kvm_vcpu *vcpu = &svm->vcpu;
-+	struct kvm *kvm = vcpu->kvm;
-+	sev_ret_code fw_err = 0;
-+	int vmm_ret = 0;
++	ghcb_set_sw_exit_info_2(svm->sev_es.ghcb, SNP_GUEST_ERR(0, fw_err));
 +
-+	if (__snp_handle_guest_req(kvm, req_gpa, resp_gpa, &fw_err))
-+		vmm_ret = SNP_GUEST_VMM_ERR_GENERIC;
++	ret = 1; /* resume guest */
 +
-+	ghcb_set_sw_exit_info_2(svm->sev_es.ghcb, SNP_GUEST_ERR(vmm_ret, fw_err));
++out_unlock:
++	mutex_unlock(&sev->guest_req_mutex);
++	return ret;
 +}
 +
  static int sev_handle_vmgexit_msr_protocol(struct vcpu_svm *svm)
  {
  	struct vmcb_control_area *control = &svm->vmcb->control;
-@@ -4186,6 +4268,10 @@ int sev_handle_vmgexit(struct kvm_vcpu *vcpu)
- 			ghcb_set_sw_exit_info_2(svm->sev_es.ghcb, GHCB_ERR_INVALID_INPUT);
- 		}
+@@ -4191,6 +4322,9 @@ int sev_handle_vmgexit(struct kvm_vcpu *vcpu)
  
-+		ret = 1;
-+		break;
-+	case SVM_VMGEXIT_GUEST_REQUEST:
-+		snp_handle_guest_req(svm, control->exit_info_1, control->exit_info_2);
  		ret = 1;
  		break;
++	case SVM_VMGEXIT_GUEST_REQUEST:
++		ret = snp_handle_guest_req(svm, control->exit_info_1, control->exit_info_2);
++		break;
  	case SVM_VMGEXIT_UNSUPPORTED_EVENT:
+ 		vcpu_unimpl(vcpu,
+ 			    "vmgexit: unsupported event - exit_info_1=%#llx, exit_info_2=%#llx\n",
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index f0ab0d93cd20..8528f40efffc 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -94,6 +94,9 @@ struct kvm_sev_info {
+ 	struct misc_cg *misc_cg; /* For misc cgroup accounting */
+ 	atomic_t migration_in_progress;
+ 	void *snp_context;      /* SNP guest context page */
++	void *guest_req_buf;    /* Bounce buffer for SNP Guest Request input */
++	void *guest_resp_buf;   /* Bounce buffer for SNP Guest Request output */
++	struct mutex guest_req_mutex; /* Must acquire before using bounce buffers */
+ };
+ 
+ struct kvm_svm {
 diff --git a/include/uapi/linux/sev-guest.h b/include/uapi/linux/sev-guest.h
-index 154a87a1eca9..7bd78e258569 100644
+index 154a87a1eca9..fcdfea767fca 100644
 --- a/include/uapi/linux/sev-guest.h
 +++ b/include/uapi/linux/sev-guest.h
-@@ -89,8 +89,17 @@ struct snp_ext_report_req {
+@@ -89,6 +89,9 @@ struct snp_ext_report_req {
  #define SNP_GUEST_FW_ERR_MASK		GENMASK_ULL(31, 0)
  #define SNP_GUEST_VMM_ERR_SHIFT		32
  #define SNP_GUEST_VMM_ERR(x)		(((u64)x) << SNP_GUEST_VMM_ERR_SHIFT)
@@ -166,16 +273,6 @@ index 154a87a1eca9..7bd78e258569 100644
 +#define SNP_GUEST_ERR(vmm_err, fw_err)	(SNP_GUEST_VMM_ERR(vmm_err) | \
 +					 SNP_GUEST_FW_ERR(fw_err))
  
-+/*
-+ * The GHCB spec only formally defines INVALID_LEN/BUSY VMM errors, but define
-+ * a GENERIC error code such that it won't ever conflict with GHCB-defined
-+ * errors if any get added in the future.
-+ */
  #define SNP_GUEST_VMM_ERR_INVALID_LEN	1
  #define SNP_GUEST_VMM_ERR_BUSY		2
-+#define SNP_GUEST_VMM_ERR_GENERIC	BIT(31)
- 
- #endif /* __UAPI_LINUX_SEV_GUEST_H_ */
--- 
-2.45.1
 

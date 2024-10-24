@@ -1,0 +1,246 @@
+From: Pranjal Shrivastava <praan@google.com>
+Date: Fri, 16 Aug 2024 10:49:06 +0000
+Subject: iommu: Handle iommu faults for a bad iopf setup
+Git-commit: b58b133e680b20d219940e0fdb6f6132c2b60f38
+Patch-mainline: v6.11-rc6
+References: jsc#PED-10539
+
+The iommu_report_device_fault function was updated to return void while
+assuming that drivers only need to call iommu_report_device_fault() for
+reporting an iopf. This implementation causes following problems:
+
+1. The drivers rely on the core code to call it's page_reponse,
+   however, when a fault is received and no fault capable domain is
+   attached / iopf_param is NULL, the ops->page_response is NOT called
+   causing the device to stall in case the fault type was PAGE_REQ.
+
+2. The arm_smmu_v3 driver relies on the returned value to log errors
+   returning void from iommu_report_device_fault causes these events to
+   be missed while logging.
+
+Modify the iommu_report_device_fault function to return -EINVAL for
+cases where no fault capable domain is attached or iopf_param was NULL
+and calls back to the driver (ops->page_response) in case the fault type
+was IOMMU_FAULT_PAGE_REQ. The returned value can be used by the drivers
+to log the fault/event as needed.
+
+Reported-by: Kunkun Jiang <jiangkunkun@huawei.com>
+Closes: https://lore.kernel.org/all/6147caf0-b9a0-30ca-795e-a1aa502a5c51@huawei.com/
+Fixes: 3dfa64aecbaf ("iommu: Make iommu_report_device_fault() return void")
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Pranjal Shrivastava <praan@google.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Reviewed-by: Lu Baolu <baolu.lu@linux.intel.com>
+Link: https://lore.kernel.org/r/20240816104906.1010626-1-praan@google.com
+Signed-off-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c |    2 
+ drivers/iommu/io-pgfault.c                  |  121 +++++++++++++++++++---------
+ include/linux/iommu.h                       |    5 -
+ 3 files changed, 87 insertions(+), 41 deletions(-)
+
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+@@ -1777,7 +1777,7 @@ static int arm_smmu_handle_evt(struct ar
+ 		goto out_unlock;
+ 	}
+ 
+-	iommu_report_device_fault(master->dev, &fault_evt);
++	ret = iommu_report_device_fault(master->dev, &fault_evt);
+ out_unlock:
+ 	mutex_unlock(&smmu->streams_mutex);
+ 	return ret;
+--- a/drivers/iommu/io-pgfault.c
++++ b/drivers/iommu/io-pgfault.c
+@@ -115,6 +115,59 @@ static struct iopf_group *iopf_group_all
+ 	return group;
+ }
+ 
++static struct iommu_attach_handle *find_fault_handler(struct device *dev,
++						     struct iopf_fault *evt)
++{
++	struct iommu_fault *fault = &evt->fault;
++	struct iommu_attach_handle *attach_handle;
++
++	if (fault->prm.flags & IOMMU_FAULT_PAGE_REQUEST_PASID_VALID) {
++		attach_handle = iommu_attach_handle_get(dev->iommu_group,
++				fault->prm.pasid, 0);
++		if (IS_ERR(attach_handle)) {
++			const struct iommu_ops *ops = dev_iommu_ops(dev);
++
++			if (!ops->user_pasid_table)
++				return NULL;
++			/*
++			 * The iommu driver for this device supports user-
++			 * managed PASID table. Therefore page faults for
++			 * any PASID should go through the NESTING domain
++			 * attached to the device RID.
++			 */
++			attach_handle = iommu_attach_handle_get(
++					dev->iommu_group, IOMMU_NO_PASID,
++					IOMMU_DOMAIN_NESTED);
++			if (IS_ERR(attach_handle))
++				return NULL;
++		}
++	} else {
++		attach_handle = iommu_attach_handle_get(dev->iommu_group,
++				IOMMU_NO_PASID, 0);
++
++		if (IS_ERR(attach_handle))
++			return NULL;
++	}
++
++	if (!attach_handle->domain->iopf_handler)
++		return NULL;
++
++	return attach_handle;
++}
++
++static void iopf_error_response(struct device *dev, struct iopf_fault *evt)
++{
++	const struct iommu_ops *ops = dev_iommu_ops(dev);
++	struct iommu_fault *fault = &evt->fault;
++	struct iommu_page_response resp = {
++		.pasid = fault->prm.pasid,
++		.grpid = fault->prm.grpid,
++		.code = IOMMU_PAGE_RESP_INVALID
++	};
++
++	ops->page_response(dev, evt, &resp);
++}
++
+ /**
+  * iommu_report_device_fault() - Report fault event to device driver
+  * @dev: the device
+@@ -153,24 +206,39 @@ static struct iopf_group *iopf_group_all
+  * handling framework should guarantee that the iommu domain could only be
+  * freed after the device has stopped generating page faults (or the iommu
+  * hardware has been set to block the page faults) and the pending page faults
+- * have been flushed.
++ * have been flushed. In case no page fault handler is attached or no iopf params
++ * are setup, then the ops->page_response() is called to complete the evt.
++ *
++ * Returns 0 on success, or an error in case of a bad/failed iopf setup.
+  */
+-void iommu_report_device_fault(struct device *dev, struct iopf_fault *evt)
++int iommu_report_device_fault(struct device *dev, struct iopf_fault *evt)
+ {
++	struct iommu_attach_handle *attach_handle;
+ 	struct iommu_fault *fault = &evt->fault;
+ 	struct iommu_fault_param *iopf_param;
+ 	struct iopf_group abort_group = {};
+ 	struct iopf_group *group;
+ 
++	attach_handle = find_fault_handler(dev, evt);
++	if (!attach_handle)
++		goto err_bad_iopf;
++
++	/*
++	 * Something has gone wrong if a fault capable domain is attached but no
++	 * iopf_param is setup
++	 */
+ 	iopf_param = iopf_get_dev_fault_param(dev);
+ 	if (WARN_ON(!iopf_param))
+-		return;
++		goto err_bad_iopf;
+ 
+ 	if (!(fault->prm.flags & IOMMU_FAULT_PAGE_REQUEST_LAST_PAGE)) {
+-		report_partial_fault(iopf_param, fault);
++		int ret;
++
++		ret = report_partial_fault(iopf_param, fault);
+ 		iopf_put_dev_fault_param(iopf_param);
+ 		/* A request that is not the last does not need to be ack'd */
+-		return;
++
++		return ret;
+ 	}
+ 
+ 	/*
+@@ -185,38 +253,7 @@ void iommu_report_device_fault(struct de
+ 	if (group == &abort_group)
+ 		goto err_abort;
+ 
+-	if (fault->prm.flags & IOMMU_FAULT_PAGE_REQUEST_PASID_VALID) {
+-		group->attach_handle = iommu_attach_handle_get(dev->iommu_group,
+-							       fault->prm.pasid,
+-							       0);
+-		if (IS_ERR(group->attach_handle)) {
+-			const struct iommu_ops *ops = dev_iommu_ops(dev);
+-
+-			if (!ops->user_pasid_table)
+-				goto err_abort;
+-
+-			/*
+-			 * The iommu driver for this device supports user-
+-			 * managed PASID table. Therefore page faults for
+-			 * any PASID should go through the NESTING domain
+-			 * attached to the device RID.
+-			 */
+-			group->attach_handle =
+-				iommu_attach_handle_get(dev->iommu_group,
+-							IOMMU_NO_PASID,
+-							IOMMU_DOMAIN_NESTED);
+-			if (IS_ERR(group->attach_handle))
+-				goto err_abort;
+-		}
+-	} else {
+-		group->attach_handle =
+-			iommu_attach_handle_get(dev->iommu_group, IOMMU_NO_PASID, 0);
+-		if (IS_ERR(group->attach_handle))
+-			goto err_abort;
+-	}
+-
+-	if (!group->attach_handle->domain->iopf_handler)
+-		goto err_abort;
++	group->attach_handle = attach_handle;
+ 
+ 	/*
+ 	 * On success iopf_handler must call iopf_group_response() and
+@@ -225,7 +262,7 @@ void iommu_report_device_fault(struct de
+ 	if (group->attach_handle->domain->iopf_handler(group))
+ 		goto err_abort;
+ 
+-	return;
++	return 0;
+ 
+ err_abort:
+ 	dev_warn_ratelimited(dev, "iopf with pasid %d aborted\n",
+@@ -235,6 +272,14 @@ err_abort:
+ 		__iopf_free_group(group);
+ 	else
+ 		iopf_free_group(group);
++
++	return 0;
++
++err_bad_iopf:
++	if (fault->type == IOMMU_FAULT_PAGE_REQ)
++		iopf_error_response(dev, evt);
++
++	return -EINVAL;
+ }
+ EXPORT_SYMBOL_GPL(iommu_report_device_fault);
+ 
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -1565,7 +1565,7 @@ struct iopf_queue *iopf_queue_alloc(cons
+ void iopf_queue_free(struct iopf_queue *queue);
+ int iopf_queue_discard_partial(struct iopf_queue *queue);
+ void iopf_free_group(struct iopf_group *group);
+-void iommu_report_device_fault(struct device *dev, struct iopf_fault *evt);
++int iommu_report_device_fault(struct device *dev, struct iopf_fault *evt);
+ void iopf_group_response(struct iopf_group *group,
+ 			 enum iommu_page_response_code status);
+ #else
+@@ -1603,9 +1603,10 @@ static inline void iopf_free_group(struc
+ {
+ }
+ 
+-static inline void
++static inline int
+ iommu_report_device_fault(struct device *dev, struct iopf_fault *evt)
+ {
++	return -ENODEV;
+ }
+ 
+ static inline void iopf_group_response(struct iopf_group *group,

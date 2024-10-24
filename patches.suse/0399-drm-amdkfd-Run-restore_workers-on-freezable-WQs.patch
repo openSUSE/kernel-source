@@ -1,0 +1,382 @@
+From 49230aeed86e711cfd9f91014cb3d2b9d9b69da9 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Fri, 27 Oct 2023 18:21:55 -0400
+Subject: drm/amdkfd: Run restore_workers on freezable WQs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 9a1c1339abf972477aeef4ea037e650f49c5892d
+Patch-mainline: v6.8-rc1
+References: drm-backport-placeholder
+
+Make restore workers freezable so we don't have to explicitly flush them
+in suspend and GPU reset code paths, and we don't accidentally try to
+restore BOs while the GPU is suspended. Not having to flush restore_work
+also helps avoid lock/fence dependencies in the GPU reset case where we're
+not allowed to wait for fences.
+
+A side effect of this is, that we can now have multiple concurrent threads
+trying to signal the same eviction fence. Rework eviction fence signaling
+and replacement to account for that.
+
+The GPU reset path can no longer rely on restore_process_worker to resume
+queues because evict/restore workers can run independently of it. Instead
+call a new restore_process_helper directly.
+
+This is an RFC and request for testing.
+
+v2:
+- Reworked eviction fence signaling
+- Introduced restore_process_helper
+
+v3:
+- Handle unsignaled eviction fences in restore_process_bos
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Tested-by: Emily Deng <Emily.Deng@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ .../gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c  | 68 +++++++++++----
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c      | 87 +++++++++++--------
+ drivers/gpu/drm/amd/amdkfd/kfd_svm.c          |  4 +-
+ 3 files changed, 104 insertions(+), 55 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index b98c0969d3be..73288f9ccaf8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -1384,7 +1384,6 @@ static int init_kfd_vm(struct amdgpu_vm *vm, void **process_info,
+ 				  amdgpu_amdkfd_restore_userptr_worker);
+ 
+ 		*process_info = info;
+-		*ef = dma_fence_get(&info->eviction_fence->base);
+ 	}
+ 
+ 	vm->process_info = *process_info;
+@@ -1415,6 +1414,8 @@ static int init_kfd_vm(struct amdgpu_vm *vm, void **process_info,
+ 	list_add_tail(&vm->vm_list_node,
+ 			&(vm->process_info->vm_list_head));
+ 	vm->process_info->n_vms++;
++
++	*ef = dma_fence_get(&vm->process_info->eviction_fence->base);
+ 	mutex_unlock(&vm->process_info->lock);
+ 
+ 	return 0;
+@@ -1426,10 +1427,7 @@ static int init_kfd_vm(struct amdgpu_vm *vm, void **process_info,
+ reserve_pd_fail:
+ 	vm->process_info = NULL;
+ 	if (info) {
+-		/* Two fence references: one in info and one in *ef */
+ 		dma_fence_put(&info->eviction_fence->base);
+-		dma_fence_put(*ef);
+-		*ef = NULL;
+ 		*process_info = NULL;
+ 		put_pid(info->pid);
+ create_evict_fence_fail:
+@@ -1623,7 +1621,8 @@ int amdgpu_amdkfd_criu_resume(void *p)
+ 		goto out_unlock;
+ 	}
+ 	WRITE_ONCE(pinfo->block_mmu_notifications, false);
+-	schedule_delayed_work(&pinfo->restore_userptr_work, 0);
++	queue_delayed_work(system_freezable_wq,
++			   &pinfo->restore_userptr_work, 0);
+ 
+ out_unlock:
+ 	mutex_unlock(&pinfo->lock);
+@@ -2426,7 +2425,8 @@ int amdgpu_amdkfd_evict_userptr(struct mmu_interval_notifier *mni,
+ 				       KFD_QUEUE_EVICTION_TRIGGER_USERPTR);
+ 		if (r)
+ 			pr_err("Failed to quiesce KFD\n");
+-		schedule_delayed_work(&process_info->restore_userptr_work,
++		queue_delayed_work(system_freezable_wq,
++			&process_info->restore_userptr_work,
+ 			msecs_to_jiffies(AMDGPU_USERPTR_RESTORE_DELAY_MS));
+ 	}
+ 	mutex_unlock(&process_info->notifier_lock);
+@@ -2749,7 +2749,8 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
+ 
+ 	/* If validation failed, reschedule another attempt */
+ 	if (evicted_bos) {
+-		schedule_delayed_work(&process_info->restore_userptr_work,
++		queue_delayed_work(system_freezable_wq,
++			&process_info->restore_userptr_work,
+ 			msecs_to_jiffies(AMDGPU_USERPTR_RESTORE_DELAY_MS));
+ 
+ 		kfd_smi_event_queue_restore_rescheduled(mm);
+@@ -2758,6 +2759,23 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
+ 	put_task_struct(usertask);
+ }
+ 
++static void replace_eviction_fence(struct dma_fence **ef,
++				   struct dma_fence *new_ef)
++{
++	struct dma_fence *old_ef = rcu_replace_pointer(*ef, new_ef, true
++		/* protected by process_info->lock */);
++
++	/* If we're replacing an unsignaled eviction fence, that fence will
++	 * never be signaled, and if anyone is still waiting on that fence,
++	 * they will hang forever. This should never happen. We should only
++	 * replace the fence in restore_work that only gets scheduled after
++	 * eviction work signaled the fence.
++	 */
++	WARN_ONCE(!dma_fence_is_signaled(old_ef),
++		  "Replacing unsignaled eviction fence");
++	dma_fence_put(old_ef);
++}
++
+ /** amdgpu_amdkfd_gpuvm_restore_process_bos - Restore all BOs for the given
+  *   KFD process identified by process_info
+  *
+@@ -2781,7 +2799,6 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info, struct dma_fence **ef)
+ 	struct amdkfd_process_info *process_info = info;
+ 	struct amdgpu_vm *peer_vm;
+ 	struct kgd_mem *mem;
+-	struct amdgpu_amdkfd_fence *new_fence;
+ 	struct list_head duplicate_save;
+ 	struct amdgpu_sync sync_obj;
+ 	unsigned long failed_size = 0;
+@@ -2907,22 +2924,35 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info, struct dma_fence **ef)
+ 	/* Wait for validate and PT updates to finish */
+ 	amdgpu_sync_wait(&sync_obj, false);
+ 
+-	/* Release old eviction fence and create new one, because fence only
+-	 * goes from unsignaled to signaled, fence cannot be reused.
+-	 * Use context and mm from the old fence.
++	/* The old eviction fence may be unsignaled if restore happens
++	 * after a GPU reset or suspend/resume. Keep the old fence in that
++	 * case. Otherwise release the old eviction fence and create new
++	 * one, because fence only goes from unsignaled to signaled once
++	 * and cannot be reused. Use context and mm from the old fence.
++	 *
++	 * If an old eviction fence signals after this check, that's OK.
++	 * Anyone signaling an eviction fence must stop the queues first
++	 * and schedule another restore worker.
+ 	 */
+-	new_fence = amdgpu_amdkfd_fence_create(
++	if (dma_fence_is_signaled(&process_info->eviction_fence->base)) {
++		struct amdgpu_amdkfd_fence *new_fence =
++			amdgpu_amdkfd_fence_create(
+ 				process_info->eviction_fence->base.context,
+ 				process_info->eviction_fence->mm,
+ 				NULL);
+-	if (!new_fence) {
+-		pr_err("Failed to create eviction fence\n");
+-		ret = -ENOMEM;
+-		goto validate_map_fail;
++
++		if (!new_fence) {
++			pr_err("Failed to create eviction fence\n");
++			ret = -ENOMEM;
++			goto validate_map_fail;
++		}
++		dma_fence_put(&process_info->eviction_fence->base);
++		process_info->eviction_fence = new_fence;
++		replace_eviction_fence(ef, dma_fence_get(&new_fence->base));
++	} else {
++		WARN_ONCE(*ef != &process_info->eviction_fence->base,
++			  "KFD eviction fence doesn't match KGD process_info");
+ 	}
+-	dma_fence_put(&process_info->eviction_fence->base);
+-	process_info->eviction_fence = new_fence;
+-	*ef = dma_fence_get(&new_fence->base);
+ 
+ 	/* Attach new eviction fence to all BOs except pinned ones */
+ 	list_for_each_entry(mem, &process_info->kfd_bo_list, validate_list) {
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index c10d050e1a61..71df51fcc1b0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -664,7 +664,8 @@ int kfd_process_create_wq(void)
+ 	if (!kfd_process_wq)
+ 		kfd_process_wq = alloc_workqueue("kfd_process_wq", 0, 0);
+ 	if (!kfd_restore_wq)
+-		kfd_restore_wq = alloc_ordered_workqueue("kfd_restore_wq", 0);
++		kfd_restore_wq = alloc_ordered_workqueue("kfd_restore_wq",
++							 WQ_FREEZABLE);
+ 
+ 	if (!kfd_process_wq || !kfd_restore_wq) {
+ 		kfd_process_destroy_wq();
+@@ -1642,6 +1643,7 @@ int kfd_process_device_init_vm(struct kfd_process_device *pdd,
+ 	struct amdgpu_fpriv *drv_priv;
+ 	struct amdgpu_vm *avm;
+ 	struct kfd_process *p;
++	struct dma_fence *ef;
+ 	struct kfd_node *dev;
+ 	int ret;
+ 
+@@ -1661,11 +1663,12 @@ int kfd_process_device_init_vm(struct kfd_process_device *pdd,
+ 
+ 	ret = amdgpu_amdkfd_gpuvm_acquire_process_vm(dev->adev, avm,
+ 						     &p->kgd_process_info,
+-						     &p->ef);
++						     &ef);
+ 	if (ret) {
+ 		pr_err("Failed to create process VM object\n");
+ 		return ret;
+ 	}
++	RCU_INIT_POINTER(p->ef, ef);
+ 	pdd->drm_priv = drm_file->private_data;
+ 
+ 	ret = kfd_process_device_reserve_ib_mem(pdd);
+@@ -1908,6 +1911,21 @@ kfd_process_gpuid_from_node(struct kfd_process *p, struct kfd_node *node,
+ 	return -EINVAL;
+ }
+ 
++static int signal_eviction_fence(struct kfd_process *p)
++{
++	struct dma_fence *ef;
++	int ret;
++
++	rcu_read_lock();
++	ef = dma_fence_get_rcu_safe(&p->ef);
++	rcu_read_unlock();
++
++	ret = dma_fence_signal(ef);
++	dma_fence_put(ef);
++
++	return ret;
++}
++
+ static void evict_process_worker(struct work_struct *work)
+ {
+ 	int ret;
+@@ -1920,31 +1938,46 @@ static void evict_process_worker(struct work_struct *work)
+ 	 * lifetime of this thread, kfd_process p will be valid
+ 	 */
+ 	p = container_of(dwork, struct kfd_process, eviction_work);
+-	WARN_ONCE(p->last_eviction_seqno != p->ef->seqno,
+-		  "Eviction fence mismatch\n");
+-
+-	/* Narrow window of overlap between restore and evict work
+-	 * item is possible. Once amdgpu_amdkfd_gpuvm_restore_process_bos
+-	 * unreserves KFD BOs, it is possible to evicted again. But
+-	 * restore has few more steps of finish. So lets wait for any
+-	 * previous restore work to complete
+-	 */
+-	flush_delayed_work(&p->restore_work);
+ 
+ 	pr_debug("Started evicting pasid 0x%x\n", p->pasid);
+ 	ret = kfd_process_evict_queues(p, KFD_QUEUE_EVICTION_TRIGGER_TTM);
+ 	if (!ret) {
+-		dma_fence_signal(p->ef);
+-		dma_fence_put(p->ef);
+-		p->ef = NULL;
+-		queue_delayed_work(kfd_restore_wq, &p->restore_work,
++		/* If another thread already signaled the eviction fence,
++		 * they are responsible stopping the queues and scheduling
++		 * the restore work.
++		 */
++		if (!signal_eviction_fence(p))
++			queue_delayed_work(kfd_restore_wq, &p->restore_work,
+ 				msecs_to_jiffies(PROCESS_RESTORE_TIME_MS));
++		else
++			kfd_process_restore_queues(p);
+ 
+ 		pr_debug("Finished evicting pasid 0x%x\n", p->pasid);
+ 	} else
+ 		pr_err("Failed to evict queues of pasid 0x%x\n", p->pasid);
+ }
+ 
++static int restore_process_helper(struct kfd_process *p)
++{
++	int ret = 0;
++
++	/* VMs may not have been acquired yet during debugging. */
++	if (p->kgd_process_info) {
++		ret = amdgpu_amdkfd_gpuvm_restore_process_bos(
++			p->kgd_process_info, &p->ef);
++		if (ret)
++			return ret;
++	}
++
++	ret = kfd_process_restore_queues(p);
++	if (!ret)
++		pr_debug("Finished restoring pasid 0x%x\n", p->pasid);
++	else
++		pr_err("Failed to restore queues of pasid 0x%x\n", p->pasid);
++
++	return ret;
++}
++
+ static void restore_process_worker(struct work_struct *work)
+ {
+ 	struct delayed_work *dwork;
+@@ -1970,24 +2003,15 @@ static void restore_process_worker(struct work_struct *work)
+ 	 */
+ 
+ 	p->last_restore_timestamp = get_jiffies_64();
+-	/* VMs may not have been acquired yet during debugging. */
+-	if (p->kgd_process_info)
+-		ret = amdgpu_amdkfd_gpuvm_restore_process_bos(p->kgd_process_info,
+-							     &p->ef);
++
++	ret = restore_process_helper(p);
+ 	if (ret) {
+ 		pr_debug("Failed to restore BOs of pasid 0x%x, retry after %d ms\n",
+ 			 p->pasid, PROCESS_BACK_OFF_TIME_MS);
+ 		ret = queue_delayed_work(kfd_restore_wq, &p->restore_work,
+ 				msecs_to_jiffies(PROCESS_BACK_OFF_TIME_MS));
+ 		WARN(!ret, "reschedule restore work failed\n");
+-		return;
+ 	}
+-
+-	ret = kfd_process_restore_queues(p);
+-	if (!ret)
+-		pr_debug("Finished restoring pasid 0x%x\n", p->pasid);
+-	else
+-		pr_err("Failed to restore queues of pasid 0x%x\n", p->pasid);
+ }
+ 
+ void kfd_suspend_all_processes(void)
+@@ -1998,14 +2022,9 @@ void kfd_suspend_all_processes(void)
+ 
+ 	WARN(debug_evictions, "Evicting all processes");
+ 	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
+-		cancel_delayed_work_sync(&p->eviction_work);
+-		flush_delayed_work(&p->restore_work);
+-
+ 		if (kfd_process_evict_queues(p, KFD_QUEUE_EVICTION_TRIGGER_SUSPEND))
+ 			pr_err("Failed to suspend process 0x%x\n", p->pasid);
+-		dma_fence_signal(p->ef);
+-		dma_fence_put(p->ef);
+-		p->ef = NULL;
++		signal_eviction_fence(p);
+ 	}
+ 	srcu_read_unlock(&kfd_processes_srcu, idx);
+ }
+@@ -2017,7 +2036,7 @@ int kfd_resume_all_processes(void)
+ 	int ret = 0, idx = srcu_read_lock(&kfd_processes_srcu);
+ 
+ 	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
+-		if (!queue_delayed_work(kfd_restore_wq, &p->restore_work, 0)) {
++		if (restore_process_helper(p)) {
+ 			pr_err("Restore process %d failed during resume\n",
+ 			       p->pasid);
+ 			ret = -EFAULT;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+index a15bfb5223e8..bf2bf7f08f5a 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+@@ -1876,7 +1876,7 @@ static void svm_range_restore_work(struct work_struct *work)
+ 	/* If validation failed, reschedule another attempt */
+ 	if (evicted_ranges) {
+ 		pr_debug("reschedule to restore svm range\n");
+-		schedule_delayed_work(&svms->restore_work,
++		queue_delayed_work(system_freezable_wq, &svms->restore_work,
+ 			msecs_to_jiffies(AMDGPU_SVM_RANGE_RESTORE_DELAY_MS));
+ 
+ 		kfd_smi_event_queue_restore_rescheduled(mm);
+@@ -1952,7 +1952,7 @@ svm_range_evict(struct svm_range *prange, struct mm_struct *mm,
+ 			pr_debug("failed to quiesce KFD\n");
+ 
+ 		pr_debug("schedule to restore svm %p ranges\n", svms);
+-		schedule_delayed_work(&svms->restore_work,
++		queue_delayed_work(system_freezable_wq, &svms->restore_work,
+ 			msecs_to_jiffies(AMDGPU_SVM_RANGE_RESTORE_DELAY_MS));
+ 	} else {
+ 		unsigned long s, l;
+-- 
+2.46.1
+
