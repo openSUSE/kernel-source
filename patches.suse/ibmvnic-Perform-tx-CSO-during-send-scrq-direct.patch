@@ -1,0 +1,126 @@
+From: Nick Child <nnac123@linux.ibm.com>
+Date: Wed, 7 Aug 2024 16:18:09 -0500
+Subject: ibmvnic: Perform tx CSO during send scrq direct
+Patch-mainline: v6.12-rc1
+Git-commit: e633e32b60fd6701bed73599b273a2a03621ea54
+References: jsc#PED-9909
+
+During initialization with the vnic server, a bitstring is communicated
+to the client regarding header info needed during CSO (See "VNIC
+Capabilities" in PAPR). Most of the time, to be safe, vnic server
+requests header info for CSO. When header info is needed, multiple TX
+descriptors are required per skb; This limits the driver to use
+send_subcrq_indirect instead of send_subcrq_direct.
+
+Previously, the vnic server request for header info was ignored. This
+allowed the use of send_sub_crq_direct. Transmissions were successful
+because the bitstring returned by vnic server is broad and over
+cautionary. It was observed that mlx backing devices could actually
+transmit and handle CSO packets without the vnic server receiving
+header info (despite the fact that the bitstring requested it).
+
+There was a trust issue: The bitstring was overcautionary. This extra
+precaution (requesting header info when the backing device may not use
+it) comes at the cost of performance (using direct vs indirect hcalls
+has a 30% delta in small packet RR transaction rate). So it has been
+requested that the vnic server team tries to ensure that the bitstring
+is more exact. In the meantime, disable CSO when it is possible to use
+the skb in the send_subcrq_direct path. In other words, calculate the
+checksum before handing the packet to FW when the packet is not
+segmented and xmit_more is false.
+
+Since the code path is only possible if the skb is non GSO and xmit_more
+is false, the cost of doing checksum in the send_subcrq_direct path is
+minimal. Any large segmented skb will have xmit_more set to true more
+frequently and it is inexpensive to do checksumming on a small skb.
+The worst-case workload would be a 9000 MTU TCP_RR test with close
+to MTU sized packets (and TSO off). This allows xmit_more to be false
+more frequently and open the code path up to use send_subcrq_direct.
+Observing trace data (graph-time = 1) and packet rate with this workload
+shows minimal performance degradation:
+
+1. NIC does checksum w headers, safely use send_subcrq_indirect:
+  - Packet rate: 631k txs
+  - Trace data:
+    ibmvnic_xmit = 44344685.87 us / 6234576 hits = AVG 7.11 us
+      skb_checksum_help = 4.07 us / 2 hits = AVG 2.04 us
+       ^ Notice hits, tracing this just for reassurance
+      ibmvnic_tx_scrq_flush = 33040649.69 us / 5638441 hits = AVG 5.86 us
+        send_subcrq_indirect = 37438922.24 us / 6030859 hits = AVG 6.21 us
+
+2. NIC does checksum w/o headers, dangerously use send_subcrq_direct:
+  - Packet rate: 831k txs
+  - Trace data:
+    ibmvnic_xmit = 48940092.29 us / 8187630 hits = AVG 5.98 us
+      skb_checksum_help = 2.03 us / 1 hits = AVG 2.03
+      ibmvnic_tx_scrq_flush = 31141879.57 us / 7948960 hits = AVG 3.92 us
+        send_subcrq_indirect = 8412506.03 us / 728781 hits = AVG 11.54
+         ^ notice hits is much lower b/c send_subcrq_direct was called
+                                            ^ wasn't traceable
+
+3. driver does checksum, safely use send_subcrq_direct (THIS PATCH):
+  - Packet rate: 829k txs
+  - Trace data:
+    ibmvnic_xmit = 56696077.63 us / 8066168 hits = AVG 7.03 us
+      skb_checksum_help = 8587456.16 us / 7526072 hits = AVG 1.14 us
+      ibmvnic_tx_scrq_flush = 30219545.55 us / 7782409 hits = AVG 3.88 us
+        send_subcrq_indirect = 8638326.44 us / 763693 hits = AVG 11.31 us
+
+When the bitstring ever specifies that CSO does not require headers
+(dependent on VIOS vnic server changes), then this patch should be
+removed and replaced with one that investigates the bitstring before
+using send_subcrq_direct.
+
+Signed-off-by: Nick Child <nnac123@linux.ibm.com>
+Link: https://patch.msgid.link/20240807211809.1259563-8-nnac123@linux.ibm.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/ibm/ibmvnic.c |   19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@ -2409,6 +2409,7 @@ static netdev_tx_t ibmvnic_xmit(struct s
+ 	unsigned long lpar_rc;
+ 	union sub_crq tx_crq;
+ 	unsigned int offset;
++	bool use_scrq_send_direct = false;
+ 	int num_entries = 1;
+ 	unsigned char *dst;
+ 	int bufidx = 0;
+@@ -2468,6 +2469,18 @@ static netdev_tx_t ibmvnic_xmit(struct s
+ 	memset(dst, 0, tx_pool->buf_size);
+ 	data_dma_addr = ltb->addr + offset;
+ 
++	/* if we are going to send_subcrq_direct this then we need to
++	 * update the checksum before copying the data into ltb. Essentially
++	 * these packets force disable CSO so that we can guarantee that
++	 * FW does not need header info and we can send direct.
++	 */
++	if (!skb_is_gso(skb) && !ind_bufp->index && !netdev_xmit_more()) {
++		use_scrq_send_direct = true;
++		if (skb->ip_summed == CHECKSUM_PARTIAL &&
++		    skb_checksum_help(skb))
++			use_scrq_send_direct = false;
++	}
++
+ 	if (skb_shinfo(skb)->nr_frags) {
+ 		int cur, i;
+ 
+@@ -2549,11 +2562,13 @@ static netdev_tx_t ibmvnic_xmit(struct s
+ 		tx_crq.v1.flags1 |= IBMVNIC_TX_LSO;
+ 		tx_crq.v1.mss = cpu_to_be16(skb_shinfo(skb)->gso_size);
+ 		hdrs += 2;
+-	} else if (!ind_bufp->index && !netdev_xmit_more()) {
+-		ind_bufp->indir_arr[0] = tx_crq;
++	} else if (use_scrq_send_direct) {
++		/* See above comment, CSO disabled with direct xmit */
++		tx_crq.v1.flags1 &= ~(IBMVNIC_TX_CHKSUM_OFFLOAD);
+ 		ind_bufp->index = 1;
+ 		tx_buff->num_entries = 1;
+ 		netdev_tx_sent_queue(txq, skb->len);
++		ind_bufp->indir_arr[0] = tx_crq;
+ 		lpar_rc = ibmvnic_tx_scrq_flush(adapter, tx_scrq, false);
+ 		if (lpar_rc != H_SUCCESS)
+ 			goto tx_err;
