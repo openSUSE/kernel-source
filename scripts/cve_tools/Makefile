@@ -47,9 +47,9 @@ cve2bugzilla: $(CACHESTAMP)
 	curl "$(CVE2BUG_URL)" -o "$@"
 
 hash_cve_$(YEAR).dat: $(wildcard $(VULNS_GIT)/cve/published/$(YEAR)/*.sha1) $(VULNS_GIT)/.git/refs/heads/master
-	@for f in $^ ; do \
+	@for f in $(notdir $^) ; do \
 		[[ $$f == *.sha1 ]] && \
-			echo $$(head -n1 $$f) $$(basename $${f%.sha1}) ; \
+			echo $$(head -n1 $(VULNS_GIT)/cve/published/$(YEAR)/$$f) $${f%.sha1} ; \
 	done | sort -k1 >"$@"
 
 $(wildcard $(VULNS_GIT)/cve/published/$(YEAR)/*.sha1): $(VULNS_GIT)/.git/refs/heads/master
