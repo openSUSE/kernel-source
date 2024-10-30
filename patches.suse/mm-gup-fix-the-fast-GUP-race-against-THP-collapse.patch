@@ -1,0 +1,143 @@
+From: Yang Shi <shy828301@gmail.com>
+Date: Wed, 7 Sep 2022 11:01:43 -0700
+Subject: mm: gup: fix the fast GUP race against THP collapse
+Git-commit: 70cbc3cc78a997d8247b50389d37c4e1736019da
+Patch-mainline: v6.0
+References: CVE-2022-48991 bsc#1232070 prerequisity
+
+Since general RCU GUP fast was introduced in commit 2667f50e8b81 ("mm:
+introduce a general RCU get_user_pages_fast()"), a TLB flush is no longer
+sufficient to handle concurrent GUP-fast in all cases, it only handles
+traditional IPI-based GUP-fast correctly.  On architectures that send an
+IPI broadcast on TLB flush, it works as expected.  But on the
+architectures that do not use IPI to broadcast TLB flush, it may have the
+below race:
+
+   CPU A                                          CPU B
+THP collapse                                     fast GUP
+                                              gup_pmd_range() <-- see valid pmd
+                                                  gup_pte_range() <-- work on pte
+pmdp_collapse_flush() <-- clear pmd and flush
+__collapse_huge_page_isolate()
+    check page pinned <-- before GUP bump refcount
+                                                      pin the page
+                                                      check PTE <-- no change
+__collapse_huge_page_copy()
+    copy data to huge page
+    ptep_clear()
+install huge pmd for the huge page
+                                                      return the stale page
+discard the stale page
+
+The race can be fixed by checking whether PMD is changed or not after
+taking the page pin in fast GUP, just like what it does for PTE.  If the
+PMD is changed it means there may be parallel THP collapse, so GUP should
+back off.
+
+Also update the stale comment about serializing against fast GUP in
+khugepaged.
+
+Link: https://lkml.kernel.org/r/20220907180144.555485-1-shy828301@gmail.com
+Fixes: 2667f50e8b81 ("mm: introduce a general RCU get_user_pages_fast()")
+Acked-by: David Hildenbrand <david@redhat.com>
+Acked-by: Peter Xu <peterx@redhat.com>
+Signed-off-by: Yang Shi <shy828301@gmail.com>
+Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+---
+ mm/gup.c        |   34 ++++++++++++++++++++++++++++------
+ mm/khugepaged.c |   10 ++++++----
+ 2 files changed, 34 insertions(+), 10 deletions(-)
+
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -2249,8 +2249,28 @@ static void __maybe_unused undo_dev_page
+ }
+ 
+ #ifdef CONFIG_ARCH_HAS_PTE_SPECIAL
+-static int gup_pte_range(pmd_t pmd, unsigned long addr, unsigned long end,
+-			 unsigned int flags, struct page **pages, int *nr)
++/*
++ * Fast-gup relies on pte change detection to avoid concurrent pgtable
++ * operations.
++ *
++ * To pin the page, fast-gup needs to do below in order:
++ * (1) pin the page (by prefetching pte), then (2) check pte not changed.
++ *
++ * For the rest of pgtable operations where pgtable updates can be racy
++ * with fast-gup, we need to do (1) clear pte, then (2) check whether page
++ * is pinned.
++ *
++ * Above will work for all pte-level operations, including THP split.
++ *
++ * For THP collapse, it's a bit more complicated because fast-gup may be
++ * walking a pgtable page that is being freed (pte is still valid but pmd
++ * can be cleared already).  To avoid race in such condition, we need to
++ * also check pmd here to make sure pmd doesn't change (corresponds to
++ * pmdp_collapse_flush() in the THP collapse code path).
++ */
++static int gup_pte_range(pmd_t pmd, pmd_t *pmdp, unsigned long addr,
++			 unsigned long end, unsigned int flags,
++			 struct page **pages, int *nr)
+ {
+ 	struct dev_pagemap *pgmap = NULL;
+ 	int nr_start = *nr, ret = 0;
+@@ -2295,7 +2315,8 @@ static int gup_pte_range(pmd_t pmd, unsi
+ 			goto pte_unmap;
+ 		}
+ 
+-		if (unlikely(pte_val(pte) != pte_val(*ptep))) {
++		if (unlikely(pmd_val(pmd) != pmd_val(*pmdp)) ||
++		    unlikely(pte_val(pte) != pte_val(*ptep))) {
+ 			put_compound_head(head, 1, flags);
+ 			goto pte_unmap;
+ 		}
+@@ -2340,8 +2361,9 @@ pte_unmap:
+  * get_user_pages_fast_only implementation that can pin pages. Thus it's still
+  * useful to have gup_huge_pmd even if we can't operate on ptes.
+  */
+-static int gup_pte_range(pmd_t pmd, unsigned long addr, unsigned long end,
+-			 unsigned int flags, struct page **pages, int *nr)
++static int gup_pte_range(pmd_t pmd, pmd_t *pmdp, unsigned long addr,
++			 unsigned long end, unsigned int flags,
++			 struct page **pages, int *nr)
+ {
+ 	return 0;
+ }
+@@ -2650,7 +2672,7 @@ static int gup_pmd_range(pud_t *pudp, pu
+ 			if (!gup_huge_pd(__hugepd(pmd_val(pmd)), addr,
+ 					 PMD_SHIFT, next, flags, pages, nr))
+ 				return 0;
+-		} else if (!gup_pte_range(pmd, addr, next, flags, pages, nr))
++		} else if (!gup_pte_range(pmd, pmdp, addr, next, flags, pages, nr))
+ 			return 0;
+ 	} while (pmdp++, addr = next, addr != end);
+ 
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -1146,10 +1146,12 @@ static void collapse_huge_page(struct mm
+ 
+ 	pmd_ptl = pmd_lock(mm, pmd); /* probably unnecessary */
+ 	/*
+-	 * After this gup_fast can't run anymore. This also removes
+-	 * any huge TLB entry from the CPU so we won't allow
+-	 * huge and small TLB entries for the same virtual address
+-	 * to avoid the risk of CPU bugs in that area.
++	 * This removes any huge TLB entry from the CPU so we won't allow
++	 * huge and small TLB entries for the same virtual address to
++	 * avoid the risk of CPU bugs in that area.
++	 *
++	 * Parallel fast GUP is fine since fast GUP will back off when
++	 * it detects PMD is changed.
+ 	 */
+ 	_pmd = pmdp_collapse_flush(vma, address, pmd);
+ 	spin_unlock(pmd_ptl);
