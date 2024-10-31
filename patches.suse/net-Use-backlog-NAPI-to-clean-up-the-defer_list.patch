@@ -1,0 +1,132 @@
+From 6182785ecd09265c898b7429936e4687626b79c1 Mon Sep 17 00:00:00 2001
+From: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date: Mon, 25 Mar 2024 08:40:30 +0100
+Subject: [PATCH] net: Use backlog-NAPI to clean up the defer_list.
+
+References: bsc#1232534 (PREEMPT_RT prerequisite backports)
+Patch-mainline: v6.10-rc1
+Git-commit: 80d2eefcb4c84aa9018b2a997ab3a4c567bc821a
+
+The defer_list is a per-CPU list which is used to free skbs outside of
+the socket lock and on the CPU on which they have been allocated.
+The list is processed during NAPI callbacks so ideally the list is
+cleaned up.
+Should the amount of skbs on the list exceed a certain water mark then
+the softirq is triggered remotely on the target CPU by invoking a remote
+function call. The raise of the softirqs via a remote function call
+leads to waking the ksoftirqd on PREEMPT_RT which is undesired.
+The backlog-NAPI threads already provide the infrastructure which can be
+utilized to perform the cleanup of the defer_list.
+
+The NAPI state is updated with the input_pkt_queue.lock acquired. It
+order not to break the state, it is needed to also wake the backlog-NAPI
+thread with the lock held. This requires to acquire the use the lock in
+rps_lock_irq*() if the backlog-NAPI threads are used even with RPS
+disabled.
+
+Move the logic of remotely starting softirqs to clean up the defer_list
+into kick_defer_list_purge(). Make sure a lock is held in
+rps_lock_irq*() if backlog-NAPI threads are used. Schedule backlog-NAPI
+for defer_list cleanup if backlog-NAPI is available.
+
+Acked-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ include/linux/netdevice.h |  1 +
+ net/core/dev.c            | 25 +++++++++++++++++++++----
+ net/core/skbuff.c         |  4 ++--
+ 3 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 5895bc23429b..bf017cc872d8 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -3366,6 +3366,7 @@ static inline void dev_xmit_recursion_dec(void)
+ 	__this_cpu_dec(softnet_data.xmit.recursion);
+ }
+ 
++void kick_defer_list_purge(struct softnet_data *sd, unsigned int cpu);
+ void __netif_schedule(struct Qdisc *q);
+ void netif_schedule_queue(struct netdev_queue *txq);
+ 
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 6676df43b26f..198b92514e51 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -219,7 +219,7 @@ static inline struct hlist_head *dev_index_hash(struct net *net, int ifindex)
+ static inline void rps_lock_irqsave(struct softnet_data *sd,
+ 				    unsigned long *flags)
+ {
+-	if (IS_ENABLED(CONFIG_RPS))
++	if (IS_ENABLED(CONFIG_RPS) || use_backlog_threads())
+ 		spin_lock_irqsave(&sd->input_pkt_queue.lock, *flags);
+ 	else if (!IS_ENABLED(CONFIG_PREEMPT_RT))
+ 		local_irq_save(*flags);
+@@ -227,7 +227,7 @@ static inline void rps_lock_irqsave(struct softnet_data *sd,
+ 
+ static inline void rps_lock_irq_disable(struct softnet_data *sd)
+ {
+-	if (IS_ENABLED(CONFIG_RPS))
++	if (IS_ENABLED(CONFIG_RPS) || use_backlog_threads())
+ 		spin_lock_irq(&sd->input_pkt_queue.lock);
+ 	else if (!IS_ENABLED(CONFIG_PREEMPT_RT))
+ 		local_irq_disable();
+@@ -236,7 +236,7 @@ static inline void rps_lock_irq_disable(struct softnet_data *sd)
+ static inline void rps_unlock_irq_restore(struct softnet_data *sd,
+ 					  unsigned long *flags)
+ {
+-	if (IS_ENABLED(CONFIG_RPS))
++	if (IS_ENABLED(CONFIG_RPS) || use_backlog_threads())
+ 		spin_unlock_irqrestore(&sd->input_pkt_queue.lock, *flags);
+ 	else if (!IS_ENABLED(CONFIG_PREEMPT_RT))
+ 		local_irq_restore(*flags);
+@@ -244,7 +244,7 @@ static inline void rps_unlock_irq_restore(struct softnet_data *sd,
+ 
+ static inline void rps_unlock_irq_enable(struct softnet_data *sd)
+ {
+-	if (IS_ENABLED(CONFIG_RPS))
++	if (IS_ENABLED(CONFIG_RPS) || use_backlog_threads())
+ 		spin_unlock_irq(&sd->input_pkt_queue.lock);
+ 	else if (!IS_ENABLED(CONFIG_PREEMPT_RT))
+ 		local_irq_enable();
+@@ -4712,6 +4712,23 @@ static void napi_schedule_rps(struct softnet_data *sd)
+ 	__napi_schedule_irqoff(&mysd->backlog);
+ }
+ 
++void kick_defer_list_purge(struct softnet_data *sd, unsigned int cpu)
++{
++	unsigned long flags;
++
++	if (use_backlog_threads()) {
++		rps_lock_irqsave(sd, &flags);
++
++		if (!__test_and_set_bit(NAPI_STATE_SCHED, &sd->backlog.state))
++			__napi_schedule_irqoff(&sd->backlog);
++
++		rps_unlock_irq_restore(sd, &flags);
++
++	} else if (!cmpxchg(&sd->defer_ipi_scheduled, 0, 1)) {
++		smp_call_function_single_async(cpu, &sd->defer_csd);
++	}
++}
++
+ #ifdef CONFIG_NET_FLOW_LIMIT
+ int netdev_flow_limit_table_len __read_mostly = (1 << 12);
+ #endif
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 5c327ede46a3..4df6d6340521 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -6859,8 +6859,8 @@ nodefer:	__kfree_skb(skb);
+ 	/* Make sure to trigger NET_RX_SOFTIRQ on the remote CPU
+ 	 * if we are unlucky enough (this seems very unlikely).
+ 	 */
+-	if (unlikely(kick) && !cmpxchg(&sd->defer_ipi_scheduled, 0, 1))
+-		smp_call_function_single_async(cpu, &sd->defer_csd);
++	if (unlikely(kick))
++		kick_defer_list_purge(sd, cpu);
+ }
+ 
+ static void skb_splice_csum_page(struct sk_buff *skb, struct page *page,
