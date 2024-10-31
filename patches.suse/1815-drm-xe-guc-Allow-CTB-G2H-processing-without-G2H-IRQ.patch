@@ -1,0 +1,131 @@
+From 2cea06225f290f52931d07825f6c8a416d209bcf Mon Sep 17 00:00:00 2001
+From: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Date: Thu, 6 Jun 2024 15:06:39 +0200
+Subject: drm/xe/guc: Allow CTB G2H processing without G2H IRQ
+Git-commit: 09b286950f2911615694f4a1ff491efe9ed5eeba
+Patch-mainline: v6.11-rc1
+References: jsc#PED-9898 jsc#PED-10191 jsc#PED-10197 jsc#PED-10226 jsc#PED-10237 jsc#PED-10340 jsc#PED-10852 jsc#PED-11022
+
+During early initialization, in the xe_guc_min_load_for_hwconfig()
+function, we are successfully enabling CTB communication, but it
+will only allow us to send non-blocking H2G messages, as due to
+not yet enabled IRQs, including G2H IRQs, we will not notice any
+new G2H message sent by the GuC, including replies to our blocking
+H2G request messages. And those successful replies are mandatory
+for the VF drivers to continue normal operations.
+
+As attempt to workaround this driver initialization ordering issue,
+introduce special safe-mode CTB worker, that will periodically
+trigger G2H processing, like original IRQ handler, in case no
+MSI/MSIX IRQs were enabled on the driver yet. Once we detect that
+IRQ were enabled, we will stop this worker.
+
+Signed-off-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Matthew Brost <matthew.brost@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240606130639.1504-3-michal.wajdeczko@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/xe/xe_guc_ct.c       | 43 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_guc_ct_types.h |  2 ++
+ 2 files changed, 45 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_guc_ct.c b/drivers/gpu/drm/xe/xe_guc_ct.c
+index 08cf355e2e56..936b63483e96 100644
+--- a/drivers/gpu/drm/xe/xe_guc_ct.c
++++ b/drivers/gpu/drm/xe/xe_guc_ct.c
+@@ -126,7 +126,9 @@ static void guc_ct_fini(struct drm_device *drm, void *arg)
+ 	xa_destroy(&ct->fence_lookup);
+ }
+ 
++static void receive_g2h(struct xe_guc_ct *ct);
+ static void g2h_worker_func(struct work_struct *w);
++static void safe_mode_worker_func(struct work_struct *w);
+ 
+ static void primelockdep(struct xe_guc_ct *ct)
+ {
+@@ -155,6 +157,7 @@ int xe_guc_ct_init(struct xe_guc_ct *ct)
+ 	spin_lock_init(&ct->fast_lock);
+ 	xa_init(&ct->fence_lookup);
+ 	INIT_WORK(&ct->g2h_worker, g2h_worker_func);
++	INIT_DELAYED_WORK(&ct->safe_mode_worker,  safe_mode_worker_func);
+ 	init_waitqueue_head(&ct->wq);
+ 	init_waitqueue_head(&ct->g2h_fence_wq);
+ 
+@@ -321,6 +324,42 @@ static void xe_guc_ct_set_state(struct xe_guc_ct *ct,
+ 	mutex_unlock(&ct->lock);
+ }
+ 
++static bool ct_needs_safe_mode(struct xe_guc_ct *ct)
++{
++	return !pci_dev_msi_enabled(to_pci_dev(ct_to_xe(ct)->drm.dev));
++}
++
++static bool ct_restart_safe_mode_worker(struct xe_guc_ct *ct)
++{
++	if (!ct_needs_safe_mode(ct))
++		return false;
++
++	queue_delayed_work(ct->g2h_wq, &ct->safe_mode_worker, HZ / 10);
++	return true;
++}
++
++static void safe_mode_worker_func(struct work_struct *w)
++{
++	struct xe_guc_ct *ct = container_of(w, struct xe_guc_ct, safe_mode_worker.work);
++
++	receive_g2h(ct);
++
++	if (!ct_restart_safe_mode_worker(ct))
++		xe_gt_dbg(ct_to_gt(ct), "GuC CT safe-mode canceled\n");
++}
++
++static void ct_enter_safe_mode(struct xe_guc_ct *ct)
++{
++	if (ct_restart_safe_mode_worker(ct))
++		xe_gt_dbg(ct_to_gt(ct), "GuC CT safe-mode enabled\n");
++}
++
++static void ct_exit_safe_mode(struct xe_guc_ct *ct)
++{
++	if (cancel_delayed_work_sync(&ct->safe_mode_worker))
++		xe_gt_dbg(ct_to_gt(ct), "GuC CT safe-mode disabled\n");
++}
++
+ int xe_guc_ct_enable(struct xe_guc_ct *ct)
+ {
+ 	struct xe_device *xe = ct_to_xe(ct);
+@@ -350,6 +389,9 @@ int xe_guc_ct_enable(struct xe_guc_ct *ct)
+ 	wake_up_all(&ct->wq);
+ 	xe_gt_dbg(gt, "GuC CT communication channel enabled\n");
+ 
++	if (ct_needs_safe_mode(ct))
++		ct_enter_safe_mode(ct);
++
+ 	return 0;
+ 
+ err_out:
+@@ -373,6 +415,7 @@ static void stop_g2h_handler(struct xe_guc_ct *ct)
+ void xe_guc_ct_disable(struct xe_guc_ct *ct)
+ {
+ 	xe_guc_ct_set_state(ct, XE_GUC_CT_STATE_DISABLED);
++	ct_exit_safe_mode(ct);
+ 	stop_g2h_handler(ct);
+ }
+ 
+diff --git a/drivers/gpu/drm/xe/xe_guc_ct_types.h b/drivers/gpu/drm/xe/xe_guc_ct_types.h
+index fede4c6e93cb..761cb9031298 100644
+--- a/drivers/gpu/drm/xe/xe_guc_ct_types.h
++++ b/drivers/gpu/drm/xe/xe_guc_ct_types.h
+@@ -110,6 +110,8 @@ struct xe_guc_ct {
+ 	u32 g2h_outstanding;
+ 	/** @g2h_worker: worker to process G2H messages */
+ 	struct work_struct g2h_worker;
++	/** @safe_mode_worker: worker to check G2H messages with IRQ disabled */
++	struct delayed_work safe_mode_worker;
+ 	/** @state: CT state */
+ 	enum xe_guc_ct_state state;
+ 	/** @fence_seqno: G2H fence seqno - 16 bits used by CT */
+-- 
+2.46.1
+
