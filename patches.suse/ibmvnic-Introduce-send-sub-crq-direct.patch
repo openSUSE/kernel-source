@@ -1,0 +1,162 @@
+From: Nick Child <nnac123@linux.ibm.com>
+Date: Wed, 7 Aug 2024 16:18:07 -0500
+Subject: ibmvnic: Introduce send sub-crq direct
+Patch-mainline: v6.12-rc1
+Git-commit: 74839f7a82689bf5a21a5447cae8e3a7b7a606d2
+References: jsc#PED-9909
+
+Firmware supports two hcalls to send a sub-crq request:
+H_SEND_SUB_CRQ_INDIRECT and H_SEND_SUB_CRQ. The indirect hcall allows
+for submission of batched messages while the other hcall is limited to
+only one message. This protocol is defined in PAPR section 17.2.3.3.
+
+Previously, the ibmvnic xmit function only used the indirect hcall. This
+allowed the driver to batch it's skbs. A single skb can occupy a few
+entries per hcall depending on if FW requires skb header information or
+not. The FW only needs header information if the packet is segmented.
+
+By this logic, if an skb is not GSO then it can fit in one sub-crq
+message and therefore is a candidate for H_SEND_SUB_CRQ.
+Batching skb transmission is only useful when there are more packets
+coming down the line (ie netdev_xmit_more is true).
+
+As it turns out, H_SEND_SUB_CRQ induces less latency than
+H_SEND_SUB_CRQ_INDIRECT. Therefore, use H_SEND_SUB_CRQ where
+appropriate.
+
+Small latency gains seen when doing TCP_RR_150 (request/response
+workload). Ftrace results (graph-time=1):
+  Previous:
+     ibmvnic_xmit = 29618270.83 us / 8860058.0 hits = AVG 3.34
+     ibmvnic_tx_scrq_flush = 21972231.02 us / 6553972.0 hits = AVG 3.35
+  Now:
+     ibmvnic_xmit = 22153350.96 us / 8438942.0 hits = AVG 2.63
+     ibmvnic_tx_scrq_flush = 15858922.4 us / 6244076.0 hits = AVG 2.54
+
+Signed-off-by: Nick Child <nnac123@linux.ibm.com>
+Link: https://patch.msgid.link/20240807211809.1259563-6-nnac123@linux.ibm.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/ibm/ibmvnic.c |   52 ++++++++++++++++++++++++++++++++-----
+ 1 file changed, 46 insertions(+), 6 deletions(-)
+
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@ -117,6 +117,7 @@ static void free_long_term_buff(struct i
+ 				struct ibmvnic_long_term_buff *ltb);
+ static void ibmvnic_disable_irqs(struct ibmvnic_adapter *adapter);
+ static void flush_reset_queue(struct ibmvnic_adapter *adapter);
++static void print_subcrq_error(struct device *dev, int rc, const char *func);
+ 
+ struct ibmvnic_stat {
+ 	char name[ETH_GSTRING_LEN];
+@@ -2334,8 +2335,29 @@ static void ibmvnic_tx_scrq_clean_buffer
+ 	}
+ }
+ 
++static int send_subcrq_direct(struct ibmvnic_adapter *adapter,
++			      u64 remote_handle, u64 *entry)
++{
++	unsigned int ua = adapter->vdev->unit_address;
++	struct device *dev = &adapter->vdev->dev;
++	int rc;
++
++	/* Make sure the hypervisor sees the complete request */
++	dma_wmb();
++	rc = plpar_hcall_norets(H_SEND_SUB_CRQ, ua,
++				cpu_to_be64(remote_handle),
++				cpu_to_be64(entry[0]), cpu_to_be64(entry[1]),
++				cpu_to_be64(entry[2]), cpu_to_be64(entry[3]));
++
++	if (rc)
++		print_subcrq_error(dev, rc, __func__);
++
++	return rc;
++}
++
+ static int ibmvnic_tx_scrq_flush(struct ibmvnic_adapter *adapter,
+-				 struct ibmvnic_sub_crq_queue *tx_scrq)
++				 struct ibmvnic_sub_crq_queue *tx_scrq,
++				 bool indirect)
+ {
+ 	struct ibmvnic_ind_xmit_queue *ind_bufp;
+ 	u64 dma_addr;
+@@ -2350,7 +2372,13 @@ static int ibmvnic_tx_scrq_flush(struct
+ 
+ 	if (!entries)
+ 		return 0;
+-	rc = send_subcrq_indirect(adapter, handle, dma_addr, entries);
++
++	if (indirect)
++		rc = send_subcrq_indirect(adapter, handle, dma_addr, entries);
++	else
++		rc = send_subcrq_direct(adapter, handle,
++					(u64 *)ind_bufp->indir_arr);
++
+ 	if (rc)
+ 		ibmvnic_tx_scrq_clean_buffer(adapter, tx_scrq);
+ 	else
+@@ -2408,7 +2436,7 @@ static netdev_tx_t ibmvnic_xmit(struct s
+ 		tx_dropped++;
+ 		tx_send_failed++;
+ 		ret = NETDEV_TX_OK;
+-		lpar_rc = ibmvnic_tx_scrq_flush(adapter, tx_scrq);
++		lpar_rc = ibmvnic_tx_scrq_flush(adapter, tx_scrq, true);
+ 		if (lpar_rc != H_SUCCESS)
+ 			goto tx_err;
+ 		goto out;
+@@ -2426,7 +2454,7 @@ static netdev_tx_t ibmvnic_xmit(struct s
+ 		tx_send_failed++;
+ 		tx_dropped++;
+ 		ret = NETDEV_TX_OK;
+-		lpar_rc = ibmvnic_tx_scrq_flush(adapter, tx_scrq);
++		lpar_rc = ibmvnic_tx_scrq_flush(adapter, tx_scrq, true);
+ 		if (lpar_rc != H_SUCCESS)
+ 			goto tx_err;
+ 		goto out;
+@@ -2521,6 +2549,16 @@ static netdev_tx_t ibmvnic_xmit(struct s
+ 		tx_crq.v1.flags1 |= IBMVNIC_TX_LSO;
+ 		tx_crq.v1.mss = cpu_to_be16(skb_shinfo(skb)->gso_size);
+ 		hdrs += 2;
++	} else if (!ind_bufp->index && !netdev_xmit_more()) {
++		ind_bufp->indir_arr[0] = tx_crq;
++		ind_bufp->index = 1;
++		tx_buff->num_entries = 1;
++		netdev_tx_sent_queue(txq, skb->len);
++		lpar_rc = ibmvnic_tx_scrq_flush(adapter, tx_scrq, false);
++		if (lpar_rc != H_SUCCESS)
++			goto tx_err;
++
++		goto early_exit;
+ 	}
+ 
+ 	if ((*hdrs >> 7) & 1)
+@@ -2530,7 +2568,7 @@ static netdev_tx_t ibmvnic_xmit(struct s
+ 	tx_buff->num_entries = num_entries;
+ 	/* flush buffer if current entry can not fit */
+ 	if (num_entries + ind_bufp->index > IBMVNIC_MAX_IND_DESCS) {
+-		lpar_rc = ibmvnic_tx_scrq_flush(adapter, tx_scrq);
++		lpar_rc = ibmvnic_tx_scrq_flush(adapter, tx_scrq, true);
+ 		if (lpar_rc != H_SUCCESS)
+ 			goto tx_flush_err;
+ 	}
+@@ -2538,15 +2576,17 @@ static netdev_tx_t ibmvnic_xmit(struct s
+ 	indir_arr[0] = tx_crq;
+ 	memcpy(&ind_bufp->indir_arr[ind_bufp->index], &indir_arr[0],
+ 	       num_entries * sizeof(struct ibmvnic_generic_scrq));
++
+ 	ind_bufp->index += num_entries;
+ 	if (__netdev_tx_sent_queue(txq, skb->len,
+ 				   netdev_xmit_more() &&
+ 				   ind_bufp->index < IBMVNIC_MAX_IND_DESCS)) {
+-		lpar_rc = ibmvnic_tx_scrq_flush(adapter, tx_scrq);
++		lpar_rc = ibmvnic_tx_scrq_flush(adapter, tx_scrq, true);
+ 		if (lpar_rc != H_SUCCESS)
+ 			goto tx_err;
+ 	}
+ 
++early_exit:
+ 	if (atomic_add_return(num_entries, &tx_scrq->used)
+ 					>= adapter->req_tx_entries_per_subcrq) {
+ 		netdev_dbg(netdev, "Stopping queue %d\n", queue_num);
