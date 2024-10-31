@@ -1,0 +1,278 @@
+From 8f9e5de0271ca8fe4bd6a10c41d144b3a283b725 Mon Sep 17 00:00:00 2001
+From: Lucas De Marchi <lucas.demarchi@intel.com>
+Date: Fri, 17 May 2024 13:43:10 -0700
+Subject: drm/xe/client: Print runtime to fdinfo
+Git-commit: 188ced1e0ff892f0948f20480e2e0122380ae46d
+Patch-mainline: v6.11-rc1
+References: jsc#PED-9898 jsc#PED-10191 jsc#PED-10197 jsc#PED-10226 jsc#PED-10237 jsc#PED-10340 jsc#PED-10852 jsc#PED-11022
+
+Print the accumulated runtime for client when printing fdinfo.
+Each time a query is done it first does 2 things:
+
+1) loop through all the exec queues for the current client and
+   accumulate the runtime, per engine class. CTX_TIMESTAMP is used for
+   that, being read from the context image.
+
+2) Read a "GPU timestamp" that can be used for considering "how much GPU
+   time has passed" and that has the same unit/refclock as the one
+   recording the runtime. RING_TIMESTAMP is used for that via MMIO.
+
+Since for all current platforms RING_TIMESTAMP follows the same
+refclock, just read it once, using any first engine available.
+
+This is exported to userspace as 2 numbers in fdinfo:
+
+	drm-cycles-<class>: <RUNTIME>
+	drm-total-cycles-<class>: <TIMESTAMP>
+
+Userspace is expected to collect at least 2 samples, which allows to
+know the client engine busyness as per:
+
+		    RUNTIME1 - RUNTIME0
+	busyness = ---------------------
+			  T1 - T0
+
+Since drm-cycles-<class> always starts at 0, it's also possible to know
+if and engine was ever used by a client.
+
+It's expected that userspace will read any 2 samples every few seconds.
+Given the update frequency of the counters involved and that
+CTX_TIMESTAMP is 32-bits, the counter for each exec_queue can wrap
+around (assuming 100% utilization) after ~200s. The wraparound is not
+perceived by userspace since it's just accumulated for all the
+exec_queues in a 64-bit counter) but the measurement will not be
+accurate if the samples are too far apart.
+
+This could be mitigated by adding a workqueue to accumulate the counters
+every so often, but it's additional complexity for something that is
+done already by userspace every few seconds in tools like gputop (from
+igt), htop, nvtop, etc, with none of them really defaulting to 1 sample
+per minute or more.
+
+Reviewed-by: Umesh Nerlige Ramappa <umesh.nerlige.ramappa@intel.com>
+Acked-by: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240517204310.88854-9-lucas.demarchi@intel.com
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ Documentation/gpu/drm-usage-stats.rst       |   21 ++++
+ Documentation/gpu/xe/index.rst              |    1 
+ Documentation/gpu/xe/xe-drm-usage-stats.rst |   10 ++
+ drivers/gpu/drm/xe/xe_drm_client.c          |  121 +++++++++++++++++++++++++++-
+ 4 files changed, 150 insertions(+), 3 deletions(-)
+ create mode 100644 Documentation/gpu/xe/xe-drm-usage-stats.rst
+
+--- a/Documentation/gpu/drm-usage-stats.rst
++++ b/Documentation/gpu/drm-usage-stats.rst
+@@ -112,6 +112,19 @@
+ was previously read, userspace is expected to stay with that larger previous
+ value until a monotonic update is seen.
+ 
++- drm-total-cycles-<keystr>: <uint>
++
++Engine identifier string must be the same as the one specified in the
++drm-cycles-<keystr> tag and shall contain the total number cycles for the given
++engine.
++
++This is a timestamp in GPU unspecified unit that matches the update rate
++of drm-cycles-<keystr>. For drivers that implement this interface, the engine
++utilization can be calculated entirely on the GPU clock domain, without
++considering the CPU sleep time between 2 samples.
++
++A driver may implement either this key or drm-maxfreq-<keystr>, but not both.
++
+ - drm-maxfreq-<keystr>: <uint> [Hz|MHz|KHz]
+ 
+ Engine identifier string must be the same as the one specified in the
+@@ -121,6 +134,9 @@
+ time active without considering what frequency the engine is operating as a
+ percentage of its maximum frequency.
+ 
++A driver may implement either this key or drm-total-cycles-<keystr>, but not
++both.
++
+ Memory
+ ^^^^^^
+ 
+@@ -168,5 +184,6 @@
+ Driver specific implementations
+ -------------------------------
+ 
+-:ref:`i915-usage-stats`
+-:ref:`panfrost-usage-stats`
++* :ref:`i915-usage-stats`
++* :ref:`panfrost-usage-stats`
++* :ref:`xe-usage-stats`
+--- a/Documentation/gpu/xe/index.rst
++++ b/Documentation/gpu/xe/index.rst
+@@ -23,3 +23,4 @@
+    xe_firmware
+    xe_tile
+    xe_debugging
++   xe-drm-usage-stats.rst
+--- /dev/null
++++ b/Documentation/gpu/xe/xe-drm-usage-stats.rst
+@@ -0,0 +1,10 @@
++.. SPDX-License-Identifier: GPL-2.0+
++
++.. _xe-usage-stats:
++
++========================================
++Xe DRM client usage stats implementation
++========================================
++
++.. kernel-doc:: drivers/gpu/drm/xe/xe_drm_client.c
++   :doc: DRM Client usage stats
+--- a/drivers/gpu/drm/xe/xe_drm_client.c
++++ b/drivers/gpu/drm/xe/xe_drm_client.c
+@@ -2,6 +2,7 @@
+ /*
+  * Copyright © 2023 Intel Corporation
+  */
++#include "xe_drm_client.h"
+ 
+ #include <drm/drm_print.h>
+ #include <drm/xe_drm.h>
+@@ -12,10 +13,67 @@
+ #include "xe_bo.h"
+ #include "xe_bo_types.h"
+ #include "xe_device_types.h"
+-#include "xe_drm_client.h"
++#include "xe_exec_queue.h"
++#include "xe_force_wake.h"
++#include "xe_gt.h"
++#include "xe_hw_engine.h"
++#include "xe_pm.h"
+ #include "xe_trace.h"
+ 
+ /**
++ * DOC: DRM Client usage stats
++ *
++ * The drm/xe driver implements the DRM client usage stats specification as
++ * documented in :ref:`drm-client-usage-stats`.
++ *
++ * Example of the output showing the implemented key value pairs and entirety of
++ * the currently possible format options:
++ *
++ * ::
++ *
++ * 	pos:    0
++ * 	flags:  0100002
++ * 	mnt_id: 26
++ * 	ino:    685
++ * 	drm-driver:     xe
++ * 	drm-client-id:  3
++ * 	drm-pdev:       0000:03:00.0
++ * 	drm-total-system:       0
++ * 	drm-shared-system:      0
++ * 	drm-active-system:      0
++ * 	drm-resident-system:    0
++ * 	drm-purgeable-system:   0
++ * 	drm-total-gtt:  192 KiB
++ * 	drm-shared-gtt: 0
++ * 	drm-active-gtt: 0
++ * 	drm-resident-gtt:       192 KiB
++ * 	drm-total-vram0:        23992 KiB
++ * 	drm-shared-vram0:       16 MiB
++ * 	drm-active-vram0:       0
++ * 	drm-resident-vram0:     23992 KiB
++ * 	drm-total-stolen:       0
++ * 	drm-shared-stolen:      0
++ * 	drm-active-stolen:      0
++ * 	drm-resident-stolen:    0
++ * 	drm-cycles-rcs: 28257900
++ * 	drm-total-cycles-rcs:   7655183225
++ * 	drm-cycles-bcs: 0
++ * 	drm-total-cycles-bcs:   7655183225
++ * 	drm-cycles-vcs: 0
++ * 	drm-total-cycles-vcs:   7655183225
++ * 	drm-engine-capacity-vcs:        2
++ * 	drm-cycles-vecs:        0
++ * 	drm-total-cycles-vecs:  7655183225
++ * 	drm-engine-capacity-vecs:       2
++ * 	drm-cycles-ccs: 0
++ * 	drm-total-cycles-ccs:   7655183225
++ * 	drm-engine-capacity-ccs:        4
++ *
++ * Possible `drm-cycles-` key names are: `rcs`, `ccs`, `bcs`, `vcs`, `vecs` and
++ * "other".
++ */
++
++/**
+  * xe_drm_client_alloc() - Allocate drm client
+  * @void: No arg
+  *
+@@ -179,6 +237,66 @@
+ 	}
+ }
+ 
++static void show_runtime(struct drm_printer *p, struct drm_file *file)
++{
++	unsigned long class, i, gt_id, capacity[XE_ENGINE_CLASS_MAX] = { };
++	struct xe_file *xef = file->driver_priv;
++	struct xe_device *xe = xef->xe;
++	struct xe_gt *gt;
++	struct xe_hw_engine *hwe;
++	struct xe_exec_queue *q;
++	u64 gpu_timestamp;
++
++	xe_pm_runtime_get(xe);
++
++	/* Accumulate all the exec queues from this client */
++	mutex_lock(&xef->exec_queue.lock);
++	xa_for_each(&xef->exec_queue.xa, i, q)
++		xe_exec_queue_update_runtime(q);
++	mutex_unlock(&xef->exec_queue.lock);
++
++	/* Get the total GPU cycles */
++	for_each_gt(gt, xe, gt_id) {
++		hwe = xe_gt_any_hw_engine(gt);
++		if (!hwe)
++			continue;
++
++		xe_force_wake_get(gt_to_fw(gt), XE_FW_GT);
++		gpu_timestamp = xe_hw_engine_read_timestamp(hwe);
++		xe_force_wake_put(gt_to_fw(gt), XE_FW_GT);
++		break;
++	}
++
++	xe_pm_runtime_put(xe);
++
++	if (unlikely(!hwe))
++		return;
++
++	for (class = 0; class < XE_ENGINE_CLASS_MAX; class++) {
++		const char *class_name;
++
++		for_each_gt(gt, xe, gt_id)
++			capacity[class] += gt->user_engines.instances_per_class[class];
++
++		/*
++		 * Engines may be fused off or not exposed to userspace. Don't
++		 * return anything if this entire class is not available
++		 */
++		if (!capacity[class])
++			continue;
++
++		class_name = xe_hw_engine_class_to_str(class);
++		drm_printf(p, "drm-cycles-%s:\t%llu\n",
++			   class_name, xef->runtime[class]);
++		drm_printf(p, "drm-total-cycles-%s:\t%llu\n",
++			   class_name, gpu_timestamp);
++
++		if (capacity[class] > 1)
++			drm_printf(p, "drm-engine-capacity-%s:\t%lu\n",
++				   class_name, capacity[class]);
++	}
++}
++
+ /**
+  * xe_drm_client_fdinfo() - Callback for fdinfo interface
+  * @p: The drm_printer ptr
+@@ -192,5 +310,6 @@
+ void xe_drm_client_fdinfo(struct drm_printer *p, struct drm_file *file)
+ {
+ 	show_meminfo(p, file);
++	show_runtime(p, file);
+ }
+ #endif
