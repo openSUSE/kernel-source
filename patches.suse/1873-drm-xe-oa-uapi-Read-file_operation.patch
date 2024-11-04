@@ -1,0 +1,340 @@
+From 9331706369f2440e4522ab67937e6e6e7185bd41 Mon Sep 17 00:00:00 2001
+From: Ashutosh Dixit <ashutosh.dixit@intel.com>
+Date: Mon, 17 Jun 2024 18:46:01 -0700
+Subject: drm/xe/oa/uapi: Read file_operation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: efb315d0a013cdc8b1e49f5c07b1a2972bc624d4
+Patch-mainline: v6.11-rc1
+References: jsc#PED-9898 jsc#PED-10191 jsc#PED-10197 jsc#PED-10226 jsc#PED-10237 jsc#PED-10340 jsc#PED-10852 jsc#PED-11022
+
+Implement the OA stream read file_operation. Both blocking and non-blocking
+reads are supported. As part of read system call, the read copies OA perf
+data from the OA buffer to the user buffer, after appending packet headers
+for status and data packets.
+
+v2: Drop OA report headers, implement DRM_XE_PERF_IOCTL_STATUS (Umesh)
+v3: Introduce 'struct drm_xe_oa_stream_status'
+v4: Define oa_status register bitfields (Umesh)
+v5: Add extensions to 'struct drm_xe_oa_stream_status'
+v6: Minor cleanup, eliminate report32 variable
+v7: Use -EIO to signal to userspace to read OASTATUS using
+    DRM_XE_PERF_IOCTL_STATUS, change previous sites returning -EIO to
+    return -EINVAL
+    Make drm_xe_oa_stream_status bits contiguous (Jose, Umesh)
+    rmw oa_status bits (Umesh)
+
+Acked-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Acked-by: José Roberto de Souza <jose.souza@intel.com>
+Reviewed-by: Umesh Nerlige Ramappa <umesh.nerlige.ramappa@intel.com>
+Signed-off-by: Ashutosh Dixit <ashutosh.dixit@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240618014609.3233427-10-ashutosh.dixit@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/xe/xe_oa.c       | 201 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_oa_types.h |   3 +
+ include/uapi/drm/xe_drm.h        |  20 +++
+ 3 files changed, 224 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_oa.c b/drivers/gpu/drm/xe/xe_oa.c
+index a71111859190..86d56b080eff 100644
+--- a/drivers/gpu/drm/xe/xe_oa.c
++++ b/drivers/gpu/drm/xe/xe_oa.c
+@@ -164,6 +164,14 @@ static u64 oa_report_id(struct xe_oa_stream *stream, void *report)
+ 	return oa_report_header_64bit(stream) ? *(u64 *)report : *(u32 *)report;
+ }
+ 
++static void oa_report_id_clear(struct xe_oa_stream *stream, u32 *report)
++{
++	if (oa_report_header_64bit(stream))
++		*(u64 *)report = 0;
++	else
++		*report = 0;
++}
++
+ static u64 oa_timestamp(struct xe_oa_stream *stream, void *report)
+ {
+ 	return oa_report_header_64bit(stream) ?
+@@ -171,6 +179,14 @@ static u64 oa_timestamp(struct xe_oa_stream *stream, void *report)
+ 		*((u32 *)report + 1);
+ }
+ 
++static void oa_timestamp_clear(struct xe_oa_stream *stream, u32 *report)
++{
++	if (oa_report_header_64bit(stream))
++		*(u64 *)&report[2] = 0;
++	else
++		report[1] = 0;
++}
++
+ static bool xe_oa_buffer_check_unlocked(struct xe_oa_stream *stream)
+ {
+ 	u32 gtt_offset = xe_bo_ggtt_addr(stream->oa_buffer.bo);
+@@ -245,6 +261,95 @@ static enum hrtimer_restart xe_oa_poll_check_timer_cb(struct hrtimer *hrtimer)
+ 	return HRTIMER_RESTART;
+ }
+ 
++static int xe_oa_append_report(struct xe_oa_stream *stream, char __user *buf,
++			       size_t count, size_t *offset, const u8 *report)
++{
++	int report_size = stream->oa_buffer.format->size;
++	int report_size_partial;
++	u8 *oa_buf_end;
++
++	if ((count - *offset) < report_size)
++		return -ENOSPC;
++
++	buf += *offset;
++
++	oa_buf_end = stream->oa_buffer.vaddr + XE_OA_BUFFER_SIZE;
++	report_size_partial = oa_buf_end - report;
++
++	if (report_size_partial < report_size) {
++		if (copy_to_user(buf, report, report_size_partial))
++			return -EFAULT;
++		buf += report_size_partial;
++
++		if (copy_to_user(buf, stream->oa_buffer.vaddr,
++				 report_size - report_size_partial))
++			return -EFAULT;
++	} else if (copy_to_user(buf, report, report_size)) {
++		return -EFAULT;
++	}
++
++	*offset += report_size;
++
++	return 0;
++}
++
++static int xe_oa_append_reports(struct xe_oa_stream *stream, char __user *buf,
++				size_t count, size_t *offset)
++{
++	int report_size = stream->oa_buffer.format->size;
++	u8 *oa_buf_base = stream->oa_buffer.vaddr;
++	u32 gtt_offset = xe_bo_ggtt_addr(stream->oa_buffer.bo);
++	u32 mask = (XE_OA_BUFFER_SIZE - 1);
++	size_t start_offset = *offset;
++	unsigned long flags;
++	u32 head, tail;
++	int ret = 0;
++
++	spin_lock_irqsave(&stream->oa_buffer.ptr_lock, flags);
++	head = stream->oa_buffer.head;
++	tail = stream->oa_buffer.tail;
++	spin_unlock_irqrestore(&stream->oa_buffer.ptr_lock, flags);
++
++	xe_assert(stream->oa->xe, head < XE_OA_BUFFER_SIZE && tail < XE_OA_BUFFER_SIZE);
++
++	for (; OA_TAKEN(tail, head); head = (head + report_size) & mask) {
++		u8 *report = oa_buf_base + head;
++
++		ret = xe_oa_append_report(stream, buf, count, offset, report);
++		if (ret)
++			break;
++
++		if (is_power_of_2(report_size)) {
++			/* Clear out report id and timestamp to detect unlanded reports */
++			oa_report_id_clear(stream, (void *)report);
++			oa_timestamp_clear(stream, (void *)report);
++		} else {
++			u8 *oa_buf_end = stream->oa_buffer.vaddr + XE_OA_BUFFER_SIZE;
++			u32 part = oa_buf_end - report;
++
++			/* Zero out the entire report */
++			if (report_size <= part) {
++				memset(report, 0, report_size);
++			} else {
++				memset(report, 0, part);
++				memset(oa_buf_base, 0, report_size - part);
++			}
++		}
++	}
++
++	if (start_offset != *offset) {
++		struct xe_reg oaheadptr = __oa_regs(stream)->oa_head_ptr;
++
++		spin_lock_irqsave(&stream->oa_buffer.ptr_lock, flags);
++		xe_mmio_write32(stream->gt, oaheadptr,
++				(head + gtt_offset) & OAG_OAHEADPTR_MASK);
++		stream->oa_buffer.head = head;
++		spin_unlock_irqrestore(&stream->oa_buffer.ptr_lock, flags);
++	}
++
++	return ret;
++}
++
+ static void xe_oa_init_oa_buffer(struct xe_oa_stream *stream)
+ {
+ 	u32 gtt_offset = xe_bo_ggtt_addr(stream->oa_buffer.bo);
+@@ -318,6 +423,78 @@ static void xe_oa_disable(struct xe_oa_stream *stream)
+ 	}
+ }
+ 
++static int xe_oa_wait_unlocked(struct xe_oa_stream *stream)
++{
++	/* We might wait indefinitely if periodic sampling is not enabled */
++	if (!stream->periodic)
++		return -EINVAL;
++
++	return wait_event_interruptible(stream->poll_wq,
++					xe_oa_buffer_check_unlocked(stream));
++}
++
++#define OASTATUS_RELEVANT_BITS (OASTATUS_MMIO_TRG_Q_FULL | OASTATUS_COUNTER_OVERFLOW | \
++				OASTATUS_BUFFER_OVERFLOW | OASTATUS_REPORT_LOST)
++
++static int __xe_oa_read(struct xe_oa_stream *stream, char __user *buf,
++			size_t count, size_t *offset)
++{
++	/* Only clear our bits to avoid side-effects */
++	stream->oa_status = xe_mmio_rmw32(stream->gt, __oa_regs(stream)->oa_status,
++					  OASTATUS_RELEVANT_BITS, 0);
++	/*
++	 * Signal to userspace that there is non-zero OA status to read via
++	 * @DRM_XE_PERF_IOCTL_STATUS perf fd ioctl
++	 */
++	if (stream->oa_status & OASTATUS_RELEVANT_BITS)
++		return -EIO;
++
++	return xe_oa_append_reports(stream, buf, count, offset);
++}
++
++static ssize_t xe_oa_read(struct file *file, char __user *buf,
++			  size_t count, loff_t *ppos)
++{
++	struct xe_oa_stream *stream = file->private_data;
++	size_t offset = 0;
++	int ret;
++
++	/* Can't read from disabled streams */
++	if (!stream->enabled || !stream->sample)
++		return -EINVAL;
++
++	if (!(file->f_flags & O_NONBLOCK)) {
++		do {
++			ret = xe_oa_wait_unlocked(stream);
++			if (ret)
++				return ret;
++
++			mutex_lock(&stream->stream_lock);
++			ret = __xe_oa_read(stream, buf, count, &offset);
++			mutex_unlock(&stream->stream_lock);
++		} while (!offset && !ret);
++	} else {
++		mutex_lock(&stream->stream_lock);
++		ret = __xe_oa_read(stream, buf, count, &offset);
++		mutex_unlock(&stream->stream_lock);
++	}
++
++	/*
++	 * Typically we clear pollin here in order to wait for the new hrtimer callback
++	 * before unblocking. The exception to this is if __xe_oa_read returns -ENOSPC,
++	 * which means that more OA data is available than could fit in the user provided
++	 * buffer. In this case we want the next poll() call to not block.
++	 *
++	 * Also in case of -EIO, we have already waited for data before returning
++	 * -EIO, so need to wait again
++	 */
++	if (ret != -ENOSPC && ret != -EIO)
++		stream->pollin = false;
++
++	/* Possible values for ret are 0, -EFAULT, -ENOSPC, -EIO, -EINVAL, ... */
++	return offset ?: (ret ?: -EAGAIN);
++}
++
+ static __poll_t xe_oa_poll_locked(struct xe_oa_stream *stream,
+ 				  struct file *file, poll_table *wait)
+ {
+@@ -680,6 +857,27 @@ static long xe_oa_config_locked(struct xe_oa_stream *stream, u64 arg)
+ 	return ret;
+ }
+ 
++static long xe_oa_status_locked(struct xe_oa_stream *stream, unsigned long arg)
++{
++	struct drm_xe_oa_stream_status status = {};
++	void __user *uaddr = (void __user *)arg;
++
++	/* Map from register to uapi bits */
++	if (stream->oa_status & OASTATUS_REPORT_LOST)
++		status.oa_status |= DRM_XE_OASTATUS_REPORT_LOST;
++	if (stream->oa_status & OASTATUS_BUFFER_OVERFLOW)
++		status.oa_status |= DRM_XE_OASTATUS_BUFFER_OVERFLOW;
++	if (stream->oa_status & OASTATUS_COUNTER_OVERFLOW)
++		status.oa_status |= DRM_XE_OASTATUS_COUNTER_OVERFLOW;
++	if (stream->oa_status & OASTATUS_MMIO_TRG_Q_FULL)
++		status.oa_status |= DRM_XE_OASTATUS_MMIO_TRG_Q_FULL;
++
++	if (copy_to_user(uaddr, &status, sizeof(status)))
++		return -EFAULT;
++
++	return 0;
++}
++
+ static long xe_oa_ioctl_locked(struct xe_oa_stream *stream,
+ 			       unsigned int cmd,
+ 			       unsigned long arg)
+@@ -693,6 +891,8 @@ static long xe_oa_ioctl_locked(struct xe_oa_stream *stream,
+ 		return 0;
+ 	case DRM_XE_PERF_IOCTL_CONFIG:
+ 		return xe_oa_config_locked(stream, arg);
++	case DRM_XE_PERF_IOCTL_STATUS:
++		return xe_oa_status_locked(stream, arg);
+ 	}
+ 
+ 	return -EINVAL;
+@@ -745,6 +945,7 @@ static const struct file_operations xe_oa_fops = {
+ 	.llseek		= no_llseek,
+ 	.release	= xe_oa_release,
+ 	.poll		= xe_oa_poll,
++	.read		= xe_oa_read,
+ 	.unlocked_ioctl	= xe_oa_ioctl,
+ };
+ 
+diff --git a/drivers/gpu/drm/xe/xe_oa_types.h b/drivers/gpu/drm/xe/xe_oa_types.h
+index 6700383b1a52..5bb8ce0d71c9 100644
+--- a/drivers/gpu/drm/xe/xe_oa_types.h
++++ b/drivers/gpu/drm/xe/xe_oa_types.h
+@@ -222,5 +222,8 @@ struct xe_oa_stream {
+ 
+ 	/** @poll_period_ns: hrtimer period for checking OA buffer for available data */
+ 	u64 poll_period_ns;
++
++	/** @oa_status: temporary storage for oa_status register value */
++	u32 oa_status;
+ };
+ #endif
+diff --git a/include/uapi/drm/xe_drm.h b/include/uapi/drm/xe_drm.h
+index 387eba438c7f..0a82a831fe4e 100644
+--- a/include/uapi/drm/xe_drm.h
++++ b/include/uapi/drm/xe_drm.h
+@@ -1576,6 +1576,26 @@ struct drm_xe_oa_config {
+ 	__u64 regs_ptr;
+ };
+ 
++/**
++ * struct drm_xe_oa_stream_status - OA stream status returned from
++ * @DRM_XE_PERF_IOCTL_STATUS perf fd ioctl. Userspace can call the ioctl to
++ * query stream status in response to EIO errno from perf fd read().
++ */
++struct drm_xe_oa_stream_status {
++	/** @extensions: Pointer to the first extension struct, if any */
++	__u64 extensions;
++
++	/** @oa_status: OA stream status (see Bspec 46717/61226) */
++	__u64 oa_status;
++#define DRM_XE_OASTATUS_MMIO_TRG_Q_FULL		(1 << 3)
++#define DRM_XE_OASTATUS_COUNTER_OVERFLOW	(1 << 2)
++#define DRM_XE_OASTATUS_BUFFER_OVERFLOW		(1 << 1)
++#define DRM_XE_OASTATUS_REPORT_LOST		(1 << 0)
++
++	/** @reserved: reserved for future use */
++	__u64 reserved[3];
++};
++
+ #if defined(__cplusplus)
+ }
+ #endif
+-- 
+2.46.1
+
