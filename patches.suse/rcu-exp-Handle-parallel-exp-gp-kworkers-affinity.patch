@@ -1,0 +1,207 @@
+From: Frederic Weisbecker <frederic@kernel.org>
+Date: Fri, 12 Jan 2024 16:46:20 +0100
+Subject: [PATCH] rcu/exp: Handle parallel exp gp kworkers affinity
+
+References: bsc#1232534 (PREEMPT_RT prerequisite backports)
+Patch-mainline: v6.9-rc1
+Git-commit: b67cffcbbf9dc759d95d330a5af5d1480af2b1f1
+
+Affine the parallel expedited gp kworkers to their respective RCU node
+in order to make them close to the cache their are playing with.
+
+This reuses the boost kthreads machinery that probe into CPU hotplug
+operations such that the kthreads become/stay affine to their respective
+node as soon/long as they contain online CPUs. Otherwise and if the
+current CPU going down was the last online on the leaf node, the related
+kthread is affine to the housekeeping CPUs.
+
+In the long run, this affinity VS CPU hotplug operation game should
+probably be implemented at the generic kthread level.
+
+Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+Reviewed-by: Paul E. McKenney <paulmck@kernel.org>
+[boqun: s/* rcu_boost_task/*rcu_boost_task as reported by checkpatch]
+Signed-off-by: Boqun Feng <boqun.feng@gmail.com>
+---
+ kernel/rcu/tree.c        | 79 +++++++++++++++++++++++++++++++++++++++++++++---
+ kernel/rcu/tree_plugin.h | 42 +++----------------------
+ 2 files changed, 78 insertions(+), 43 deletions(-)
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index 398c099d45d9..312c4c5d4509 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -145,7 +145,7 @@ static int rcu_scheduler_fully_active __read_mostly;
+ 
+ static void rcu_report_qs_rnp(unsigned long mask, struct rcu_node *rnp,
+ 			      unsigned long gps, unsigned long flags);
+-static void rcu_boost_kthread_setaffinity(struct rcu_node *rnp, int outgoingcpu);
++static struct task_struct *rcu_boost_task(struct rcu_node *rnp);
+ static void invoke_rcu_core(void);
+ static void rcu_report_exp_rdp(struct rcu_data *rdp);
+ static void sync_sched_exp_online_cleanup(int cpu);
+@@ -4417,6 +4417,16 @@ static void rcu_spawn_exp_par_gp_kworker(struct rcu_node *rnp)
+ 	sched_setscheduler_nocheck(kworker->task, SCHED_FIFO, &param);
+ }
+ 
++static struct task_struct *rcu_exp_par_gp_task(struct rcu_node *rnp)
++{
++	struct kthread_worker *kworker = READ_ONCE(rnp->exp_kworker);
++
++	if (!kworker)
++		return NULL;
++
++	return kworker->task;
++}
++
+ static void __init rcu_start_exp_gp_kworker(void)
+ {
+ 	const char *name = "rcu_exp_gp_kthread_worker";
+@@ -4441,6 +4451,11 @@ static void rcu_spawn_exp_par_gp_kworker(struct rcu_node *rnp)
+ {
+ }
+ 
++static struct task_struct *rcu_exp_par_gp_task(struct rcu_node *rnp)
++{
++	return NULL;
++}
++
+ static void __init rcu_start_exp_gp_kworker(void)
+ {
+ }
+@@ -4519,13 +4534,67 @@ int rcutree_prepare_cpu(unsigned int cpu)
+ }
+ 
+ /*
+- * Update RCU priority boot kthread affinity for CPU-hotplug changes.
++ * Update kthreads affinity during CPU-hotplug changes.
++ *
++ * Set the per-rcu_node kthread's affinity to cover all CPUs that are
++ * served by the rcu_node in question.  The CPU hotplug lock is still
++ * held, so the value of rnp->qsmaskinit will be stable.
++ *
++ * We don't include outgoingcpu in the affinity set, use -1 if there is
++ * no outgoing CPU.  If there are no CPUs left in the affinity set,
++ * this function allows the kthread to execute on any CPU.
++ *
++ * Any future concurrent calls are serialized via ->kthread_mutex.
+  */
+-static void rcutree_affinity_setting(unsigned int cpu, int outgoing)
++static void rcutree_affinity_setting(unsigned int cpu, int outgoingcpu)
+ {
+-	struct rcu_data *rdp = per_cpu_ptr(&rcu_data, cpu);
++	cpumask_var_t cm;
++	unsigned long mask;
++	struct rcu_data *rdp;
++	struct rcu_node *rnp;
++	struct task_struct *task_boost, *task_exp;
++
++	if (!IS_ENABLED(CONFIG_RCU_EXP_KTHREAD) && !IS_ENABLED(CONFIG_RCU_BOOST))
++		return;
++
++	rdp = per_cpu_ptr(&rcu_data, cpu);
++	rnp = rdp->mynode;
++
++	task_boost = rcu_boost_task(rnp);
++	task_exp = rcu_exp_par_gp_task(rnp);
++
++	/*
++	 * If CPU is the boot one, those tasks are created later from early
++	 * initcall since kthreadd must be created first.
++	 */
++	if (!task_boost && !task_exp)
++		return;
++
++	if (!zalloc_cpumask_var(&cm, GFP_KERNEL))
++		return;
++
++	mutex_lock(&rnp->kthread_mutex);
++	mask = rcu_rnp_online_cpus(rnp);
++	for_each_leaf_node_possible_cpu(rnp, cpu)
++		if ((mask & leaf_node_cpu_bit(rnp, cpu)) &&
++		    cpu != outgoingcpu)
++			cpumask_set_cpu(cpu, cm);
++	cpumask_and(cm, cm, housekeeping_cpumask(HK_TYPE_RCU));
++	if (cpumask_empty(cm)) {
++		cpumask_copy(cm, housekeeping_cpumask(HK_TYPE_RCU));
++		if (outgoingcpu >= 0)
++			cpumask_clear_cpu(outgoingcpu, cm);
++	}
++
++	if (task_exp)
++		set_cpus_allowed_ptr(task_exp, cm);
++
++	if (task_boost)
++		set_cpus_allowed_ptr(task_boost, cm);
++
++	mutex_unlock(&rnp->kthread_mutex);
+ 
+-	rcu_boost_kthread_setaffinity(rdp->mynode, outgoing);
++	free_cpumask_var(cm);
+ }
+ 
+ /*
+diff --git a/kernel/rcu/tree_plugin.h b/kernel/rcu/tree_plugin.h
+index 09bdd36ca9ff..36a8b5dbf5b5 100644
+--- a/kernel/rcu/tree_plugin.h
++++ b/kernel/rcu/tree_plugin.h
+@@ -1211,43 +1211,9 @@ static void rcu_spawn_one_boost_kthread(struct rcu_node *rnp)
+ 	wake_up_process(t); /* get to TASK_INTERRUPTIBLE quickly. */
+ }
+ 
+-/*
+- * Set the per-rcu_node kthread's affinity to cover all CPUs that are
+- * served by the rcu_node in question.  The CPU hotplug lock is still
+- * held, so the value of rnp->qsmaskinit will be stable.
+- *
+- * We don't include outgoingcpu in the affinity set, use -1 if there is
+- * no outgoing CPU.  If there are no CPUs left in the affinity set,
+- * this function allows the kthread to execute on any CPU.
+- *
+- * Any future concurrent calls are serialized via ->kthread_mutex.
+- */
+-static void rcu_boost_kthread_setaffinity(struct rcu_node *rnp, int outgoingcpu)
++static struct task_struct *rcu_boost_task(struct rcu_node *rnp)
+ {
+-	struct task_struct *t = rnp->boost_kthread_task;
+-	unsigned long mask;
+-	cpumask_var_t cm;
+-	int cpu;
+-
+-	if (!t)
+-		return;
+-	if (!zalloc_cpumask_var(&cm, GFP_KERNEL))
+-		return;
+-	mutex_lock(&rnp->kthread_mutex);
+-	mask = rcu_rnp_online_cpus(rnp);
+-	for_each_leaf_node_possible_cpu(rnp, cpu)
+-		if ((mask & leaf_node_cpu_bit(rnp, cpu)) &&
+-		    cpu != outgoingcpu)
+-			cpumask_set_cpu(cpu, cm);
+-	cpumask_and(cm, cm, housekeeping_cpumask(HK_TYPE_RCU));
+-	if (cpumask_empty(cm)) {
+-		cpumask_copy(cm, housekeeping_cpumask(HK_TYPE_RCU));
+-		if (outgoingcpu >= 0)
+-			cpumask_clear_cpu(outgoingcpu, cm);
+-	}
+-	set_cpus_allowed_ptr(t, cm);
+-	mutex_unlock(&rnp->kthread_mutex);
+-	free_cpumask_var(cm);
++	return READ_ONCE(rnp->boost_kthread_task);
+ }
+ 
+ #else /* #ifdef CONFIG_RCU_BOOST */
+@@ -1266,10 +1232,10 @@ static void rcu_spawn_one_boost_kthread(struct rcu_node *rnp)
+ {
+ }
+ 
+-static void rcu_boost_kthread_setaffinity(struct rcu_node *rnp, int outgoingcpu)
++static struct task_struct *rcu_boost_task(struct rcu_node *rnp)
+ {
++	return NULL;
+ }
+-
+ #endif /* #else #ifdef CONFIG_RCU_BOOST */
+ 
+ /*
