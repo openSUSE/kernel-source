@@ -1,0 +1,213 @@
+Patch-mainline: v6.12-rc1
+Git-commit: 989a84c93f592e6b288fb3b96d2eeec827d75bef
+References: git-fixes
+From: Sean Christopherson <seanjc@google.com>
+Date: Fri, 30 Aug 2024 17:15:18 -0700
+Subject: [PATCH] KVM: x86/mmu: Trigger unprotect logic only on
+ write-protection page faults
+
+Trigger KVM's various "unprotect gfn" paths if and only if the page fault
+was a write to a write-protected gfn.  To do so, add a new page fault
+return code, RET_PF_WRITE_PROTECTED, to explicitly and precisely track
+such page faults.
+
+If a page fault requires emulation for any MMIO (or any reason besides
+write-protection), trying to unprotect the gfn is pointless and risks
+putting the vCPU into an infinite loop.  E.g. KVM will put the vCPU into
+an infinite loop if the vCPU manages to trigger MMIO on a page table walk.
+
+Fixes: 147277540bbc ("kvm: svm: Add support for additional SVM NPF error codes")
+Reviewed-by: Yuan Yao <yuan.yao@intel.com>
+Link: https://lore.kernel.org/r/20240831001538.336683-4-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/kvm/mmu/mmu.c          | 75 +++++++++++++++++++--------------
+ arch/x86/kvm/mmu/mmu_internal.h |  3 ++
+ arch/x86/kvm/mmu/mmutrace.h     |  1 +
+ arch/x86/kvm/mmu/paging_tmpl.h  |  2 +-
+ arch/x86/kvm/mmu/tdp_mmu.c      |  6 +--
+ 5 files changed, 50 insertions(+), 37 deletions(-)
+
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 1eedd1932e5f..d8deed29091b 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -2896,10 +2896,8 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
+ 		trace_kvm_mmu_set_spte(level, gfn, sptep);
+ 	}
+ 
+-	if (wrprot) {
+-		if (write_fault)
+-			ret = RET_PF_EMULATE;
+-	}
++	if (wrprot && write_fault)
++		ret = RET_PF_WRITE_PROTECTED;
+ 
+ 	if (flush)
+ 		kvm_flush_remote_tlbs_gfn(vcpu->kvm, gfn, level);
+@@ -4531,7 +4529,7 @@ static int direct_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 		return RET_PF_RETRY;
+ 
+ 	if (page_fault_handle_page_track(vcpu, fault))
+-		return RET_PF_EMULATE;
++		return RET_PF_WRITE_PROTECTED;
+ 
+ 	r = fast_page_fault(vcpu, fault);
+ 	if (r != RET_PF_INVALID)
+@@ -4624,7 +4622,7 @@ static int kvm_tdp_mmu_page_fault(struct kvm_vcpu *vcpu,
+ 	int r;
+ 
+ 	if (page_fault_handle_page_track(vcpu, fault))
+-		return RET_PF_EMULATE;
++		return RET_PF_WRITE_PROTECTED;
+ 
+ 	r = fast_page_fault(vcpu, fault);
+ 	if (r != RET_PF_INVALID)
+@@ -5952,6 +5951,40 @@ static bool is_write_to_guest_page_table(u64 error_code)
+ 	write_unlock(&vcpu->kvm->mmu_lock);
+ }
+ 
++static int kvm_mmu_write_protect_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
++				       u64 error_code, int *emulation_type)
++{
++	bool direct = vcpu->arch.mmu->root_role.direct;
++
++	/*
++	 * Before emulating the instruction, check if the error code
++	 * was due to a RO violation while translating the guest page.
++	 * This can occur when using nested virtualization with nested
++	 * paging in both guests. If true, we simply unprotect the page
++	 * and resume the guest.
++	 */
++	if (direct && (error_code & PFERR_NESTED_GUEST_PAGE) == PFERR_NESTED_GUEST_PAGE) {
++		kvm_mmu_unprotect_page(vcpu->kvm, gpa_to_gfn(cr2_or_gpa));
++		return RET_PF_RETRY;
++	}
++
++	/*
++	 * The gfn is write-protected, but if emulation fails we can still
++	 * optimistically try to just unprotect the page and let the processor
++	 * re-execute the instruction that caused the page fault.  Do not allow
++	 * retrying MMIO emulation, as it's not only pointless but could also
++	 * cause us to enter an infinite loop because the processor will keep
++	 * faulting on the non-existent MMIO address.  Retrying an instruction
++	 * from a nested guest is also pointless and dangerous as we are only
++	 * explicitly shadowing L1's page tables, i.e. unprotecting something
++	 * for L1 isn't going to magically fix whatever issue cause L2 to fail.
++	 */
++	if (!mmio_info_in_cache(vcpu, cr2_or_gpa, direct) && !is_guest_mode(vcpu))
++		*emulation_type |= EMULTYPE_ALLOW_RETRY_PF;
++
++	return RET_PF_EMULATE;
++}
++
+ int noinline kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa, u64 error_code,
+ 		       void *insn, int insn_len)
+ {
+@@ -5997,35 +6030,13 @@ int noinline kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa, u64 err
+ 
+ 	if (r < 0)
+ 		return r;
++	if (r == RET_PF_WRITE_PROTECTED)
++		r = kvm_mmu_write_protect_fault(vcpu, cr2_or_gpa, error_code,
++						&emulation_type);
++
+ 	if (r != RET_PF_EMULATE)
+ 		return 1;
+ 
+-	/*
+-	 * Before emulating the instruction, check if the error code
+-	 * was due to a RO violation while translating the guest page.
+-	 * This can occur when using nested virtualization with nested
+-	 * paging in both guests. If true, we simply unprotect the page
+-	 * and resume the guest.
+-	 */
+-	if (vcpu->arch.mmu->root_role.direct &&
+-	    (error_code & PFERR_NESTED_GUEST_PAGE) == PFERR_NESTED_GUEST_PAGE) {
+-		kvm_mmu_unprotect_page(vcpu->kvm, gpa_to_gfn(cr2_or_gpa));
+-		return 1;
+-	}
+-
+-	/*
+-	 * vcpu->arch.mmu.page_fault returned RET_PF_EMULATE, but we can still
+-	 * optimistically try to just unprotect the page and let the processor
+-	 * re-execute the instruction that caused the page fault.  Do not allow
+-	 * retrying MMIO emulation, as it's not only pointless but could also
+-	 * cause us to enter an infinite loop because the processor will keep
+-	 * faulting on the non-existent MMIO address.  Retrying an instruction
+-	 * from a nested guest is also pointless and dangerous as we are only
+-	 * explicitly shadowing L1's page tables, i.e. unprotecting something
+-	 * for L1 isn't going to magically fix whatever issue cause L2 to fail.
+-	 */
+-	if (!mmio_info_in_cache(vcpu, cr2_or_gpa, direct) && !is_guest_mode(vcpu))
+-		emulation_type |= EMULTYPE_ALLOW_RETRY_PF;
+ emulate:
+ 	return x86_emulate_instruction(vcpu, cr2_or_gpa, emulation_type, insn,
+ 				       insn_len);
+diff --git a/arch/x86/kvm/mmu/mmu_internal.h b/arch/x86/kvm/mmu/mmu_internal.h
+index 1721d97743e9..50d2624111f8 100644
+--- a/arch/x86/kvm/mmu/mmu_internal.h
++++ b/arch/x86/kvm/mmu/mmu_internal.h
+@@ -258,6 +258,8 @@ int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault);
+  * RET_PF_CONTINUE: So far, so good, keep handling the page fault.
+  * RET_PF_RETRY: let CPU fault again on the address.
+  * RET_PF_EMULATE: mmio page fault, emulate the instruction directly.
++ * RET_PF_WRITE_PROTECTED: the gfn is write-protected, either unprotected the
++ *                         gfn and retry, or emulate the instruction directly.
+  * RET_PF_INVALID: the spte is invalid, let the real page fault path update it.
+  * RET_PF_FIXED: The faulting entry has been fixed.
+  * RET_PF_SPURIOUS: The faulting entry was already fixed, e.g. by another vCPU.
+@@ -274,6 +276,7 @@ enum {
+ 	RET_PF_CONTINUE = 0,
+ 	RET_PF_RETRY,
+ 	RET_PF_EMULATE,
++	RET_PF_WRITE_PROTECTED,
+ 	RET_PF_INVALID,
+ 	RET_PF_FIXED,
+ 	RET_PF_SPURIOUS,
+diff --git a/arch/x86/kvm/mmu/mmutrace.h b/arch/x86/kvm/mmu/mmutrace.h
+index 195d98bc8de8..f35a830ce469 100644
+--- a/arch/x86/kvm/mmu/mmutrace.h
++++ b/arch/x86/kvm/mmu/mmutrace.h
+@@ -57,6 +57,7 @@
+ TRACE_DEFINE_ENUM(RET_PF_CONTINUE);
+ TRACE_DEFINE_ENUM(RET_PF_RETRY);
+ TRACE_DEFINE_ENUM(RET_PF_EMULATE);
++TRACE_DEFINE_ENUM(RET_PF_WRITE_PROTECTED);
+ TRACE_DEFINE_ENUM(RET_PF_INVALID);
+ TRACE_DEFINE_ENUM(RET_PF_FIXED);
+ TRACE_DEFINE_ENUM(RET_PF_SPURIOUS);
+diff --git a/arch/x86/kvm/mmu/paging_tmpl.h b/arch/x86/kvm/mmu/paging_tmpl.h
+index 405bd7ceee2a..ae7d39ff2d07 100644
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@ -806,7 +806,7 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 
+ 	if (page_fault_handle_page_track(vcpu, fault)) {
+ 		shadow_page_table_clear_flood(vcpu, fault->addr);
+-		return RET_PF_EMULATE;
++		return RET_PF_WRITE_PROTECTED;
+ 	}
+ 
+ 	r = mmu_topup_memory_caches(vcpu, true);
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index c7dc49ee7388..8bf44ac9372f 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -1046,10 +1046,8 @@ static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
+ 	 * protected, emulation is needed. If the emulation was skipped,
+ 	 * the vCPU would have the same fault again.
+ 	 */
+-	if (wrprot) {
+-		if (fault->write)
+-			ret = RET_PF_EMULATE;
+-	}
++	if (wrprot && fault->write)
++		ret = RET_PF_WRITE_PROTECTED;
+ 
+ 	/* If a MMIO SPTE is installed, the MMIO will need to be emulated. */
+ 	if (unlikely(is_mmio_spte(new_spte))) {
+-- 
+2.43.0
+
