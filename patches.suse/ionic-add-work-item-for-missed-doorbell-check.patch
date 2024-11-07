@@ -1,0 +1,174 @@
+From: Shannon Nelson <shannon.nelson@amd.com>
+Date: Tue, 18 Jun 2024 17:32:53 -0700
+Subject: ionic: add work item for missed-doorbell check
+Patch-mainline: v6.11-rc1
+Git-commit: 4ded136c78f8ae17d140b8aae3cd4459a6827577
+References: jsc#PED-11379
+
+Add the first queued work for checking on the missed doorbell.
+This is a delayed work item that reschedules itself every cycle
+starting at probe.
+
+Signed-off-by: Shannon Nelson <shannon.nelson@amd.com>
+Link: https://lore.kernel.org/r/20240619003257.6138-5-shannon.nelson@amd.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/pensando/ionic/ionic.h         |    1 
+ drivers/net/ethernet/pensando/ionic/ionic_bus_pci.c |    2 
+ drivers/net/ethernet/pensando/ionic/ionic_dev.c     |   66 ++++++++++++++++++++
+ drivers/net/ethernet/pensando/ionic/ionic_dev.h     |    3 
+ drivers/net/ethernet/pensando/ionic/ionic_lif.c     |    2 
+ 5 files changed, 73 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/pensando/ionic/ionic.h
++++ b/drivers/net/ethernet/pensando/ionic/ionic.h
+@@ -56,6 +56,7 @@ struct ionic {
+ 	unsigned int nintrs;
+ 	DECLARE_BITMAP(intrs, IONIC_INTR_CTRL_REGS_MAX);
+ 	cpumask_var_t *affinity_masks;
++	struct delayed_work doorbell_check_dwork;
+ 	struct work_struct nb_work;
+ 	struct notifier_block nb;
+ 	struct rw_semaphore vf_op_lock;	/* lock for VF operations */
+--- a/drivers/net/ethernet/pensando/ionic/ionic_bus_pci.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_bus_pci.c
+@@ -377,6 +377,7 @@ static int ionic_probe(struct pci_dev *p
+ 
+ 	mod_timer(&ionic->watchdog_timer,
+ 		  round_jiffies(jiffies + ionic->watchdog_period));
++	ionic_queue_doorbell_check(ionic, IONIC_NAPI_DEADLINE);
+ 
+ 	return 0;
+ 
+@@ -411,6 +412,7 @@ static void ionic_remove(struct pci_dev
+ 		if (test_and_clear_bit(IONIC_LIF_F_FW_RESET, ionic->lif->state))
+ 			set_bit(IONIC_LIF_F_FW_STOPPING, ionic->lif->state);
+ 
++		cancel_delayed_work_sync(&ionic->doorbell_check_dwork);
+ 		ionic_lif_unregister(ionic->lif);
+ 		ionic_devlink_unregister(ionic);
+ 		ionic_lif_deinit(ionic->lif);
+--- a/drivers/net/ethernet/pensando/ionic/ionic_dev.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_dev.c
+@@ -47,6 +47,61 @@ static void ionic_watchdog_cb(struct tim
+ 	}
+ }
+ 
++static void ionic_napi_schedule_do_softirq(struct napi_struct *napi)
++{
++	local_bh_disable();
++	napi_schedule(napi);
++	local_bh_enable();
++}
++
++static int ionic_get_preferred_cpu(struct ionic *ionic,
++				   struct ionic_intr_info *intr)
++{
++	int cpu;
++
++	cpu = cpumask_first_and(*intr->affinity_mask, cpu_online_mask);
++	if (cpu >= nr_cpu_ids)
++		cpu = cpumask_local_spread(0, dev_to_node(ionic->dev));
++
++	return cpu;
++}
++
++static void ionic_doorbell_check_dwork(struct work_struct *work)
++{
++	struct ionic *ionic = container_of(work, struct ionic,
++					   doorbell_check_dwork.work);
++	struct ionic_lif *lif = ionic->lif;
++
++	mutex_lock(&lif->queue_lock);
++
++	if (test_bit(IONIC_LIF_F_FW_STOPPING, lif->state) ||
++	    test_bit(IONIC_LIF_F_FW_RESET, lif->state)) {
++		mutex_unlock(&lif->queue_lock);
++		return;
++	}
++
++	ionic_napi_schedule_do_softirq(&lif->adminqcq->napi);
++
++	if (test_bit(IONIC_LIF_F_UP, lif->state)) {
++		int i;
++
++		for (i = 0; i < lif->nxqs; i++) {
++			ionic_napi_schedule_do_softirq(&lif->txqcqs[i]->napi);
++			ionic_napi_schedule_do_softirq(&lif->rxqcqs[i]->napi);
++		}
++
++		if (lif->hwstamp_txq &&
++		    lif->hwstamp_txq->flags & IONIC_QCQ_F_INTR)
++			ionic_napi_schedule_do_softirq(&lif->hwstamp_txq->napi);
++		if (lif->hwstamp_rxq &&
++		    lif->hwstamp_rxq->flags & IONIC_QCQ_F_INTR)
++			ionic_napi_schedule_do_softirq(&lif->hwstamp_rxq->napi);
++	}
++	mutex_unlock(&lif->queue_lock);
++
++	ionic_queue_doorbell_check(ionic, IONIC_NAPI_DEADLINE);
++}
++
+ static int ionic_watchdog_init(struct ionic *ionic)
+ {
+ 	struct ionic_dev *idev = &ionic->idev;
+@@ -70,10 +125,21 @@ static int ionic_watchdog_init(struct io
+ 		dev_err(ionic->dev, "alloc_workqueue failed");
+ 		return -ENOMEM;
+ 	}
++	INIT_DELAYED_WORK(&ionic->doorbell_check_dwork,
++			  ionic_doorbell_check_dwork);
+ 
+ 	return 0;
+ }
+ 
++void ionic_queue_doorbell_check(struct ionic *ionic, int delay)
++{
++	int cpu;
++
++	cpu = ionic_get_preferred_cpu(ionic, &ionic->lif->adminqcq->intr);
++	queue_delayed_work_on(cpu, ionic->wq, &ionic->doorbell_check_dwork,
++			      delay);
++}
++
+ void ionic_init_devinfo(struct ionic *ionic)
+ {
+ 	struct ionic_dev *idev = &ionic->idev;
+--- a/drivers/net/ethernet/pensando/ionic/ionic_dev.h
++++ b/drivers/net/ethernet/pensando/ionic/ionic_dev.h
+@@ -28,7 +28,7 @@
+ #define IONIC_DEV_INFO_REG_COUNT	32
+ #define IONIC_DEV_CMD_REG_COUNT		32
+ 
+-#define IONIC_NAPI_DEADLINE		(HZ / 200)	/* 5ms */
++#define IONIC_NAPI_DEADLINE		(HZ)		/* 1 sec */
+ #define IONIC_ADMIN_DOORBELL_DEADLINE	(HZ / 2)	/* 500ms */
+ #define IONIC_TX_DOORBELL_DEADLINE	(HZ / 100)	/* 10ms */
+ #define IONIC_RX_MIN_DOORBELL_DEADLINE	(HZ / 100)	/* 10ms */
+@@ -388,6 +388,7 @@ bool ionic_q_is_posted(struct ionic_queu
+ 
+ int ionic_heartbeat_check(struct ionic *ionic);
+ bool ionic_is_fw_running(struct ionic_dev *idev);
++void ionic_queue_doorbell_check(struct ionic *ionic, int delay);
+ 
+ bool ionic_adminq_poke_doorbell(struct ionic_queue *q);
+ bool ionic_txq_poke_doorbell(struct ionic_queue *q);
+--- a/drivers/net/ethernet/pensando/ionic/ionic_lif.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_lif.c
+@@ -1191,6 +1191,7 @@ static int ionic_adminq_napi(struct napi
+ 	if (lif->adminqcq && lif->adminqcq->flags & IONIC_QCQ_F_INITED)
+ 		a_work = ionic_cq_service(&lif->adminqcq->cq, budget,
+ 					  ionic_adminq_service, NULL, NULL);
++
+ 	spin_unlock_irqrestore(&lif->adminq_lock, irqflags);
+ 
+ 	if (lif->hwstamp_rxq)
+@@ -3406,6 +3407,7 @@ int ionic_restart_lif(struct ionic_lif *
+ 	clear_bit(IONIC_LIF_F_FW_RESET, lif->state);
+ 	ionic_link_status_check_request(lif, CAN_SLEEP);
+ 	netif_device_attach(lif->netdev);
++	ionic_queue_doorbell_check(ionic, IONIC_NAPI_DEADLINE);
+ 
+ 	return 0;
+ 
