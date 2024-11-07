@@ -1,0 +1,227 @@
+From: Brett Creeley <brett.creeley@amd.com>
+Date: Fri, 6 Sep 2024 16:26:23 -0700
+Subject: ionic: Allow XDP program to be hot swapped
+Patch-mainline: v6.12-rc1
+Git-commit: 3c0bf13f5d5fcd6722e83a7203bf3dbb3ef73b6f
+References: jsc#PED-11379
+
+Using examples of other driver(s), add the ability to hot-swap an XDP
+program without having to reconfigure the queues. To prevent the
+q->xdp_prog to be read/written more than once use READ_ONCE() and
+WRITE_ONCE() on the q->xdp_prog.
+
+The q->xdp_prog was being checked in multiple different for loops in the
+hot path. The change to allow xdp_prog hot swapping created the
+possibility for many READ_ONCE(q->xdp_prog) calls during a single napi
+callback. Refactor the Rx napi handling to allow a previous
+READ_ONCE(q->xdp_prog) (or NULL for hwstamp_rxq) to be passed into the
+relevant functions.
+
+Also, move other Rx related hotpath handling into the newly created
+ionic_rx_cq_service() function to reduce the scope of the xdp_prog
+local variable and put all Rx handling in one function similar to Tx.
+
+Signed-off-by: Brett Creeley <brett.creeley@amd.com>
+Signed-off-by: Shannon Nelson <shannon.nelson@amd.com>
+Link: https://patch.msgid.link/20240906232623.39651-8-brett.creeley@amd.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/pensando/ionic/ionic_lif.c  |   12 +++-
+ drivers/net/ethernet/pensando/ionic/ionic_txrx.c |   58 ++++++++++++++++-------
+ drivers/net/ethernet/pensando/ionic/ionic_txrx.h |    4 +
+ 3 files changed, 52 insertions(+), 22 deletions(-)
+
+--- a/drivers/net/ethernet/pensando/ionic/ionic_lif.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_lif.c
+@@ -1074,7 +1074,7 @@ int ionic_lif_create_hwstamp_rxq(struct
+ 			goto err_qcq_init;
+ 
+ 		if (test_bit(IONIC_LIF_F_UP, lif->state)) {
+-			ionic_rx_fill(&rxq->q);
++			ionic_rx_fill(&rxq->q, NULL);
+ 			err = ionic_qcq_enable(rxq);
+ 			if (err)
+ 				goto err_qcq_enable;
+@@ -2190,7 +2190,8 @@ static int ionic_txrx_enable(struct ioni
+ 			goto err_out;
+ 		}
+ 
+-		ionic_rx_fill(&lif->rxqcqs[i]->q);
++		ionic_rx_fill(&lif->rxqcqs[i]->q,
++			      READ_ONCE(lif->rxqcqs[i]->q.xdp_prog));
+ 		err = ionic_qcq_enable(lif->rxqcqs[i]);
+ 		if (err)
+ 			goto err_out;
+@@ -2203,7 +2204,7 @@ static int ionic_txrx_enable(struct ioni
+ 	}
+ 
+ 	if (lif->hwstamp_rxq) {
+-		ionic_rx_fill(&lif->hwstamp_rxq->q);
++		ionic_rx_fill(&lif->hwstamp_rxq->q, NULL);
+ 		err = ionic_qcq_enable(lif->hwstamp_rxq);
+ 		if (err)
+ 			goto err_out_hwstamp_rx;
+@@ -2746,7 +2747,7 @@ static void ionic_xdp_rxqs_prog_update(s
+ 	for (i = 0; i < lif->ionic->nrxqs_per_lif && lif->rxqcqs[i]; i++) {
+ 		struct ionic_queue *q = &lif->rxqcqs[i]->q;
+ 
+-		q->xdp_prog = xdp_prog;
++		WRITE_ONCE(q->xdp_prog, xdp_prog);
+ 	}
+ }
+ 
+@@ -2777,6 +2778,9 @@ static int ionic_xdp_config(struct net_d
+ 
+ 	if (!netif_running(netdev)) {
+ 		old_prog = xchg(&lif->xdp_prog, bpf->prog);
++	} else if (lif->xdp_prog && bpf->prog) {
++		old_prog = xchg(&lif->xdp_prog, bpf->prog);
++		ionic_xdp_rxqs_prog_update(lif);
+ 	} else {
+ 		struct ionic_queue_params qparams;
+ 
+--- a/drivers/net/ethernet/pensando/ionic/ionic_txrx.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_txrx.c
+@@ -602,7 +602,8 @@ static bool ionic_run_xdp(struct ionic_r
+ 
+ static void ionic_rx_clean(struct ionic_queue *q,
+ 			   struct ionic_rx_desc_info *desc_info,
+-			   struct ionic_rxq_comp *comp)
++			   struct ionic_rxq_comp *comp,
++			   struct bpf_prog *xdp_prog)
+ {
+ 	struct net_device *netdev = q->lif->netdev;
+ 	struct ionic_qcq *qcq = q_to_qcq(q);
+@@ -631,8 +632,8 @@ static void ionic_rx_clean(struct ionic_
+ 	stats->pkts++;
+ 	stats->bytes += len;
+ 
+-	if (q->xdp_prog) {
+-		if (ionic_run_xdp(stats, netdev, q->xdp_prog, q, desc_info->bufs, len))
++	if (xdp_prog) {
++		if (ionic_run_xdp(stats, netdev, xdp_prog, q, desc_info->bufs, len))
+ 			return;
+ 		synced = true;
+ 		headroom = XDP_PACKET_HEADROOM;
+@@ -718,7 +719,7 @@ static void ionic_rx_clean(struct ionic_
+ 		napi_gro_frags(&qcq->napi);
+ }
+ 
+-bool ionic_rx_service(struct ionic_cq *cq)
++static bool __ionic_rx_service(struct ionic_cq *cq, struct bpf_prog *xdp_prog)
+ {
+ 	struct ionic_rx_desc_info *desc_info;
+ 	struct ionic_queue *q = cq->bound_q;
+@@ -740,11 +741,16 @@ bool ionic_rx_service(struct ionic_cq *c
+ 	q->tail_idx = (q->tail_idx + 1) & (q->num_descs - 1);
+ 
+ 	/* clean the related q entry, only one per qc completion */
+-	ionic_rx_clean(q, desc_info, comp);
++	ionic_rx_clean(q, desc_info, comp, xdp_prog);
+ 
+ 	return true;
+ }
+ 
++bool ionic_rx_service(struct ionic_cq *cq)
++{
++	return __ionic_rx_service(cq, NULL);
++}
++
+ static inline void ionic_write_cmb_desc(struct ionic_queue *q,
+ 					void *desc)
+ {
+@@ -755,7 +761,7 @@ static inline void ionic_write_cmb_desc(
+ 		memcpy_toio(&q->cmb_txq[q->head_idx], desc, sizeof(q->cmb_txq[0]));
+ }
+ 
+-void ionic_rx_fill(struct ionic_queue *q)
++void ionic_rx_fill(struct ionic_queue *q, struct bpf_prog *xdp_prog)
+ {
+ 	struct net_device *netdev = q->lif->netdev;
+ 	struct ionic_rx_desc_info *desc_info;
+@@ -783,7 +789,7 @@ void ionic_rx_fill(struct ionic_queue *q
+ 
+ 	len = netdev->mtu + VLAN_ETH_HLEN;
+ 
+-	if (q->xdp_prog) {
++	if (xdp_prog) {
+ 		/* Always alloc the full size buffer, but only need
+ 		 * the actual frag_len in the descriptor
+ 		 * XDP uses space in the first buffer, so account for
+@@ -964,6 +970,32 @@ static void ionic_xdp_do_flush(struct io
+ 	}
+ }
+ 
++static unsigned int ionic_rx_cq_service(struct ionic_cq *cq,
++					unsigned int work_to_do)
++{
++	struct ionic_queue *q = cq->bound_q;
++	unsigned int work_done = 0;
++	struct bpf_prog *xdp_prog;
++
++	if (work_to_do == 0)
++		return 0;
++
++	xdp_prog = READ_ONCE(q->xdp_prog);
++	while (__ionic_rx_service(cq, xdp_prog)) {
++		if (cq->tail_idx == cq->num_descs - 1)
++			cq->done_color = !cq->done_color;
++
++		cq->tail_idx = (cq->tail_idx + 1) & (cq->num_descs - 1);
++
++		if (++work_done >= work_to_do)
++			break;
++	}
++	ionic_rx_fill(q, xdp_prog);
++	ionic_xdp_do_flush(cq);
++
++	return work_done;
++}
++
+ int ionic_rx_napi(struct napi_struct *napi, int budget)
+ {
+ 	struct ionic_qcq *qcq = napi_to_qcq(napi);
+@@ -974,12 +1006,8 @@ int ionic_rx_napi(struct napi_struct *na
+ 	if (unlikely(!budget))
+ 		return budget;
+ 
+-	work_done = ionic_cq_service(cq, budget,
+-				     ionic_rx_service, NULL, NULL);
+-
+-	ionic_rx_fill(cq->bound_q);
++	work_done = ionic_rx_cq_service(cq, budget);
+ 
+-	ionic_xdp_do_flush(cq);
+ 	if (work_done < budget && napi_complete_done(napi, work_done)) {
+ 		ionic_dim_update(qcq, IONIC_LIF_F_RX_DIM_INTR);
+ 		flags |= IONIC_INTR_CRED_UNMASK;
+@@ -1020,12 +1048,8 @@ int ionic_txrx_napi(struct napi_struct *
+ 	if (unlikely(!budget))
+ 		return budget;
+ 
+-	rx_work_done = ionic_cq_service(rxcq, budget,
+-					ionic_rx_service, NULL, NULL);
+-
+-	ionic_rx_fill(rxcq->bound_q);
++	rx_work_done = ionic_rx_cq_service(rxcq, budget);
+ 
+-	ionic_xdp_do_flush(rxcq);
+ 	if (rx_work_done < budget && napi_complete_done(napi, rx_work_done)) {
+ 		ionic_dim_update(rxqcq, 0);
+ 		flags |= IONIC_INTR_CRED_UNMASK;
+--- a/drivers/net/ethernet/pensando/ionic/ionic_txrx.h
++++ b/drivers/net/ethernet/pensando/ionic/ionic_txrx.h
+@@ -4,9 +4,11 @@
+ #ifndef _IONIC_TXRX_H_
+ #define _IONIC_TXRX_H_
+ 
++struct bpf_prog;
++
+ void ionic_tx_flush(struct ionic_cq *cq);
+ 
+-void ionic_rx_fill(struct ionic_queue *q);
++void ionic_rx_fill(struct ionic_queue *q, struct bpf_prog *xdp_prog);
+ void ionic_rx_empty(struct ionic_queue *q);
+ void ionic_tx_empty(struct ionic_queue *q);
+ int ionic_rx_napi(struct napi_struct *napi, int budget);
