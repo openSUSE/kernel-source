@@ -1,0 +1,132 @@
+From: Shannon Nelson <shannon.nelson@amd.com>
+Date: Wed, 14 Feb 2024 09:59:08 -0800
+Subject: ionic: add ndo_xdp_xmit
+Patch-mainline: v6.9-rc1
+Git-commit: 26f5726a78574a4f9d77ef7610bfb6dc402cca81
+References: jsc#PED-11379
+
+When our ndo_xdp_xmit is called we mark the buffer with
+XDP_REDIRECT so we know to return it to the XDP stack for
+cleaning.
+
+Co-developed-by: Brett Creeley <brett.creeley@amd.com>
+Signed-off-by: Brett Creeley <brett.creeley@amd.com>
+Signed-off-by: Shannon Nelson <shannon.nelson@amd.com>
+Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/pensando/ionic/ionic_lif.c  |    4 +
+ drivers/net/ethernet/pensando/ionic/ionic_txrx.c |   63 ++++++++++++++++++++++-
+ drivers/net/ethernet/pensando/ionic/ionic_txrx.h |    1 
+ 3 files changed, 66 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/pensando/ionic/ionic_lif.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_lif.c
+@@ -1650,7 +1650,8 @@ static int ionic_init_nic_features(struc
+ 			      IFF_LIVE_ADDR_CHANGE;
+ 
+ 	netdev->xdp_features = NETDEV_XDP_ACT_BASIC    |
+-			       NETDEV_XDP_ACT_REDIRECT;
++			       NETDEV_XDP_ACT_REDIRECT |
++			       NETDEV_XDP_ACT_NDO_XMIT;
+ 
+ 	return 0;
+ }
+@@ -2847,6 +2848,7 @@ static const struct net_device_ops ionic
+ 	.ndo_eth_ioctl		= ionic_eth_ioctl,
+ 	.ndo_start_xmit		= ionic_start_xmit,
+ 	.ndo_bpf		= ionic_xdp,
++	.ndo_xdp_xmit		= ionic_xdp_xmit,
+ 	.ndo_get_stats64	= ionic_get_stats64,
+ 	.ndo_set_rx_mode	= ionic_ndo_set_rx_mode,
+ 	.ndo_set_features	= ionic_set_features,
+--- a/drivers/net/ethernet/pensando/ionic/ionic_txrx.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_txrx.c
+@@ -320,9 +320,13 @@ static void ionic_xdp_tx_desc_clean(stru
+ 	buf_info = desc_info->bufs;
+ 	dma_unmap_single(dev, buf_info->dma_addr,
+ 			 buf_info->len, DMA_TO_DEVICE);
+-	__free_pages(buf_info->page, 0);
++	if (desc_info->act == XDP_TX)
++		__free_pages(buf_info->page, 0);
+ 	buf_info->page = NULL;
+ 
++	if (desc_info->act == XDP_REDIRECT)
++		xdp_return_frame(desc_info->xdpf);
++
+ 	desc_info->nbufs = 0;
+ 	desc_info->xdpf = NULL;
+ 	desc_info->act = 0;
+@@ -376,6 +380,63 @@ static int ionic_xdp_post_frame(struct n
+ 	return 0;
+ }
+ 
++int ionic_xdp_xmit(struct net_device *netdev, int n,
++		   struct xdp_frame **xdp_frames, u32 flags)
++{
++	struct ionic_lif *lif = netdev_priv(netdev);
++	struct ionic_queue *txq;
++	struct netdev_queue *nq;
++	int nxmit;
++	int space;
++	int cpu;
++	int qi;
++
++	if (unlikely(!test_bit(IONIC_LIF_F_UP, lif->state)))
++		return -ENETDOWN;
++
++	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++		return -EINVAL;
++
++	/* AdminQ is assumed on cpu 0, while we attempt to affinitize the
++	 * TxRx queue pairs 0..n-1 on cpus 1..n.  We try to keep with that
++	 * affinitization here, but of course irqbalance and friends might
++	 * have juggled things anyway, so we have to check for the 0 case.
++	 */
++	cpu = smp_processor_id();
++	qi = cpu ? (cpu - 1) % lif->nxqs : cpu;
++
++	txq = &lif->txqcqs[qi]->q;
++	nq = netdev_get_tx_queue(netdev, txq->index);
++	__netif_tx_lock(nq, cpu);
++	txq_trans_cond_update(nq);
++
++	if (netif_tx_queue_stopped(nq) ||
++	    unlikely(ionic_maybe_stop_tx(txq, 1))) {
++		__netif_tx_unlock(nq);
++		return -EIO;
++	}
++
++	space = min_t(int, n, ionic_q_space_avail(txq));
++	for (nxmit = 0; nxmit < space ; nxmit++) {
++		if (ionic_xdp_post_frame(netdev, txq, xdp_frames[nxmit],
++					 XDP_REDIRECT,
++					 virt_to_page(xdp_frames[nxmit]->data),
++					 0, false)) {
++			nxmit--;
++			break;
++		}
++	}
++
++	if (flags & XDP_XMIT_FLUSH)
++		ionic_dbell_ring(lif->kern_dbpage, txq->hw_type,
++				 txq->dbval | txq->head_idx);
++
++	ionic_maybe_stop_tx(txq, 4);
++	__netif_tx_unlock(nq);
++
++	return nxmit;
++}
++
+ static bool ionic_run_xdp(struct ionic_rx_stats *stats,
+ 			  struct net_device *netdev,
+ 			  struct bpf_prog *xdp_prog,
+--- a/drivers/net/ethernet/pensando/ionic/ionic_txrx.h
++++ b/drivers/net/ethernet/pensando/ionic/ionic_txrx.h
+@@ -17,4 +17,5 @@ netdev_tx_t ionic_start_xmit(struct sk_b
+ bool ionic_rx_service(struct ionic_cq *cq, struct ionic_cq_info *cq_info);
+ bool ionic_tx_service(struct ionic_cq *cq, struct ionic_cq_info *cq_info);
+ 
++int ionic_xdp_xmit(struct net_device *netdev, int n, struct xdp_frame **xdp, u32 flags);
+ #endif /* _IONIC_TXRX_H_ */
