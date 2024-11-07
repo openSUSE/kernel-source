@@ -1,0 +1,268 @@
+From: Brett Creeley <brett.creeley@amd.com>
+Date: Thu, 29 Feb 2024 11:39:24 -0800
+Subject: ionic: Rework Tx start/stop flow
+Patch-mainline: v6.9-rc1
+Git-commit: 061b9bedbef124ab28682496bdba7f265f13b2f3
+References: jsc#PED-11379
+
+Currently the driver attempts to wake the Tx queue
+for every descriptor processed. However, this is
+overkill and can cause thrashing since Tx xmit can be
+running concurrently on a different CPU than Tx clean.
+Fix this by refactoring Tx cq servicing into its own
+function so the Tx wake code can run after processing
+all Tx descriptors.
+
+The driver isn't using the expected memory barriers
+to make sure the stop/start bits are coherent. Fix
+this by  making sure to use the correct memory barriers.
+
+Also, the driver is using the wake API during Tx
+xmit even though it's already scheduled. Fix this by
+using the start API during Tx xmit.
+
+Signed-off-by: Brett Creeley <brett.creeley@amd.com>
+Signed-off-by: Shannon Nelson <shannon.nelson@amd.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/pensando/ionic/ionic_dev.h  |    2 
+ drivers/net/ethernet/pensando/ionic/ionic_lif.c  |    3 
+ drivers/net/ethernet/pensando/ionic/ionic_txrx.c |   89 ++++++++++++-----------
+ drivers/net/ethernet/pensando/ionic/ionic_txrx.h |    1 
+ 4 files changed, 50 insertions(+), 45 deletions(-)
+
+--- a/drivers/net/ethernet/pensando/ionic/ionic_dev.h
++++ b/drivers/net/ethernet/pensando/ionic/ionic_dev.h
+@@ -19,6 +19,7 @@
+ #define IONIC_DEF_TXRX_DESC		4096
+ #define IONIC_RX_FILL_THRESHOLD		16
+ #define IONIC_RX_FILL_DIV		8
++#define IONIC_TSO_DESCS_NEEDED		44 /* 64K TSO @1500B */
+ #define IONIC_LIFS_MAX			1024
+ #define IONIC_WATCHDOG_SECS		5
+ #define IONIC_ITR_COAL_USEC_DEFAULT	64
+@@ -379,6 +380,7 @@ typedef void (*ionic_cq_done_cb)(void *d
+ unsigned int ionic_cq_service(struct ionic_cq *cq, unsigned int work_to_do,
+ 			      ionic_cq_cb cb, ionic_cq_done_cb done_cb,
+ 			      void *done_arg);
++unsigned int ionic_tx_cq_service(struct ionic_cq *cq, unsigned int work_to_do);
+ 
+ int ionic_q_init(struct ionic_lif *lif, struct ionic_dev *idev,
+ 		 struct ionic_queue *q, unsigned int index, const char *name,
+--- a/drivers/net/ethernet/pensando/ionic/ionic_lif.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_lif.c
+@@ -1262,8 +1262,7 @@ static int ionic_adminq_napi(struct napi
+ 					   ionic_rx_service, NULL, NULL);
+ 
+ 	if (lif->hwstamp_txq)
+-		tx_work = ionic_cq_service(&lif->hwstamp_txq->cq, budget,
+-					   ionic_tx_service, NULL, NULL);
++		tx_work = ionic_tx_cq_service(&lif->hwstamp_txq->cq, budget);
+ 
+ 	work_done = max(max(n_work, a_work), max(rx_work, tx_work));
+ 	if (work_done < budget && napi_complete_done(napi, work_done)) {
+--- a/drivers/net/ethernet/pensando/ionic/ionic_txrx.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_txrx.c
+@@ -5,13 +5,12 @@
+ #include <linux/ipv6.h>
+ #include <linux/if_vlan.h>
+ #include <net/ip6_checksum.h>
++#include <net/netdev_queues.h>
+ 
+ #include "ionic.h"
+ #include "ionic_lif.h"
+ #include "ionic_txrx.h"
+ 
+-static int ionic_maybe_stop_tx(struct ionic_queue *q, int ndescs);
+-
+ static dma_addr_t ionic_tx_map_single(struct ionic_queue *q,
+ 				      void *data, size_t len);
+ 
+@@ -458,7 +457,9 @@ int ionic_xdp_xmit(struct net_device *ne
+ 	txq_trans_cond_update(nq);
+ 
+ 	if (netif_tx_queue_stopped(nq) ||
+-	    unlikely(ionic_maybe_stop_tx(txq, 1))) {
++	    !netif_txq_maybe_stop(q_to_ndq(txq),
++				  ionic_q_space_avail(txq),
++				  1, 1)) {
+ 		__netif_tx_unlock(nq);
+ 		return -EIO;
+ 	}
+@@ -478,7 +479,9 @@ int ionic_xdp_xmit(struct net_device *ne
+ 		ionic_dbell_ring(lif->kern_dbpage, txq->hw_type,
+ 				 txq->dbval | txq->head_idx);
+ 
+-	ionic_maybe_stop_tx(txq, 4);
++	netif_txq_maybe_stop(q_to_ndq(txq),
++			     ionic_q_space_avail(txq),
++			     4, 4);
+ 	__netif_tx_unlock(nq);
+ 
+ 	return nxmit;
+@@ -571,7 +574,9 @@ static bool ionic_run_xdp(struct ionic_r
+ 		txq_trans_cond_update(nq);
+ 
+ 		if (netif_tx_queue_stopped(nq) ||
+-		    unlikely(ionic_maybe_stop_tx(txq, 1))) {
++		    !netif_txq_maybe_stop(q_to_ndq(txq),
++					  ionic_q_space_avail(txq),
++					  1, 1)) {
+ 			__netif_tx_unlock(nq);
+ 			goto out_xdp_abort;
+ 		}
+@@ -946,8 +951,7 @@ int ionic_tx_napi(struct napi_struct *na
+ 	lif = cq->bound_q->lif;
+ 	idev = &lif->ionic->idev;
+ 
+-	work_done = ionic_cq_service(cq, budget,
+-				     ionic_tx_service, NULL, NULL);
++	work_done = ionic_tx_cq_service(cq, budget);
+ 
+ 	if (unlikely(!budget))
+ 		return budget;
+@@ -1038,8 +1042,7 @@ int ionic_txrx_napi(struct napi_struct *
+ 	txqcq = lif->txqcqs[qi];
+ 	txcq = &lif->txqcqs[qi]->cq;
+ 
+-	tx_work_done = ionic_cq_service(txcq, IONIC_TX_BUDGET_DEFAULT,
+-					ionic_tx_service, NULL, NULL);
++	tx_work_done = ionic_tx_cq_service(txcq, IONIC_TX_BUDGET_DEFAULT);
+ 
+ 	if (unlikely(!budget))
+ 		return budget;
+@@ -1183,7 +1186,6 @@ static void ionic_tx_clean(struct ionic_
+ 	struct ionic_tx_stats *stats = q_to_tx_stats(q);
+ 	struct ionic_qcq *qcq = q_to_qcq(q);
+ 	struct sk_buff *skb = cb_arg;
+-	u16 qi;
+ 
+ 	if (desc_info->xdpf) {
+ 		ionic_xdp_tx_desc_clean(q->partner, desc_info);
+@@ -1200,8 +1202,6 @@ static void ionic_tx_clean(struct ionic_
+ 	if (!skb)
+ 		return;
+ 
+-	qi = skb_get_queue_mapping(skb);
+-
+ 	if (ionic_txq_hwstamp_enabled(q)) {
+ 		if (cq_info) {
+ 			struct skb_shared_hwtstamps hwts = {};
+@@ -1227,9 +1227,6 @@ static void ionic_tx_clean(struct ionic_
+ 				stats->hwstamp_invalid++;
+ 			}
+ 		}
+-
+-	} else if (unlikely(__netif_subqueue_stopped(q->lif->netdev, qi))) {
+-		netif_wake_subqueue(q->lif->netdev, qi);
+ 	}
+ 
+ 	desc_info->bytes = skb->len;
+@@ -1238,7 +1235,7 @@ static void ionic_tx_clean(struct ionic_
+ 	dev_consume_skb_any(skb);
+ }
+ 
+-bool ionic_tx_service(struct ionic_cq *cq, struct ionic_cq_info *cq_info)
++static bool ionic_tx_service(struct ionic_cq *cq, struct ionic_cq_info *cq_info)
+ {
+ 	struct ionic_queue *q = cq->bound_q;
+ 	struct ionic_desc_info *desc_info;
+@@ -1275,6 +1272,37 @@ bool ionic_tx_service(struct ionic_cq *c
+ 	return true;
+ }
+ 
++unsigned int ionic_tx_cq_service(struct ionic_cq *cq, unsigned int work_to_do)
++{
++	struct ionic_cq_info *cq_info;
++	unsigned int work_done = 0;
++
++	if (work_to_do == 0)
++		return 0;
++
++	cq_info = &cq->info[cq->tail_idx];
++	while (ionic_tx_service(cq, cq_info)) {
++		if (cq->tail_idx == cq->num_descs - 1)
++			cq->done_color = !cq->done_color;
++		cq->tail_idx = (cq->tail_idx + 1) & (cq->num_descs - 1);
++		cq_info = &cq->info[cq->tail_idx];
++
++		if (++work_done >= work_to_do)
++			break;
++	}
++
++	if (work_done) {
++		struct ionic_queue *q = cq->bound_q;
++
++		smp_mb();	/* assure sync'd state before stopped check */
++		if (unlikely(__netif_subqueue_stopped(q->lif->netdev, q->index)) &&
++		    ionic_q_has_space(q, IONIC_TSO_DESCS_NEEDED))
++			netif_wake_subqueue(q->lif->netdev, q->index);
++	}
++
++	return work_done;
++}
++
+ void ionic_tx_flush(struct ionic_cq *cq)
+ {
+ 	struct ionic_dev *idev = &cq->lif->ionic->idev;
+@@ -1724,25 +1752,6 @@ linearize:
+ 	return ndescs;
+ }
+ 
+-static int ionic_maybe_stop_tx(struct ionic_queue *q, int ndescs)
+-{
+-	int stopped = 0;
+-
+-	if (unlikely(!ionic_q_has_space(q, ndescs))) {
+-		netif_stop_subqueue(q->lif->netdev, q->index);
+-		stopped = 1;
+-
+-		/* Might race with ionic_tx_clean, check again */
+-		smp_rmb();
+-		if (ionic_q_has_space(q, ndescs)) {
+-			netif_wake_subqueue(q->lif->netdev, q->index);
+-			stopped = 0;
+-		}
+-	}
+-
+-	return stopped;
+-}
+-
+ static netdev_tx_t ionic_start_hwstamp_xmit(struct sk_buff *skb,
+ 					    struct net_device *netdev)
+ {
+@@ -1804,7 +1813,9 @@ netdev_tx_t ionic_start_xmit(struct sk_b
+ 	if (ndescs < 0)
+ 		goto err_out_drop;
+ 
+-	if (unlikely(ionic_maybe_stop_tx(q, ndescs)))
++	if (!netif_txq_maybe_stop(q_to_ndq(q),
++				  ionic_q_space_avail(q),
++				  ndescs, ndescs))
+ 		return NETDEV_TX_BUSY;
+ 
+ 	if (skb_is_gso(skb))
+@@ -1815,12 +1826,6 @@ netdev_tx_t ionic_start_xmit(struct sk_b
+ 	if (err)
+ 		goto err_out_drop;
+ 
+-	/* Stop the queue if there aren't descriptors for the next packet.
+-	 * Since our SG lists per descriptor take care of most of the possible
+-	 * fragmentation, we don't need to have many descriptors available.
+-	 */
+-	ionic_maybe_stop_tx(q, 4);
+-
+ 	return NETDEV_TX_OK;
+ 
+ err_out_drop:
+--- a/drivers/net/ethernet/pensando/ionic/ionic_txrx.h
++++ b/drivers/net/ethernet/pensando/ionic/ionic_txrx.h
+@@ -15,7 +15,6 @@ int ionic_txrx_napi(struct napi_struct *
+ netdev_tx_t ionic_start_xmit(struct sk_buff *skb, struct net_device *netdev);
+ 
+ bool ionic_rx_service(struct ionic_cq *cq, struct ionic_cq_info *cq_info);
+-bool ionic_tx_service(struct ionic_cq *cq, struct ionic_cq_info *cq_info);
+ 
+ int ionic_xdp_xmit(struct net_device *netdev, int n, struct xdp_frame **xdp, u32 flags);
+ #endif /* _IONIC_TXRX_H_ */

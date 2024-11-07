@@ -1,0 +1,357 @@
+From: John Ogness <john.ogness@linutronix.de>
+Date: Tue, 20 Aug 2024 08:35:56 +0206
+Subject: [PATCH] printk: Add helper for flush type logic
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+References: bsc#1232534 (PREEMPT_RT prerequisite backports)
+Patch-mainline: v6.12-rc1
+Git-commit: 6690d6b52726bcb2b743466a1833e0b9f049b9d7
+
+There are many call sites where console flushing occur.
+Depending on the system state and types of consoles, the flush
+methods to use are different. A flush call site generally must
+consider:
+
+	@have_boot_console
+	@have_nbcon_console
+	@have_legacy_console
+	@legacy_allow_panic_sync
+	is_printk_preferred()
+
+and take into account the current CPU state:
+
+	NBCON_PRIO_NORMAL
+	NBCON_PRIO_EMERGENCY
+	NBCON_PRIO_PANIC
+
+in order to decide if it should:
+
+	flush nbcon directly via atomic_write() callback
+	flush legacy directly via console_unlock
+	flush legacy via offload to irq_work
+
+All of these call sites use their own logic to make this
+decision, which is complicated and error prone. Especially
+later when two more flush methods will be introduced:
+
+	flush nbcon via offload to kthread
+	flush legacy via offload to kthread
+
+Introduce a new internal struct console_flush_type that specifies
+which console flushing methods should be used in the context of
+the caller.
+
+Introduce a helper function to fill out console_flush_type to
+be used for flushing call sites.
+
+Replace the logic of all flushing call sites to use the new
+helper.
+
+This change standardizes behavior, leading to both fixes and
+optimizations across various call sites. For instance, in
+console_cpu_notify(), the new logic ensures that nbcon consoles
+are flushed when they aren’t managed by the legacy loop.
+Similarly, in console_flush_on_panic(), the system no longer
+needs to flush nbcon consoles if none are present.
+
+Signed-off-by: John Ogness <john.ogness@linutronix.de>
+Reviewed-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20240820063001.36405-31-john.ogness@linutronix.de
+[pmladek@suse.com: Updated the commit message.]
+Signed-off-by: Petr Mladek <pmladek@suse.com>
+---
+ kernel/printk/internal.h | 73 ++++++++++++++++++++++++++++++++++++++++++++++++
+ kernel/printk/nbcon.c    | 12 ++++++--
+ kernel/printk/printk.c   | 68 ++++++++++++++++++++------------------------
+ 3 files changed, 112 insertions(+), 41 deletions(-)
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+
+diff --git a/kernel/printk/internal.h b/kernel/printk/internal.h
+index 6b61350a3026..ba2e0f1940bd 100644
+--- a/kernel/printk/internal.h
++++ b/kernel/printk/internal.h
+@@ -154,8 +154,81 @@ static inline bool console_is_usable(struct console *con, short flags) { return
+ #endif /* CONFIG_PRINTK */
+ 
+ extern bool have_boot_console;
++extern bool have_nbcon_console;
++extern bool have_legacy_console;
+ extern bool legacy_allow_panic_sync;
+ 
++/**
++ * struct console_flush_type - Define available console flush methods
++ * @nbcon_atomic:	Flush directly using nbcon_atomic() callback
++ * @legacy_direct:	Call the legacy loop in this context
++ * @legacy_offload:	Offload the legacy loop into IRQ
++ *
++ * Note that the legacy loop also flushes the nbcon consoles.
++ */
++struct console_flush_type {
++	bool	nbcon_atomic;
++	bool	legacy_direct;
++	bool	legacy_offload;
++};
++
++/*
++ * Identify which console flushing methods should be used in the context of
++ * the caller.
++ */
++static inline void printk_get_console_flush_type(struct console_flush_type *ft)
++{
++	memset(ft, 0, sizeof(*ft));
++
++	switch (nbcon_get_default_prio()) {
++	case NBCON_PRIO_NORMAL:
++		if (have_nbcon_console && !have_boot_console)
++			ft->nbcon_atomic = true;
++
++		/* Legacy consoles are flushed directly when possible. */
++		if (have_legacy_console || have_boot_console) {
++			if (!is_printk_legacy_deferred())
++				ft->legacy_direct = true;
++			else
++				ft->legacy_offload = true;
++		}
++		break;
++
++	case NBCON_PRIO_PANIC:
++		/*
++		 * In panic, the nbcon consoles will directly print. But
++		 * only allowed if there are no boot consoles.
++		 */
++		if (have_nbcon_console && !have_boot_console)
++			ft->nbcon_atomic = true;
++
++		if (have_legacy_console || have_boot_console) {
++			/*
++			 * This is the same decision as NBCON_PRIO_NORMAL
++			 * except that offloading never occurs in panic.
++			 *
++			 * Note that console_flush_on_panic() will flush
++			 * legacy consoles anyway, even if unsafe.
++			 */
++			if (!is_printk_legacy_deferred())
++				ft->legacy_direct = true;
++
++			/*
++			 * In panic, if nbcon atomic printing occurs,
++			 * the legacy consoles must remain silent until
++			 * explicitly allowed.
++			 */
++			if (ft->nbcon_atomic && !legacy_allow_panic_sync)
++				ft->legacy_direct = false;
++		}
++		break;
++
++	default:
++		WARN_ON_ONCE(1);
++		break;
++	}
++}
++
+ extern struct printk_buffers printk_shared_pbufs;
+ 
+ /**
+diff --git a/kernel/printk/nbcon.c b/kernel/printk/nbcon.c
+index afdb16c1c733..18488d6c17c0 100644
+--- a/kernel/printk/nbcon.c
++++ b/kernel/printk/nbcon.c
+@@ -1344,6 +1344,7 @@ EXPORT_SYMBOL_GPL(nbcon_device_try_acquire);
+ void nbcon_device_release(struct console *con)
+ {
+ 	struct nbcon_context *ctxt = &ACCESS_PRIVATE(con, nbcon_device_ctxt);
++	struct console_flush_type ft;
+ 	int cookie;
+ 
+ 	if (!nbcon_context_exit_unsafe(ctxt))
+@@ -1359,12 +1360,17 @@ void nbcon_device_release(struct console *con)
+ 	cookie = console_srcu_read_lock();
+ 	if (console_is_usable(con, console_srcu_read_flags(con)) &&
+ 	    prb_read_valid(prb, nbcon_seq_read(con), NULL)) {
+-		if (!have_boot_console) {
++		/*
++		 * If nbcon_atomic flushing is not available, fallback to
++		 * using the legacy loop.
++		 */
++		printk_get_console_flush_type(&ft);
++		if (ft.nbcon_atomic) {
+ 			__nbcon_atomic_flush_pending_con(con, prb_next_reserve_seq(prb), false);
+-		} else if (!is_printk_legacy_deferred()) {
++		} else if (ft.legacy_direct) {
+ 			if (console_trylock())
+ 				console_unlock();
+-		} else {
++		} else if (ft.legacy_offload) {
+ 			printk_trigger_flush();
+ 		}
+ 	}
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index fc3f8970eea2..6accd1704e73 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -468,14 +468,14 @@ static DEFINE_MUTEX(syslog_lock);
+  * present, it is necessary to perform the console lock/unlock dance
+  * whenever console flushing should occur.
+  */
+-static bool have_legacy_console;
++bool have_legacy_console;
+ 
+ /*
+  * Specifies if an nbcon console is registered. If nbcon consoles are present,
+  * synchronous printing of legacy consoles will not occur during panic until
+  * the backtrace has been stored to the ringbuffer.
+  */
+-static bool have_nbcon_console;
++bool have_nbcon_console;
+ 
+ /*
+  * Specifies if a boot console is registered. If boot consoles are present,
+@@ -488,14 +488,6 @@ bool have_boot_console;
+ /* See printk_legacy_allow_panic_sync() for details. */
+ bool legacy_allow_panic_sync;
+ 
+-/*
+- * Specifies if the console lock/unlock dance is needed for console
+- * printing. If @have_boot_console is true, the nbcon consoles will
+- * be printed serially along with the legacy consoles because nbcon
+- * consoles cannot print simultaneously with boot consoles.
+- */
+-#define printing_via_unlock (have_legacy_console || have_boot_console)
+-
+ #ifdef CONFIG_PRINTK
+ DECLARE_WAIT_QUEUE_HEAD(log_wait);
+ /* All 3 protected by @syslog_lock. */
+@@ -2342,9 +2334,12 @@ int vprintk_store(int facility, int level,
+  */
+ void printk_legacy_allow_panic_sync(void)
+ {
++	struct console_flush_type ft;
++
+ 	legacy_allow_panic_sync = true;
+ 
+-	if (printing_via_unlock && !is_printk_legacy_deferred()) {
++	printk_get_console_flush_type(&ft);
++	if (ft.legacy_direct) {
+ 		if (console_trylock())
+ 			console_unlock();
+ 	}
+@@ -2354,8 +2349,7 @@ asmlinkage int vprintk_emit(int facility, int level,
+ 			    const struct dev_printk_info *dev_info,
+ 			    const char *fmt, va_list args)
+ {
+-	bool do_trylock_unlock = printing_via_unlock;
+-	bool defer_legacy = false;
++	struct console_flush_type ft;
+ 	int printed_len;
+ 
+ 	/* Suppress unimportant messages after panic happens */
+@@ -2370,35 +2364,23 @@ asmlinkage int vprintk_emit(int facility, int level,
+ 	if (other_cpu_in_panic() && !panic_triggering_all_cpu_backtrace)
+ 		return 0;
+ 
++	printk_get_console_flush_type(&ft);
++
+ 	/* If called from the scheduler, we can not call up(). */
+ 	if (level == LOGLEVEL_SCHED) {
+ 		level = LOGLEVEL_DEFAULT;
+-		defer_legacy = do_trylock_unlock;
+-		do_trylock_unlock = false;
++		ft.legacy_offload |= ft.legacy_direct;
++		ft.legacy_direct = false;
+ 	}
+ 
+ 	printk_delay(level);
+ 
+ 	printed_len = vprintk_store(facility, level, dev_info, fmt, args);
+ 
+-	if (have_nbcon_console && !have_boot_console) {
++	if (ft.nbcon_atomic)
+ 		nbcon_atomic_flush_pending();
+ 
+-		/*
+-		 * In panic, the legacy consoles are not allowed to print from
+-		 * the printk calling context unless explicitly allowed. This
+-		 * gives the safe nbcon consoles a chance to print out all the
+-		 * panic messages first. This restriction only applies if
+-		 * there are nbcon consoles registered and they are allowed to
+-		 * flush.
+-		 */
+-		if (this_cpu_in_panic() && !legacy_allow_panic_sync) {
+-			do_trylock_unlock = false;
+-			defer_legacy = false;
+-		}
+-	}
+-
+-	if (do_trylock_unlock) {
++	if (ft.legacy_direct) {
+ 		/*
+ 		 * The caller may be holding system-critical or
+ 		 * timing-sensitive locks. Disable preemption during
+@@ -2418,7 +2400,7 @@ asmlinkage int vprintk_emit(int facility, int level,
+ 		preempt_enable();
+ 	}
+ 
+-	if (defer_legacy)
++	if (ft.legacy_offload)
+ 		defer_console_output();
+ 	else
+ 		wake_up_klogd();
+@@ -2777,10 +2759,16 @@ void resume_console(void)
+  */
+ static int console_cpu_notify(unsigned int cpu)
+ {
+-	if (!cpuhp_tasks_frozen && printing_via_unlock) {
+-		/* If trylock fails, someone else is doing the printing */
+-		if (console_trylock())
+-			console_unlock();
++	struct console_flush_type ft;
++
++	if (!cpuhp_tasks_frozen) {
++		printk_get_console_flush_type(&ft);
++		if (ft.nbcon_atomic)
++			nbcon_atomic_flush_pending();
++		if (ft.legacy_direct) {
++			if (console_trylock())
++				console_unlock();
++		}
+ 	}
+ 	return 0;
+ }
+@@ -3305,6 +3293,7 @@ static void __console_rewind_all(void)
+  */
+ void console_flush_on_panic(enum con_flush_mode mode)
+ {
++	struct console_flush_type ft;
+ 	bool handover;
+ 	u64 next_seq;
+ 
+@@ -3328,7 +3317,8 @@ void console_flush_on_panic(enum con_flush_mode mode)
+ 	if (mode == CONSOLE_REPLAY_ALL)
+ 		__console_rewind_all();
+ 
+-	if (!have_boot_console)
++	printk_get_console_flush_type(&ft);
++	if (ft.nbcon_atomic)
+ 		nbcon_atomic_flush_pending();
+ 
+ 	/* Flush legacy consoles once allowed, even when dangerous. */
+@@ -3992,6 +3982,7 @@ static bool __pr_flush(struct console *con, int timeout_ms, bool reset_on_progre
+ {
+ 	unsigned long timeout_jiffies = msecs_to_jiffies(timeout_ms);
+ 	unsigned long remaining_jiffies = timeout_jiffies;
++	struct console_flush_type ft;
+ 	struct console *c;
+ 	u64 last_diff = 0;
+ 	u64 printk_seq;
+@@ -4005,7 +3996,8 @@ static bool __pr_flush(struct console *con, int timeout_ms, bool reset_on_progre
+ 	seq = prb_next_reserve_seq(prb);
+ 
+ 	/* Flush the consoles so that records up to @seq are printed. */
+-	if (printing_via_unlock) {
++	printk_get_console_flush_type(&ft);
++	if (ft.legacy_direct) {
+ 		console_lock();
+ 		console_unlock();
+ 	}
