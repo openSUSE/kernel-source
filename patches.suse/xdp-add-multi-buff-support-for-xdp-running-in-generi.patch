@@ -1,0 +1,257 @@
+From: Lorenzo Bianconi <lorenzo@kernel.org>
+Date: Mon, 12 Feb 2024 10:50:56 +0100
+Subject: xdp: add multi-buff support for xdp running in generic mode
+Patch-mainline: v6.9-rc1
+Git-commit: e6d5dbdd20aa6a86974af51deb9414cd2e7794cb
+References: jsc#PED-11221
+
+Similar to native xdp, do not always linearize the skb in
+netif_receive_generic_xdp routine but create a non-linear xdp_buff to be
+processed by the eBPF program. This allow to add multi-buffer support
+for xdp running in generic mode.
+
+Acked-by: Jesper Dangaard Brouer <hawk@kernel.org>
+Reviewed-by: Toke Hoiland-Jorgensen <toke@redhat.com>
+Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+Link: https://lore.kernel.org/r/1044d6412b1c3e95b40d34993fd5f37cd2f319fd.1707729884.git.lorenzo@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/skbuff.h |    2 +
+ net/core/dev.c         |   70 +++++++++++++++++++++++++++----------
+ net/core/skbuff.c      |   91 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 144 insertions(+), 19 deletions(-)
+
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -3449,6 +3449,8 @@ static inline void skb_frag_ref(struct s
+ 	__skb_frag_ref(&skb_shinfo(skb)->frags[f]);
+ }
+ 
++int skb_cow_data_for_xdp(struct page_pool *pool, struct sk_buff **pskb,
++			 struct bpf_prog *prog);
+ bool napi_pp_put_page(struct page *page, bool napi_safe);
+ 
+ static inline void
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -4855,6 +4855,12 @@ u32 bpf_prog_run_generic_xdp(struct sk_b
+ 	xdp_init_buff(xdp, frame_sz, &rxqueue->xdp_rxq);
+ 	xdp_prepare_buff(xdp, hard_start, skb_headroom(skb) - mac_len,
+ 			 skb_headlen(skb) + mac_len, true);
++	if (skb_is_nonlinear(skb)) {
++		skb_shinfo(skb)->xdp_frags_size = skb->data_len;
++		xdp_buff_set_frags_flag(xdp);
++	} else {
++		xdp_buff_clear_frags_flag(xdp);
++	}
+ 
+ 	orig_data_end = xdp->data_end;
+ 	orig_data = xdp->data;
+@@ -4884,6 +4890,14 @@ u32 bpf_prog_run_generic_xdp(struct sk_b
+ 		skb->len += off; /* positive on grow, negative on shrink */
+ 	}
+ 
++	/* XDP frag metadata (e.g. nr_frags) are updated in eBPF helpers
++	 * (e.g. bpf_xdp_adjust_tail), we need to update data_len here.
++	 */
++	if (xdp_buff_has_frags(xdp))
++		skb->data_len = skb_shinfo(skb)->xdp_frags_size;
++	else
++		skb->data_len = 0;
++
+ 	/* check if XDP changed eth hdr such SKB needs update */
+ 	eth = (struct ethhdr *)xdp->data;
+ 	if ((orig_eth_type != eth->h_proto) ||
+@@ -4917,12 +4931,35 @@ u32 bpf_prog_run_generic_xdp(struct sk_b
+ 	return act;
+ }
+ 
++static int
++netif_skb_check_for_xdp(struct sk_buff **pskb, struct bpf_prog *prog)
++{
++	struct sk_buff *skb = *pskb;
++	int err, hroom, troom;
++
++	if (!skb_cow_data_for_xdp(this_cpu_read(system_page_pool), pskb, prog))
++		return 0;
++
++	/* In case we have to go down the path and also linearize,
++	 * then lets do the pskb_expand_head() work just once here.
++	 */
++	hroom = XDP_PACKET_HEADROOM - skb_headroom(skb);
++	troom = skb->tail + skb->data_len - skb->end;
++	err = pskb_expand_head(skb,
++			       hroom > 0 ? ALIGN(hroom, NET_SKB_PAD) : 0,
++			       troom > 0 ? troom + 128 : 0, GFP_ATOMIC);
++	if (err)
++		return err;
++
++	return skb_linearize(skb);
++}
++
+ static u32 netif_receive_generic_xdp(struct sk_buff **pskb,
+ 				     struct xdp_buff *xdp,
+ 				     struct bpf_prog *xdp_prog)
+ {
+ 	struct sk_buff *skb = *pskb;
+-	u32 act = XDP_DROP;
++	u32 mac_len, act = XDP_DROP;
+ 
+ 	/* Reinjected packets coming from act_mirred or similar should
+ 	 * not get XDP generic processing.
+@@ -4930,41 +4967,36 @@ static u32 netif_receive_generic_xdp(str
+ 	if (skb_is_redirected(skb))
+ 		return XDP_PASS;
+ 
+-	/* XDP packets must be linear and must have sufficient headroom
+-	 * of XDP_PACKET_HEADROOM bytes. This is the guarantee that also
+-	 * native XDP provides, thus we need to do it here as well.
++	/* XDP packets must have sufficient headroom of XDP_PACKET_HEADROOM
++	 * bytes. This is the guarantee that also native XDP provides,
++	 * thus we need to do it here as well.
+ 	 */
++	mac_len = skb->data - skb_mac_header(skb);
++	__skb_push(skb, mac_len);
++
+ 	if (skb_cloned(skb) || skb_is_nonlinear(skb) ||
+ 	    skb_headroom(skb) < XDP_PACKET_HEADROOM) {
+-		int hroom = XDP_PACKET_HEADROOM - skb_headroom(skb);
+-		int troom = skb->tail + skb->data_len - skb->end;
+-
+-		/* In case we have to go down the path and also linearize,
+-		 * then lets do the pskb_expand_head() work just once here.
+-		 */
+-		if (pskb_expand_head(skb,
+-				     hroom > 0 ? ALIGN(hroom, NET_SKB_PAD) : 0,
+-				     troom > 0 ? troom + 128 : 0, GFP_ATOMIC))
+-			goto do_drop;
+-		if (skb_linearize(skb))
++		if (netif_skb_check_for_xdp(pskb, xdp_prog))
+ 			goto do_drop;
+ 	}
+ 
+-	act = bpf_prog_run_generic_xdp(skb, xdp, xdp_prog);
++	__skb_pull(*pskb, mac_len);
++
++	act = bpf_prog_run_generic_xdp(*pskb, xdp, xdp_prog);
+ 	switch (act) {
+ 	case XDP_REDIRECT:
+ 	case XDP_TX:
+ 	case XDP_PASS:
+ 		break;
+ 	default:
+-		bpf_warn_invalid_xdp_action(skb->dev, xdp_prog, act);
++		bpf_warn_invalid_xdp_action((*pskb)->dev, xdp_prog, act);
+ 		fallthrough;
+ 	case XDP_ABORTED:
+-		trace_xdp_exception(skb->dev, xdp_prog, act);
++		trace_xdp_exception((*pskb)->dev, xdp_prog, act);
+ 		fallthrough;
+ 	case XDP_DROP:
+ 	do_drop:
+-		kfree_skb(skb);
++		kfree_skb(*pskb);
+ 		break;
+ 	}
+ 
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -901,6 +901,97 @@ static bool is_pp_page(struct page *page
+ 	return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
+ }
+ 
++static int skb_pp_cow_data(struct page_pool *pool, struct sk_buff **pskb,
++			   unsigned int headroom)
++{
++#if IS_ENABLED(CONFIG_PAGE_POOL)
++	u32 size, truesize, len, max_head_size, off;
++	struct sk_buff *skb = *pskb, *nskb;
++	int err, i, head_off;
++	void *data;
++
++	/* XDP does not support fraglist so we need to linearize
++	 * the skb.
++	 */
++	if (skb_has_frag_list(skb))
++		return -EOPNOTSUPP;
++
++	max_head_size = SKB_WITH_OVERHEAD(PAGE_SIZE - headroom);
++	if (skb->len > max_head_size + MAX_SKB_FRAGS * PAGE_SIZE)
++		return -ENOMEM;
++
++	size = min_t(u32, skb->len, max_head_size);
++	truesize = SKB_HEAD_ALIGN(size) + headroom;
++	data = page_pool_dev_alloc_va(pool, &truesize);
++	if (!data)
++		return -ENOMEM;
++
++	nskb = napi_build_skb(data, truesize);
++	if (!nskb) {
++		page_pool_free_va(pool, data, true);
++		return -ENOMEM;
++	}
++
++	skb_reserve(nskb, headroom);
++	skb_copy_header(nskb, skb);
++	skb_mark_for_recycle(nskb);
++
++	err = skb_copy_bits(skb, 0, nskb->data, size);
++	if (err) {
++		consume_skb(nskb);
++		return err;
++	}
++	skb_put(nskb, size);
++
++	head_off = skb_headroom(nskb) - skb_headroom(skb);
++	skb_headers_offset_update(nskb, head_off);
++
++	off = size;
++	len = skb->len - off;
++	for (i = 0; i < MAX_SKB_FRAGS && off < skb->len; i++) {
++		struct page *page;
++		u32 page_off;
++
++		size = min_t(u32, len, PAGE_SIZE);
++		truesize = size;
++
++		page = page_pool_dev_alloc(pool, &page_off, &truesize);
++		if (!data) {
++			consume_skb(nskb);
++			return -ENOMEM;
++		}
++
++		skb_add_rx_frag(nskb, i, page, page_off, size, truesize);
++		err = skb_copy_bits(skb, off, page_address(page) + page_off,
++				    size);
++		if (err) {
++			consume_skb(nskb);
++			return err;
++		}
++
++		len -= size;
++		off += size;
++	}
++
++	consume_skb(skb);
++	*pskb = nskb;
++
++	return 0;
++#else
++	return -EOPNOTSUPP;
++#endif
++}
++
++int skb_cow_data_for_xdp(struct page_pool *pool, struct sk_buff **pskb,
++			 struct bpf_prog *prog)
++{
++	if (!prog->aux->xdp_has_frags)
++		return -EINVAL;
++
++	return skb_pp_cow_data(pool, pskb, XDP_PACKET_HEADROOM);
++}
++EXPORT_SYMBOL(skb_cow_data_for_xdp);
++
+ #if IS_ENABLED(CONFIG_PAGE_POOL)
+ bool napi_pp_put_page(struct page *page, bool napi_safe)
+ {
