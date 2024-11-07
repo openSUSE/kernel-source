@@ -1,0 +1,144 @@
+From: John Ogness <john.ogness@linutronix.de>
+Date: Wed, 4 Sep 2024 14:11:30 +0206
+Subject: [PATCH] printk: nbcon: Show replay message on takeover
+
+References: bsc#1232534 (PREEMPT_RT prerequisite backports)
+Patch-mainline: v6.12-rc1
+Git-commit: 5102981d5e2a5a7a12424b5d26c7524ac2899898
+
+An emergency or panic context can takeover console ownership
+while the current owner was printing a printk message. The
+atomic printer will re-print the message that the previous
+owner was printing. However, this can look confusing to the
+user and may even seem as though a message was lost.
+
+  [3430014.1
+  [3430014.181123] usb 1-2: Product: USB Audio
+
+Add a new field @nbcon_prev_seq to struct console to track
+the sequence number to print that was assigned to the previous
+console owner. If this matches the sequence number to print
+that the current owner is assigned, then a takeover must have
+occurred. In this case, print an additional message to inform
+the user that the previous message is being printed again.
+
+  [3430014.1
+  ** replaying previous printk message **
+  [3430014.181123] usb 1-2: Product: USB Audio
+
+Signed-off-by: John Ogness <john.ogness@linutronix.de>
+Reviewed-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20240904120536.115780-12-john.ogness@linutronix.de
+Signed-off-by: Petr Mladek <pmladek@suse.com>
+---
+ include/linux/console.h  |  2 ++
+ kernel/printk/internal.h |  1 +
+ kernel/printk/nbcon.c    | 26 ++++++++++++++++++++++++++
+ kernel/printk/printk.c   | 11 +++++++++++
+ 4 files changed, 40 insertions(+)
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+
+diff --git a/include/linux/console.h b/include/linux/console.h
+index 788ce9c829f6..eba367bf605d 100644
+--- a/include/linux/console.h
++++ b/include/linux/console.h
+@@ -325,6 +325,7 @@ struct nbcon_write_context {
+  * @nbcon_state:	State for nbcon consoles
+  * @nbcon_seq:		Sequence number of the next record for nbcon to print
+  * @nbcon_device_ctxt:	Context available for non-printing operations
++ * @nbcon_prev_seq:	Seq num the previous nbcon owner was assigned to print
+  * @pbufs:		Pointer to nbcon private buffer
+  * @kthread:		Printer kthread for this console
+  * @rcuwait:		RCU-safe wait object for @kthread waking
+@@ -459,6 +460,7 @@ struct console {
+ 	atomic_t		__private nbcon_state;
+ 	atomic_long_t		__private nbcon_seq;
+ 	struct nbcon_context	__private nbcon_device_ctxt;
++	atomic_long_t           __private nbcon_prev_seq;
+ 
+ 	struct printk_buffers	*pbufs;
+ 	struct task_struct	*kthread;
+diff --git a/kernel/printk/internal.h b/kernel/printk/internal.h
+index 8166e24f8780..c365d25b13c7 100644
+--- a/kernel/printk/internal.h
++++ b/kernel/printk/internal.h
+@@ -319,4 +319,5 @@ bool printk_get_next_message(struct printk_message *pmsg, u64 seq,
+ 
+ #ifdef CONFIG_PRINTK
+ void console_prepend_dropped(struct printk_message *pmsg, unsigned long dropped);
++void console_prepend_replay(struct printk_message *pmsg);
+ #endif
+diff --git a/kernel/printk/nbcon.c b/kernel/printk/nbcon.c
+index 5146ce9853a3..98440889d222 100644
+--- a/kernel/printk/nbcon.c
++++ b/kernel/printk/nbcon.c
+@@ -946,7 +946,9 @@ static bool nbcon_emit_next_record(struct nbcon_write_context *wctxt, bool use_a
+ 		.pbufs = ctxt->pbufs,
+ 	};
+ 	unsigned long con_dropped;
++	struct nbcon_state cur;
+ 	unsigned long dropped;
++	unsigned long ulseq;
+ 
+ 	/*
+ 	 * This function should never be called for consoles that have not
+@@ -987,6 +989,29 @@ static bool nbcon_emit_next_record(struct nbcon_write_context *wctxt, bool use_a
+ 	if (dropped && !is_extended)
+ 		console_prepend_dropped(&pmsg, dropped);
+ 
++	/*
++	 * If the previous owner was assigned the same record, this context
++	 * has taken over ownership and is replaying the record. Prepend a
++	 * message to let the user know the record is replayed.
++	 */
++	ulseq = atomic_long_read(&ACCESS_PRIVATE(con, nbcon_prev_seq));
++	if (__ulseq_to_u64seq(prb, ulseq) == pmsg.seq) {
++		console_prepend_replay(&pmsg);
++	} else {
++		/*
++		 * Ensure this context is still the owner before trying to
++		 * update @nbcon_prev_seq. Otherwise the value in @ulseq may
++		 * not be from the previous owner and instead be some later
++		 * value from the context that took over ownership.
++		 */
++		nbcon_state_read(con, &cur);
++		if (!nbcon_context_can_proceed(ctxt, &cur))
++			return false;
++
++		atomic_long_try_cmpxchg(&ACCESS_PRIVATE(con, nbcon_prev_seq), &ulseq,
++					__u64seq_to_ulseq(pmsg.seq));
++	}
++
+ 	if (!nbcon_context_exit_unsafe(ctxt))
+ 		return false;
+ 
+@@ -1646,6 +1671,7 @@ bool nbcon_alloc(struct console *con)
+ 
+ 	rcuwait_init(&con->rcuwait);
+ 	init_irq_work(&con->irq_work, nbcon_irq_work);
++	atomic_long_set(&ACCESS_PRIVATE(con, nbcon_prev_seq), -1UL);
+ 	nbcon_state_set(con, &state);
+ 
+ 	/*
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index e9458569bcfd..c27dc54f4151 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -2902,6 +2902,17 @@ void console_prepend_dropped(struct printk_message *pmsg, unsigned long dropped)
+ 	console_prepend_message(pmsg, "** %lu printk messages dropped **\n", dropped);
+ }
+ 
++/*
++ * Prepend the message in @pmsg->pbufs->outbuf with a "replay message".
++ * @pmsg->outbuf_len is updated appropriately.
++ *
++ * @pmsg is the printk message to prepend.
++ */
++void console_prepend_replay(struct printk_message *pmsg)
++{
++	console_prepend_message(pmsg, "** replaying previous printk message **\n");
++}
++
+ /*
+  * Read and format the specified record (or a later record if the specified
+  * record is not available).
