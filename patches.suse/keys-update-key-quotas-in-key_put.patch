@@ -1,0 +1,194 @@
+From: Luis Henriques <lhenriques@suse.de>
+Date: Tue, 30 Jan 2024 10:13:44 +0000
+Subject: keys: update key quotas in key_put()
+Patch-mainline: v6.10-rc1
+Git-commit: 9578e327b2b4935a25d49e3891b8fcca9b6c10c6
+References: jsc#PED-11152
+
+Delaying key quotas update when key's refcount reaches 0 in key_put() has
+been causing some issues in fscrypt testing, specifically in fstest
+generic/581.  This commit fixes this test flakiness by dealing with the
+quotas immediately, and leaving all the other clean-ups to the key garbage
+collector.
+
+This is done by moving the updates to the qnkeys and qnbytes fields in
+struct key_user from key_gc_unused_keys() into key_put().  Unfortunately,
+this also means that we need to switch to the irq-version of the spinlock
+that protects these fields and use spin_lock_{irqsave,irqrestore} in all
+the code that touches these fields.
+
+Signed-off-by: Luis Henriques <lhenriques@suse.de>
+Reviewed-by: Jarkko Sakkinen <jarkko@kernel.org>
+Acked-by: David Howells <dhowells@redhat.com>
+Signed-off-by: Jarkko Sakkinen <jarkko.sakkinen@kernel.org>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ security/keys/gc.c     |    8 --------
+ security/keys/key.c    |   32 ++++++++++++++++++++++----------
+ security/keys/keyctl.c |   11 ++++++-----
+ 3 files changed, 28 insertions(+), 23 deletions(-)
+
+--- a/security/keys/gc.c
++++ b/security/keys/gc.c
+@@ -155,14 +155,6 @@ static noinline void key_gc_unused_keys(
+ 
+ 		security_key_free(key);
+ 
+-		/* deal with the user's key tracking and quota */
+-		if (test_bit(KEY_FLAG_IN_QUOTA, &key->flags)) {
+-			spin_lock(&key->user->lock);
+-			key->user->qnkeys--;
+-			key->user->qnbytes -= key->quotalen;
+-			spin_unlock(&key->user->lock);
+-		}
+-
+ 		atomic_dec(&key->user->nkeys);
+ 		if (state != KEY_IS_UNINSTANTIATED)
+ 			atomic_dec(&key->user->nikeys);
+--- a/security/keys/key.c
++++ b/security/keys/key.c
+@@ -231,6 +231,7 @@ struct key *key_alloc(struct key_type *t
+ 	struct key *key;
+ 	size_t desclen, quotalen;
+ 	int ret;
++	unsigned long irqflags;
+ 
+ 	key = ERR_PTR(-EINVAL);
+ 	if (!desc || !*desc)
+@@ -260,7 +261,7 @@ struct key *key_alloc(struct key_type *t
+ 		unsigned maxbytes = uid_eq(uid, GLOBAL_ROOT_UID) ?
+ 			key_quota_root_maxbytes : key_quota_maxbytes;
+ 
+-		spin_lock(&user->lock);
++		spin_lock_irqsave(&user->lock, irqflags);
+ 		if (!(flags & KEY_ALLOC_QUOTA_OVERRUN)) {
+ 			if (user->qnkeys + 1 > maxkeys ||
+ 			    user->qnbytes + quotalen > maxbytes ||
+@@ -270,7 +271,7 @@ struct key *key_alloc(struct key_type *t
+ 
+ 		user->qnkeys++;
+ 		user->qnbytes += quotalen;
+-		spin_unlock(&user->lock);
++		spin_unlock_irqrestore(&user->lock, irqflags);
+ 	}
+ 
+ 	/* allocate and initialise the key and its description */
+@@ -328,10 +329,10 @@ security_error:
+ 	kfree(key->description);
+ 	kmem_cache_free(key_jar, key);
+ 	if (!(flags & KEY_ALLOC_NOT_IN_QUOTA)) {
+-		spin_lock(&user->lock);
++		spin_lock_irqsave(&user->lock, irqflags);
+ 		user->qnkeys--;
+ 		user->qnbytes -= quotalen;
+-		spin_unlock(&user->lock);
++		spin_unlock_irqrestore(&user->lock, irqflags);
+ 	}
+ 	key_user_put(user);
+ 	key = ERR_PTR(ret);
+@@ -341,10 +342,10 @@ no_memory_3:
+ 	kmem_cache_free(key_jar, key);
+ no_memory_2:
+ 	if (!(flags & KEY_ALLOC_NOT_IN_QUOTA)) {
+-		spin_lock(&user->lock);
++		spin_lock_irqsave(&user->lock, irqflags);
+ 		user->qnkeys--;
+ 		user->qnbytes -= quotalen;
+-		spin_unlock(&user->lock);
++		spin_unlock_irqrestore(&user->lock, irqflags);
+ 	}
+ 	key_user_put(user);
+ no_memory_1:
+@@ -352,7 +353,7 @@ no_memory_1:
+ 	goto error;
+ 
+ no_quota:
+-	spin_unlock(&user->lock);
++	spin_unlock_irqrestore(&user->lock, irqflags);
+ 	key_user_put(user);
+ 	key = ERR_PTR(-EDQUOT);
+ 	goto error;
+@@ -381,8 +382,9 @@ int key_payload_reserve(struct key *key,
+ 	if (delta != 0 && test_bit(KEY_FLAG_IN_QUOTA, &key->flags)) {
+ 		unsigned maxbytes = uid_eq(key->user->uid, GLOBAL_ROOT_UID) ?
+ 			key_quota_root_maxbytes : key_quota_maxbytes;
++		unsigned long flags;
+ 
+-		spin_lock(&key->user->lock);
++		spin_lock_irqsave(&key->user->lock, flags);
+ 
+ 		if (delta > 0 &&
+ 		    (key->user->qnbytes + delta > maxbytes ||
+@@ -393,7 +395,7 @@ int key_payload_reserve(struct key *key,
+ 			key->user->qnbytes += delta;
+ 			key->quotalen += delta;
+ 		}
+-		spin_unlock(&key->user->lock);
++		spin_unlock_irqrestore(&key->user->lock, flags);
+ 	}
+ 
+ 	/* change the recorded data length if that didn't generate an error */
+@@ -646,8 +648,18 @@ void key_put(struct key *key)
+ 	if (key) {
+ 		key_check(key);
+ 
+-		if (refcount_dec_and_test(&key->usage))
++		if (refcount_dec_and_test(&key->usage)) {
++			unsigned long flags;
++
++			/* deal with the user's key tracking and quota */
++			if (test_bit(KEY_FLAG_IN_QUOTA, &key->flags)) {
++				spin_lock_irqsave(&key->user->lock, flags);
++				key->user->qnkeys--;
++				key->user->qnbytes -= key->quotalen;
++				spin_unlock_irqrestore(&key->user->lock, flags);
++			}
+ 			schedule_work(&key_gc_work);
++		}
+ 	}
+ }
+ EXPORT_SYMBOL(key_put);
+--- a/security/keys/keyctl.c
++++ b/security/keys/keyctl.c
+@@ -954,6 +954,7 @@ long keyctl_chown_key(key_serial_t id, u
+ 	long ret;
+ 	kuid_t uid;
+ 	kgid_t gid;
++	unsigned long flags;
+ 
+ 	uid = make_kuid(current_user_ns(), user);
+ 	gid = make_kgid(current_user_ns(), group);
+@@ -1010,7 +1011,7 @@ long keyctl_chown_key(key_serial_t id, u
+ 			unsigned maxbytes = uid_eq(uid, GLOBAL_ROOT_UID) ?
+ 				key_quota_root_maxbytes : key_quota_maxbytes;
+ 
+-			spin_lock(&newowner->lock);
++			spin_lock_irqsave(&newowner->lock, flags);
+ 			if (newowner->qnkeys + 1 > maxkeys ||
+ 			    newowner->qnbytes + key->quotalen > maxbytes ||
+ 			    newowner->qnbytes + key->quotalen <
+@@ -1019,12 +1020,12 @@ long keyctl_chown_key(key_serial_t id, u
+ 
+ 			newowner->qnkeys++;
+ 			newowner->qnbytes += key->quotalen;
+-			spin_unlock(&newowner->lock);
++			spin_unlock_irqrestore(&newowner->lock, flags);
+ 
+-			spin_lock(&key->user->lock);
++			spin_lock_irqsave(&key->user->lock, flags);
+ 			key->user->qnkeys--;
+ 			key->user->qnbytes -= key->quotalen;
+-			spin_unlock(&key->user->lock);
++			spin_unlock_irqrestore(&key->user->lock, flags);
+ 		}
+ 
+ 		atomic_dec(&key->user->nkeys);
+@@ -1056,7 +1057,7 @@ error:
+ 	return ret;
+ 
+ quota_overrun:
+-	spin_unlock(&newowner->lock);
++	spin_unlock_irqrestore(&newowner->lock, flags);
+ 	zapowner = newowner;
+ 	ret = -EDQUOT;
+ 	goto error_put;

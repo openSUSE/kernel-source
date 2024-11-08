@@ -1,0 +1,506 @@
+From: "Kory Maincent (Dent Project)" <kory.maincent@bootlin.com>
+Date: Wed, 17 Apr 2024 16:39:58 +0200
+Subject: net: pse-pd: Use regulator framework within PSE framework
+Patch-mainline: v6.10-rc1
+Git-commit: d83e13761d5b0568376963729abcccf6de5a43ba
+References: bsc#1232798
+
+Integrate the regulator framework to the PSE framework for enhanced
+access to features such as voltage, power measurement, and limits, which
+are akin to regulators. Additionally, PSE features like port priorities
+could potentially enhance the regulator framework. Note that this
+integration introduces some implementation complexity, including wrapper
+callbacks, but the potential benefits make it worthwhile.
+
+Regulator are using enable counter with specific behavior.
+Two calls to regulator_disable will trigger kernel warnings.
+If the counter exceeds one, regulator_disable call won't disable the
+PSE PI. These behavior isn't suitable for PSE control.
+Added a boolean 'enabled' state to prevent multiple calls to
+regulator_enable/disable. These calls will only be called from PSE
+framework as it won't have any regulator children, therefore no mutex are
+needed to safeguards this boolean.
+
+regulator_get needs the consumer device pointer. Use PSE as regulator
+provider and consumer device until we have RJ45 ports represented in
+the Kernel.
+
+Signed-off-by: Kory Maincent <kory.maincent@bootlin.com>
+Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+Link: https://lore.kernel.org/r/20240417-feature_poe-v9-10-242293fd1900@bootlin.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/pse-pd/pse_core.c      |  249 ++++++++++++++++++++++++++++++++++---
+ drivers/net/pse-pd/pse_regulator.c |   46 +++---
+ include/linux/pse-pd/pse.h         |   15 +-
+ 3 files changed, 266 insertions(+), 44 deletions(-)
+
+--- a/drivers/net/pse-pd/pse_core.c
++++ b/drivers/net/pse-pd/pse_core.c
+@@ -8,6 +8,8 @@
+ #include <linux/device.h>
+ #include <linux/of.h>
+ #include <linux/pse-pd/pse.h>
++#include <linux/regulator/driver.h>
++#include <linux/regulator/machine.h>
+ 
+ static DEFINE_MUTEX(pse_list_mutex);
+ static LIST_HEAD(pse_controller_list);
+@@ -16,12 +18,14 @@ static LIST_HEAD(pse_controller_list);
+  * struct pse_control - a PSE control
+  * @pcdev: a pointer to the PSE controller device
+  *         this PSE control belongs to
++ * @ps: PSE PI supply of the PSE control
+  * @list: list entry for the pcdev's PSE controller list
+  * @id: ID of the PSE line in the PSE controller device
+  * @refcnt: Number of gets of this pse_control
+  */
+ struct pse_control {
+ 	struct pse_controller_dev *pcdev;
++	struct regulator *ps;
+ 	struct list_head list;
+ 	unsigned int id;
+ 	struct kref refcnt;
+@@ -132,6 +136,10 @@ static int of_load_pse_pis(struct pse_co
+ 	if (!np)
+ 		return -ENODEV;
+ 
++	pcdev->pi = kcalloc(pcdev->nr_lines, sizeof(*pcdev->pi), GFP_KERNEL);
++	if (!pcdev->pi)
++		return -ENOMEM;
++
+ 	pis = of_get_child_by_name(np, "pse-pis");
+ 	if (!pis) {
+ 		/* no description of PSE PIs */
+@@ -139,12 +147,6 @@ static int of_load_pse_pis(struct pse_co
+ 		return 0;
+ 	}
+ 
+-	pcdev->pi = kcalloc(pcdev->nr_lines, sizeof(*pcdev->pi), GFP_KERNEL);
+-	if (!pcdev->pi) {
+-		of_node_put(pis);
+-		return -ENOMEM;
+-	}
+-
+ 	for_each_child_of_node(pis, node) {
+ 		struct pse_pi pi = {0};
+ 		u32 id;
+@@ -205,13 +207,124 @@ out:
+ 	return ret;
+ }
+ 
++static int pse_pi_is_enabled(struct regulator_dev *rdev)
++{
++	struct pse_controller_dev *pcdev = rdev_get_drvdata(rdev);
++	const struct pse_controller_ops *ops;
++	int id, ret;
++
++	ops = pcdev->ops;
++	if (!ops->pi_is_enabled)
++		return -EOPNOTSUPP;
++
++	id = rdev_get_id(rdev);
++	mutex_lock(&pcdev->lock);
++	ret = ops->pi_is_enabled(pcdev, id);
++	mutex_unlock(&pcdev->lock);
++
++	return ret;
++}
++
++static int pse_pi_enable(struct regulator_dev *rdev)
++{
++	struct pse_controller_dev *pcdev = rdev_get_drvdata(rdev);
++	const struct pse_controller_ops *ops;
++	int id, ret;
++
++	ops = pcdev->ops;
++	if (!ops->pi_enable)
++		return -EOPNOTSUPP;
++
++	id = rdev_get_id(rdev);
++	mutex_lock(&pcdev->lock);
++	ret = ops->pi_enable(pcdev, id);
++	if (!ret)
++		pcdev->pi[id].admin_state_enabled = 1;
++	mutex_unlock(&pcdev->lock);
++
++	return ret;
++}
++
++static int pse_pi_disable(struct regulator_dev *rdev)
++{
++	struct pse_controller_dev *pcdev = rdev_get_drvdata(rdev);
++	const struct pse_controller_ops *ops;
++	int id, ret;
++
++	ops = pcdev->ops;
++	if (!ops->pi_disable)
++		return -EOPNOTSUPP;
++
++	id = rdev_get_id(rdev);
++	mutex_lock(&pcdev->lock);
++	ret = ops->pi_disable(pcdev, id);
++	if (!ret)
++		pcdev->pi[id].admin_state_enabled = 0;
++	mutex_unlock(&pcdev->lock);
++
++	return ret;
++}
++
++static const struct regulator_ops pse_pi_ops = {
++	.is_enabled = pse_pi_is_enabled,
++	.enable = pse_pi_enable,
++	.disable = pse_pi_disable,
++};
++
++static int
++devm_pse_pi_regulator_register(struct pse_controller_dev *pcdev,
++			       char *name, int id)
++{
++	struct regulator_init_data *rinit_data;
++	struct regulator_config rconfig = {0};
++	struct regulator_desc *rdesc;
++	struct regulator_dev *rdev;
++
++	rinit_data = devm_kzalloc(pcdev->dev, sizeof(*rinit_data),
++				  GFP_KERNEL);
++	if (!rinit_data)
++		return -ENOMEM;
++
++	rdesc = devm_kzalloc(pcdev->dev, sizeof(*rdesc), GFP_KERNEL);
++	if (!rdesc)
++		return -ENOMEM;
++
++	/* Regulator descriptor id have to be the same as its associated
++	 * PSE PI id for the well functioning of the PSE controls.
++	 */
++	rdesc->id = id;
++	rdesc->name = name;
++	rdesc->type = REGULATOR_CURRENT;
++	rdesc->ops = &pse_pi_ops;
++	rdesc->owner = pcdev->owner;
++
++	rinit_data->constraints.valid_ops_mask = REGULATOR_CHANGE_STATUS;
++	rinit_data->supply_regulator = "vpwr";
++
++	rconfig.dev = pcdev->dev;
++	rconfig.driver_data = pcdev;
++	rconfig.init_data = rinit_data;
++
++	rdev = devm_regulator_register(pcdev->dev, rdesc, &rconfig);
++	if (IS_ERR(rdev)) {
++		dev_err_probe(pcdev->dev, PTR_ERR(rdev),
++			      "Failed to register regulator\n");
++		return PTR_ERR(rdev);
++	}
++
++	pcdev->pi[id].rdev = rdev;
++
++	return 0;
++}
++
+ /**
+  * pse_controller_register - register a PSE controller device
+  * @pcdev: a pointer to the initialized PSE controller device
+  */
+ int pse_controller_register(struct pse_controller_dev *pcdev)
+ {
+-	int ret;
++	size_t reg_name_len;
++	int ret, i;
+ 
+ 	mutex_init(&pcdev->lock);
+ 	INIT_LIST_HEAD(&pcdev->pse_control_head);
+@@ -229,6 +342,31 @@ int pse_controller_register(struct pse_c
+ 			return ret;
+ 	}
+ 
++	/* Each regulator name len is pcdev dev name + 7 char +
++	 * int max digit number (10) + 1
++	 */
++	reg_name_len = strlen(dev_name(pcdev->dev)) + 18;
++
++	/* Register PI regulators */
++	for (i = 0; i < pcdev->nr_lines; i++) {
++		char *reg_name;
++
++		/* Do not register regulator for PIs not described */
++		if (!pcdev->no_of_pse_pi && !pcdev->pi[i].np)
++			continue;
++
++		reg_name = devm_kzalloc(pcdev->dev, reg_name_len, GFP_KERNEL);
++		if (!reg_name)
++			return -ENOMEM;
++
++		snprintf(reg_name, reg_name_len, "pse-%s_pi%d",
++			 dev_name(pcdev->dev), i);
++
++		ret = devm_pse_pi_regulator_register(pcdev, reg_name, i);
++		if (ret)
++			return ret;
++	}
++
+ 	mutex_lock(&pse_list_mutex);
+ 	list_add(&pcdev->list, &pse_controller_list);
+ 	mutex_unlock(&pse_list_mutex);
+@@ -297,6 +435,10 @@ static void __pse_control_release(struct
+ 
+ 	lockdep_assert_held(&pse_list_mutex);
+ 
++	if (psec->pcdev->pi[psec->id].admin_state_enabled)
++		regulator_disable(psec->ps);
++	devm_regulator_put(psec->ps);
++
+ 	module_put(psec->pcdev->owner);
+ 
+ 	list_del(&psec->list);
+@@ -329,6 +471,7 @@ static struct pse_control *
+ pse_control_get_internal(struct pse_controller_dev *pcdev, unsigned int index)
+ {
+ 	struct pse_control *psec;
++	int ret;
+ 
+ 	lockdep_assert_held(&pse_list_mutex);
+ 
+@@ -344,16 +487,38 @@ pse_control_get_internal(struct pse_cont
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	if (!try_module_get(pcdev->owner)) {
+-		kfree(psec);
+-		return ERR_PTR(-ENODEV);
++		ret = -ENODEV;
++		goto free_psec;
+ 	}
+ 
++	psec->ps = devm_regulator_get_exclusive(pcdev->dev,
++						rdev_get_name(pcdev->pi[index].rdev));
++	if (IS_ERR(psec->ps)) {
++		ret = PTR_ERR(psec->ps);
++		goto put_module;
++	}
++
++	ret = regulator_is_enabled(psec->ps);
++	if (ret < 0)
++		goto regulator_put;
++
++	pcdev->pi[index].admin_state_enabled = ret;
++
+ 	psec->pcdev = pcdev;
+ 	list_add(&psec->list, &pcdev->pse_control_head);
+ 	psec->id = index;
+ 	kref_init(&psec->refcnt);
+ 
+ 	return psec;
++
++regulator_put:
++	devm_regulator_put(psec->ps);
++put_module:
++	module_put(pcdev->owner);
++free_psec:
++	kfree(psec);
++
++	return ERR_PTR(ret);
+ }
+ 
+ /**
+@@ -486,6 +651,54 @@ int pse_ethtool_get_status(struct pse_co
+ }
+ EXPORT_SYMBOL_GPL(pse_ethtool_get_status);
+ 
++static int pse_ethtool_c33_set_config(struct pse_control *psec,
++				      const struct pse_control_config *config)
++{
++	int err = 0;
++
++	/* Look at admin_state_enabled status to not call regulator_enable
++	 * or regulator_disable twice creating a regulator counter mismatch
++	 */
++	switch (config->c33_admin_control) {
++	case ETHTOOL_C33_PSE_ADMIN_STATE_ENABLED:
++		if (!psec->pcdev->pi[psec->id].admin_state_enabled)
++			err = regulator_enable(psec->ps);
++		break;
++	case ETHTOOL_C33_PSE_ADMIN_STATE_DISABLED:
++		if (psec->pcdev->pi[psec->id].admin_state_enabled)
++			err = regulator_disable(psec->ps);
++		break;
++	default:
++		err = -EOPNOTSUPP;
++	}
++
++	return err;
++}
++
++static int pse_ethtool_podl_set_config(struct pse_control *psec,
++				       const struct pse_control_config *config)
++{
++	int err = 0;
++
++	/* Look at admin_state_enabled status to not call regulator_enable
++	 * or regulator_disable twice creating a regulator counter mismatch
++	 */
++	switch (config->podl_admin_control) {
++	case ETHTOOL_PODL_PSE_ADMIN_STATE_ENABLED:
++		if (!psec->pcdev->pi[psec->id].admin_state_enabled)
++			err = regulator_enable(psec->ps);
++		break;
++	case ETHTOOL_PODL_PSE_ADMIN_STATE_DISABLED:
++		if (psec->pcdev->pi[psec->id].admin_state_enabled)
++			err = regulator_disable(psec->ps);
++		break;
++	default:
++		err = -EOPNOTSUPP;
++	}
++
++	return err;
++}
++
+ /**
+  * pse_ethtool_set_config - set PSE control configuration
+  * @psec: PSE control pointer
+@@ -496,20 +709,16 @@ int pse_ethtool_set_config(struct pse_co
+ 			   struct netlink_ext_ack *extack,
+ 			   const struct pse_control_config *config)
+ {
+-	const struct pse_controller_ops *ops;
+-	int err;
+-
+-	ops = psec->pcdev->ops;
++	int err = 0;
+ 
+-	if (!ops->ethtool_set_config) {
+-		NL_SET_ERR_MSG(extack,
+-			       "PSE driver does not configuration");
+-		return -EOPNOTSUPP;
++	if (pse_has_c33(psec)) {
++		err = pse_ethtool_c33_set_config(psec, config);
++		if (err)
++			return err;
+ 	}
+ 
+-	mutex_lock(&psec->pcdev->lock);
+-	err = ops->ethtool_set_config(psec->pcdev, psec->id, extack, config);
+-	mutex_unlock(&psec->pcdev->lock);
++	if (pse_has_podl(psec))
++		err = pse_ethtool_podl_set_config(psec, config);
+ 
+ 	return err;
+ }
+--- a/drivers/net/pse-pd/pse_regulator.c
++++ b/drivers/net/pse-pd/pse_regulator.c
+@@ -24,38 +24,42 @@ static struct pse_reg_priv *to_pse_reg(s
+ }
+ 
+ static int
+-pse_reg_ethtool_set_config(struct pse_controller_dev *pcdev, unsigned long id,
+-			   struct netlink_ext_ack *extack,
+-			   const struct pse_control_config *config)
++pse_reg_pi_enable(struct pse_controller_dev *pcdev, int id)
+ {
+ 	struct pse_reg_priv *priv = to_pse_reg(pcdev);
+ 	int ret;
+ 
+-	if (priv->admin_state == config->podl_admin_control)
+-		return 0;
++	ret = regulator_enable(priv->ps);
++	if (ret)
++		return ret;
+ 
+-	switch (config->podl_admin_control) {
+-	case ETHTOOL_PODL_PSE_ADMIN_STATE_ENABLED:
+-		ret = regulator_enable(priv->ps);
+-		break;
+-	case ETHTOOL_PODL_PSE_ADMIN_STATE_DISABLED:
+-		ret = regulator_disable(priv->ps);
+-		break;
+-	default:
+-		dev_err(pcdev->dev, "Unknown admin state %i\n",
+-			config->podl_admin_control);
+-		ret = -ENOTSUPP;
+-	}
++	priv->admin_state = ETHTOOL_PODL_PSE_ADMIN_STATE_ENABLED;
++	return 0;
++}
+ 
++static int
++pse_reg_pi_disable(struct pse_controller_dev *pcdev, int id)
++{
++	struct pse_reg_priv *priv = to_pse_reg(pcdev);
++	int ret;
++
++	ret = regulator_disable(priv->ps);
+ 	if (ret)
+ 		return ret;
+ 
+-	priv->admin_state = config->podl_admin_control;
+-
++	priv->admin_state = ETHTOOL_PODL_PSE_ADMIN_STATE_DISABLED;
+ 	return 0;
+ }
+ 
+ static int
++pse_reg_pi_is_enabled(struct pse_controller_dev *pcdev, int id)
++{
++	struct pse_reg_priv *priv = to_pse_reg(pcdev);
++
++	return regulator_is_enabled(priv->ps);
++}
++
++static int
+ pse_reg_ethtool_get_status(struct pse_controller_dev *pcdev, unsigned long id,
+ 			   struct netlink_ext_ack *extack,
+ 			   struct pse_control_status *status)
+@@ -80,7 +84,9 @@ pse_reg_ethtool_get_status(struct pse_co
+ 
+ static const struct pse_controller_ops pse_reg_ops = {
+ 	.ethtool_get_status = pse_reg_ethtool_get_status,
+-	.ethtool_set_config = pse_reg_ethtool_set_config,
++	.pi_enable = pse_reg_pi_enable,
++	.pi_is_enabled = pse_reg_pi_is_enabled,
++	.pi_disable = pse_reg_pi_disable,
+ };
+ 
+ static int
+--- a/include/linux/pse-pd/pse.h
++++ b/include/linux/pse-pd/pse.h
+@@ -48,17 +48,20 @@ struct pse_control_status {
+  * struct pse_controller_ops - PSE controller driver callbacks
+  *
+  * @ethtool_get_status: get PSE control status for ethtool interface
+- * @ethtool_set_config: set PSE control configuration over ethtool interface
+  * @setup_pi_matrix: setup PI matrix of the PSE controller
++ * @pi_is_enabled: Return 1 if the PSE PI is enabled, 0 if not.
++ *		   May also return negative errno.
++ * @pi_enable: Configure the PSE PI as enabled.
++ * @pi_disable: Configure the PSE PI as disabled.
+  */
+ struct pse_controller_ops {
+ 	int (*ethtool_get_status)(struct pse_controller_dev *pcdev,
+ 		unsigned long id, struct netlink_ext_ack *extack,
+ 		struct pse_control_status *status);
+-	int (*ethtool_set_config)(struct pse_controller_dev *pcdev,
+-		unsigned long id, struct netlink_ext_ack *extack,
+-		const struct pse_control_config *config);
+ 	int (*setup_pi_matrix)(struct pse_controller_dev *pcdev);
++	int (*pi_is_enabled)(struct pse_controller_dev *pcdev, int id);
++	int (*pi_enable)(struct pse_controller_dev *pcdev, int id);
++	int (*pi_disable)(struct pse_controller_dev *pcdev, int id);
+ };
+ 
+ struct module;
+@@ -90,10 +93,14 @@ struct pse_pi_pairset {
+  *
+  * @pairset: table of the PSE PI pinout alternative for the two pairset
+  * @np: device node pointer of the PSE PI node
++ * @rdev: regulator represented by the PSE PI
++ * @admin_state_enabled: PI enabled state
+  */
+ struct pse_pi {
+ 	struct pse_pi_pairset pairset[2];
+ 	struct device_node *np;
++	struct regulator_dev *rdev;
++	bool admin_state_enabled;
+ };
+ 
+ /**
