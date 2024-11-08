@@ -1,0 +1,290 @@
+From: Kalesh AP <kalesh-anakkur.purayil@broadcom.com>
+Date: Tue, 30 Apr 2024 17:30:55 -0700
+Subject: bnxt_en: Optimize recovery path ULP locking in the driver
+Patch-mainline: v6.10-rc1
+Git-commit: 3c163f35bd50314d4e70ed9e83e1d8d83c473325
+References: jsc#PED-11221
+
+In the error recovery path (AER, firmware recovery, etc), the
+driver notifies the RoCE driver via ULP_STOP before the reset
+and via ULP_START after the reset, all under RTNL_LOCK.  The
+RoCE driver can take a long time if there are a lot of QPs to
+destroy, so it is not ideal to hold the global RTNL lock.
+
+Rely on the new en_dev_lock mutex instead for ULP_STOP and
+ULP_START.  For the most part, we move the ULP_STOP call before
+we take the RTNL lock and move the ULP_START after RTNL unlock.
+Note that SRIOV re-enablement must be done after ULP_START
+or RoCE on the VFs will not resume properly after reset.
+
+The one scenario in bnxt_hwrm_if_change() where the RTNL lock
+is already taken in the .ndo_open() context requires the ULP
+restart to be deferred to the bnxt_sp_task() workqueue.
+
+Reviewed-by: Selvin Thyparampil Xavier <selvin.xavier@broadcom.com>
+Reviewed-by: Vikas Gupta <vikas.gupta@broadcom.com>
+Reviewed-by: Pavan Chebbi <pavan.chebbi@broadcom.com>
+Signed-off-by: Kalesh AP <kalesh-anakkur.purayil@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://lore.kernel.org/r/20240501003056.100607-6-michael.chan@broadcom.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c         |   62 +++++++++++++---------
+ drivers/net/ethernet/broadcom/bnxt/bnxt.h         |    1 
+ drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c |    7 +-
+ 3 files changed, 44 insertions(+), 26 deletions(-)
+
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -11556,7 +11556,7 @@ static int bnxt_hwrm_if_change(struct bn
+ 		if (fw_reset) {
+ 			set_bit(BNXT_STATE_FW_RESET_DET, &bp->state);
+ 			if (!test_bit(BNXT_STATE_IN_FW_RESET, &bp->state))
+-				bnxt_ulp_stop(bp);
++				bnxt_ulp_irq_stop(bp);
+ 			bnxt_free_ctx_mem(bp);
+ 			bnxt_dcb_free(bp);
+ 			rc = bnxt_fw_init_one(bp);
+@@ -12111,10 +12111,9 @@ static int bnxt_open(struct net_device *
+ 		bnxt_hwrm_if_change(bp, false);
+ 	} else {
+ 		if (test_and_clear_bit(BNXT_STATE_FW_RESET_DET, &bp->state)) {
+-			if (!test_bit(BNXT_STATE_IN_FW_RESET, &bp->state)) {
+-				bnxt_ulp_start(bp, 0);
+-				bnxt_reenable_sriov(bp);
+-			}
++			if (!test_bit(BNXT_STATE_IN_FW_RESET, &bp->state))
++				bnxt_queue_sp_work(bp,
++						   BNXT_RESTART_ULP_SP_EVENT);
+ 		}
+ 	}
+ 
+@@ -13270,7 +13269,6 @@ static void bnxt_fw_fatal_close(struct b
+ 
+ static void bnxt_fw_reset_close(struct bnxt *bp)
+ {
+-	bnxt_ulp_stop(bp);
+ 	/* When firmware is in fatal state, quiesce device and disable
+ 	 * bus master to prevent any potential bad DMAs before freeing
+ 	 * kernel memory.
+@@ -13351,6 +13349,7 @@ void bnxt_fw_exception(struct bnxt *bp)
+ {
+ 	netdev_warn(bp->dev, "Detected firmware fatal condition, initiating reset\n");
+ 	set_bit(BNXT_STATE_FW_FATAL_COND, &bp->state);
++	bnxt_ulp_stop(bp);
+ 	bnxt_rtnl_lock_sp(bp);
+ 	bnxt_force_fw_reset(bp);
+ 	bnxt_rtnl_unlock_sp(bp);
+@@ -13382,6 +13381,7 @@ static int bnxt_get_registered_vfs(struc
+ 
+ void bnxt_fw_reset(struct bnxt *bp)
+ {
++	bnxt_ulp_stop(bp);
+ 	bnxt_rtnl_lock_sp(bp);
+ 	if (test_bit(BNXT_STATE_OPEN, &bp->state) &&
+ 	    !test_bit(BNXT_STATE_IN_FW_RESET, &bp->state)) {
+@@ -13506,6 +13506,12 @@ static void bnxt_fw_echo_reply(struct bn
+ 	hwrm_req_send(bp, req);
+ }
+ 
++static void bnxt_ulp_restart(struct bnxt *bp)
++{
++	bnxt_ulp_stop(bp);
++	bnxt_ulp_start(bp, 0);
++}
++
+ static void bnxt_sp_task(struct work_struct *work)
+ {
+ 	struct bnxt *bp = container_of(work, struct bnxt, sp_task);
+@@ -13517,6 +13523,11 @@ static void bnxt_sp_task(struct work_str
+ 		return;
+ 	}
+ 
++	if (test_and_clear_bit(BNXT_RESTART_ULP_SP_EVENT, &bp->sp_event)) {
++		bnxt_ulp_restart(bp);
++		bnxt_reenable_sriov(bp);
++	}
++
+ 	if (test_and_clear_bit(BNXT_RX_MASK_SP_EVENT, &bp->sp_event))
+ 		bnxt_cfg_rx_mode(bp);
+ 
+@@ -13973,10 +13984,8 @@ static bool bnxt_fw_reset_timeout(struct
+ static void bnxt_fw_reset_abort(struct bnxt *bp, int rc)
+ {
+ 	clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
+-	if (bp->fw_reset_state != BNXT_FW_RESET_STATE_POLL_VF) {
+-		bnxt_ulp_start(bp, rc);
++	if (bp->fw_reset_state != BNXT_FW_RESET_STATE_POLL_VF)
+ 		bnxt_dl_health_fw_status_update(bp, false);
+-	}
+ 	bp->fw_reset_state = 0;
+ 	dev_close(bp->dev);
+ }
+@@ -14007,7 +14016,7 @@ static void bnxt_fw_reset_task(struct wo
+ 				bp->fw_reset_state = 0;
+ 				netdev_err(bp->dev, "Firmware reset aborted, bnxt_get_registered_vfs() returns %d\n",
+ 					   n);
+-				return;
++				goto ulp_start;
+ 			}
+ 			bnxt_queue_fw_reset_work(bp, HZ / 10);
+ 			return;
+@@ -14017,7 +14026,7 @@ static void bnxt_fw_reset_task(struct wo
+ 		if (test_bit(BNXT_STATE_ABORT_ERR, &bp->state)) {
+ 			bnxt_fw_reset_abort(bp, rc);
+ 			rtnl_unlock();
+-			return;
++			goto ulp_start;
+ 		}
+ 		bnxt_fw_reset_close(bp);
+ 		if (bp->fw_cap & BNXT_FW_CAP_ERR_RECOVER_RELOAD) {
+@@ -14110,7 +14119,7 @@ static void bnxt_fw_reset_task(struct wo
+ 			netdev_err(bp->dev, "bnxt_open() failed during FW reset\n");
+ 			bnxt_fw_reset_abort(bp, rc);
+ 			rtnl_unlock();
+-			return;
++			goto ulp_start;
+ 		}
+ 
+ 		if ((bp->fw_cap & BNXT_FW_CAP_ERROR_RECOVERY) &&
+@@ -14122,10 +14131,6 @@ static void bnxt_fw_reset_task(struct wo
+ 		/* Make sure fw_reset_state is 0 before clearing the flag */
+ 		smp_mb__before_atomic();
+ 		clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
+-		bnxt_ulp_start(bp, 0);
+-		bnxt_reenable_sriov(bp);
+-		bnxt_vf_reps_alloc(bp);
+-		bnxt_vf_reps_open(bp);
+ 		bnxt_ptp_reapply_pps(bp);
+ 		clear_bit(BNXT_STATE_FW_ACTIVATE, &bp->state);
+ 		if (test_and_clear_bit(BNXT_STATE_RECOVER, &bp->state)) {
+@@ -14133,6 +14138,12 @@ static void bnxt_fw_reset_task(struct wo
+ 			bnxt_dl_health_fw_status_update(bp, true);
+ 		}
+ 		rtnl_unlock();
++		bnxt_ulp_start(bp, 0);
++		bnxt_reenable_sriov(bp);
++		rtnl_lock();
++		bnxt_vf_reps_alloc(bp);
++		bnxt_vf_reps_open(bp);
++		rtnl_unlock();
+ 		break;
+ 	}
+ 	return;
+@@ -14148,6 +14159,8 @@ fw_reset_abort:
+ 	rtnl_lock();
+ 	bnxt_fw_reset_abort(bp, rc);
+ 	rtnl_unlock();
++ulp_start:
++	bnxt_ulp_start(bp, rc);
+ }
+ 
+ static int bnxt_init_board(struct pci_dev *pdev, struct net_device *dev)
+@@ -15534,8 +15547,9 @@ static int bnxt_suspend(struct device *d
+ 	struct bnxt *bp = netdev_priv(dev);
+ 	int rc = 0;
+ 
+-	rtnl_lock();
+ 	bnxt_ulp_stop(bp);
++
++	rtnl_lock();
+ 	if (netif_running(dev)) {
+ 		netif_device_detach(dev);
+ 		rc = bnxt_close(dev);
+@@ -15590,10 +15604,10 @@ static int bnxt_resume(struct device *de
+ 	}
+ 
+ resume_exit:
++	rtnl_unlock();
+ 	bnxt_ulp_start(bp, rc);
+ 	if (!rc)
+ 		bnxt_reenable_sriov(bp);
+-	rtnl_unlock();
+ 	return rc;
+ }
+ 
+@@ -15623,11 +15637,11 @@ static pci_ers_result_t bnxt_io_error_de
+ 
+ 	netdev_info(netdev, "PCI I/O error detected\n");
+ 
++	bnxt_ulp_stop(bp);
++
+ 	rtnl_lock();
+ 	netif_device_detach(netdev);
+ 
+-	bnxt_ulp_stop(bp);
+-
+ 	if (test_and_set_bit(BNXT_STATE_IN_FW_RESET, &bp->state)) {
+ 		netdev_err(bp->dev, "Firmware reset already in progress\n");
+ 		abort = true;
+@@ -15763,13 +15777,13 @@ static void bnxt_io_resume(struct pci_de
+ 	if (!err && netif_running(netdev))
+ 		err = bnxt_open(netdev);
+ 
+-	bnxt_ulp_start(bp, err);
+-	if (!err) {
+-		bnxt_reenable_sriov(bp);
++	if (!err)
+ 		netif_device_attach(netdev);
+-	}
+ 
+ 	rtnl_unlock();
++	bnxt_ulp_start(bp, err);
++	if (!err)
++		bnxt_reenable_sriov(bp);
+ }
+ 
+ static const struct pci_error_handlers bnxt_err_handler = {
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -2440,6 +2440,7 @@ struct bnxt {
+ #define BNXT_LINK_CFG_CHANGE_SP_EVENT	21
+ #define BNXT_THERMAL_THRESHOLD_SP_EVENT	22
+ #define BNXT_FW_ECHO_REQUEST_SP_EVENT	23
++#define BNXT_RESTART_ULP_SP_EVENT	24
+ 
+ 	struct delayed_work	fw_reset_task;
+ 	int			fw_reset_state;
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+@@ -437,18 +437,20 @@ static int bnxt_dl_reload_down(struct de
+ 
+ 	switch (action) {
+ 	case DEVLINK_RELOAD_ACTION_DRIVER_REINIT: {
++		bnxt_ulp_stop(bp);
+ 		rtnl_lock();
+ 		if (bnxt_sriov_cfg(bp)) {
+ 			NL_SET_ERR_MSG_MOD(extack,
+ 					   "reload is unsupported while VFs are allocated or being configured");
+ 			rtnl_unlock();
++			bnxt_ulp_start(bp, 0);
+ 			return -EOPNOTSUPP;
+ 		}
+ 		if (bp->dev->reg_state == NETREG_UNREGISTERED) {
+ 			rtnl_unlock();
++			bnxt_ulp_start(bp, 0);
+ 			return -ENODEV;
+ 		}
+-		bnxt_ulp_stop(bp);
+ 		if (netif_running(bp->dev))
+ 			bnxt_close_nic(bp, true, true);
+ 		bnxt_vf_reps_free(bp);
+@@ -516,7 +518,6 @@ static int bnxt_dl_reload_up(struct devl
+ 		bnxt_vf_reps_alloc(bp);
+ 		if (netif_running(bp->dev))
+ 			rc = bnxt_open_nic(bp, true, true);
+-		bnxt_ulp_start(bp, rc);
+ 		if (!rc) {
+ 			bnxt_reenable_sriov(bp);
+ 			bnxt_ptp_reapply_pps(bp);
+@@ -570,6 +571,8 @@ static int bnxt_dl_reload_up(struct devl
+ 		dev_close(bp->dev);
+ 	}
+ 	rtnl_unlock();
++	if (action == DEVLINK_RELOAD_ACTION_DRIVER_REINIT)
++		bnxt_ulp_start(bp, rc);
+ 	return rc;
+ }
+ 
