@@ -1,0 +1,305 @@
+From: Pavan Chebbi <pavan.chebbi@broadcom.com>
+Date: Fri, 28 Jun 2024 12:30:04 -0700
+Subject: bnxt_en: Increase the max total outstanding PTP TX packets to 4
+Patch-mainline: v6.11-rc1
+Git-commit: 8aa2a79e9b95eadec5c2a97662adb5b0a8f333ad
+References: jsc#PED-11221
+
+Start accepting up to 4 TX TS requests on BCM5750X (P5) chips.
+These PTP TX packets will be queued in the ptp->txts_req[] array
+waiting for the TX timestamp to complete.  The entries in the
+array will be managed by a producer and consumer index.  The
+producer index is updated under spinlock since multiple TX rings
+can try to send PTP packets at the same time.
+
+Signed-off-by: Pavan Chebbi <pavan.chebbi@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c     |   20 ++++++--
+ drivers/net/ethernet/broadcom/bnxt/bnxt.h     |    5 +-
+ drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c |   60 +++++++++++++++++---------
+ drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h |   13 +++--
+ 4 files changed, 68 insertions(+), 30 deletions(-)
+
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -457,8 +457,8 @@ static netdev_tx_t bnxt_start_xmit(struc
+ 	unsigned int length, pad = 0;
+ 	u32 len, free_size, vlan_tag_flags, cfa_action, flags;
+ 	struct bnxt_ptp_cfg *ptp = bp->ptp_cfg;
+-	u16 prod, last_frag;
+ 	struct pci_dev *pdev = bp->pdev;
++	u16 prod, last_frag, txts_prod;
+ 	struct bnxt_tx_ring_info *txr;
+ 	struct bnxt_sw_tx_bd *tx_buf;
+ 	__le32 lflags = 0;
+@@ -527,11 +527,19 @@ static netdev_tx_t bnxt_start_xmit(struc
+ 			if (!bnxt_ptp_parse(skb, &seq_id, &hdr_off)) {
+ 				if (vlan_tag_flags)
+ 					hdr_off += VLAN_HLEN;
+-				ptp->txts_req.tx_seqid = seq_id;
+-				ptp->txts_req.tx_hdr_off = hdr_off;
+ 				lflags |= cpu_to_le32(TX_BD_FLAGS_STAMP);
+ 				tx_buf->is_ts_pkt = 1;
+ 				skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
++
++				spin_lock_bh(&ptp->ptp_tx_lock);
++				txts_prod = ptp->txts_prod;
++				ptp->txts_prod = NEXT_TXTS(txts_prod);
++				spin_unlock_bh(&ptp->ptp_tx_lock);
++
++				ptp->txts_req[txts_prod].tx_seqid = seq_id;
++				ptp->txts_req[txts_prod].tx_hdr_off = hdr_off;
++				tx_buf->txts_prod = txts_prod;
++
+ 			} else {
+ 				atomic_inc(&bp->ptp_cfg->tx_avail);
+ 			}
+@@ -769,7 +777,9 @@ tx_kick_pending:
+ 	if (BNXT_TX_PTP_IS_SET(lflags)) {
+ 		txr->tx_buf_ring[txr->tx_prod].is_ts_pkt = 0;
+ 		atomic64_inc(&bp->ptp_cfg->stats.ts_err);
+-		atomic_inc(&bp->ptp_cfg->tx_avail);
++		if (!(bp->fw_cap & BNXT_FW_CAP_TX_TS_CMP))
++			/* set SKB to err so PTP worker will clean up */
++			ptp->txts_req[txts_prod].tx_skb = ERR_PTR(-EIO);
+ 	}
+ 	if (txr->kick_pending)
+ 		bnxt_txr_db_kick(bp, txr, txr->tx_prod);
+@@ -837,7 +847,7 @@ static bool __bnxt_tx_int(struct bnxt *b
+ 		if (unlikely(is_ts_pkt)) {
+ 			if (BNXT_CHIP_P5(bp)) {
+ 				/* PTP worker takes ownership of the skb */
+-				bnxt_get_tx_ts_p5(bp, skb);
++				bnxt_get_tx_ts_p5(bp, skb, tx_buf->txts_prod);
+ 				skb = NULL;
+ 			}
+ 		}
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -878,7 +878,10 @@ struct bnxt_sw_tx_bd {
+ 	u8			is_push;
+ 	u8			action;
+ 	unsigned short		nr_frags;
+-	u16			rx_prod;
++	union {
++		u16			rx_prod;
++		u16			txts_prod;
++	};
+ };
+ 
+ struct bnxt_sw_rx_bd {
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c
+@@ -110,7 +110,7 @@ static void bnxt_ptp_get_current_time(st
+ }
+ 
+ static int bnxt_hwrm_port_ts_query(struct bnxt *bp, u32 flags, u64 *ts,
+-				   u32 txts_tmo)
++				   u32 txts_tmo, int slot)
+ {
+ 	struct hwrm_port_ts_query_output *resp;
+ 	struct hwrm_port_ts_query_input *req;
+@@ -123,7 +123,7 @@ static int bnxt_hwrm_port_ts_query(struc
+ 	req->flags = cpu_to_le32(flags);
+ 	if ((flags & PORT_TS_QUERY_REQ_FLAGS_PATH) ==
+ 	    PORT_TS_QUERY_REQ_FLAGS_PATH_TX) {
+-		struct bnxt_ptp_tx_req *txts_req = &bp->ptp_cfg->txts_req;
++		struct bnxt_ptp_tx_req *txts_req = &bp->ptp_cfg->txts_req[slot];
+ 		u32 tmo_us = txts_tmo * 1000;
+ 
+ 		req->enables = cpu_to_le16(BNXT_PTP_QTS_TX_ENABLES);
+@@ -683,7 +683,7 @@ static u64 bnxt_cc_read(const struct cyc
+ 	return ns;
+ }
+ 
+-static int bnxt_stamp_tx_skb(struct bnxt *bp, struct sk_buff *skb)
++static int bnxt_stamp_tx_skb(struct bnxt *bp, int slot)
+ {
+ 	struct bnxt_ptp_cfg *ptp = bp->ptp_cfg;
+ 	struct skb_shared_hwtstamps timestamp;
+@@ -693,13 +693,13 @@ static int bnxt_stamp_tx_skb(struct bnxt
+ 	u32 tmo = 0;
+ 	int rc;
+ 
+-	txts_req = &ptp->txts_req;
+-	if (!txts_req->txts_pending)
+-		txts_req->abs_txts_tmo = now + msecs_to_jiffies(ptp->txts_tmo);
++	txts_req = &ptp->txts_req[slot];
++	/* make sure bnxt_get_tx_ts_p5() has updated abs_txts_tmo */
++	smp_rmb();
+ 	if (!time_after_eq(now, txts_req->abs_txts_tmo))
+ 		tmo = jiffies_to_msecs(txts_req->abs_txts_tmo - now);
+ 	rc = bnxt_hwrm_port_ts_query(bp, PORT_TS_QUERY_REQ_FLAGS_PATH_TX, &ts,
+-				     tmo);
++				     tmo, slot);
+ 	if (!rc) {
+ 		memset(&timestamp, 0, sizeof(timestamp));
+ 		spin_lock_bh(&ptp->ptp_lock);
+@@ -709,10 +709,9 @@ static int bnxt_stamp_tx_skb(struct bnxt
+ 		skb_tstamp_tx(txts_req->tx_skb, &timestamp);
+ 		ptp->stats.ts_pkts++;
+ 	} else {
+-		if (!time_after_eq(jiffies, txts_req->abs_txts_tmo)) {
+-			txts_req->txts_pending = true;
++		if (!time_after_eq(jiffies, txts_req->abs_txts_tmo))
+ 			return -EAGAIN;
+-		}
++
+ 		ptp->stats.ts_lost++;
+ 		netdev_warn_once(bp->dev,
+ 				 "TS query for TX timer failed rc = %x\n", rc);
+@@ -720,8 +719,6 @@ static int bnxt_stamp_tx_skb(struct bnxt
+ 
+ 	dev_kfree_skb_any(txts_req->tx_skb);
+ 	txts_req->tx_skb = NULL;
+-	atomic_inc(&ptp->tx_avail);
+-	txts_req->txts_pending = false;
+ 
+ 	return 0;
+ }
+@@ -732,10 +729,24 @@ static long bnxt_ptp_ts_aux_work(struct
+ 						ptp_info);
+ 	unsigned long now = jiffies;
+ 	struct bnxt *bp = ptp->bp;
++	u16 cons = ptp->txts_cons;
++	u8 num_requests;
+ 	int rc = 0;
+ 
+-	if (ptp->txts_req.tx_skb)
+-		rc = bnxt_stamp_tx_skb(bp, ptp->txts_req.tx_skb);
++	num_requests = BNXT_MAX_TX_TS - atomic_read(&ptp->tx_avail);
++	while (num_requests--) {
++		if (IS_ERR(ptp->txts_req[cons].tx_skb))
++			goto next_slot;
++		if (!ptp->txts_req[cons].tx_skb)
++			break;
++		rc = bnxt_stamp_tx_skb(bp, cons);
++		if (rc == -EAGAIN)
++			break;
++next_slot:
++		atomic_inc(&ptp->tx_avail);
++		cons = NEXT_TXTS(cons);
++	}
++	ptp->txts_cons = cons;
+ 
+ 	if (!time_after_eq(now, ptp->next_period)) {
+ 		if (rc == -EAGAIN)
+@@ -756,11 +767,16 @@ static long bnxt_ptp_ts_aux_work(struct
+ 	return HZ;
+ }
+ 
+-void bnxt_get_tx_ts_p5(struct bnxt *bp, struct sk_buff *skb)
++void bnxt_get_tx_ts_p5(struct bnxt *bp, struct sk_buff *skb, u16 prod)
+ {
+ 	struct bnxt_ptp_cfg *ptp = bp->ptp_cfg;
++	struct bnxt_ptp_tx_req *txts_req;
+ 
+-	ptp->txts_req.tx_skb = skb;
++	txts_req = &ptp->txts_req[prod];
++	txts_req->abs_txts_tmo = jiffies + msecs_to_jiffies(ptp->txts_tmo);
++	/* make sure abs_txts_tmo is written first */
++	smp_wmb();
++	txts_req->tx_skb = skb;
+ 	ptp_schedule_worker(ptp->ptp_clock, 0);
+ }
+ 
+@@ -958,7 +974,7 @@ int bnxt_ptp_init_rtc(struct bnxt *bp, b
+ 			return rc;
+ 	} else {
+ 		rc = bnxt_hwrm_port_ts_query(bp, PORT_TS_QUERY_REQ_FLAGS_CURRENT_TIME,
+-					     &ns, 0);
++					     &ns, 0, 0);
+ 		if (rc)
+ 			return rc;
+ 	}
+@@ -1000,6 +1016,7 @@ int bnxt_ptp_init(struct bnxt *bp, bool
+ 
+ 	atomic_set(&ptp->tx_avail, BNXT_MAX_TX_TS);
+ 	spin_lock_init(&ptp->ptp_lock);
++	spin_lock_init(&ptp->ptp_tx_lock);
+ 
+ 	if (BNXT_PTP_USE_RTC(bp)) {
+ 		bnxt_ptp_timecounter_init(bp, false);
+@@ -1049,6 +1066,7 @@ out:
+ void bnxt_ptp_clear(struct bnxt *bp)
+ {
+ 	struct bnxt_ptp_cfg *ptp = bp->ptp_cfg;
++	int i;
+ 
+ 	if (!ptp)
+ 		return;
+@@ -1060,9 +1078,11 @@ void bnxt_ptp_clear(struct bnxt *bp)
+ 	kfree(ptp->ptp_info.pin_config);
+ 	ptp->ptp_info.pin_config = NULL;
+ 
+-	if (ptp->txts_req.tx_skb) {
+-		dev_kfree_skb_any(ptp->txts_req.tx_skb);
+-		ptp->txts_req.tx_skb = NULL;
++	for (i = 0; i < BNXT_MAX_TX_TS; i++) {
++		if (ptp->txts_req[i].tx_skb) {
++			dev_kfree_skb_any(ptp->txts_req[i].tx_skb);
++			ptp->txts_req[i].tx_skb = NULL;
++		}
+ 	}
+ 
+ 	bnxt_unmap_ptp_regs(bp);
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h
+@@ -85,11 +85,13 @@ struct bnxt_ptp_stats {
+ 	atomic64_t	ts_err;
+ };
+ 
++#define BNXT_MAX_TX_TS		4
++#define NEXT_TXTS(idx)		(((idx) + 1) & (BNXT_MAX_TX_TS - 1))
++
+ struct bnxt_ptp_tx_req {
+ 	struct sk_buff		*tx_skb;
+ 	u16			tx_seqid;
+ 	u16			tx_hdr_off;
+-	u8			txts_pending:1;
+ 	unsigned long		abs_txts_tmo;
+ };
+ 
+@@ -101,6 +103,8 @@ struct bnxt_ptp_cfg {
+ 	struct bnxt_pps		pps_info;
+ 	/* serialize timecounter access */
+ 	spinlock_t		ptp_lock;
++	/* serialize ts tx request queuing */
++	spinlock_t		ptp_tx_lock;
+ 	u64			current_time;
+ 	u64			old_time;
+ 	unsigned long		next_period;
+@@ -109,11 +113,10 @@ struct bnxt_ptp_cfg {
+ 	/* a 23b shift cyclecounter will overflow in ~36 mins.  Check overflow every 18 mins. */
+ 	#define BNXT_PHC_OVERFLOW_PERIOD	(18 * 60 * HZ)
+ 
+-	struct bnxt_ptp_tx_req	txts_req;
++	struct bnxt_ptp_tx_req	txts_req[BNXT_MAX_TX_TS];
+ 
+ 	struct bnxt		*bp;
+ 	atomic_t		tx_avail;
+-#define BNXT_MAX_TX_TS	1
+ 	u16			rxctl;
+ #define BNXT_PTP_MSG_SYNC			(1 << 0)
+ #define BNXT_PTP_MSG_DELAY_REQ			(1 << 1)
+@@ -136,6 +139,8 @@ struct bnxt_ptp_cfg {
+ 	u32			refclk_regs[2];
+ 	u32			refclk_mapped_regs[2];
+ 	u32			txts_tmo;
++	u16			txts_prod;
++	u16			txts_cons;
+ 
+ 	struct bnxt_ptp_stats	stats;
+ };
+@@ -159,7 +164,7 @@ int bnxt_ptp_cfg_tstamp_filters(struct b
+ void bnxt_ptp_reapply_pps(struct bnxt *bp);
+ int bnxt_hwtstamp_set(struct net_device *dev, struct ifreq *ifr);
+ int bnxt_hwtstamp_get(struct net_device *dev, struct ifreq *ifr);
+-void bnxt_get_tx_ts_p5(struct bnxt *bp, struct sk_buff *skb);
++void bnxt_get_tx_ts_p5(struct bnxt *bp, struct sk_buff *skb, u16 prod);
+ int bnxt_get_rx_ts_p5(struct bnxt *bp, u64 *ts, u32 pkt_ts);
+ void bnxt_tx_ts_cmp(struct bnxt *bp, struct bnxt_napi *bnapi,
+ 		    struct tx_ts_cmp *tscmp);
