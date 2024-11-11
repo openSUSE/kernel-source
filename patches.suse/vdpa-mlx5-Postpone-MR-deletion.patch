@@ -1,0 +1,159 @@
+From: Dragos Tatulea <dtatulea@nvidia.com>
+Date: Fri, 30 Aug 2024 13:58:38 +0300
+Subject: vdpa/mlx5: Postpone MR deletion
+Patch-mainline: v6.12-rc1
+Git-commit: 62111654481d5df4be3776a898cb88b5e4974103
+References: jsc#PED-9900 jsc#PED-11429
+
+Currently, when a new MR is set up, the old MR is deleted. MR deletion
+is about 30-40% the time of MR creation. As deleting the old MR is not
+important for the process of setting up the new MR, this operation
+can be postponed.
+
+This series adds a workqueue that does MR garbage collection at a later
+point. If the MR lock is taken, the handler will back off and
+reschedule. The exception during shutdown: then the handler must
+not postpone the work.
+
+Note that this is only a speculative optimization: if there is some
+mapping operation that is triggered while the garbage collector handler
+has the lock taken, this operation it will have to wait for the handler
+to finish.
+
+Signed-off-by: Dragos Tatulea <dtatulea@nvidia.com>
+Reviewed-by: Cosmin Ratiu <cratiu@nvidia.com>
+Message-Id: <20240830105838.2666587-9-dtatulea@nvidia.com>
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/vdpa/mlx5/core/mlx5_vdpa.h |   10 ++++++
+ drivers/vdpa/mlx5/core/mr.c        |   55 ++++++++++++++++++++++++++++++++++---
+ drivers/vdpa/mlx5/net/mlx5_vnet.c  |    4 +-
+ 3 files changed, 64 insertions(+), 5 deletions(-)
+
+--- a/drivers/vdpa/mlx5/core/mlx5_vdpa.h
++++ b/drivers/vdpa/mlx5/core/mlx5_vdpa.h
+@@ -86,8 +86,18 @@ enum {
+ struct mlx5_vdpa_mr_resources {
+ 	struct mlx5_vdpa_mr *mr[MLX5_VDPA_NUM_AS];
+ 	unsigned int group2asid[MLX5_VDPA_NUMVQ_GROUPS];
++
++	/* Pre-deletion mr list */
+ 	struct list_head mr_list_head;
++
++	/* Deferred mr list */
++	struct list_head mr_gc_list_head;
++	struct workqueue_struct *wq_gc;
++	struct delayed_work gc_dwork_ent;
++
+ 	struct mutex lock;
++
++	atomic_t shutdown;
+ };
+ 
+ struct mlx5_vdpa_dev {
+--- a/drivers/vdpa/mlx5/core/mr.c
++++ b/drivers/vdpa/mlx5/core/mr.c
+@@ -653,14 +653,50 @@ static void _mlx5_vdpa_destroy_mr(struct
+ 	kfree(mr);
+ }
+ 
++/* There can be multiple .set_map() operations in quick succession.
++ * This large delay is a simple way to prevent the MR cleanup from blocking
++ * .set_map() MR creation in this scenario.
++ */
++#define MLX5_VDPA_MR_GC_TRIGGER_MS 2000
++
++static void mlx5_vdpa_mr_gc_handler(struct work_struct *work)
++{
++	struct mlx5_vdpa_mr_resources *mres;
++	struct mlx5_vdpa_mr *mr, *tmp;
++	struct mlx5_vdpa_dev *mvdev;
++
++	mres = container_of(work, struct mlx5_vdpa_mr_resources, gc_dwork_ent.work);
++
++	if (atomic_read(&mres->shutdown)) {
++		mutex_lock(&mres->lock);
++	} else if (!mutex_trylock(&mres->lock)) {
++		queue_delayed_work(mres->wq_gc, &mres->gc_dwork_ent,
++				   msecs_to_jiffies(MLX5_VDPA_MR_GC_TRIGGER_MS));
++		return;
++	}
++
++	mvdev = container_of(mres, struct mlx5_vdpa_dev, mres);
++
++	list_for_each_entry_safe(mr, tmp, &mres->mr_gc_list_head, mr_list) {
++		_mlx5_vdpa_destroy_mr(mvdev, mr);
++	}
++
++	mutex_unlock(&mres->lock);
++}
++
+ static void _mlx5_vdpa_put_mr(struct mlx5_vdpa_dev *mvdev,
+ 			      struct mlx5_vdpa_mr *mr)
+ {
++	struct mlx5_vdpa_mr_resources *mres = &mvdev->mres;
++
+ 	if (!mr)
+ 		return;
+ 
+-	if (refcount_dec_and_test(&mr->refcount))
+-		_mlx5_vdpa_destroy_mr(mvdev, mr);
++	if (refcount_dec_and_test(&mr->refcount)) {
++		list_move_tail(&mr->mr_list, &mres->mr_gc_list_head);
++		queue_delayed_work(mres->wq_gc, &mres->gc_dwork_ent,
++				   msecs_to_jiffies(MLX5_VDPA_MR_GC_TRIGGER_MS));
++	}
+ }
+ 
+ void mlx5_vdpa_put_mr(struct mlx5_vdpa_dev *mvdev,
+@@ -851,9 +887,17 @@ int mlx5_vdpa_init_mr_resources(struct m
+ {
+ 	struct mlx5_vdpa_mr_resources *mres = &mvdev->mres;
+ 
+-	INIT_LIST_HEAD(&mres->mr_list_head);
++	mres->wq_gc = create_singlethread_workqueue("mlx5_vdpa_mr_gc");
++	if (!mres->wq_gc)
++		return -ENOMEM;
++
++	INIT_DELAYED_WORK(&mres->gc_dwork_ent, mlx5_vdpa_mr_gc_handler);
++
+ 	mutex_init(&mres->lock);
+ 
++	INIT_LIST_HEAD(&mres->mr_list_head);
++	INIT_LIST_HEAD(&mres->mr_gc_list_head);
++
+ 	return 0;
+ }
+ 
+@@ -861,5 +905,10 @@ void mlx5_vdpa_destroy_mr_resources(stru
+ {
+ 	struct mlx5_vdpa_mr_resources *mres = &mvdev->mres;
+ 
++	atomic_set(&mres->shutdown, 1);
++
++	flush_delayed_work(&mres->gc_dwork_ent);
++	destroy_workqueue(mres->wq_gc);
++	mres->wq_gc = NULL;
+ 	mutex_destroy(&mres->lock);
+ }
+--- a/drivers/vdpa/mlx5/net/mlx5_vnet.c
++++ b/drivers/vdpa/mlx5/net/mlx5_vnet.c
+@@ -3435,6 +3435,8 @@ static void mlx5_vdpa_free(struct vdpa_d
+ 	free_fixed_resources(ndev);
+ 	mlx5_vdpa_clean_mrs(mvdev);
+ 	mlx5_vdpa_destroy_mr_resources(&ndev->mvdev);
++	mlx5_cmd_cleanup_async_ctx(&mvdev->async_ctx);
++
+ 	if (!is_zero_ether_addr(ndev->config.mac)) {
+ 		pfmdev = pci_get_drvdata(pci_physfn(mvdev->mdev->pdev));
+ 		mlx5_mpfs_del_mac(pfmdev, ndev->config.mac);
+@@ -4042,8 +4044,6 @@ static void mlx5_vdpa_dev_del(struct vdp
+ 	mvdev->wq = NULL;
+ 	destroy_workqueue(wq);
+ 	mgtdev->ndev = NULL;
+-
+-	mlx5_cmd_cleanup_async_ctx(&mvdev->async_ctx);
+ }
+ 
+ static int mlx5_vdpa_set_attr(struct vdpa_mgmt_dev *v_mdev, struct vdpa_device *dev,
