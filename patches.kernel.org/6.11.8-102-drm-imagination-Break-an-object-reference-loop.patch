@@ -1,0 +1,179 @@
+From: Brendan King <brendan.king@imgtec.com>
+Date: Fri, 18 Oct 2024 15:41:40 +0000
+Subject: [PATCH] drm/imagination: Break an object reference loop
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1012628
+Patch-mainline: 6.11.8
+Git-commit: b04ce1e718bd55302b52d05d6873e233cb3ec7a1
+
+commit b04ce1e718bd55302b52d05d6873e233cb3ec7a1 upstream.
+
+When remaining resources are being cleaned up on driver close,
+outstanding VM mappings may result in resources being leaked, due
+to an object reference loop, as shown below, with each object (or
+set of objects) referencing the object below it:
+
+    PVR GEM Object
+    GPU scheduler "finished" fence
+    GPU scheduler “scheduled” fence
+    PVR driver “done” fence
+    PVR Context
+    PVR VM Context
+    PVR VM Mappings
+    PVR GEM Object
+
+The reference that the PVR VM Context has on the VM mappings is a
+soft one, in the sense that the freeing of outstanding VM mappings
+is done as part of VM context destruction; no reference counts are
+involved, as is the case for all the other references in the loop.
+
+To break the reference loop during cleanup, free the outstanding
+VM mappings before destroying the PVR Context associated with the
+VM context.
+
+Signed-off-by: Brendan King <brendan.king@imgtec.com>
+Signed-off-by: Matt Coster <matt.coster@imgtec.com>
+Reviewed-by: Frank Binns <frank.binns@imgtec.com>
+Cc: stable@vger.kernel.org
+Link: https://patchwork.freedesktop.org/patch/msgid/8a25924f-1bb7-4d9a-a346-58e871dfb1d1@imgtec.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/gpu/drm/imagination/pvr_context.c | 19 +++++++++++++++++++
+ drivers/gpu/drm/imagination/pvr_context.h | 18 ++++++++++++++++++
+ drivers/gpu/drm/imagination/pvr_vm.c      | 22 ++++++++++++++++++----
+ drivers/gpu/drm/imagination/pvr_vm.h      |  1 +
+ 4 files changed, 56 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/imagination/pvr_context.c b/drivers/gpu/drm/imagination/pvr_context.c
+index 255c93582734..4cb3494c0bb2 100644
+--- a/drivers/gpu/drm/imagination/pvr_context.c
++++ b/drivers/gpu/drm/imagination/pvr_context.c
+@@ -450,11 +450,30 @@ pvr_context_destroy(struct pvr_file *pvr_file, u32 handle)
+  */
+ void pvr_destroy_contexts_for_file(struct pvr_file *pvr_file)
+ {
++	struct pvr_device *pvr_dev = pvr_file->pvr_dev;
+ 	struct pvr_context *ctx;
+ 	unsigned long handle;
+ 
+ 	xa_for_each(&pvr_file->ctx_handles, handle, ctx)
+ 		pvr_context_destroy(pvr_file, handle);
++
++	spin_lock(&pvr_dev->ctx_list_lock);
++	ctx = list_first_entry(&pvr_file->contexts, struct pvr_context, file_link);
++
++	while (!list_entry_is_head(ctx, &pvr_file->contexts, file_link)) {
++		list_del_init(&ctx->file_link);
++
++		if (pvr_context_get_if_referenced(ctx)) {
++			spin_unlock(&pvr_dev->ctx_list_lock);
++
++			pvr_vm_unmap_all(ctx->vm_ctx);
++
++			pvr_context_put(ctx);
++			spin_lock(&pvr_dev->ctx_list_lock);
++		}
++		ctx = list_first_entry(&pvr_file->contexts, struct pvr_context, file_link);
++	}
++	spin_unlock(&pvr_dev->ctx_list_lock);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/imagination/pvr_context.h b/drivers/gpu/drm/imagination/pvr_context.h
+index a5b0a82a54a1..07afa179cdf4 100644
+--- a/drivers/gpu/drm/imagination/pvr_context.h
++++ b/drivers/gpu/drm/imagination/pvr_context.h
+@@ -126,6 +126,24 @@ pvr_context_get(struct pvr_context *ctx)
+ 	return ctx;
+ }
+ 
++/**
++ * pvr_context_get_if_referenced() - Take an additional reference on a still
++ * referenced context.
++ * @ctx: Context pointer.
++ *
++ * Call pvr_context_put() to release.
++ *
++ * Returns:
++ *  * True on success, or
++ *  * false if no context pointer passed, or the context wasn't still
++ *  * referenced.
++ */
++static __always_inline bool
++pvr_context_get_if_referenced(struct pvr_context *ctx)
++{
++	return ctx != NULL && kref_get_unless_zero(&ctx->ref_count) != 0;
++}
++
+ /**
+  * pvr_context_lookup() - Lookup context pointer from handle and file.
+  * @pvr_file: Pointer to pvr_file structure.
+diff --git a/drivers/gpu/drm/imagination/pvr_vm.c b/drivers/gpu/drm/imagination/pvr_vm.c
+index 97c0f772ed65..7bd6ba4c6e8a 100644
+--- a/drivers/gpu/drm/imagination/pvr_vm.c
++++ b/drivers/gpu/drm/imagination/pvr_vm.c
+@@ -14,6 +14,7 @@
+ #include <drm/drm_gem.h>
+ #include <drm/drm_gpuvm.h>
+ 
++#include <linux/bug.h>
+ #include <linux/container_of.h>
+ #include <linux/err.h>
+ #include <linux/errno.h>
+@@ -597,12 +598,26 @@ pvr_vm_create_context(struct pvr_device *pvr_dev, bool is_userspace_context)
+ }
+ 
+ /**
+- * pvr_vm_context_release() - Teardown a VM context.
+- * @ref_count: Pointer to reference counter of the VM context.
++ * pvr_vm_unmap_all() - Unmap all mappings associated with a VM context.
++ * @vm_ctx: Target VM context.
+  *
+  * This function ensures that no mappings are left dangling by unmapping them
+  * all in order of ascending device-virtual address.
+  */
++void
++pvr_vm_unmap_all(struct pvr_vm_context *vm_ctx)
++{
++	WARN_ON(pvr_vm_unmap(vm_ctx, vm_ctx->gpuvm_mgr.mm_start,
++			     vm_ctx->gpuvm_mgr.mm_range));
++}
++
++/**
++ * pvr_vm_context_release() - Teardown a VM context.
++ * @ref_count: Pointer to reference counter of the VM context.
++ *
++ * This function also ensures that no mappings are left dangling by calling
++ * pvr_vm_unmap_all.
++ */
+ static void
+ pvr_vm_context_release(struct kref *ref_count)
+ {
+@@ -612,8 +627,7 @@ pvr_vm_context_release(struct kref *ref_count)
+ 	if (vm_ctx->fw_mem_ctx_obj)
+ 		pvr_fw_object_destroy(vm_ctx->fw_mem_ctx_obj);
+ 
+-	WARN_ON(pvr_vm_unmap(vm_ctx, vm_ctx->gpuvm_mgr.mm_start,
+-			     vm_ctx->gpuvm_mgr.mm_range));
++	pvr_vm_unmap_all(vm_ctx);
+ 
+ 	pvr_mmu_context_destroy(vm_ctx->mmu_ctx);
+ 	drm_gem_private_object_fini(&vm_ctx->dummy_gem);
+diff --git a/drivers/gpu/drm/imagination/pvr_vm.h b/drivers/gpu/drm/imagination/pvr_vm.h
+index f2a6463f2b05..79406243617c 100644
+--- a/drivers/gpu/drm/imagination/pvr_vm.h
++++ b/drivers/gpu/drm/imagination/pvr_vm.h
+@@ -39,6 +39,7 @@ int pvr_vm_map(struct pvr_vm_context *vm_ctx,
+ 	       struct pvr_gem_object *pvr_obj, u64 pvr_obj_offset,
+ 	       u64 device_addr, u64 size);
+ int pvr_vm_unmap(struct pvr_vm_context *vm_ctx, u64 device_addr, u64 size);
++void pvr_vm_unmap_all(struct pvr_vm_context *vm_ctx);
+ 
+ dma_addr_t pvr_vm_get_page_table_root_addr(struct pvr_vm_context *vm_ctx);
+ struct dma_resv *pvr_vm_get_dma_resv(struct pvr_vm_context *vm_ctx);
+-- 
+2.47.0
+
