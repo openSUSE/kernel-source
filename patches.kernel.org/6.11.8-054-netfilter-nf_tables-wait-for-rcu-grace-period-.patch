@@ -1,0 +1,163 @@
+From: Pablo Neira Ayuso <pablo@netfilter.org>
+Date: Tue, 5 Nov 2024 12:07:22 +0100
+Subject: [PATCH] netfilter: nf_tables: wait for rcu grace period on net_device
+ removal
+References: bsc#1012628
+Patch-mainline: 6.11.8
+Git-commit: c03d278fdf35e73dd0ec543b9b556876b9d9a8dc
+
+[ Upstream commit c03d278fdf35e73dd0ec543b9b556876b9d9a8dc ]
+
+8c873e219970 ("netfilter: core: free hooks with call_rcu") removed
+synchronize_net() call when unregistering basechain hook, however,
+net_device removal event handler for the NFPROTO_NETDEV was not updated
+to wait for RCU grace period.
+
+Note that 835b803377f5 ("netfilter: nf_tables_netdev: unregister hooks
+on net_device removal") does not remove basechain rules on device
+removal, I was hinted to remove rules on net_device removal later, see
+5ebe0b0eec9d ("netfilter: nf_tables: destroy basechain and rules on
+netdevice removal").
+
+Although NETDEV_UNREGISTER event is guaranteed to be handled after
+synchronize_net() call, this path needs to wait for rcu grace period via
+rcu callback to release basechain hooks if netns is alive because an
+ongoing netlink dump could be in progress (sockets hold a reference on
+the netns).
+
+Note that nf_tables_pre_exit_net() unregisters and releases basechain
+hooks but it is possible to see NETDEV_UNREGISTER at a later stage in
+the netns exit path, eg. veth peer device in another netns:
+
+ cleanup_net()
+  default_device_exit_batch()
+   unregister_netdevice_many_notify()
+    notifier_call_chain()
+     nf_tables_netdev_event()
+      __nft_release_basechain()
+
+In this particular case, same rule of thumb applies: if netns is alive,
+then wait for rcu grace period because netlink dump in the other netns
+could be in progress. Otherwise, if the other netns is going away then
+no netlink dump can be in progress and basechain hooks can be released
+inmediately.
+
+While at it, turn WARN_ON() into WARN_ON_ONCE() for the basechain
+validation, which should not ever happen.
+
+Fixes: 835b803377f5 ("netfilter: nf_tables_netdev: unregister hooks on net_device removal")
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ include/net/netfilter/nf_tables.h |  4 +++
+ net/netfilter/nf_tables_api.c     | 41 +++++++++++++++++++++++++------
+ 2 files changed, 38 insertions(+), 7 deletions(-)
+
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index 2be4738eae1c..0d01e0310e5f 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -1099,6 +1099,7 @@ struct nft_rule_blob {
+  *	@name: name of the chain
+  *	@udlen: user data length
+  *	@udata: user data in the chain
++ *	@rcu_head: rcu head for deferred release
+  *	@blob_next: rule blob pointer to the next in the chain
+  */
+ struct nft_chain {
+@@ -1116,6 +1117,7 @@ struct nft_chain {
+ 	char				*name;
+ 	u16				udlen;
+ 	u8				*udata;
++	struct rcu_head			rcu_head;
+ 
+ 	/* Only used during control plane commit phase: */
+ 	struct nft_rule_blob		*blob_next;
+@@ -1259,6 +1261,7 @@ static inline void nft_use_inc_restore(u32 *use)
+  *	@sets: sets in the table
+  *	@objects: stateful objects in the table
+  *	@flowtables: flow tables in the table
++ *	@net: netnamespace this table belongs to
+  *	@hgenerator: handle generator state
+  *	@handle: table handle
+  *	@use: number of chain references to this table
+@@ -1278,6 +1281,7 @@ struct nft_table {
+ 	struct list_head		sets;
+ 	struct list_head		objects;
+ 	struct list_head		flowtables;
++	possible_net_t			net;
+ 	u64				hgenerator;
+ 	u64				handle;
+ 	u32				use;
+diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
+index e792f153f958..58503348ed3a 100644
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -1493,6 +1493,7 @@ static int nf_tables_newtable(struct sk_buff *skb, const struct nfnl_info *info,
+ 	INIT_LIST_HEAD(&table->sets);
+ 	INIT_LIST_HEAD(&table->objects);
+ 	INIT_LIST_HEAD(&table->flowtables);
++	write_pnet(&table->net, net);
+ 	table->family = family;
+ 	table->flags = flags;
+ 	table->handle = ++nft_net->table_handle;
+@@ -11363,22 +11364,48 @@ int nft_data_dump(struct sk_buff *skb, int attr, const struct nft_data *data,
+ }
+ EXPORT_SYMBOL_GPL(nft_data_dump);
+ 
+-int __nft_release_basechain(struct nft_ctx *ctx)
++static void __nft_release_basechain_now(struct nft_ctx *ctx)
+ {
+ 	struct nft_rule *rule, *nr;
+ 
+-	if (WARN_ON(!nft_is_base_chain(ctx->chain)))
+-		return 0;
+-
+-	nf_tables_unregister_hook(ctx->net, ctx->chain->table, ctx->chain);
+ 	list_for_each_entry_safe(rule, nr, &ctx->chain->rules, list) {
+ 		list_del(&rule->list);
+-		nft_use_dec(&ctx->chain->use);
+ 		nf_tables_rule_release(ctx, rule);
+ 	}
++	nf_tables_chain_destroy(ctx->chain);
++}
++
++static void nft_release_basechain_rcu(struct rcu_head *head)
++{
++	struct nft_chain *chain = container_of(head, struct nft_chain, rcu_head);
++	struct nft_ctx ctx = {
++		.family	= chain->table->family,
++		.chain	= chain,
++		.net	= read_pnet(&chain->table->net),
++	};
++
++	__nft_release_basechain_now(&ctx);
++	put_net(ctx.net);
++}
++
++int __nft_release_basechain(struct nft_ctx *ctx)
++{
++	struct nft_rule *rule;
++
++	if (WARN_ON_ONCE(!nft_is_base_chain(ctx->chain)))
++		return 0;
++
++	nf_tables_unregister_hook(ctx->net, ctx->chain->table, ctx->chain);
++	list_for_each_entry(rule, &ctx->chain->rules, list)
++		nft_use_dec(&ctx->chain->use);
++
+ 	nft_chain_del(ctx->chain);
+ 	nft_use_dec(&ctx->table->use);
+-	nf_tables_chain_destroy(ctx->chain);
++
++	if (maybe_get_net(ctx->net))
++		call_rcu(&ctx->chain->rcu_head, nft_release_basechain_rcu);
++	else
++		__nft_release_basechain_now(ctx);
+ 
+ 	return 0;
+ }
+-- 
+2.47.0
+
