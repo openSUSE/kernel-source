@@ -1,1 +1,0 @@
-../python/dispatch-cves.py
