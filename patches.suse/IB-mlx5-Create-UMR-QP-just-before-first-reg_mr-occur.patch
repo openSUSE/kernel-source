@@ -1,0 +1,214 @@
+From: Jianbo Liu <jianbol@nvidia.com>
+Date: Mon, 3 Jun 2024 13:26:38 +0300
+Subject: IB/mlx5: Create UMR QP just before first reg_mr occurs
+Patch-mainline: v6.11-rc1
+Git-commit: 638420115cc4ad6c3a2683bf46a052b505abb202
+References: jsc#PED-9900 jsc#PED-11429
+
+UMR QP is not used in some cases, so move QP and its CQ creations from
+driver load flow to the time first reg_mr occurs, that is when MR
+interfaces are first called.
+
+The initialization of dev->umrc.pd and dev->umrc.lock is still done in
+driver load because pd is needed for mlx5_mkey_cache_init and the lock
+is reused to protect against the concurrent creation.
+
+When testing 4G bytes memory registration latency with rtool [1] and 8
+threads in parallel, there is minor performance degradation (<5% for
+the max latency) is seen for the first reg_mr with this change.
+
+Link: https://github.com/paravmellanox/rtool [1]
+
+Signed-off-by: Jianbo Liu <jianbol@nvidia.com>
+Link: https://lore.kernel.org/r/55d3c4f8a542fd974d8a4c5816eccfb318a59b38.1717409369.git.leon@kernel.org
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/mlx5/main.c    |    3 +
+ drivers/infiniband/hw/mlx5/mlx5_ib.h |    2 +
+ drivers/infiniband/hw/mlx5/mr.c      |    9 +++++
+ drivers/infiniband/hw/mlx5/umr.c     |   55 ++++++++++++++++++++++++++---------
+ drivers/infiniband/hw/mlx5/umr.h     |    3 +
+ 5 files changed, 58 insertions(+), 14 deletions(-)
+
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -4086,6 +4086,7 @@ static void mlx5_ib_stage_pre_ib_reg_umr
+ {
+ 	mlx5_mkey_cache_cleanup(dev);
+ 	mlx5r_umr_resource_cleanup(dev);
++	mlx5r_umr_cleanup(dev);
+ }
+ 
+ static void mlx5_ib_stage_ib_reg_cleanup(struct mlx5_ib_dev *dev)
+@@ -4097,7 +4098,7 @@ static int mlx5_ib_stage_post_ib_reg_umr
+ {
+ 	int ret;
+ 
+-	ret = mlx5r_umr_resource_init(dev);
++	ret = mlx5r_umr_init(dev);
+ 	if (ret)
+ 		return ret;
+ 
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -751,6 +751,8 @@ struct umr_common {
+ 	 */
+ 	struct mutex lock;
+ 	unsigned int state;
++	/* Protects from repeat UMR QP creation */
++	struct mutex init_lock;
+ };
+ 
+ #define NUM_MKEYS_PER_PAGE \
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@ -1470,6 +1470,7 @@ struct ib_mr *mlx5_ib_reg_user_mr(struct
+ {
+ 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
+ 	struct ib_umem *umem;
++	int err;
+ 
+ 	if (!IS_ENABLED(CONFIG_INFINIBAND_USER_MEM))
+ 		return ERR_PTR(-EOPNOTSUPP);
+@@ -1477,6 +1478,10 @@ struct ib_mr *mlx5_ib_reg_user_mr(struct
+ 	mlx5_ib_dbg(dev, "start 0x%llx, iova 0x%llx, length 0x%llx, access_flags 0x%x\n",
+ 		    start, iova, length, access_flags);
+ 
++	err = mlx5r_umr_resource_init(dev);
++	if (err)
++		return ERR_PTR(err);
++
+ 	if (access_flags & IB_ACCESS_ON_DEMAND)
+ 		return create_user_odp_mr(pd, start, length, iova, access_flags,
+ 					  udata);
+@@ -1523,6 +1528,10 @@ struct ib_mr *mlx5_ib_reg_user_mr_dmabuf
+ 		    "offset 0x%llx, virt_addr 0x%llx, length 0x%llx, fd %d, access_flags 0x%x\n",
+ 		    offset, virt_addr, length, fd, access_flags);
+ 
++	err = mlx5r_umr_resource_init(dev);
++	if (err)
++		return ERR_PTR(err);
++
+ 	/* dmabuf requires xlt update via umr to work. */
+ 	if (!mlx5r_umr_can_load_pas(dev, length))
+ 		return ERR_PTR(-EINVAL);
+--- a/drivers/infiniband/hw/mlx5/umr.c
++++ b/drivers/infiniband/hw/mlx5/umr.c
+@@ -135,22 +135,28 @@ static int mlx5r_umr_qp_rst2rts(struct m
+ int mlx5r_umr_resource_init(struct mlx5_ib_dev *dev)
+ {
+ 	struct ib_qp_init_attr init_attr = {};
+-	struct ib_pd *pd;
+ 	struct ib_cq *cq;
+ 	struct ib_qp *qp;
+-	int ret;
++	int ret = 0;
+ 
+-	pd = ib_alloc_pd(&dev->ib_dev, 0);
+-	if (IS_ERR(pd)) {
+-		mlx5_ib_dbg(dev, "Couldn't create PD for sync UMR QP\n");
+-		return PTR_ERR(pd);
+-	}
++
++	/*
++	 * UMR qp is set once, never changed until device unload.
++	 * Avoid taking the mutex if initialization is already done.
++	 */
++	if (dev->umrc.qp)
++		return 0;
++
++	mutex_lock(&dev->umrc.init_lock);
++	/* First user allocates the UMR resources. Skip if already allocated. */
++	if (dev->umrc.qp)
++		goto unlock;
+ 
+ 	cq = ib_alloc_cq(&dev->ib_dev, NULL, 128, 0, IB_POLL_SOFTIRQ);
+ 	if (IS_ERR(cq)) {
+ 		mlx5_ib_dbg(dev, "Couldn't create CQ for sync UMR QP\n");
+ 		ret = PTR_ERR(cq);
+-		goto destroy_pd;
++		goto unlock;
+ 	}
+ 
+ 	init_attr.send_cq = cq;
+@@ -160,7 +166,7 @@ int mlx5r_umr_resource_init(struct mlx5_
+ 	init_attr.cap.max_send_sge = 1;
+ 	init_attr.qp_type = MLX5_IB_QPT_REG_UMR;
+ 	init_attr.port_num = 1;
+-	qp = ib_create_qp(pd, &init_attr);
++	qp = ib_create_qp(dev->umrc.pd, &init_attr);
+ 	if (IS_ERR(qp)) {
+ 		mlx5_ib_dbg(dev, "Couldn't create sync UMR QP\n");
+ 		ret = PTR_ERR(qp);
+@@ -171,22 +177,22 @@ int mlx5r_umr_resource_init(struct mlx5_
+ 	if (ret)
+ 		goto destroy_qp;
+ 
+-	dev->umrc.qp = qp;
+ 	dev->umrc.cq = cq;
+-	dev->umrc.pd = pd;
+ 
+ 	sema_init(&dev->umrc.sem, MAX_UMR_WR);
+ 	mutex_init(&dev->umrc.lock);
+ 	dev->umrc.state = MLX5_UMR_STATE_ACTIVE;
++	dev->umrc.qp = qp;
+ 
++	mutex_unlock(&dev->umrc.init_lock);
+ 	return 0;
+ 
+ destroy_qp:
+ 	ib_destroy_qp(qp);
+ destroy_cq:
+ 	ib_free_cq(cq);
+-destroy_pd:
+-	ib_dealloc_pd(pd);
++unlock:
++	mutex_unlock(&dev->umrc.init_lock);
+ 	return ret;
+ }
+ 
+@@ -194,8 +200,31 @@ void mlx5r_umr_resource_cleanup(struct m
+ {
+ 	if (dev->umrc.state == MLX5_UMR_STATE_UNINIT)
+ 		return;
++	mutex_destroy(&dev->umrc.lock);
++	/* After device init, UMR cp/qp are not unset during the lifetime. */
+ 	ib_destroy_qp(dev->umrc.qp);
+ 	ib_free_cq(dev->umrc.cq);
++}
++
++int mlx5r_umr_init(struct mlx5_ib_dev *dev)
++{
++	struct ib_pd *pd;
++
++	pd = ib_alloc_pd(&dev->ib_dev, 0);
++	if (IS_ERR(pd)) {
++		mlx5_ib_dbg(dev, "Couldn't create PD for sync UMR QP\n");
++		return PTR_ERR(pd);
++	}
++	dev->umrc.pd = pd;
++
++	mutex_init(&dev->umrc.init_lock);
++
++	return 0;
++}
++
++void mlx5r_umr_cleanup(struct mlx5_ib_dev *dev)
++{
++	mutex_destroy(&dev->umrc.init_lock);
+ 	ib_dealloc_pd(dev->umrc.pd);
+ }
+ 
+--- a/drivers/infiniband/hw/mlx5/umr.h
++++ b/drivers/infiniband/hw/mlx5/umr.h
+@@ -16,6 +16,9 @@
+ int mlx5r_umr_resource_init(struct mlx5_ib_dev *dev);
+ void mlx5r_umr_resource_cleanup(struct mlx5_ib_dev *dev);
+ 
++int mlx5r_umr_init(struct mlx5_ib_dev *dev);
++void mlx5r_umr_cleanup(struct mlx5_ib_dev *dev);
++
+ static inline bool mlx5r_umr_can_load_pas(struct mlx5_ib_dev *dev,
+ 					  size_t length)
+ {

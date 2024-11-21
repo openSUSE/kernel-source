@@ -1,0 +1,204 @@
+From: "Radu Pirea (NXP OSS)" <radu-nicolae.pirea@oss.nxp.com>
+Date: Tue, 19 Dec 2023 16:53:30 +0200
+Subject: net: macsec: introduce mdo_insert_tx_tag
+Patch-mainline: v6.8-rc1
+Git-commit: a73d8779d61ad99b966c932a1715bd4d9006a9de
+References: jsc#PED-9900 jsc#PED-11429
+
+Offloading MACsec in PHYs requires inserting the SecTAG and the ICV in
+the ethernet frame. This operation will increase the frame size with up
+to 32 bytes. If the frames are sent at line rate, the PHY will not have
+enough room to insert the SecTAG and the ICV.
+
+Some PHYs use a hardware buffer to store a number of ethernet frames and,
+if it fills up, a pause frame is sent to the MAC to control the flow.
+This HW implementation does not need any modification in the stack.
+
+Other PHYs might offer to use a specific ethertype with some padding
+bytes present in the ethernet frame. This ethertype and its associated
+bytes will be replaced by the SecTAG and ICV.
+
+mdo_insert_tx_tag allows the PHY drivers to add any specific tag in the
+skb.
+
+Signed-off-by: Radu Pirea (NXP OSS) <radu-nicolae.pirea@oss.nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/macsec.c |   88 ++++++++++++++++++++++++++++++++++++++++++++++++---
+ include/net/macsec.h |   10 +++++
+ 2 files changed, 93 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/macsec.c
++++ b/drivers/net/macsec.c
+@@ -93,6 +93,8 @@ struct pcpu_secy_stats {
+  * @secys: linked list of SecY's on the underlying device
+  * @gro_cells: pointer to the Generic Receive Offload cell
+  * @offload: status of offloading on the MACsec device
++ * @insert_tx_tag: when offloading, device requires to insert an
++ *	additional tag
+  */
+ struct macsec_dev {
+ 	struct macsec_secy secy;
+@@ -102,6 +104,7 @@ struct macsec_dev {
+ 	struct list_head secys;
+ 	struct gro_cells gro_cells;
+ 	enum macsec_offload offload;
++	bool insert_tx_tag;
+ };
+ 
+ /**
+@@ -2583,6 +2586,33 @@ static bool macsec_is_configured(struct
+ 	return false;
+ }
+ 
++static bool macsec_needs_tx_tag(struct macsec_dev *macsec,
++				const struct macsec_ops *ops)
++{
++	return macsec->offload == MACSEC_OFFLOAD_PHY &&
++		ops->mdo_insert_tx_tag;
++}
++
++static void macsec_set_head_tail_room(struct net_device *dev)
++{
++	struct macsec_dev *macsec = macsec_priv(dev);
++	struct net_device *real_dev = macsec->real_dev;
++	int needed_headroom, needed_tailroom;
++	const struct macsec_ops *ops;
++
++	ops = macsec_get_ops(macsec, NULL);
++	if (ops) {
++		needed_headroom = ops->needed_headroom;
++		needed_tailroom = ops->needed_tailroom;
++	} else {
++		needed_headroom = MACSEC_NEEDED_HEADROOM;
++		needed_tailroom = MACSEC_NEEDED_TAILROOM;
++	}
++
++	dev->needed_headroom = real_dev->needed_headroom + needed_headroom;
++	dev->needed_tailroom = real_dev->needed_tailroom + needed_tailroom;
++}
++
+ static int macsec_update_offload(struct net_device *dev, enum macsec_offload offload)
+ {
+ 	enum macsec_offload prev_offload;
+@@ -2620,8 +2650,13 @@ static int macsec_update_offload(struct
+ 	ctx.secy = &macsec->secy;
+ 	ret = offload == MACSEC_OFFLOAD_OFF ? macsec_offload(ops->mdo_del_secy, &ctx)
+ 					    : macsec_offload(ops->mdo_add_secy, &ctx);
+-	if (ret)
++	if (ret) {
+ 		macsec->offload = prev_offload;
++		return ret;
++	}
++
++	macsec_set_head_tail_room(dev);
++	macsec->insert_tx_tag = macsec_needs_tx_tag(macsec, ops);
+ 
+ 	return ret;
+ }
+@@ -3379,6 +3414,40 @@ static struct genl_family macsec_fam __r
+ 	.resv_start_op	= MACSEC_CMD_UPD_OFFLOAD + 1,
+ };
+ 
++static struct sk_buff *macsec_insert_tx_tag(struct sk_buff *skb,
++					    struct net_device *dev)
++{
++	struct macsec_dev *macsec = macsec_priv(dev);
++	const struct macsec_ops *ops;
++	struct phy_device *phydev;
++	struct macsec_context ctx;
++	int skb_final_len;
++	int err;
++
++	ops = macsec_get_ops(macsec, &ctx);
++	skb_final_len = skb->len - ETH_HLEN + ops->needed_headroom +
++		ops->needed_tailroom;
++	if (unlikely(skb_final_len > macsec->real_dev->mtu)) {
++		err = -EINVAL;
++		goto cleanup;
++	}
++
++	phydev = macsec->real_dev->phydev;
++
++	err = skb_ensure_writable_head_tail(skb, dev);
++	if (unlikely(err < 0))
++		goto cleanup;
++
++	err = ops->mdo_insert_tx_tag(phydev, skb);
++	if (unlikely(err))
++		goto cleanup;
++
++	return skb;
++cleanup:
++	kfree_skb(skb);
++	return ERR_PTR(err);
++}
++
+ static netdev_tx_t macsec_start_xmit(struct sk_buff *skb,
+ 				     struct net_device *dev)
+ {
+@@ -3393,6 +3462,15 @@ static netdev_tx_t macsec_start_xmit(str
+ 		skb_dst_drop(skb);
+ 		dst_hold(&md_dst->dst);
+ 		skb_dst_set(skb, &md_dst->dst);
++
++		if (macsec->insert_tx_tag) {
++			skb = macsec_insert_tx_tag(skb, dev);
++			if (IS_ERR(skb)) {
++				DEV_STATS_INC(dev, tx_dropped);
++				return NETDEV_TX_OK;
++			}
++		}
++
+ 		skb->dev = macsec->real_dev;
+ 		return dev_queue_xmit(skb);
+ 	}
+@@ -3454,10 +3532,7 @@ static int macsec_dev_init(struct net_de
+ 	dev->features = real_dev->features & MACSEC_FEATURES;
+ 	dev->features |= NETIF_F_LLTX | NETIF_F_GSO_SOFTWARE;
+ 
+-	dev->needed_headroom = real_dev->needed_headroom +
+-			       MACSEC_NEEDED_HEADROOM;
+-	dev->needed_tailroom = real_dev->needed_tailroom +
+-			       MACSEC_NEEDED_TAILROOM;
++	macsec_set_head_tail_room(dev);
+ 
+ 	if (is_zero_ether_addr(dev->dev_addr))
+ 		eth_hw_addr_inherit(dev, real_dev);
+@@ -4140,6 +4215,9 @@ static int macsec_newlink(struct net *ne
+ 			err = macsec_offload(ops->mdo_add_secy, &ctx);
+ 			if (err)
+ 				goto del_dev;
++
++			macsec->insert_tx_tag =
++				macsec_needs_tx_tag(macsec, ops);
+ 		}
+ 	}
+ 
+--- a/include/net/macsec.h
++++ b/include/net/macsec.h
+@@ -316,6 +316,11 @@ struct macsec_context {
+  * @mdo_get_tx_sa_stats: called when TX SA stats are read
+  * @mdo_get_rx_sc_stats: called when RX SC stats are read
+  * @mdo_get_rx_sa_stats: called when RX SA stats are read
++ * @mdo_insert_tx_tag: called to insert the TX tag
++ * @needed_headroom: number of bytes reserved at the beginning of the sk_buff
++ *	for the TX tag
++ * @needed_tailroom: number of bytes reserved at the end of the sk_buff for the
++ *	TX tag
+  */
+ struct macsec_ops {
+ 	/* Device wide */
+@@ -342,6 +347,11 @@ struct macsec_ops {
+ 	int (*mdo_get_tx_sa_stats)(struct macsec_context *ctx);
+ 	int (*mdo_get_rx_sc_stats)(struct macsec_context *ctx);
+ 	int (*mdo_get_rx_sa_stats)(struct macsec_context *ctx);
++	/* Offload tag */
++	int (*mdo_insert_tx_tag)(struct phy_device *phydev,
++				 struct sk_buff *skb);
++	unsigned int needed_headroom;
++	unsigned int needed_tailroom;
+ };
+ 
+ void macsec_pn_wrapped(struct macsec_secy *secy, struct macsec_tx_sa *tx_sa);
