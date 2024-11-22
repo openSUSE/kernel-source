@@ -1,4 +1,4 @@
-import bugzilla, datetime
+import bugzilla, datetime, os
 from bugzilla._cli import DEFAULT_BZ
 
 def get_bugzilla_api():
@@ -23,3 +23,21 @@ def make_url(bug_id):
 
 def format_time(t):
     return datetime.datetime.strptime(str(t), '%Y%m%dT%H:%M:%S')
+
+def create_cache_dir(program_dir):
+    cache_dir = os.getenv('XDG_CACHE_HOME', None)
+    if not cache_dir:
+        cache_dir = os.getenv('HOME', None)
+        if not cache_dir:
+            sys.exit(2)
+        cache_dir = cache_dir + os.sep + '.cache'
+    if not os.path.isdir(cache_dir):
+        os.mkdir(cache_dir)
+    if not os.path.isdir(cache_dir):
+        sys.exit(3)
+    program_dir = cache_dir + os.sep + program_dir
+    if not os.path.isdir(program_dir):
+        os.mkdir(program_dir)
+    if not os.path.isdir(program_dir):
+        sys.exit(4)
+    return program_dir
