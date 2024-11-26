@@ -12,12 +12,12 @@ MULTIBUILD="Yes"
 # Use new style livepatch package names
 LIVEPATCH=livepatch
 # buildservice projects to build the kernel against
-OBS_PROJECT=SUSE:ALP:Source:Standard:Core:1.0:Build
-IBS_PROJECT=SUSE:ALP:Source:Standard:Core:1.0:Build
+OBS_PROJECT=SUSE:SLFO:Main:Build
+IBS_PROJECT=SUSE:SLFO:Main:Build
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
-BUGZILLA_PRODUCT="SUSE Linux Enterprise Micro 6.0"
-SPLIT_OPTIONAL=No
+BUGZILLA_PRODUCT="SUSE Linux Enterprise Micro 6.2"
+SPLIT_OPTIONAL=Yes
 SUPPORTED_MODULES_CHECK=Yes
 # build documentation in HTML format
 BUILD_HTML=Yes
