@@ -24,6 +24,9 @@ def make_url(bug_id):
 def format_time(t):
     return datetime.datetime.strptime(str(t), '%Y%m%dT%H:%M:%S')
 
+def get_backport_string(references, h, comment):
+    return f'./scripts/git_sort/series_insert.py patches.suse/$(exportpatch -w -s -d patches.suse {" ".join(f"-F {r}" for r in references)} {h}) # {comment}'
+
 def create_cache_dir(program_dir):
     cache_dir = os.getenv('XDG_CACHE_HOME', None)
     if not cache_dir:
