@@ -775,6 +775,20 @@ Acked-by: developer@suse.com
 """
         self.header = header.Checker(text, False, "patches.kabi/FATE123456_fix_kabi.patch")
 
+    def test_kabi_patch_in_wrong_folder(self):
+        text = """
+From: developer@site.com
+Subject: some patch
+References: FATE#123456
+Patch-mainline: Never, kABI workaround
+Acked-by: developer@suse.com
+"""
+        with self.assertRaises(header.HeaderException) as cm:
+            self.header = header.Checker(text, False, "patches.suse/FATE123456_fix_kabi.patch")
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.WrongFolderError))
+
     def test_patch_mainline_invalid2(self):
         text = """
 From: developer@site.com
