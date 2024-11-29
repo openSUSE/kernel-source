@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 # vim: sw=4 ts=4 et si:
 
-import sys
 import re
-from optparse import OptionParser
 from . import patch
 from io import StringIO
 
@@ -252,6 +250,11 @@ class EmptyTagError(ValidationError):
         msg = "%s: Value cannot be empty." % name
         super(EmptyTagError, self).__init__(name, msg)
 
+class WrongFolderError(patch.ValidationError):
+    def __init__(self, fn):
+        msg = "%s: file should be in patches.kabi/." % fn
+        super(WrongFolderError, self).__init__(msg)
+
 class HeaderException(patch.PatchException):
     def tag_is_missing(self, name):
         try:
@@ -260,7 +263,7 @@ class HeaderException(patch.PatchException):
                     for tag in err.target:
                         if tag['name'].lower() == name.lower():
                             return True
-        except KeyError as e:
+        except KeyError:
             pass
 
         return False
@@ -276,14 +279,14 @@ class Tag:
         return "%s: %s" % (self.name, self.value)
 
     def __repr__(self):
-        type = "<none>"
+        tagtype = "<none>"
         if self.tagtype:
-            type = self.tagtype
+            tagtype = self.tagtype
         valid = "No"
         if self.valid:
             valid = "Yes"
         return "<Tag: name=%s value='%s' type='%s' valid='%s'>" % \
-                (self.name, self.value, type, valid)
+                (self.name, self.value, tagtype, valid)
 
     def match_req(self, req):
         if self.name == req['name']:
@@ -314,13 +317,13 @@ class HeaderChecker(patch.PatchChecker):
     def get_rulename(self, ruleset, rulename):
         if rulename in ruleset:
             if self.kabi:
-                 kabi_rule = "%s_on_kabi" % rulename
-                 if kabi_rule in ruleset:
-                     return kabi_rule
+                kabi_rule = "%s_on_kabi" % rulename
+                if kabi_rule in ruleset:
+                    return kabi_rule
             if self.updating:
-                 updating_rule = "%s_on_update" % rulename
-                 if updating_rule in ruleset:
-                     return updating_rule
+                updating_rule = "%s_on_update" % rulename
+                if updating_rule in ruleset:
+                    return updating_rule
             return rulename
         return None
 
@@ -365,7 +368,7 @@ class HeaderChecker(patch.PatchChecker):
 
                 try:
                     multi = mapping['multi']
-                except KeyError as e:
+                except KeyError:
                     multi = False
 
                 for t in self.tags:
@@ -456,11 +459,11 @@ class HeaderChecker(patch.PatchChecker):
 
         for entry in tag_map:
             if 'required' in tag_map[entry]:
-                found = False
+                this_tag = None
                 for tag in self.tags:
                     if entry == tag.name:
-                        found = True
-                if not found:
+                        this_tag = tag
+                if this_tag is None:
                     required = True
                     if self.kabi and 'required_on_kabi' in tag_map[entry]:
                         if not tag_map[entry]['required_on_kabi']:
@@ -471,6 +474,9 @@ class HeaderChecker(patch.PatchChecker):
                     if required:
                         self.errors.append(MissingTagError(None,
                                                            { 'name' : entry }))
+                elif (not self.kabi and 'Patch-mainline' in this_tag.name and
+                    re.match(".*kabi.*", this_tag.value, re.IGNORECASE)):
+                    self.errors.append(WrongFolderError(self.filename))
 
         if self.errors:
             raise HeaderException(self.errors)
