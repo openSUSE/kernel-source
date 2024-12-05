@@ -1,0 +1,232 @@
+From 023d16deb34fbd0b2a04c3a0f6f2b66f98089525 Mon Sep 17 00:00:00 2001
+From: Philip Yang <Philip.Yang@amd.com>
+Date: Thu, 20 Jun 2024 12:44:57 -0400
+Subject: drm/amdkfd: Validate user queue svm memory residency
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: b049504e211e8f4dbcd40434f2dcab2215ea1039
+Patch-mainline: v6.12-rc1
+References: jsc#PED-9898 jsc#PED-10191 jsc#PED-10197 jsc#PED-10226 jsc#PED-10237 jsc#PED-10340 jsc#PED-10852 jsc#PED-11022
+
+Queue CWSR area maybe registered to GPU as svm memory, create queue to
+ensure svm mapped to GPU with KFD_IOCTL_SVM_FLAG_GPU_ALWAYS_MAPPED flag.
+
+Add queue_refcount to struct svm_range, to track queue CWSR area usage.
+
+Because unmap mmu notifier callback return value is ignored, if
+application unmap the CWSR area while queue is active, pr_warn message
+in dmesg log. To be safe, evict user queue.
+
+Signed-off-by: Philip Yang <Philip.Yang@amd.com>
+Reviewed-by: Felix Kuehling <felix.kuehling@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_queue.c | 110 ++++++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_svm.c   |  12 +++
+ drivers/gpu/drm/amd/amdkfd/kfd_svm.h   |   1 +
+ 3 files changed, 122 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_queue.c b/drivers/gpu/drm/amd/amdkfd/kfd_queue.c
+index 3fd386dcb011..67242ce051b5 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_queue.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_queue.c
+@@ -24,6 +24,7 @@
+ 
+ #include <linux/slab.h>
+ #include "kfd_priv.h"
++#include "kfd_svm.h"
+ 
+ void print_queue_properties(struct queue_properties *q)
+ {
+@@ -83,6 +84,100 @@ void uninit_queue(struct queue *q)
+ 	kfree(q);
+ }
+ 
++static int kfd_queue_buffer_svm_get(struct kfd_process_device *pdd, u64 addr, u64 size)
++{
++	struct kfd_process *p = pdd->process;
++	struct list_head update_list;
++	struct svm_range *prange;
++	int ret = -EINVAL;
++
++	INIT_LIST_HEAD(&update_list);
++	addr >>= PAGE_SHIFT;
++	size >>= PAGE_SHIFT;
++
++	mutex_lock(&p->svms.lock);
++
++	/*
++	 * range may split to multiple svm pranges aligned to granularity boundaery.
++	 */
++	while (size) {
++		uint32_t gpuid, gpuidx;
++		int r;
++
++		prange = svm_range_from_addr(&p->svms, addr, NULL);
++		if (!prange)
++			break;
++
++		if (!prange->mapped_to_gpu)
++			break;
++
++		r = kfd_process_gpuid_from_node(p, pdd->dev, &gpuid, &gpuidx);
++		if (r < 0)
++			break;
++		if (!test_bit(gpuidx, prange->bitmap_access) &&
++		    !test_bit(gpuidx, prange->bitmap_aip))
++			break;
++
++		if (!(prange->flags & KFD_IOCTL_SVM_FLAG_GPU_ALWAYS_MAPPED))
++			break;
++
++		list_add(&prange->update_list, &update_list);
++
++		if (prange->last - prange->start + 1 >= size) {
++			size = 0;
++			break;
++		}
++
++		size -= prange->last - prange->start + 1;
++		addr += prange->last - prange->start + 1;
++	}
++	if (size) {
++		pr_debug("[0x%llx 0x%llx] not registered\n", addr, addr + size - 1);
++		goto out_unlock;
++	}
++
++	list_for_each_entry(prange, &update_list, update_list)
++		atomic_inc(&prange->queue_refcount);
++	ret = 0;
++
++out_unlock:
++	mutex_unlock(&p->svms.lock);
++	return ret;
++}
++
++static void kfd_queue_buffer_svm_put(struct kfd_process_device *pdd, u64 addr, u64 size)
++{
++	struct kfd_process *p = pdd->process;
++	struct svm_range *prange, *pchild;
++	struct interval_tree_node *node;
++	unsigned long last;
++
++	addr >>= PAGE_SHIFT;
++	last = addr + (size >> PAGE_SHIFT) - 1;
++
++	mutex_lock(&p->svms.lock);
++
++	node = interval_tree_iter_first(&p->svms.objects, addr, last);
++	while (node) {
++		struct interval_tree_node *next_node;
++		unsigned long next_start;
++
++		prange = container_of(node, struct svm_range, it_node);
++		next_node = interval_tree_iter_next(node, addr, last);
++		next_start = min(node->last, last) + 1;
++
++		if (atomic_add_unless(&prange->queue_refcount, -1, 0)) {
++			list_for_each_entry(pchild, &prange->child_list, child_list)
++				atomic_add_unless(&pchild->queue_refcount, -1, 0);
++		}
++
++		node = next_node;
++		addr = next_start;
++	}
++
++	mutex_unlock(&p->svms.lock);
++}
++
+ int kfd_queue_buffer_get(struct amdgpu_vm *vm, void __user *addr, struct amdgpu_bo **pbo,
+ 			 u64 expected_size)
+ {
+@@ -165,8 +260,17 @@ int kfd_queue_acquire_buffers(struct kfd_process_device *pdd, struct queue_prope
+ 
+ 	err = kfd_queue_buffer_get(vm, (void *)properties->ctx_save_restore_area_address,
+ 				   &properties->cwsr_bo, 0);
++	if (!err)
++		goto out_unreserve;
++
++	amdgpu_bo_unreserve(vm->root.bo);
++
++	err = kfd_queue_buffer_svm_get(pdd, properties->ctx_save_restore_area_address,
++				       properties->ctx_save_restore_area_size);
+ 	if (err)
+-		goto out_err_unreserve;
++		goto out_err_release;
++
++	return 0;
+ 
+ out_unreserve:
+ 	amdgpu_bo_unreserve(vm->root.bo);
+@@ -174,6 +278,7 @@ int kfd_queue_acquire_buffers(struct kfd_process_device *pdd, struct queue_prope
+ 
+ out_err_unreserve:
+ 	amdgpu_bo_unreserve(vm->root.bo);
++out_err_release:
+ 	kfd_queue_release_buffers(pdd, properties);
+ 	return err;
+ }
+@@ -195,5 +300,8 @@ int kfd_queue_release_buffers(struct kfd_process_device *pdd, struct queue_prope
+ 	kfd_queue_buffer_put(vm, &properties->cwsr_bo);
+ 
+ 	amdgpu_bo_unreserve(vm->root.bo);
++
++	kfd_queue_buffer_svm_put(pdd, properties->ctx_save_restore_area_address,
++				 properties->ctx_save_restore_area_size);
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+index bd9c2921e0dc..2339bbdf452f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+@@ -1051,6 +1051,7 @@ svm_range_split_adjust(struct svm_range *new, struct svm_range *old,
+ 	new->mapped_to_gpu = old->mapped_to_gpu;
+ 	bitmap_copy(new->bitmap_access, old->bitmap_access, MAX_GPU_INSTANCE);
+ 	bitmap_copy(new->bitmap_aip, old->bitmap_aip, MAX_GPU_INSTANCE);
++	atomic_set(&new->queue_refcount, atomic_read(&old->queue_refcount));
+ 
+ 	return 0;
+ }
+@@ -1992,6 +1993,7 @@ static struct svm_range *svm_range_clone(struct svm_range *old)
+ 	new->vram_pages = old->vram_pages;
+ 	bitmap_copy(new->bitmap_access, old->bitmap_access, MAX_GPU_INSTANCE);
+ 	bitmap_copy(new->bitmap_aip, old->bitmap_aip, MAX_GPU_INSTANCE);
++	atomic_set(&new->queue_refcount, atomic_read(&old->queue_refcount));
+ 
+ 	return new;
+ }
+@@ -2444,6 +2446,16 @@ svm_range_unmap_from_cpu(struct mm_struct *mm, struct svm_range *prange,
+ 	unsigned long s, l;
+ 	bool unmap_parent;
+ 
++	if (atomic_read(&prange->queue_refcount)) {
++		int r;
++
++		pr_warn("Freeing queue vital buffer 0x%lx, queue evicted\n",
++			prange->start << PAGE_SHIFT);
++		r = kgd2kfd_quiesce_mm(mm, KFD_QUEUE_EVICTION_TRIGGER_SVM);
++		if (r)
++			pr_debug("failed %d to quiesce KFD queues\n", r);
++	}
++
+ 	p = kfd_lookup_process_by_mm(mm);
+ 	if (!p)
+ 		return;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_svm.h b/drivers/gpu/drm/amd/amdkfd/kfd_svm.h
+index 70c1776611c4..747325a2ea89 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.h
+@@ -137,6 +137,7 @@ struct svm_range {
+ 	DECLARE_BITMAP(bitmap_access, MAX_GPU_INSTANCE);
+ 	DECLARE_BITMAP(bitmap_aip, MAX_GPU_INSTANCE);
+ 	bool				mapped_to_gpu;
++	atomic_t			queue_refcount;
+ };
+ 
+ static inline void svm_range_lock(struct svm_range *prange)
+-- 
+2.46.1
+
