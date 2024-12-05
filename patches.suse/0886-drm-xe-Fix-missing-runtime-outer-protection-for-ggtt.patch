@@ -1,0 +1,224 @@
+From dcee308356f2a9cb452826f8d3b18a950ec43980 Mon Sep 17 00:00:00 2001
+From: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Date: Wed, 21 Aug 2024 15:38:42 -0400
+Subject: drm/xe: Fix missing runtime outer protection for ggtt_remove_node
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 919bb54e989c1edef87e9797be125c94c450fc65
+Patch-mainline: v6.12-rc1
+References: jsc#PED-9898 jsc#PED-10191 jsc#PED-10197 jsc#PED-10226 jsc#PED-10237 jsc#PED-10340 jsc#PED-10852 jsc#PED-11022
+
+Defer the ggtt node removal to a thread if runtime_pm is not active.
+
+The ggtt node removal can be called from multiple places, including
+places where we cannot protect with outer callers and places we are
+within other locks. So, try to grab the runtime reference if the
+device is already active, otherwise defer the removal to a separate
+thread from where we are sure we can wake the device up.
+
+v2: - use xe wq instead of system wq (Matt and CI)
+    - Avoid GFP_KERNEL to be future proof since this removal can
+    be called from outside our drivers and we don't want to block
+    if atomic is needed. (Brost)
+v3: amend forgot chunk declaring xe_device.
+v4: Use a xe_ggtt_region to encapsulate the node and remova info,
+    wihtout the need for any memory allocation at runtime.
+v5: Actually fill the delayed_removal.invalidate (Brost)
+v6: - Ensure that ggtt_region is not freed before work finishes (Auld)
+    - Own wq to ensures that the queued works are flushed before
+      ggtt_fini (Brost)
+v7: also free ggtt_region on early !bound return (Auld)
+v8: Address the null deref (CI)
+v9: Based on the new xe_ggtt_node for the proper care of the lifetime
+    of the object.
+v10: Redo the lost v5 change. (Brost)
+v11: Simplify the invalidate_on_remove (Lucas)
+
+Cc: Matthew Auld <matthew.auld@intel.com>
+Cc: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Cc: Francois Dugast <francois.dugast@intel.com>
+Cc: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240821193842.352557-12-rodrigo.vivi@intel.com
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/xe/xe_ggtt.c       | 106 ++++++++++++++++++-----------
+ drivers/gpu/drm/xe/xe_ggtt_types.h |   6 ++
+ 2 files changed, 73 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_ggtt.c b/drivers/gpu/drm/xe/xe_ggtt.c
+index 58d7cad2425b..b4a0cd2b62ed 100644
+--- a/drivers/gpu/drm/xe/xe_ggtt.c
++++ b/drivers/gpu/drm/xe/xe_ggtt.c
+@@ -161,6 +161,7 @@ static void ggtt_fini_early(struct drm_device *drm, void *arg)
+ {
+ 	struct xe_ggtt *ggtt = arg;
+ 
++	destroy_workqueue(ggtt->wq);
+ 	mutex_destroy(&ggtt->lock);
+ 	drm_mm_takedown(&ggtt->mm);
+ }
+@@ -242,6 +243,8 @@ int xe_ggtt_init_early(struct xe_ggtt *ggtt)
+ 	else
+ 		ggtt->pt_ops = &xelp_pt_ops;
+ 
++	ggtt->wq = alloc_workqueue("xe-ggtt-wq", 0, 0);
++
+ 	drm_mm_init(&ggtt->mm, xe_wopcm_size(xe),
+ 		    ggtt->size - xe_wopcm_size(xe));
+ 	mutex_init(&ggtt->lock);
+@@ -276,6 +279,68 @@ static void xe_ggtt_initial_clear(struct xe_ggtt *ggtt)
+ 	mutex_unlock(&ggtt->lock);
+ }
+ 
++static void ggtt_node_remove(struct xe_ggtt_node *node)
++{
++	struct xe_ggtt *ggtt = node->ggtt;
++	struct xe_device *xe = tile_to_xe(ggtt->tile);
++	bool bound;
++	int idx;
++
++	if (!node || !node->ggtt)
++		return;
++
++	bound = drm_dev_enter(&xe->drm, &idx);
++
++	mutex_lock(&ggtt->lock);
++	if (bound)
++		xe_ggtt_clear(ggtt, node->base.start, node->base.size);
++	drm_mm_remove_node(&node->base);
++	node->base.size = 0;
++	mutex_unlock(&ggtt->lock);
++
++	if (!bound)
++		goto free_node;
++
++	if (node->invalidate_on_remove)
++		xe_ggtt_invalidate(ggtt);
++
++	drm_dev_exit(idx);
++
++free_node:
++	xe_ggtt_node_fini(node);
++}
++
++static void ggtt_node_remove_work_func(struct work_struct *work)
++{
++	struct xe_ggtt_node *node = container_of(work, typeof(*node),
++						 delayed_removal_work);
++	struct xe_device *xe = tile_to_xe(node->ggtt->tile);
++
++	xe_pm_runtime_get(xe);
++	ggtt_node_remove(node);
++	xe_pm_runtime_put(xe);
++}
++
++/**
++ * xe_ggtt_node_remove - Remove a &xe_ggtt_node from the GGTT
++ * @node: the &xe_ggtt_node to be removed
++ * @invalidate: if node needs invalidation upon removal
++ */
++void xe_ggtt_node_remove(struct xe_ggtt_node *node, bool invalidate)
++{
++	struct xe_ggtt *ggtt = node->ggtt;
++	struct xe_device *xe = tile_to_xe(ggtt->tile);
++
++	node->invalidate_on_remove = invalidate;
++
++	if (xe_pm_runtime_get_if_active(xe)) {
++		ggtt_node_remove(node);
++		xe_pm_runtime_put(xe);
++	} else {
++		queue_work(ggtt->wq, &node->delayed_removal_work);
++	}
++}
++
+ /**
+  * xe_ggtt_init - Regular non-early GGTT initialization
+  * @ggtt: the &xe_ggtt to be initialized
+@@ -471,7 +536,9 @@ struct xe_ggtt_node *xe_ggtt_node_init(struct xe_ggtt *ggtt)
+ 	if (!node)
+ 		return ERR_PTR(-ENOMEM);
+ 
++	INIT_WORK(&node->delayed_removal_work, ggtt_node_remove_work_func);
+ 	node->ggtt = ggtt;
++
+ 	return node;
+ }
+ 
+@@ -488,45 +555,6 @@ void xe_ggtt_node_fini(struct xe_ggtt_node *node)
+ 	kfree(node);
+ }
+ 
+-/**
+- * xe_ggtt_node_remove - Remove a &xe_ggtt_node from the GGTT
+- * @node: the &xe_ggtt_node to be removed
+- * @invalidate: if node needs invalidation upon removal
+- */
+-void xe_ggtt_node_remove(struct xe_ggtt_node *node, bool invalidate)
+-{
+-	struct xe_ggtt *ggtt = node->ggtt;
+-	struct xe_device *xe = tile_to_xe(ggtt->tile);
+-	bool bound;
+-	int idx;
+-
+-	if (!node || !node->ggtt)
+-		return;
+-
+-	bound = drm_dev_enter(&xe->drm, &idx);
+-	if (bound)
+-		xe_pm_runtime_get_noresume(xe);
+-
+-	mutex_lock(&ggtt->lock);
+-	if (bound)
+-		xe_ggtt_clear(ggtt, node->base.start, node->base.size);
+-	drm_mm_remove_node(&node->base);
+-	node->base.size = 0;
+-	mutex_unlock(&ggtt->lock);
+-
+-	if (!bound)
+-		goto free_node;
+-
+-	if (invalidate)
+-		xe_ggtt_invalidate(ggtt);
+-
+-	xe_pm_runtime_put(xe);
+-	drm_dev_exit(idx);
+-
+-free_node:
+-	xe_ggtt_node_fini(node);
+-}
+-
+ /**
+  * xe_ggtt_node_allocated - Check if node is allocated in GGTT
+  * @node: the &xe_ggtt_node to be inspected
+diff --git a/drivers/gpu/drm/xe/xe_ggtt_types.h b/drivers/gpu/drm/xe/xe_ggtt_types.h
+index 0e8822ae13fc..cb02b7994a9a 100644
+--- a/drivers/gpu/drm/xe/xe_ggtt_types.h
++++ b/drivers/gpu/drm/xe/xe_ggtt_types.h
+@@ -47,6 +47,8 @@ struct xe_ggtt {
+ 	struct drm_mm mm;
+ 	/** @access_count: counts GGTT writes */
+ 	unsigned int access_count;
++	/** @wq: Dedicated unordered work queue to process node removals */
++	struct workqueue_struct *wq;
+ };
+ 
+ /**
+@@ -61,6 +63,10 @@ struct xe_ggtt_node {
+ 	struct xe_ggtt *ggtt;
+ 	/** @base: A drm_mm_node */
+ 	struct drm_mm_node base;
++	/** @delayed_removal_work: The work struct for the delayed removal */
++	struct work_struct delayed_removal_work;
++	/** @invalidate_on_remove: If it needs invalidation upon removal */
++	bool invalidate_on_remove;
+ };
+ 
+ /**
+-- 
+2.46.1
+
