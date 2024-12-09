@@ -1,0 +1,177 @@
+From: Shay Agroskin <shayagr@amazon.com>
+Date: Tue, 8 Dec 2020 20:02:08 +0200
+Subject: net: ena: introduce ndo_xdp_xmit() function for XDP_REDIRECT
+Patch-mainline: v5.11-rc1
+Git-commit: f1a25589130366a96a2a0d165e9f4d9289336e9f
+References: bsc#1198778
+
+This patch implements the ndo_xdp_xmit() net_device function which is
+called when a packet is redirected to this driver using an
+XDP_REDIRECT directive.
+
+The function receives an array of xdp frames that it needs to xmit.
+The TX queues that are used to xmit these frames are the XDP
+queues used by the XDP_TX flow. Therefore a lock is added to synchronize
+both flows (XDP_TX and XDP_REDIRECT).
+
+Signed-off-by: Shay Agroskin <shayagr@amazon.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/amazon/ena/ena_netdev.c |   83 +++++++++++++++++++++++----
+ drivers/net/ethernet/amazon/ena/ena_netdev.h |    1 
+ 2 files changed, 72 insertions(+), 12 deletions(-)
+
+--- a/drivers/net/ethernet/amazon/ena/ena_netdev.c
++++ b/drivers/net/ethernet/amazon/ena/ena_netdev.c
+@@ -284,20 +284,18 @@ error_report_dma_error:
+ 	return -EINVAL;
+ }
+ 
+-static int ena_xdp_xmit_frame(struct net_device *dev,
++static int ena_xdp_xmit_frame(struct ena_ring *xdp_ring,
++			      struct net_device *dev,
+ 			      struct xdp_frame *xdpf,
+-			      int qid)
++			      int flags)
+ {
+-	struct ena_adapter *adapter = netdev_priv(dev);
+ 	struct ena_com_tx_ctx ena_tx_ctx = {};
+ 	struct ena_tx_buffer *tx_info;
+-	struct ena_ring *xdp_ring;
+ 	u16 next_to_use, req_id;
+-	int rc;
+ 	void *push_hdr;
+ 	u32 push_len;
++	int rc;
+ 
+-	xdp_ring = &adapter->tx_ring[qid];
+ 	next_to_use = xdp_ring->next_to_use;
+ 	req_id = xdp_ring->free_ids[next_to_use];
+ 	tx_info = &xdp_ring->tx_buffer_info[req_id];
+@@ -324,25 +322,76 @@ static int ena_xdp_xmit_frame(struct net
+ 	/* trigger the dma engine. ena_com_write_sq_doorbell()
+ 	 * has a mb
+ 	 */
+-	ena_com_write_sq_doorbell(xdp_ring->ena_com_io_sq);
+-	ena_increase_stat(&xdp_ring->tx_stats.doorbells, 1, &xdp_ring->syncp);
++	if (flags & XDP_XMIT_FLUSH) {
++		ena_com_write_sq_doorbell(xdp_ring->ena_com_io_sq);
++		ena_increase_stat(&xdp_ring->tx_stats.doorbells, 1,
++				  &xdp_ring->syncp);
++	}
+ 
+-	return NETDEV_TX_OK;
++	return rc;
+ 
+ error_unmap_dma:
+ 	ena_unmap_tx_buff(xdp_ring, tx_info);
+ 	tx_info->xdpf = NULL;
+ error_drop_packet:
+ 	xdp_return_frame(xdpf);
+-	return NETDEV_TX_OK;
++	return rc;
++}
++
++static int ena_xdp_xmit(struct net_device *dev, int n,
++			struct xdp_frame **frames, u32 flags)
++{
++	struct ena_adapter *adapter = netdev_priv(dev);
++	int qid, i, err, drops = 0;
++	struct ena_ring *xdp_ring;
++
++	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++		return -EINVAL;
++
++	if (!test_bit(ENA_FLAG_DEV_UP, &adapter->flags))
++		return -ENETDOWN;
++
++	/* We assume that all rings have the same XDP program */
++	if (!READ_ONCE(adapter->rx_ring->xdp_bpf_prog))
++		return -ENXIO;
++
++	qid = smp_processor_id() % adapter->xdp_num_queues;
++	qid += adapter->xdp_first_ring;
++	xdp_ring = &adapter->tx_ring[qid];
++
++	/* Other CPU ids might try to send thorugh this queue */
++	spin_lock(&xdp_ring->xdp_tx_lock);
++
++	for (i = 0; i < n; i++) {
++		err = ena_xdp_xmit_frame(xdp_ring, dev, frames[i], 0);
++		/* The descriptor is freed by ena_xdp_xmit_frame in case
++		 * of an error.
++		 */
++		if (err)
++			drops++;
++	}
++
++	/* Ring doorbell to make device aware of the packets */
++	if (flags & XDP_XMIT_FLUSH) {
++		ena_com_write_sq_doorbell(xdp_ring->ena_com_io_sq);
++		ena_increase_stat(&xdp_ring->tx_stats.doorbells, 1,
++				  &xdp_ring->syncp);
++	}
++
++	spin_unlock(&xdp_ring->xdp_tx_lock);
++
++	/* Return number of packets sent */
++	return n - drops;
+ }
+ 
+ static int ena_xdp_execute(struct ena_ring *rx_ring, struct xdp_buff *xdp)
+ {
+ 	struct bpf_prog *xdp_prog;
++	struct ena_ring *xdp_ring;
+ 	u32 verdict = XDP_PASS;
+ 	struct xdp_frame *xdpf;
+ 	u64 *xdp_stat;
++	int qid;
+ 
+ 	rcu_read_lock();
+ 	xdp_prog = READ_ONCE(rx_ring->xdp_bpf_prog);
+@@ -361,8 +410,16 @@ static int ena_xdp_execute(struct ena_ri
+ 			break;
+ 		}
+ 
+-		ena_xdp_xmit_frame(rx_ring->netdev, xdpf,
+-				   rx_ring->qid + rx_ring->adapter->num_io_queues);
++		/* Find xmit queue */
++		qid = rx_ring->qid + rx_ring->adapter->num_io_queues;
++		xdp_ring = &rx_ring->adapter->tx_ring[qid];
++
++		/* The XDP queues are shared between XDP_TX and XDP_REDIRECT */
++		spin_lock(&xdp_ring->xdp_tx_lock);
++
++		ena_xdp_xmit_frame(xdp_ring, rx_ring->netdev, xdpf, XDP_XMIT_FLUSH);
++
++		spin_unlock(&xdp_ring->xdp_tx_lock);
+ 		xdp_stat = &rx_ring->rx_stats.xdp_tx;
+ 		break;
+ 	case XDP_REDIRECT:
+@@ -661,6 +718,7 @@ static void ena_init_io_rings(struct ena
+ 		txr->smoothed_interval =
+ 			ena_com_get_nonadaptive_moderation_interval_tx(ena_dev);
+ 		txr->disable_meta_caching = adapter->disable_meta_caching;
++		spin_lock_init(&txr->xdp_tx_lock);
+ 
+ 		/* Don't init RX queues for xdp queues */
+ 		if (!ENA_IS_XDP_INDEX(adapter, i)) {
+@@ -3253,6 +3311,7 @@ static const struct net_device_ops ena_n
+ 	.ndo_set_mac_address	= NULL,
+ 	.ndo_validate_addr	= eth_validate_addr,
+ 	.ndo_bpf		= ena_xdp,
++	.ndo_xdp_xmit		= ena_xdp_xmit,
+ };
+ 
+ static int ena_device_validate_params(struct ena_adapter *adapter,
+--- a/drivers/net/ethernet/amazon/ena/ena_netdev.h
++++ b/drivers/net/ethernet/amazon/ena/ena_netdev.h
+@@ -264,6 +264,7 @@ struct ena_ring {
+ 	struct ena_com_io_sq *ena_com_io_sq;
+ 	struct bpf_prog *xdp_bpf_prog;
+ 	struct xdp_rxq_info xdp_rxq;
++	spinlock_t xdp_tx_lock;	/* synchronize XDP TX/Redirect traffic */
+ 
+ 	u16 next_to_use;
+ 	u16 next_to_clean;
