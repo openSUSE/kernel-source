@@ -1,7 +1,7 @@
 # The version of the main tarball to use
 SRCVERSION=6.12
 # variant of the kernel-source package, either empty or "-rt"
-VARIANT=
+VARIANT=-rt
 # enable kernel module compression
 COMPRESS_MODULES="zstd"
 COMPRESS_VMLINUX="xz"
@@ -11,6 +11,8 @@ BUILD_DTBS="Yes"
 MULTIBUILD="Yes"
 # Use new style livepatch package names
 LIVEPATCH=livepatch
+# Enable livepatching related packages on -rt variant
+LIVEPATCH_RT=1
 # buildservice projects to build the kernel against
 OBS_PROJECT=SUSE:SLFO:Main:Build
 IBS_PROJECT=SUSE:SLFO:Main:Build
