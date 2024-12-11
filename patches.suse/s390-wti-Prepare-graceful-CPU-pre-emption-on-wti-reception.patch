@@ -1,0 +1,201 @@
+From: Tobias Huschle <huschle@linux.ibm.com>
+Date: Mon, 12 Aug 2024 13:39:28 +0200
+Subject: s390/wti: Prepare graceful CPU pre-emption on wti reception
+Git-commit: cafeff5a030983bbf37b11ab766b68d7da3b8aab
+Patch-mainline: v6.12-rc1
+References: jsc#PED-10248
+
+When a warning track interrupt is received, the kernel has only a very
+limited amount of time to make sure, that the CPU can be yielded as
+gracefully as possible before being pre-empted by the hypervisor.
+
+The interrupt handler for the wti therefore unparks a kernel thread
+which has being created on boot re-using the CPU hotplug kernel thread
+infrastructure. These threads exist per CPU and are assigned the
+highest possible real-time priority. This makes sure, that said threads
+will execute as soon as possible as the scheduler should pre-empt any
+other running user tasks to run the real-time thread.
+
+Furthermore, the interrupt handler disables all I/O interrupts to
+prevent additional interrupt processing on the soon-preempted CPU.
+Interrupt handlers are likely to take kernel locks, which in the worst
+case, will be kept while the interrupt handler is pre-empted from itself
+underlying physical CPU. In that case, all tasks or interrupt handlers
+on other CPUs would have to wait for the pre-empted CPU being dispatched
+again. By preventing further interrupt processing, this risk is
+minimized.
+
+Once the CPU gets dispatched again, the real-time kernel thread regains
+control, reenables interrupts and parks itself again.
+
+Acked-by: Heiko Carstens <hca@linux.ibm.com>
+Reviewed-by: Mete Durlu <meted@linux.ibm.com>
+Signed-off-by: Tobias Huschle <huschle@linux.ibm.com>
+Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+Acked-by: Miroslav Franc <mfranc@suse.cz>
+---
+ arch/s390/kernel/Makefile |   2 +-
+ arch/s390/kernel/wti.c    | 141 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 142 insertions(+), 1 deletion(-)
+
+diff --git a/arch/s390/kernel/Makefile b/arch/s390/kernel/Makefile
+index a70f25e9c17d..badeaa5ccd83 100644
+--- a/arch/s390/kernel/Makefile
++++ b/arch/s390/kernel/Makefile
+@@ -43,7 +43,7 @@ obj-y	+= sysinfo.o lgr.o os_info.o ctlreg.o
+ obj-y	+= runtime_instr.o cache.o fpu.o dumpstack.o guarded_storage.o sthyi.o
+ obj-y	+= entry.o reipl.o relocate_kernel.o kdebugfs.o alternative.o
+ obj-y	+= nospec-branch.o ipl_vmparm.o machine_kexec_reloc.o unwind_bc.o
+-obj-y	+= smp.o text_amode31.o stacktrace.o abs_lowcore.o
++obj-y	+= smp.o text_amode31.o stacktrace.o abs_lowcore.o wti.o
+ 
+ extra-y				+= vmlinux.lds
+ 
+diff --git a/arch/s390/kernel/wti.c b/arch/s390/kernel/wti.c
+new file mode 100644
+index 000000000000..3abae3908e65
+--- /dev/null
++++ b/arch/s390/kernel/wti.c
+@@ -0,0 +1,141 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Support for warning track interruption
++ *
++ * Copyright IBM Corp. 2023
++ */
++
++#include <linux/smpboot.h>
++#include <linux/irq.h>
++#include <uapi/linux/sched/types.h>
++#include <asm/diag.h>
++#include <asm/sclp.h>
++
++struct wti_state {
++	/*
++	 * Represents the real-time thread responsible to
++	 * acknowledge the warning-track interrupt and trigger
++	 * preliminary and postliminary precautions.
++	 */
++	struct task_struct	*thread;
++	/*
++	 * If pending is true, the real-time thread must be scheduled.
++	 * If not, a wake up of that thread will remain a noop.
++	 */
++	bool			pending;
++};
++
++static DEFINE_PER_CPU(struct wti_state, wti_state);
++
++/*
++ * During a warning-track grace period, interrupts are disabled
++ * to prevent delays of the warning-track acknowledgment.
++ *
++ * Once the CPU is physically dispatched again, interrupts are
++ * re-enabled.
++ */
++
++static void wti_irq_disable(void)
++{
++	unsigned long flags;
++	unsigned long cr6;
++
++	local_irq_save(flags);
++	local_ctl_store(6, &cr6);
++	/* disable all I/O interrupts */
++	cr6 &= ~0xff000000UL;
++	local_ctl_load(6, &cr6);
++	local_irq_restore(flags);
++}
++
++static void wti_irq_enable(void)
++{
++	unsigned long flags;
++	unsigned long cr6;
++
++	local_irq_save(flags);
++	local_ctl_store(6, &cr6);
++	/* enable all I/O interrupts */
++	cr6 |= 0xff000000UL;
++	local_ctl_load(6, &cr6);
++	local_irq_restore(flags);
++}
++
++static void wti_interrupt(struct ext_code ext_code,
++			  unsigned int param32, unsigned long param64)
++{
++	struct wti_state *st = this_cpu_ptr(&wti_state);
++
++	inc_irq_stat(IRQEXT_WTI);
++	wti_irq_disable();
++	st->pending = true;
++	wake_up_process(st->thread);
++}
++
++static int wti_pending(unsigned int cpu)
++{
++	struct wti_state *st = per_cpu_ptr(&wti_state, cpu);
++
++	return st->pending;
++}
++
++static void wti_thread_fn(unsigned int cpu)
++{
++	struct wti_state *st = per_cpu_ptr(&wti_state, cpu);
++
++	st->pending = false;
++	/*
++	 * Yield CPU voluntarily to the hypervisor. Control
++	 * resumes when hypervisor decides to dispatch CPU
++	 * to this LPAR again.
++	 */
++	diag49c(DIAG49C_SUBC_ACK);
++	wti_irq_enable();
++}
++
++static struct smp_hotplug_thread wti_threads = {
++	.store			= &wti_state.thread,
++	.thread_should_run	= wti_pending,
++	.thread_fn		= wti_thread_fn,
++	.thread_comm		= "cpuwti/%u",
++	.selfparking		= false,
++};
++
++static int __init wti_init(void)
++{
++	struct sched_param wti_sched_param = { .sched_priority = MAX_RT_PRIO - 1 };
++	struct wti_state *st;
++	int cpu, rc;
++
++	rc = -EOPNOTSUPP;
++	if (!sclp.has_wti)
++		goto out;
++	rc = smpboot_register_percpu_thread(&wti_threads);
++	if (WARN_ON(rc))
++		goto out;
++	for_each_online_cpu(cpu) {
++		st = per_cpu_ptr(&wti_state, cpu);
++		sched_setscheduler(st->thread, SCHED_FIFO, &wti_sched_param);
++	}
++	rc = register_external_irq(EXT_IRQ_WARNING_TRACK, wti_interrupt);
++	if (rc) {
++		pr_warn("Couldn't request external interrupt 0x1007\n");
++		goto out_thread;
++	}
++	irq_subclass_register(IRQ_SUBCLASS_WARNING_TRACK);
++	rc = diag49c(DIAG49C_SUBC_REG);
++	if (rc) {
++		pr_warn("Failed to register warning track interrupt through DIAG 49C\n");
++		rc = -EOPNOTSUPP;
++		goto out_subclass;
++	}
++	goto out;
++out_subclass:
++	irq_subclass_unregister(IRQ_SUBCLASS_WARNING_TRACK);
++	unregister_external_irq(EXT_IRQ_WARNING_TRACK, wti_interrupt);
++out_thread:
++	smpboot_unregister_percpu_thread(&wti_threads);
++out:
++	return rc;
++}
++late_initcall(wti_init);
+
