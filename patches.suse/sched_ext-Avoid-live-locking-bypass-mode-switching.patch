@@ -1,0 +1,141 @@
+From 145f75bd8b77d96c80be96a6a38b0950676e1ff3 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Tue, 5 Nov 2024 11:48:11 -1000
+Subject: [PATCH] sched_ext: Avoid live-locking bypass mode switching
+
+References: bsc#1234634 (Scheduler functional and performance backports)
+Patch-mainline: v6.13-rc1
+Git-commit: 62dcbab8b0ef21729532600039fd514c09407092
+
+A poorly behaving BPF scheduler can live-lock the system by e.g. incessantly
+banging on the same DSQ on a large NUMA system to the point where switching
+to the bypass mode can take a long time. Turning on the bypass mode requires
+dequeueing and re-enqueueing currently runnable tasks, if the DSQs that they
+are on are live-locked, this can take tens of seconds cascading into other
+failures. This was observed on 2 x Intel Sapphire Rapids machines with 224
+logical CPUs.
+
+Inject artifical delays while the bypass mode is switching to guarantee
+timely completion.
+
+While at it, move __scx_ops_bypass_lock into scx_ops_bypass() and rename it
+to bypass_lock.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reported-by: Valentin Andrei <vandrei@meta.com>
+Reported-by: Patrick Lu <patlu@meta.com>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ kernel/sched/ext.c | 55 +++++++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 52 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index ee76968b5b4a..288ef961f6e0 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -867,8 +867,8 @@ static DEFINE_MUTEX(scx_ops_enable_mutex);
+ DEFINE_STATIC_KEY_FALSE(__scx_ops_enabled);
+ DEFINE_STATIC_PERCPU_RWSEM(scx_fork_rwsem);
+ static atomic_t scx_ops_enable_state_var = ATOMIC_INIT(SCX_OPS_DISABLED);
++static atomic_t scx_ops_breather_depth = ATOMIC_INIT(0);
+ static int scx_ops_bypass_depth;
+-static DEFINE_RAW_SPINLOCK(__scx_ops_bypass_lock);
+ static bool scx_ops_init_task_enabled;
+ static bool scx_switching_all;
+ DEFINE_STATIC_KEY_FALSE(__scx_switched_all);
+@@ -2474,10 +2474,47 @@ static struct rq *move_task_between_dsqs(struct task_struct *p, u64 enq_flags,
+ 	return dst_rq;
+ }
+ 
++/*
++ * A poorly behaving BPF scheduler can live-lock the system by e.g. incessantly
++ * banging on the same DSQ on a large NUMA system to the point where switching
++ * to the bypass mode can take a long time. Inject artifical delays while the
++ * bypass mode is switching to guarantee timely completion.
++ */
++static void scx_ops_breather(struct rq *rq)
++{
++	u64 until;
++
++	lockdep_assert_rq_held(rq);
++
++	if (likely(!atomic_read(&scx_ops_breather_depth)))
++		return;
++
++	raw_spin_rq_unlock(rq);
++
++	until = ktime_get_ns() + NSEC_PER_MSEC;
++
++	do {
++		int cnt = 1024;
++		while (atomic_read(&scx_ops_breather_depth) && --cnt)
++			cpu_relax();
++	} while (atomic_read(&scx_ops_breather_depth) &&
++		 time_before64(ktime_get_ns(), until));
++
++	raw_spin_rq_lock(rq);
++}
++
+ static bool consume_dispatch_q(struct rq *rq, struct scx_dispatch_q *dsq)
+ {
+ 	struct task_struct *p;
+ retry:
++	/*
++	 * This retry loop can repeatedly race against scx_ops_bypass()
++	 * dequeueing tasks from @dsq trying to put the system into the bypass
++	 * mode. On some multi-socket machines (e.g. 2x Intel 8480c), this can
++	 * live-lock the machine into soft lockups. Give a breather.
++	 */
++	scx_ops_breather(rq);
++
+ 	/*
+ 	 * The caller can't expect to successfully consume a task if the task's
+ 	 * addition to @dsq isn't guaranteed to be visible somehow. Test
+@@ -4622,10 +4659,11 @@ bool task_should_scx(int policy)
+  */
+ static void scx_ops_bypass(bool bypass)
+ {
++	static DEFINE_RAW_SPINLOCK(bypass_lock);
+ 	int cpu;
+ 	unsigned long flags;
+ 
+-	raw_spin_lock_irqsave(&__scx_ops_bypass_lock, flags);
++	raw_spin_lock_irqsave(&bypass_lock, flags);
+ 	if (bypass) {
+ 		scx_ops_bypass_depth++;
+ 		WARN_ON_ONCE(scx_ops_bypass_depth <= 0);
+@@ -4638,6 +4676,8 @@ static void scx_ops_bypass(bool bypass)
+ 			goto unlock;
+ 	}
+ 
++	atomic_inc(&scx_ops_breather_depth);
++
+ 	/*
+ 	 * No task property is changing. We just need to make sure all currently
+ 	 * queued tasks are re-queued according to the new scx_rq_bypassing()
+@@ -4693,8 +4733,10 @@ static void scx_ops_bypass(bool bypass)
+ 		/* resched to restore ticks and idle state */
+ 		resched_cpu(cpu);
+ 	}
++
++	atomic_dec(&scx_ops_breather_depth);
+ unlock:
+-	raw_spin_unlock_irqrestore(&__scx_ops_bypass_lock, flags);
++	raw_spin_unlock_irqrestore(&bypass_lock, flags);
+ }
+ 
+ static void free_exit_info(struct scx_exit_info *ei)
+@@ -6357,6 +6399,13 @@ static bool scx_dispatch_from_dsq(struct bpf_iter_scx_dsq_kern *kit,
+ 		raw_spin_rq_lock(src_rq);
+ 	}
+ 
++	/*
++	 * If the BPF scheduler keeps calling this function repeatedly, it can
++	 * cause similar live-lock conditions as consume_dispatch_q(). Insert a
++	 * breather if necessary.
++	 */
++	scx_ops_breather(src_rq);
++
+ 	locked_rq = src_rq;
+ 	raw_spin_lock(&src_dsq->lock);
+ 
