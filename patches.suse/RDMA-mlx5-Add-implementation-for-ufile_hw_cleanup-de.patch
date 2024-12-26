@@ -1,0 +1,180 @@
+From: Patrisious Haddad <phaddad@nvidia.com>
+Date: Thu, 31 Oct 2024 13:22:53 +0200
+Subject: RDMA/mlx5: Add implementation for ufile_hw_cleanup device operation
+Patch-mainline: v6.13-rc1
+Git-commit: 7c891a4dbcc1f6c69297fcf89f1553e64d282643
+References: jsc#PED-11326
+
+Implement the device API for ufile_hw_cleanup operation, which
+iterates over the ufile uobjects lists, and attempts to destroy
+DevX QPs, by issuing up to 8 commands in parallel.
+
+This function is responsible only for cleaning the FW resources of the
+QP, and doesn't necessarily cleanup all of its resources.
+Hence the normal serialized cleanup flow is still executed after it
+in __uverbs_cleanup_ufile() to cleanup the remaining resources and
+handle the cleanup of SW objects.
+
+In order to avoid double cleanup for the FW resources, new DevX flag
+was added DEVX_OBJ_FLAGS_HW_FREED, which marks the object's FW resources
+as already freed.
+
+Since QP destruction is the most time-consuming operation in FW,
+parallelizing it reduces the cleanup time of applications that use
+DevX QPs.
+
+Signed-off-by: Patrisious Haddad <phaddad@nvidia.com>
+Link: https://patch.msgid.link/2f82675d0412542cba1c47a6b86f589521ae41e1.1730373303.git.leon@kernel.org
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/mlx5/devx.c |   93 +++++++++++++++++++++++++++++++++++++-
+ drivers/infiniband/hw/mlx5/devx.h |    4 +
+ drivers/infiniband/hw/mlx5/main.c |    1 
+ 3 files changed, 97 insertions(+), 1 deletion(-)
+
+--- a/drivers/infiniband/hw/mlx5/devx.c
++++ b/drivers/infiniband/hw/mlx5/devx.c
+@@ -27,6 +27,19 @@ enum devx_obj_flags {
+ 	DEVX_OBJ_FLAGS_INDIRECT_MKEY = 1 << 0,
+ 	DEVX_OBJ_FLAGS_DCT = 1 << 1,
+ 	DEVX_OBJ_FLAGS_CQ = 1 << 2,
++	DEVX_OBJ_FLAGS_HW_FREED = 1 << 3,
++};
++
++#define MAX_ASYNC_CMDS 8
++
++struct mlx5_async_cmd {
++	struct ib_uobject *uobject;
++	void *in;
++	int in_size;
++	u32 out[MLX5_ST_SZ_DW(general_obj_out_cmd_hdr)];
++	int err;
++	struct mlx5_async_work cb_work;
++	struct completion comp;
+ };
+ 
+ struct devx_async_data {
+@@ -1405,7 +1418,9 @@ static int devx_obj_cleanup(struct ib_uo
+ 		 */
+ 		mlx5r_deref_wait_odp_mkey(&obj->mkey);
+ 
+-	if (obj->flags & DEVX_OBJ_FLAGS_DCT)
++	if (obj->flags & DEVX_OBJ_FLAGS_HW_FREED)
++		ret = 0;
++	else if (obj->flags & DEVX_OBJ_FLAGS_DCT)
+ 		ret = mlx5_core_destroy_dct(obj->ib_dev, &obj->core_dct);
+ 	else if (obj->flags & DEVX_OBJ_FLAGS_CQ)
+ 		ret = mlx5_core_destroy_cq(obj->ib_dev->mdev, &obj->core_cq);
+@@ -2595,6 +2610,82 @@ void mlx5_ib_devx_cleanup(struct mlx5_ib
+ 	}
+ }
+ 
++static void devx_async_destroy_cb(int status, struct mlx5_async_work *context)
++{
++	struct mlx5_async_cmd *devx_out = container_of(context,
++					  struct mlx5_async_cmd, cb_work);
++	struct devx_obj *obj = devx_out->uobject->object;
++
++	if (!status)
++		obj->flags |= DEVX_OBJ_FLAGS_HW_FREED;
++
++	complete(&devx_out->comp);
++}
++
++static void devx_async_destroy(struct mlx5_ib_dev *dev,
++			       struct mlx5_async_cmd *cmd)
++{
++	init_completion(&cmd->comp);
++	cmd->err = mlx5_cmd_exec_cb(&dev->async_ctx, cmd->in, cmd->in_size,
++				    &cmd->out, sizeof(cmd->out),
++				    devx_async_destroy_cb, &cmd->cb_work);
++}
++
++static void devx_wait_async_destroy(struct mlx5_async_cmd *cmd)
++{
++	if (!cmd->err)
++		wait_for_completion(&cmd->comp);
++	atomic_set(&cmd->uobject->usecnt, 0);
++}
++
++void mlx5_ib_ufile_hw_cleanup(struct ib_uverbs_file *ufile)
++{
++	struct mlx5_async_cmd async_cmd[MAX_ASYNC_CMDS];
++	struct ib_ucontext *ucontext = ufile->ucontext;
++	struct ib_device *device = ucontext->device;
++	struct mlx5_ib_dev *dev = to_mdev(device);
++	struct ib_uobject *uobject;
++	struct devx_obj *obj;
++	int head = 0;
++	int tail = 0;
++
++	list_for_each_entry(uobject, &ufile->uobjects, list) {
++		WARN_ON(uverbs_try_lock_object(uobject, UVERBS_LOOKUP_WRITE));
++
++		/*
++		 * Currently we only support QP destruction, if other objects
++		 * are to be destroyed need to add type synchronization to the
++		 * cleanup algorithm and handle pre/post FW cleanup for the
++		 * new types if needed.
++		 */
++		if (uobj_get_object_id(uobject) != MLX5_IB_OBJECT_DEVX_OBJ ||
++		    (get_dec_obj_type(uobject->object, MLX5_EVENT_TYPE_MAX) !=
++		     MLX5_OBJ_TYPE_QP)) {
++			atomic_set(&uobject->usecnt, 0);
++			continue;
++		}
++
++		obj = uobject->object;
++
++		async_cmd[tail % MAX_ASYNC_CMDS].in = obj->dinbox;
++		async_cmd[tail % MAX_ASYNC_CMDS].in_size = obj->dinlen;
++		async_cmd[tail % MAX_ASYNC_CMDS].uobject = uobject;
++
++		devx_async_destroy(dev, &async_cmd[tail % MAX_ASYNC_CMDS]);
++		tail++;
++
++		if (tail - head == MAX_ASYNC_CMDS) {
++			devx_wait_async_destroy(&async_cmd[head % MAX_ASYNC_CMDS]);
++			head++;
++		}
++	}
++
++	while (head != tail) {
++		devx_wait_async_destroy(&async_cmd[head % MAX_ASYNC_CMDS]);
++		head++;
++	}
++}
++
+ static ssize_t devx_async_cmd_event_read(struct file *filp, char __user *buf,
+ 					 size_t count, loff_t *pos)
+ {
+--- a/drivers/infiniband/hw/mlx5/devx.h
++++ b/drivers/infiniband/hw/mlx5/devx.h
+@@ -28,6 +28,7 @@ int mlx5_ib_devx_create(struct mlx5_ib_d
+ void mlx5_ib_devx_destroy(struct mlx5_ib_dev *dev, u16 uid);
+ int mlx5_ib_devx_init(struct mlx5_ib_dev *dev);
+ void mlx5_ib_devx_cleanup(struct mlx5_ib_dev *dev);
++void mlx5_ib_ufile_hw_cleanup(struct ib_uverbs_file *ufile);
+ #else
+ static inline int mlx5_ib_devx_create(struct mlx5_ib_dev *dev, bool is_user)
+ {
+@@ -41,5 +42,8 @@ static inline int mlx5_ib_devx_init(stru
+ static inline void mlx5_ib_devx_cleanup(struct mlx5_ib_dev *dev)
+ {
+ }
++static inline void mlx5_ib_ufile_hw_cleanup(struct ib_uverbs_file *ufile)
++{
++}
+ #endif
+ #endif /* _MLX5_IB_DEVX_H */
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -4149,6 +4149,7 @@ static const struct ib_device_ops mlx5_i
+ 	.req_notify_cq = mlx5_ib_arm_cq,
+ 	.rereg_user_mr = mlx5_ib_rereg_user_mr,
+ 	.resize_cq = mlx5_ib_resize_cq,
++	.ufile_hw_cleanup = mlx5_ib_ufile_hw_cleanup,
+ 
+ 	INIT_RDMA_OBJ_SIZE(ib_ah, mlx5_ib_ah, ibah),
+ 	INIT_RDMA_OBJ_SIZE(ib_counters, mlx5_ib_mcounters, ibcntrs),
