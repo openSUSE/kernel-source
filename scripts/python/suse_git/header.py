@@ -250,11 +250,6 @@ class EmptyTagError(ValidationError):
         msg = "%s: Value cannot be empty." % name
         super(EmptyTagError, self).__init__(name, msg)
 
-class WrongFolderError(patch.ValidationError):
-    def __init__(self, fn):
-        msg = "%s: file should be in patches.kabi/." % fn
-        super(WrongFolderError, self).__init__(msg)
-
 class HeaderException(patch.PatchException):
     def tag_is_missing(self, name):
         try:
@@ -459,11 +454,11 @@ class HeaderChecker(patch.PatchChecker):
 
         for entry in tag_map:
             if 'required' in tag_map[entry]:
-                this_tag = None
+                found = False
                 for tag in self.tags:
                     if entry == tag.name:
-                        this_tag = tag
-                if this_tag is None:
+                        found = True
+                if not found:
                     required = True
                     if self.kabi and 'required_on_kabi' in tag_map[entry]:
                         if not tag_map[entry]['required_on_kabi']:
@@ -474,9 +469,6 @@ class HeaderChecker(patch.PatchChecker):
                     if required:
                         self.errors.append(MissingTagError(None,
                                                            { 'name' : entry }))
-                elif (not self.kabi and 'Patch-mainline' in this_tag.name and
-                    re.match(".*kabi.*", this_tag.value, re.IGNORECASE)):
-                    self.errors.append(WrongFolderError(self.filename))
 
         if self.errors:
             raise HeaderException(self.errors)
