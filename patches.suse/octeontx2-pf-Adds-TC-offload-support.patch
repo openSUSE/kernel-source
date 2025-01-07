@@ -1,0 +1,347 @@
+From: Geetha sowjanya <gakula@marvell.com>
+Date: Thu, 7 Nov 2024 21:38:38 +0530
+Subject: octeontx2-pf: Adds TC offload support
+Patch-mainline: v6.13-rc1
+Git-commit: 6c40ca957fe5d5982d55fc77d86d9f8ea0b6bba6
+References: jsc#PED-11317
+
+Implements tc offload support for rvu representors.
+
+Usage example:
+
+ - Add tc rule to drop packets with vlan id 3 using port
+   representor(Rpf1vf0).
+
+	# tc filter add dev Rpf1vf0 protocol 802.1Q parent ffff: flower
+	   vlan_id 3 vlan_ethtype ipv4 skip_sw action drop
+
+- Redirect packets with vlan id 5 and IPv4 packets to eth1,
+  after stripping vlan header.
+
+	# tc filter add dev Rpf1vf0 ingress protocol 802.1Q flower vlan_id 5
+	  vlan_ethtype ipv4 skip_sw action vlan pop action mirred ingress
+	  redirect dev eth1
+
+Signed-off-by: Geetha sowjanya <gakula@marvell.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c   |   14 +
+ drivers/net/ethernet/marvell/octeontx2/af/rvu_rep.c      |    4 
+ drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h |    7 
+ drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c  |    5 
+ drivers/net/ethernet/marvell/octeontx2/nic/otx2_tc.c     |   25 ++-
+ drivers/net/ethernet/marvell/octeontx2/nic/rep.c         |  115 +++++++++++++++
+ drivers/net/ethernet/marvell/octeontx2/nic/rep.h         |    1 
+ 7 files changed, 154 insertions(+), 17 deletions(-)
+
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+@@ -1398,6 +1398,7 @@ int rvu_mbox_handler_npc_install_flow(st
+ 				      struct npc_install_flow_rsp *rsp)
+ {
+ 	bool from_vf = !!(req->hdr.pcifunc & RVU_PFVF_FUNC_MASK);
++	bool from_rep_dev = !!is_rep_dev(rvu, req->hdr.pcifunc);
+ 	struct rvu_switch *rswitch = &rvu->rswitch;
+ 	int blkaddr, nixlf, err;
+ 	struct rvu_pfvf *pfvf;
+@@ -1454,14 +1455,19 @@ process_flow:
+ 	/* AF installing for a PF/VF */
+ 	if (!req->hdr.pcifunc)
+ 		target = req->vf;
++
+ 	/* PF installing for its VF */
+-	else if (!from_vf && req->vf) {
++	if (!from_vf && req->vf && !from_rep_dev) {
+ 		target = (req->hdr.pcifunc & ~RVU_PFVF_FUNC_MASK) | req->vf;
+ 		pf_set_vfs_mac = req->default_rule &&
+ 				(req->features & BIT_ULL(NPC_DMAC));
+ 	}
+-	/* msg received from PF/VF */
++
++	/* Representor device installing for a representee */
++	if (from_rep_dev && req->vf)
++		target = req->vf;
+ 	else
++		/* msg received from PF/VF */
+ 		target = req->hdr.pcifunc;
+ 
+ 	/* ignore chan_mask in case pf func is not AF, revisit later */
+@@ -1474,8 +1480,10 @@ process_flow:
+ 
+ 	pfvf = rvu_get_pfvf(rvu, target);
+ 
++	if (from_rep_dev)
++		req->channel = pfvf->rx_chan_base;
+ 	/* PF installing for its VF */
+-	if (req->hdr.pcifunc && !from_vf && req->vf)
++	if (req->hdr.pcifunc && !from_vf && req->vf && !from_rep_dev)
+ 		set_bit(PF_SET_VF_CFG, &pfvf->flags);
+ 
+ 	/* update req destination mac addr */
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_rep.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_rep.c
+@@ -427,6 +427,10 @@ int rvu_mbox_handler_esw_cfg(struct rvu
+ 		return 0;
+ 
+ 	rvu->rep_mode = req->ena;
++
++	if (!rvu->rep_mode)
++		rvu_npc_free_mcam_entries(rvu, req->hdr.pcifunc, -1);
++
+ 	return 0;
+ }
+ 
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -1142,4 +1142,11 @@ int otx2_get_txq_by_classid(struct otx2_
+ void otx2_qos_config_txschq(struct otx2_nic *pfvf);
+ void otx2_clean_qos_queues(struct otx2_nic *pfvf);
+ int rvu_event_up_notify(struct otx2_nic *pf, struct rep_event *info);
++int otx2_setup_tc_cls_flower(struct otx2_nic *nic,
++			     struct flow_cls_offload *cls_flower);
++
++static inline int mcam_entry_cmp(const void *a, const void *b)
++{
++	return *(u16 *)a - *(u16 *)b;
++}
+ #endif /* OTX2_COMMON_H */
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c
+@@ -64,11 +64,6 @@ static int otx2_free_ntuple_mcam_entries
+ 	return 0;
+ }
+ 
+-static int mcam_entry_cmp(const void *a, const void *b)
+-{
+-	return *(u16 *)a - *(u16 *)b;
+-}
+-
+ int otx2_alloc_mcam_entries(struct otx2_nic *pfvf, u16 count)
+ {
+ 	struct otx2_flow_config *flow_cfg = pfvf->flow_cfg;
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_tc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_tc.c
+@@ -443,6 +443,7 @@ static int otx2_tc_parse_actions(struct
+ 	struct flow_action_entry *act;
+ 	struct net_device *target;
+ 	struct otx2_nic *priv;
++	struct rep_dev *rdev;
+ 	u32 burst, mark = 0;
+ 	u8 nr_police = 0;
+ 	u8 num_intf = 1;
+@@ -464,14 +465,18 @@ static int otx2_tc_parse_actions(struct
+ 			return 0;
+ 		case FLOW_ACTION_REDIRECT_INGRESS:
+ 			target = act->dev;
+-			priv = netdev_priv(target);
+-			/* npc_install_flow_req doesn't support passing a target pcifunc */
+-			if (rvu_get_pf(nic->pcifunc) != rvu_get_pf(priv->pcifunc)) {
+-				NL_SET_ERR_MSG_MOD(extack,
+-						   "can't redirect to other pf/vf");
+-				return -EOPNOTSUPP;
++			if (target->dev.parent) {
++				priv = netdev_priv(target);
++				if (rvu_get_pf(nic->pcifunc) != rvu_get_pf(priv->pcifunc)) {
++					NL_SET_ERR_MSG_MOD(extack,
++							   "can't redirect to other pf/vf");
++					return -EOPNOTSUPP;
++				}
++				req->vf = priv->pcifunc & RVU_PFVF_FUNC_MASK;
++			} else {
++				rdev = netdev_priv(target);
++				req->vf = rdev->pcifunc & RVU_PFVF_FUNC_MASK;
+ 			}
+-			req->vf = priv->pcifunc & RVU_PFVF_FUNC_MASK;
+ 
+ 			/* if op is already set; avoid overwriting the same */
+ 			if (!req->op)
+@@ -1300,6 +1305,7 @@ static int otx2_tc_add_flow(struct otx2_
+ 	req->channel = nic->hw.rx_chan_base;
+ 	req->entry = flow_cfg->flow_ent[mcam_idx];
+ 	req->intf = NIX_INTF_RX;
++	req->vf = nic->pcifunc;
+ 	req->set_cntr = 1;
+ 	new_node->entry = req->entry;
+ 
+@@ -1400,8 +1406,8 @@ static int otx2_tc_get_flow_stats(struct
+ 	return 0;
+ }
+ 
+-static int otx2_setup_tc_cls_flower(struct otx2_nic *nic,
+-				    struct flow_cls_offload *cls_flower)
++int otx2_setup_tc_cls_flower(struct otx2_nic *nic,
++			     struct flow_cls_offload *cls_flower)
+ {
+ 	switch (cls_flower->command) {
+ 	case FLOW_CLS_REPLACE:
+@@ -1414,6 +1420,7 @@ static int otx2_setup_tc_cls_flower(stru
+ 		return -EOPNOTSUPP;
+ 	}
+ }
++EXPORT_SYMBOL(otx2_setup_tc_cls_flower);
+ 
+ static int otx2_tc_ingress_matchall_install(struct otx2_nic *nic,
+ 					    struct tc_cls_matchall_offload *cls)
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/rep.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/rep.c
+@@ -9,6 +9,7 @@
+ #include <linux/module.h>
+ #include <linux/pci.h>
+ #include <linux/net_tstamp.h>
++#include <linux/sort.h>
+ 
+ #include "otx2_common.h"
+ #include "cn10k.h"
+@@ -31,6 +32,117 @@ MODULE_DEVICE_TABLE(pci, rvu_rep_id_tabl
+ static int rvu_rep_notify_pfvf(struct otx2_nic *priv, u16 event,
+ 			       struct rep_event *data);
+ 
++static int rvu_rep_mcam_flow_init(struct rep_dev *rep)
++{
++	struct npc_mcam_alloc_entry_req *req;
++	struct npc_mcam_alloc_entry_rsp *rsp;
++	struct otx2_nic *priv = rep->mdev;
++	int ent, allocated = 0;
++	int count;
++
++	rep->flow_cfg = kcalloc(1, sizeof(struct otx2_flow_config), GFP_KERNEL);
++
++	if (!rep->flow_cfg)
++		return -ENOMEM;
++
++	count = OTX2_DEFAULT_FLOWCOUNT;
++
++	rep->flow_cfg->flow_ent = kcalloc(count, sizeof(u16), GFP_KERNEL);
++	if (!rep->flow_cfg->flow_ent)
++		return -ENOMEM;
++
++	while (allocated < count) {
++		req = otx2_mbox_alloc_msg_npc_mcam_alloc_entry(&priv->mbox);
++		if (!req)
++			goto exit;
++
++		req->hdr.pcifunc = rep->pcifunc;
++		req->contig = false;
++		req->ref_entry = 0;
++		req->count = (count - allocated) > NPC_MAX_NONCONTIG_ENTRIES ?
++				NPC_MAX_NONCONTIG_ENTRIES : count - allocated;
++
++		if (otx2_sync_mbox_msg(&priv->mbox))
++			goto exit;
++
++		rsp = (struct npc_mcam_alloc_entry_rsp *)otx2_mbox_get_rsp
++			(&priv->mbox.mbox, 0, &req->hdr);
++
++		for (ent = 0; ent < rsp->count; ent++)
++			rep->flow_cfg->flow_ent[ent + allocated] = rsp->entry_list[ent];
++
++		allocated += rsp->count;
++
++		if (rsp->count != req->count)
++			break;
++	}
++exit:
++	/* Multiple MCAM entry alloc requests could result in non-sequential
++	 * MCAM entries in the flow_ent[] array. Sort them in an ascending
++	 * order, otherwise user installed ntuple filter index and MCAM entry
++	 * index will not be in sync.
++	 */
++	if (allocated)
++		sort(&rep->flow_cfg->flow_ent[0], allocated,
++		     sizeof(rep->flow_cfg->flow_ent[0]), mcam_entry_cmp, NULL);
++
++	mutex_unlock(&priv->mbox.lock);
++
++	rep->flow_cfg->max_flows = allocated;
++
++	if (allocated) {
++		rep->flags |= OTX2_FLAG_MCAM_ENTRIES_ALLOC;
++		rep->flags |= OTX2_FLAG_NTUPLE_SUPPORT;
++		rep->flags |= OTX2_FLAG_TC_FLOWER_SUPPORT;
++	}
++
++	INIT_LIST_HEAD(&rep->flow_cfg->flow_list);
++	INIT_LIST_HEAD(&rep->flow_cfg->flow_list_tc);
++	return 0;
++}
++
++static int rvu_rep_setup_tc_cb(enum tc_setup_type type,
++			       void *type_data, void *cb_priv)
++{
++	struct rep_dev *rep = cb_priv;
++	struct otx2_nic *priv = rep->mdev;
++
++	if (!(rep->flags & RVU_REP_VF_INITIALIZED))
++		return -EINVAL;
++
++	if (!(rep->flags & OTX2_FLAG_TC_FLOWER_SUPPORT))
++		rvu_rep_mcam_flow_init(rep);
++
++	priv->netdev = rep->netdev;
++	priv->flags = rep->flags;
++	priv->pcifunc = rep->pcifunc;
++	priv->flow_cfg = rep->flow_cfg;
++
++	switch (type) {
++	case TC_SETUP_CLSFLOWER:
++		return otx2_setup_tc_cls_flower(priv, type_data);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static LIST_HEAD(rvu_rep_block_cb_list);
++static int rvu_rep_setup_tc(struct net_device *netdev, enum tc_setup_type type,
++			    void *type_data)
++{
++	struct rvu_rep *rep = netdev_priv(netdev);
++
++	switch (type) {
++	case TC_SETUP_BLOCK:
++		return flow_block_cb_setup_simple(type_data,
++						  &rvu_rep_block_cb_list,
++						  rvu_rep_setup_tc_cb,
++						  rep, rep, true);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ static int
+ rvu_rep_sp_stats64(const struct net_device *dev,
+ 		   struct rtnl_link_stats64 *stats)
+@@ -367,6 +479,7 @@ static const struct net_device_ops rvu_r
+ 	.ndo_change_mtu		= rvu_rep_change_mtu,
+ 	.ndo_has_offload_stats	= rvu_rep_has_offload_stats,
+ 	.ndo_get_offload_stats	= rvu_rep_get_offload_stats,
++	.ndo_setup_tc		= rvu_rep_setup_tc,
+ };
+ 
+ static int rvu_rep_napi_init(struct otx2_nic *priv,
+@@ -512,6 +625,7 @@ void rvu_rep_destroy(struct otx2_nic *pr
+ 		unregister_netdev(rep->netdev);
+ 		rvu_rep_devlink_port_unregister(rep);
+ 		free_netdev(rep->netdev);
++		kfree(rep->flow_cfg);
+ 	}
+ 	kfree(priv->reps);
+ 	rvu_rep_rsrc_free(priv);
+@@ -562,6 +676,7 @@ int rvu_rep_create(struct otx2_nic *priv
+ 			       NETIF_F_IPV6_CSUM | NETIF_F_RXHASH |
+ 			       NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6);
+ 
++		ndev->hw_features |= NETIF_F_HW_TC;
+ 		ndev->features |= ndev->hw_features;
+ 		eth_hw_addr_random(ndev);
+ 		err = rvu_rep_devlink_port_register(rep);
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/rep.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/rep.h
+@@ -35,6 +35,7 @@ struct rep_dev {
+ 	struct rep_stats stats;
+ 	struct delayed_work stats_wrk;
+ 	struct devlink_port dl_port;
++	struct otx2_flow_config	*flow_cfg;
+ #define RVU_REP_VF_INITIALIZED		BIT_ULL(0)
+ 	u64 flags;
+ 	u16 rep_id;
