@@ -1,0 +1,148 @@
+From 42b7581376015c1bbcbe5831f043cd0ac119d028 Mon Sep 17 00:00:00 2001
+From: Michal Pecio <michal.pecio@gmail.com>
+Date: Wed, 6 Nov 2024 12:14:57 +0200
+Subject: [PATCH] usb: xhci: Limit Stop Endpoint retries
+Git-commit: 42b7581376015c1bbcbe5831f043cd0ac119d028
+References: jsc#PED-10701
+Patch-mainline: v6.13-rc1
+
+Some host controllers fail to atomically transition an endpoint to the
+Running state on a doorbell ring and enter a hidden "Restarting" state,
+which looks very much like Stopped, with the important difference that
+it will spontaneously transition to Running anytime soon.
+
+A Stop Endpoint command queued in the Restarting state typically fails
+with Context State Error and the completion handler sees the Endpoint
+Context State as either still Stopped or already Running. Even a case
+of Halted was observed, when an error occurred right after the restart.
+
+The Halted state is already recovered from by resetting the endpoint.
+The Running state is handled by retrying Stop Endpoint.
+
+The Stopped state was recognized as a problem on NEC controllers and
+worked around also by retrying, because the endpoint soon restarts and
+then stops for good. But there is a risk: the command may fail if the
+endpoint is "stopped for good" already, and retries will fail forever.
+
+The possibility of this was not realized at the time, but a number of
+cases were discovered later and reproduced. Some proved difficult to
+deal with, and it is outright impossible to predict if an endpoint may
+fail to ever start at all due to a hardware bug. One such bug (albeit
+on ASM3142, not on NEC) was found to be reliably triggered simply by
+toggling an AX88179 NIC up/down in a tight loop for a few seconds.
+
+An endless retries storm is quite nasty. Besides putting needless load
+on the xHC and CPU, it causes URBs never to be given back, paralyzing
+the device and connection/disconnection logic for the whole bus if the
+device is unplugged. User processes waiting for URBs become unkillable,
+drivers and kworker threads lock up and xhci_hcd cannot be reloaded.
+
+For peace of mind, impose a timeout on Stop Endpoint retries in this
+case. If they don't succeed in 100ms, consider the endpoint stopped
+permanently for some reason and just give back the unlinked URBs. This
+failure case is rare already and work is under way to make it rarer.
+
+Start this work today by also handling one simple case of race with
+Reset Endpoint, because it costs just two lines to implement.
+
+Fixes: fd9d55d190c0 ("xhci: retry Stop Endpoint on buggy NEC controllers")
+Cc: stable@vger.kernel.org
+Signed-off-by: Michal Pecio <michal.pecio@gmail.com>
+Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Link: https://lore.kernel.org/r/20241106101459.775897-32-mathias.nyman@linux.intel.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ drivers/usb/host/xhci-ring.c | 28 ++++++++++++++++++++++++----
+ drivers/usb/host/xhci.c      |  2 ++
+ drivers/usb/host/xhci.h      |  1 +
+ 3 files changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index c9c0c4a7588a..dd23596ccd84 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -52,6 +52,7 @@
+  *   endpoint rings; it generates events on the event ring for these.
+  */
+ 
++#include <linux/jiffies.h>
+ #include <linux/scatterlist.h>
+ #include <linux/slab.h>
+ #include <linux/dma-mapping.h>
+@@ -1158,16 +1159,35 @@ static void xhci_handle_cmd_stop_ep(struct xhci_hcd *xhci, int slot_id,
+ 			return;
+ 		case EP_STATE_STOPPED:
+ 			/*
+-			 * NEC uPD720200 sometimes sets this state and fails with
+-			 * Context Error while continuing to process TRBs.
+-			 * Be conservative and trust EP_CTX_STATE on other chips.
++			 * Per xHCI 4.6.9, Stop Endpoint command on a Stopped
++			 * EP is a Context State Error, and EP stays Stopped.
++			 *
++			 * But maybe it failed on Halted, and somebody ran Reset
++			 * Endpoint later. EP state is now Stopped and EP_HALTED
++			 * still set because Reset EP handler will run after us.
++			 */
++			if (ep->ep_state & EP_HALTED)
++				break;
++			/*
++			 * On some HCs EP state remains Stopped for some tens of
++			 * us to a few ms or more after a doorbell ring, and any
++			 * new Stop Endpoint fails without aborting the restart.
++			 * This handler may run quickly enough to still see this
++			 * Stopped state, but it will soon change to Running.
++			 *
++			 * Assume this bug on unexpected Stop Endpoint failures.
++			 * Keep retrying until the EP starts and stops again, on
++			 * chips where this is known to help. Wait for 100ms.
+ 			 */
+ 			if (!(xhci->quirks & XHCI_NEC_HOST))
+ 				break;
++			if (time_is_before_jiffies(ep->stop_time + msecs_to_jiffies(100)))
++				break;
+ 			fallthrough;
+ 		case EP_STATE_RUNNING:
+ 			/* Race, HW handled stop ep cmd before ep was running */
+-			xhci_dbg(xhci, "Stop ep completion ctx error, ep is running\n");
++			xhci_dbg(xhci, "Stop ep completion ctx error, ctx_state %d\n",
++					GET_EP_CTX_STATE(ep_ctx));
+ 
+ 			command = xhci_alloc_command(xhci, false, GFP_ATOMIC);
+ 			if (!command) {
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index bc477cf99805..4977ada0a19e 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -8,6 +8,7 @@
+  * Some code borrowed from the Linux EHCI driver.
+  */
+ 
++#include <linux/jiffies.h>
+ #include <linux/pci.h>
+ #include <linux/iommu.h>
+ #include <linux/iopoll.h>
+@@ -1764,6 +1765,7 @@ static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
+ 			ret = -ENOMEM;
+ 			goto done;
+ 		}
++		ep->stop_time = jiffies;
+ 		ep->ep_state |= EP_STOP_CMD_PENDING;
+ 		xhci_queue_stop_endpoint(xhci, command, urb->dev->slot_id,
+ 					 ep_index, 0);
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index a0e992c3db0d..6dd3138b2380 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -691,6 +691,7 @@ struct xhci_virt_ep {
+ 	/* Bandwidth checking storage */
+ 	struct xhci_bw_info	bw_info;
+ 	struct list_head	bw_endpoint_list;
++	unsigned long		stop_time;
+ 	/* Isoch Frame ID checking storage */
+ 	int			next_frame_id;
+ 	/* Use new Isoch TRB layout needed for extended TBC support */
+-- 
+2.47.1
+
