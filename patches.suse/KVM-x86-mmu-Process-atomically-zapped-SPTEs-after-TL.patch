@@ -1,0 +1,215 @@
+Patch-mainline: v6.10-rc1
+Git-commit: aca48556c592189fdcdc68b82bbae442bd08730f
+References: PED#348
+From: David Matlack <dmatlack@google.com>
+Date: Thu, 7 Mar 2024 11:40:59 -0800
+Subject: [PATCH] KVM: x86/mmu: Process atomically-zapped SPTEs after TLB flush
+
+When zapping TDP MMU SPTEs under read-lock, processes zapped SPTEs *after*
+flushing TLBs and after replacing the special REMOVED_SPTE with '0'.
+When zapping an SPTE that points to a page table, processing SPTEs after
+flushing TLBs minimizes contention on the child SPTEs (e.g. vCPUs won't
+hit write-protection faults via stale, read-only child SPTEs), and
+processing after replacing REMOVED_SPTE with '0' minimizes the amount of
+time vCPUs will be blocked by the REMOVED_SPTE.
+
+Processing SPTEs after setting the SPTE to '0', i.e. in parallel with the
+SPTE potentially being replacing with a new SPTE, is safe because KVM does
+not depend on completing the processing before a new SPTE is installed, and
+the processing is done on a subset of the page tables that is disconnected
+from the root, and thus unreachable by other tasks (after the TLB flush).
+KVM already relies on similar logic, as kvm_mmu_zap_all_fast() can result
+in KVM processing all SPTEs in a given root after vCPUs create mappings in
+a new root.
+
+In VMs with a large (400+) number of vCPUs, it can take KVM multiple
+seconds to process a 1GiB region mapped with 4KiB entries, e.g. when
+disabling dirty logging in a VM backed by 1GiB HugeTLB.  During those
+seconds, if a vCPU accesses the 1GiB region being zapped it will be
+stalled until KVM finishes processing the SPTE and replaces the
+REMOVED_SPTE with 0.
+
+Re-ordering the processing does speed up the atomic-zaps somewhat, but
+the main benefit is avoiding blocking vCPU threads.
+
+Before:
+
+ $ ./dirty_log_perf_test -s anonymous_hugetlb_1gb -v 416 -b 1G -e
+ ...
+ Disabling dirty logging time: 509.765146313s
+
+ $ ./funclatency -m tdp_mmu_zap_spte_atomic
+
+     msec                : count    distribution
+         0 -> 1          : 0        |                                        |
+         2 -> 3          : 0        |                                        |
+         4 -> 7          : 0        |                                        |
+         8 -> 15         : 0        |                                        |
+        16 -> 31         : 0        |                                        |
+        32 -> 63         : 0        |                                        |
+        64 -> 127        : 0        |                                        |
+       128 -> 255        : 8        |**                                      |
+       256 -> 511        : 68       |******************                      |
+       512 -> 1023       : 129      |**********************************      |
+      1024 -> 2047       : 151      |****************************************|
+      2048 -> 4095       : 60       |***************                         |
+
+After:
+
+ $ ./dirty_log_perf_test -s anonymous_hugetlb_1gb -v 416 -b 1G -e
+ ...
+ Disabling dirty logging time: 336.516838548s
+
+ $ ./funclatency -m tdp_mmu_zap_spte_atomic
+
+     msec                : count    distribution
+         0 -> 1          : 0        |                                        |
+         2 -> 3          : 0        |                                        |
+         4 -> 7          : 0        |                                        |
+         8 -> 15         : 0        |                                        |
+        16 -> 31         : 0        |                                        |
+        32 -> 63         : 0        |                                        |
+        64 -> 127        : 0        |                                        |
+       128 -> 255        : 12       |**                                      |
+       256 -> 511        : 166      |****************************************|
+       512 -> 1023       : 101      |************************                |
+      1024 -> 2047       : 137      |*********************************       |
+
+Note, KVM's processing of collapsible SPTEs is still extremely slow and
+can be improved.  For example, a significant amount of time is spent
+calling kvm_set_pfn_{accessed,dirty}() for every last-level SPTE, even
+when processing SPTEs that all map the same folio.  But avoiding blocking
+vCPUs and contending SPTEs is valuable regardless of how fast KVM can
+process collapsible SPTEs.
+
+Link: https://lore.kernel.org/all/20240320005024.3216282-1-seanjc@google.com
+Cc: Vipin Sharma <vipinsh@google.com>
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: David Matlack <dmatlack@google.com>
+Reviewed-by: Vipin Sharma <vipinsh@google.com>
+Link: https://lore.kernel.org/r/20240307194059.1357377-1-dmatlack@google.com
+[sean: massage changelog]
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/kvm/mmu/tdp_mmu.c | 75 +++++++++++++++++++++++++-------------
+ 1 file changed, 49 insertions(+), 26 deletions(-)
+
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index d078157e62aa..afd00f79e741 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -530,6 +530,31 @@ static void handle_changed_spte(struct kvm *kvm, int as_id, gfn_t gfn,
+ 		kvm_set_pfn_accessed(spte_to_pfn(old_spte));
+ }
+ 
++static inline int __tdp_mmu_set_spte_atomic(struct tdp_iter *iter, u64 new_spte)
++{
++	u64 *sptep = rcu_dereference(iter->sptep);
++
++	/*
++	 * The caller is responsible for ensuring the old SPTE is not a REMOVED
++	 * SPTE.  KVM should never attempt to zap or manipulate a REMOVED SPTE,
++	 * and pre-checking before inserting a new SPTE is advantageous as it
++	 * avoids unnecessary work.
++	 */
++	WARN_ON_ONCE(iter->yielded || is_removed_spte(iter->old_spte));
++
++	/*
++	 * Note, fast_pf_fix_direct_spte() can also modify TDP MMU SPTEs and
++	 * does not hold the mmu_lock.  On failure, i.e. if a different logical
++	 * CPU modified the SPTE, try_cmpxchg64() updates iter->old_spte with
++	 * the current value, so the caller operates on fresh data, e.g. if it
++	 * retries tdp_mmu_set_spte_atomic()
++	 */
++	if (!try_cmpxchg64(sptep, &iter->old_spte, new_spte))
++		return -EBUSY;
++
++	return 0;
++}
++
+ /*
+  * tdp_mmu_set_spte_atomic - Set a TDP MMU SPTE atomically
+  * and handle the associated bookkeeping.  Do not mark the page dirty
+@@ -551,27 +576,13 @@ static inline int tdp_mmu_set_spte_atomic(struct kvm *kvm,
+ 					  struct tdp_iter *iter,
+ 					  u64 new_spte)
+ {
+-	u64 *sptep = rcu_dereference(iter->sptep);
+-
+-	/*
+-	 * The caller is responsible for ensuring the old SPTE is not a REMOVED
+-	 * SPTE.  KVM should never attempt to zap or manipulate a REMOVED SPTE,
+-	 * and pre-checking before inserting a new SPTE is advantageous as it
+-	 * avoids unnecessary work.
+-	 */
+-	WARN_ON_ONCE(iter->yielded || is_removed_spte(iter->old_spte));
++	int ret;
+ 
+ 	lockdep_assert_held_read(&kvm->mmu_lock);
+ 
+-	/*
+-	 * Note, fast_pf_fix_direct_spte() can also modify TDP MMU SPTEs and
+-	 * does not hold the mmu_lock.  On failure, i.e. if a different logical
+-	 * CPU modified the SPTE, try_cmpxchg64() updates iter->old_spte with
+-	 * the current value, so the caller operates on fresh data, e.g. if it
+-	 * retries tdp_mmu_set_spte_atomic()
+-	 */
+-	if (!try_cmpxchg64(sptep, &iter->old_spte, new_spte))
+-		return -EBUSY;
++	ret = __tdp_mmu_set_spte_atomic(iter, new_spte);
++	if (ret)
++		return ret;
+ 
+ 	handle_changed_spte(kvm, iter->as_id, iter->gfn, iter->old_spte,
+ 			    new_spte, iter->level, true);
+@@ -584,13 +595,17 @@ static inline int tdp_mmu_zap_spte_atomic(struct kvm *kvm,
+ {
+ 	int ret;
+ 
++	lockdep_assert_held_read(&kvm->mmu_lock);
++
+ 	/*
+-	 * Freeze the SPTE by setting it to a special,
+-	 * non-present value. This will stop other threads from
+-	 * immediately installing a present entry in its place
+-	 * before the TLBs are flushed.
++	 * Freeze the SPTE by setting it to a special, non-present value. This
++	 * will stop other threads from immediately installing a present entry
++	 * in its place before the TLBs are flushed.
++	 *
++	 * Delay processing of the zapped SPTE until after TLBs are flushed and
++	 * the REMOVED_SPTE is replaced (see below).
+ 	 */
+-	ret = tdp_mmu_set_spte_atomic(kvm, iter, REMOVED_SPTE);
++	ret = __tdp_mmu_set_spte_atomic(iter, REMOVED_SPTE);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -599,12 +614,20 @@ static inline int tdp_mmu_zap_spte_atomic(struct kvm *kvm,
+ 	/*
+ 	 * No other thread can overwrite the removed SPTE as they must either
+ 	 * wait on the MMU lock or use tdp_mmu_set_spte_atomic() which will not
+-	 * overwrite the special removed SPTE value. No bookkeeping is needed
+-	 * here since the SPTE is going from non-present to non-present.  Use
+-	 * the raw write helper to avoid an unnecessary check on volatile bits.
++	 * overwrite the special removed SPTE value. Use the raw write helper to
++	 * avoid an unnecessary check on volatile bits.
+ 	 */
+ 	__kvm_tdp_mmu_write_spte(iter->sptep, 0);
+ 
++	/*
++	 * Process the zapped SPTE after flushing TLBs, and after replacing
++	 * REMOVED_SPTE with 0. This minimizes the amount of time vCPUs are
++	 * blocked by the REMOVED_SPTE and reduces contention on the child
++	 * SPTEs.
++	 */
++	handle_changed_spte(kvm, iter->as_id, iter->gfn, iter->old_spte,
++			    0, iter->level, true);
++
+ 	return 0;
+ }
+ 
+-- 
+2.43.0
+
