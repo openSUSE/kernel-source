@@ -1,0 +1,161 @@
+Patch-mainline: v6.9-rc1
+Git-commit: f5238c2a60f1e0eb48ce21037bce6f4781afa37f
+References: PED#348
+From: Sean Christopherson <seanjc@google.com>
+Date: Wed, 10 Jan 2024 18:00:46 -0800
+Subject: [PATCH] KVM: x86/mmu: Check for usable TDP MMU root while holding
+ mmu_lock for read
+
+When allocating a new TDP MMU root, check for a usable root while holding
+mmu_lock for read and only acquire mmu_lock for write if a new root needs
+to be created.  There is no need to serialize other MMU operations if a
+vCPU is simply grabbing a reference to an existing root, holding mmu_lock
+for write is "necessary" (spoiler alert, it's not strictly necessary) only
+to ensure KVM doesn't end up with duplicate roots.
+
+Allowing vCPUs to get "new" roots in parallel is beneficial to VM boot and
+to setups that frequently delete memslots, i.e. which force all vCPUs to
+reload all roots.
+
+Link: https://lore.kernel.org/r/20240111020048.844847-7-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/kvm/mmu/mmu.c     |  8 ++---
+ arch/x86/kvm/mmu/tdp_mmu.c | 60 +++++++++++++++++++++++++++++++-------
+ arch/x86/kvm/mmu/tdp_mmu.h |  2 +-
+ 3 files changed, 55 insertions(+), 15 deletions(-)
+
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 3c193b096b45..c9150080fbd2 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -3693,15 +3693,15 @@ static int mmu_alloc_direct_roots(struct kvm_vcpu *vcpu)
+ 	unsigned i;
+ 	int r;
+ 
++	if (tdp_mmu_enabled)
++		return kvm_tdp_mmu_alloc_root(vcpu);
++
+ 	write_lock(&vcpu->kvm->mmu_lock);
+ 	r = make_mmu_pages_available(vcpu);
+ 	if (r < 0)
+ 		goto out_unlock;
+ 
+-	if (tdp_mmu_enabled) {
+-		root = kvm_tdp_mmu_get_vcpu_root_hpa(vcpu);
+-		mmu->root.hpa = root;
+-	} else if (shadow_root_level >= PT64_ROOT_4LEVEL) {
++	if (shadow_root_level >= PT64_ROOT_4LEVEL) {
+ 		root = mmu_alloc_root(vcpu, 0, 0, shadow_root_level);
+ 		mmu->root.hpa = root;
+ 	} else if (shadow_root_level == PT32E_ROOT_LEVEL) {
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index e0a8343f66dc..9a8250a14fc1 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -223,21 +223,52 @@ static void tdp_mmu_init_child_sp(struct kvm_mmu_page *child_sp,
+ 	tdp_mmu_init_sp(child_sp, iter->sptep, iter->gfn, role);
+ }
+ 
+-hpa_t kvm_tdp_mmu_get_vcpu_root_hpa(struct kvm_vcpu *vcpu)
++static struct kvm_mmu_page *kvm_tdp_mmu_try_get_root(struct kvm_vcpu *vcpu)
+ {
+ 	union kvm_mmu_page_role role = vcpu->arch.mmu->root_role;
++	int as_id = kvm_mmu_role_as_id(role);
+ 	struct kvm *kvm = vcpu->kvm;
+ 	struct kvm_mmu_page *root;
+ 
+-	lockdep_assert_held_write(&kvm->mmu_lock);
+-
+-	/* Check for an existing root before allocating a new one. */
+-	for_each_valid_tdp_mmu_root(kvm, root, kvm_mmu_role_as_id(role)) {
+-		if (root->role.word == role.word &&
+-		    kvm_tdp_mmu_get_root(root))
+-			goto out;
++	for_each_valid_tdp_mmu_root_yield_safe(kvm, root, as_id) {
++		if (root->role.word == role.word)
++			return root;
+ 	}
+ 
++	return NULL;
++}
++
++int kvm_tdp_mmu_alloc_root(struct kvm_vcpu *vcpu)
++{
++	struct kvm_mmu *mmu = vcpu->arch.mmu;
++	union kvm_mmu_page_role role = mmu->root_role;
++	struct kvm *kvm = vcpu->kvm;
++	struct kvm_mmu_page *root;
++
++	/*
++	 * Check for an existing root while holding mmu_lock for read to avoid
++	 * unnecessary serialization if multiple vCPUs are loading a new root.
++	 * E.g. when bringing up secondary vCPUs, KVM will already have created
++	 * a valid root on behalf of the primary vCPU.
++	 */
++	read_lock(&kvm->mmu_lock);
++	root = kvm_tdp_mmu_try_get_root(vcpu);
++	read_unlock(&kvm->mmu_lock);
++
++	if (root)
++		goto out;
++
++	write_lock(&kvm->mmu_lock);
++
++	/*
++	 * Recheck for an existing root after acquiring mmu_lock for write.  It
++	 * is possible a new usable root was created between dropping mmu_lock
++	 * (for read) and acquiring it for write.
++	 */
++	root = kvm_tdp_mmu_try_get_root(vcpu);
++	if (root)
++		goto out_unlock;
++
+ 	root = tdp_mmu_alloc_sp(vcpu);
+ 	tdp_mmu_init_sp(root, NULL, 0, role);
+ 
+@@ -254,8 +285,17 @@ hpa_t kvm_tdp_mmu_get_vcpu_root_hpa(struct kvm_vcpu *vcpu)
+ 	list_add_rcu(&root->link, &kvm->arch.tdp_mmu_roots);
+ 	spin_unlock(&kvm->arch.tdp_mmu_pages_lock);
+ 
++out_unlock:
++	write_unlock(&kvm->mmu_lock);
+ out:
+-	return __pa(root->spt);
++	/*
++	 * Note, KVM_REQ_MMU_FREE_OBSOLETE_ROOTS will prevent entering the guest
++	 * and actually consuming the root if it's invalidated after dropping
++	 * mmu_lock, and the root can't be freed as this vCPU holds a reference.
++	 */
++	mmu->root.hpa = __pa(root->spt);
++	mmu->root.pgd = 0;
++	return 0;
+ }
+ 
+ static void handle_changed_spte(struct kvm *kvm, int as_id, gfn_t gfn,
+@@ -917,7 +957,7 @@ void kvm_tdp_mmu_zap_invalidated_roots(struct kvm *kvm)
+  * the VM is being destroyed).
+  *
+  * Note, kvm_tdp_mmu_zap_invalidated_roots() is gifted the TDP MMU's reference.
+- * See kvm_tdp_mmu_get_vcpu_root_hpa().
++ * See kvm_tdp_mmu_alloc_root().
+  */
+ void kvm_tdp_mmu_invalidate_all_roots(struct kvm *kvm)
+ {
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.h b/arch/x86/kvm/mmu/tdp_mmu.h
+index 20d97aa46c49..6e1ea04ca885 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@ -10,7 +10,7 @@
+ void kvm_mmu_init_tdp_mmu(struct kvm *kvm);
+ void kvm_mmu_uninit_tdp_mmu(struct kvm *kvm);
+ 
+-hpa_t kvm_tdp_mmu_get_vcpu_root_hpa(struct kvm_vcpu *vcpu);
++int kvm_tdp_mmu_alloc_root(struct kvm_vcpu *vcpu);
+ 
+ __must_check static inline bool kvm_tdp_mmu_get_root(struct kvm_mmu_page *root)
+ {
+-- 
+2.43.0
+
