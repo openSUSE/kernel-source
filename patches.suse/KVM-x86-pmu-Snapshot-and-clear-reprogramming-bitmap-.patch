@@ -1,0 +1,138 @@
+Patch-mainline: v6.9-rc1
+Git-commit: 004a0aa56edea3effc97bc90a620da1bcde5c63c
+References: PED#348
+From: Sean Christopherson <seanjc@google.com>
+Date: Thu, 9 Nov 2023 18:28:51 -0800
+Subject: [PATCH] KVM: x86/pmu: Snapshot and clear reprogramming bitmap before
+ reprogramming
+
+Refactor the handling of the reprogramming bitmap to snapshot and clear
+to-be-processed bits before doing the reprogramming, and then explicitly
+set bits for PMCs that need to be reprogrammed (again).  This will allow
+adding a macro to iterate over all valid PMCs without having to add
+special handling for the reprogramming bit, which (a) can have bits set
+for non-existent PMCs and (b) needs to clear such bits to avoid wasting
+cycles in perpetuity.
+
+Note, the existing behavior of clearing bits after reprogramming does NOT
+have a race with kvm_vm_ioctl_set_pmu_event_filter().  Setting a new PMU
+filter synchronizes SRCU _before_ setting the bitmap, i.e. guarantees that
+the vCPU isn't in the middle of reprogramming with a stale filter prior to
+setting the bitmap.
+
+Link: https://lore.kernel.org/r/20231110022857.1273836-5-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |  1 +
+ arch/x86/kvm/pmu.c              | 52 ++++++++++++++++++---------------
+ 2 files changed, 30 insertions(+), 23 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index b5b2d0fde579..ad5319a503f0 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -536,6 +536,7 @@ struct kvm_pmc {
+ #define KVM_PMC_MAX_FIXED	3
+ #define MSR_ARCH_PERFMON_FIXED_CTR_MAX	(MSR_ARCH_PERFMON_FIXED_CTR0 + KVM_PMC_MAX_FIXED - 1)
+ #define KVM_AMD_PMC_MAX_GENERIC	6
++
+ struct kvm_pmu {
+ 	u8 version;
+ 	unsigned nr_arch_gp_counters;
+diff --git a/arch/x86/kvm/pmu.c b/arch/x86/kvm/pmu.c
+index 0873937c90bc..81a0c6719863 100644
+--- a/arch/x86/kvm/pmu.c
++++ b/arch/x86/kvm/pmu.c
+@@ -444,7 +444,7 @@ static bool pmc_event_is_allowed(struct kvm_pmc *pmc)
+ 	       check_pmu_event_filter(pmc);
+ }
+ 
+-static void reprogram_counter(struct kvm_pmc *pmc)
++static int reprogram_counter(struct kvm_pmc *pmc)
+ {
+ 	struct kvm_pmu *pmu = pmc_to_pmu(pmc);
+ 	u64 eventsel = pmc->eventsel;
+@@ -455,7 +455,7 @@ static void reprogram_counter(struct kvm_pmc *pmc)
+ 	emulate_overflow = pmc_pause_counter(pmc);
+ 
+ 	if (!pmc_event_is_allowed(pmc))
+-		goto reprogram_complete;
++		return 0;
+ 
+ 	if (emulate_overflow)
+ 		__kvm_perf_overflow(pmc, false);
+@@ -476,43 +476,49 @@ static void reprogram_counter(struct kvm_pmc *pmc)
+ 	}
+ 
+ 	if (pmc->current_config == new_config && pmc_resume_counter(pmc))
+-		goto reprogram_complete;
++		return 0;
+ 
+ 	pmc_release_perf_event(pmc);
+ 
+ 	pmc->current_config = new_config;
+ 
+-	/*
+-	 * If reprogramming fails, e.g. due to contention, leave the counter's
+-	 * regprogram bit set, i.e. opportunistically try again on the next PMU
+-	 * refresh.  Don't make a new request as doing so can stall the guest
+-	 * if reprogramming repeatedly fails.
+-	 */
+-	if (pmc_reprogram_counter(pmc, PERF_TYPE_RAW,
+-				  (eventsel & pmu->raw_event_mask),
+-				  !(eventsel & ARCH_PERFMON_EVENTSEL_USR),
+-				  !(eventsel & ARCH_PERFMON_EVENTSEL_OS),
+-				  eventsel & ARCH_PERFMON_EVENTSEL_INT))
+-		return;
+-
+-reprogram_complete:
+-	clear_bit(pmc->idx, (unsigned long *)&pmc_to_pmu(pmc)->reprogram_pmi);
++	return pmc_reprogram_counter(pmc, PERF_TYPE_RAW,
++				     (eventsel & pmu->raw_event_mask),
++				     !(eventsel & ARCH_PERFMON_EVENTSEL_USR),
++				     !(eventsel & ARCH_PERFMON_EVENTSEL_OS),
++				     eventsel & ARCH_PERFMON_EVENTSEL_INT);
+ }
+ 
+ void kvm_pmu_handle_event(struct kvm_vcpu *vcpu)
+ {
++	DECLARE_BITMAP(bitmap, X86_PMC_IDX_MAX);
+ 	struct kvm_pmu *pmu = vcpu_to_pmu(vcpu);
+ 	int bit;
+ 
+-	for_each_set_bit(bit, pmu->reprogram_pmi, X86_PMC_IDX_MAX) {
++	bitmap_copy(bitmap, pmu->reprogram_pmi, X86_PMC_IDX_MAX);
++
++	/*
++	 * The reprogramming bitmap can be written asynchronously by something
++	 * other than the task that holds vcpu->mutex, take care to clear only
++	 * the bits that will actually processed.
++	 */
++	BUILD_BUG_ON(sizeof(bitmap) != sizeof(atomic64_t));
++	atomic64_andnot(*(s64 *)bitmap, &pmu->__reprogram_pmi);
++
++	for_each_set_bit(bit, bitmap, X86_PMC_IDX_MAX) {
+ 		struct kvm_pmc *pmc = kvm_pmc_idx_to_pmc(pmu, bit);
+ 
+-		if (unlikely(!pmc)) {
+-			clear_bit(bit, pmu->reprogram_pmi);
++		if (unlikely(!pmc))
+ 			continue;
+-		}
+ 
+-		reprogram_counter(pmc);
++		/*
++		 * If reprogramming fails, e.g. due to contention, re-set the
++		 * regprogram bit set, i.e. opportunistically try again on the
++		 * next PMU refresh.  Don't make a new request as doing so can
++		 * stall the guest if reprogramming repeatedly fails.
++		 */
++		if (reprogram_counter(pmc))
++			set_bit(pmc->idx, pmu->reprogram_pmi);
+ 	}
+ 
+ 	/*
+-- 
+2.43.0
+

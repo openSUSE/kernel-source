@@ -1,0 +1,164 @@
+Patch-mainline: v6.9-rc1
+Git-commit: a364c014a2c1ad6e011bc5fdb8afb9d4ba316956
+References: PED#348
+From: Andrei Vagin <avagin@google.com>
+Date: Tue, 13 Feb 2024 11:23:40 -0800
+Subject: [PATCH] kvm/x86: allocate the write-tracking metadata on-demand
+
+The write-track is used externally only by the gpu/drm/i915 driver.
+Currently, it is always enabled, if a kernel has been compiled with this
+driver.
+
+Enabling the write-track mechanism adds a two-byte overhead per page across
+all memory slots. It isn't significant for regular VMs. However in gVisor,
+where the entire process virtual address space is mapped into the VM, even
+with a 39-bit address space, the overhead amounts to 256MB.
+
+Rework the write-tracking mechanism to enable it on-demand in
+kvm_page_track_register_notifier.
+
+Here is Sean's comment about the locking scheme:
+
+The only potential hiccup would be if taking slots_arch_lock would
+deadlock, but it should be impossible for slots_arch_lock to be taken in
+any other path that involves VFIO and/or KVMGT *and* can be coincident.
+Except for kvm_arch_destroy_vm() (which deletes KVM's internal
+memslots), slots_arch_lock is taken only through KVM ioctls(), and the
+caller of kvm_page_track_register_notifier() *must* hold a reference to
+the VM.
+
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Cc: Sean Christopherson <seanjc@google.com>
+Cc: Zhenyu Wang <zhenyuw@linux.intel.com>
+Co-developed-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Andrei Vagin <avagin@google.com>
+Link: https://lore.kernel.org/r/20240213192340.2023366-1-avagin@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |  9 +++++
+ arch/x86/kvm/mmu/page_track.c   | 68 ++++++++++++++++++++++++++++++++-
+ 2 files changed, 75 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index b5b2d0fde579..7d33a2605ad5 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1466,6 +1466,15 @@ struct kvm_arch {
+ 	 */
+ 	bool shadow_root_allocated;
+ 
++#ifdef CONFIG_KVM_EXTERNAL_WRITE_TRACKING
++	/*
++	 * If set, the VM has (or had) an external write tracking user, and
++	 * thus all write tracking metadata has been allocated, even if KVM
++	 * itself isn't using write tracking.
++	 */
++	bool external_write_tracking_enabled;
++#endif
++
+ #if IS_ENABLED(CONFIG_HYPERV)
+ 	hpa_t	hv_root_tdp;
+ 	spinlock_t hv_root_tdp_lock;
+diff --git a/arch/x86/kvm/mmu/page_track.c b/arch/x86/kvm/mmu/page_track.c
+index c87da11f3a04..f6448284c18e 100644
+--- a/arch/x86/kvm/mmu/page_track.c
++++ b/arch/x86/kvm/mmu/page_track.c
+@@ -20,10 +20,23 @@
+ #include "mmu_internal.h"
+ #include "page_track.h"
+ 
++static bool kvm_external_write_tracking_enabled(struct kvm *kvm)
++{
++#ifdef CONFIG_KVM_EXTERNAL_WRITE_TRACKING
++	/*
++	 * Read external_write_tracking_enabled before related pointers.  Pairs
++	 * with the smp_store_release in kvm_page_track_write_tracking_enable().
++	 */
++	return smp_load_acquire(&kvm->arch.external_write_tracking_enabled);
++#else
++	return false;
++#endif
++}
++
+ bool kvm_page_track_write_tracking_enabled(struct kvm *kvm)
+ {
+-	return IS_ENABLED(CONFIG_KVM_EXTERNAL_WRITE_TRACKING) ||
+-	       !tdp_enabled || kvm_shadow_root_allocated(kvm);
++	return kvm_external_write_tracking_enabled(kvm) ||
++	       kvm_shadow_root_allocated(kvm) || !tdp_enabled;
+ }
+ 
+ void kvm_page_track_free_memslot(struct kvm_memory_slot *slot)
+@@ -153,6 +166,50 @@ int kvm_page_track_init(struct kvm *kvm)
+ 	return init_srcu_struct(&head->track_srcu);
+ }
+ 
++static int kvm_enable_external_write_tracking(struct kvm *kvm)
++{
++	struct kvm_memslots *slots;
++	struct kvm_memory_slot *slot;
++	int r = 0, i, bkt;
++
++	mutex_lock(&kvm->slots_arch_lock);
++
++	/*
++	 * Check for *any* write tracking user (not just external users) under
++	 * lock.  This avoids unnecessary work, e.g. if KVM itself is using
++	 * write tracking, or if two external users raced when registering.
++	 */
++	if (kvm_page_track_write_tracking_enabled(kvm))
++		goto out_success;
++
++	for (i = 0; i < kvm_arch_nr_memslot_as_ids(kvm); i++) {
++		slots = __kvm_memslots(kvm, i);
++		kvm_for_each_memslot(slot, bkt, slots) {
++			/*
++			 * Intentionally do NOT free allocations on failure to
++			 * avoid having to track which allocations were made
++			 * now versus when the memslot was created.  The
++			 * metadata is guaranteed to be freed when the slot is
++			 * freed, and will be kept/used if userspace retries
++			 * the failed ioctl() instead of killing the VM.
++			 */
++			r = kvm_page_track_write_tracking_alloc(slot);
++			if (r)
++				goto out_unlock;
++		}
++	}
++
++out_success:
++	/*
++	 * Ensure that external_write_tracking_enabled becomes true strictly
++	 * after all the related pointers are set.
++	 */
++	smp_store_release(&kvm->arch.external_write_tracking_enabled, true);
++out_unlock:
++	mutex_unlock(&kvm->slots_arch_lock);
++	return r;
++}
++
+ /*
+  * register the notifier so that event interception for the tracked guest
+  * pages can be received.
+@@ -161,10 +218,17 @@ int kvm_page_track_register_notifier(struct kvm *kvm,
+ 				     struct kvm_page_track_notifier_node *n)
+ {
+ 	struct kvm_page_track_notifier_head *head;
++	int r;
+ 
+ 	if (!kvm || kvm->mm != current->mm)
+ 		return -ESRCH;
+ 
++	if (!kvm_external_write_tracking_enabled(kvm)) {
++		r = kvm_enable_external_write_tracking(kvm);
++		if (r)
++			return r;
++	}
++
+ 	kvm_get_kvm(kvm);
+ 
+ 	head = &kvm->arch.track_notifier_head;
+-- 
+2.43.0
+
