@@ -1,0 +1,173 @@
+From 3fcb9d17206e31630f802a3ab52081d1342b8ed9 Mon Sep 17 00:00:00 2001
+From: Xiaobing Li <xiaobing.li@samsung.com>
+Date: Wed, 28 Feb 2024 17:12:51 +0800
+Subject: [PATCH] io_uring/sqpoll: statistics of the true utilization of sq
+ threads
+Git-commit: 3fcb9d17206e31630f802a3ab52081d1342b8ed9
+Patch-mainline: v6.9-rc1
+References: bsc#1230569
+
+Count the running time and actual IO processing time of the sqpoll
+thread, and output the statistical data to fdinfo.
+
+Variable description:
+"work_time" in the code represents the sum of the jiffies of the sq
+thread actually processing IO, that is, how many milliseconds it
+actually takes to process IO. "total_time" represents the total time
+that the sq thread has elapsed from the beginning of the loop to the
+current time point, that is, how many milliseconds it has spent in
+total.
+
+The test tool is fio, and its parameters are as follows:
+[global]
+ioengine=io_uring
+direct=1
+group_reporting
+bs=128k
+norandommap=1
+randrepeat=0
+refill_buffers
+ramp_time=30s
+time_based
+runtime=1m
+clocksource=clock_gettime
+overwrite=1
+log_avg_msec=1000
+numjobs=1
+
+[disk0]
+filename=/dev/nvme0n1
+rw=read
+iodepth=16
+hipri
+sqthread_poll=1
+
+The test results are as follows:
+Every 2.0s: cat /proc/9230/fdinfo/6 | grep -E Sq
+SqMask: 0x3
+SqHead: 3197153
+SqTail: 3197153
+CachedSqHead:   3197153
+SqThread:       9231
+SqThreadCpu:    11
+SqTotalTime:    18099614
+SqWorkTime:     16748316
+
+The test results corresponding to different iodepths are as follows:
+|-----------|-------|-------|-------|------|-------|
+|   iodepth |   1   |   4   |   8   |  16  |  64   |
+|-----------|-------|-------|-------|------|-------|
+|utilization| 2.9%  | 8.8%  | 10.9% | 92.9%| 84.4% |
+|-----------|-------|-------|-------|------|-------|
+|    idle   | 97.1% | 91.2% | 89.1% | 7.1% | 15.6% |
+|-----------|-------|-------|-------|------|-------|
+
+Signed-off-by: Xiaobing Li <xiaobing.li@samsung.com>
+Link: https://lore.kernel.org/r/20240228091251.543383-1-xiaobing.li@samsung.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ io_uring/fdinfo.c |  7 +++++++
+ io_uring/sqpoll.c | 17 ++++++++++++++++-
+ io_uring/sqpoll.h |  1 +
+ 3 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/io_uring/fdinfo.c b/io_uring/fdinfo.c
+index 976e9500f651..37afc5bac279 100644
+--- a/io_uring/fdinfo.c
++++ b/io_uring/fdinfo.c
+@@ -55,6 +55,7 @@ __cold void io_uring_show_fdinfo(struct seq_file *m, struct file *f)
+ 	struct io_ring_ctx *ctx = f->private_data;
+ 	struct io_overflow_cqe *ocqe;
+ 	struct io_rings *r = ctx->rings;
++	struct rusage sq_usage;
+ 	unsigned int sq_mask = ctx->sq_entries - 1, cq_mask = ctx->cq_entries - 1;
+ 	unsigned int sq_head = READ_ONCE(r->sq.head);
+ 	unsigned int sq_tail = READ_ONCE(r->sq.tail);
+@@ -64,6 +65,7 @@ __cold void io_uring_show_fdinfo(struct seq_file *m, struct file *f)
+ 	unsigned int sq_shift = 0;
+ 	unsigned int sq_entries, cq_entries;
+ 	int sq_pid = -1, sq_cpu = -1;
++	u64 sq_total_time = 0, sq_work_time = 0;
+ 	bool has_lock;
+ 	unsigned int i;
+ 
+@@ -147,10 +149,15 @@ __cold void io_uring_show_fdinfo(struct seq_file *m, struct file *f)
+ 
+ 		sq_pid = sq->task_pid;
+ 		sq_cpu = sq->sq_cpu;
++		getrusage(sq->thread, RUSAGE_SELF, &sq_usage);
++		sq_total_time = sq_usage.ru_stime.tv_sec * 1000000 + sq_usage.ru_stime.tv_usec;
++		sq_work_time = sq->work_time;
+ 	}
+ 
+ 	seq_printf(m, "SqThread:\t%d\n", sq_pid);
+ 	seq_printf(m, "SqThreadCpu:\t%d\n", sq_cpu);
++	seq_printf(m, "SqTotalTime:\t%llu\n", sq_total_time);
++	seq_printf(m, "SqWorkTime:\t%llu\n", sq_work_time);
+ 	seq_printf(m, "UserFiles:\t%u\n", ctx->nr_user_files);
+ 	for (i = 0; has_lock && i < ctx->nr_user_files; i++) {
+ 		struct file *f = io_file_from_index(&ctx->file_table, i);
+diff --git a/io_uring/sqpoll.c b/io_uring/sqpoll.c
+index 82672eaaee81..363052b4ea76 100644
+--- a/io_uring/sqpoll.c
++++ b/io_uring/sqpoll.c
+@@ -253,11 +253,23 @@ static bool io_sq_tw_pending(struct llist_node *retry_list)
+ 	return retry_list || !llist_empty(&tctx->task_list);
+ }
+ 
++static void io_sq_update_worktime(struct io_sq_data *sqd, struct rusage *start)
++{
++	struct rusage end;
++
++	getrusage(current, RUSAGE_SELF, &end);
++	end.ru_stime.tv_sec -= start->ru_stime.tv_sec;
++	end.ru_stime.tv_usec -= start->ru_stime.tv_usec;
++
++	sqd->work_time += end.ru_stime.tv_usec + end.ru_stime.tv_sec * 1000000;
++}
++
+ static int io_sq_thread(void *data)
+ {
+ 	struct llist_node *retry_list = NULL;
+ 	struct io_sq_data *sqd = data;
+ 	struct io_ring_ctx *ctx;
++	struct rusage start;
+ 	unsigned long timeout = 0;
+ 	char buf[TASK_COMM_LEN];
+ 	DEFINE_WAIT(wait);
+@@ -286,6 +298,7 @@ static int io_sq_thread(void *data)
+ 		}
+ 
+ 		cap_entries = !list_is_singular(&sqd->ctx_list);
++		getrusage(current, RUSAGE_SELF, &start);
+ 		list_for_each_entry(ctx, &sqd->ctx_list, sqd_list) {
+ 			int ret = __io_sq_thread(ctx, cap_entries);
+ 
+@@ -296,8 +309,10 @@ static int io_sq_thread(void *data)
+ 			sqt_spin = true;
+ 
+ 		if (sqt_spin || !time_after(jiffies, timeout)) {
+-			if (sqt_spin)
++			if (sqt_spin) {
++				io_sq_update_worktime(sqd, &start);
+ 				timeout = jiffies + sqd->sq_thread_idle;
++			}
+ 			if (unlikely(need_resched())) {
+ 				mutex_unlock(&sqd->lock);
+ 				cond_resched();
+diff --git a/io_uring/sqpoll.h b/io_uring/sqpoll.h
+index 8df37e8c9149..4171666b1cf4 100644
+--- a/io_uring/sqpoll.h
++++ b/io_uring/sqpoll.h
+@@ -16,6 +16,7 @@ struct io_sq_data {
+ 	pid_t			task_pid;
+ 	pid_t			task_tgid;
+ 
++	u64			work_time;
+ 	unsigned long		state;
+ 	struct completion	exited;
+ };
+-- 
+2.47.0
+
