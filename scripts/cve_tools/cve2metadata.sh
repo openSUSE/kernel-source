@@ -18,7 +18,8 @@ then
 	export CVEKERNELTREE=$LINUX_GIT
 fi
 
-. scripts/common-functions
+[ -z "$KSOURCE_GIT" ] && KSOURCE_GIT="."
+. $KSOURCE_GIT/scripts/common-functions
 
 while [ $# -gt 0 ]
 do
@@ -33,6 +34,7 @@ do
 		echo -n " score:${cvss:-unknown}"
 		bsc="$(cve2bugzilla $cve)"
 		echo " $cve $bsc"
+		is_cve_rejected $cve && echo "W: $cve has been rejected" >&2
 	else
 		echo $arg cannot be resolved to a CVE >&2
 	fi
