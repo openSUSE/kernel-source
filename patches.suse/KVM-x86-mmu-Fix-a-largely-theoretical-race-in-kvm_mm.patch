@@ -1,0 +1,126 @@
+Patch-mainline: v6.10-rc1
+Git-commit: 226d9b8f16883ca412ef8efbad6f3594587a8dab
+References: PED#348
+From: Sean Christopherson <seanjc@google.com>
+Date: Tue, 23 Apr 2024 12:31:14 -0700
+Subject: [PATCH] KVM: x86/mmu: Fix a largely theoretical race in
+ kvm_mmu_track_write()
+
+Add full memory barriers in kvm_mmu_track_write() and account_shadowed()
+to plug a (very, very theoretical) race where kvm_mmu_track_write() could
+miss a 0->1 transition of indirect_shadow_pages and fail to zap relevant,
+*stale* SPTEs.
+
+Without the barriers, because modern x86 CPUs allow (per the SDM):
+
+  Reads may be reordered with older writes to different locations but not
+  with older writes to the same location.
+
+it's possible that the following could happen (terms of values being
+visible/resolved):
+
+ CPU0                          CPU1
+ read memory[gfn] (=Y)
+                               memory[gfn] Y=>X
+                               read indirect_shadow_pages (=0)
+ indirect_shadow_pages 0=>1
+
+or conversely:
+
+ CPU0                          CPU1
+ indirect_shadow_pages 0=>1
+                               read indirect_shadow_pages (=0)
+ read memory[gfn] (=Y)
+                               memory[gfn] Y=>X
+
+E.g. in the below scenario, CPU0 could fail to zap SPTEs, and CPU1 could
+fail to retry the faulting instruction, resulting in a KVM entering the
+guest with a stale SPTE (map PTE=X instead of PTE=Y).
+
+PTE = X;
+
+CPU0:
+    emulator_write_phys()
+    PTE = Y
+    kvm_page_track_write()
+      kvm_mmu_track_write()
+      // memory barrier missing here
+      if (indirect_shadow_pages)
+          zap();
+
+CPU1:
+   FNAME(page_fault)
+     FNAME(walk_addr)
+       FNAME(walk_addr_generic)
+         gw->pte = PTE; // X
+
+     FNAME(fetch)
+       kvm_mmu_get_child_sp
+         kvm_mmu_get_shadow_page
+           __kvm_mmu_get_shadow_page
+             kvm_mmu_alloc_shadow_page
+               account_shadowed
+                 indirect_shadow_pages++
+                 // memory barrier missing here
+       if (FNAME(gpte_changed)) // if (PTE == X)
+           return RET_PF_RETRY;
+
+In practice, this bug likely cannot be observed as both the 0=>1
+transition and reordering of this scope are extremely rare occurrences.
+
+Note, if the cost of the barrier (which is simply a locked ADD, see commit
+450cbdd0125c ("locking/x86: Use LOCK ADD for smp_mb() instead of MFENCE")),
+is problematic, KVM could avoid the barrier by bailing earlier if checking
+kvm_memslots_have_rmaps() is false.  But the odds of the barrier being
+problematic is extremely low, *and* the odds of the extra checks being
+meaningfully faster overall is also low.
+
+Link: https://lore.kernel.org/r/20240423193114.2887673-1-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/kvm/mmu/mmu.c | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 992e651540e8..283b2309e75f 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -831,6 +831,15 @@ static void account_shadowed(struct kvm *kvm, struct kvm_mmu_page *sp)
+ 	gfn_t gfn;
+ 
+ 	kvm->arch.indirect_shadow_pages++;
++	/*
++	 * Ensure indirect_shadow_pages is elevated prior to re-reading guest
++	 * child PTEs in FNAME(gpte_changed), i.e. guarantee either in-flight
++	 * emulated writes are visible before re-reading guest PTEs, or that
++	 * an emulated write will see the elevated count and acquire mmu_lock
++	 * to update SPTEs.  Pairs with the smp_mb() in kvm_mmu_track_write().
++	 */
++	smp_mb();
++
+ 	gfn = sp->gfn;
+ 	slots = kvm_memslots_for_spte_role(kvm, sp->role);
+ 	slot = __gfn_to_memslot(slots, gfn);
+@@ -5802,10 +5811,15 @@ void kvm_mmu_track_write(struct kvm_vcpu *vcpu, gpa_t gpa, const u8 *new,
+ 	bool flush = false;
+ 
+ 	/*
+-	 * If we don't have indirect shadow pages, it means no page is
+-	 * write-protected, so we can exit simply.
++	 * When emulating guest writes, ensure the written value is visible to
++	 * any task that is handling page faults before checking whether or not
++	 * KVM is shadowing a guest PTE.  This ensures either KVM will create
++	 * the correct SPTE in the page fault handler, or this task will see
++	 * a non-zero indirect_shadow_pages.  Pairs with the smp_mb() in
++	 * account_shadowed().
+ 	 */
+-	if (!READ_ONCE(vcpu->kvm->arch.indirect_shadow_pages))
++	smp_mb();
++	if (!vcpu->kvm->arch.indirect_shadow_pages)
+ 		return;
+ 
+ 	write_lock(&vcpu->kvm->mmu_lock);
+-- 
+2.43.0
+
