@@ -1,0 +1,158 @@
+From: Long Li <leo.lilong@huawei.com>
+Date: Mon, 9 Dec 2024 19:42:40 +0800
+Subject: [PATCH] iomap: fix zero padding data issue in concurrent append
+ writes
+References: bsc#1012628
+Patch-mainline: 6.12.10
+Git-commit: 51d20d1dacbec589d459e11fc88fbca419f84a99
+
+[ Upstream commit 51d20d1dacbec589d459e11fc88fbca419f84a99 ]
+
+During concurrent append writes to XFS filesystem, zero padding data
+may appear in the file after power failure. This happens due to imprecise
+disk size updates when handling write completion.
+
+Consider this scenario with concurrent append writes same file:
+
+  Thread 1:                  Thread 2:
+  ------------               -----------
+  write [A, A+B]
+  update inode size to A+B
+  submit I/O [A, A+BS]
+                             write [A+B, A+B+C]
+                             update inode size to A+B+C
+  <I/O completes, updates disk size to min(A+B+C, A+BS)>
+  <power failure>
+
+After reboot:
+  1) with A+B+C < A+BS, the file has zero padding in range [A+B, A+B+C]
+
+  |<         Block Size (BS)      >|
+  |DDDDDDDDDDDDDDDD0000000000000000|
+  ^               ^        ^
+  A              A+B     A+B+C
+                         (EOF)
+
+  2) with A+B+C > A+BS, the file has zero padding in range [A+B, A+BS]
+
+  |<         Block Size (BS)      >|<           Block Size (BS)    >|
+  |DDDDDDDDDDDDDDDD0000000000000000|00000000000000000000000000000000|
+  ^               ^                ^               ^
+  A              A+B              A+BS           A+B+C
+                                  (EOF)
+
+  D = Valid Data
+  0 = Zero Padding
+
+The issue stems from disk size being set to min(io_offset + io_size,
+inode->i_size) at I/O completion. Since io_offset+io_size is block
+size granularity, it may exceed the actual valid file data size. In
+the case of concurrent append writes, inode->i_size may be larger
+than the actual range of valid file data written to disk, leading to
+inaccurate disk size updates.
+
+This patch modifies the meaning of io_size to represent the size of
+valid data within EOF in an ioend. If the ioend spans beyond i_size,
+io_size will be trimmed to provide the file with more accurate size
+information. This is particularly useful for on-disk size updates
+at completion time.
+
+After this change, ioends that span i_size will not grow or merge with
+other ioends in concurrent scenarios. However, these cases that need
+growth/merging rarely occur and it seems no noticeable performance impact.
+Although rounding up io_size could enable ioend growth/merging in these
+scenarios, we decided to keep the code simple after discussion [1].
+
+Another benefit is that it makes the xfs_ioend_is_append() check more
+accurate, which can reduce unnecessary end bio callbacks of xfs_end_bio()
+in certain scenarios, such as repeated writes at the file tail without
+extending the file size.
+
+Link [1]: https://patchwork.kernel.org/project/xfs/patch/20241113091907.56937-1-leo.lilong@huawei.com
+
+Fixes: ae259a9c8593 ("fs: introduce iomap infrastructure") # goes further back than this
+Signed-off-by: Long Li <leo.lilong@huawei.com>
+Link: https://lore.kernel.org/r/20241209114241.3725722-3-leo.lilong@huawei.com
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/iomap/buffered-io.c | 45 ++++++++++++++++++++++++++++++++++++++++++
+ include/linux/iomap.h  |  2 +-
+ 2 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c
+index 05e5cc3bf976..25d1ede6bb0e 100644
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@ -1784,7 +1784,52 @@ static int iomap_add_to_ioend(struct iomap_writepage_ctx *wpc,
+ 
+ 	if (ifs)
+ 		atomic_add(len, &ifs->write_bytes_pending);
++
++	/*
++	 * Clamp io_offset and io_size to the incore EOF so that ondisk
++	 * file size updates in the ioend completion are byte-accurate.
++	 * This avoids recovering files with zeroed tail regions when
++	 * writeback races with appending writes:
++	 *
++	 *    Thread 1:                  Thread 2:
++	 *    ------------               -----------
++	 *    write [A, A+B]
++	 *    update inode size to A+B
++	 *    submit I/O [A, A+BS]
++	 *                               write [A+B, A+B+C]
++	 *                               update inode size to A+B+C
++	 *    <I/O completes, updates disk size to min(A+B+C, A+BS)>
++	 *    <power failure>
++	 *
++	 *  After reboot:
++	 *    1) with A+B+C < A+BS, the file has zero padding in range
++	 *       [A+B, A+B+C]
++	 *
++	 *    |<     Block Size (BS)   >|
++	 *    |DDDDDDDDDDDD0000000000000|
++	 *    ^           ^        ^
++	 *    A          A+B     A+B+C
++	 *                       (EOF)
++	 *
++	 *    2) with A+B+C > A+BS, the file has zero padding in range
++	 *       [A+B, A+BS]
++	 *
++	 *    |<     Block Size (BS)   >|<     Block Size (BS)    >|
++	 *    |DDDDDDDDDDDD0000000000000|00000000000000000000000000|
++	 *    ^           ^             ^           ^
++	 *    A          A+B           A+BS       A+B+C
++	 *                             (EOF)
++	 *
++	 *    D = Valid Data
++	 *    0 = Zero Padding
++	 *
++	 * Note that this defeats the ability to chain the ioends of
++	 * appending writes.
++	 */
+ 	wpc->ioend->io_size += len;
++	if (wpc->ioend->io_offset + wpc->ioend->io_size > end_pos)
++		wpc->ioend->io_size = end_pos - wpc->ioend->io_offset;
++
+ 	wbc_account_cgroup_owner(wbc, folio, len);
+ 	return 0;
+ }
+diff --git a/include/linux/iomap.h b/include/linux/iomap.h
+index f61407e3b121..d204dcd35063 100644
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@ -330,7 +330,7 @@ struct iomap_ioend {
+ 	u16			io_type;
+ 	u16			io_flags;	/* IOMAP_F_* */
+ 	struct inode		*io_inode;	/* file being written to */
+-	size_t			io_size;	/* size of the extent */
++	size_t			io_size;	/* size of data within eof */
+ 	loff_t			io_offset;	/* offset in the file */
+ 	sector_t		io_sector;	/* start sector of ioend */
+ 	struct bio		io_bio;		/* MUST BE LAST! */
+-- 
+2.47.0
+
