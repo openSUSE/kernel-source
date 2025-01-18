@@ -1,0 +1,167 @@
+From: Milan Broz <gmazyland@gmail.com>
+Date: Wed, 18 Dec 2024 13:56:58 +0100
+Subject: [PATCH] dm-verity FEC: Fix RS FEC repair for roots unaligned to block
+ size (take 2)
+References: bsc#1012628
+Patch-mainline: 6.12.10
+Git-commit: 6df90c02bae468a3a6110bafbc659884d0c4966c
+
+commit 6df90c02bae468a3a6110bafbc659884d0c4966c upstream.
+
+This patch fixes an issue that was fixed in the commit
+  df7b59ba9245 ("dm verity: fix FEC for RS roots unaligned to block size")
+but later broken again in the commit
+  8ca7cab82bda ("dm verity fec: fix misaligned RS roots IO")
+
+If the Reed-Solomon roots setting spans multiple blocks, the code does not
+use proper parity bytes and randomly fails to repair even trivial errors.
+
+This bug cannot happen if the sector size is multiple of RS roots
+setting (Android case with roots 2).
+
+The previous solution was to find a dm-bufio block size that is multiple
+of the device sector size and roots size. Unfortunately, the optimization
+in commit 8ca7cab82bda ("dm verity fec: fix misaligned RS roots IO")
+is incorrect and uses data block size for some roots (for example, it uses
+4096 block size for roots = 20).
+
+This patch uses a different approach:
+
+ - It always uses a configured data block size for dm-bufio to avoid
+ possible misaligned IOs.
+
+ - and it caches the processed parity bytes, so it can join it
+ if it spans two blocks.
+
+As the RS calculation is called only if an error is detected and
+the process is computationally intensive, copying a few more bytes
+should not introduce performance issues.
+
+The issue was reported to cryptsetup with trivial reproducer
+  https://gitlab.com/cryptsetup/cryptsetup/-/issues/923
+
+Reproducer (with roots=20):
+
+ # create verity device with RS FEC
+ dd if=/dev/urandom of=data.img bs=4096 count=8 status=none
+ veritysetup format data.img hash.img --fec-device=fec.img --fec-roots=20 | \
+ awk '/^Root hash/{ print $3 }' >roothash
+
+ # create an erasure that should always be repairable with this roots setting
+ dd if=/dev/zero of=data.img conv=notrunc bs=1 count=4 seek=4 status=none
+
+ # try to read it through dm-verity
+ veritysetup open data.img test hash.img --fec-device=fec.img --fec-roots=20 $(cat roothash)
+ dd if=/dev/mapper/test of=/dev/null bs=4096 status=noxfer
+
+ Even now the log says it cannot repair it:
+   : verity-fec: 7:1: FEC 0: failed to correct: -74
+   : device-mapper: verity: 7:1: data block 0 is corrupted
+   ...
+
+With this fix, errors are properly repaired.
+   : verity-fec: 7:1: FEC 0: corrected 4 errors
+
+Signed-off-by: Milan Broz <gmazyland@gmail.com>
+Fixes: 8ca7cab82bda ("dm verity fec: fix misaligned RS roots IO")
+Cc: stable@vger.kernel.org
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/md/dm-verity-fec.c | 40 +++++++++++++++++++++++++-------------
+ 1 file changed, 26 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/md/dm-verity-fec.c b/drivers/md/dm-verity-fec.c
+index 62b1a44b8dd2..6bd9848518d4 100644
+--- a/drivers/md/dm-verity-fec.c
++++ b/drivers/md/dm-verity-fec.c
+@@ -60,15 +60,19 @@ static int fec_decode_rs8(struct dm_verity *v, struct dm_verity_fec_io *fio,
+  * to the data block. Caller is responsible for releasing buf.
+  */
+ static u8 *fec_read_parity(struct dm_verity *v, u64 rsb, int index,
+-			   unsigned int *offset, struct dm_buffer **buf,
+-			   unsigned short ioprio)
++			   unsigned int *offset, unsigned int par_buf_offset,
++			   struct dm_buffer **buf, unsigned short ioprio)
+ {
+ 	u64 position, block, rem;
+ 	u8 *res;
+ 
++	/* We have already part of parity bytes read, skip to the next block */
++	if (par_buf_offset)
++		index++;
++
+ 	position = (index + rsb) * v->fec->roots;
+ 	block = div64_u64_rem(position, v->fec->io_size, &rem);
+-	*offset = (unsigned int)rem;
++	*offset = par_buf_offset ? 0 : (unsigned int)rem;
+ 
+ 	res = dm_bufio_read_with_ioprio(v->fec->bufio, block, buf, ioprio);
+ 	if (IS_ERR(res)) {
+@@ -128,11 +132,12 @@ static int fec_decode_bufs(struct dm_verity *v, struct dm_verity_io *io,
+ {
+ 	int r, corrected = 0, res;
+ 	struct dm_buffer *buf;
+-	unsigned int n, i, offset;
+-	u8 *par, *block;
++	unsigned int n, i, offset, par_buf_offset = 0;
++	u8 *par, *block, par_buf[DM_VERITY_FEC_RSM - DM_VERITY_FEC_MIN_RSN];
+ 	struct bio *bio = dm_bio_from_per_bio_data(io, v->ti->per_io_data_size);
+ 
+-	par = fec_read_parity(v, rsb, block_offset, &offset, &buf, bio_prio(bio));
++	par = fec_read_parity(v, rsb, block_offset, &offset,
++			      par_buf_offset, &buf, bio_prio(bio));
+ 	if (IS_ERR(par))
+ 		return PTR_ERR(par);
+ 
+@@ -142,7 +147,8 @@ static int fec_decode_bufs(struct dm_verity *v, struct dm_verity_io *io,
+ 	 */
+ 	fec_for_each_buffer_rs_block(fio, n, i) {
+ 		block = fec_buffer_rs_block(v, fio, n, i);
+-		res = fec_decode_rs8(v, fio, block, &par[offset], neras);
++		memcpy(&par_buf[par_buf_offset], &par[offset], v->fec->roots - par_buf_offset);
++		res = fec_decode_rs8(v, fio, block, par_buf, neras);
+ 		if (res < 0) {
+ 			r = res;
+ 			goto error;
+@@ -155,12 +161,21 @@ static int fec_decode_bufs(struct dm_verity *v, struct dm_verity_io *io,
+ 		if (block_offset >= 1 << v->data_dev_block_bits)
+ 			goto done;
+ 
+-		/* read the next block when we run out of parity bytes */
+-		offset += v->fec->roots;
++		/* Read the next block when we run out of parity bytes */
++		offset += (v->fec->roots - par_buf_offset);
++		/* Check if parity bytes are split between blocks */
++		if (offset < v->fec->io_size && (offset + v->fec->roots) > v->fec->io_size) {
++			par_buf_offset = v->fec->io_size - offset;
++			memcpy(par_buf, &par[offset], par_buf_offset);
++			offset += par_buf_offset;
++		} else
++			par_buf_offset = 0;
++
+ 		if (offset >= v->fec->io_size) {
+ 			dm_bufio_release(buf);
+ 
+-			par = fec_read_parity(v, rsb, block_offset, &offset, &buf, bio_prio(bio));
++			par = fec_read_parity(v, rsb, block_offset, &offset,
++					      par_buf_offset, &buf, bio_prio(bio));
+ 			if (IS_ERR(par))
+ 				return PTR_ERR(par);
+ 		}
+@@ -724,10 +739,7 @@ int verity_fec_ctr(struct dm_verity *v)
+ 		return -E2BIG;
+ 	}
+ 
+-	if ((f->roots << SECTOR_SHIFT) & ((1 << v->data_dev_block_bits) - 1))
+-		f->io_size = 1 << v->data_dev_block_bits;
+-	else
+-		f->io_size = v->fec->roots << SECTOR_SHIFT;
++	f->io_size = 1 << v->data_dev_block_bits;
+ 
+ 	f->bufio = dm_bufio_client_create(f->dev->bdev,
+ 					  f->io_size,
+-- 
+2.47.0
+
