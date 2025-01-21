@@ -1,0 +1,138 @@
+Patch-mainline: v6.12-rc1
+Git-commit: 363010e1dd0efd4778637c1a5a5aaffbcfcae919
+References: jsc#PED-348
+From: Sean Christopherson <seanjc@google.com>
+Date: Thu, 5 Sep 2024 21:34:08 -0700
+Subject: [PATCH] KVM: nVMX: Get to-be-acknowledge IRQ for nested VM-Exit at
+ injection site
+
+Move the logic to get the to-be-acknowledge IRQ for a nested VM-Exit from
+nested_vmx_vmexit() to vmx_check_nested_events(), which is subtly the one
+and only path where KVM invokes nested_vmx_vmexit() with
+EXIT_REASON_EXTERNAL_INTERRUPT.  A future fix will perform a last-minute
+check on L2's nested posted interrupt notification vector, just before
+injecting a nested VM-Exit.  To handle that scenario correctly, KVM needs
+to get the interrupt _before_ injecting VM-Exit, as simply querying the
+highest priority interrupt, via kvm_cpu_has_interrupt(), would result in
+TOCTOU bug, as a new, higher priority interrupt could arrive between
+kvm_cpu_has_interrupt() and kvm_cpu_get_interrupt().
+
+Unfortunately, simply moving the call to kvm_cpu_get_interrupt() doesn't
+suffice, as a VMWRITE to GUEST_INTERRUPT_STATUS.SVI is hiding in
+kvm_get_apic_interrupt(), and acknowledging the interrupt before nested
+VM-Exit would cause the VMWRITE to hit vmcs02 instead of vmcs01.
+
+Open code a rough equivalent to kvm_cpu_get_interrupt() so that the IRQ
+is acknowledged after emulating VM-Exit, taking care to avoid the TOCTOU
+issue described above.
+
+Opportunistically convert the WARN_ON() to a WARN_ON_ONCE().  If KVM has
+a bug that results in a false positive from kvm_cpu_has_interrupt(),
+spamming dmesg won't help the situation.
+
+Note, nested_vmx_reflect_vmexit() can never reflect external interrupts as
+they are always "wanted" by L0.
+
+Link: https://lore.kernel.org/r/20240906043413.1049633-3-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |  1 +
+ arch/x86/kvm/irq.c              |  3 ++-
+ arch/x86/kvm/vmx/nested.c       | 36 ++++++++++++++++++++++++---------
+ 3 files changed, 30 insertions(+), 10 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 4a93ac1b9be9..aa31c4b94977 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -2256,6 +2256,7 @@ int kvm_cpu_has_injectable_intr(struct kvm_vcpu *v);
+ int kvm_cpu_has_interrupt(struct kvm_vcpu *vcpu);
+ int kvm_cpu_has_extint(struct kvm_vcpu *v);
+ int kvm_arch_interrupt_allowed(struct kvm_vcpu *vcpu);
++int kvm_cpu_get_extint(struct kvm_vcpu *v);
+ int kvm_cpu_get_interrupt(struct kvm_vcpu *v);
+ void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event);
+ 
+diff --git a/arch/x86/kvm/irq.c b/arch/x86/kvm/irq.c
+index 3d7eb11d0e45..810da99ff7ed 100644
+--- a/arch/x86/kvm/irq.c
++++ b/arch/x86/kvm/irq.c
+@@ -108,7 +108,7 @@ EXPORT_SYMBOL_GPL(kvm_cpu_has_interrupt);
+  * Read pending interrupt(from non-APIC source)
+  * vector and intack.
+  */
+-static int kvm_cpu_get_extint(struct kvm_vcpu *v)
++int kvm_cpu_get_extint(struct kvm_vcpu *v)
+ {
+ 	if (!kvm_cpu_has_extint(v)) {
+ 		WARN_ON(!lapic_in_kernel(v));
+@@ -131,6 +131,7 @@ static int kvm_cpu_get_extint(struct kvm_vcpu *v)
+ 	} else
+ 		return kvm_pic_read_irq(v->kvm); /* PIC */
+ }
++EXPORT_SYMBOL_GPL(kvm_cpu_get_extint);
+ 
+ /*
+  * Read pending interrupt vector and intack.
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index 867de342df33..1a6dc85cde18 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -4285,11 +4285,37 @@ static int vmx_check_nested_events(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	if (kvm_cpu_has_interrupt(vcpu) && !vmx_interrupt_blocked(vcpu)) {
++		int irq;
++
+ 		if (block_nested_events)
+ 			return -EBUSY;
+ 		if (!nested_exit_on_intr(vcpu))
+ 			goto no_vmexit;
+-		nested_vmx_vmexit(vcpu, EXIT_REASON_EXTERNAL_INTERRUPT, 0, 0);
++
++		if (!nested_exit_intr_ack_set(vcpu)) {
++			nested_vmx_vmexit(vcpu, EXIT_REASON_EXTERNAL_INTERRUPT, 0, 0);
++			return 0;
++		}
++
++		irq = kvm_cpu_get_extint(vcpu);
++		if (irq != -1) {
++			nested_vmx_vmexit(vcpu, EXIT_REASON_EXTERNAL_INTERRUPT,
++					  INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR | irq, 0);
++			return 0;
++		}
++
++		irq = kvm_apic_has_interrupt(vcpu);
++		WARN_ON_ONCE(irq < 0);
++
++		nested_vmx_vmexit(vcpu, EXIT_REASON_EXTERNAL_INTERRUPT,
++				  INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR | irq, 0);
++
++		/*
++		 * ACK the interrupt _after_ emulating VM-Exit, as the IRQ must
++		 * be marked as in-service in vmcs01.GUEST_INTERRUPT_STATUS.SVI
++		 * if APICv is active.
++		 */
++		kvm_apic_ack_interrupt(vcpu, irq);
+ 		return 0;
+ 	}
+ 
+@@ -4970,14 +4996,6 @@ void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 vm_exit_reason,
+ 	vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+ 
+ 	if (likely(!vmx->fail)) {
+-		if ((u16)vm_exit_reason == EXIT_REASON_EXTERNAL_INTERRUPT &&
+-		    nested_exit_intr_ack_set(vcpu)) {
+-			int irq = kvm_cpu_get_interrupt(vcpu);
+-			WARN_ON(irq < 0);
+-			vmcs12->vm_exit_intr_info = irq |
+-				INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR;
+-		}
+-
+ 		if (vm_exit_reason != -1)
+ 			trace_kvm_nested_vmexit_inject(vmcs12->vm_exit_reason,
+ 						       vmcs12->exit_qualification,
+-- 
+2.43.0
+
