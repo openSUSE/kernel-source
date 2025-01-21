@@ -1,0 +1,300 @@
+From ae98dbf43d755b4e111fcd086e53939bef3e9a1a Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Aug 2024 11:20:45 -0600
+Subject: [PATCH] io_uring/kbuf: add support for incremental buffer consumption
+Git-commit: ae98dbf43d755b4e111fcd086e53939bef3e9a1a
+Patch-mainline: v6.12-rc1
+References: bsc#1230569 jsc#PED-11603
+
+By default, any recv/read operation that uses provided buffers will
+consume at least 1 buffer fully (and maybe more, in case of bundles).
+This adds support for incremental consumption, meaning that an
+application may add large buffers, and each read/recv will just consume
+the part of the buffer that it needs.
+
+For example, let's say an application registers 1MB buffers in a
+provided buffer ring, for streaming receives. If it gets a short recv,
+then the full 1MB buffer will be consumed and passed back to the
+application. With incremental consumption, only the part that was
+actually used is consumed, and the buffer remains the current one.
+
+This means that both the application and the kernel needs to keep track
+of what the current receive point is. Each recv will still pass back a
+buffer ID and the size consumed, the only difference is that before the
+next receive would always be the next buffer in the ring. Now the same
+buffer ID may return multiple receives, each at an offset into that
+buffer from where the previous receive left off. Example:
+
+Application registers a provided buffer ring, and adds two 32K buffers
+to the ring.
+
+Buffer1 address: 0x1000000 (buffer ID 0)
+Buffer2 address: 0x2000000 (buffer ID 1)
+
+A recv completion is received with the following values:
+
+cqe->res	0x1000	(4k bytes received)
+cqe->flags	0x11	(CQE_F_BUFFER|CQE_F_BUF_MORE set, buffer ID 0)
+
+and the application now knows that 4096b of data is available at
+0x1000000, the start of that buffer, and that more data from this buffer
+will be coming. Now the next receive comes in:
+
+cqe->res	0x2010	(8k bytes received)
+cqe->flags	0x11	(CQE_F_BUFFER|CQE_F_BUF_MORE set, buffer ID 0)
+
+which tells the application that 8k is available where the last
+completion left off, at 0x1001000. Next completion is:
+
+cqe->res	0x5000	(20k bytes received)
+cqe->flags	0x1	(CQE_F_BUFFER set, buffer ID 0)
+
+and the application now knows that 20k of data is available at
+0x1003000, which is where the previous receive ended. CQE_F_BUF_MORE
+isn't set, as no more data is available in this buffer ID. The next
+completion is then:
+
+cqe->res	0x1000	(4k bytes received)
+cqe->flags	0x10001	(CQE_F_BUFFER|CQE_F_BUF_MORE set, buffer ID 1)
+
+which tells the application that buffer ID 1 is now the current one,
+hence there's 4k of valid data at 0x2000000. 0x2001000 will be the next
+receive point for this buffer ID.
+
+When a buffer will be reused by future CQE completions,
+IORING_CQE_BUF_MORE will be set in cqe->flags. This tells the application
+that the kernel isn't done with the buffer yet, and that it should expect
+more completions for this buffer ID. Will only be set by provided buffer
+rings setup with IOU_PBUF_RING INC, as that's the only type of buffer
+that will see multiple consecutive completions for the same buffer ID.
+For any other provided buffer type, any completion that passes back
+a buffer to the application is final.
+
+Once a buffer has been fully consumed, the buffer ring head is
+incremented and the next receive will indicate the next buffer ID in the
+CQE cflags.
+
+On the send side, the application can manage how much data is sent from
+an existing buffer by setting sqe->len to the desired send length.
+
+An application can request incremental consumption by setting
+IOU_PBUF_RING_INC in the provided buffer ring registration. Outside of
+that, any provided buffer ring setup and buffer additions is done like
+before, no changes there. The only change is in how an application may
+see multiple completions for the same buffer ID, hence needing to know
+where the next receive will happen.
+
+Note that like existing provided buffer rings, this should not be used
+with IOSQE_ASYNC, as both really require the ring to remain locked over
+the duration of the buffer selection and the operation completion. It
+will consume a buffer otherwise regardless of the size of the IO done.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ include/uapi/linux/io_uring.h |   19 +++++++++++++++++++
+ io_uring/kbuf.c               |   42 ++++++++++++++++++++++++++++++------------
+ io_uring/kbuf.h               |   42 ++++++++++++++++++++++++++++++++++--------
+ 3 files changed, 83 insertions(+), 20 deletions(-)
+
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -431,11 +431,21 @@ struct io_uring_cqe {
+  * IORING_CQE_F_SOCK_NONEMPTY	If set, more data to read after socket recv
+  * IORING_CQE_F_NOTIF	Set for notification CQEs. Can be used to distinct
+  * 			them from sends.
++ * IORING_CQE_F_BUF_MORE If set, the buffer ID set in the completion will get
++ *			more completions. In other words, the buffer is being
++ *			partially consumed, and will be used by the kernel for
++ *			more completions. This is only set for buffers used via
++ *			the incremental buffer consumption, as provided by
++ *			a ring buffer setup with IOU_PBUF_RING_INC. For any
++ *			other provided buffer type, all completions with a
++ *			buffer passed back is automatically returned to the
++ *			application.
+  */
+ #define IORING_CQE_F_BUFFER		(1U << 0)
+ #define IORING_CQE_F_MORE		(1U << 1)
+ #define IORING_CQE_F_SOCK_NONEMPTY	(1U << 2)
+ #define IORING_CQE_F_NOTIF		(1U << 3)
++#define IORING_CQE_F_BUF_MORE		(1U << 4)
+ 
+ enum {
+ 	IORING_CQE_BUFFER_SHIFT		= 16,
+@@ -709,9 +719,18 @@ struct io_uring_buf_ring {
+  *			mmap(2) with the offset set as:
+  *			IORING_OFF_PBUF_RING | (bgid << IORING_OFF_PBUF_SHIFT)
+  *			to get a virtual mapping for the ring.
++ * IOU_PBUF_RING_INC:	If set, buffers consumed from this buffer ring can be
++ *			consumed incrementally. Normally one (or more) buffers
++ *			are fully consumed. With incremental consumptions, it's
++ *			feasible to register big ranges of buffers, and each
++ *			use of it will consume only as much as it needs. This
++ *			requires that both the kernel and application keep
++ *			track of where the current read/recv index is at.
+  */
+ enum {
+ 	IOU_PBUF_RING_MMAP	= 1,
++	IOU_PBUF_RING_INC	= 2,
++
+ };
+ 
+ /* argument for IORING_(UN)REGISTER_PBUF_RING */
+--- a/io_uring/kbuf.c
++++ b/io_uring/kbuf.c
+@@ -212,14 +212,25 @@ static int io_ring_buffers_peek(struct i
+ 	buf = io_ring_head_to_buf(br, head, bl->mask);
+ 	if (arg->max_len) {
+ 		u32 len = READ_ONCE(buf->len);
+-		size_t needed;
+ 
+ 		if (unlikely(!len))
+ 			return -ENOBUFS;
+-		needed = (arg->max_len + len - 1) / len;
+-		needed = min_not_zero(needed, (size_t) PEEK_MAX_IMPORT);
+-		if (nr_avail > needed)
+-			nr_avail = needed;
++		/*
++		 * Limit incremental buffers to 1 segment. No point trying
++		 * to peek ahead and map more than we need, when the buffers
++		 * themselves should be large when setup with
++		 * IOU_PBUF_RING_INC.
++		 */
++		if (bl->flags & IOBL_INC) {
++			nr_avail = 1;
++		} else {
++			size_t needed;
++
++			needed = (arg->max_len + len - 1) / len;
++			needed = min_not_zero(needed, (size_t) PEEK_MAX_IMPORT);
++			if (nr_avail > needed)
++				nr_avail = needed;
++		}
+ 	}
+ 
+ 	/*
+@@ -244,16 +255,21 @@ static int io_ring_buffers_peek(struct i
+ 
+ 	req->buf_index = buf->bid;
+ 	do {
+-		/* truncate end piece, if needed */
+-		if (buf->len > arg->max_len)
+-			buf->len = arg->max_len;
++		u32 len = buf->len;
++
++		/* truncate end piece, if needed, for non partial buffers */
++		if (len > arg->max_len) {
++			len = arg->max_len;
++			if (!(bl->flags & IOBL_INC))
++				buf->len = len;
++		}
+ 
+ 		iov->iov_base = u64_to_user_ptr(buf->addr);
+-		iov->iov_len = buf->len;
++		iov->iov_len = len;
+ 		iov++;
+ 
+-		arg->out_len += buf->len;
+-		arg->max_len -= buf->len;
++		arg->out_len += len;
++		arg->max_len -= len;
+ 		if (!arg->max_len)
+ 			break;
+ 
+@@ -675,7 +691,7 @@ int io_register_pbuf_ring(struct io_ring
+ 
+ 	if (reg.resv[0] || reg.resv[1] || reg.resv[2])
+ 		return -EINVAL;
+-	if (reg.flags & ~IOU_PBUF_RING_MMAP)
++	if (reg.flags & ~(IOU_PBUF_RING_MMAP | IOU_PBUF_RING_INC))
+ 		return -EINVAL;
+ 	if (!(reg.flags & IOU_PBUF_RING_MMAP)) {
+ 		if (!reg.ring_addr)
+@@ -713,6 +729,8 @@ int io_register_pbuf_ring(struct io_ring
+ 	if (!ret) {
+ 		bl->nr_entries = reg.ring_entries;
+ 		bl->mask = reg.ring_entries - 1;
++		if (reg.flags & IOU_PBUF_RING_INC)
++			bl->flags |= IOBL_INC;
+ 
+ 		io_buffer_add_list(ctx, bl, reg.bgid);
+ 		return 0;
+--- a/io_uring/kbuf.h
++++ b/io_uring/kbuf.h
+@@ -9,6 +9,9 @@ enum {
+ 	IOBL_BUF_RING	= 1,
+ 	/* ring mapped provided buffers, but mmap'ed by application */
+ 	IOBL_MMAP	= 2,
++	/* buffers are consumed incrementally rather than always fully */
++	IOBL_INC	= 4,
++
+ };
+ 
+ struct io_buffer_list {
+@@ -124,24 +127,45 @@ static inline bool io_kbuf_recycle(struc
+ /* Mapped buffer ring, return io_uring_buf from head */
+ #define io_ring_head_to_buf(br, head, mask)	&(br)->bufs[(head) & (mask)]
+ 
+-static inline void io_kbuf_commit(struct io_kiocb *req,
++static inline bool io_kbuf_commit(struct io_kiocb *req,
+ 				  struct io_buffer_list *bl, int len, int nr)
+ {
+ 	if (unlikely(!(req->flags & REQ_F_BUFFERS_COMMIT)))
+-		return;
+-	bl->head += nr;
++		return true;
++
+ 	req->flags &= ~REQ_F_BUFFERS_COMMIT;
++
++	if (unlikely(len < 0))
++		return true;
++
++	if (bl->flags & IOBL_INC) {
++		struct io_uring_buf *buf;
++
++		buf = io_ring_head_to_buf(bl->buf_ring, bl->head, bl->mask);
++		if (WARN_ON_ONCE(len > buf->len))
++			len = buf->len;
++		buf->len -= len;
++		if (buf->len) {
++			buf->addr += len;
++			return false;
++		}
++	}
++
++	bl->head += nr;
++	return true;
+ }
+ 
+-static inline void __io_put_kbuf_ring(struct io_kiocb *req, int len, int nr)
++static inline bool __io_put_kbuf_ring(struct io_kiocb *req, int len, int nr)
+ {
+ 	struct io_buffer_list *bl = req->buf_list;
++	bool ret = true;
+ 
+ 	if (bl) {
+-		io_kbuf_commit(req, bl, len, nr);
++		ret = io_kbuf_commit(req, bl, len, nr);
+ 		req->buf_index = bl->bgid;
+ 	}
+ 	req->flags &= ~REQ_F_BUFFER_RING;
++	return ret;
+ }
+ 
+ static inline void __io_put_kbuf_list(struct io_kiocb *req, int len,
+@@ -176,10 +200,12 @@ static inline unsigned int __io_put_kbuf
+ 		return 0;
+ 
+ 	ret = IORING_CQE_F_BUFFER | (req->buf_index << IORING_CQE_BUFFER_SHIFT);
+-	if (req->flags & REQ_F_BUFFER_RING)
+-		__io_put_kbuf_ring(req, len, nbufs);
+-	else
++	if (req->flags & REQ_F_BUFFER_RING) {
++		if (!__io_put_kbuf_ring(req, len, nbufs))
++			ret |= IORING_CQE_F_BUF_MORE;
++	} else {
+ 		__io_put_kbuf(req, len, issue_flags);
++	}
+ 	return ret;
+ }
+ 
