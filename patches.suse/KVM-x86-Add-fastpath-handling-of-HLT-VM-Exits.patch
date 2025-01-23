@@ -1,0 +1,131 @@
+Patch-mainline: v6.12-rc1
+Git-commit: 1876dd69dfe8c29e249070b0e4dc941fc15ac1e4
+References: jsc#PED-348
+From: Sean Christopherson <seanjc@google.com>
+Date: Fri, 2 Aug 2024 12:51:20 -0700
+Subject: [PATCH] KVM: x86: Add fastpath handling of HLT VM-Exits
+
+Add a fastpath for HLT VM-Exits by immediately re-entering the guest if
+it has a pending wake event.  When virtual interrupt delivery is enabled,
+i.e. when KVM doesn't need to manually inject interrupts, this allows KVM
+to stay in the fastpath run loop when a vIRQ arrives between the guest
+doing CLI and STI;HLT.  Without AMD's Idle HLT-intercept support, the CPU
+generates a HLT VM-Exit even though KVM will immediately resume the guest.
+
+Note, on bare metal, it's relatively uncommon for a modern guest kernel to
+actually trigger this scenario, as the window between the guest checking
+for a wake event and committing to HLT is quite small.  But in a nested
+environment, the timings change significantly, e.g. rudimentary testing
+showed that ~50% of HLT exits where HLT-polling was successful would be
+serviced by this fastpath, i.e. ~50% of the time that a nested vCPU gets
+a wake event before KVM schedules out the vCPU, the wake event was pending
+even before the VM-Exit.
+
+Link: https://lore.kernel.org/all/20240528041926.3989-3-manali.shukla@amd.com
+Link: https://lore.kernel.org/r/20240802195120.325560-6-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/kvm/svm/svm.c | 13 +++++++++++--
+ arch/x86/kvm/vmx/vmx.c |  2 ++
+ arch/x86/kvm/x86.c     | 23 ++++++++++++++++++++++-
+ arch/x86/kvm/x86.h     |  1 +
+ 4 files changed, 36 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index eb3de01602b9..eb64976590fb 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -4147,12 +4147,21 @@ static int svm_vcpu_pre_run(struct kvm_vcpu *vcpu)
+ 
+ static fastpath_t svm_exit_handlers_fastpath(struct kvm_vcpu *vcpu)
+ {
++	struct vcpu_svm *svm = to_svm(vcpu);
++
+ 	if (is_guest_mode(vcpu))
+ 		return EXIT_FASTPATH_NONE;
+ 
+-	if (to_svm(vcpu)->vmcb->control.exit_code == SVM_EXIT_MSR &&
+-	    to_svm(vcpu)->vmcb->control.exit_info_1)
++	switch (svm->vmcb->control.exit_code) {
++	case SVM_EXIT_MSR:
++		if (!svm->vmcb->control.exit_info_1)
++			break;
+ 		return handle_fastpath_set_msr_irqoff(vcpu);
++	case SVM_EXIT_HLT:
++		return handle_fastpath_hlt(vcpu);
++	default:
++		break;
++	}
+ 
+ 	return EXIT_FASTPATH_NONE;
+ }
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index cf85f8d50ccb..9cac0ffb8553 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -7265,6 +7265,8 @@ static fastpath_t vmx_exit_handlers_fastpath(struct kvm_vcpu *vcpu,
+ 		return handle_fastpath_set_msr_irqoff(vcpu);
+ 	case EXIT_REASON_PREEMPTION_TIMER:
+ 		return handle_fastpath_preemption_timer(vcpu, force_immediate_exit);
++	case EXIT_REASON_HLT:
++		return handle_fastpath_hlt(vcpu);
+ 	default:
+ 		return EXIT_FASTPATH_NONE;
+ 	}
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index c15eb8e7d3c3..fa455a60b557 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -11363,7 +11363,10 @@ static int __kvm_emulate_halt(struct kvm_vcpu *vcpu, int state, int reason)
+ 	 */
+ 	++vcpu->stat.halt_exits;
+ 	if (lapic_in_kernel(vcpu)) {
+-		vcpu->arch.mp_state = state;
++		if (kvm_vcpu_has_events(vcpu))
++			vcpu->arch.pv.pv_unhalted = false;
++		else
++			vcpu->arch.mp_state = state;
+ 		return 1;
+ 	} else {
+ 		vcpu->run->exit_reason = reason;
+@@ -11388,6 +11391,24 @@ int kvm_emulate_halt(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(kvm_emulate_halt);
+ 
++fastpath_t handle_fastpath_hlt(struct kvm_vcpu *vcpu)
++{
++	int ret;
++
++	kvm_vcpu_srcu_read_lock(vcpu);
++	ret = kvm_emulate_halt(vcpu);
++	kvm_vcpu_srcu_read_unlock(vcpu);
++
++	if (!ret)
++		return EXIT_FASTPATH_EXIT_USERSPACE;
++
++	if (kvm_vcpu_running(vcpu))
++		return EXIT_FASTPATH_REENTER_GUEST;
++
++	return EXIT_FASTPATH_EXIT_HANDLED;
++}
++EXPORT_SYMBOL_GPL(handle_fastpath_hlt);
++
+ int kvm_emulate_ap_reset_hold(struct kvm_vcpu *vcpu)
+ {
+ 	int ret = kvm_skip_emulated_instruction(vcpu);
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index f47b9905ba78..516eb9e28752 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -334,6 +334,7 @@ int x86_decode_emulated_instruction(struct kvm_vcpu *vcpu, int emulation_type,
+ int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+ 			    int emulation_type, void *insn, int insn_len);
+ fastpath_t handle_fastpath_set_msr_irqoff(struct kvm_vcpu *vcpu);
++fastpath_t handle_fastpath_hlt(struct kvm_vcpu *vcpu);
+ 
+ extern struct kvm_caps kvm_caps;
+ extern struct kvm_host_values kvm_host;
+-- 
+2.43.0
+

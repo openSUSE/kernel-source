@@ -1,0 +1,157 @@
+Patch-mainline: v6.12-rc1
+Git-commit: 01dd4d319207c4cfd51a1c9a1812909e944d8c86
+References: jsc#PED-348
+From: Sean Christopherson <seanjc@google.com>
+Date: Fri, 30 Aug 2024 17:15:23 -0700
+Subject: [PATCH] KVM: x86/mmu: Apply retry protection to "fast nTDP unprotect"
+ path
+
+Move the anti-infinite-loop protection provided by last_retry_{eip,addr}
+into kvm_mmu_write_protect_fault() so that it guards unprotect+retry that
+never hits the emulator, as well as reexecute_instruction(), which is the
+last ditch "might as well try it" logic that kicks in when emulation fails
+on an instruction that faulted on a write-protected gfn.
+
+Add a new helper, kvm_mmu_unprotect_gfn_and_retry(), to set the retry
+fields and deduplicate other code (with more to come).
+
+Link: https://lore.kernel.org/r/20240831001538.336683-9-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |  1 +
+ arch/x86/kvm/mmu/mmu.c          | 39 ++++++++++++++++++++++++++++++++-
+ arch/x86/kvm/x86.c              | 27 +----------------------
+ 3 files changed, 40 insertions(+), 27 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 797433994d56..fd115feb49b3 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -2133,6 +2133,7 @@ int kvm_get_nr_pending_nmis(struct kvm_vcpu *vcpu);
+ void kvm_update_dr7(struct kvm_vcpu *vcpu);
+ 
+ int kvm_mmu_unprotect_page(struct kvm *kvm, gfn_t gfn);
++bool kvm_mmu_unprotect_gfn_and_retry(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa);
+ void kvm_mmu_free_roots(struct kvm *kvm, struct kvm_mmu *mmu,
+ 			ulong roots_to_free);
+ void kvm_mmu_free_guest_mode_roots(struct kvm *kvm, struct kvm_mmu *mmu);
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index edca32a4e874..e992da21f4e5 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -2713,6 +2713,22 @@ int kvm_mmu_unprotect_page(struct kvm *kvm, gfn_t gfn)
+ 	return r;
+ }
+ 
++bool kvm_mmu_unprotect_gfn_and_retry(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa)
++{
++	gpa_t gpa = cr2_or_gpa;
++	bool r;
++
++	if (!vcpu->arch.mmu->root_role.direct)
++		gpa = kvm_mmu_gva_to_gpa_write(vcpu, cr2_or_gpa, NULL);
++
++	r = kvm_mmu_unprotect_page(vcpu->kvm, gpa_to_gfn(gpa));
++	if (r) {
++		vcpu->arch.last_retry_eip = kvm_rip_read(vcpu);
++		vcpu->arch.last_retry_addr = cr2_or_gpa;
++	}
++	return r;
++}
++
+ static int kvm_mmu_unprotect_page_virt(struct kvm_vcpu *vcpu, gva_t gva)
+ {
+ 	gpa_t gpa;
+@@ -5956,6 +5972,27 @@ static int kvm_mmu_write_protect_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+ {
+ 	bool direct = vcpu->arch.mmu->root_role.direct;
+ 
++	/*
++	 * Do not try to unprotect and retry if the vCPU re-faulted on the same
++	 * RIP with the same address that was previously unprotected, as doing
++	 * so will likely put the vCPU into an infinite.  E.g. if the vCPU uses
++	 * a non-page-table modifying instruction on the PDE that points to the
++	 * instruction, then unprotecting the gfn will unmap the instruction's
++	 * code, i.e. make it impossible for the instruction to ever complete.
++	 */
++	if (vcpu->arch.last_retry_eip == kvm_rip_read(vcpu) &&
++	    vcpu->arch.last_retry_addr == cr2_or_gpa)
++		return RET_PF_EMULATE;
++
++	/*
++	 * Reset the unprotect+retry values that guard against infinite loops.
++	 * The values will be refreshed if KVM explicitly unprotects a gfn and
++	 * retries, in all other cases it's safe to retry in the future even if
++	 * the next page fault happens on the same RIP+address.
++	 */
++	vcpu->arch.last_retry_eip = 0;
++	vcpu->arch.last_retry_addr = 0;
++
+ 	/*
+ 	 * Before emulating the instruction, check to see if the access was due
+ 	 * to a read-only violation while the CPU was walking non-nested NPT
+@@ -5986,7 +6023,7 @@ static int kvm_mmu_write_protect_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+ 	 * format) with L2's page tables (EPT format).
+ 	 */
+ 	if (direct && is_write_to_guest_page_table(error_code) &&
+-	    kvm_mmu_unprotect_page(vcpu->kvm, gpa_to_gfn(cr2_or_gpa)))
++	    kvm_mmu_unprotect_gfn_and_retry(vcpu, cr2_or_gpa))
+ 		return RET_PF_RETRY;
+ 
+ 	/*
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index d26e107225f7..ce075e07126b 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -8932,27 +8932,13 @@ static bool retry_instruction(struct x86_emulate_ctxt *ctxt,
+ 			      gpa_t cr2_or_gpa,  int emulation_type)
+ {
+ 	struct kvm_vcpu *vcpu = emul_to_vcpu(ctxt);
+-	unsigned long last_retry_eip, last_retry_addr;
+-	gpa_t gpa = cr2_or_gpa;
+-
+-	last_retry_eip = vcpu->arch.last_retry_eip;
+-	last_retry_addr = vcpu->arch.last_retry_addr;
+ 
+ 	/*
+ 	 * If the emulation is caused by #PF and it is non-page_table
+ 	 * writing instruction, it means the VM-EXIT is caused by shadow
+ 	 * page protected, we can zap the shadow page and retry this
+ 	 * instruction directly.
+-	 *
+-	 * Note: if the guest uses a non-page-table modifying instruction
+-	 * on the PDE that points to the instruction, then we will unmap
+-	 * the instruction and go to an infinite loop. So, we cache the
+-	 * last retried eip and the last fault address, if we meet the eip
+-	 * and the address again, we can break out of the potential infinite
+-	 * loop.
+ 	 */
+-	vcpu->arch.last_retry_eip = vcpu->arch.last_retry_addr = 0;
+-
+ 	if (!(emulation_type & EMULTYPE_ALLOW_RETRY_PF))
+ 		return false;
+ 
+@@ -8963,18 +8949,7 @@ static bool retry_instruction(struct x86_emulate_ctxt *ctxt,
+ 	if (x86_page_table_writing_insn(ctxt))
+ 		return false;
+ 
+-	if (ctxt->eip == last_retry_eip && last_retry_addr == cr2_or_gpa)
+-		return false;
+-
+-	if (!vcpu->arch.mmu->root_role.direct)
+-		gpa = kvm_mmu_gva_to_gpa_write(vcpu, cr2_or_gpa, NULL);
+-
+-	if (!kvm_mmu_unprotect_page(vcpu->kvm, gpa_to_gfn(gpa)))
+-		return false;
+-
+-	vcpu->arch.last_retry_eip = kvm_rip_read(vcpu);
+-	vcpu->arch.last_retry_addr = cr2_or_gpa;
+-	return true;
++	return kvm_mmu_unprotect_gfn_and_retry(vcpu, cr2_or_gpa);
+ }
+ 
+ static int complete_emulated_mmio(struct kvm_vcpu *vcpu);
+-- 
+2.43.0
+

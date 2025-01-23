@@ -1,0 +1,147 @@
+Patch-mainline: v6.12-rc1
+Git-commit: 3f6821aa147b6e6fe07e8b35999724518b74a632
+References: jsc#PED-348
+From: Sean Christopherson <seanjc@google.com>
+Date: Fri, 6 Sep 2024 09:13:37 -0700
+Subject: [PATCH] KVM: x86: Forcibly leave nested if RSM to L2 hits shutdown
+
+Leave nested mode before synthesizing shutdown (a.k.a. TRIPLE_FAULT) if
+RSM fails when resuming L2 (a.k.a. guest mode).  Architecturally, shutdown
+on RSM occurs _before_ the transition back to guest mode on both Intel and
+AMD.
+
+On Intel, per the SDM pseudocode, SMRAM state is loaded before critical
+VMX state:
+
+  restore state normally from SMRAM;
+  ...
+  CR4.VMXE := value stored internally;
+  IF internal storage indicates that the logical processor had been in
+     VMX operation (root or non-root)
+  THEN
+     enter VMX operation (root or non-root);
+     restore VMX-critical state as defined in Section 32.14.1;
+     ...
+     restore current VMCS pointer;
+  FI;
+
+AMD's APM is both less clearcut and more explicit.  Because AMD CPUs save
+VMCB and guest state in SMRAM itself, given the lack of anything in the
+APM to indicate a shutdown in guest mode is possible, a straightforward
+reading of the clause on invalid state is that _what_ state is invalid is
+irrelevant, i.e. all roads lead to shutdown.
+
+  An RSM causes a processor shutdown if an invalid-state condition is
+  found in the SMRAM state-save area.
+
+This fixes a bug found by syzkaller where synthesizing shutdown for L2
+led to a nested VM-Exit (if L1 is intercepting shutdown), which in turn
+caused KVM to complain about trying to cancel a nested VM-Enter (see
+commit 759cbd59674a ("KVM: x86: nSVM/nVMX: set nested_run_pending on VM
+entry which is a result of RSM").
+
+Note, Paolo pointed out that KVM shouldn't set nested_run_pending until
+after loading SMRAM state.  But as above, that's only half the story, KVM
+shouldn't transition to guest mode either.  Unfortunately, fixing that
+mess requires rewriting the nVMX and nSVM RSM flows to not piggyback
+their nested VM-Enter flows, as executing the nested VM-Enter flows after
+loading state from SMRAM would clobber much of said state.
+
+For now, add a FIXME to call out that transitioning to guest mode before
+loading state from SMRAM is wrong.
+
+Link: https://lore.kernel.org/all/CABgObfYaUHXyRmsmg8UjRomnpQ0Jnaog9-L2gMjsjkqChjDYUQ@mail.gmail.com
+Reported-by: syzbot+988d9efcdf137bc05f66@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/all/0000000000007a9acb06151e1670@google.com
+Reported-by: Zheyu Ma <zheyuma97@gmail.com>
+Closes: https://lore.kernel.org/all/CAMhUBjmXMYsEoVYw_M8hSZjBMHh24i88QYm-RY6HDta5YZ7Wgw@mail.gmail.com
+Analyzed-by: Michal Wilczynski <michal.wilczynski@intel.com>
+Cc: Kishen Maloor <kishen.maloor@intel.com>
+Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+Link: https://lore.kernel.org/r/20240906161337.1118412-1-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/kvm/smm.c | 24 +++++++++++++++++++-----
+ arch/x86/kvm/x86.c |  6 ------
+ arch/x86/kvm/x86.h |  6 ++++++
+ 3 files changed, 25 insertions(+), 11 deletions(-)
+
+diff --git a/arch/x86/kvm/smm.c b/arch/x86/kvm/smm.c
+index 00e3c27d2a87..85241c0c7f56 100644
+--- a/arch/x86/kvm/smm.c
++++ b/arch/x86/kvm/smm.c
+@@ -624,17 +624,31 @@ int emulator_leave_smm(struct x86_emulate_ctxt *ctxt)
+ #endif
+ 
+ 	/*
+-	 * Give leave_smm() a chance to make ISA-specific changes to the vCPU
+-	 * state (e.g. enter guest mode) before loading state from the SMM
+-	 * state-save area.
++	 * FIXME: When resuming L2 (a.k.a. guest mode), the transition to guest
++	 * mode should happen _after_ loading state from SMRAM.  However, KVM
++	 * piggybacks the nested VM-Enter flows (which is wrong for many other
++	 * reasons), and so nSVM/nVMX would clobber state that is loaded from
++	 * SMRAM and from the VMCS/VMCB.
+ 	 */
+ 	if (kvm_x86_call(leave_smm)(vcpu, &smram))
+ 		return X86EMUL_UNHANDLEABLE;
+ 
+ #ifdef CONFIG_X86_64
+ 	if (guest_cpuid_has(vcpu, X86_FEATURE_LM))
+-		return rsm_load_state_64(ctxt, &smram.smram64);
++		ret = rsm_load_state_64(ctxt, &smram.smram64);
+ 	else
+ #endif
+-		return rsm_load_state_32(ctxt, &smram.smram32);
++		ret = rsm_load_state_32(ctxt, &smram.smram32);
++
++	/*
++	 * If RSM fails and triggers shutdown, architecturally the shutdown
++	 * occurs *before* the transition to guest mode.  But due to KVM's
++	 * flawed handling of RSM to L2 (see above), the vCPU may already be
++	 * in_guest_mode().  Force the vCPU out of guest mode before delivering
++	 * the shutdown, so that L1 enters shutdown instead of seeing a VM-Exit
++	 * that architecturally shouldn't be possible.
++	 */
++	if (ret != X86EMUL_CONTINUE && is_guest_mode(vcpu))
++		kvm_leave_nested(vcpu);
++	return ret;
+ }
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index fa455a60b557..92fade53c79f 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -833,12 +833,6 @@ static void kvm_queue_exception_vmexit(struct kvm_vcpu *vcpu, unsigned int vecto
+ 	ex->payload = payload;
+ }
+ 
+-/* Forcibly leave the nested mode in cases like a vCPU reset */
+-static void kvm_leave_nested(struct kvm_vcpu *vcpu)
+-{
+-	kvm_x86_ops.nested_ops->leave_nested(vcpu);
+-}
+-
+ static void kvm_multiple_exception(struct kvm_vcpu *vcpu,
+ 		unsigned nr, bool has_error, u32 error_code,
+ 	        bool has_payload, unsigned long payload, bool reinject)
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index 516eb9e28752..121f5c19613e 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -108,6 +108,12 @@ static inline unsigned int __shrink_ple_window(unsigned int val,
+ void kvm_service_local_tlb_flush_requests(struct kvm_vcpu *vcpu);
+ int kvm_check_nested_events(struct kvm_vcpu *vcpu);
+ 
++/* Forcibly leave the nested mode in cases like a vCPU reset */
++static inline void kvm_leave_nested(struct kvm_vcpu *vcpu)
++{
++	kvm_x86_ops.nested_ops->leave_nested(vcpu);
++}
++
+ static inline bool kvm_vcpu_has_run(struct kvm_vcpu *vcpu)
+ {
+ 	return vcpu->arch.last_vmentry_cpu != -1;
+-- 
+2.43.0
+
