@@ -327,8 +327,7 @@ Related information
 
 Internal:
 
-* <https://wiki.suse.net/index.php/SUSE-Labs_Publications/Kernel_Building>,
-* <https://wiki.suse.net/index.php/SUSE-Labs_Publications/kernel_patches_rules>.
+* <https://confluence.suse.com/display/labs/Kernel>.
 
 Public:
 
