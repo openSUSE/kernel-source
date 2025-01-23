@@ -1,0 +1,138 @@
+From ac5f71a3d9d7eb540f6bf7e794eb4a3e4c3f11dd Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 19 Feb 2024 10:46:44 -0700
+Subject: [PATCH] io_uring/net: add provided buffer support for IORING_OP_SEND
+Git-commit: ac5f71a3d9d7eb540f6bf7e794eb4a3e4c3f11dd
+Patch-mainline: v6.10-rc1
+References: bsc#1230569 jsc#PED-11603
+
+It's pretty trivial to wire up provided buffer support for the send
+side, just like how it's done the receive side. This enables setting up
+a buffer ring that an application can use to push pending sends to,
+and then have a send pick a buffer from that ring.
+
+One of the challenges with async IO and networking sends is that you
+can get into reordering conditions if you have more than one inflight
+at the same time. Consider the following scenario where everything is
+fine:
+
+1) App queues sendA for socket1
+2) App queues sendB for socket1
+3) App does io_uring_submit()
+4) sendA is issued, completes successfully, posts CQE
+5) sendB is issued, completes successfully, posts CQE
+
+All is fine. Requests are always issued in-order, and both complete
+inline as most sends do.
+
+However, if we're flooding socket1 with sends, the following could
+also result from the same sequence:
+
+1) App queues sendA for socket1
+2) App queues sendB for socket1
+3) App does io_uring_submit()
+4) sendA is issued, socket1 is full, poll is armed for retry
+5) Space frees up in socket1, this triggers sendA retry via task_work
+6) sendB is issued, completes successfully, posts CQE
+7) sendA is retried, completes successfully, posts CQE
+
+Now we've sent sendB before sendA, which can make things unhappy. If
+both sendA and sendB had been using provided buffers, then it would look
+as follows instead:
+
+1) App queues dataA for sendA, queues sendA for socket1
+2) App queues dataB for sendB queues sendB for socket1
+3) App does io_uring_submit()
+4) sendA is issued, socket1 is full, poll is armed for retry
+5) Space frees up in socket1, this triggers sendA retry via task_work
+6) sendB is issued, picks first buffer (dataA), completes successfully,
+   posts CQE (which says "I sent dataA")
+7) sendA is retried, picks first buffer (dataB), completes successfully,
+   posts CQE (which says "I sent dataB")
+
+Now we've sent the data in order, and everybody is happy.
+
+It's worth noting that this also opens the door for supporting multishot
+sends, as provided buffers would be a prerequisite for that. Those can
+trigger either when new buffers are added to the outgoing ring, or (if
+stalled due to lack of space) when space frees up in the socket.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ io_uring/net.c   | 25 ++++++++++++++++++++-----
+ io_uring/opdef.c |  1 +
+ 2 files changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/io_uring/net.c b/io_uring/net.c
+index dc310f0bfe4c..13685d133582 100644
+--- a/io_uring/net.c
++++ b/io_uring/net.c
+@@ -364,10 +364,12 @@ static int io_send_setup(struct io_kiocb *req)
+ 		kmsg->msg.msg_name = &kmsg->addr;
+ 		kmsg->msg.msg_namelen = sr->addr_len;
+ 	}
+-	ret = import_ubuf(ITER_SOURCE, sr->buf, sr->len, &kmsg->msg.msg_iter);
+-	if (unlikely(ret < 0))
+-		return ret;
+-
++	if (!io_do_buffer_select(req)) {
++		ret = import_ubuf(ITER_SOURCE, sr->buf, sr->len,
++				  &kmsg->msg.msg_iter);
++		if (unlikely(ret < 0))
++			return ret;
++	}
+ 	return 0;
+ }
+ 
+@@ -480,6 +482,7 @@ int io_send(struct io_kiocb *req, unsigned int issue_flags)
+ 	struct io_sr_msg *sr = io_kiocb_to_cmd(req, struct io_sr_msg);
+ 	struct io_async_msghdr *kmsg = req->async_data;
+ 	struct socket *sock;
++	unsigned int cflags;
+ 	unsigned flags;
+ 	int min_ret = 0;
+ 	int ret;
+@@ -492,6 +495,17 @@ int io_send(struct io_kiocb *req, unsigned int issue_flags)
+ 	    (sr->flags & IORING_RECVSEND_POLL_FIRST))
+ 		return -EAGAIN;
+ 
++	if (io_do_buffer_select(req)) {
++		size_t len = sr->len;
++		void __user *buf;
++
++		buf = io_buffer_select(req, &len, issue_flags);
++		if (unlikely(!buf))
++			return -ENOBUFS;
++		sr->buf = buf;
++		sr->len = len;
++	}
++
+ 	flags = sr->msg_flags;
+ 	if (issue_flags & IO_URING_F_NONBLOCK)
+ 		flags |= MSG_DONTWAIT;
+@@ -521,7 +535,8 @@ int io_send(struct io_kiocb *req, unsigned int issue_flags)
+ 	else if (sr->done_io)
+ 		ret = sr->done_io;
+ 	io_req_msg_cleanup(req, issue_flags);
+-	io_req_set_res(req, ret, 0);
++	cflags = io_put_kbuf(req, issue_flags);
++	io_req_set_res(req, ret, cflags);
+ 	return IOU_OK;
+ }
+ 
+diff --git a/io_uring/opdef.c b/io_uring/opdef.c
+index a16f73938ebb..2de5cca9504e 100644
+--- a/io_uring/opdef.c
++++ b/io_uring/opdef.c
+@@ -281,6 +281,7 @@ const struct io_issue_def io_issue_defs[] = {
+ 		.pollout		= 1,
+ 		.audit_skip		= 1,
+ 		.ioprio			= 1,
++		.buffer_select		= 1,
+ #if defined(CONFIG_NET)
+ 		.async_size		= sizeof(struct io_async_msghdr),
+ 		.prep			= io_sendmsg_prep,
+-- 
+2.47.0
+

@@ -1,0 +1,138 @@
+From 50cf5f3842af3135b88b041890e7e12a74425fcb Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Thu, 6 Jun 2024 12:25:01 -0600
+Subject: [PATCH] io_uring/msg_ring: add an alloc cache for io_kiocb entries
+Git-commit: 50cf5f3842af3135b88b041890e7e12a74425fcb
+Patch-mainline: v6.11-rc1
+References: bsc#1230569
+
+With slab accounting, allocating and freeing memory has considerable
+overhead. Add a basic alloc cache for the io_kiocb allocations that
+msg_ring needs to do. Unlike other caches, this one is used by the
+sender, grabbing it from the remote ring. When the remote ring gets
+the posted completion, it'll free it locally. Hence it is separately
+locked, using ctx->msg_lock.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ include/linux/io_uring_types.h |    3 +++
+ io_uring/io_uring.c            |    7 ++++++-
+ io_uring/msg_ring.c            |   31 +++++++++++++++++++++++++++++--
+ io_uring/msg_ring.h            |    1 +
+ 4 files changed, 39 insertions(+), 3 deletions(-)
+
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -390,6 +390,9 @@ struct io_ring_ctx {
+ 	struct callback_head		poll_wq_task_work;
+ 	struct list_head		defer_list;
+ 
++	struct io_alloc_cache		msg_cache;
++	spinlock_t			msg_lock;
++
+ #ifdef CONFIG_NET_RX_BUSY_POLL
+ 	struct list_head	napi_list;	/* track busy poll napi_id */
+ 	spinlock_t		napi_lock;	/* napi_list lock */
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -94,6 +94,7 @@
+ #include "waitid.h"
+ #include "napi.h"
+ #include "uring_cmd.h"
++#include "msg_ring.h"
+ #include "memmap.h"
+ 
+ #include "timeout.h"
+@@ -320,7 +321,10 @@ static __cold struct io_ring_ctx *io_rin
+ 	ret |= io_alloc_cache_init(&ctx->rw_cache, IO_ALLOC_CACHE_MAX,
+ 			    sizeof(struct io_async_rw));
+ 	ret |= io_alloc_cache_init(&ctx->uring_cache, IO_ALLOC_CACHE_MAX,
+-			   sizeof(struct uring_cache));
++				   sizeof(struct uring_cache));
++	spin_lock_init(&ctx->msg_lock);
++	ret |= io_alloc_cache_init(&ctx->msg_cache, IO_ALLOC_CACHE_MAX,
++				   sizeof(struct io_kiocb));
+ 	if (ret)
+ 		goto err;
+ 	init_completion(&ctx->ref_comp);
+@@ -2600,6 +2604,7 @@ static __cold void io_ring_ctx_free(stru
+ 	io_alloc_cache_free(&ctx->netmsg_cache, io_netmsg_cache_free);
+ 	io_alloc_cache_free(&ctx->rw_cache, io_rw_cache_free);
+ 	io_alloc_cache_free(&ctx->uring_cache, kfree);
++	io_alloc_cache_free(&ctx->msg_cache, io_msg_cache_free);
+ 	io_destroy_buffers(ctx);
+ 	mutex_unlock(&ctx->uring_lock);
+ 	if (ctx->sq_creds)
+--- a/io_uring/msg_ring.c
++++ b/io_uring/msg_ring.c
+@@ -11,6 +11,7 @@
+ #include "io_uring.h"
+ #include "rsrc.h"
+ #include "filetable.h"
++#include "alloc_cache.h"
+ #include "msg_ring.h"
+ 
+ /* All valid masks for MSG_RING */
+@@ -75,7 +76,13 @@ static void io_msg_tw_complete(struct io
+ 	struct io_ring_ctx *ctx = req->ctx;
+ 
+ 	io_add_aux_cqe(ctx, req->cqe.user_data, req->cqe.res, req->cqe.flags);
+-	kmem_cache_free(req_cachep, req);
++	if (spin_trylock(&ctx->msg_lock)) {
++		if (io_alloc_cache_put(&ctx->msg_cache, req))
++			req = NULL;
++		spin_unlock(&ctx->msg_lock);
++	}
++	if (req)
++		kfree(req);
+ 	percpu_ref_put(&ctx->refs);
+ }
+ 
+@@ -91,6 +98,19 @@ static void io_msg_remote_post(struct io
+ 	io_req_task_work_add_remote(req, ctx, IOU_F_TWQ_LAZY_WAKE);
+ }
+ 
++static struct io_kiocb *io_msg_get_kiocb(struct io_ring_ctx *ctx)
++{
++	struct io_kiocb *req = NULL;
++
++	if (spin_trylock(&ctx->msg_lock)) {
++		req = io_alloc_cache_get(&ctx->msg_cache);
++		spin_unlock(&ctx->msg_lock);
++	}
++	if (req)
++		return req;
++	return kmem_cache_alloc(req_cachep, GFP_KERNEL | __GFP_NOWARN);
++}
++
+ static int io_msg_data_remote(struct io_kiocb *req)
+ {
+ 	struct io_ring_ctx *target_ctx = req->file->private_data;
+@@ -98,7 +118,7 @@ static int io_msg_data_remote(struct io_
+ 	struct io_kiocb *target;
+ 	u32 flags = 0;
+ 
+-	target = kmem_cache_alloc(req_cachep, GFP_KERNEL);
++	target = io_msg_get_kiocb(req->ctx);
+ 	if (unlikely(!target))
+ 		return -ENOMEM;
+ 
+@@ -296,3 +316,10 @@ done:
+ 	io_req_set_res(req, ret, 0);
+ 	return IOU_OK;
+ }
++
++void io_msg_cache_free(const void *entry)
++{
++	struct io_kiocb *req = (struct io_kiocb *) entry;
++
++	kmem_cache_free(req_cachep, req);
++}
+--- a/io_uring/msg_ring.h
++++ b/io_uring/msg_ring.h
+@@ -3,3 +3,4 @@
+ int io_msg_ring_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe);
+ int io_msg_ring(struct io_kiocb *req, unsigned int issue_flags);
+ void io_msg_ring_cleanup(struct io_kiocb *req);
++void io_msg_cache_free(const void *entry);
