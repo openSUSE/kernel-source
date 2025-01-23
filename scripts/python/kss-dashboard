@@ -1,17 +1,19 @@
 #!/usr/bin/python3
-import sys, re, os, argparse, datetime
-import bugzilla
-from bugzilla._cli import DEFAULT_BZ
+import sys, re, os, argparse, datetime, bugzilla, subprocess, multiprocessing
 import git_sort.pygit2_wrapper as git
+from bugzilla.utils import get_bugzilla_api, check_being_logged_in, format_time, get_backport_string, make_url
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # dashboard kss script - work in progress
 
 CVE_PATTERN = re.compile(r"CVE-[0-9]{4}-[0-9]{4,}")
 CVSS_PATTERN = re.compile(r"CVSSv3.1:SUSE:CVE-[0-9]{4}-[0-9]{4,}:([0-9].[0-9])")
 VECTOR_PATTERN = re.compile(r"CVSSv3.1:SUSE:CVE-[0-9]{4}-[0-9]{4,}:[0-9]{1,}.[0-9]:\(AV:(.)\/AC:(.)\/PR:(.)\/UI:(.)\/S:(.)\/C:(.)\/I:(.)\/A:(.)\)")
+ZDI_PATTERN = re.compile(r"ZDI-[0-9]{2}-[0-9]{3,}")
 FIXES_PATTERN = re.compile(r"Fixes: ([0-9a-f]{12,})")
 PATCH_PATTERN = re.compile(r"\+\+\+ b/([^ ]{1,})\n")
 COMMENT_BANLIST = [ 'swamp@suse.de', 'bwiedemann+obsbugzillabot@suse.com', 'maint-coord+maintenance-robot@suse.de', 'smash_bz@suse.de' ]
+GIT_ROOT = '1da177e4c3f41524e886b7f1b8a0c1fc7321cac2'
 
 T_RED = "\033[01;31m"
 T_GREEN = "\033[01;32m"
@@ -22,6 +24,24 @@ T_END = "\033[0m"
 show_colors = os.isatty(sys.stdout.fileno())
 today = datetime.date.today()
 
+def color_format(color, msg):
+    if show_colors and msg:
+        return "{}{}{}".format(color, msg, T_END)
+    return msg
+
+class ExitOnException:
+    def __init__(self, msg):
+        self.msg = msg
+
+    def __call__(self, f):
+        def wrapper(*args, **kwargs):
+            try:
+                return f(*args, **kwargs)
+            except Exception as e:
+                print(f'{color_format(T_RED, "failed to " + self.msg)}: {e}', file=sys.stderr)
+                sys.exit(1)
+        return wrapper
+
 def check_envvar(var):
     result = os.environ.get(var)
     if not result:
@@ -30,20 +50,12 @@ def check_envvar(var):
         sys.exit(1)
     return result
 
-def check_being_logged_in(bzapi):
-    if not bzapi.logged_in:
-        print("You are not logged in the bugzilla!\n\nGo to https://bugzilla.suse.com/, log in via web interace with your credentials.\n"\
-              "Then go to Preferences, click on the tab API KEYS and generate a new api key\nif you don't have one already.  Then store "\
-              "the api_key in a file ~/.bugzillarc\nin the following format...\n\n# ~/.bugzillarc\n[apibugzilla.suse.com]\napi_key = YOUR_API_KEY")
-        sys.exit(1)
+def make_zdi_url(zdi_id):
+    return f'https://www.zerodayinitiative.com/advisories/{zdi_id}/'
 
-def format_time(t):
-    return datetime.datetime.strptime(str(t), '%Y%m%dT%H:%M:%S')
-
-def color_format(color, msg):
-    if show_colors and msg:
-        return "{}{}{}".format(color, msg, T_END)
-    return msg
+def get_zdi(s):
+    m = re.search(ZDI_PATTERN, s)
+    return m.group(0) if m else ''
 
 def get_cve(s):
     m = re.search(CVE_PATTERN, s)
@@ -61,21 +73,21 @@ def fetch_cves():
              { get_cve(t.path): repo[t.id].data.decode('ascii').rstrip() for t in tree_index if t.path.startswith('cve/rejected/') and t.path.endswith('.sha1') } )
 
 def show_patch(p, h):
-    print('--- Begin {} ---'.format(h))
+    yield f'--- Begin {h} ---\n'
     for l in p.splitlines():
         if l.startswith('-'):
-            print(color_format(T_RED, l))
+            yield color_format(T_RED, l) + '\n'
         elif l.startswith('+'):
-            print(color_format(T_GREEN, l))
+            yield color_format(T_GREEN, l) + '\n'
         else:
-            print(l)
-    print('--- End {} ---'.format(h))
+            yield l + '\n'
+    yield f'--- End {h} ---\n'
 
 def show_stats(linux_git, h):
-    print("     changes:", color_format(T_PURPLE, "{:>4}".format(linux_git.pstats[h]['added'] + linux_git.pstats[h]['removed'])), "   (",
-          color_format(T_GREEN, "{:>4}".format("{0:+}".format(linux_git.pstats[h]['added']))), ",",
-          color_format(T_RED, "{:>4}".format("{0:+}".format(-linux_git.pstats[h]['removed']))),
-          ")    files: {}".format(linux_git.pstats[h]['files']))
+    changes = color_format(T_PURPLE, f'{linux_git.pstats[h]["added"] + linux_git.pstats[h]["removed"]:>4}')
+    added = color_format(T_GREEN, '{:>4}'.format(f'{linux_git.pstats[h]["added"]:+}'))
+    removed = color_format(T_RED, '{:>4}'.format(f'{-linux_git.pstats[h]["removed"]:+}'))
+    yield f'     changes: {changes}    ( {added} , {removed} )    files: {linux_git.pstats[h]["files"]}\n'
 
 class ScoreVector:
     def __init__(self, vector):
@@ -143,6 +155,7 @@ class BugData:
         self.is_rejected = False
         self.data = bug
         self.cve = get_cve(self.data.summary)
+        self.zdi = get_zdi(self.data.summary)
         self.sha = published.get(self.cve, '')
         if not self.sha:
             self.sha = rejected.get(self.cve, '')
@@ -155,8 +168,11 @@ class BugData:
         self.paths = None
         self.vector = None
         self.comments = []
+        self.smash_comments = []
         self.matched_comments = []
         self.changes = 0
+        self.history = None
+        self.embargoed = 'EMBARGOED' in self.data.summary
 
     def grep_paths(self, regex, linux_git):
         if not self.sha:
@@ -180,8 +196,52 @@ class BugData:
     def store_comments(self, raw_comments):
         self.comments = [ { 'no': rc['count'], 'time': format_time(rc['time']), 'text': rc['text'], 'author': rc['creator'] } for rc in raw_comments
                           if rc['creator'] not in COMMENT_BANLIST ]
+        self.smash_comments = [ { 'no': rc['count'], 'time': format_time(rc['time']), 'text': rc['text'], 'author': rc['creator'] } for rc in raw_comments
+                          if rc['creator'] == 'smash_bz@suse.de' ]
         self.mtime = self.comments[-1]['time'] if self.comments else self.btime;
         return self
+
+    def __show_comment_header(self, no, time, author):
+        yield f'     [{no:>3}] at {time} by <{author + ">":<51} https://bugzilla.suse.com/show_bug.cgi?id={self.data.id}#c{no}\n'
+
+    def show_last_comment_header(self):
+        if self.comments:
+            yield from self.__show_comment_header(self.comments[-1]['no'], self.comments[-1]['time'], self.comments[-1]['author'])
+        else:
+            yield color_format(T_RED, "     no comment\n")
+
+    def show_comments_short(self):
+        for c in sorted(self.comments, key=lambda x: x['no']):
+            yield from self.__show_comment_header(c["no"], c["time"], c["author"])
+
+    def __show_comments(self, comments):
+        for c in sorted(comments, key=lambda x: x['no']):
+            yield f'--- At {color_format(T_PURPLE, c["time"])} comment {color_format(T_GREEN, "#{}".format(c["no"]))} by <{color_format(T_YELLOW, c["author"])}> ---\n{c["text"]}\n\n---'\
+                  f'Bugzilla url https://bugzilla.suse.com/show_bug.cgi?id={self.data.id}#c{c["no"]} ---\n\n\n'
+
+    def show_comments_long(self):
+        yield from self.__show_comments(self.comments)
+
+    def show_comments_smash(self):
+        yield from self.__show_comments(self.smash_comments)
+
+    def show_history(self):
+        space_outer = '\n' + ' ' * 62
+        space_inner = space_outer + ' ' * 25
+        for h in sorted(self.history, key=lambda x: x['when']):
+            fra = (space_outer).join(
+                [ f"{color_format(T_PURPLE, ch['field_name']):<{36 if show_colors else 24}} {color_format(T_RED, '- ' + ch['removed'])}{space_inner}{color_format(T_GREEN, '+ ' + ch['added'])}"
+                  for ch in h['changes'] ])
+            yield '{:>{}} ; {} : {}\n'.format(color_format(T_YELLOW, h['who']), 49 if show_colors else 37,  format_time(h['when']), fra)
+
+    def store_history(self, raw_history):
+        self.history = raw_history
+
+    def already_dispatched(self):
+        for c in self.comments:
+            if 'ACTION NEEDED' in c['text'] or 'NO CODESTREAM AFFECTED' in c['text'] or 'No codestream affected' in c['text']:
+                return c['no']
+        return 0
 
     def grep_comments(self, regex):
         for c in self.comments:
@@ -205,35 +265,54 @@ def banlist_emails_in_bz_query(query, emails):
         query['emailtype{}'.format(n)] = 'notequals'
 
 class BZApi:
+    @ExitOnException("connect to bugzilla")
     def __init__(self):
-        self.bzapi = bugzilla.Bugzilla(DEFAULT_BZ)
-        check_being_logged_in(self.bzapi)
+        self.bzapi = get_bugzilla_api()
+        if not check_being_logged_in(self.bzapi):
+            sys.exit(1)
 
+    @ExitOnException("fetch bug comments from bugzilla")
     def fetch_comments(self, bugs):
         bug_ids = [ b.data.id for b in bugs ]
         comments = self.bzapi.get_comments(bug_ids)
         for b in bugs:
             b.store_comments(comments['bugs'][str(b.data.id)]['comments'])
 
-    def fetch_bugs(self, email):
+    @ExitOnException("fetch bug history from bugzilla")
+    def fetch_history(self, bugs):
+        bug_pairs = { b.data.id: b for b in bugs }
+        history = self.bzapi.bugs_history_raw(list(bug_pairs.keys()))
+        for h in history['bugs']:
+            bug_pairs[h['id']].store_history(h['history'])
+
+    @ExitOnException("fetch bugs from bugzilla")
+    def fetch_bugs(self, email, bug_list = None, cve_list = None):
         kvargs = { 'status': ['NEW', 'IN_PROGRESS', 'CONFIRMED', 'REOPENED'],
                    'product': 'SUSE Security Incidents',
                    'component': 'Incidents',
-                   'include_fields': ["id", "status", "summary", "status_whiteboard", "last_change_time", "creation_time", "assigned_to"] }
-        if email:
+                   'include_fields': ["id", "status", "summary", "status_whiteboard", "last_change_time", "creation_time", "assigned_to", "url"] }
+        if bug_list:
+            kvargs['bug_id'] = bug_list
+        elif cve_list:
+            kvargs['alias'] = cve_list
+        elif email:
             kvargs['assigned_to'] = email
 
         query = self.bzapi.build_query(**kvargs)
 
         # this is unfortunate, but build_query is not powerful enough
-        if not email:
+        if email == 'security-team@suse.de':
+            query['short_desc'] = 'VUL- kernel'
+            query['short_desc_type'] = 'allwordssubstr'
+
+        if not email and not bug_list and not cve_list:
             banlist_emails_in_bz_query(query, ['cve-kpm@suse.de', 'security-team@suse.de', 'kernel-bugs@suse.de'])
             query['short_desc'] = 'VUL- kernel'
             query['short_desc_type'] = 'allwordssubstr'
 
         return self.bzapi.query(query)
 
-def show_bug(n, b, linux_git, short, files, birth, print_patch, stats):
+def show_bug(n, b, linux_git, args):
     color = T_RED
     fixes = []
     paths = []
@@ -241,39 +320,128 @@ def show_bug(n, b, linux_git, short, files, birth, print_patch, stats):
         fixes = linux_git.get_all_fixes(b.sha)
         if fixes and b.score and b.sha:
             color = T_GREEN
-        if files:
+        if args.files:
             if b.paths:
                 paths = b.paths
             else:
                 paths = linux_git.get_all_paths(b.sha)
-        if short:
+        if args.short:
             fixes = []
-    if not short:
-        print("{:>3};".format(n), end=' ')
-    print("{} ; {:<11} ; {:<14} ; {:<40}".format(b.data.id, b.data.status, color_format(T_RED, b.cve) if b.is_rejected else b.cve, color_format(color, b.sha)), end=' ')
-    print("; {:>4} ; {} ; {:>3} ; {}".format(b.score, b.btime if birth else b.mtime, b.age, color_format(T_RED, '[cve is rejected] ') + b.data.summary if b.is_rejected else b.data.summary))
-    for f in fixes:
-        print("{:>46}{}".format('', f))
-    if not short and b.data.assigned_to not in ('kernel-bugs@suse.de', 'cve-kpm@suse.de'):
-        if b.comments:
-            print("     [{no:>3}] at {time} by <{author}> (https://bugzilla.suse.com/show_bug.cgi?id={0}#c{no})".format(b.data.id, **b.comments[-1]))
-        else:
-            print(color_format(T_RED, "     no comment"))
-    if print_patch and b.sha:
-        show_patch(linux_git.get_patch(b.sha), b.sha)
+    if not args.short:
+        yield f'{n:>3}; '
+    middle = b.data.assigned_to if args.short and args.assigned_queue else color_format(color, b.sha)
+    padding_middle = 30 if args.short and args.assigned_queue else 40
+    yield "{} ; {:<11} ; {:<14} ; {:>{}}".format(b.data.id, b.data.status, color_format(T_RED, b.cve) if b.is_rejected else b.cve, middle, padding_middle)
+    yield " ; {:>4} ; {} ; {:>3} ; {}\n".format(b.score, b.btime if args.birth_time else b.mtime, b.age, color_format(T_RED, '[cve is rejected] ') + b.data.summary if b.is_rejected else b.data.summary)
+    for f in sorted(fixes):
+        yield f'{"":>46}{f}\n'
+    if not args.short and not args.comments_short and b.data.assigned_to not in ('kernel-bugs@suse.de', 'cve-kpm@suse.de'):
+        yield from b.show_last_comment_header()
+    if args.patch and b.sha:
+        yield from show_patch(linux_git.get_patch(b.sha), b.sha)
     else:
         for p in sorted(paths):
-            print("{:>46}{}".format('', color_format(T_PURPLE, p)))
-    if stats and b.sha:
+            yield f'{"":>46}{color_format(T_PURPLE, p)}\n'
+    if args.breakers and fixes:
+        for f in sorted(fixes):
+            if f == GIT_ROOT:
+                yield f'{color_format(T_RED, "Warning")}: the breaker {color_format(T_YELLOW, GIT_ROOT)} is the initial commit (Linux-2.6.12-rc2)\n'
+            else:
+                yield from show_patch(linux_git.get_patch(f), f)
+    if args.stats_info and b.sha:
         linux_git.get_patch(b.sha)
-        show_stats(linux_git, b.sha)
+        yield from show_stats(linux_git, b.sha)
     for c in b.matched_comments:
-        print(c)
+        yield c + '\n'
     if b.vector:
-        print('> ', b.vector, ' <\n')
+        yield f'> {b.vector} <\n\n'
+    if b.history:
+        yield from b.show_history()
+    if args.url and b.data.url:
+        yield f'{"":>46}{color_format(T_PURPLE, b.data.url)}\n'
+    if args.comments_short:
+        yield from b.show_comments_short()
+    elif args.comments_long:
+        yield from b.show_comments_long()
+    elif args.comments_smash:
+        yield from b.show_comments_smash()
+    if not args.short:
+        if b.embargoed:
+            yield f'{color_format(T_RED, "Warning: ")}{b.cve} is embargoed\n'
+        if b.zdi:
+            yield f'{color_format(T_RED, "Warning: ")}{make_zdi_url(b.zdi)}\n'
+        if b.is_rejected:
+            yield f'{color_format(T_RED, "Warning: ")}{b.cve} is rejected\n'
+        if b.data.assigned_to == 'kernel-bugs@suse.de':
+            c_no = b.already_dispatched()
+            if c_no:
+                yield f'{color_format(T_RED, "Warning: ")}{make_url(b.data.id)}#c{c_no} seems to have been already dispatched\n'
 
-def check_kernel_fix(b):
-    print("./scripts/check-kernel-fix -s {0} -b {1} {2} > /tmp/kss.{2}.bsc{1}".format(b.score, b.data.id, b.cve))
+def exportpatch(b):
+    yield get_backport_string([f'bsc#{b.data.id}', b.cve], b.sha, re.sub(CVE_PATTERN, '', b.data.summary.removeprefix('VUL-0: ').replace('kernel: ', ''))) + '\n'
+
+class ParallelRunner:
+    def __init__(self, blist, directory, j):
+        self.failures = [ f"# {make_url(b.data.id)} # NO CVE NUMBER" for b in blist if not b.cve ]
+        self.jobs = [ ( f"./scripts/check-kernel-fix {'-s ' + b.score if b.score else '      '} -b {b.data.id} {b.cve}"
+                        if b.data.status_whiteboard else f"./scripts/check-kernel-fix -b {b.data.id} {b.cve}",
+                        directory + os.sep + f"kss.{b.cve}.bsc{b.data.id}")
+                      for b in blist if b.cve ]
+        self.parallel = bool(j)
+        self.n_workers = j if j and j != -1 else multiprocessing.cpu_count()
+
+    def __call__(self):
+        for fail in self.failures:
+            print(fail, file=sys.stderr)
+        if not self.parallel:
+            for script, path in self.jobs:
+                yield f'{script} > {path}\n'
+            return
+        with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
+            for job in self.jobs:
+                yield color_format(T_PURPLE, f"Schedule '{job[0]} > {job[1]}' ... (with {self.n_workers} workers...)\n")
+            futures = { executor.submit(one_job, job): job for job in self.jobs }
+            for f in as_completed(futures):
+                job = futures[f]
+                yield color_format(T_YELLOW, f"$ {job[0]} > {job[1]}\n")
+                try:
+                    res = f.result()
+                    yield res.stdout
+                    if res.stderr:
+                        yield color_format(T_RED, res.stderr)
+                    yield color_format(T_PURPLE, f"Store '{job[1]}' ...\n")
+                    store_into_file(job[1], res.stdout)
+                except subprocess.CalledProcessError as e:
+                    yield color_format(T_RED, f"{job} failed\n{e}\n{e.stderr}")
+                except Exception as e:
+                    print(color_format(T_RED, f"{job} failed\n{e}"), file=sys.stderr)
+
+def one_job(job):
+    return subprocess.run(job[0], shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, universal_newlines=True)
+
+def store_into_file(path, content):
+    try:
+        with open(path, 'w') as f:
+            f.write(content)
+    except Exception as e:
+        print(color_format(T_RED, f"failed to store a file {path}: {e}"), file=sys.stderr)
+
+def handle_parallelism(njobs, ckf):
+    if not njobs:
+        return None
+    if not ckf:
+        print("--jobs (-j) doesn't make sense without --check-kernel-fix (-0)", file=sys.stderr)
+        sys.exit(1)
+    try:
+        r = int(njobs)
+        if r == -1:
+            return r
+        if r < 1:
+            raise Exception()
+        return r
+    except Exception:
+        print(njobs, "must be at least 1", file=sys.stderr)
+    sys.exit(1)
 
 def handle_grep(regex):
     if not regex:
@@ -319,15 +487,82 @@ def handle_ages(ages):
     sys.exit(1)
 
 def handle_email(email):
+    if email == '__empty-env-var__':
+        print("Please set the environment variable BUGZILLA_ACCOUNT_EMAIL to your bugzilla email or provide it after --email (-e).", file=sys.stderr)
+        sys.exit(1)
     if len(email) < 9 or "@suse." not in email:
         print("no valid bz email provided", file=sys.stderr)
         sys.exit(1)
     return email
 
+def handle_bugs(bug_string):
+    if not bug_string:
+        return None
+    ret = []
+    for b in bug_string.split(','):
+        try:
+            if b.startswith('bsc#'):
+                b = b[4:]
+            bz_number = int(b)
+            if bz_number < 1:
+                raise Exception()
+            ret.append(bz_number)
+        except:
+            print(f'{b} is not a valid bz number', file=sys.stderr)
+    if not ret:
+        sys.exit(1)
+    return ret
+
+def handle_cves(cve_string):
+    if not cve_string:
+        return None
+    ret = []
+    for c in cve_string.split(','):
+        m = re.match(CVE_PATTERN, c)
+        if not m:
+            print(f'{c} is not a valid CVE number', file=sys.stderr)
+            continue
+        ret.append(c)
+    if not ret:
+        sys.exit(1)
+    return ret
+
+def handle_score(score_string):
+    if not score_string:
+        return None
+    try:
+        ret = [ int(n) for n in score_string.split('.') ]
+        if len(ret) == 1 and ret[0] >= 0 and ret[0] <= 10:
+            ret.append(0)
+            return ret
+        elif len(ret) == 2 and ret[0] >= 0 and ret[0] <= 10 and ret[1] >= 0 and ret[1] <= 9:
+            return ret
+        raise Exception()
+    except:
+        print(f'{score_string} is not a valid CVE score', file=sys.stderr)
+        sys.exit(1)
+
+class SortActions(argparse.Action):
+    key_functions = []
+    settings = { 'changes': False, 'score': False }
+    def __call__(self, parser, namespace, values, option_string = None):
+        if option_string in ["-S", "--sort-score"]:
+            self.key_functions.append(lambda x: [ int(n) for n in x.score.split('.') ])
+            self.settings['score'] = True
+        elif option_string in ["-N", "--sort-cve"]:
+            self.key_functions.append(lambda x: [ int(n) for n in re.findall(r'\d+', x.cve) ])
+        elif option_string in ["-t", "--sort-time"]:
+            self.key_functions.append(lambda x: x.mtime)
+        elif option_string in ["-M", "--sort-changes"]:
+            self.key_functions.append(lambda x: x.changes)
+            self.settings['changes'] = True
+        elif option_string == '--sort-age':
+            self.key_functions.append(lambda x: x.age)
+
 def parse_args():
     parser = argparse.ArgumentParser(description="KSS Dashboard")
     c_group = parser.add_mutually_exclusive_group()
-    c_group.add_argument("-c", "--colors", help="show colors unconditionally (by default they show only in terminal); this is useful for piping into \"less -iR\"", action="store_true", default=False)
+    c_group.add_argument("-c", "--colors", help="show colors unconditionally (by default they show only in terminal)", action="store_true", default=False)
     c_group.add_argument("-C", "--no-colors", help="do not show colors unconditionally (by default they show only in terminal)", action="store_true", default=False)
     w_group = parser.add_mutually_exclusive_group()
     w_group.add_argument("-w", "--whiteboard", help="show only bugs with whiteboard set (thus CVSS score set)", action="store_true", default=False)
@@ -335,20 +570,37 @@ def parse_args():
     s_group = parser.add_mutually_exclusive_group()
     s_group.add_argument("-s", "--short", help="show only bug headers (one bug per line; no fixes tags)", action="store_true", default=False)
     s_group.add_argument("-p", "--patch", help="show the entire fixing patch; incompatible with --short", action="store_true", default=False)
+    s_group.add_argument("--breakers", help="show all the breaking changes; incompatible with --short or --patch", action="store_true", default=False)
     s_group.add_argument("-f", "--files", help="show paths from the patch; incompatible with --short and --grep-paths", action="store_true", default=False)
+    s_group.add_argument("-u", "--url", help="show bug url (SMASH)", action="store_true", default=False)
     s_group.add_argument("-A", "--analyze-vector", help="show all CVSSv3.1 components (https://nvd.nist.gov/vuln-metrics/cvss/v3-calculator) and nothing else", action="store_true", default=False)
-    s_group.add_argument("-0", "--check-kernel-fix", help="prints ./scripts/check-kernel-fix cli", action="store_true", default=False)
+    s_group.add_argument("-H", "--history", help="show bug histories", action="store_true", default=False)
+    s_group.add_argument("--comments-short", help="show comment links with authors and dates", action="store_true", default=False)
+    s_group.add_argument("-L", "--comments-long", help="show all human comments", action="store_true", default=False)
+    s_group.add_argument("--comments-smash", help="show comments made by SMASH", action="store_true", default=False)
+    s_group.add_argument("-0", "--check-kernel-fix", help="prints ./scripts/check-kernel-fix cli; takes an optional argument <directory>", nargs='?', type=str, default='', const='/tmp')
+    s_group.add_argument("-1", "--exportpatch", help="prints exportpatch and series_insert.py command for the backport with correct references", action="store_true", default=False)
+    parser.add_argument("--minimal-score", help="show only bugs with the score equal or above", default=None, type=str)
+    parser.add_argument("-j", "--jobs", help="runs ./scripts/check-kernel-fix in parallel; takes an optional argument <number of workers>; to be used with -0", nargs='?', type=str, default=None, const='-1')
     parser.add_argument("-i", "--stats-info", help="show patch statistics; # of changed files, # of added lines, # of removed lines", action="store_true", default=False)
     parser.add_argument("-b", "--birth-time", help="show the reported time instead of the last modification time", action="store_true", default=False)
-    parser.add_argument("-S", "--sort-score", help="sort bugs by CVSS score instead of their bug ids, implies -w (--whiteboard)", action="store_true", default=False)
-    parser.add_argument("-N", "--sort-cve", help="sort bugs by CVE number instead of their bug ids", action="store_true", default=False)
-    parser.add_argument("-t", "--sort-time", help="sort bugs by the last comment (excluding the bots)", action="store_true", default=False)
-    parser.add_argument("-M", "--sort-changes", help="sort by the number of insertion/deletion introduced by the patch", action="store_true", default=False)
+    parser.add_argument("-S", "--sort-score", help="sort bugs by CVSS score instead of their bug ids, implies -w (--whiteboard)", action=SortActions, nargs=0)
+    parser.add_argument("-N", "--sort-cve", help="sort bugs by CVE number instead of their bug ids", action=SortActions, nargs=0)
+    parser.add_argument("-t", "--sort-time", help="sort bugs by the last comment (excluding the bots)", action=SortActions, nargs=0)
+    parser.add_argument("-M", "--sort-changes", help="sort by the number of insertion/deletion introduced by the patch", action=SortActions, nargs=0)
+    parser.add_argument("--sort-age", help="sort bugs by the the age in days; useful with --ages and --birth-time", action=SortActions, nargs=0)
     parser.add_argument("-r", "--reverse", help="sort bugs in reverse order (descending)", action="store_true", default=False)
     q_group = parser.add_mutually_exclusive_group()
-    q_group.add_argument("-e", "--email", help="instead of incoming CVE queue, display CVE queue for another email; including info about the last comment for each bug", default='kernel-bugs@suse.de', type=str)
+    q_group.add_argument("-e", "--email", help="instead of incoming CVE queue, display CVE queue for another email; including info about the last comment for each bug;"\
+                         " can be also taken from the envvar $BUGZILLA_ACCOUNT_EMAIL", default='kernel-bugs@suse.de', nargs='?',
+                         const=os.environ.get('BUGZILLA_ACCOUNT_EMAIL', '__empty-env-var__'), type=str)
     q_group.add_argument("-k", "--cve-kpm", help="show CVE Kernel Patch Monkey queue", action="store_true", default=False)
     q_group.add_argument("-q", "--assigned-queue", help="show already assigned bugs", action="store_true", default=False)
+    q_group.add_argument("-d", "--done", help="show bugs already switched to the security team; BEWARE: this might take a long time to execute as the queue is quite long",
+                         action="store_true", default=False)
+    q_group.add_argument("-B", "--bugs", help="show only specific bugs; takes a comma separated list of bug numbers, they must be security incidents", default=None, type=str)
+    q_group.add_argument("-V", "--cves", help="show only specific CVE bugs; takes a comma separated list of CVE numbers", default=None, type=str)
+    parser.add_argument("-z", "--zdi", help="show only ZDI advisories", action="store_true", default=False)
     parser.add_argument("-R", "--rejected", help="show rejected CVEs if any", action="store_true", default=False)
     parser.add_argument("-g", "--grep", help="grep summary for REGEX and show only bugs that match it", default=None, type=str)
     parser.add_argument("-G", "--grep-paths", help="grep fix commit paths for REGEX and show only bugs with fix commits that match it", default=None, type=str)
@@ -356,9 +608,21 @@ def parse_args():
     parser.add_argument("-T", "--grep-comments", help="grep bugzilla comments and show only bugs that match including the matching comments (highlighted)", default=None, type=str)
     parser.add_argument("-a", "--ages", help="show only tickets of a particular age in days; X means X days old or older and X:Y means betwen X and Y days old, inclusive", default=None, type=str)
     parser.add_argument("-m", "--modulo", help="takes two integers in the format \"Q:R\" and shows only bugs with IDs that satisfy N %% Q == R", default=None, type=str)
+    parser.add_argument("-Z", "--pager", help="user pager for output (less -iR)", action="store_true", default=False)
     return parser.parse_args()
 
-if __name__ == "__main__":
+def generate_output(linux_git, bugs, args, key_functions, jobs):
+    if args.check_kernel_fix:
+        pr = ParallelRunner(sorted(bugs, key=lambda x: [ f(x) for f in key_functions], reverse=args.reverse), args.check_kernel_fix, jobs)
+        yield from pr()
+        return
+    for n, b in enumerate(sorted(bugs, key=lambda x: [ f(x) for f in key_functions], reverse=args.reverse), 1):
+        if args.exportpatch:
+            yield from exportpatch(b)
+        else:
+            yield from show_bug(n, b, linux_git, args)
+
+def main():
     args = parse_args()
     grep = handle_grep(args.grep)
     grep_paths = handle_grep(args.grep_paths)
@@ -367,15 +631,22 @@ if __name__ == "__main__":
     q, r = handle_modulo(args.modulo)
     x, y = handle_ages(args.ages)
     email = handle_email(args.email)
+    bug_list = handle_bugs(args.bugs)
+    cve_list = handle_cves(args.cves)
+    min_score = handle_score(args.minimal_score)
     if args.cve_kpm:
         email = 'cve-kpm@suse.de'
+    if args.done:
+        email = 'security-team@suse.de'
     if args.assigned_queue:
         email = None
+    jobs = handle_parallelism(args.jobs, args.check_kernel_fix)
     bzapi = BZApi()
-    bugs = bzapi.fetch_bugs(email)
+    bugs = bzapi.fetch_bugs(email, bug_list, cve_list)
     published, rejected = fetch_cves()
     linux_git = MainlineRepo()
 
+    global show_colors
     if args.colors:
         show_colors = True
     elif args.no_colors:
@@ -383,13 +654,22 @@ if __name__ == "__main__":
 
     bugs = [ BugData(b, published, rejected) for b in bugs ]
 
+    if min_score:
+        bugs = [ b for b in bugs if b.score and [ int(n) for n in b.score.split('.') ] >= min_score ]
+
     if args.rejected:
         bugs = [ b for b in bugs if b.is_rejected ]
 
-    if args.whiteboard or args.sort_score or args.check_kernel_fix:
+    if args.zdi:
+        bugs = [ b for b in bugs if b.zdi ]
+
+    if args.whiteboard or SortActions.settings['score']:
         bugs = [ b for b in bugs if b.data.status_whiteboard ]
     elif args.no_whiteboard:
         bugs = [ b for b in bugs if not b.data.status_whiteboard ]
+
+    if args.exportpatch:
+        bugs = [ b for b in bugs if b.sha and b.data.status_whiteboard ]
 
     if grep:
         bugs = [ b for b in bugs if re.search(grep, b.data.summary) ]
@@ -409,6 +689,9 @@ if __name__ == "__main__":
     if grep_comments:
         bugs = [ b for b in bugs if b.grep_comments(grep_comments) ]
 
+    if args.history:
+        bzapi.fetch_history(bugs)
+
     if x is not None and y is None:
         bugs = [ b for b in bugs if b.age >= x ]
     elif x is not None and y is not None:
@@ -418,20 +701,20 @@ if __name__ == "__main__":
         bugs = [ b.with_score_vector() for b in bugs if b.data.status_whiteboard ]
         args.short = True
 
-    if args.sort_score:
-        keyf = lambda x: float(x.score or 0.0)
-    elif args.sort_cve:
-        keyf = lambda x: x.cve
-    elif args.sort_time:
-        keyf = lambda x: x.mtime
-    elif args.sort_changes:
+    if SortActions.settings['changes']:
         bugs = [ b for b in bugs if b.get_stats(linux_git) > 0 ]
-        keyf = lambda x: x.changes
-    else:
-        keyf = lambda x: x.data.id
+    SortActions.key_functions.append(lambda x: x.data.id)
 
-    for n, b in enumerate(sorted(bugs, key=keyf, reverse=args.reverse), 1):
-        if not args.check_kernel_fix:
-            show_bug(n, b, linux_git, args.short, args.files, args.birth_time, args.patch, args.stats_info)
-        else:
-            check_kernel_fix(b)
+    if args.pager:
+        try:
+            import subprocess
+            with subprocess.Popen(['less', '-i', '-R'], stdin=subprocess.PIPE, text=True) as pager:
+                for l in generate_output(linux_git, bugs, args, SortActions.key_functions, jobs):
+                    pager.stdin.write(l)
+        except BrokenPipeError:
+            pass
+    else:
+        for l in generate_output(linux_git, bugs, args, SortActions.key_functions, jobs):
+            sys.stdout.write(l)
+
+main()
