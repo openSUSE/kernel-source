@@ -319,7 +319,7 @@ patches must not be committed to the usual branches, because these are pushed to
 a public mirror, but instead to a branch named with an \_EMBARGO suffix, for
 example, SLE15-SP5\_EMBARGO. The KOTD scripts will testbuild such branches but
 won't publish them. Once the fix becomes public, the branch needs to be merged
-back info the "mainline" branch.
+back into the "mainline" branch.
 
 
 Related information
