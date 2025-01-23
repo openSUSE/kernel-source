@@ -1,0 +1,147 @@
+From: Youzhong Yang <youzhong@gmail.com>
+Date: Wed, 10 Jul 2024 10:40:35 -0400
+Subject: [PATCH] nfsd: add list_head nf_gc to struct nfsd_file
+References: bsc#1218260
+Patch-mainline: 6.6.74
+Git-commit: 8e6e2ffa6569a205f1805cbaeca143b556581da6
+
+commit 8e6e2ffa6569a205f1805cbaeca143b556581da6 upstream.
+
+nfsd_file_put() in one thread can race with another thread doing
+garbage collection (running nfsd_file_gc() -> list_lru_walk() ->
+nfsd_file_lru_cb()):
+
+  * In nfsd_file_put(), nf->nf_ref is 1, so it tries to do nfsd_file_lru_add().
+  * nfsd_file_lru_add() returns true (with NFSD_FILE_REFERENCED bit set)
+  * garbage collector kicks in, nfsd_file_lru_cb() clears REFERENCED bit and
+    returns LRU_ROTATE.
+  * garbage collector kicks in again, nfsd_file_lru_cb() now decrements nf->nf_ref
+    to 0, runs nfsd_file_unhash(), removes it from the LRU and adds to the dispose
+    list [list_lru_isolate_move(lru, &nf->nf_lru, head)]
+  * nfsd_file_put() detects NFSD_FILE_HASHED bit is cleared, so it tries to remove
+    the 'nf' from the LRU [if (!nfsd_file_lru_remove(nf))]. The 'nf' has been added
+    to the 'dispose' list by nfsd_file_lru_cb(), so nfsd_file_lru_remove(nf) simply
+    treats it as part of the LRU and removes it, which leads to its removal from
+    the 'dispose' list.
+  * At this moment, 'nf' is unhashed with its nf_ref being 0, and not on the LRU.
+    nfsd_file_put() continues its execution [if (refcount_dec_and_test(&nf->nf_ref))],
+    as nf->nf_ref is already 0, nf->nf_ref is set to REFCOUNT_SATURATED, and the 'nf'
+    gets no chance of being freed.
+
+nfsd_file_put() can also race with nfsd_file_cond_queue():
+  * In nfsd_file_put(), nf->nf_ref is 1, so it tries to do nfsd_file_lru_add().
+  * nfsd_file_lru_add() sets REFERENCED bit and returns true.
+  * Some userland application runs 'exportfs -f' or something like that, which triggers
+    __nfsd_file_cache_purge() -> nfsd_file_cond_queue().
+  * In nfsd_file_cond_queue(), it runs [if (!nfsd_file_unhash(nf))], unhash is done
+    successfully.
+  * nfsd_file_cond_queue() runs [if (!nfsd_file_get(nf))], now nf->nf_ref goes to 2.
+  * nfsd_file_cond_queue() runs [if (nfsd_file_lru_remove(nf))], it succeeds.
+  * nfsd_file_cond_queue() runs [if (refcount_sub_and_test(decrement, &nf->nf_ref))]
+    (with "decrement" being 2), so the nf->nf_ref goes to 0, the 'nf' is added to the
+    dispose list [list_add(&nf->nf_lru, dispose)]
+  * nfsd_file_put() detects NFSD_FILE_HASHED bit is cleared, so it tries to remove
+    the 'nf' from the LRU [if (!nfsd_file_lru_remove(nf))], although the 'nf' is not
+    in the LRU, but it is linked in the 'dispose' list, nfsd_file_lru_remove() simply
+    treats it as part of the LRU and removes it. This leads to its removal from
+    the 'dispose' list!
+  * Now nf->ref is 0, unhashed. nfsd_file_put() continues its execution and set
+    nf->nf_ref to REFCOUNT_SATURATED.
+
+As shown in the above analysis, using nf_lru for both the LRU list and dispose list
+can cause the leaks. This patch adds a new list_head nf_gc in struct nfsd_file, and uses
+it for the dispose list. This does not fix the nfsd_file leaking issue completely.
+
+Signed-off-by: Youzhong Yang <youzhong@gmail.com>
+Reviewed-by: Jeff Layton <jlayton@kernel.org>
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/nfsd/filecache.c | 18 ++++++++++--------
+ fs/nfsd/filecache.h |  1 +
+ 2 files changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/fs/nfsd/filecache.c b/fs/nfsd/filecache.c
+index 6f2bcbfde45e..0ff07d53931f 100644
+--- a/fs/nfsd/filecache.c
++++ b/fs/nfsd/filecache.c
+@@ -219,6 +219,7 @@ nfsd_file_alloc(struct net *net, struct inode *inode, unsigned char need,
+ 		return NULL;
+ 
+ 	INIT_LIST_HEAD(&nf->nf_lru);
++	INIT_LIST_HEAD(&nf->nf_gc);
+ 	nf->nf_birthtime = ktime_get();
+ 	nf->nf_file = NULL;
+ 	nf->nf_cred = get_current_cred();
+@@ -396,8 +397,8 @@ nfsd_file_dispose_list(struct list_head *dispose)
+ 	struct nfsd_file *nf;
+ 
+ 	while (!list_empty(dispose)) {
+-		nf = list_first_entry(dispose, struct nfsd_file, nf_lru);
+-		list_del_init(&nf->nf_lru);
++		nf = list_first_entry(dispose, struct nfsd_file, nf_gc);
++		list_del_init(&nf->nf_gc);
+ 		nfsd_file_free(nf);
+ 	}
+ }
+@@ -414,12 +415,12 @@ nfsd_file_dispose_list_delayed(struct list_head *dispose)
+ {
+ 	while(!list_empty(dispose)) {
+ 		struct nfsd_file *nf = list_first_entry(dispose,
+-						struct nfsd_file, nf_lru);
++						struct nfsd_file, nf_gc);
+ 		struct nfsd_net *nn = net_generic(nf->nf_net, nfsd_net_id);
+ 		struct nfsd_fcache_disposal *l = nn->fcache_disposal;
+ 
+ 		spin_lock(&l->lock);
+-		list_move_tail(&nf->nf_lru, &l->freeme);
++		list_move_tail(&nf->nf_gc, &l->freeme);
+ 		spin_unlock(&l->lock);
+ 		queue_work(nfsd_filecache_wq, &l->work);
+ 	}
+@@ -476,7 +477,8 @@ nfsd_file_lru_cb(struct list_head *item, struct list_lru_one *lru,
+ 
+ 	/* Refcount went to zero. Unhash it and queue it to the dispose list */
+ 	nfsd_file_unhash(nf);
+-	list_lru_isolate_move(lru, &nf->nf_lru, head);
++	list_lru_isolate(lru, &nf->nf_lru);
++	list_add(&nf->nf_gc, head);
+ 	this_cpu_inc(nfsd_file_evictions);
+ 	trace_nfsd_file_gc_disposed(nf);
+ 	return LRU_REMOVED;
+@@ -555,7 +557,7 @@ nfsd_file_cond_queue(struct nfsd_file *nf, struct list_head *dispose)
+ 
+ 	/* If refcount goes to 0, then put on the dispose list */
+ 	if (refcount_sub_and_test(decrement, &nf->nf_ref)) {
+-		list_add(&nf->nf_lru, dispose);
++		list_add(&nf->nf_gc, dispose);
+ 		trace_nfsd_file_closing(nf);
+ 	}
+ }
+@@ -631,8 +633,8 @@ nfsd_file_close_inode_sync(struct inode *inode)
+ 
+ 	nfsd_file_queue_for_close(inode, &dispose);
+ 	while (!list_empty(&dispose)) {
+-		nf = list_first_entry(&dispose, struct nfsd_file, nf_lru);
+-		list_del_init(&nf->nf_lru);
++		nf = list_first_entry(&dispose, struct nfsd_file, nf_gc);
++		list_del_init(&nf->nf_gc);
+ 		nfsd_file_free(nf);
+ 	}
+ 	flush_delayed_fput();
+diff --git a/fs/nfsd/filecache.h b/fs/nfsd/filecache.h
+index e54165a3224f..bf7a630f1a45 100644
+--- a/fs/nfsd/filecache.h
++++ b/fs/nfsd/filecache.h
+@@ -44,6 +44,7 @@ struct nfsd_file {
+ 
+ 	struct nfsd_file_mark	*nf_mark;
+ 	struct list_head	nf_lru;
++	struct list_head	nf_gc;
+ 	struct rcu_head		nf_rcu;
+ 	ktime_t			nf_birthtime;
+ };
+-- 
+2.48.0
+
