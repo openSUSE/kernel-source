@@ -1,0 +1,569 @@
+From 414d0f45c316221acbf066658afdbae5b354a5cc Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Wed, 20 Mar 2024 15:19:44 -0600
+Subject: [PATCH] io_uring/alloc_cache: switch to array based caching
+Git-commit: 414d0f45c316221acbf066658afdbae5b354a5cc
+Patch-mainline: v6.10-rc1
+References: bsc#1230569
+
+Currently lists are being used to manage this, but best practice is
+usually to have these in an array instead as that it cheaper to manage.
+
+Outside of that detail, games are also played with KASAN as the list
+is inside the cached entry itself.
+
+Finally, all users of this need a struct io_cache_entry embedded in
+their struct, which is union'ized with something else in there that
+isn't used across the free -> realloc cycle.
+
+Get rid of all of that, and simply have it be an array. This will not
+change the memory used, as we're just trading an 8-byte member entry
+for the per-elem array size.
+
+This reduces the overhead of the recycled allocations, and it reduces
+the amount of code code needed to support recycling to about half of
+what it currently is.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ include/linux/io_uring_types.h |    2 -
+ io_uring/alloc_cache.h         |   56 +++++++++++++++++------------------------
+ io_uring/io_uring.c            |   33 +++++++++++++-----------
+ io_uring/net.c                 |   13 +++------
+ io_uring/net.h                 |   18 +++----------
+ io_uring/poll.c                |   12 ++------
+ io_uring/poll.h                |    9 ------
+ io_uring/rsrc.c                |   10 ++-----
+ io_uring/rsrc.h                |    7 -----
+ io_uring/rw.c                  |   14 ++++------
+ io_uring/rw.h                  |    7 +----
+ io_uring/uring_cmd.c           |   14 ++--------
+ io_uring/uring_cmd.h           |    6 ----
+ 13 files changed, 75 insertions(+), 126 deletions(-)
+
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -220,7 +220,7 @@ struct io_ev_fd {
+ };
+ 
+ struct io_alloc_cache {
+-	struct io_wq_work_node	list;
++	void			**entries;
+ 	unsigned int		nr_cached;
+ 	unsigned int		max_cached;
+ 	size_t			elem_size;
+--- a/io_uring/alloc_cache.h
++++ b/io_uring/alloc_cache.h
+@@ -6,62 +6,54 @@
+  */
+ #define IO_ALLOC_CACHE_MAX	128
+ 
+-struct io_cache_entry {
+-	struct io_wq_work_node node;
+-};
+-
+ static inline bool io_alloc_cache_put(struct io_alloc_cache *cache,
+-				      struct io_cache_entry *entry)
++				      void *entry)
+ {
+ 	if (cache->nr_cached < cache->max_cached) {
+-		cache->nr_cached++;
+-		wq_stack_add_head(&entry->node, &cache->list);
+ 		/* KASAN poisons object */
+ 		kasan_slab_free_mempool(entry);
++		cache->entries[cache->nr_cached++] = entry;
+ 		return true;
+ 	}
+ 	return false;
+ }
+ 
+-static inline bool io_alloc_cache_empty(struct io_alloc_cache *cache)
++static inline void *io_alloc_cache_get(struct io_alloc_cache *cache)
+ {
+-	return !cache->list.next;
+-}
+-
+-static inline struct io_cache_entry *io_alloc_cache_get(struct io_alloc_cache *cache)
+-{
+-	if (cache->list.next) {
+-		struct io_cache_entry *entry;
+-
+-		entry = container_of(cache->list.next, struct io_cache_entry, node);
++	if (cache->nr_cached) {
++		void *entry = cache->entries[--cache->nr_cached];
+ 		kasan_unpoison_range(entry, cache->elem_size);
+-		cache->list.next = cache->list.next->next;
+-		cache->nr_cached--;
+ 		return entry;
+ 	}
+-
+ 	return NULL;
+ }
+ 
+-static inline void io_alloc_cache_init(struct io_alloc_cache *cache,
++/* returns false if the cache was initialized properly */
++static inline bool io_alloc_cache_init(struct io_alloc_cache *cache,
+ 				       unsigned max_nr, size_t size)
+ {
+-	cache->list.next = NULL;
+-	cache->nr_cached = 0;
+-	cache->max_cached = max_nr;
+-	cache->elem_size = size;
++	cache->entries = kvmalloc_array(max_nr, sizeof(void *), GFP_KERNEL);
++	if (cache->entries) {
++		cache->nr_cached = 0;
++		cache->max_cached = max_nr;
++		cache->elem_size = size;
++		return false;
++	}
++	return true;
+ }
+ 
+ static inline void io_alloc_cache_free(struct io_alloc_cache *cache,
+-					void (*free)(struct io_cache_entry *))
++				       void (*free)(const void *))
+ {
+-	while (1) {
+-		struct io_cache_entry *entry = io_alloc_cache_get(cache);
++	void *entry;
++
++	if (!cache->entries)
++		return;
+ 
+-		if (!entry)
+-			break;
++	while ((entry = io_alloc_cache_get(cache)) != NULL)
+ 		free(entry);
+-	}
+-	cache->nr_cached = 0;
++
++	kvfree(cache->entries);
++	cache->entries = NULL;
+ }
+ #endif
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -281,6 +281,7 @@ static __cold struct io_ring_ctx *io_rin
+ {
+ 	struct io_ring_ctx *ctx;
+ 	int hash_bits;
++	bool ret;
+ 
+ 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+ 	if (!ctx)
+@@ -310,16 +311,18 @@ static __cold struct io_ring_ctx *io_rin
+ 	INIT_LIST_HEAD(&ctx->cq_overflow_list);
+ 	INIT_LIST_HEAD(&ctx->io_buffers_cache);
+ 	INIT_HLIST_HEAD(&ctx->io_buf_list);
+-	io_alloc_cache_init(&ctx->rsrc_node_cache, IO_NODE_ALLOC_CACHE_MAX,
++	ret = io_alloc_cache_init(&ctx->rsrc_node_cache, IO_NODE_ALLOC_CACHE_MAX,
+ 			    sizeof(struct io_rsrc_node));
+-	io_alloc_cache_init(&ctx->apoll_cache, IO_ALLOC_CACHE_MAX,
++	ret |= io_alloc_cache_init(&ctx->apoll_cache, IO_ALLOC_CACHE_MAX,
+ 			    sizeof(struct async_poll));
+-	io_alloc_cache_init(&ctx->netmsg_cache, IO_ALLOC_CACHE_MAX,
++	ret |= io_alloc_cache_init(&ctx->netmsg_cache, IO_ALLOC_CACHE_MAX,
+ 			    sizeof(struct io_async_msghdr));
+-	io_alloc_cache_init(&ctx->rw_cache, IO_ALLOC_CACHE_MAX,
++	ret |= io_alloc_cache_init(&ctx->rw_cache, IO_ALLOC_CACHE_MAX,
+ 			    sizeof(struct io_async_rw));
+-	io_alloc_cache_init(&ctx->uring_cache, IO_ALLOC_CACHE_MAX,
+-			    sizeof(struct uring_cache));
++	ret |= io_alloc_cache_init(&ctx->uring_cache, IO_ALLOC_CACHE_MAX,
++			   sizeof(struct uring_cache));
++	if (ret)
++		goto err;
+ 	init_completion(&ctx->ref_comp);
+ 	xa_init_flags(&ctx->personalities, XA_FLAGS_ALLOC1);
+ 	mutex_init(&ctx->uring_lock);
+@@ -346,6 +349,11 @@ static __cold struct io_ring_ctx *io_rin
+ 
+ 	return ctx;
+ err:
++	io_alloc_cache_free(&ctx->rsrc_node_cache, kfree);
++	io_alloc_cache_free(&ctx->apoll_cache, kfree);
++	io_alloc_cache_free(&ctx->netmsg_cache, io_netmsg_cache_free);
++	io_alloc_cache_free(&ctx->rw_cache, io_rw_cache_free);
++	io_alloc_cache_free(&ctx->uring_cache, kfree);
+ 	kfree(ctx->cancel_table.hbs);
+ 	kfree(ctx->cancel_table_locked.hbs);
+ 	xa_destroy(&ctx->io_bl_xa);
+@@ -1483,7 +1491,7 @@ static void io_free_batch_list(struct io
+ 
+ 				if (apoll->double_poll)
+ 					kfree(apoll->double_poll);
+-				if (!io_alloc_cache_put(&ctx->apoll_cache, &apoll->cache))
++				if (!io_alloc_cache_put(&ctx->apoll_cache, apoll))
+ 					kfree(apoll);
+ 				req->flags &= ~REQ_F_POLLED;
+ 			}
+@@ -2778,11 +2786,6 @@ static void io_req_caches_free(struct io
+ 	mutex_unlock(&ctx->uring_lock);
+ }
+ 
+-static void io_rsrc_node_cache_free(struct io_cache_entry *entry)
+-{
+-	kfree(container_of(entry, struct io_rsrc_node, cache));
+-}
+-
+ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
+ {
+ 	io_sq_thread_finish(ctx);
+@@ -2797,10 +2800,10 @@ static __cold void io_ring_ctx_free(stru
+ 		__io_sqe_files_unregister(ctx);
+ 	io_cqring_overflow_kill(ctx);
+ 	io_eventfd_unregister(ctx);
+-	io_alloc_cache_free(&ctx->apoll_cache, io_apoll_cache_free);
++	io_alloc_cache_free(&ctx->apoll_cache, kfree);
+ 	io_alloc_cache_free(&ctx->netmsg_cache, io_netmsg_cache_free);
+ 	io_alloc_cache_free(&ctx->rw_cache, io_rw_cache_free);
+-	io_alloc_cache_free(&ctx->uring_cache, io_uring_cache_free);
++	io_alloc_cache_free(&ctx->uring_cache, kfree);
+ 	io_destroy_buffers(ctx);
+ 	mutex_unlock(&ctx->uring_lock);
+ 	if (ctx->sq_creds)
+@@ -2815,7 +2818,7 @@ static __cold void io_ring_ctx_free(stru
+ 	WARN_ON_ONCE(!list_empty(&ctx->rsrc_ref_list));
+ 	WARN_ON_ONCE(!list_empty(&ctx->ltimeout_list));
+ 
+-	io_alloc_cache_free(&ctx->rsrc_node_cache, io_rsrc_node_cache_free);
++	io_alloc_cache_free(&ctx->rsrc_node_cache, kfree);
+ 	if (ctx->mm_account) {
+ 		mmdrop(ctx->mm_account);
+ 		ctx->mm_account = NULL;
+--- a/io_uring/net.c
++++ b/io_uring/net.c
+@@ -137,7 +137,7 @@ static void io_netmsg_recycle(struct io_
+ 
+ 	/* Let normal cleanup path reap it if we fail adding to the cache */
+ 	iov = hdr->free_iov;
+-	if (io_alloc_cache_put(&req->ctx->netmsg_cache, &hdr->cache)) {
++	if (io_alloc_cache_put(&req->ctx->netmsg_cache, hdr)) {
+ 		if (iov)
+ 			kasan_slab_free_mempool(iov);
+ 		req->async_data = NULL;
+@@ -148,12 +148,10 @@ static void io_netmsg_recycle(struct io_
+ static struct io_async_msghdr *io_msg_alloc_async(struct io_kiocb *req)
+ {
+ 	struct io_ring_ctx *ctx = req->ctx;
+-	struct io_cache_entry *entry;
+ 	struct io_async_msghdr *hdr;
+ 
+-	entry = io_alloc_cache_get(&ctx->netmsg_cache);
+-	if (entry) {
+-		hdr = container_of(entry, struct io_async_msghdr, cache);
++	hdr = io_alloc_cache_get(&ctx->netmsg_cache);
++	if (hdr) {
+ 		if (hdr->free_iov) {
+ 			kasan_unpoison_range(hdr->free_iov,
+ 				hdr->free_iov_nr * sizeof(struct iovec));
+@@ -1490,11 +1488,10 @@ out:
+ 	return IOU_OK;
+ }
+ 
+-void io_netmsg_cache_free(struct io_cache_entry *entry)
++void io_netmsg_cache_free(const void *entry)
+ {
+-	struct io_async_msghdr *kmsg;
++	struct io_async_msghdr *kmsg = (struct io_async_msghdr *) entry;
+ 
+-	kmsg = container_of(entry, struct io_async_msghdr, cache);
+ 	if (kmsg->free_iov) {
+ 		kasan_unpoison_range(kmsg->free_iov,
+ 			     kmsg->free_iov_nr * sizeof(struct iovec));
+--- a/io_uring/net.h
++++ b/io_uring/net.h
+@@ -3,23 +3,15 @@
+ #include <linux/net.h>
+ #include <linux/uio.h>
+ 
+-#include "alloc_cache.h"
+-
+ struct io_async_msghdr {
+ #if defined(CONFIG_NET)
+-	union {
+-		struct iovec			fast_iov;
+-		struct {
+-			struct io_cache_entry	cache;
+-			/* entry size of ->free_iov, if valid */
+-			int			free_iov_nr;
+-		};
+-	};
++	struct iovec			fast_iov;
+ 	/* points to an allocated iov, if NULL we use fast_iov instead */
+ 	struct iovec			*free_iov;
++	int				free_iov_nr;
++	int				namelen;
+ 	__kernel_size_t			controllen;
+ 	__kernel_size_t			payloadlen;
+-	int				namelen;
+ 	struct sockaddr __user		*uaddr;
+ 	struct msghdr			msg;
+ 	struct sockaddr_storage		addr;
+@@ -57,9 +49,9 @@ int io_sendmsg_zc(struct io_kiocb *req,
+ int io_send_zc_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe);
+ void io_send_zc_cleanup(struct io_kiocb *req);
+ 
+-void io_netmsg_cache_free(struct io_cache_entry *entry);
++void io_netmsg_cache_free(const void *entry);
+ #else
+-static inline void io_netmsg_cache_free(struct io_cache_entry *entry)
++static inline void io_netmsg_cache_free(const void *entry)
+ {
+ }
+ #endif
+--- a/io_uring/poll.c
++++ b/io_uring/poll.c
+@@ -14,6 +14,7 @@
+ #include <uapi/linux/io_uring.h>
+ 
+ #include "io_uring.h"
++#include "alloc_cache.h"
+ #include "refs.h"
+ #include "napi.h"
+ #include "opdef.h"
+@@ -686,17 +687,15 @@ static struct async_poll *io_req_alloc_a
+ 					     unsigned issue_flags)
+ {
+ 	struct io_ring_ctx *ctx = req->ctx;
+-	struct io_cache_entry *entry;
+ 	struct async_poll *apoll;
+ 
+ 	if (req->flags & REQ_F_POLLED) {
+ 		apoll = req->apoll;
+ 		kfree(apoll->double_poll);
+ 	} else if (!(issue_flags & IO_URING_F_UNLOCKED)) {
+-		entry = io_alloc_cache_get(&ctx->apoll_cache);
+-		if (entry == NULL)
++		apoll = io_alloc_cache_get(&ctx->apoll_cache);
++		if (!apoll)
+ 			goto alloc_apoll;
+-		apoll = container_of(entry, struct async_poll, cache);
+ 		apoll->poll.retries = APOLL_MAX_RETRY;
+ 	} else {
+ alloc_apoll:
+@@ -1055,8 +1054,3 @@ out:
+ 	io_req_set_res(req, ret, 0);
+ 	return IOU_OK;
+ }
+-
+-void io_apoll_cache_free(struct io_cache_entry *entry)
+-{
+-	kfree(container_of(entry, struct async_poll, cache));
+-}
+--- a/io_uring/poll.h
++++ b/io_uring/poll.h
+@@ -1,7 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+-#include "alloc_cache.h"
+-
+ enum {
+ 	IO_APOLL_OK,
+ 	IO_APOLL_ABORTED,
+@@ -17,10 +15,7 @@ struct io_poll {
+ };
+ 
+ struct async_poll {
+-	union {
+-		struct io_poll		poll;
+-		struct io_cache_entry	cache;
+-	};
++	struct io_poll		poll;
+ 	struct io_poll		*double_poll;
+ };
+ 
+@@ -46,6 +41,4 @@ int io_arm_poll_handler(struct io_kiocb
+ bool io_poll_remove_all(struct io_ring_ctx *ctx, struct task_struct *tsk,
+ 			bool cancel_all);
+ 
+-void io_apoll_cache_free(struct io_cache_entry *entry);
+-
+ void io_poll_task_func(struct io_kiocb *req, struct io_tw_state *ts);
+--- a/io_uring/rsrc.c
++++ b/io_uring/rsrc.c
+@@ -13,6 +13,7 @@
+ #include <uapi/linux/io_uring.h>
+ 
+ #include "io_uring.h"
++#include "alloc_cache.h"
+ #include "openclose.h"
+ #include "rsrc.h"
+ 
+@@ -169,7 +170,7 @@ static void io_rsrc_put_work(struct io_r
+ 
+ void io_rsrc_node_destroy(struct io_ring_ctx *ctx, struct io_rsrc_node *node)
+ {
+-	if (!io_alloc_cache_put(&ctx->rsrc_node_cache, &node->cache))
++	if (!io_alloc_cache_put(&ctx->rsrc_node_cache, node))
+ 		kfree(node);
+ }
+ 
+@@ -197,12 +198,9 @@ void io_rsrc_node_ref_zero(struct io_rsr
+ struct io_rsrc_node *io_rsrc_node_alloc(struct io_ring_ctx *ctx)
+ {
+ 	struct io_rsrc_node *ref_node;
+-	struct io_cache_entry *entry;
+ 
+-	entry = io_alloc_cache_get(&ctx->rsrc_node_cache);
+-	if (entry) {
+-		ref_node = container_of(entry, struct io_rsrc_node, cache);
+-	} else {
++	ref_node = io_alloc_cache_get(&ctx->rsrc_node_cache);
++	if (!ref_node) {
+ 		ref_node = kzalloc(sizeof(*ref_node), GFP_KERNEL);
+ 		if (!ref_node)
+ 			return NULL;
+--- a/io_uring/rsrc.h
++++ b/io_uring/rsrc.h
+@@ -2,8 +2,6 @@
+ #ifndef IOU_RSRC_H
+ #define IOU_RSRC_H
+ 
+-#include "alloc_cache.h"
+-
+ #define IO_NODE_ALLOC_CACHE_MAX 32
+ 
+ #define IO_RSRC_TAG_TABLE_SHIFT	(PAGE_SHIFT - 3)
+@@ -36,10 +34,7 @@ struct io_rsrc_data {
+ };
+ 
+ struct io_rsrc_node {
+-	union {
+-		struct io_cache_entry		cache;
+-		struct io_ring_ctx		*ctx;
+-	};
++	struct io_ring_ctx		*ctx;
+ 	int				refs;
+ 	bool				empty;
+ 	u16				type;
+--- a/io_uring/rw.c
++++ b/io_uring/rw.c
+@@ -18,6 +18,7 @@
+ #include "io_uring.h"
+ #include "opdef.h"
+ #include "kbuf.h"
++#include "alloc_cache.h"
+ #include "rsrc.h"
+ #include "poll.h"
+ #include "rw.h"
+@@ -154,7 +155,7 @@ static void io_rw_recycle(struct io_kioc
+ 		return;
+ 	}
+ 	iov = rw->free_iovec;
+-	if (io_alloc_cache_put(&req->ctx->rw_cache, &rw->cache)) {
++	if (io_alloc_cache_put(&req->ctx->rw_cache, rw)) {
+ 		if (iov)
+ 			kasan_slab_free_mempool(iov);
+ 		req->async_data = NULL;
+@@ -200,12 +201,10 @@ static void io_req_rw_cleanup(struct io_
+ static int io_rw_alloc_async(struct io_kiocb *req)
+ {
+ 	struct io_ring_ctx *ctx = req->ctx;
+-	struct io_cache_entry *entry;
+ 	struct io_async_rw *rw;
+ 
+-	entry = io_alloc_cache_get(&ctx->rw_cache);
+-	if (entry) {
+-		rw = container_of(entry, struct io_async_rw, cache);
++	rw = io_alloc_cache_get(&ctx->rw_cache);
++	if (rw) {
+ 		if (rw->free_iovec) {
+ 			kasan_unpoison_range(rw->free_iovec,
+ 				rw->free_iov_nr * sizeof(struct iovec));
+@@ -1162,11 +1161,10 @@ int io_do_iopoll(struct io_ring_ctx *ctx
+ 	return nr_events;
+ }
+ 
+-void io_rw_cache_free(struct io_cache_entry *entry)
++void io_rw_cache_free(const void *entry)
+ {
+-	struct io_async_rw *rw;
++	struct io_async_rw *rw = (struct io_async_rw *) entry;
+ 
+-	rw = container_of(entry, struct io_async_rw, cache);
+ 	if (rw->free_iovec) {
+ 		kasan_unpoison_range(rw->free_iovec,
+ 				rw->free_iov_nr * sizeof(struct iovec));
+--- a/io_uring/rw.h
++++ b/io_uring/rw.h
+@@ -3,10 +3,7 @@
+ #include <linux/pagemap.h>
+ 
+ struct io_async_rw {
+-	union {
+-		size_t			bytes_done;
+-		struct io_cache_entry	cache;
+-	};
++	size_t				bytes_done;
+ 	struct iov_iter			iter;
+ 	struct iov_iter_state		iter_state;
+ 	struct iovec			fast_iov;
+@@ -28,4 +25,4 @@ void io_rw_fail(struct io_kiocb *req);
+ void io_req_rw_complete(struct io_kiocb *req, struct io_tw_state *ts);
+ int io_read_mshot_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe);
+ int io_read_mshot(struct io_kiocb *req, unsigned int issue_flags);
+-void io_rw_cache_free(struct io_cache_entry *entry);
++void io_rw_cache_free(const void *entry);
+--- a/io_uring/uring_cmd.c
++++ b/io_uring/uring_cmd.c
+@@ -10,18 +10,17 @@
+ #include <uapi/linux/io_uring.h>
+ 
+ #include "io_uring.h"
++#include "alloc_cache.h"
+ #include "rsrc.h"
+ #include "uring_cmd.h"
+ 
+ static struct uring_cache *io_uring_async_get(struct io_kiocb *req)
+ {
+ 	struct io_ring_ctx *ctx = req->ctx;
+-	struct io_cache_entry *entry;
+ 	struct uring_cache *cache;
+ 
+-	entry = io_alloc_cache_get(&ctx->uring_cache);
+-	if (entry) {
+-		cache = container_of(entry, struct uring_cache, cache);
++	cache = io_alloc_cache_get(&ctx->uring_cache);
++	if (cache) {
+ 		req->flags |= REQ_F_ASYNC_DATA;
+ 		req->async_data = cache;
+ 		return cache;
+@@ -38,7 +37,7 @@ static void io_req_uring_cleanup(struct
+ 
+ 	if (issue_flags & IO_URING_F_UNLOCKED)
+ 		return;
+-	if (io_alloc_cache_put(&req->ctx->uring_cache, &cache->cache)) {
++	if (io_alloc_cache_put(&req->ctx->uring_cache, cache)) {
+ 		ioucmd->sqe = NULL;
+ 		req->async_data = NULL;
+ 		req->flags &= ~REQ_F_ASYNC_DATA;
+@@ -275,8 +274,3 @@ int io_uring_cmd_import_fixed(u64 ubuf,
+ 	return io_import_fixed(rw, iter, req->imu, ubuf, len);
+ }
+ EXPORT_SYMBOL_GPL(io_uring_cmd_import_fixed);
+-
+-void io_uring_cache_free(struct io_cache_entry *entry)
+-{
+-	kfree(container_of(entry, struct uring_cache, cache));
+-}
+--- a/io_uring/uring_cmd.h
++++ b/io_uring/uring_cmd.h
+@@ -1,15 +1,11 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+ struct uring_cache {
+-	union {
+-		struct io_cache_entry cache;
+-		struct io_uring_sqe sqes[2];
+-	};
++	struct io_uring_sqe sqes[2];
+ };
+ 
+ int io_uring_cmd(struct io_kiocb *req, unsigned int issue_flags);
+ int io_uring_cmd_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe);
+-void io_uring_cache_free(struct io_cache_entry *entry);
+ 
+ bool io_uring_try_cancel_uring_cmd(struct io_ring_ctx *ctx,
+ 				   struct task_struct *task, bool cancel_all);
