@@ -1,0 +1,172 @@
+From: Frederic Weisbecker <frederic@kernel.org>
+Date: Wed, 15 Jan 2025 00:15:04 +0100
+Subject: [PATCH] timers/migration: Fix another race between hotplug and idle
+ entry/exit
+References: bsc#1234429
+Patch-mainline: 6.12.11
+Git-commit: b729cc1ec21a5899b7879ccfbe1786664928d597
+
+commit b729cc1ec21a5899b7879ccfbe1786664928d597 upstream.
+
+Commit 10a0e6f3d3db ("timers/migration: Move hierarchy setup into
+cpuhotplug prepare callback") fixed a race between idle exit and CPU
+hotplug up leading to a wrong "0" value migrator assigned to the top
+level. However there is still a situation that remains unhandled:
+
+         [GRP0:0]
+        migrator  = TMIGR_NONE
+        active    = NONE
+        groupmask = 0
+        /     \      \
+       0       1     2..7
+     idle      idle   idle
+
+0) The system is fully idle.
+
+         [GRP0:0]
+        migrator  = CPU 0
+        active    = CPU 0
+        groupmask = 0
+        /     \      \
+       0       1     2..7
+     active   idle   idle
+
+1) CPU 0 is activating. It has done the cmpxchg on the top's ->migr_state
+but it hasn't yet returned to __walk_groups().
+
+         [GRP0:0]
+        migrator  = CPU 0
+        active    = CPU 0, CPU 1
+        groupmask = 0
+        /     \      \
+       0       1     2..7
+     active  active  idle
+
+2) CPU 1 is activating. CPU 0 stays the migrator (still stuck in
+__walk_groups(), delayed by #VMEXIT for example).
+
+                 [GRP1:0]
+              migrator = TMIGR_NONE
+              active   = NONE
+              groupmask = 0
+              /                  \
+        [GRP0:0]                      [GRP0:1]
+       migrator  = CPU 0           migrator = TMIGR_NONE
+       active    = CPU 0, CPU1     active   = NONE
+       groupmask = 2               groupmask = 1
+       /     \      \
+      0       1     2..7                   8
+    active  active  idle              !online
+
+3) CPU 8 is preparing to boot. CPUHP_TMIGR_PREPARE is being ran by CPU 1
+which has created the GRP0:1 and the new top GRP1:0 connected to GRP0:1
+and GRP0:0. The groupmask of GRP0:0 is now 2. CPU 1 hasn't yet
+propagated its activation up to GRP1:0.
+
+                 [GRP1:0]
+              migrator = 0 (!!!)
+              active   = NONE
+              groupmask = 0
+              /                  \
+        [GRP0:0]                  [GRP0:1]
+       migrator  = CPU 0           migrator = TMIGR_NONE
+       active    = CPU 0, CPU1     active   = NONE
+       groupmask = 2               groupmask = 1
+       /     \      \
+      0       1     2..7                   8
+    active  active  idle                !online
+
+4) CPU 0 finally resumed after its #VMEXIT. It's in __walk_groups()
+returning from tmigr_cpu_active(). The new top GRP1:0 is visible and
+fetched but the freshly updated groupmask of GRP0:0 may not be visible
+due to lack of ordering! As a result tmigr_active_up() is called to
+GRP0:0 with a child's groupmask of "0". This buggy "0" groupmask then
+becomes the migrator for GRP1:0 forever. As a result, timers on a fully
+idle system get ignored.
+
+One possible fix would be to define TMIGR_NONE as "0" so that such a
+race would have no effect. And after all TMIGR_NONE doesn't need to be
+anything else. However this would leave an uncomfortable state machine
+where gears happen not to break by chance but are vulnerable to future
+modifications.
+
+Keep TMIGR_NONE as is instead and pre-initialize to "1" the groupmask of
+any newly created top level. This groupmask is guaranteed to be visible
+upon fetching the corresponding group for the 1st time:
+
+_ By the upcoming CPU thanks to CPU hotplug synchronization between the
+  control CPU (BP) and the booting one (AP).
+
+_ By the control CPU since the groupmask and parent pointers are
+  initialized locally.
+
+_ By all CPUs belonging to the same group than the control CPU because
+  they must wait for it to ever become idle before needing to walk to
+  the new top. The cmpcxhg() on ->migr_state then makes sure its
+  groupmask is visible.
+
+With this pre-initialization, it is guaranteed that if a future top level
+is linked to an old one, it is walked through with a valid groupmask.
+
+Fixes: 10a0e6f3d3db ("timers/migration: Move hierarchy setup into cpuhotplug prepare callback")
+Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/all/20250114231507.21672-2-frederic@kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ kernel/time/timer_migration.c | 29 ++++++++++++++++++++++++++++-
+ 1 file changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/time/timer_migration.c b/kernel/time/timer_migration.c
+index 8d57f7686bb0..c8a8ea2e5b98 100644
+--- a/kernel/time/timer_migration.c
++++ b/kernel/time/timer_migration.c
+@@ -1487,6 +1487,21 @@ static void tmigr_init_group(struct tmigr_group *group, unsigned int lvl,
+ 	s.seq = 0;
+ 	atomic_set(&group->migr_state, s.state);
+ 
++	/*
++	 * If this is a new top-level, prepare its groupmask in advance.
++	 * This avoids accidents where yet another new top-level is
++	 * created in the future and made visible before the current groupmask.
++	 */
++	if (list_empty(&tmigr_level_list[lvl])) {
++		group->groupmask = BIT(0);
++		/*
++		 * The previous top level has prepared its groupmask already,
++		 * simply account it as the first child.
++		 */
++		if (lvl > 0)
++			group->num_children = 1;
++	}
++
+ 	timerqueue_init_head(&group->events);
+ 	timerqueue_init(&group->groupevt.nextevt);
+ 	group->groupevt.nextevt.expires = KTIME_MAX;
+@@ -1550,8 +1565,20 @@ static void tmigr_connect_child_parent(struct tmigr_group *child,
+ 	raw_spin_lock_irq(&child->lock);
+ 	raw_spin_lock_nested(&parent->lock, SINGLE_DEPTH_NESTING);
+ 
++	if (activate) {
++		/*
++		 * @child is the old top and @parent the new one. In this
++		 * case groupmask is pre-initialized and @child already
++		 * accounted, along with its new sibling corresponding to the
++		 * CPU going up.
++		 */
++		WARN_ON_ONCE(child->groupmask != BIT(0) || parent->num_children != 2);
++	} else {
++		/* Adding @child for the CPU going up to @parent. */
++		child->groupmask = BIT(parent->num_children++);
++	}
++
+ 	child->parent = parent;
+-	child->groupmask = BIT(parent->num_children++);
+ 
+ 	raw_spin_unlock(&parent->lock);
+ 	raw_spin_unlock_irq(&child->lock);
+-- 
+2.48.0
+
