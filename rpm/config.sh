@@ -1,7 +1,7 @@
 # The version of the main tarball to use
 SRCVERSION=6.12
 # variant of the kernel-source package, either empty or "-rt"
-VARIANT=
+VARIANT=-longterm
 # enable kernel module compression
 COMPRESS_MODULES="zstd"
 COMPRESS_VMLINUX="xz"
