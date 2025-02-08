@@ -1,0 +1,384 @@
+From: Zong-Zhe Yang <kevin_yang@realtek.com>
+Date: Tue, 22 Oct 2024 16:31:05 +0800
+Subject: [PATCH] wifi: rtw89: tweak setting of channel and TX power for MLO
+References: bsc#1234429
+Patch-mainline: 6.12.13
+Git-commit: 2305ebc1835b1ca921045b4f0941e82edde3249b
+
+[ Upstream commit 2305ebc1835b1ca921045b4f0941e82edde3249b ]
+
+Setting of channel and TX power depend on channel contexts, but original
+code cannot handle combination of MCC (multi-channel concurrency) and MLO
+well. So according to active interfaces, we generate a table for current
+channel contexts. And then based on entity mode, we get the corresponding
+channel context to apply during channel or TX power setting. When MLO is
+supported, there will be dual-PHY and we will apply the channel context of
+the 2nd link to the 2nd PHY.
+
+Signed-off-by: Zong-Zhe Yang <kevin_yang@realtek.com>
+Signed-off-by: Ping-Ke Shih <pkshih@realtek.com>
+Link: https://patch.msgid.link/20241022083106.149252-5-pkshih@realtek.com
+Stable-dep-of: e47f0a589854 ("wifi: rtw89: fix proceeding MCC with wrong scanning state after sequence changes")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/net/wireless/realtek/rtw89/chan.c |  80 +++++++++++++++-
+ drivers/net/wireless/realtek/rtw89/chan.h |   8 ++
+ drivers/net/wireless/realtek/rtw89/core.c | 111 ++++++++++------------
+ drivers/net/wireless/realtek/rtw89/core.h |  15 ++-
+ 4 files changed, 149 insertions(+), 65 deletions(-)
+
+diff --git a/drivers/net/wireless/realtek/rtw89/chan.c b/drivers/net/wireless/realtek/rtw89/chan.c
+index 2b7e6921ff9c..fb9449930c40 100644
+--- a/drivers/net/wireless/realtek/rtw89/chan.c
++++ b/drivers/net/wireless/realtek/rtw89/chan.c
+@@ -299,6 +299,64 @@ static void rtw89_normalize_link_chanctx(struct rtw89_dev *rtwdev,
+ 	rtw89_swap_chanctx(rtwdev, rtwvif_link->chanctx_idx, cur->chanctx_idx);
+ }
+ 
++const struct rtw89_chan *__rtw89_mgnt_chan_get(struct rtw89_dev *rtwdev,
++					       const char *caller_message,
++					       u8 link_index)
++{
++	struct rtw89_hal *hal = &rtwdev->hal;
++	struct rtw89_entity_mgnt *mgnt = &hal->entity_mgnt;
++	enum rtw89_chanctx_idx chanctx_idx;
++	enum rtw89_chanctx_idx roc_idx;
++	enum rtw89_entity_mode mode;
++	u8 role_index;
++
++	lockdep_assert_held(&rtwdev->mutex);
++
++	if (unlikely(link_index >= __RTW89_MLD_MAX_LINK_NUM)) {
++		WARN(1, "link index %u is invalid (max link inst num: %d)\n",
++		     link_index, __RTW89_MLD_MAX_LINK_NUM);
++		goto dflt;
++	}
++
++	mode = rtw89_get_entity_mode(rtwdev);
++	switch (mode) {
++	case RTW89_ENTITY_MODE_SCC_OR_SMLD:
++	case RTW89_ENTITY_MODE_MCC:
++		role_index = 0;
++		break;
++	case RTW89_ENTITY_MODE_MCC_PREPARE:
++		role_index = 1;
++		break;
++	default:
++		WARN(1, "Invalid ent mode: %d\n", mode);
++		goto dflt;
++	}
++
++	chanctx_idx = mgnt->chanctx_tbl[role_index][link_index];
++	if (chanctx_idx == RTW89_CHANCTX_IDLE)
++		goto dflt;
++
++	roc_idx = atomic_read(&hal->roc_chanctx_idx);
++	if (roc_idx != RTW89_CHANCTX_IDLE) {
++		/* ROC is ongoing (given ROC runs on RTW89_ROC_BY_LINK_INDEX).
++		 * If @link_index is the same as RTW89_ROC_BY_LINK_INDEX, get
++		 * the ongoing ROC chanctx.
++		 */
++		if (link_index == RTW89_ROC_BY_LINK_INDEX)
++			chanctx_idx = roc_idx;
++	}
++
++	return rtw89_chan_get(rtwdev, chanctx_idx);
++
++dflt:
++	rtw89_debug(rtwdev, RTW89_DBG_CHAN,
++		    "%s (%s): prefetch NULL on link index %u\n",
++		    __func__, caller_message ?: "", link_index);
++
++	return rtw89_chan_get(rtwdev, RTW89_CHANCTX_0);
++}
++EXPORT_SYMBOL(__rtw89_mgnt_chan_get);
++
+ static void rtw89_entity_recalc_mgnt_roles(struct rtw89_dev *rtwdev)
+ {
+ 	struct rtw89_hal *hal = &rtwdev->hal;
+@@ -306,13 +364,18 @@ static void rtw89_entity_recalc_mgnt_roles(struct rtw89_dev *rtwdev)
+ 	struct rtw89_vif_link *link;
+ 	struct rtw89_vif *role;
+ 	u8 pos = 0;
+-	int i;
++	int i, j;
+ 
+ 	lockdep_assert_held(&rtwdev->mutex);
+ 
+ 	for (i = 0; i < RTW89_MAX_INTERFACE_NUM; i++)
+ 		mgnt->active_roles[i] = NULL;
+ 
++	for (i = 0; i < RTW89_MAX_INTERFACE_NUM; i++) {
++		for (j = 0; j < __RTW89_MLD_MAX_LINK_NUM; j++)
++			mgnt->chanctx_tbl[i][j] = RTW89_CHANCTX_IDLE;
++	}
++
+ 	/* To be consistent with legacy behavior, expect the first active role
+ 	 * which uses RTW89_CHANCTX_0 to put at position 0, and make its first
+ 	 * link instance take RTW89_CHANCTX_0. (normalizing)
+@@ -341,6 +404,14 @@ static void rtw89_entity_recalc_mgnt_roles(struct rtw89_dev *rtwdev)
+ 			break;
+ 		}
+ 
++		for (i = 0; i < role->links_inst_valid_num; i++) {
++			link = rtw89_vif_get_link_inst(role, i);
++			if (!link || !link->chanctx_assigned)
++				continue;
++
++			mgnt->chanctx_tbl[pos][i] = link->chanctx_idx;
++		}
++
+ 		mgnt->active_roles[pos++] = role;
+ 	}
+ }
+@@ -371,9 +442,14 @@ enum rtw89_entity_mode rtw89_entity_recalc(struct rtw89_dev *rtwdev)
+ 		set_bit(RTW89_CHANCTX_0, recalc_map);
+ 		fallthrough;
+ 	case 1:
+-		mode = RTW89_ENTITY_MODE_SCC;
++		mode = RTW89_ENTITY_MODE_SCC_OR_SMLD;
+ 		break;
+ 	case 2 ... NUM_OF_RTW89_CHANCTX:
++		if (w.active_roles == 1) {
++			mode = RTW89_ENTITY_MODE_SCC_OR_SMLD;
++			break;
++		}
++
+ 		if (w.active_roles != NUM_OF_RTW89_MCC_ROLES) {
+ 			rtw89_debug(rtwdev, RTW89_DBG_CHAN,
+ 				    "unhandled ent: %d chanctxs %d roles\n",
+diff --git a/drivers/net/wireless/realtek/rtw89/chan.h b/drivers/net/wireless/realtek/rtw89/chan.h
+index 74de13a2e7da..2eb31dff2083 100644
+--- a/drivers/net/wireless/realtek/rtw89/chan.h
++++ b/drivers/net/wireless/realtek/rtw89/chan.h
+@@ -101,6 +101,14 @@ void rtw89_chanctx_track(struct rtw89_dev *rtwdev);
+ void rtw89_chanctx_pause(struct rtw89_dev *rtwdev,
+ 			 enum rtw89_chanctx_pause_reasons rsn);
+ void rtw89_chanctx_proceed(struct rtw89_dev *rtwdev);
++
++const struct rtw89_chan *__rtw89_mgnt_chan_get(struct rtw89_dev *rtwdev,
++					       const char *caller_message,
++					       u8 link_index);
++
++#define rtw89_mgnt_chan_get(rtwdev, link_index) \
++	__rtw89_mgnt_chan_get(rtwdev, __func__, link_index)
++
+ int rtw89_chanctx_ops_add(struct rtw89_dev *rtwdev,
+ 			  struct ieee80211_chanctx_conf *ctx);
+ void rtw89_chanctx_ops_remove(struct rtw89_dev *rtwdev,
+diff --git a/drivers/net/wireless/realtek/rtw89/core.c b/drivers/net/wireless/realtek/rtw89/core.c
+index e864da4d3751..d35d066c0b12 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.c
++++ b/drivers/net/wireless/realtek/rtw89/core.c
+@@ -341,84 +341,47 @@ void rtw89_get_channel_params(const struct cfg80211_chan_def *chandef,
+ 	rtw89_chan_create(chan, center_chan, channel->hw_value, band, bandwidth);
+ }
+ 
+-void rtw89_core_set_chip_txpwr(struct rtw89_dev *rtwdev)
++static void __rtw89_core_set_chip_txpwr(struct rtw89_dev *rtwdev,
++					const struct rtw89_chan *chan,
++					enum rtw89_phy_idx phy_idx)
+ {
+-	struct rtw89_hal *hal = &rtwdev->hal;
+ 	const struct rtw89_chip_info *chip = rtwdev->chip;
+-	const struct rtw89_chan *chan;
+-	enum rtw89_chanctx_idx chanctx_idx;
+-	enum rtw89_chanctx_idx roc_idx;
+-	enum rtw89_phy_idx phy_idx;
+-	enum rtw89_entity_mode mode;
+ 	bool entity_active;
+ 
+-	mode = rtw89_get_entity_mode(rtwdev);
+-	switch (mode) {
+-	case RTW89_ENTITY_MODE_SCC:
+-	case RTW89_ENTITY_MODE_MCC:
+-		chanctx_idx = RTW89_CHANCTX_0;
+-		break;
+-	case RTW89_ENTITY_MODE_MCC_PREPARE:
+-		chanctx_idx = RTW89_CHANCTX_1;
+-		break;
+-	default:
+-		WARN(1, "Invalid ent mode: %d\n", mode);
++	entity_active = rtw89_get_entity_state(rtwdev, phy_idx);
++	if (!entity_active)
+ 		return;
+-	}
+ 
+-	roc_idx = atomic_read(&hal->roc_chanctx_idx);
+-	if (roc_idx != RTW89_CHANCTX_IDLE)
+-		chanctx_idx = roc_idx;
++	chip->ops->set_txpwr(rtwdev, chan, phy_idx);
++}
+ 
+-	phy_idx = RTW89_PHY_0;
++void rtw89_core_set_chip_txpwr(struct rtw89_dev *rtwdev)
++{
++	const struct rtw89_chan *chan;
+ 
+-	entity_active = rtw89_get_entity_state(rtwdev, phy_idx);
+-	if (!entity_active)
++	chan = rtw89_mgnt_chan_get(rtwdev, 0);
++	__rtw89_core_set_chip_txpwr(rtwdev, chan, RTW89_PHY_0);
++
++	if (!rtwdev->support_mlo)
+ 		return;
+ 
+-	chan = rtw89_chan_get(rtwdev, chanctx_idx);
+-	chip->ops->set_txpwr(rtwdev, chan, phy_idx);
++	chan = rtw89_mgnt_chan_get(rtwdev, 1);
++	__rtw89_core_set_chip_txpwr(rtwdev, chan, RTW89_PHY_1);
+ }
+ 
+-int rtw89_set_channel(struct rtw89_dev *rtwdev)
++static void __rtw89_set_channel(struct rtw89_dev *rtwdev,
++				const struct rtw89_chan *chan,
++				enum rtw89_mac_idx mac_idx,
++				enum rtw89_phy_idx phy_idx)
+ {
+-	struct rtw89_hal *hal = &rtwdev->hal;
+ 	const struct rtw89_chip_info *chip = rtwdev->chip;
+ 	const struct rtw89_chan_rcd *chan_rcd;
+-	const struct rtw89_chan *chan;
+-	enum rtw89_chanctx_idx chanctx_idx;
+-	enum rtw89_chanctx_idx roc_idx;
+-	enum rtw89_mac_idx mac_idx;
+-	enum rtw89_phy_idx phy_idx;
+ 	struct rtw89_channel_help_params bak;
+-	enum rtw89_entity_mode mode;
+ 	bool entity_active;
+ 
+-	mode = rtw89_entity_recalc(rtwdev);
+-	switch (mode) {
+-	case RTW89_ENTITY_MODE_SCC:
+-	case RTW89_ENTITY_MODE_MCC:
+-		chanctx_idx = RTW89_CHANCTX_0;
+-		break;
+-	case RTW89_ENTITY_MODE_MCC_PREPARE:
+-		chanctx_idx = RTW89_CHANCTX_1;
+-		break;
+-	default:
+-		WARN(1, "Invalid ent mode: %d\n", mode);
+-		return -EINVAL;
+-	}
+-
+-	roc_idx = atomic_read(&hal->roc_chanctx_idx);
+-	if (roc_idx != RTW89_CHANCTX_IDLE)
+-		chanctx_idx = roc_idx;
+-
+-	mac_idx = RTW89_MAC_0;
+-	phy_idx = RTW89_PHY_0;
+-
+ 	entity_active = rtw89_get_entity_state(rtwdev, phy_idx);
+ 
+-	chan = rtw89_chan_get(rtwdev, chanctx_idx);
+-	chan_rcd = rtw89_chan_rcd_get(rtwdev, chanctx_idx);
++	chan_rcd = rtw89_chan_rcd_get_by_chan(chan);
+ 
+ 	rtw89_chip_set_channel_prepare(rtwdev, &bak, chan, mac_idx, phy_idx);
+ 
+@@ -434,6 +397,28 @@ int rtw89_set_channel(struct rtw89_dev *rtwdev)
+ 	}
+ 
+ 	rtw89_set_entity_state(rtwdev, phy_idx, true);
++}
++
++int rtw89_set_channel(struct rtw89_dev *rtwdev)
++{
++	const struct rtw89_chan *chan;
++	enum rtw89_entity_mode mode;
++
++	mode = rtw89_entity_recalc(rtwdev);
++	if (mode < 0 || mode >= NUM_OF_RTW89_ENTITY_MODE) {
++		WARN(1, "Invalid ent mode: %d\n", mode);
++		return -EINVAL;
++	}
++
++	chan = rtw89_mgnt_chan_get(rtwdev, 0);
++	__rtw89_set_channel(rtwdev, chan, RTW89_MAC_0, RTW89_PHY_0);
++
++	if (!rtwdev->support_mlo)
++		return 0;
++
++	chan = rtw89_mgnt_chan_get(rtwdev, 1);
++	__rtw89_set_channel(rtwdev, chan, RTW89_MAC_1, RTW89_PHY_1);
++
+ 	return 0;
+ }
+ 
+@@ -3158,9 +3143,10 @@ void rtw89_roc_start(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif)
+ 	rtw89_leave_ips_by_hwflags(rtwdev);
+ 	rtw89_leave_lps(rtwdev);
+ 
+-	rtwvif_link = rtw89_vif_get_link_inst(rtwvif, 0);
++	rtwvif_link = rtw89_vif_get_link_inst(rtwvif, RTW89_ROC_BY_LINK_INDEX);
+ 	if (unlikely(!rtwvif_link)) {
+-		rtw89_err(rtwdev, "roc start: find no link on HW-0\n");
++		rtw89_err(rtwdev, "roc start: find no link on HW-%u\n",
++			  RTW89_ROC_BY_LINK_INDEX);
+ 		return;
+ 	}
+ 
+@@ -3212,9 +3198,10 @@ void rtw89_roc_end(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif)
+ 	rtw89_leave_ips_by_hwflags(rtwdev);
+ 	rtw89_leave_lps(rtwdev);
+ 
+-	rtwvif_link = rtw89_vif_get_link_inst(rtwvif, 0);
++	rtwvif_link = rtw89_vif_get_link_inst(rtwvif, RTW89_ROC_BY_LINK_INDEX);
+ 	if (unlikely(!rtwvif_link)) {
+-		rtw89_err(rtwdev, "roc end: find no link on HW-0\n");
++		rtw89_err(rtwdev, "roc end: find no link on HW-%u\n",
++			  RTW89_ROC_BY_LINK_INDEX);
+ 		return;
+ 	}
+ 
+diff --git a/drivers/net/wireless/realtek/rtw89/core.h b/drivers/net/wireless/realtek/rtw89/core.h
+index 65ad3d03d053..ff3048d2489f 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.h
++++ b/drivers/net/wireless/realtek/rtw89/core.h
+@@ -3424,6 +3424,8 @@ enum rtw89_roc_state {
+ 	RTW89_ROC_MGMT,
+ };
+ 
++#define RTW89_ROC_BY_LINK_INDEX 0
++
+ struct rtw89_roc {
+ 	struct ieee80211_channel chan;
+ 	struct delayed_work roc_work;
+@@ -4619,7 +4621,7 @@ enum rtw89_chanctx_changes {
+ };
+ 
+ enum rtw89_entity_mode {
+-	RTW89_ENTITY_MODE_SCC,
++	RTW89_ENTITY_MODE_SCC_OR_SMLD,
+ 	RTW89_ENTITY_MODE_MCC_PREPARE,
+ 	RTW89_ENTITY_MODE_MCC,
+ 
+@@ -4634,6 +4636,8 @@ enum rtw89_entity_mode {
+ struct rtw89_entity_mgnt {
+ 	struct list_head active_list;
+ 	struct rtw89_vif *active_roles[RTW89_MAX_INTERFACE_NUM];
++	enum rtw89_chanctx_idx chanctx_tbl[RTW89_MAX_INTERFACE_NUM]
++					  [__RTW89_MLD_MAX_LINK_NUM];
+ };
+ 
+ struct rtw89_chanctx {
+@@ -6371,6 +6375,15 @@ const struct rtw89_chan_rcd *rtw89_chan_rcd_get(struct rtw89_dev *rtwdev,
+ 	return &hal->chanctx[idx].rcd;
+ }
+ 
++static inline
++const struct rtw89_chan_rcd *rtw89_chan_rcd_get_by_chan(const struct rtw89_chan *chan)
++{
++	const struct rtw89_chanctx *chanctx =
++		container_of_const(chan, struct rtw89_chanctx, chan);
++
++	return &chanctx->rcd;
++}
++
+ static inline
+ const struct rtw89_chan *rtw89_scan_chan_get(struct rtw89_dev *rtwdev)
+ {
+-- 
+2.48.0
+
