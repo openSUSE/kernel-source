@@ -1,0 +1,202 @@
+From: Nicolin Chen <nicolinc@nvidia.com>
+Date: Fri, 17 Jan 2025 11:29:01 -0800
+Subject: [PATCH] iommufd/fault: Use a separate spinlock to protect
+ fault->deliver list
+References: bsc#1012628
+Patch-mainline: 6.13.3
+Git-commit: 3d49020a327cd7d069059317c11df24e407ccfa3
+
+commit 3d49020a327cd7d069059317c11df24e407ccfa3 upstream.
+
+The fault->mutex serializes the fault read()/write() fops and the
+iommufd_fault_auto_response_faults(), mainly for fault->response. Also, it
+was conveniently used to fence the fault->deliver in poll() fop and
+iommufd_fault_iopf_handler().
+
+However, copy_from/to_user() may sleep if pagefaults are enabled. Thus,
+they could take a long time to wait for user pages to swap in, blocking
+iommufd_fault_iopf_handler() and its caller that is typically a shared IRQ
+handler of an IOMMU driver, resulting in a potential global DOS.
+
+Instead of reusing the mutex to protect the fault->deliver list, add a
+separate spinlock, nested under the mutex, to do the job.
+iommufd_fault_iopf_handler() would no longer be blocked by
+copy_from/to_user().
+
+Add a free_list in iommufd_auto_response_faults(), so the spinlock can
+simply fence a fast list_for_each_entry_safe routine.
+
+Provide two deliver list helpers for iommufd_fault_fops_read() to use:
+ - Fetch the first iopf_group out of the fault->deliver list
+ - Restore an iopf_group back to the head of the fault->deliver list
+
+Lastly, move the mutex closer to the response in the fault structure,
+and update its kdoc accordingly.
+
+Fixes: 07838f7fd529 ("iommufd: Add iommufd fault object")
+Link: https://patch.msgid.link/r/20250117192901.79491-1-nicolinc@nvidia.com
+Cc: stable@vger.kernel.org
+Suggested-by: Jason Gunthorpe <jgg@nvidia.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Reviewed-by: Lu Baolu <baolu.lu@linux.intel.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Nicolin Chen <nicolinc@nvidia.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/iommu/iommufd/fault.c           | 34 ++++++++++++++++---------
+ drivers/iommu/iommufd/iommufd_private.h | 29 +++++++++++++++++++--
+ 2 files changed, 49 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/iommu/iommufd/fault.c b/drivers/iommu/iommufd/fault.c
+index 58bfea7b42ab..d9a937450e55 100644
+--- a/drivers/iommu/iommufd/fault.c
++++ b/drivers/iommu/iommufd/fault.c
+@@ -103,15 +103,23 @@ static void iommufd_auto_response_faults(struct iommufd_hw_pagetable *hwpt,
+ {
+ 	struct iommufd_fault *fault = hwpt->fault;
+ 	struct iopf_group *group, *next;
++	struct list_head free_list;
+ 	unsigned long index;
+ 
+ 	if (!fault)
+ 		return;
++	INIT_LIST_HEAD(&free_list);
+ 
+ 	mutex_lock(&fault->mutex);
++	spin_lock(&fault->lock);
+ 	list_for_each_entry_safe(group, next, &fault->deliver, node) {
+ 		if (group->attach_handle != &handle->handle)
+ 			continue;
++		list_move(&group->node, &free_list);
++	}
++	spin_unlock(&fault->lock);
++
++	list_for_each_entry_safe(group, next, &free_list, node) {
+ 		list_del(&group->node);
+ 		iopf_group_response(group, IOMMU_PAGE_RESP_INVALID);
+ 		iopf_free_group(group);
+@@ -266,17 +274,19 @@ static ssize_t iommufd_fault_fops_read(struct file *filep, char __user *buf,
+ 		return -ESPIPE;
+ 
+ 	mutex_lock(&fault->mutex);
+-	while (!list_empty(&fault->deliver) && count > done) {
+-		group = list_first_entry(&fault->deliver,
+-					 struct iopf_group, node);
+-
+-		if (group->fault_count * fault_size > count - done)
++	while ((group = iommufd_fault_deliver_fetch(fault))) {
++		if (done >= count ||
++		    group->fault_count * fault_size > count - done) {
++			iommufd_fault_deliver_restore(fault, group);
+ 			break;
++		}
+ 
+ 		rc = xa_alloc(&fault->response, &group->cookie, group,
+ 			      xa_limit_32b, GFP_KERNEL);
+-		if (rc)
++		if (rc) {
++			iommufd_fault_deliver_restore(fault, group);
+ 			break;
++		}
+ 
+ 		idev = to_iommufd_handle(group->attach_handle)->idev;
+ 		list_for_each_entry(iopf, &group->faults, list) {
+@@ -285,13 +295,12 @@ static ssize_t iommufd_fault_fops_read(struct file *filep, char __user *buf,
+ 						      group->cookie);
+ 			if (copy_to_user(buf + done, &data, fault_size)) {
+ 				xa_erase(&fault->response, group->cookie);
++				iommufd_fault_deliver_restore(fault, group);
+ 				rc = -EFAULT;
+ 				break;
+ 			}
+ 			done += fault_size;
+ 		}
+-
+-		list_del(&group->node);
+ 	}
+ 	mutex_unlock(&fault->mutex);
+ 
+@@ -349,10 +358,10 @@ static __poll_t iommufd_fault_fops_poll(struct file *filep,
+ 	__poll_t pollflags = EPOLLOUT;
+ 
+ 	poll_wait(filep, &fault->wait_queue, wait);
+-	mutex_lock(&fault->mutex);
++	spin_lock(&fault->lock);
+ 	if (!list_empty(&fault->deliver))
+ 		pollflags |= EPOLLIN | EPOLLRDNORM;
+-	mutex_unlock(&fault->mutex);
++	spin_unlock(&fault->lock);
+ 
+ 	return pollflags;
+ }
+@@ -394,6 +403,7 @@ int iommufd_fault_alloc(struct iommufd_ucmd *ucmd)
+ 	INIT_LIST_HEAD(&fault->deliver);
+ 	xa_init_flags(&fault->response, XA_FLAGS_ALLOC1);
+ 	mutex_init(&fault->mutex);
++	spin_lock_init(&fault->lock);
+ 	init_waitqueue_head(&fault->wait_queue);
+ 
+ 	filep = anon_inode_getfile("[iommufd-pgfault]", &iommufd_fault_fops,
+@@ -442,9 +452,9 @@ int iommufd_fault_iopf_handler(struct iopf_group *group)
+ 	hwpt = group->attach_handle->domain->fault_data;
+ 	fault = hwpt->fault;
+ 
+-	mutex_lock(&fault->mutex);
++	spin_lock(&fault->lock);
+ 	list_add_tail(&group->node, &fault->deliver);
+-	mutex_unlock(&fault->mutex);
++	spin_unlock(&fault->lock);
+ 
+ 	wake_up_interruptible(&fault->wait_queue);
+ 
+diff --git a/drivers/iommu/iommufd/iommufd_private.h b/drivers/iommu/iommufd/iommufd_private.h
+index b6d706cf2c66..0b1bafc7fd99 100644
+--- a/drivers/iommu/iommufd/iommufd_private.h
++++ b/drivers/iommu/iommufd/iommufd_private.h
+@@ -443,14 +443,39 @@ struct iommufd_fault {
+ 	struct iommufd_ctx *ictx;
+ 	struct file *filep;
+ 
+-	/* The lists of outstanding faults protected by below mutex. */
+-	struct mutex mutex;
++	spinlock_t lock; /* protects the deliver list */
+ 	struct list_head deliver;
++	struct mutex mutex; /* serializes response flows */
+ 	struct xarray response;
+ 
+ 	struct wait_queue_head wait_queue;
+ };
+ 
++/* Fetch the first node out of the fault->deliver list */
++static inline struct iopf_group *
++iommufd_fault_deliver_fetch(struct iommufd_fault *fault)
++{
++	struct list_head *list = &fault->deliver;
++	struct iopf_group *group = NULL;
++
++	spin_lock(&fault->lock);
++	if (!list_empty(list)) {
++		group = list_first_entry(list, struct iopf_group, node);
++		list_del(&group->node);
++	}
++	spin_unlock(&fault->lock);
++	return group;
++}
++
++/* Restore a node back to the head of the fault->deliver list */
++static inline void iommufd_fault_deliver_restore(struct iommufd_fault *fault,
++						 struct iopf_group *group)
++{
++	spin_lock(&fault->lock);
++	list_add(&group->node, &fault->deliver);
++	spin_unlock(&fault->lock);
++}
++
+ struct iommufd_attach_handle {
+ 	struct iommu_attach_handle handle;
+ 	struct iommufd_device *idev;
+-- 
+2.47.0
+

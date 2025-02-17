@@ -1,0 +1,153 @@
+From: Philip Yang <Philip.Yang@amd.com>
+Date: Tue, 26 Nov 2024 11:33:15 -0500
+Subject: [PATCH] drm/amdkfd: Queue interrupt work to different CPU
+References: bsc#1012628
+Patch-mainline: 6.13.3
+Git-commit: 34db5a32617d102e8042151bb87590e43c97132e
+
+[ Upstream commit 34db5a32617d102e8042151bb87590e43c97132e ]
+
+For CPX mode, each KFD node has interrupt worker to process ih_fifo to
+send events to user space. Currently all interrupt workers of same adev
+queue to same CPU, all workers execution are actually serialized and
+this cause KFD ih_fifo overflow when CPU usage is high.
+
+Use per-GPU unbounded highpri queue with number of workers equals to
+number of partitions, let queue_work select the next CPU round robin
+among the local CPUs of same NUMA.
+
+Signed-off-by: Philip Yang <Philip.Yang@amd.com>
+Reviewed-by: Felix Kuehling <felix.kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c    | 25 ++++++++--------------
+ drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c | 25 ++++++++--------------
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h      |  3 ++-
+ 3 files changed, 20 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 9b51dd75fefc..35caa71f317d 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -638,6 +638,14 @@ static void kfd_cleanup_nodes(struct kfd_dev *kfd, unsigned int num_nodes)
+ 	struct kfd_node *knode;
+ 	unsigned int i;
+ 
++	/*
++	 * flush_work ensures that there are no outstanding
++	 * work-queue items that will access interrupt_ring. New work items
++	 * can't be created because we stopped interrupt handling above.
++	 */
++	flush_workqueue(kfd->ih_wq);
++	destroy_workqueue(kfd->ih_wq);
++
+ 	for (i = 0; i < num_nodes; i++) {
+ 		knode = kfd->nodes[i];
+ 		device_queue_manager_uninit(knode->dqm);
+@@ -1059,21 +1067,6 @@ static int kfd_resume(struct kfd_node *node)
+ 	return err;
+ }
+ 
+-static inline void kfd_queue_work(struct workqueue_struct *wq,
+-				  struct work_struct *work)
+-{
+-	int cpu, new_cpu;
+-
+-	cpu = new_cpu = smp_processor_id();
+-	do {
+-		new_cpu = cpumask_next(new_cpu, cpu_online_mask) % nr_cpu_ids;
+-		if (cpu_to_node(new_cpu) == numa_node_id())
+-			break;
+-	} while (cpu != new_cpu);
+-
+-	queue_work_on(new_cpu, wq, work);
+-}
+-
+ /* This is called directly from KGD at ISR. */
+ void kgd2kfd_interrupt(struct kfd_dev *kfd, const void *ih_ring_entry)
+ {
+@@ -1099,7 +1092,7 @@ void kgd2kfd_interrupt(struct kfd_dev *kfd, const void *ih_ring_entry)
+ 			    	patched_ihre, &is_patched)
+ 		    && enqueue_ih_ring_entry(node,
+ 			    	is_patched ? patched_ihre : ih_ring_entry)) {
+-			kfd_queue_work(node->ih_wq, &node->interrupt_work);
++			queue_work(node->kfd->ih_wq, &node->interrupt_work);
+ 			spin_unlock_irqrestore(&node->interrupt_lock, flags);
+ 			return;
+ 		}
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c b/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c
+index 9b6b6e882593..15b4b70cf199 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c
+@@ -62,11 +62,14 @@ int kfd_interrupt_init(struct kfd_node *node)
+ 		return r;
+ 	}
+ 
+-	node->ih_wq = alloc_workqueue("KFD IH", WQ_HIGHPRI, 1);
+-	if (unlikely(!node->ih_wq)) {
+-		kfifo_free(&node->ih_fifo);
+-		dev_err(node->adev->dev, "Failed to allocate KFD IH workqueue\n");
+-		return -ENOMEM;
++	if (!node->kfd->ih_wq) {
++		node->kfd->ih_wq = alloc_workqueue("KFD IH", WQ_HIGHPRI | WQ_UNBOUND,
++						   node->kfd->num_nodes);
++		if (unlikely(!node->kfd->ih_wq)) {
++			kfifo_free(&node->ih_fifo);
++			dev_err(node->adev->dev, "Failed to allocate KFD IH workqueue\n");
++			return -ENOMEM;
++		}
+ 	}
+ 	spin_lock_init(&node->interrupt_lock);
+ 
+@@ -96,16 +99,6 @@ void kfd_interrupt_exit(struct kfd_node *node)
+ 	spin_lock_irqsave(&node->interrupt_lock, flags);
+ 	node->interrupts_active = false;
+ 	spin_unlock_irqrestore(&node->interrupt_lock, flags);
+-
+-	/*
+-	 * flush_work ensures that there are no outstanding
+-	 * work-queue items that will access interrupt_ring. New work items
+-	 * can't be created because we stopped interrupt handling above.
+-	 */
+-	flush_workqueue(node->ih_wq);
+-
+-	destroy_workqueue(node->ih_wq);
+-
+ 	kfifo_free(&node->ih_fifo);
+ }
+ 
+@@ -162,7 +155,7 @@ static void interrupt_wq(struct work_struct *work)
+ 			/* If we spent more than a second processing signals,
+ 			 * reschedule the worker to avoid soft-lockup warnings
+ 			 */
+-			queue_work(dev->ih_wq, &dev->interrupt_work);
++			queue_work(dev->kfd->ih_wq, &dev->interrupt_work);
+ 			break;
+ 		}
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 9e5ca0b93b2a..74881a5ca59a 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -273,7 +273,6 @@ struct kfd_node {
+ 
+ 	/* Interrupts */
+ 	struct kfifo ih_fifo;
+-	struct workqueue_struct *ih_wq;
+ 	struct work_struct interrupt_work;
+ 	spinlock_t interrupt_lock;
+ 
+@@ -366,6 +365,8 @@ struct kfd_dev {
+ 	struct kfd_node *nodes[MAX_KFD_NODES];
+ 	unsigned int num_nodes;
+ 
++	struct workqueue_struct *ih_wq;
++
+ 	/* Kernel doorbells for KFD device */
+ 	struct amdgpu_bo *doorbells;
+ 
+-- 
+2.47.0
+
