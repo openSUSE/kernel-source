@@ -1,0 +1,238 @@
+From e938a0167d886caf9a54bae5a0c4442c2a7aaae4 Mon Sep 17 00:00:00 2001
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Tue, 12 Nov 2024 10:28:26 -0500
+Subject: [PATCH] rseq: Validate read-only fields under DEBUG_RSEQ config
+
+References: bsc#1234634 (Scheduler functional and performance backports)
+Patch-mainline: v6.14-rc1
+Git-commit: 7d5265ffcd8b41da5e09066360540d6e0716e9cd
+
+The rseq uapi requires cooperation between users of the rseq fields
+to ensure that all libraries and applications using rseq within a
+process do not interfere with each other.
+
+This is especially important for fields which are meant to be read-only
+from user-space, as documented in uapi/linux/rseq.h:
+
+  - cpu_id_start,
+  - cpu_id,
+  - node_id,
+  - mm_cid.
+
+Storing to those fields from a user-space library prevents any sharing
+of the rseq ABI with other libraries and applications, as other users
+are not aware that the content of those fields has been altered by a
+third-party library.
+
+This is unfortunately the current behavior of tcmalloc: it purposefully
+overlaps part of a cached value with the cpu_id_start upper bits to get
+notified about preemption, because the kernel clears those upper bits
+before returning to user-space. This behavior does not conform to the
+rseq uapi header ABI.
+
+This prevents tcmalloc from using rseq when rseq is registered by the
+GNU C library 2.35+. It requires tcmalloc users to disable glibc rseq
+registration with a glibc tunable, which is a sad state of affairs.
+
+Considering that tcmalloc and the GNU C library are the two first
+upstream projects using rseq, and that they are already incompatible due
+to use of this hack, adding kernel-level validation of all read-only
+fields content is necessary to ensure future users of rseq abide by the
+rseq ABI requirements.
+
+Validate that user-space does not corrupt the read-only fields and
+conform to the rseq uapi header ABI when the kernel is built with
+CONFIG_DEBUG_RSEQ=y. This is done by storing a copy of the read-only
+fields in the task_struct, and validating the prior values present in
+user-space before updating them. If the values do not match, print
+a warning on the console (printk_ratelimited()).
+
+This is a first step to identify misuses of the rseq ABI by printing
+a warning on the console. After a giving some time to userspace to
+correct its use of rseq, the plan is to eventually terminate offending
+processes with SIGSEGV.
+
+This change is expected to produce warnings for the upstream tcmalloc
+implementation, but tcmalloc developers mentioned they were open to
+adapt their implementation to kernel-level change.
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://github.com/google/tcmalloc/issues/144
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ include/linux/sched.h |  9 +++++
+ kernel/rseq.c         | 98 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 107 insertions(+)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 40c75c44b4e9..e6a5b594a26a 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1373,6 +1373,15 @@ struct task_struct {
+ 	 * with respect to preemption.
+ 	 */
+ 	unsigned long rseq_event_mask;
++# ifdef CONFIG_DEBUG_RSEQ
++	/*
++	 * This is a place holder to save a copy of the rseq fields for
++	 * validation of read-only fields. The struct rseq has a
++	 * variable-length array at the end, so it cannot be used
++	 * directly. Reserve a size large enough for the known fields.
++	 */
++	char				rseq_fields[sizeof(struct rseq)];
++# endif
+ #endif
+ 
+ #ifdef CONFIG_SCHED_MM_CID
+diff --git a/kernel/rseq.c b/kernel/rseq.c
+index 9de6e35fe679..e04bb30a2eb8 100644
+--- a/kernel/rseq.c
++++ b/kernel/rseq.c
+@@ -13,6 +13,7 @@
+ #include <linux/syscalls.h>
+ #include <linux/rseq.h>
+ #include <linux/types.h>
++#include <linux/ratelimit.h>
+ #include <asm/ptrace.h>
+ 
+ #define CREATE_TRACE_POINTS
+@@ -25,6 +26,78 @@
+ 				  RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL | \
+ 				  RSEQ_CS_FLAG_NO_RESTART_ON_MIGRATE)
+ 
++#ifdef CONFIG_DEBUG_RSEQ
++static struct rseq *rseq_kernel_fields(struct task_struct *t)
++{
++	return (struct rseq *) t->rseq_fields;
++}
++
++static int rseq_validate_ro_fields(struct task_struct *t)
++{
++	static DEFINE_RATELIMIT_STATE(_rs,
++				      DEFAULT_RATELIMIT_INTERVAL,
++				      DEFAULT_RATELIMIT_BURST);
++	u32 cpu_id_start, cpu_id, node_id, mm_cid;
++	struct rseq __user *rseq = t->rseq;
++
++	/*
++	 * Validate fields which are required to be read-only by
++	 * user-space.
++	 */
++	if (!user_read_access_begin(rseq, t->rseq_len))
++		goto efault;
++	unsafe_get_user(cpu_id_start, &rseq->cpu_id_start, efault_end);
++	unsafe_get_user(cpu_id, &rseq->cpu_id, efault_end);
++	unsafe_get_user(node_id, &rseq->node_id, efault_end);
++	unsafe_get_user(mm_cid, &rseq->mm_cid, efault_end);
++	user_read_access_end();
++
++	if ((cpu_id_start != rseq_kernel_fields(t)->cpu_id_start ||
++	    cpu_id != rseq_kernel_fields(t)->cpu_id ||
++	    node_id != rseq_kernel_fields(t)->node_id ||
++	    mm_cid != rseq_kernel_fields(t)->mm_cid) && __ratelimit(&_rs)) {
++
++		pr_warn("Detected rseq corruption for pid: %d, name: %s\n"
++			"\tcpu_id_start: %u ?= %u\n"
++			"\tcpu_id:       %u ?= %u\n"
++			"\tnode_id:      %u ?= %u\n"
++			"\tmm_cid:       %u ?= %u\n",
++			t->pid, t->comm,
++			cpu_id_start, rseq_kernel_fields(t)->cpu_id_start,
++			cpu_id, rseq_kernel_fields(t)->cpu_id,
++			node_id, rseq_kernel_fields(t)->node_id,
++			mm_cid, rseq_kernel_fields(t)->mm_cid);
++	}
++
++	/* For now, only print a console warning on mismatch. */
++	return 0;
++
++efault_end:
++	user_read_access_end();
++efault:
++	return -EFAULT;
++}
++
++static void rseq_set_ro_fields(struct task_struct *t, u32 cpu_id_start, u32 cpu_id,
++			       u32 node_id, u32 mm_cid)
++{
++	rseq_kernel_fields(t)->cpu_id_start = cpu_id;
++	rseq_kernel_fields(t)->cpu_id = cpu_id;
++	rseq_kernel_fields(t)->node_id = node_id;
++	rseq_kernel_fields(t)->mm_cid = mm_cid;
++}
++#else
++static int rseq_validate_ro_fields(struct task_struct *t)
++{
++	return 0;
++}
++
++static void rseq_set_ro_fields(struct task_struct *t, u32 cpu_id_start, u32 cpu_id,
++			       u32 node_id, u32 mm_cid)
++{
++}
++#endif
++
+ /*
+  *
+  * Restartable sequences are a lightweight interface that allows
+@@ -92,6 +165,11 @@ static int rseq_update_cpu_node_id(struct task_struct *t)
+ 	u32 node_id = cpu_to_node(cpu_id);
+ 	u32 mm_cid = task_mm_cid(t);
+ 
++	/*
++	 * Validate read-only rseq fields.
++	 */
++	if (rseq_validate_ro_fields(t))
++		goto efault;
+ 	WARN_ON_ONCE((int) mm_cid < 0);
+ 	if (!user_write_access_begin(rseq, t->rseq_len))
+ 		goto efault;
+@@ -105,6 +183,7 @@ static int rseq_update_cpu_node_id(struct task_struct *t)
+ 	 * t->rseq_len != ORIG_RSEQ_SIZE.
+ 	 */
+ 	user_write_access_end();
++	rseq_set_ro_fields(t, cpu_id, cpu_id, node_id, mm_cid);
+ 	trace_rseq_update(t);
+ 	return 0;
+ 
+@@ -119,6 +198,11 @@ static int rseq_reset_rseq_cpu_node_id(struct task_struct *t)
+ 	u32 cpu_id_start = 0, cpu_id = RSEQ_CPU_ID_UNINITIALIZED, node_id = 0,
+ 	    mm_cid = 0;
+ 
++	/*
++	 * Validate read-only rseq fields.
++	 */
++	if (!rseq_validate_ro_fields(t))
++		return -EFAULT;
+ 	/*
+ 	 * Reset cpu_id_start to its initial state (0).
+ 	 */
+@@ -141,6 +225,9 @@ static int rseq_reset_rseq_cpu_node_id(struct task_struct *t)
+ 	 */
+ 	if (put_user(mm_cid, &t->rseq->mm_cid))
+ 		return -EFAULT;
++
++	rseq_set_ro_fields(t, cpu_id_start, cpu_id, node_id, mm_cid);
++
+ 	/*
+ 	 * Additional feature fields added after ORIG_RSEQ_SIZE
+ 	 * need to be conditionally reset only if
+@@ -423,6 +510,17 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
+ 	current->rseq = rseq;
+ 	current->rseq_len = rseq_len;
+ 	current->rseq_sig = sig;
++#ifdef CONFIG_DEBUG_RSEQ
++	/*
++	 * Initialize the in-kernel rseq fields copy for validation of
++	 * read-only fields.
++	 */
++	if (get_user(rseq_kernel_fields(current)->cpu_id_start, &rseq->cpu_id_start) ||
++	    get_user(rseq_kernel_fields(current)->cpu_id, &rseq->cpu_id) ||
++	    get_user(rseq_kernel_fields(current)->node_id, &rseq->node_id) ||
++	    get_user(rseq_kernel_fields(current)->mm_cid, &rseq->mm_cid))
++		return -EFAULT;
++#endif
+ 	/*
+ 	 * If rseq was previously inactive, and has just been
+ 	 * registered, ensure the cpu_id_start and cpu_id fields
