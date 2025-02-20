@@ -17,7 +17,6 @@ from git_sort import git_sort
 from git_sort import lib
 
 
-@unittest.skip("Patched quilt not maintained")
 class TestQuiltMode(unittest.TestCase):
     def setUp(self):
         os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
@@ -400,7 +399,6 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
         self.assertEqual(retval.decode().strip(), "M  series.conf")
 
 
-@unittest.skip("Patched quilt not maintained")
 class TestQCP(unittest.TestCase):
     def setUp(self):
         os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
