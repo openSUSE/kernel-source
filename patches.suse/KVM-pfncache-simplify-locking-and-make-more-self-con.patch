@@ -1,0 +1,156 @@
+Patch-mainline: v6.9-rc1
+Git-commit: 6addfcf27139da1356493f2a440af1252b5b7dbe
+References: jsc#PED-348
+From: David Woodhouse <dwmw@amazon.co.uk>
+Date: Tue, 27 Feb 2024 11:49:18 +0000
+Subject: [PATCH] KVM: pfncache: simplify locking and make more self-contained
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The locking on the gfn_to_pfn_cache is... interesting. And awful.
+
+There is a rwlock in ->lock which readers take to ensure protection
+against concurrent changes. But __kvm_gpc_refresh() makes assumptions
+that certain fields will not change even while it drops the write lock
+and performs MM operations to revalidate the target PFN and kernel
+mapping.
+
+Commit 93984f19e7bc ("KVM: Fully serialize gfn=>pfn cache refresh via
+mutex") partly addressed that — not by fixing it, but by adding a new
+mutex, ->refresh_lock. This prevented concurrent __kvm_gpc_refresh()
+calls on a given gfn_to_pfn_cache, but is still only a partial solution.
+
+There is still a theoretical race where __kvm_gpc_refresh() runs in
+parallel with kvm_gpc_deactivate(). While __kvm_gpc_refresh() has
+dropped the write lock, kvm_gpc_deactivate() clears the ->active flag
+and unmaps ->khva. Then __kvm_gpc_refresh() determines that the previous
+->pfn and ->khva are still valid, and reinstalls those values into the
+structure. This leaves the gfn_to_pfn_cache with the ->valid bit set,
+but ->active clear. And a ->khva which looks like a reasonable kernel
+address but is actually unmapped.
+
+All it takes is a subsequent reactivation to cause that ->khva to be
+dereferenced. This would theoretically cause an oops which would look
+something like this:
+
+[1724749.564994] BUG: unable to handle page fault for address: ffffaa3540ace0e0
+[1724749.565039] RIP: 0010:__kvm_xen_has_interrupt+0x8b/0xb0
+
+I say "theoretically" because theoretically, that oops that was seen in
+production cannot happen. The code which uses the gfn_to_pfn_cache is
+supposed to have its *own* locking, to further paper over the fact that
+the gfn_to_pfn_cache's own papering-over (->refresh_lock) of its own
+rwlock abuse is not sufficient.
+
+For the Xen vcpu_info that external lock is the vcpu->mutex, and for the
+shared info it's kvm->arch.xen.xen_lock. Those locks ought to protect
+the gfn_to_pfn_cache against concurrent deactivation vs. refresh in all
+but the cases where the vcpu or kvm object is being *destroyed*, in
+which case the subsequent reactivation should never happen.
+
+Theoretically.
+
+Nevertheless, this locking abuse is awful and should be fixed, even if
+no clear explanation can be found for how the oops happened. So expand
+the use of the ->refresh_lock mutex to ensure serialization of
+activate/deactivate vs. refresh and make the pfncache locking entirely
+self-sufficient.
+
+This means that a future commit can simplify the locking in the callers,
+such as the Xen emulation code which has an outstanding problem with
+recursive locking of kvm->arch.xen.xen_lock, which will no longer be
+necessary.
+
+The rwlock abuse described above is still not best practice, although
+it's harmless now that the ->refresh_lock is held for the entire duration
+while the offending code drops the write lock, does some other stuff,
+then takes the write lock again and assumes nothing changed. That can
+also be fixed^W cleaned up in a subsequent commit, but this commit is
+a simpler basis for the Xen deadlock fix mentioned above.
+
+Signed-off-by: David Woodhouse <dwmw@amazon.co.uk>
+Reviewed-by: Paul Durrant <paul@xen.org>
+Link: https://lore.kernel.org/r/20240227115648.3104-5-dwmw2@infradead.org
+[sean: use guard(mutex) to fix a missed unlock]
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ virt/kvm/pfncache.c | 21 +++++++++++----------
+ 1 file changed, 11 insertions(+), 10 deletions(-)
+
+diff --git a/virt/kvm/pfncache.c b/virt/kvm/pfncache.c
+index 9ac8c9da4eda..4e07112a24c2 100644
+--- a/virt/kvm/pfncache.c
++++ b/virt/kvm/pfncache.c
+@@ -256,12 +256,7 @@ static int __kvm_gpc_refresh(struct gfn_to_pfn_cache *gpc, gpa_t gpa, unsigned l
+ 	if (page_offset + len > PAGE_SIZE)
+ 		return -EINVAL;
+ 
+-	/*
+-	 * If another task is refreshing the cache, wait for it to complete.
+-	 * There is no guarantee that concurrent refreshes will see the same
+-	 * gpa, memslots generation, etc..., so they must be fully serialized.
+-	 */
+-	mutex_lock(&gpc->refresh_lock);
++	lockdep_assert_held(&gpc->refresh_lock);
+ 
+ 	write_lock_irq(&gpc->lock);
+ 
+@@ -347,8 +342,6 @@ static int __kvm_gpc_refresh(struct gfn_to_pfn_cache *gpc, gpa_t gpa, unsigned l
+ out_unlock:
+ 	write_unlock_irq(&gpc->lock);
+ 
+-	mutex_unlock(&gpc->refresh_lock);
+-
+ 	if (unmap_old)
+ 		gpc_unmap(old_pfn, old_khva);
+ 
+@@ -357,13 +350,16 @@ static int __kvm_gpc_refresh(struct gfn_to_pfn_cache *gpc, gpa_t gpa, unsigned l
+ 
+ int kvm_gpc_refresh(struct gfn_to_pfn_cache *gpc, unsigned long len)
+ {
++	unsigned long uhva;
++
++	guard(mutex)(&gpc->refresh_lock);
++
+ 	/*
+ 	 * If the GPA is valid then ignore the HVA, as a cache can be GPA-based
+ 	 * or HVA-based, not both.  For GPA-based caches, the HVA will be
+ 	 * recomputed during refresh if necessary.
+ 	 */
+-	unsigned long uhva = kvm_is_error_gpa(gpc->gpa) ? gpc->uhva :
+-							  KVM_HVA_ERR_BAD;
++	uhva = kvm_is_error_gpa(gpc->gpa) ? gpc->uhva : KVM_HVA_ERR_BAD;
+ 
+ 	return __kvm_gpc_refresh(gpc, gpc->gpa, uhva, len);
+ }
+@@ -377,6 +373,7 @@ void kvm_gpc_init(struct gfn_to_pfn_cache *gpc, struct kvm *kvm)
+ 	gpc->pfn = KVM_PFN_ERR_FAULT;
+ 	gpc->gpa = INVALID_GPA;
+ 	gpc->uhva = KVM_HVA_ERR_BAD;
++	gpc->active = gpc->valid = false;
+ }
+ 
+ static int __kvm_gpc_activate(struct gfn_to_pfn_cache *gpc, gpa_t gpa, unsigned long uhva,
+@@ -384,6 +381,8 @@ static int __kvm_gpc_activate(struct gfn_to_pfn_cache *gpc, gpa_t gpa, unsigned
+ {
+ 	struct kvm *kvm = gpc->kvm;
+ 
++	guard(mutex)(&gpc->refresh_lock);
++
+ 	if (!gpc->active) {
+ 		if (KVM_BUG_ON(gpc->valid, kvm))
+ 			return -EIO;
+@@ -420,6 +419,8 @@ void kvm_gpc_deactivate(struct gfn_to_pfn_cache *gpc)
+ 	kvm_pfn_t old_pfn;
+ 	void *old_khva;
+ 
++	guard(mutex)(&gpc->refresh_lock);
++
+ 	if (gpc->active) {
+ 		/*
+ 		 * Deactivate the cache before removing it from the list, KVM
+-- 
+2.43.0
+

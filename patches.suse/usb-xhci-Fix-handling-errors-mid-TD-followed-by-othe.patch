@@ -1,0 +1,144 @@
+From f42a36bae0645f85c0290abc1d1385efd8ec9b13 Mon Sep 17 00:00:00 2001
+From: Michal Pecio <michal.pecio@gmail.com>
+Date: Wed, 16 Oct 2024 16:59:59 +0300
+Subject: [PATCH] usb: xhci: Fix handling errors mid TD followed by other
+ errors
+Git-commit: f42a36bae0645f85c0290abc1d1385efd8ec9b13
+References: jsc#PED-10701
+Patch-mainline: v6.12-rc4
+
+Some host controllers fail to produce the final completion event on an
+isochronous TD which experienced an error mid TD. We deal with it by
+flagging such TDs and checking if the next event points at the flagged
+TD or at the next one, and giving back the flagged TD if the latter.
+
+This is not enough, because the next TD may be missed by the xHC. Or
+there may be no next TD but a ring underrun. We also need to get such
+TD quickly out of the way, or errors on later TDs may be handled wrong.
+
+If the next TD experiences a Missed Service Error, we will set the skip
+flag on the endpoint and then attempt skipping TDs when yet another
+event arrives. In such scenario, we ought to report the 'error mid TD'
+transfer as such rather than skip it.
+
+Another problem case are Stopped events. If we see one after an error
+mid TD, we naively assume that it's a Force Stopped Event because it
+doesn't match the pending TD, but in reality it might be an ordinary
+Stopped event for the next TD, which we fail to recognize and handle.
+
+Fix this by moving error mid TD handling before the whole TD skipping
+loop. Remove unnecessary conditions, always give back the TD if the new
+event points to any TRB outside it or if the pointer is NULL, as may be
+the case in Ring Underrun and Overrun events on 1st gen hardware. Only
+if the pending TD isn't flagged, consider other actions like skipping.
+
+As a side effect of reordering with skip and FSE cases, error mid TD is
+reordered with last_td_was_short check. This is harmless, because the
+two cases are mutually exclusive - only one can happen in any given run
+of handle_tx_event().
+
+Tested on the NEC host and a USB camera with flaky cable. Dynamic debug
+confirmed that Transaction Errors are sometimes seen, sometimes mid-TD,
+sometimes followed by Missed Service. In such cases, they were finished
+properly before skipping began.
+
+[Rebase on 6.12-rc1 -Mathias]
+
+Signed-off-by: Michal Pecio <michal.pecio@gmail.com>
+Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Link: https://lore.kernel.org/r/20241016140000.783905-4-mathias.nyman@linux.intel.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ drivers/usb/host/xhci-ring.c | 66 ++++++++++++++++--------------------
+ 1 file changed, 29 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index 7dedf31bbddd..b6eb928e260f 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -2775,6 +2775,29 @@ static int handle_tx_event(struct xhci_hcd *xhci,
+ 		return 0;
+ 	}
+ 
++	/*
++	 * xhci 4.10.2 states isoc endpoints should continue
++	 * processing the next TD if there was an error mid TD.
++	 * So host like NEC don't generate an event for the last
++	 * isoc TRB even if the IOC flag is set.
++	 * xhci 4.9.1 states that if there are errors in mult-TRB
++	 * TDs xHC should generate an error for that TRB, and if xHC
++	 * proceeds to the next TD it should genete an event for
++	 * any TRB with IOC flag on the way. Other host follow this.
++	 *
++	 * We wait for the final IOC event, but if we get an event
++	 * anywhere outside this TD, just give it back already.
++	 */
++	td = list_first_entry_or_null(&ep_ring->td_list, struct xhci_td, td_list);
++
++	if (td && td->error_mid_td && !trb_in_td(xhci, td, ep_trb_dma, false)) {
++		xhci_dbg(xhci, "Missing TD completion event after mid TD error\n");
++		ep_ring->dequeue = td->last_trb;
++		ep_ring->deq_seg = td->last_trb_seg;
++		inc_deq(xhci, ep_ring);
++		xhci_td_cleanup(xhci, td, ep_ring, td->status);
++	}
++
+ 	if (list_empty(&ep_ring->td_list)) {
+ 		/*
+ 		 * Don't print wanings if ring is empty due to a stopped endpoint generating an
+@@ -2836,44 +2859,13 @@ static int handle_tx_event(struct xhci_hcd *xhci,
+ 				return 0;
+ 			}
+ 
+-			/*
+-			 * xhci 4.10.2 states isoc endpoints should continue
+-			 * processing the next TD if there was an error mid TD.
+-			 * So host like NEC don't generate an event for the last
+-			 * isoc TRB even if the IOC flag is set.
+-			 * xhci 4.9.1 states that if there are errors in mult-TRB
+-			 * TDs xHC should generate an error for that TRB, and if xHC
+-			 * proceeds to the next TD it should genete an event for
+-			 * any TRB with IOC flag on the way. Other host follow this.
+-			 * So this event might be for the next TD.
+-			 */
+-			if (td->error_mid_td &&
+-			    !list_is_last(&td->td_list, &ep_ring->td_list)) {
+-				struct xhci_td *td_next = list_next_entry(td, td_list);
+-
+-				ep_seg = trb_in_td(xhci, td_next, ep_trb_dma, false);
+-				if (ep_seg) {
+-					/* give back previous TD, start handling new */
+-					xhci_dbg(xhci, "Missing TD completion event after mid TD error\n");
+-					ep_ring->dequeue = td->last_trb;
+-					ep_ring->deq_seg = td->last_trb_seg;
+-					inc_deq(xhci, ep_ring);
+-					xhci_td_cleanup(xhci, td, ep_ring, td->status);
+-					td = td_next;
+-				}
+-			}
+-
+-			if (!ep_seg) {
+-				/* HC is busted, give up! */
+-				xhci_err(xhci,
+-					"ERROR Transfer event TRB DMA ptr not "
+-					"part of current TD ep_index %d "
+-					"comp_code %u\n", ep_index,
+-					trb_comp_code);
+-				trb_in_td(xhci, td, ep_trb_dma, true);
++			/* HC is busted, give up! */
++			xhci_err(xhci,
++				 "ERROR Transfer event TRB DMA ptr not part of current TD ep_index %d comp_code %u\n",
++				 ep_index, trb_comp_code);
++			trb_in_td(xhci, td, ep_trb_dma, true);
+ 
+-				return -ESHUTDOWN;
+-			}
++			return -ESHUTDOWN;
+ 		}
+ 
+ 		if (ep->skip) {
+-- 
+2.47.1
+

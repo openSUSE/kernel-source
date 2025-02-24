@@ -1,0 +1,152 @@
+Patch-mainline: v6.11-rc1
+Git-commit: 22daa42294b419a0d8060a3870285e7a72aa63e4
+References: jsc#PED-348
+From: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Date: Fri, 14 Jun 2024 12:58:55 +0300
+Subject: [PATCH] x86/mm: Add callbacks to prepare encrypted memory for kexec
+
+AMD SEV and Intel TDX guests allocate shared buffers for performing I/O.
+This is done by allocating pages normally from the buddy allocator and
+then converting them to shared using set_memory_decrypted().
+
+On kexec, the second kernel is unaware of which memory has been
+converted in this manner. It only sees E820_TYPE_RAM. Accessing shared
+memory as private is fatal.
+
+Therefore, the memory state must be reset to its original state before
+starting the new kernel with kexec.
+
+The process of converting shared memory back to private occurs in two
+steps:
+
+- enc_kexec_begin() stops new conversions.
+
+- enc_kexec_finish() unshares all existing shared memory, reverting it
+  back to private.
+
+Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Reviewed-by: Nikolay Borisov <nik.borisov@suse.com>
+Reviewed-by: Kai Huang <kai.huang@intel.com>
+Tested-by: Tao Liu <ltao@redhat.com>
+Link: https://lore.kernel.org/r/20240614095904.1345461-11-kirill.shutemov@linux.intel.com
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/include/asm/x86_init.h | 10 ++++++++++
+ arch/x86/kernel/crash.c         | 12 ++++++++++++
+ arch/x86/kernel/reboot.c        | 12 ++++++++++++
+ arch/x86/kernel/x86_init.c      |  4 ++++
+ 4 files changed, 38 insertions(+)
+
+diff --git a/arch/x86/include/asm/x86_init.h b/arch/x86/include/asm/x86_init.h
+index 28ac3cb9b987..213cf5379a5a 100644
+--- a/arch/x86/include/asm/x86_init.h
++++ b/arch/x86/include/asm/x86_init.h
+@@ -149,12 +149,22 @@ struct x86_init_acpi {
+  * @enc_status_change_finish	Notify HV after the encryption status of a range is changed
+  * @enc_tlb_flush_required	Returns true if a TLB flush is needed before changing page encryption status
+  * @enc_cache_flush_required	Returns true if a cache flush is needed before changing page encryption status
++ * @enc_kexec_begin		Begin the two-step process of converting shared memory back
++ *				to private. It stops the new conversions from being started
++ *				and waits in-flight conversions to finish, if possible.
++ * @enc_kexec_finish		Finish the two-step process of converting shared memory to
++ *				private. All memory is private after the call when
++ *				the function returns.
++ *				It is called on only one CPU while the others are shut down
++ *				and with interrupts disabled.
+  */
+ struct x86_guest {
+ 	int (*enc_status_change_prepare)(unsigned long vaddr, int npages, bool enc);
+ 	int (*enc_status_change_finish)(unsigned long vaddr, int npages, bool enc);
+ 	bool (*enc_tlb_flush_required)(bool enc);
+ 	bool (*enc_cache_flush_required)(void);
++	void (*enc_kexec_begin)(void);
++	void (*enc_kexec_finish)(void);
+ };
+ 
+ /**
+diff --git a/arch/x86/kernel/crash.c b/arch/x86/kernel/crash.c
+index f06501445cd9..340af8155658 100644
+--- a/arch/x86/kernel/crash.c
++++ b/arch/x86/kernel/crash.c
+@@ -128,6 +128,18 @@ void native_machine_crash_shutdown(struct pt_regs *regs)
+ #ifdef CONFIG_HPET_TIMER
+ 	hpet_disable();
+ #endif
++
++	/*
++	 * Non-crash kexec calls enc_kexec_begin() while scheduling is still
++	 * active. This allows the callback to wait until all in-flight
++	 * shared<->private conversions are complete. In a crash scenario,
++	 * enc_kexec_begin() gets called after all but one CPU have been shut
++	 * down and interrupts have been disabled. This allows the callback to
++	 * detect a race with the conversion and report it.
++	 */
++	x86_platform.guest.enc_kexec_begin();
++	x86_platform.guest.enc_kexec_finish();
++
+ 	crash_save_cpu(regs, safe_smp_processor_id());
+ }
+ 
+diff --git a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
+index f3130f762784..bb7a44af7efd 100644
+--- a/arch/x86/kernel/reboot.c
++++ b/arch/x86/kernel/reboot.c
+@@ -12,6 +12,7 @@
+ #include <linux/delay.h>
+ #include <linux/objtool.h>
+ #include <linux/pgtable.h>
++#include <linux/kexec.h>
+ #include <acpi/reboot.h>
+ #include <asm/io.h>
+ #include <asm/apic.h>
+@@ -716,6 +717,14 @@ static void native_machine_emergency_restart(void)
+ 
+ void native_machine_shutdown(void)
+ {
++	/*
++	 * Call enc_kexec_begin() while all CPUs are still active and
++	 * interrupts are enabled. This will allow all in-flight memory
++	 * conversions to finish cleanly.
++	 */
++	if (kexec_in_progress)
++		x86_platform.guest.enc_kexec_begin();
++
+ 	/* Stop the cpus and apics */
+ #ifdef CONFIG_X86_IO_APIC
+ 	/*
+@@ -752,6 +761,9 @@ void native_machine_shutdown(void)
+ #ifdef CONFIG_X86_64
+ 	x86_platform.iommu_shutdown();
+ #endif
++
++	if (kexec_in_progress)
++		x86_platform.guest.enc_kexec_finish();
+ }
+ 
+ static void __machine_emergency_restart(int emergency)
+diff --git a/arch/x86/kernel/x86_init.c b/arch/x86/kernel/x86_init.c
+index a7143bb7dd93..82b128d3f309 100644
+--- a/arch/x86/kernel/x86_init.c
++++ b/arch/x86/kernel/x86_init.c
+@@ -138,6 +138,8 @@ static int enc_status_change_prepare_noop(unsigned long vaddr, int npages, bool
+ static int enc_status_change_finish_noop(unsigned long vaddr, int npages, bool enc) { return 0; }
+ static bool enc_tlb_flush_required_noop(bool enc) { return false; }
+ static bool enc_cache_flush_required_noop(void) { return false; }
++static void enc_kexec_begin_noop(void) {}
++static void enc_kexec_finish_noop(void) {}
+ static bool is_private_mmio_noop(u64 addr) {return false; }
+ 
+ struct x86_platform_ops x86_platform __ro_after_init = {
+@@ -161,6 +163,8 @@ struct x86_platform_ops x86_platform __ro_after_init = {
+ 		.enc_status_change_finish  = enc_status_change_finish_noop,
+ 		.enc_tlb_flush_required	   = enc_tlb_flush_required_noop,
+ 		.enc_cache_flush_required  = enc_cache_flush_required_noop,
++		.enc_kexec_begin	   = enc_kexec_begin_noop,
++		.enc_kexec_finish	   = enc_kexec_finish_noop,
+ 	},
+ };
+ 
+-- 
+2.43.0
+
