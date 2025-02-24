@@ -1,0 +1,181 @@
+Patch-mainline: v6.13-rc1
+Git-commit: f0e7012c4b938606c7ca230154f181f8eed683eb
+References: git-fixes
+From: Sean Christopherson <seanjc@google.com>
+Date: Wed, 9 Oct 2024 10:49:59 -0700
+Subject: [PATCH] KVM: x86: Bypass register cache when querying CPL from
+ kvm_sched_out()
+
+When querying guest CPL to determine if a vCPU was preempted while in
+kernel mode, bypass the register cache, i.e. always read SS.AR_BYTES from
+the VMCS on Intel CPUs.  If the kernel is running with full preemption
+enabled, using the register cache in the preemption path can result in
+stale and/or uninitialized data being cached in the segment cache.
+
+In particular the following scenario is currently possible:
+
+ - vCPU is just created, and the vCPU thread is preempted before
+   SS.AR_BYTES is written in vmx_vcpu_reset().
+
+ - When scheduling out the vCPU task, kvm_arch_vcpu_in_kernel() =>
+   vmx_get_cpl() reads and caches '0' for SS.AR_BYTES.
+
+ - vmx_vcpu_reset() => seg_setup() configures SS.AR_BYTES, but doesn't
+   invoke vmx_segment_cache_clear() to invalidate the cache.
+
+As a result, KVM retains a stale value in the cache, which can be read,
+e.g. via KVM_GET_SREGS.  Usually this is not a problem because the VMX
+segment cache is reset on each VM-Exit, but if the userspace VMM (e.g KVM
+selftests) reads and writes system registers just after the vCPU was
+created, _without_ modifying SS.AR_BYTES, userspace will write back the
+stale '0' value and ultimately will trigger a VM-Entry failure due to
+incorrect SS segment type.
+
+Note, the VM-Enter failure can also be avoided by moving the call to
+vmx_segment_cache_clear() until after the vmx_vcpu_reset() initializes all
+segments.  However, while that change is correct and desirable (and will
+come along shortly), it does not address the underlying problem that
+accessing KVM's register caches from !task context is generally unsafe.
+
+In addition to fixing the immediate bug, bypassing the cache for this
+particular case will allow hardening KVM register caching log to assert
+that the caches are accessed only when KVM _knows_ it is safe to do so.
+
+Fixes: de63ad4cf497 ("KVM: X86: implement the logic for spinlock optimization")
+Reported-by: Maxim Levitsky <mlevitsk@redhat.com>
+Closes: https://lore.kernel.org/all/20240716022014.240960-3-mlevitsk@redhat.com
+Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+Link: https://lore.kernel.org/r/20241009175002.1118178-2-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/include/asm/kvm-x86-ops.h |  1 +
+ arch/x86/include/asm/kvm_host.h    |  1 +
+ arch/x86/kvm/svm/svm.c             |  1 +
+ arch/x86/kvm/vmx/main.c            |  1 +
+ arch/x86/kvm/vmx/vmx.c             | 23 ++++++++++++++++++-----
+ arch/x86/kvm/vmx/vmx.h             |  1 +
+ arch/x86/kvm/x86.c                 |  8 +++++++-
+ 7 files changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm-x86-ops.h b/arch/x86/include/asm/kvm-x86-ops.h
+index 861d080ed4c6..5aff7222e40f 100644
+--- a/arch/x86/include/asm/kvm-x86-ops.h
++++ b/arch/x86/include/asm/kvm-x86-ops.h
+@@ -34,6 +34,7 @@ KVM_X86_OP(set_msr)
+ KVM_X86_OP(get_segment_base)
+ KVM_X86_OP(get_segment)
+ KVM_X86_OP(get_cpl)
++KVM_X86_OP(get_cpl_no_cache)
+ KVM_X86_OP(set_segment)
+ KVM_X86_OP(get_cs_db_l_bits)
+ KVM_X86_OP(is_valid_cr0)
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 6d9f763a7bb9..3ae90df0a177 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1656,6 +1656,7 @@ struct kvm_x86_ops {
+ 	void (*get_segment)(struct kvm_vcpu *vcpu,
+ 			    struct kvm_segment *var, int seg);
+ 	int (*get_cpl)(struct kvm_vcpu *vcpu);
++	int (*get_cpl_no_cache)(struct kvm_vcpu *vcpu);
+ 	void (*set_segment)(struct kvm_vcpu *vcpu,
+ 			    struct kvm_segment *var, int seg);
+ 	void (*get_cs_db_l_bits)(struct kvm_vcpu *vcpu, int *db, int *l);
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 9df3e1e5ae81..50f6b0e03d04 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -5031,6 +5031,7 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
+ 	.get_segment = svm_get_segment,
+ 	.set_segment = svm_set_segment,
+ 	.get_cpl = svm_get_cpl,
++	.get_cpl_no_cache = svm_get_cpl,
+ 	.get_cs_db_l_bits = svm_get_cs_db_l_bits,
+ 	.is_valid_cr0 = svm_is_valid_cr0,
+ 	.set_cr0 = svm_set_cr0,
+diff --git a/arch/x86/kvm/vmx/main.c b/arch/x86/kvm/vmx/main.c
+index 7668e2fb8043..92d35cc6cd15 100644
+--- a/arch/x86/kvm/vmx/main.c
++++ b/arch/x86/kvm/vmx/main.c
+@@ -50,6 +50,7 @@ struct kvm_x86_ops vt_x86_ops __initdata = {
+ 	.get_segment = vmx_get_segment,
+ 	.set_segment = vmx_set_segment,
+ 	.get_cpl = vmx_get_cpl,
++	.get_cpl_no_cache = vmx_get_cpl_no_cache,
+ 	.get_cs_db_l_bits = vmx_get_cs_db_l_bits,
+ 	.is_valid_cr0 = vmx_is_valid_cr0,
+ 	.set_cr0 = vmx_set_cr0,
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 81ed596e4454..a11faab67b4a 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -3568,16 +3568,29 @@ u64 vmx_get_segment_base(struct kvm_vcpu *vcpu, int seg)
+ 	return vmx_read_guest_seg_base(to_vmx(vcpu), seg);
+ }
+ 
+-int vmx_get_cpl(struct kvm_vcpu *vcpu)
++static int __vmx_get_cpl(struct kvm_vcpu *vcpu, bool no_cache)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	int ar;
+ 
+ 	if (unlikely(vmx->rmode.vm86_active))
+ 		return 0;
+-	else {
+-		int ar = vmx_read_guest_seg_ar(vmx, VCPU_SREG_SS);
+-		return VMX_AR_DPL(ar);
+-	}
++
++	if (no_cache)
++		ar = vmcs_read32(GUEST_SS_AR_BYTES);
++	else
++		ar = vmx_read_guest_seg_ar(vmx, VCPU_SREG_SS);
++	return VMX_AR_DPL(ar);
++}
++
++int vmx_get_cpl(struct kvm_vcpu *vcpu)
++{
++	return __vmx_get_cpl(vcpu, false);
++}
++
++int vmx_get_cpl_no_cache(struct kvm_vcpu *vcpu)
++{
++	return __vmx_get_cpl(vcpu, true);
+ }
+ 
+ static u32 vmx_segment_access_rights(struct kvm_segment *var)
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index 2325f773a20b..bcf40c7f3a38 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -385,6 +385,7 @@ void vmx_prepare_switch_to_guest(struct kvm_vcpu *vcpu);
+ void vmx_set_host_fs_gs(struct vmcs_host_state *host, u16 fs_sel, u16 gs_sel,
+ 			unsigned long fs_base, unsigned long gs_base);
+ int vmx_get_cpl(struct kvm_vcpu *vcpu);
++int vmx_get_cpl_no_cache(struct kvm_vcpu *vcpu);
+ bool vmx_emulation_required(struct kvm_vcpu *vcpu);
+ unsigned long vmx_get_rflags(struct kvm_vcpu *vcpu);
+ void vmx_set_rflags(struct kvm_vcpu *vcpu, unsigned long rflags);
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 312d6e08c76b..eeac4296d32a 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -5095,7 +5095,13 @@ void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
+ 	int idx;
+ 
+ 	if (vcpu->preempted) {
+-		vcpu->arch.preempted_in_kernel = kvm_arch_vcpu_in_kernel(vcpu);
++		/*
++		 * Assume protected guests are in-kernel.  Inefficient yielding
++		 * due to false positives is preferable to never yielding due
++		 * to false negatives.
++		 */
++		vcpu->arch.preempted_in_kernel = vcpu->arch.guest_state_protected ||
++						 !kvm_x86_call(get_cpl_no_cache)(vcpu);
+ 
+ 		/*
+ 		 * Take the srcu lock as memslots will be accessed to check the gfn
+-- 
+2.43.0
+
