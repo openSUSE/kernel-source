@@ -1,0 +1,199 @@
+From: Qu Wenruo <wqu@suse.com>
+Date: Mon, 16 Sep 2024 08:03:00 +0930
+Subject: [PATCH] btrfs: move the delalloc range bitmap search into extent_io.c
+References: bsc#1234429
+Patch-mainline: 6.12.17
+Git-commit: 2bca8eb0774d271b1077b72f1be135073e0a898f
+
+[ Upstream commit 2bca8eb0774d271b1077b72f1be135073e0a898f ]
+
+Currently for subpage (sector size < page size) cases, we reuse subpage
+locked bitmap to find out all delalloc ranges we have locked, and run
+all those found ranges.
+
+However such reuse is not perfect, e.g.:
+
+    0       32K      64K      96K       128K
+    |       |////////||///////|    |////|
+                                   120K
+
+For above range, writepage_delalloc() for page 0 will handle the range
+[32K, 96k), note delalloc range can be beyond the page boundary.
+
+But writepage_delalloc() for page 64K will only handle range [120K,
+128K), as the previous run on page 0 has already handled range [64K,
+96K).
+Meanwhile for the writeback we should expect range [64K, 96K) to also be
+locked, this leads to the mismatch from locked bitmap and delalloc
+range.
+
+This is not causing problems yet, but it's still an inconsistent
+behavior.
+
+So instead of relying on the subpage locked bitmap, move the delalloc
+range search using local @delalloc_bitmap, so that we can remove the
+existing btrfs_folio_find_writer_locked().
+
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Stable-dep-of: 8bf334beb349 ("btrfs: fix double accounting race when extent_writepage_io() failed")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/btrfs/extent_io.c | 44 ++++++++++++++++++++++++++++++++++++++++-
+ fs/btrfs/subpage.c   | 47 --------------------------------------------
+ fs/btrfs/subpage.h   |  4 ----
+ 3 files changed, 43 insertions(+), 52 deletions(-)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 9ff72a5a13eb..ba34b92d48c2 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -1105,6 +1105,45 @@ int btrfs_read_folio(struct file *file, struct folio *folio)
+ 	return ret;
+ }
+ 
++static void set_delalloc_bitmap(struct folio *folio, unsigned long *delalloc_bitmap,
++				u64 start, u32 len)
++{
++	struct btrfs_fs_info *fs_info = folio_to_fs_info(folio);
++	const u64 folio_start = folio_pos(folio);
++	unsigned int start_bit;
++	unsigned int nbits;
++
++	ASSERT(start >= folio_start && start + len <= folio_start + PAGE_SIZE);
++	start_bit = (start - folio_start) >> fs_info->sectorsize_bits;
++	nbits = len >> fs_info->sectorsize_bits;
++	ASSERT(bitmap_test_range_all_zero(delalloc_bitmap, start_bit, nbits));
++	bitmap_set(delalloc_bitmap, start_bit, nbits);
++}
++
++static bool find_next_delalloc_bitmap(struct folio *folio,
++				      unsigned long *delalloc_bitmap, u64 start,
++				      u64 *found_start, u32 *found_len)
++{
++	struct btrfs_fs_info *fs_info = folio_to_fs_info(folio);
++	const u64 folio_start = folio_pos(folio);
++	const unsigned int bitmap_size = fs_info->sectors_per_page;
++	unsigned int start_bit;
++	unsigned int first_zero;
++	unsigned int first_set;
++
++	ASSERT(start >= folio_start && start < folio_start + PAGE_SIZE);
++
++	start_bit = (start - folio_start) >> fs_info->sectorsize_bits;
++	first_set = find_next_bit(delalloc_bitmap, bitmap_size, start_bit);
++	if (first_set >= bitmap_size)
++		return false;
++
++	*found_start = folio_start + (first_set << fs_info->sectorsize_bits);
++	first_zero = find_next_zero_bit(delalloc_bitmap, bitmap_size, first_set);
++	*found_len = (first_zero - first_set) << fs_info->sectorsize_bits;
++	return true;
++}
++
+ /*
+  * helper for extent_writepage(), doing all of the delayed allocation setup.
+  *
+@@ -1124,6 +1163,7 @@ static noinline_for_stack int writepage_delalloc(struct btrfs_inode *inode,
+ 	const bool is_subpage = btrfs_is_subpage(fs_info, folio->mapping);
+ 	const u64 page_start = folio_pos(folio);
+ 	const u64 page_end = page_start + folio_size(folio) - 1;
++	unsigned long delalloc_bitmap = 0;
+ 	/*
+ 	 * Save the last found delalloc end. As the delalloc end can go beyond
+ 	 * page boundary, thus we cannot rely on subpage bitmap to locate the
+@@ -1151,6 +1191,8 @@ static noinline_for_stack int writepage_delalloc(struct btrfs_inode *inode,
+ 			delalloc_start = delalloc_end + 1;
+ 			continue;
+ 		}
++		set_delalloc_bitmap(folio, &delalloc_bitmap, delalloc_start,
++				    min(delalloc_end, page_end) + 1 - delalloc_start);
+ 		btrfs_folio_set_writer_lock(fs_info, folio, delalloc_start,
+ 					    min(delalloc_end, page_end) + 1 -
+ 					    delalloc_start);
+@@ -1178,7 +1220,7 @@ static noinline_for_stack int writepage_delalloc(struct btrfs_inode *inode,
+ 			found_len = last_delalloc_end + 1 - found_start;
+ 			found = true;
+ 		} else {
+-			found = btrfs_subpage_find_writer_locked(fs_info, folio,
++			found = find_next_delalloc_bitmap(folio, &delalloc_bitmap,
+ 					delalloc_start, &found_start, &found_len);
+ 		}
+ 		if (!found)
+diff --git a/fs/btrfs/subpage.c b/fs/btrfs/subpage.c
+index ec7328a6bfd7..c4950e04f481 100644
+--- a/fs/btrfs/subpage.c
++++ b/fs/btrfs/subpage.c
+@@ -801,53 +801,6 @@ void btrfs_folio_set_writer_lock(const struct btrfs_fs_info *fs_info,
+ 	spin_unlock_irqrestore(&subpage->lock, flags);
+ }
+ 
+-/*
+- * Find any subpage writer locked range inside @folio, starting at file offset
+- * @search_start. The caller should ensure the folio is locked.
+- *
+- * Return true and update @found_start_ret and @found_len_ret to the first
+- * writer locked range.
+- * Return false if there is no writer locked range.
+- */
+-bool btrfs_subpage_find_writer_locked(const struct btrfs_fs_info *fs_info,
+-				      struct folio *folio, u64 search_start,
+-				      u64 *found_start_ret, u32 *found_len_ret)
+-{
+-	struct btrfs_subpage *subpage = folio_get_private(folio);
+-	const u32 sectors_per_page = fs_info->sectors_per_page;
+-	const unsigned int len = PAGE_SIZE - offset_in_page(search_start);
+-	const unsigned int start_bit = subpage_calc_start_bit(fs_info, folio,
+-						locked, search_start, len);
+-	const unsigned int locked_bitmap_start = sectors_per_page * btrfs_bitmap_nr_locked;
+-	const unsigned int locked_bitmap_end = locked_bitmap_start + sectors_per_page;
+-	unsigned long flags;
+-	int first_zero;
+-	int first_set;
+-	bool found = false;
+-
+-	ASSERT(folio_test_locked(folio));
+-	spin_lock_irqsave(&subpage->lock, flags);
+-	first_set = find_next_bit(subpage->bitmaps, locked_bitmap_end, start_bit);
+-	if (first_set >= locked_bitmap_end)
+-		goto out;
+-
+-	found = true;
+-
+-	*found_start_ret = folio_pos(folio) +
+-		((first_set - locked_bitmap_start) << fs_info->sectorsize_bits);
+-	/*
+-	 * Since @first_set is ensured to be smaller than locked_bitmap_end
+-	 * here, @found_start_ret should be inside the folio.
+-	 */
+-	ASSERT(*found_start_ret < folio_pos(folio) + PAGE_SIZE);
+-
+-	first_zero = find_next_zero_bit(subpage->bitmaps, locked_bitmap_end, first_set);
+-	*found_len_ret = (first_zero - first_set) << fs_info->sectorsize_bits;
+-out:
+-	spin_unlock_irqrestore(&subpage->lock, flags);
+-	return found;
+-}
+-
+ #define GET_SUBPAGE_BITMAP(subpage, fs_info, name, dst)			\
+ {									\
+ 	const int sectors_per_page = fs_info->sectors_per_page;		\
+diff --git a/fs/btrfs/subpage.h b/fs/btrfs/subpage.h
+index cdb554e0d215..197ec6c0b07b 100644
+--- a/fs/btrfs/subpage.h
++++ b/fs/btrfs/subpage.h
+@@ -108,10 +108,6 @@ void btrfs_folio_set_writer_lock(const struct btrfs_fs_info *fs_info,
+ 				 struct folio *folio, u64 start, u32 len);
+ void btrfs_folio_end_writer_lock_bitmap(const struct btrfs_fs_info *fs_info,
+ 					struct folio *folio, unsigned long bitmap);
+-bool btrfs_subpage_find_writer_locked(const struct btrfs_fs_info *fs_info,
+-				      struct folio *folio, u64 search_start,
+-				      u64 *found_start_ret, u32 *found_len_ret);
+-
+ /*
+  * Template for subpage related operations.
+  *
+-- 
+2.48.0
+
