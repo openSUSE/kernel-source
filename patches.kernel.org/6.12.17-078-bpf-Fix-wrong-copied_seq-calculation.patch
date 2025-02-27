@@ -1,0 +1,236 @@
+From: Jiayuan Chen <mrpre@163.com>
+Date: Wed, 22 Jan 2025 18:09:14 +0800
+Subject: [PATCH] bpf: Fix wrong copied_seq calculation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1234429
+Patch-mainline: 6.12.17
+Git-commit: 36b62df5683c315ba58c950f1a9c771c796c30ec
+
+[ Upstream commit 36b62df5683c315ba58c950f1a9c771c796c30ec ]
+
+'sk->copied_seq' was updated in the tcp_eat_skb() function when the action
+of a BPF program was SK_REDIRECT. For other actions, like SK_PASS, the
+update logic for 'sk->copied_seq' was moved to tcp_bpf_recvmsg_parser()
+to ensure the accuracy of the 'fionread' feature.
+
+It works for a single stream_verdict scenario, as it also modified
+sk_data_ready->sk_psock_verdict_data_ready->tcp_read_skb
+to remove updating 'sk->copied_seq'.
+
+However, for programs where both stream_parser and stream_verdict are
+active (strparser purpose), tcp_read_sock() was used instead of
+tcp_read_skb() (sk_data_ready->strp_data_ready->tcp_read_sock).
+tcp_read_sock() now still updates 'sk->copied_seq', leading to duplicate
+updates.
+
+In summary, for strparser + SK_PASS, copied_seq is redundantly calculated
+in both tcp_read_sock() and tcp_bpf_recvmsg_parser().
+
+The issue causes incorrect copied_seq calculations, which prevent
+correct data reads from the recv() interface in user-land.
+
+We do not want to add new proto_ops to implement a new version of
+tcp_read_sock, as this would introduce code complexity [1].
+
+We could have added noack and copied_seq to desc, and then called
+ops->read_sock. However, unfortunately, other modules didn’t fully
+initialize desc to zero. So, for now, we are directly calling
+tcp_read_sock_noack() in tcp_bpf.c.
+
+[1]: https://lore.kernel.org/bpf/20241218053408.437295-1-mrpre@163.com
+
+Fixes: e5c6de5fa025 ("bpf, sockmap: Incorrectly handling copied_seq")
+Suggested-by: Jakub Sitnicki <jakub@cloudflare.com>
+Signed-off-by: Jiayuan Chen <mrpre@163.com>
+Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+Reviewed-by: Jakub Sitnicki <jakub@cloudflare.com>
+Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://patch.msgid.link/20250122100917.49845-3-mrpre@163.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/linux/skmsg.h |  2 ++
+ include/net/tcp.h     |  8 ++++++++
+ net/core/skmsg.c      |  7 +++++++
+ net/ipv4/tcp.c        | 29 ++++++++++++++++++++++++-----
+ net/ipv4/tcp_bpf.c    | 36 ++++++++++++++++++++++++++++++++++++
+ 5 files changed, 77 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/skmsg.h b/include/linux/skmsg.h
+index 2cbe0c22a32f..0b9095a281b8 100644
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@ -91,6 +91,8 @@ struct sk_psock {
+ 	struct sk_psock_progs		progs;
+ #if IS_ENABLED(CONFIG_BPF_STREAM_PARSER)
+ 	struct strparser		strp;
++	u32				copied_seq;
++	u32				ingress_bytes;
+ #endif
+ 	struct sk_buff_head		ingress_skb;
+ 	struct list_head		ingress_msg;
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 6cd0fde80651..3255a199ef60 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -743,6 +743,9 @@ void tcp_get_info(struct sock *, struct tcp_info *);
+ /* Read 'sendfile()'-style from a TCP socket */
+ int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
+ 		  sk_read_actor_t recv_actor);
++int tcp_read_sock_noack(struct sock *sk, read_descriptor_t *desc,
++			sk_read_actor_t recv_actor, bool noack,
++			u32 *copied_seq);
+ int tcp_read_skb(struct sock *sk, skb_read_actor_t recv_actor);
+ struct sk_buff *tcp_recv_skb(struct sock *sk, u32 seq, u32 *off);
+ void tcp_read_done(struct sock *sk, size_t len);
+@@ -2609,6 +2612,11 @@ struct sk_psock;
+ #ifdef CONFIG_BPF_SYSCALL
+ int tcp_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore);
+ void tcp_bpf_clone(const struct sock *sk, struct sock *newsk);
++#ifdef CONFIG_BPF_STREAM_PARSER
++struct strparser;
++int tcp_bpf_strp_read_sock(struct strparser *strp, read_descriptor_t *desc,
++			   sk_read_actor_t recv_actor);
++#endif /* CONFIG_BPF_STREAM_PARSER */
+ #endif /* CONFIG_BPF_SYSCALL */
+ 
+ #ifdef CONFIG_INET
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 8ad7e6755fd6..f76cbf49c68c 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -548,6 +548,9 @@ static int sk_psock_skb_ingress_enqueue(struct sk_buff *skb,
+ 			return num_sge;
+ 	}
+ 
++#if IS_ENABLED(CONFIG_BPF_STREAM_PARSER)
++	psock->ingress_bytes += len;
++#endif
+ 	copied = len;
+ 	msg->sg.start = 0;
+ 	msg->sg.size = copied;
+@@ -1143,6 +1146,10 @@ int sk_psock_init_strp(struct sock *sk, struct sk_psock *psock)
+ 	if (!ret)
+ 		sk_psock_set_state(psock, SK_PSOCK_RX_STRP_ENABLED);
+ 
++	if (sk_is_tcp(sk)) {
++		psock->strp.cb.read_sock = tcp_bpf_strp_read_sock;
++		psock->copied_seq = tcp_sk(sk)->copied_seq;
++	}
+ 	return ret;
+ }
+ 
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 4f77bd862e95..68cb6a966b18 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1564,12 +1564,13 @@ EXPORT_SYMBOL(tcp_recv_skb);
+  *	  or for 'peeking' the socket using this routine
+  *	  (although both would be easy to implement).
+  */
+-int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
+-		  sk_read_actor_t recv_actor)
++static int __tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
++			   sk_read_actor_t recv_actor, bool noack,
++			   u32 *copied_seq)
+ {
+ 	struct sk_buff *skb;
+ 	struct tcp_sock *tp = tcp_sk(sk);
+-	u32 seq = tp->copied_seq;
++	u32 seq = *copied_seq;
+ 	u32 offset;
+ 	int copied = 0;
+ 
+@@ -1623,9 +1624,12 @@ int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
+ 		tcp_eat_recv_skb(sk, skb);
+ 		if (!desc->count)
+ 			break;
+-		WRITE_ONCE(tp->copied_seq, seq);
++		WRITE_ONCE(*copied_seq, seq);
+ 	}
+-	WRITE_ONCE(tp->copied_seq, seq);
++	WRITE_ONCE(*copied_seq, seq);
++
++	if (noack)
++		goto out;
+ 
+ 	tcp_rcv_space_adjust(sk);
+ 
+@@ -1634,10 +1638,25 @@ int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
+ 		tcp_recv_skb(sk, seq, &offset);
+ 		tcp_cleanup_rbuf(sk, copied);
+ 	}
++out:
+ 	return copied;
+ }
++
++int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
++		  sk_read_actor_t recv_actor)
++{
++	return __tcp_read_sock(sk, desc, recv_actor, false,
++			       &tcp_sk(sk)->copied_seq);
++}
+ EXPORT_SYMBOL(tcp_read_sock);
+ 
++int tcp_read_sock_noack(struct sock *sk, read_descriptor_t *desc,
++			sk_read_actor_t recv_actor, bool noack,
++			u32 *copied_seq)
++{
++	return __tcp_read_sock(sk, desc, recv_actor, noack, copied_seq);
++}
++
+ int tcp_read_skb(struct sock *sk, skb_read_actor_t recv_actor)
+ {
+ 	struct sk_buff *skb;
+diff --git a/net/ipv4/tcp_bpf.c b/net/ipv4/tcp_bpf.c
+index 392678ae80f4..22e8a2af5dd8 100644
+--- a/net/ipv4/tcp_bpf.c
++++ b/net/ipv4/tcp_bpf.c
+@@ -646,6 +646,42 @@ static int tcp_bpf_assert_proto_ops(struct proto *ops)
+ 	       ops->sendmsg  == tcp_sendmsg ? 0 : -ENOTSUPP;
+ }
+ 
++#if IS_ENABLED(CONFIG_BPF_STREAM_PARSER)
++int tcp_bpf_strp_read_sock(struct strparser *strp, read_descriptor_t *desc,
++			   sk_read_actor_t recv_actor)
++{
++	struct sock *sk = strp->sk;
++	struct sk_psock *psock;
++	struct tcp_sock *tp;
++	int copied = 0;
++
++	tp = tcp_sk(sk);
++	rcu_read_lock();
++	psock = sk_psock(sk);
++	if (WARN_ON_ONCE(!psock)) {
++		desc->error = -EINVAL;
++		goto out;
++	}
++
++	psock->ingress_bytes = 0;
++	copied = tcp_read_sock_noack(sk, desc, recv_actor, true,
++				     &psock->copied_seq);
++	if (copied < 0)
++		goto out;
++	/* recv_actor may redirect skb to another socket (SK_REDIRECT) or
++	 * just put skb into ingress queue of current socket (SK_PASS).
++	 * For SK_REDIRECT, we need to ack the frame immediately but for
++	 * SK_PASS, we want to delay the ack until tcp_bpf_recvmsg_parser().
++	 */
++	tp->copied_seq = psock->copied_seq - psock->ingress_bytes;
++	tcp_rcv_space_adjust(sk);
++	__tcp_cleanup_rbuf(sk, copied - psock->ingress_bytes);
++out:
++	rcu_read_unlock();
++	return copied;
++}
++#endif /* CONFIG_BPF_STREAM_PARSER */
++
+ int tcp_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore)
+ {
+ 	int family = sk->sk_family == AF_INET6 ? TCP_BPF_IPV6 : TCP_BPF_IPV4;
+-- 
+2.48.0
+
