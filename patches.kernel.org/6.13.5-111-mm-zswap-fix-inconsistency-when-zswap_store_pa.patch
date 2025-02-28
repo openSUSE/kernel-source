@@ -1,0 +1,161 @@
+From: Hyeonggon Yoo <42.hyeyoo@gmail.com>
+Date: Wed, 29 Jan 2025 19:08:44 +0900
+Subject: [PATCH] mm/zswap: fix inconsistency when zswap_store_page() fails
+References: bsc#1012628
+Patch-mainline: 6.13.5
+Git-commit: 63895d20d63b446f5049a963983489319c2ea3e2
+
+commit 63895d20d63b446f5049a963983489319c2ea3e2 upstream.
+
+Commit b7c0ccdfbafd ("mm: zswap: support large folios in zswap_store()")
+skips charging any zswap entries when it failed to zswap the entire folio.
+
+However, when some base pages are zswapped but it failed to zswap the
+entire folio, the zswap operation is rolled back.  When freeing zswap
+entries for those pages, zswap_entry_free() uncharges the zswap entries
+that were not previously charged, causing zswap charging to become
+inconsistent.
+
+This inconsistency triggers two warnings with following steps:
+  # On a machine with 64GiB of RAM and 36GiB of zswap
+  $ stress-ng --bigheap 2 # wait until the OOM-killer kills stress-ng
+  $ sudo reboot
+
+  The two warnings are:
+    in mm/memcontrol.c:163, function obj_cgroup_release():
+      WARN_ON_ONCE(nr_bytes & (PAGE_SIZE - 1));
+
+    in mm/page_counter.c:60, function page_counter_cancel():
+      if (WARN_ONCE(new < 0, "page_counter underflow: %ld nr_pages=%lu\n",
+	  new, nr_pages))
+
+zswap_stored_pages also becomes inconsistent in the same way.
+
+As suggested by Kanchana, increment zswap_stored_pages and charge zswap
+entries within zswap_store_page() when it succeeds.  This way,
+zswap_entry_free() will decrement the counter and uncharge the entries
+when it failed to zswap the entire folio.
+
+While this could potentially be optimized by batching objcg charging and
+incrementing the counter, let's focus on fixing the bug this time and
+leave the optimization for later after some evaluation.
+
+After resolving the inconsistency, the warnings disappear.
+
+[42.hyeyoo@gmail.com: refactor zswap_store_page()]
+  Link: https://lkml.kernel.org/r/20250131082037.2426-1-42.hyeyoo@gmail.com
+Link: https://lkml.kernel.org/r/20250129100844.2935-1-42.hyeyoo@gmail.com
+Fixes: b7c0ccdfbafd ("mm: zswap: support large folios in zswap_store()")
+Co-developed-by: Kanchana P Sridhar <kanchana.p.sridhar@intel.com>
+Signed-off-by: Kanchana P Sridhar <kanchana.p.sridhar@intel.com>
+Signed-off-by: Hyeonggon Yoo <42.hyeyoo@gmail.com>
+Acked-by: Yosry Ahmed <yosry.ahmed@linux.dev>
+Acked-by: Nhat Pham <nphamcs@gmail.com>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ mm/zswap.c | 35 ++++++++++++++++-------------------
+ 1 file changed, 16 insertions(+), 19 deletions(-)
+
+diff --git a/mm/zswap.c b/mm/zswap.c
+index b84c20d889b1..6e0c0fca5830 100644
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@ -1445,9 +1445,9 @@ static void shrink_worker(struct work_struct *w)
+ * main API
+ **********************************/
+ 
+-static ssize_t zswap_store_page(struct page *page,
+-				struct obj_cgroup *objcg,
+-				struct zswap_pool *pool)
++static bool zswap_store_page(struct page *page,
++			     struct obj_cgroup *objcg,
++			     struct zswap_pool *pool)
+ {
+ 	swp_entry_t page_swpentry = page_swap_entry(page);
+ 	struct zswap_entry *entry, *old;
+@@ -1456,7 +1456,7 @@ static ssize_t zswap_store_page(struct page *page,
+ 	entry = zswap_entry_cache_alloc(GFP_KERNEL, page_to_nid(page));
+ 	if (!entry) {
+ 		zswap_reject_kmemcache_fail++;
+-		return -EINVAL;
++		return false;
+ 	}
+ 
+ 	if (!zswap_compress(page, entry, pool))
+@@ -1483,13 +1483,17 @@ static ssize_t zswap_store_page(struct page *page,
+ 
+ 	/*
+ 	 * The entry is successfully compressed and stored in the tree, there is
+-	 * no further possibility of failure. Grab refs to the pool and objcg.
+-	 * These refs will be dropped by zswap_entry_free() when the entry is
+-	 * removed from the tree.
++	 * no further possibility of failure. Grab refs to the pool and objcg,
++	 * charge zswap memory, and increment zswap_stored_pages.
++	 * The opposite actions will be performed by zswap_entry_free()
++	 * when the entry is removed from the tree.
+ 	 */
+ 	zswap_pool_get(pool);
+-	if (objcg)
++	if (objcg) {
+ 		obj_cgroup_get(objcg);
++		obj_cgroup_charge_zswap(objcg, entry->length);
++	}
++	atomic_long_inc(&zswap_stored_pages);
+ 
+ 	/*
+ 	 * We finish initializing the entry while it's already in xarray.
+@@ -1510,13 +1514,13 @@ static ssize_t zswap_store_page(struct page *page,
+ 		zswap_lru_add(&zswap_list_lru, entry);
+ 	}
+ 
+-	return entry->length;
++	return true;
+ 
+ store_failed:
+ 	zpool_free(pool->zpool, entry->handle);
+ compress_failed:
+ 	zswap_entry_cache_free(entry);
+-	return -EINVAL;
++	return false;
+ }
+ 
+ bool zswap_store(struct folio *folio)
+@@ -1526,7 +1530,6 @@ bool zswap_store(struct folio *folio)
+ 	struct obj_cgroup *objcg = NULL;
+ 	struct mem_cgroup *memcg = NULL;
+ 	struct zswap_pool *pool;
+-	size_t compressed_bytes = 0;
+ 	bool ret = false;
+ 	long index;
+ 
+@@ -1564,20 +1567,14 @@ bool zswap_store(struct folio *folio)
+ 
+ 	for (index = 0; index < nr_pages; ++index) {
+ 		struct page *page = folio_page(folio, index);
+-		ssize_t bytes;
+ 
+-		bytes = zswap_store_page(page, objcg, pool);
+-		if (bytes < 0)
++		if (!zswap_store_page(page, objcg, pool))
+ 			goto put_pool;
+-		compressed_bytes += bytes;
+ 	}
+ 
+-	if (objcg) {
+-		obj_cgroup_charge_zswap(objcg, compressed_bytes);
++	if (objcg)
+ 		count_objcg_events(objcg, ZSWPOUT, nr_pages);
+-	}
+ 
+-	atomic_long_add(nr_pages, &zswap_stored_pages);
+ 	count_vm_events(ZSWPOUT, nr_pages);
+ 
+ 	ret = true;
+-- 
+2.47.0
+
