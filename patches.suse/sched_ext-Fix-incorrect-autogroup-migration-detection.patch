@@ -1,0 +1,173 @@
+From 06884f67856236c2a4cf2f30dfebf4ca73de86b4 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Fri, 24 Jan 2025 12:22:12 -1000
+Subject: [PATCH] sched_ext: Fix incorrect autogroup migration detection
+
+References: git fixes (sched)
+Patch-mainline: v6.14-rc3
+Git-commit: d6f3e7d564b2309e1f17e709a70eca78d7ca2bb8
+
+scx_move_task() is called from sched_move_task() and tells the BPF scheduler
+that cgroup migration is being committed. sched_move_task() is used by both
+cgroup and autogroup migrations and scx_move_task() tried to filter out
+autogroup migrations by testing the destination cgroup and PF_EXITING but
+this is not enough. In fact, without explicitly tagging the thread which is
+doing the cgroup migration, there is no good way to tell apart
+scx_move_task() invocations for racing migration to the root cgroup and an
+autogroup migration.
+
+This led to scx_move_task() incorrectly ignoring a migration from non-root
+cgroup to an autogroup of the root cgroup triggering the following warning:
+
+  WARNING: CPU: 7 PID: 1 at kernel/sched/ext.c:3725 scx_cgroup_can_attach+0x196/0x340
+  ...
+  Call Trace:
+  <TASK>
+    cgroup_migrate_execute+0x5b1/0x700
+    cgroup_attach_task+0x296/0x400
+    __cgroup_procs_write+0x128/0x140
+    cgroup_procs_write+0x17/0x30
+    kernfs_fop_write_iter+0x141/0x1f0
+    vfs_write+0x31d/0x4a0
+    __x64_sys_write+0x72/0xf0
+    do_syscall_64+0x82/0x160
+    entry_SYSCALL_64_after_hwframe+0x76/0x7e
+
+Fix it by adding an argument to sched_move_task() that indicates whether the
+moving is for a cgroup or autogroup migration. After the change,
+scx_move_task() is called only for cgroup migrations and renamed to
+scx_cgroup_move_task().
+
+Link: https://github.com/sched-ext/scx/issues/370
+Fixes: 819513666966 ("sched_ext: Add cgroup support")
+Cc: stable@vger.kernel.org # v6.12+
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ kernel/sched/autogroup.c |  4 ++--
+ kernel/sched/core.c      |  7 ++++---
+ kernel/sched/ext.c       | 15 +--------------
+ kernel/sched/ext.h       |  4 ++--
+ kernel/sched/sched.h     |  2 +-
+ 5 files changed, 10 insertions(+), 22 deletions(-)
+
+diff --git a/kernel/sched/autogroup.c b/kernel/sched/autogroup.c
+index db68a964e34e..c4a3ccf6a8ac 100644
+--- a/kernel/sched/autogroup.c
++++ b/kernel/sched/autogroup.c
+@@ -150,7 +150,7 @@ void sched_autogroup_exit_task(struct task_struct *p)
+ 	 * see this thread after that: we can no longer use signal->autogroup.
+ 	 * See the PF_EXITING check in task_wants_autogroup().
+ 	 */
+-	sched_move_task(p);
++	sched_move_task(p, true);
+ }
+ 
+ static void
+@@ -182,7 +182,7 @@ autogroup_move_group(struct task_struct *p, struct autogroup *ag)
+ 	 * sched_autogroup_exit_task().
+ 	 */
+ 	for_each_thread(p, t)
+-		sched_move_task(t);
++		sched_move_task(t, true);
+ 
+ 	unlock_task_sighand(p, &flags);
+ 	autogroup_kref_put(prev);
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 850a1bfa5430..1e368b35da5d 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -9047,7 +9047,7 @@ static void sched_change_group(struct task_struct *tsk, struct task_group *group
+  * now. This function just updates tsk->se.cfs_rq and tsk->se.parent to reflect
+  * its new group.
+  */
+-void sched_move_task(struct task_struct *tsk)
++void sched_move_task(struct task_struct *tsk, bool for_autogroup)
+ {
+ 	int queued, running, queue_flags =
+ 		DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK;
+@@ -9076,7 +9076,8 @@ void sched_move_task(struct task_struct *tsk)
+ 		put_prev_task(rq, tsk);
+ 
+ 	sched_change_group(tsk, group);
+-	scx_move_task(tsk);
++	if (!for_autogroup)
++		scx_cgroup_move_task(tsk);
+ 
+ 	if (queued)
+ 		enqueue_task(rq, tsk, queue_flags);
+@@ -9177,7 +9178,7 @@ static void cpu_cgroup_attach(struct cgroup_taskset *tset)
+ 	struct cgroup_subsys_state *css;
+ 
+ 	cgroup_taskset_for_each(task, css, tset)
+-		sched_move_task(task);
++		sched_move_task(task, false);
+ 
+ 	scx_cgroup_finish_attach();
+ }
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index acf39f8ae8cd..e20cb59c9024 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -4317,24 +4317,11 @@ int scx_cgroup_can_attach(struct cgroup_taskset *tset)
+ 	return ops_sanitize_err("cgroup_prep_move", ret);
+ }
+ 
+-void scx_move_task(struct task_struct *p)
++void scx_cgroup_move_task(struct task_struct *p)
+ {
+ 	if (!scx_cgroup_enabled)
+ 		return;
+ 
+-	/*
+-	 * We're called from sched_move_task() which handles both cgroup and
+-	 * autogroup moves. Ignore the latter.
+-	 *
+-	 * Also ignore exiting tasks, because in the exit path tasks transition
+-	 * from the autogroup to the root group, so task_group_is_autogroup()
+-	 * alone isn't able to catch exiting autogroup tasks. This is safe for
+-	 * cgroup_move(), because cgroup migrations never happen for PF_EXITING
+-	 * tasks.
+-	 */
+-	if (task_group_is_autogroup(task_group(p)) || (p->flags & PF_EXITING))
+-		return;
+-
+ 	/*
+ 	 * @p must have ops.cgroup_prep_move() called on it and thus
+ 	 * cgrp_moving_from set.
+diff --git a/kernel/sched/ext.h b/kernel/sched/ext.h
+index 4d022d17ac7d..1079b56b0f7a 100644
+--- a/kernel/sched/ext.h
++++ b/kernel/sched/ext.h
+@@ -73,7 +73,7 @@ static inline void scx_update_idle(struct rq *rq, bool idle, bool do_notify) {}
+ int scx_tg_online(struct task_group *tg);
+ void scx_tg_offline(struct task_group *tg);
+ int scx_cgroup_can_attach(struct cgroup_taskset *tset);
+-void scx_move_task(struct task_struct *p);
++void scx_cgroup_move_task(struct task_struct *p);
+ void scx_cgroup_finish_attach(void);
+ void scx_cgroup_cancel_attach(struct cgroup_taskset *tset);
+ void scx_group_set_weight(struct task_group *tg, unsigned long cgrp_weight);
+@@ -82,7 +82,7 @@ void scx_group_set_idle(struct task_group *tg, bool idle);
+ static inline int scx_tg_online(struct task_group *tg) { return 0; }
+ static inline void scx_tg_offline(struct task_group *tg) {}
+ static inline int scx_cgroup_can_attach(struct cgroup_taskset *tset) { return 0; }
+-static inline void scx_move_task(struct task_struct *p) {}
++static inline void scx_cgroup_move_task(struct task_struct *p) {}
+ static inline void scx_cgroup_finish_attach(void) {}
+ static inline void scx_cgroup_cancel_attach(struct cgroup_taskset *tset) {}
+ static inline void scx_group_set_weight(struct task_group *tg, unsigned long cgrp_weight) {}
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 245191920547..cd711bc81d37 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -572,7 +572,7 @@ extern void sched_online_group(struct task_group *tg,
+ extern void sched_destroy_group(struct task_group *tg);
+ extern void sched_release_group(struct task_group *tg);
+ 
+-extern void sched_move_task(struct task_struct *tsk);
++extern void sched_move_task(struct task_struct *tsk, bool for_autogroup);
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ extern int sched_group_set_shares(struct task_group *tg, unsigned long shares);
