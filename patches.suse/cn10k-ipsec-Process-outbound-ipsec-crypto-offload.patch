@@ -1,0 +1,523 @@
+From: Bharat Bhushan <bbhushan2@marvell.com>
+Date: Wed, 4 Dec 2024 11:26:57 +0530
+Subject: cn10k-ipsec: Process outbound ipsec crypto offload
+Patch-mainline: v6.14-rc1
+Git-commit: 6a77a158848a8c68930df27b8840660db8531222
+References: jsc#PED-11317
+
+Prepare and submit crypto hardware (CPT) instruction for
+outbound ipsec crypto offload. The CPT instruction have
+authentication offset, IV offset and encapsulation offset
+in input packet. Also provide SA context pointer which have
+details about algo, keys, salt etc. Crypto hardware encrypt,
+authenticate and provide the ESP packet to networking hardware.
+
+Signed-off-by: Bharat Bhushan <bbhushan2@marvell.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/marvell/octeontx2/nic/cn10k_ipsec.c |  219 +++++++++++++++
+ drivers/net/ethernet/marvell/octeontx2/nic/cn10k_ipsec.h |   42 ++
+ drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c |   23 +
+ drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h |    3 
+ drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c     |    2 
+ drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c   |   32 +-
+ drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h   |    3 
+ 7 files changed, 321 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/cn10k_ipsec.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/cn10k_ipsec.c
+@@ -7,10 +7,15 @@
+ #include <net/xfrm.h>
+ #include <linux/netdevice.h>
+ #include <linux/bitfield.h>
++#include <crypto/aead.h>
++#include <crypto/gcm.h>
+ 
+ #include "otx2_common.h"
++#include "otx2_struct.h"
+ #include "cn10k_ipsec.h"
+ 
++DEFINE_STATIC_KEY_FALSE(cn10k_ipsec_sa_enabled);
++
+ static bool is_dev_support_ipsec_offload(struct pci_dev *pdev)
+ {
+ 	return is_dev_cn10ka_b0(pdev) || is_dev_cn10kb(pdev);
+@@ -690,6 +695,9 @@ static int cn10k_ipsec_outb_add_state(st
+ 	}
+ 
+ 	x->xso.offload_handle = (unsigned long)sa_info;
++	/* Enable static branch when first SA setup */
++	if (!pf->ipsec.outb_sa_count)
++		static_branch_enable(&cn10k_ipsec_sa_enabled);
+ 	pf->ipsec.outb_sa_count++;
+ 	return 0;
+ }
+@@ -749,6 +757,8 @@ static void cn10k_ipsec_sa_wq_handler(st
+ 						 sa_work);
+ 	struct otx2_nic *pf = container_of(ipsec, struct otx2_nic, ipsec);
+ 
++	/* Disable static branch when no more SA enabled */
++	static_branch_disable(&cn10k_ipsec_sa_enabled);
+ 	rtnl_lock();
+ 	netdev_update_features(pf->netdev);
+ 	rtnl_unlock();
+@@ -822,3 +832,212 @@ void cn10k_ipsec_clean(struct otx2_nic *
+ 	cn10k_outb_cpt_clean(pf);
+ }
+ EXPORT_SYMBOL(cn10k_ipsec_clean);
++
++static u16 cn10k_ipsec_get_ip_data_len(struct xfrm_state *x,
++				       struct sk_buff *skb)
++{
++	struct ipv6hdr *ipv6h;
++	struct iphdr *iph;
++	u8 *src;
++
++	src = (u8 *)skb->data + ETH_HLEN;
++
++	if (x->props.family == AF_INET) {
++		iph = (struct iphdr *)src;
++		return ntohs(iph->tot_len);
++	}
++
++	ipv6h = (struct ipv6hdr *)src;
++	return ntohs(ipv6h->payload_len) + sizeof(struct ipv6hdr);
++}
++
++/* Prepare CPT and NIX SQE scatter/gather subdescriptor structure.
++ * SG of NIX and CPT are same in size.
++ * Layout of a NIX SQE and CPT SG entry:
++ *      -----------------------------
++ *     |     CPT Scatter Gather      |
++ *     |       (SQE SIZE)            |
++ *     |                             |
++ *      -----------------------------
++ *     |       NIX SQE               |
++ *     |       (SQE SIZE)            |
++ *     |                             |
++ *      -----------------------------
++ */
++bool otx2_sqe_add_sg_ipsec(struct otx2_nic *pfvf, struct otx2_snd_queue *sq,
++			   struct sk_buff *skb, int num_segs, int *offset)
++{
++	struct cpt_sg_s *cpt_sg = NULL;
++	struct nix_sqe_sg_s *sg = NULL;
++	u64 dma_addr, *iova = NULL;
++	u64 *cpt_iova = NULL;
++	u16 *sg_lens = NULL;
++	int seg, len;
++
++	sq->sg[sq->head].num_segs = 0;
++	cpt_sg = (struct cpt_sg_s *)(sq->sqe_base - sq->sqe_size);
++
++	for (seg = 0; seg < num_segs; seg++) {
++		if ((seg % MAX_SEGS_PER_SG) == 0) {
++			sg = (struct nix_sqe_sg_s *)(sq->sqe_base + *offset);
++			sg->ld_type = NIX_SEND_LDTYPE_LDD;
++			sg->subdc = NIX_SUBDC_SG;
++			sg->segs = 0;
++			sg_lens = (void *)sg;
++			iova = (void *)sg + sizeof(*sg);
++			/* Next subdc always starts at a 16byte boundary.
++			 * So if sg->segs is whether 2 or 3, offset += 16bytes.
++			 */
++			if ((num_segs - seg) >= (MAX_SEGS_PER_SG - 1))
++				*offset += sizeof(*sg) + (3 * sizeof(u64));
++			else
++				*offset += sizeof(*sg) + sizeof(u64);
++
++			cpt_sg += (seg / MAX_SEGS_PER_SG) * 4;
++			cpt_iova = (void *)cpt_sg + sizeof(*cpt_sg);
++		}
++		dma_addr = otx2_dma_map_skb_frag(pfvf, skb, seg, &len);
++		if (dma_mapping_error(pfvf->dev, dma_addr))
++			return false;
++
++		sg_lens[seg % MAX_SEGS_PER_SG] = len;
++		sg->segs++;
++		*iova++ = dma_addr;
++		*cpt_iova++ = dma_addr;
++
++		/* Save DMA mapping info for later unmapping */
++		sq->sg[sq->head].dma_addr[seg] = dma_addr;
++		sq->sg[sq->head].size[seg] = len;
++		sq->sg[sq->head].num_segs++;
++
++		*cpt_sg = *(struct cpt_sg_s *)sg;
++		cpt_sg->rsvd_63_50 = 0;
++	}
++
++	sq->sg[sq->head].skb = (u64)skb;
++	return true;
++}
++
++static u16 cn10k_ipsec_get_param1(u8 iv_offset)
++{
++	u16 param1_val;
++
++	/* Set Crypto mode, disable L3/L4 checksum */
++	param1_val = CN10K_IPSEC_INST_PARAM1_DIS_L4_CSUM |
++		      CN10K_IPSEC_INST_PARAM1_DIS_L3_CSUM;
++	param1_val |= (u16)iv_offset << CN10K_IPSEC_INST_PARAM1_IV_OFFSET_SHIFT;
++	return param1_val;
++}
++
++bool cn10k_ipsec_transmit(struct otx2_nic *pf, struct netdev_queue *txq,
++			  struct otx2_snd_queue *sq, struct sk_buff *skb,
++			  int num_segs, int size)
++{
++	struct cpt_inst_s inst;
++	struct cpt_res_s *res;
++	struct xfrm_state *x;
++	struct qmem *sa_info;
++	dma_addr_t dptr_iova;
++	struct sec_path *sp;
++	u8 encap_offset;
++	u8 auth_offset;
++	u8 gthr_size;
++	u8 iv_offset;
++	u16 dlen;
++
++	/* Check for IPSEC offload enabled */
++	if (!(pf->flags & OTX2_FLAG_IPSEC_OFFLOAD_ENABLED))
++		goto drop;
++
++	sp = skb_sec_path(skb);
++	if (unlikely(!sp->len))
++		goto drop;
++
++	x = xfrm_input_state(skb);
++	if (unlikely(!x))
++		goto drop;
++
++	if (x->props.mode != XFRM_MODE_TRANSPORT &&
++	    x->props.mode != XFRM_MODE_TUNNEL)
++		goto drop;
++
++	dlen = cn10k_ipsec_get_ip_data_len(x, skb);
++	if (dlen == 0 && netif_msg_tx_err(pf)) {
++		netdev_err(pf->netdev, "Invalid IP header, ip-length zero\n");
++		goto drop;
++	}
++
++	/* Check for valid SA context */
++	sa_info = (struct qmem *)x->xso.offload_handle;
++	if (!sa_info)
++		goto drop;
++
++	memset(&inst, 0, sizeof(struct cpt_inst_s));
++
++	/* Get authentication offset */
++	if (x->props.family == AF_INET)
++		auth_offset = sizeof(struct iphdr);
++	else
++		auth_offset = sizeof(struct ipv6hdr);
++
++	/* IV offset is after ESP header */
++	iv_offset = auth_offset + sizeof(struct ip_esp_hdr);
++	/* Encap will start after IV */
++	encap_offset = iv_offset + GCM_RFC4106_IV_SIZE;
++
++	/* CPT Instruction word-1 */
++	res = (struct cpt_res_s *)(sq->cpt_resp->base + (64 * sq->head));
++	res->compcode = 0;
++	inst.res_addr = sq->cpt_resp->iova + (64 * sq->head);
++
++	/* CPT Instruction word-2 */
++	inst.rvu_pf_func = pf->pcifunc;
++
++	/* CPT Instruction word-3:
++	 * Set QORD to force CPT_RES_S write completion
++	 */
++	inst.qord = 1;
++
++	/* CPT Instruction word-4 */
++	/* inst.dlen should not include ICV length */
++	inst.dlen = dlen + ETH_HLEN - (x->aead->alg_icv_len / 8);
++	inst.opcode_major = CN10K_IPSEC_MAJOR_OP_OUTB_IPSEC;
++	inst.param1 = cn10k_ipsec_get_param1(iv_offset);
++
++	inst.param2 = encap_offset <<
++		       CN10K_IPSEC_INST_PARAM2_ENC_DATA_OFFSET_SHIFT;
++	inst.param2 |= (u16)auth_offset <<
++			CN10K_IPSEC_INST_PARAM2_AUTH_DATA_OFFSET_SHIFT;
++
++	/* CPT Instruction word-5 */
++	gthr_size = num_segs / MAX_SEGS_PER_SG;
++	gthr_size = (num_segs % MAX_SEGS_PER_SG) ? gthr_size + 1 : gthr_size;
++
++	gthr_size &= 0xF;
++	dptr_iova = (sq->sqe_ring->iova + (sq->head * (sq->sqe_size * 2)));
++	inst.dptr = dptr_iova | ((u64)gthr_size << 60);
++
++	/* CPT Instruction word-6 */
++	inst.rptr = inst.dptr;
++
++	/* CPT Instruction word-7 */
++	inst.cptr = sa_info->iova;
++	inst.ctx_val = 1;
++	inst.egrp = CN10K_DEF_CPT_IPSEC_EGRP;
++
++	/* CPT Instruction word-0 */
++	inst.nixtxl = (size / 16) - 1;
++	inst.dat_offset = ETH_HLEN;
++	inst.nixtx_offset = sq->sqe_size;
++
++	netdev_tx_sent_queue(txq, skb->len);
++
++	/* Finally Flush the CPT instruction */
++	sq->head++;
++	sq->head &= (sq->sqe_cnt - 1);
++	cn10k_cpt_inst_flush(pf, &inst, sizeof(struct cpt_inst_s));
++	return true;
++drop:
++	dev_kfree_skb_any(skb);
++	return false;
++}
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/cn10k_ipsec.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/cn10k_ipsec.h
+@@ -9,6 +9,8 @@
+ 
+ #include <linux/types.h>
+ 
++DECLARE_STATIC_KEY_FALSE(cn10k_ipsec_sa_enabled);
++
+ /* CPT instruction size in bytes */
+ #define CN10K_CPT_INST_SIZE	64
+ 
+@@ -53,6 +55,7 @@
+ /* IPSEC Instruction opcodes */
+ #define CN10K_IPSEC_MAJOR_OP_WRITE_SA 0x01UL
+ #define CN10K_IPSEC_MINOR_OP_WRITE_SA 0x09UL
++#define CN10K_IPSEC_MAJOR_OP_OUTB_IPSEC 0x2AUL
+ 
+ enum cn10k_cpt_comp_e {
+ 	CN10K_CPT_COMP_E_NOTDONE = 0x00,
+@@ -143,6 +146,16 @@ struct cn10k_tx_sa_s {
+ 	u64 hw_ctx[6];		/* W31 - W36 */
+ };
+ 
++/* CPT instruction parameter-1 */
++#define CN10K_IPSEC_INST_PARAM1_DIS_L4_CSUM		0x1
++#define CN10K_IPSEC_INST_PARAM1_DIS_L3_CSUM		0x2
++#define CN10K_IPSEC_INST_PARAM1_CRYPTO_MODE		0x20
++#define CN10K_IPSEC_INST_PARAM1_IV_OFFSET_SHIFT		8
++
++/* CPT instruction parameter-2 */
++#define CN10K_IPSEC_INST_PARAM2_ENC_DATA_OFFSET_SHIFT	0
++#define CN10K_IPSEC_INST_PARAM2_AUTH_DATA_OFFSET_SHIFT	8
++
+ /* CPT Instruction Structure */
+ struct cpt_inst_s {
+ 	u64 nixtxl		: 3; /* W0 */
+@@ -182,6 +195,15 @@ struct cpt_res_s {
+ 	u64 esn;		/* W1 */
+ };
+ 
++/* CPT SG structure */
++struct cpt_sg_s {
++	u64 seg1_size	: 16;
++	u64 seg2_size	: 16;
++	u64 seg3_size	: 16;
++	u64 segs	: 2;
++	u64 rsvd_63_50	: 14;
++};
++
+ /* CPT LF_INPROG Register */
+ #define CPT_LF_INPROG_INFLIGHT	GENMASK_ULL(8, 0)
+ #define CPT_LF_INPROG_GRB_CNT	GENMASK_ULL(39, 32)
+@@ -204,6 +226,11 @@ struct cpt_res_s {
+ int cn10k_ipsec_init(struct net_device *netdev);
+ void cn10k_ipsec_clean(struct otx2_nic *pf);
+ int cn10k_ipsec_ethtool_init(struct net_device *netdev, bool enable);
++bool otx2_sqe_add_sg_ipsec(struct otx2_nic *pfvf, struct otx2_snd_queue *sq,
++			   struct sk_buff *skb, int num_segs, int *offset);
++bool cn10k_ipsec_transmit(struct otx2_nic *pf, struct netdev_queue *txq,
++			  struct otx2_snd_queue *sq, struct sk_buff *skb,
++			  int num_segs, int size);
+ #else
+ static inline __maybe_unused int cn10k_ipsec_init(struct net_device *netdev)
+ {
+@@ -219,5 +246,20 @@ int cn10k_ipsec_ethtool_init(struct net_
+ {
+ 	return 0;
+ }
++
++static inline bool __maybe_unused
++otx2_sqe_add_sg_ipsec(struct otx2_nic *pfvf, struct otx2_snd_queue *sq,
++		      struct sk_buff *skb, int num_segs, int *offset)
++{
++	return true;
++}
++
++static inline bool __maybe_unused
++cn10k_ipsec_transmit(struct otx2_nic *pf, struct netdev_queue *txq,
++		     struct otx2_snd_queue *sq, struct sk_buff *skb,
++		     int num_segs, int size)
++{
++	return true;
++}
+ #endif
+ #endif // CN10K_IPSEC_H
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -970,6 +970,29 @@ int otx2_sq_init(struct otx2_nic *pfvf,
+ 	if (err)
+ 		return err;
+ 
++	/* Allocate memory for NIX SQE (which includes NIX SG) and CPT SG.
++	 * SG of NIX and CPT are same in size. Allocate memory for CPT SG
++	 * same as NIX SQE for base address alignment.
++	 * Layout of a NIX SQE and CPT SG entry:
++	 *      -----------------------------
++	 *     |     CPT Scatter Gather      |
++	 *     |       (SQE SIZE)            |
++	 *     |                             |
++	 *      -----------------------------
++	 *     |       NIX SQE               |
++	 *     |       (SQE SIZE)            |
++	 *     |                             |
++	 *      -----------------------------
++	 */
++	err = qmem_alloc(pfvf->dev, &sq->sqe_ring, qset->sqe_cnt,
++			 sq->sqe_size * 2);
++	if (err)
++		return err;
++
++	err = qmem_alloc(pfvf->dev, &sq->cpt_resp, qset->sqe_cnt, 64);
++	if (err)
++		return err;
++
+ 	if (qidx < pfvf->hw.tx_queues) {
+ 		err = qmem_alloc(pfvf->dev, &sq->tso_hdrs, qset->sqe_cnt,
+ 				 TSO_HEADER_SIZE);
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -57,6 +57,9 @@
+ #define NIX_PF_PFC_PRIO_MAX			8
+ #endif
+ 
++/* Number of segments per SG structure */
++#define MAX_SEGS_PER_SG 3
++
+ enum arua_mapped_qtypes {
+ 	AURA_NIX_RQ,
+ 	AURA_NIX_SQ,
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -1485,6 +1485,8 @@ static void otx2_free_sq_res(struct otx2
+ 		if (!sq->sqe)
+ 			continue;
+ 		qmem_free(pf->dev, sq->sqe);
++		qmem_free(pf->dev, sq->sqe_ring);
++		qmem_free(pf->dev, sq->cpt_resp);
+ 		qmem_free(pf->dev, sq->tso_hdrs);
+ 		kfree(sq->sg);
+ 		kfree(sq->sqb_ptrs);
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -11,6 +11,7 @@
+ #include <linux/bpf.h>
+ #include <linux/bpf_trace.h>
+ #include <net/ip6_checksum.h>
++#include <net/xfrm.h>
+ 
+ #include "otx2_reg.h"
+ #include "otx2_common.h"
+@@ -32,6 +33,17 @@ static bool otx2_xdp_rcv_pkt_handler(str
+ 				     struct otx2_cq_queue *cq,
+ 				     bool *need_xdp_flush);
+ 
++static void otx2_sq_set_sqe_base(struct otx2_snd_queue *sq,
++				 struct sk_buff *skb)
++{
++	if (static_branch_unlikely(&cn10k_ipsec_sa_enabled) &&
++	    (xfrm_offload(skb)))
++		sq->sqe_base = sq->sqe_ring->base + sq->sqe_size +
++				(sq->head * (sq->sqe_size * 2));
++	else
++		sq->sqe_base = sq->sqe->base;
++}
++
+ static int otx2_nix_cq_op_status(struct otx2_nic *pfvf,
+ 				 struct otx2_cq_queue *cq)
+ {
+@@ -593,7 +605,6 @@ void otx2_sqe_flush(void *dev, struct ot
+ 	sq->head &= (sq->sqe_cnt - 1);
+ }
+ 
+-#define MAX_SEGS_PER_SG	3
+ /* Add SQE scatter/gather subdescriptor structure */
+ static bool otx2_sqe_add_sg(struct otx2_nic *pfvf, struct otx2_snd_queue *sq,
+ 			    struct sk_buff *skb, int num_segs, int *offset)
+@@ -1129,6 +1140,7 @@ bool otx2_sq_append_skb(void *dev, struc
+ 	int offset, num_segs, free_desc;
+ 	struct nix_sqe_hdr_s *sqe_hdr;
+ 	struct otx2_nic *pfvf = dev;
++	bool ret;
+ 
+ 	/* Check if there is enough room between producer
+ 	 * and consumer index.
+@@ -1145,6 +1157,7 @@ bool otx2_sq_append_skb(void *dev, struc
+ 	/* If SKB doesn't fit in a single SQE, linearize it.
+ 	 * TODO: Consider adding JUMP descriptor instead.
+ 	 */
++
+ 	if (unlikely(num_segs > OTX2_MAX_FRAGS_IN_SQE)) {
+ 		if (__skb_linearize(skb)) {
+ 			dev_kfree_skb_any(skb);
+@@ -1164,6 +1177,9 @@ bool otx2_sq_append_skb(void *dev, struc
+ 		return true;
+ 	}
+ 
++	/* Set sqe base address */
++	otx2_sq_set_sqe_base(sq, skb);
++
+ 	/* Set SQE's SEND_HDR.
+ 	 * Do not clear the first 64bit as it contains constant info.
+ 	 */
+@@ -1176,7 +1192,13 @@ bool otx2_sq_append_skb(void *dev, struc
+ 	otx2_sqe_add_ext(pfvf, sq, skb, &offset);
+ 
+ 	/* Add SG subdesc with data frags */
+-	if (!otx2_sqe_add_sg(pfvf, sq, skb, num_segs, &offset)) {
++	if (static_branch_unlikely(&cn10k_ipsec_sa_enabled) &&
++	    (xfrm_offload(skb)))
++		ret = otx2_sqe_add_sg_ipsec(pfvf, sq, skb, num_segs, &offset);
++	else
++		ret = otx2_sqe_add_sg(pfvf, sq, skb, num_segs, &offset);
++
++	if (!ret) {
+ 		otx2_dma_unmap_skb_frags(pfvf, &sq->sg[sq->head]);
+ 		return false;
+ 	}
+@@ -1185,11 +1207,15 @@ bool otx2_sq_append_skb(void *dev, struc
+ 
+ 	sqe_hdr->sizem1 = (offset / 16) - 1;
+ 
++	if (static_branch_unlikely(&cn10k_ipsec_sa_enabled) &&
++	    (xfrm_offload(skb)))
++		return cn10k_ipsec_transmit(pfvf, txq, sq, skb, num_segs,
++					    offset);
++
+ 	netdev_tx_sent_queue(txq, skb->len);
+ 
+ 	/* Flush SQE to HW */
+ 	pfvf->hw_ops->sqe_flush(pfvf, sq, offset, qidx);
+-
+ 	return true;
+ }
+ EXPORT_SYMBOL(otx2_sq_append_skb);
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+@@ -101,6 +101,9 @@ struct otx2_snd_queue {
+ 	struct queue_stats	stats;
+ 	u16			sqb_count;
+ 	u64			*sqb_ptrs;
++	/* SQE ring and CPT response queue for Inline IPSEC */
++	struct qmem		*sqe_ring;
++	struct qmem		*cpt_resp;
+ } ____cacheline_aligned_in_smp;
+ 
+ enum cq_type {
