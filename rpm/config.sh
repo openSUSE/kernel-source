@@ -26,3 +26,5 @@ BUILD_HTML=Yes
 BUILD_PDF=No
 # Generate compile_commands.json
 GENERATE_COMPILE_COMMANDS=Yes
+# Set gcc version to the one used for build in IBS
+GCC_VERSION=13
