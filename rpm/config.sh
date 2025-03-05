@@ -16,8 +16,8 @@ OBS_PROJECT=SUSE:SLFO:Main:Build
 IBS_PROJECT=SUSE:SLFO:Main:Build
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
-BUGZILLA_PRODUCT="SUSE Linux Micro 6.2"
-BUGZILLA_COMPONENT="Kernel/filesystems"
+BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 16.0"
+BUGZILLA_COMPONENT="Kernel"
 SPLIT_OPTIONAL=Yes
 SUPPORTED_MODULES_CHECK=Yes
 # build documentation in HTML format
