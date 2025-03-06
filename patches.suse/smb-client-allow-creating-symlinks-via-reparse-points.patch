@@ -1,0 +1,201 @@
+From: Paulo Alcantara <pc@manguebit.com>
+Date: Sat, 25 Nov 2023 23:55:04 -0300
+Subject: [PATCH] smb: client: allow creating symlinks via reparse points
+Git-commit: 514d793e27a310eb26b112c1f8f1a160472907e5
+References: git-fixes
+Patch-mainline: v6.8-rc1
+
+Add support for creating symlinks via IO_REPARSE_TAG_SYMLINK reparse
+points in SMB2+.
+
+These are fully supported by most SMB servers and documented in
+MS-FSCC.  Also have the advantage of requiring fewer roundtrips as
+their symlink targets can be parsed directly from CREATE responses on
+STATUS_STOPPED_ON_SYMLINK errors.
+
+Reported-by: kernel test robot <lkp@intel.com>
+Closes: https://lore.kernel.org/oe-kbuild-all/202311260838.nx5mkj1j-lkp@intel.com/
+Signed-off-by: Paulo Alcantara (SUSE) <pc@manguebit.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Acked-by: Enzo Matsumiya <ematsumiya@suse.de>
+---
+ fs/smb/client/cifsglob.h |  6 ++++
+ fs/smb/client/link.c     | 15 ++++++---
+ fs/smb/client/smb2ops.c  | 70 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 86 insertions(+), 5 deletions(-)
+
+diff --git a/fs/smb/client/cifsglob.h b/fs/smb/client/cifsglob.h
+index d5d6aedef558..f840756e0169 100644
+--- a/fs/smb/client/cifsglob.h
++++ b/fs/smb/client/cifsglob.h
+@@ -574,6 +574,12 @@ struct smb_version_operations {
+ 	int (*parse_reparse_point)(struct cifs_sb_info *cifs_sb,
+ 				   struct kvec *rsp_iov,
+ 				   struct cifs_open_info_data *data);
++	int (*create_reparse_symlink)(const unsigned int xid,
++				      struct inode *inode,
++				      struct dentry *dentry,
++				      struct cifs_tcon *tcon,
++				      const char *full_path,
++				      const char *symname);
+ };
+ 
+ struct smb_version_values {
+diff --git a/fs/smb/client/link.c b/fs/smb/client/link.c
+index 691f43a1ec2b..d86da949a919 100644
+--- a/fs/smb/client/link.c
++++ b/fs/smb/client/link.c
+@@ -569,6 +569,7 @@ cifs_symlink(struct mnt_idmap *idmap, struct inode *inode,
+ 	int rc = -EOPNOTSUPP;
+ 	unsigned int xid;
+ 	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
++	struct TCP_Server_Info *server;
+ 	struct tcon_link *tlink;
+ 	struct cifs_tcon *pTcon;
+ 	const char *full_path;
+@@ -590,6 +591,7 @@ cifs_symlink(struct mnt_idmap *idmap, struct inode *inode,
+ 		goto symlink_exit;
+ 	}
+ 	pTcon = tlink_tcon(tlink);
++	server = cifs_pick_channel(pTcon->ses);
+ 
+ 	full_path = build_path_from_dentry(direntry, page);
+ 	if (IS_ERR(full_path)) {
+@@ -601,17 +603,20 @@ cifs_symlink(struct mnt_idmap *idmap, struct inode *inode,
+ 	cifs_dbg(FYI, "symname is %s\n", symname);
+ 
+ 	/* BB what if DFS and this volume is on different share? BB */
+-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MF_SYMLINKS)
++	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MF_SYMLINKS) {
+ 		rc = create_mf_symlink(xid, pTcon, cifs_sb, full_path, symname);
+ #ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
+-	else if (pTcon->unix_ext)
++	} else if (pTcon->unix_ext) {
+ 		rc = CIFSUnixCreateSymLink(xid, pTcon, full_path, symname,
+ 					   cifs_sb->local_nls,
+ 					   cifs_remap(cifs_sb));
+ #endif /* CONFIG_CIFS_ALLOW_INSECURE_LEGACY */
+-	/* else
+-	   rc = CIFSCreateReparseSymLink(xid, pTcon, fromName, toName,
+-					cifs_sb_target->local_nls); */
++	} else if (server->ops->create_reparse_symlink) {
++		rc =  server->ops->create_reparse_symlink(xid, inode, direntry,
++							  pTcon, full_path,
++							  symname);
++		goto symlink_exit;
++	}
+ 
+ 	if (rc == 0) {
+ 		if (pTcon->posix_extensions) {
+diff --git a/fs/smb/client/smb2ops.c b/fs/smb/client/smb2ops.c
+index 201e951d50e5..8a9029bd9f0f 100644
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -5247,6 +5247,72 @@ static int nfs_make_node(unsigned int xid, struct inode *inode,
+ 	return rc;
+ }
+ 
++static int smb2_create_reparse_symlink(const unsigned int xid,
++				       struct inode *inode,
++				       struct dentry *dentry,
++				       struct cifs_tcon *tcon,
++				       const char *full_path,
++				       const char *symname)
++{
++	struct reparse_symlink_data_buffer *buf = NULL;
++	struct cifs_open_info_data data;
++	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
++	struct inode *new;
++	struct kvec iov;
++	__le16 *path;
++	char *sym;
++	u16 len, plen;
++	int rc = 0;
++
++	sym = kstrdup(symname, GFP_KERNEL);
++	if (!sym)
++		return -ENOMEM;
++
++	data = (struct cifs_open_info_data) {
++		.reparse_point = true,
++		.reparse = { .tag = IO_REPARSE_TAG_SYMLINK, },
++		.symlink_target = sym,
++	};
++
++	path = cifs_convert_path_to_utf16(symname, cifs_sb);
++	if (!path) {
++		rc = -ENOMEM;
++		goto out;
++	}
++
++	plen = 2 * UniStrnlen((wchar_t *)path, PATH_MAX);
++	len = sizeof(*buf) + plen * 2;
++	buf = kzalloc(len, GFP_KERNEL);
++	if (!buf) {
++		rc = -ENOMEM;
++		goto out;
++	}
++
++	buf->ReparseTag = cpu_to_le32(IO_REPARSE_TAG_SYMLINK);
++	buf->ReparseDataLength = cpu_to_le16(len - sizeof(struct reparse_data_buffer));
++	buf->SubstituteNameOffset = cpu_to_le16(plen);
++	buf->SubstituteNameLength = cpu_to_le16(plen);
++	memcpy(&buf->PathBuffer[plen], path, plen);
++	buf->PrintNameOffset = 0;
++	buf->PrintNameLength = cpu_to_le16(plen);
++	memcpy(buf->PathBuffer, path, plen);
++	buf->Flags = cpu_to_le32(*symname != '/' ? SYMLINK_FLAG_RELATIVE : 0);
++
++	iov.iov_base = buf;
++	iov.iov_len = len;
++	new = smb2_get_reparse_inode(&data, inode->i_sb, xid,
++				     tcon, full_path, &iov);
++	if (!IS_ERR(new))
++		d_instantiate(dentry, new);
++	else
++		rc = PTR_ERR(new);
++out:
++	kfree(path);
++	cifs_free_open_info(&data);
++	kfree(buf);
++	return rc;
++}
++
+ static int smb2_make_node(unsigned int xid, struct inode *inode,
+ 			  struct dentry *dentry, struct cifs_tcon *tcon,
+ 			  const char *full_path, umode_t mode, dev_t dev)
+@@ -5323,6 +5389,7 @@ struct smb_version_operations smb20_operations = {
+ 	.parse_reparse_point = smb2_parse_reparse_point,
+ 	.query_mf_symlink = smb3_query_mf_symlink,
+ 	.create_mf_symlink = smb3_create_mf_symlink,
++	.create_reparse_symlink = smb2_create_reparse_symlink,
+ 	.open = smb2_open_file,
+ 	.set_fid = smb2_set_fid,
+ 	.close = smb2_close_file,
+@@ -5425,6 +5492,7 @@ struct smb_version_operations smb21_operations = {
+ 	.parse_reparse_point = smb2_parse_reparse_point,
+ 	.query_mf_symlink = smb3_query_mf_symlink,
+ 	.create_mf_symlink = smb3_create_mf_symlink,
++	.create_reparse_symlink = smb2_create_reparse_symlink,
+ 	.open = smb2_open_file,
+ 	.set_fid = smb2_set_fid,
+ 	.close = smb2_close_file,
+@@ -5530,6 +5598,7 @@ struct smb_version_operations smb30_operations = {
+ 	.parse_reparse_point = smb2_parse_reparse_point,
+ 	.query_mf_symlink = smb3_query_mf_symlink,
+ 	.create_mf_symlink = smb3_create_mf_symlink,
++	.create_reparse_symlink = smb2_create_reparse_symlink,
+ 	.open = smb2_open_file,
+ 	.set_fid = smb2_set_fid,
+ 	.close = smb2_close_file,
+@@ -5644,6 +5713,7 @@ struct smb_version_operations smb311_operations = {
+ 	.parse_reparse_point = smb2_parse_reparse_point,
+ 	.query_mf_symlink = smb3_query_mf_symlink,
+ 	.create_mf_symlink = smb3_create_mf_symlink,
++	.create_reparse_symlink = smb2_create_reparse_symlink,
+ 	.open = smb2_open_file,
+ 	.set_fid = smb2_set_fid,
+ 	.close = smb2_close_file,
+-- 
+2.43.0
+
