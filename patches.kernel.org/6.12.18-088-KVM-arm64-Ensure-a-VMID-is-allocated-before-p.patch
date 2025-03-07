@@ -1,0 +1,156 @@
+From: Oliver Upton <oliver.upton@linux.dev>
+Date: Wed, 19 Feb 2025 14:07:37 -0800
+Subject: [PATCH] KVM: arm64: Ensure a VMID is allocated before programming
+ VTTBR_EL2
+References: bsc#1234429
+Patch-mainline: 6.12.18
+Git-commit: fa808ed4e199ed17d878eb75b110bda30dd52434
+
+commit fa808ed4e199ed17d878eb75b110bda30dd52434 upstream.
+
+Vladimir reports that a race condition to attach a VMID to a stage-2 MMU
+sometimes results in a vCPU entering the guest with a VMID of 0:
+
+| CPU1                                            |   CPU2
+|                                                 |
+|                                                 | kvm_arch_vcpu_ioctl_run
+|                                                 |   vcpu_load             <= load VTTBR_EL2
+|                                                 |                            kvm_vmid->id = 0
+|                                                 |
+| kvm_arch_vcpu_ioctl_run                         |
+|   vcpu_load             <= load VTTBR_EL2       |
+|                            with kvm_vmid->id = 0|
+|   kvm_arm_vmid_update   <= allocates fresh      |
+|                            kvm_vmid->id and     |
+|                            reload VTTBR_EL2     |
+|                                                 |
+|                                                 |   kvm_arm_vmid_update <= observes that kvm_vmid->id
+|                                                 |                          already allocated,
+|                                                 |                          skips reload VTTBR_EL2
+
+Oh yeah, it's as bad as it looks. Remember that VHE loads the stage-2
+MMU eagerly but a VMID only gets attached to the MMU later on in the
+KVM_RUN loop.
+
+Even in the "best case" where VTTBR_EL2 correctly gets reprogrammed
+before entering the EL1&0 regime, there is a period of time where
+hardware is configured with VMID 0. That's completely insane. So, rather
+than decorating the 'late' binding with another hack, just allocate the
+damn thing up front.
+
+Attaching a VMID from vcpu_load() is still rollover safe since
+(surprise!) it'll always get called after a vCPU was preempted.
+
+Excuse me while I go find a brown paper bag.
+
+Cc: stable@vger.kernel.org
+Fixes: 934bf871f011 ("KVM: arm64: Load the stage-2 MMU context in kvm_vcpu_load_vhe()")
+Reported-by: Vladimir Murzin <vladimir.murzin@arm.com>
+Signed-off-by: Oliver Upton <oliver.upton@linux.dev>
+Link: https://lore.kernel.org/r/20250219220737.130842-1-oliver.upton@linux.dev
+Signed-off-by: Marc Zyngier <maz@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ arch/arm64/include/asm/kvm_host.h |  2 +-
+ arch/arm64/kvm/arm.c              | 22 ++++++++++------------
+ arch/arm64/kvm/vmid.c             | 11 +++--------
+ 3 files changed, 14 insertions(+), 21 deletions(-)
+
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index c315bc1a4e9a..1bf70fa1045d 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -1243,7 +1243,7 @@ int kvm_arm_pvtime_has_attr(struct kvm_vcpu *vcpu,
+ extern unsigned int __ro_after_init kvm_arm_vmid_bits;
+ int __init kvm_arm_vmid_alloc_init(void);
+ void __init kvm_arm_vmid_alloc_free(void);
+-bool kvm_arm_vmid_update(struct kvm_vmid *kvm_vmid);
++void kvm_arm_vmid_update(struct kvm_vmid *kvm_vmid);
+ void kvm_arm_vmid_clear_active(void);
+ 
+ static inline void kvm_arm_pvtime_vcpu_init(struct kvm_vcpu_arch *vcpu_arch)
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index 117702f03321..3cf65daa75a5 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -580,6 +580,16 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ 	mmu = vcpu->arch.hw_mmu;
+ 	last_ran = this_cpu_ptr(mmu->last_vcpu_ran);
+ 
++	/*
++	 * Ensure a VMID is allocated for the MMU before programming VTTBR_EL2,
++	 * which happens eagerly in VHE.
++	 *
++	 * Also, the VMID allocator only preserves VMIDs that are active at the
++	 * time of rollover, so KVM might need to grab a new VMID for the MMU if
++	 * this is called from kvm_sched_in().
++	 */
++	kvm_arm_vmid_update(&mmu->vmid);
++
+ 	/*
+ 	 * We guarantee that both TLBs and I-cache are private to each
+ 	 * vcpu. If detecting that a vcpu from the same VM has
+@@ -1155,18 +1165,6 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 		 */
+ 		preempt_disable();
+ 
+-		/*
+-		 * The VMID allocator only tracks active VMIDs per
+-		 * physical CPU, and therefore the VMID allocated may not be
+-		 * preserved on VMID roll-over if the task was preempted,
+-		 * making a thread's VMID inactive. So we need to call
+-		 * kvm_arm_vmid_update() in non-premptible context.
+-		 */
+-		if (kvm_arm_vmid_update(&vcpu->arch.hw_mmu->vmid) &&
+-		    has_vhe())
+-			__load_stage2(vcpu->arch.hw_mmu,
+-				      vcpu->arch.hw_mmu->arch);
+-
+ 		kvm_pmu_flush_hwstate(vcpu);
+ 
+ 		local_irq_disable();
+diff --git a/arch/arm64/kvm/vmid.c b/arch/arm64/kvm/vmid.c
+index 806223b7022a..7fe8ba1a2851 100644
+--- a/arch/arm64/kvm/vmid.c
++++ b/arch/arm64/kvm/vmid.c
+@@ -135,11 +135,10 @@ void kvm_arm_vmid_clear_active(void)
+ 	atomic64_set(this_cpu_ptr(&active_vmids), VMID_ACTIVE_INVALID);
+ }
+ 
+-bool kvm_arm_vmid_update(struct kvm_vmid *kvm_vmid)
++void kvm_arm_vmid_update(struct kvm_vmid *kvm_vmid)
+ {
+ 	unsigned long flags;
+ 	u64 vmid, old_active_vmid;
+-	bool updated = false;
+ 
+ 	vmid = atomic64_read(&kvm_vmid->id);
+ 
+@@ -157,21 +156,17 @@ bool kvm_arm_vmid_update(struct kvm_vmid *kvm_vmid)
+ 	if (old_active_vmid != 0 && vmid_gen_match(vmid) &&
+ 	    0 != atomic64_cmpxchg_relaxed(this_cpu_ptr(&active_vmids),
+ 					  old_active_vmid, vmid))
+-		return false;
++		return;
+ 
+ 	raw_spin_lock_irqsave(&cpu_vmid_lock, flags);
+ 
+ 	/* Check that our VMID belongs to the current generation. */
+ 	vmid = atomic64_read(&kvm_vmid->id);
+-	if (!vmid_gen_match(vmid)) {
++	if (!vmid_gen_match(vmid))
+ 		vmid = new_vmid(kvm_vmid);
+-		updated = true;
+-	}
+ 
+ 	atomic64_set(this_cpu_ptr(&active_vmids), vmid);
+ 	raw_spin_unlock_irqrestore(&cpu_vmid_lock, flags);
+-
+-	return updated;
+ }
+ 
+ /*
+-- 
+2.48.0
+
