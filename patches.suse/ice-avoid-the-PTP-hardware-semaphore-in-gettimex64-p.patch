@@ -1,0 +1,149 @@
+From: Michal Schmidt <mschmidt@redhat.com>
+Date: Tue, 26 Mar 2024 00:20:38 +0100
+Subject: ice: avoid the PTP hardware semaphore in gettimex64 path
+Patch-mainline: v6.10-rc1
+Git-commit: d29a8134c78232213fb88f20d7ae865ec364e367
+References: bsc#1235111
+
+The PTP hardware semaphore (PFTSYN_SEM) is used to synchronize
+operations that program the PTP timers. The operations involve issuing
+commands to the sideband queue. The E810 does not have a hardware
+sideband queue, so the admin queue is used. The admin queue is slow.
+I have observed delays in hundreds of milliseconds waiting for
+ice_sq_done.
+
+When phc2sys reads the time from the ice PTP clock and PFTSYN_SEM is
+held by a task performing one of the slow operations, ice_ptp_lock can
+easily time out. phc2sys gets -EBUSY and the kernel prints:
+  ice 0000:XX:YY.0: PTP failed to get time
+These messages appear once every few seconds, causing log spam.
+
+The E810 datasheet recommends an algorithm for reading the upper 64 bits
+of the GLTSYN_TIME register. It matches what's implemented in
+ice_ptp_read_src_clk_reg. It is robust against wrap-around, but not
+necessarily against the concurrent setting of the register (with
+GLTSYN_CMD_{INIT,ADJ}_TIME commands). Perhaps that's why
+ice_ptp_gettimex64 also takes PFTSYN_SEM.
+
+The race with time setters can be prevented without relying on the PTP
+hardware semaphore. Using the "ice_adapter" from the previous patch,
+we can have a common spinlock for the PFs that share the clock hardware.
+It will protect the reading and writing to the GLTSYN_TIME register.
+The writing is performed indirectly, by the hardware, as a result of
+the driver writing GLTSYN_CMD_SYNC in ice_ptp_exec_tmr_cmd. I wasn't
+sure if the ice_flush there is enough to make sure GLTSYN_TIME has been
+updated, but it works well in my testing.
+
+My test code can be seen here:
+https://gitlab.com/mschmidt2/linux/-/commits/ice-ptp-host-side-lock-10
+It consists of:
+ - kernel threads reading the time in a busy loop and looking at the
+   deltas between consecutive values, reporting new maxima.
+ - a shell script that sets the time repeatedly;
+ - a bpftrace probe to produce a histogram of the measured deltas.
+Without the spinlock ptp_gltsyn_time_lock, it is easy to see tearing.
+Deltas in the [2G, 4G) range appear in the histograms.
+With the spinlock added, there is no tearing and the biggest delta I saw
+was in the range [1M, 2M), that is under 2 ms.
+
+Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+Signed-off-by: Michal Schmidt <mschmidt@redhat.com>
+Tested-by: Pucha Himasekhar Reddy <himasekharx.reddy.pucha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_adapter.c |    2 ++
+ drivers/net/ethernet/intel/ice/ice_adapter.h |    6 ++++++
+ drivers/net/ethernet/intel/ice/ice_ptp.c     |    8 +-------
+ drivers/net/ethernet/intel/ice/ice_ptp_hw.c  |    4 ++++
+ 4 files changed, 13 insertions(+), 7 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ice/ice_adapter.c
++++ b/drivers/net/ethernet/intel/ice/ice_adapter.c
+@@ -6,6 +6,7 @@
+ #include <linux/mutex.h>
+ #include <linux/pci.h>
+ #include <linux/slab.h>
++#include <linux/spinlock.h>
+ #include <linux/xarray.h>
+ #include "ice_adapter.h"
+ 
+@@ -35,6 +36,7 @@ static struct ice_adapter *ice_adapter_n
+ 	if (!adapter)
+ 		return NULL;
+ 
++	spin_lock_init(&adapter->ptp_gltsyn_time_lock);
+ 	refcount_set(&adapter->refcount, 1);
+ 
+ 	return adapter;
+--- a/drivers/net/ethernet/intel/ice/ice_adapter.h
++++ b/drivers/net/ethernet/intel/ice/ice_adapter.h
+@@ -4,15 +4,21 @@
+ #ifndef _ICE_ADAPTER_H_
+ #define _ICE_ADAPTER_H_
+ 
++#include <linux/spinlock_types.h>
+ #include <linux/refcount.h>
+ 
+ struct pci_dev;
+ 
+ /**
+  * struct ice_adapter - PCI adapter resources shared across PFs
++ * @ptp_gltsyn_time_lock: Spinlock protecting access to the GLTSYN_TIME
++ *                        register of the PTP clock.
+  * @refcount: Reference count. struct ice_pf objects hold the references.
+  */
+ struct ice_adapter {
++	/* For access to the GLTSYN_TIME register */
++	spinlock_t ptp_gltsyn_time_lock;
++
+ 	refcount_t refcount;
+ };
+ 
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@ -466,6 +466,7 @@ ice_ptp_read_src_clk_reg(struct ice_pf *
+ 	u8 tmr_idx;
+ 
+ 	tmr_idx = ice_get_ptp_src_clock_index(hw);
++	guard(spinlock)(&pf->adapter->ptp_gltsyn_time_lock);
+ 	/* Read the system timestamp pre PHC read */
+ 	ptp_read_system_prets(sts);
+ 
+@@ -1802,15 +1803,8 @@ ice_ptp_gettimex64(struct ptp_clock_info
+ 		   struct ptp_system_timestamp *sts)
+ {
+ 	struct ice_pf *pf = ptp_info_to_pf(info);
+-	struct ice_hw *hw = &pf->hw;
+-
+-	if (!ice_ptp_lock(hw)) {
+-		dev_err(ice_pf_to_dev(pf), "PTP failed to get time\n");
+-		return -EBUSY;
+-	}
+ 
+ 	ice_ptp_read_time(pf, ts, sts);
+-	ice_ptp_unlock(hw);
+ 
+ 	return 0;
+ }
+--- a/drivers/net/ethernet/intel/ice/ice_ptp_hw.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp_hw.c
+@@ -2,6 +2,7 @@
+ /* Copyright (C) 2021, Intel Corporation. */
+ 
+ #include <linux/delay.h>
++#include "ice.h"
+ #include "ice_common.h"
+ #include "ice_ptp_hw.h"
+ #include "ice_ptp_consts.h"
+@@ -148,6 +149,9 @@ static void ice_ptp_src_cmd(struct ice_h
+  */
+ static void ice_ptp_exec_tmr_cmd(struct ice_hw *hw)
+ {
++	struct ice_pf *pf = container_of(hw, struct ice_pf, hw);
++
++	guard(spinlock)(&pf->adapter->ptp_gltsyn_time_lock);
+ 	wr32(hw, GLTSYN_CMD_SYNC, SYNC_EXEC_CMD);
+ 	ice_flush(hw);
+ }
