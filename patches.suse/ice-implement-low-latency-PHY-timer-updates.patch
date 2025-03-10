@@ -1,0 +1,216 @@
+From: Jacob Keller <jacob.e.keller@intel.com>
+Date: Mon, 16 Dec 2024 09:53:32 -0500
+Subject: ice: implement low latency PHY timer updates
+Patch-mainline: v6.14-rc1
+Git-commit: ef9a64c07294abcda51e1b6adcbf0392afe2c62d
+References: jsc#PED-10419
+
+Programming the PHY registers in preparation for an increment value change
+or a timer adjustment on E810 requires issuing Admin Queue commands for
+each PHY register. It has been found that the firmware Admin Queue
+processing occasionally has delays of tens or rarely up to hundreds of
+milliseconds. This delay cascades to failures in the PTP applications which
+depend on these updates being low latency.
+
+Consider a standard PTP profile with a sync rate of 16 times per second.
+This means there is ~62 milliseconds between sync messages. A complete
+cycle of the PTP algorithm
+
+1) Sync message (with Tx timestamp) from source
+2) Follow-up message from source
+3) Delay request (with Tx timestamp) from sink
+4) Delay response (with Rx timestamp of request) from source
+5) measure instantaneous clock offset
+6) request time adjustment via CLOCK_ADJTIME systemcall
+
+The Tx timestamps have a default maximum timeout of 10 milliseconds. If we
+assume that the maximum possible time is used, this leaves us with ~42
+milliseconds of processing time for a complete cycle.
+
+The CLOCK_ADJTIME system call is synchronous and will block until the
+driver completes its timer adjustment or frequency change.
+
+If the writes to prepare the PHY timers get hit by a latency spike of 50
+milliseconds, then the PTP application will be delayed past the point where
+the next cycle should start. Packets from the next cycle may have already
+arrived and are waiting on the socket.
+
+In particular, LinuxPTP ptp4l may start complaining about missing an
+announce message from the source, triggering a fault. In addition, the
+clockcheck logic it uses may trigger. This clockcheck failure occurs
+because the timestamp captured by hardware is compared against a reading of
+CLOCK_MONOTONIC. It is assumed that the time when the Rx timestamp is
+captured and the read from CLOCK_MONOTONIC are relatively close together.
+This is not the case if there is a significant delay to processing the Rx
+packet.
+
+Newer firmware supports programming the PHY registers over a low latency
+interface which bypasses the Admin Queue. Instead, software writes to the
+REG_LL_PROXY_L and REG_LL_PROXY_H registers. Firmware reads these registers
+and then programs the PHY timers.
+
+Implement functions to use this interface when available to program the PHY
+timers instead of using the Admin Queue. This avoids the Admin Queue
+latency and ensures that adjustments happen within acceptable latency
+bounds.
+
+Co-developed-by: Karol Kolacinski <karol.kolacinski@intel.com>
+Signed-off-by: Karol Kolacinski <karol.kolacinski@intel.com>
+Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+Signed-off-by: Anton Nadezhdin <anton.nadezhdin@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_ptp_hw.c |  105 ++++++++++++++++++++++++++++
+ drivers/net/ethernet/intel/ice/ice_ptp_hw.h |    4 +
+ 2 files changed, 109 insertions(+)
+
+--- a/drivers/net/ethernet/intel/ice/ice_ptp_hw.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp_hw.c
+@@ -5098,6 +5098,55 @@ static int ice_ptp_prep_phy_time_e810(st
+ }
+ 
+ /**
++ * ice_ptp_prep_phy_adj_ll_e810 - Prep PHY ports for a time adjustment
++ * @hw: pointer to HW struct
++ * @adj: adjustment value to program
++ *
++ * Use the low latency firmware interface to program PHY time adjustment to
++ * all PHY ports.
++ *
++ * Return: 0 on success, -EBUSY on timeout
++ */
++static int ice_ptp_prep_phy_adj_ll_e810(struct ice_hw *hw, s32 adj)
++{
++	const u8 tmr_idx = hw->func_caps.ts_func_info.tmr_index_owned;
++	struct ice_e810_params *params = &hw->ptp.phy.e810;
++	u32 val;
++	int err;
++
++	spin_lock_irq(&params->atqbal_wq.lock);
++
++	/* Wait for any pending in-progress low latency interrupt */
++	err = wait_event_interruptible_locked_irq(params->atqbal_wq,
++						  !(params->atqbal_flags &
++						    ATQBAL_FLAGS_INTR_IN_PROGRESS));
++	if (err) {
++		spin_unlock_irq(&params->atqbal_wq.lock);
++		return err;
++	}
++
++	wr32(hw, REG_LL_PROXY_L, adj);
++	val = FIELD_PREP(REG_LL_PROXY_H_PHY_TMR_CMD_M, REG_LL_PROXY_H_PHY_TMR_CMD_ADJ) |
++	      FIELD_PREP(REG_LL_PROXY_H_PHY_TMR_IDX_M, tmr_idx) | REG_LL_PROXY_H_EXEC;
++	wr32(hw, REG_LL_PROXY_H, val);
++
++	/* Read the register repeatedly until the FW indicates completion */
++	err = read_poll_timeout_atomic(rd32, val,
++				       !FIELD_GET(REG_LL_PROXY_H_EXEC, val),
++				       10, REG_LL_PROXY_H_TIMEOUT_US, false, hw,
++				       REG_LL_PROXY_H);
++	if (err) {
++		ice_debug(hw, ICE_DBG_PTP, "Failed to prepare PHY timer adjustment using low latency interface\n");
++		spin_unlock_irq(&params->atqbal_wq.lock);
++		return err;
++	}
++
++	spin_unlock_irq(&params->atqbal_wq.lock);
++
++	return 0;
++}
++
++/**
+  * ice_ptp_prep_phy_adj_e810 - Prep PHY port for a time adjustment
+  * @hw: pointer to HW struct
+  * @adj: adjustment value to program
+@@ -5115,6 +5164,9 @@ static int ice_ptp_prep_phy_adj_e810(str
+ 	u8 tmr_idx;
+ 	int err;
+ 
++	if (hw->dev_caps.ts_dev_info.ll_phy_tmr_update)
++		return ice_ptp_prep_phy_adj_ll_e810(hw, adj);
++
+ 	tmr_idx = hw->func_caps.ts_func_info.tmr_index_owned;
+ 
+ 	/* Adjustments are represented as signed 2's complement values in
+@@ -5138,6 +5190,56 @@ static int ice_ptp_prep_phy_adj_e810(str
+ }
+ 
+ /**
++ * ice_ptp_prep_phy_incval_ll_e810 - Prep PHY ports increment value change
++ * @hw: pointer to HW struct
++ * @incval: The new 40bit increment value to prepare
++ *
++ * Use the low latency firmware interface to program PHY time increment value
++ * for all PHY ports.
++ *
++ * Return: 0 on success, -EBUSY on timeout
++ */
++static int ice_ptp_prep_phy_incval_ll_e810(struct ice_hw *hw, u64 incval)
++{
++	const u8 tmr_idx = hw->func_caps.ts_func_info.tmr_index_owned;
++	struct ice_e810_params *params = &hw->ptp.phy.e810;
++	u32 val;
++	int err;
++
++	spin_lock_irq(&params->atqbal_wq.lock);
++
++	/* Wait for any pending in-progress low latency interrupt */
++	err = wait_event_interruptible_locked_irq(params->atqbal_wq,
++						  !(params->atqbal_flags &
++						    ATQBAL_FLAGS_INTR_IN_PROGRESS));
++	if (err) {
++		spin_unlock_irq(&params->atqbal_wq.lock);
++		return err;
++	}
++
++	wr32(hw, REG_LL_PROXY_L, lower_32_bits(incval));
++	val = FIELD_PREP(REG_LL_PROXY_H_PHY_TMR_CMD_M, REG_LL_PROXY_H_PHY_TMR_CMD_FREQ) |
++	      FIELD_PREP(REG_LL_PROXY_H_TS_HIGH, (u8)upper_32_bits(incval)) |
++	      FIELD_PREP(REG_LL_PROXY_H_PHY_TMR_IDX_M, tmr_idx) | REG_LL_PROXY_H_EXEC;
++	wr32(hw, REG_LL_PROXY_H, val);
++
++	/* Read the register repeatedly until the FW indicates completion */
++	err = read_poll_timeout_atomic(rd32, val,
++				       !FIELD_GET(REG_LL_PROXY_H_EXEC, val),
++				       10, REG_LL_PROXY_H_TIMEOUT_US, false, hw,
++				       REG_LL_PROXY_H);
++	if (err) {
++		ice_debug(hw, ICE_DBG_PTP, "Failed to prepare PHY timer increment using low latency interface\n");
++		spin_unlock_irq(&params->atqbal_wq.lock);
++		return err;
++	}
++
++	spin_unlock_irq(&params->atqbal_wq.lock);
++
++	return 0;
++}
++
++/**
+  * ice_ptp_prep_phy_incval_e810 - Prep PHY port increment value change
+  * @hw: pointer to HW struct
+  * @incval: The new 40bit increment value to prepare
+@@ -5152,6 +5254,9 @@ static int ice_ptp_prep_phy_incval_e810(
+ 	u8 tmr_idx;
+ 	int err;
+ 
++	if (hw->dev_caps.ts_dev_info.ll_phy_tmr_update)
++		return ice_ptp_prep_phy_incval_ll_e810(hw, incval);
++
+ 	tmr_idx = hw->func_caps.ts_func_info.tmr_index_owned;
+ 	low = lower_32_bits(incval);
+ 	high = upper_32_bits(incval);
+--- a/drivers/net/ethernet/intel/ice/ice_ptp_hw.h
++++ b/drivers/net/ethernet/intel/ice/ice_ptp_hw.h
+@@ -690,7 +690,11 @@ static inline bool ice_is_dual(struct ic
+ 
+ /* Tx timestamp low latency read definitions */
+ #define REG_LL_PROXY_H_TIMEOUT_US	2000
++#define REG_LL_PROXY_H_PHY_TMR_CMD_M	GENMASK(7, 6)
++#define REG_LL_PROXY_H_PHY_TMR_CMD_ADJ	0x1
++#define REG_LL_PROXY_H_PHY_TMR_CMD_FREQ	0x2
+ #define REG_LL_PROXY_H_TS_HIGH		GENMASK(23, 16)
++#define REG_LL_PROXY_H_PHY_TMR_IDX_M	BIT(24)
+ #define REG_LL_PROXY_H_TS_IDX		GENMASK(29, 24)
+ #define REG_LL_PROXY_H_TS_INTR_ENA	BIT(30)
+ #define REG_LL_PROXY_H_EXEC		BIT(31)
