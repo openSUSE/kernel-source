@@ -1,0 +1,293 @@
+From: Alexander Lobakin <aleksander.lobakin@intel.com>
+Date: Wed, 11 Dec 2024 18:26:38 +0100
+Subject: page_pool: allow mixing PPs within one bulk
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v6.14-rc1
+Git-commit: fcc680a647ba77370480fe753664cc10d572b240
+References: jsc#PED-10428
+
+The main reason for this change was to allow mixing pages from different
+&page_pools within one &xdp_buff/&xdp_frame. Why not? With stuff like
+devmem and io_uring zerocopy Rx, it's required to have separate PPs for
+header buffers and payload buffers.
+Adjust xdp_return_frame_bulk() and page_pool_put_netmem_bulk(), so that
+they won't be tied to a particular pool. Let the latter create a
+separate bulk of pages which's PP is different from the first netmem of
+the bulk and process it after the main loop.
+This greatly optimizes xdp_return_frame_bulk(): no more hashtable
+lookups and forced flushes on PP mismatch. Also make
+xdp_flush_frame_bulk() inline, as it's just one if + function call + one
+u32 read, not worth extending the call ladder.
+
+Co-developed-by: Toke Høiland-Jørgensen <toke@redhat.com> # iterative
+Signed-off-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Suggested-by: Jakub Kicinski <kuba@kernel.org> # while (count)
+Signed-off-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Link: https://patch.msgid.link/20241211172649.761483-2-aleksander.lobakin@intel.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/page_pool/types.h |    6 --
+ include/net/xdp.h             |   16 ++++--
+ net/core/page_pool.c          |  109 +++++++++++++++++++++++++++---------------
+ net/core/xdp.c                |   29 -----------
+ 4 files changed, 87 insertions(+), 73 deletions(-)
+
+--- a/include/net/page_pool/types.h
++++ b/include/net/page_pool/types.h
+@@ -259,8 +259,7 @@ void page_pool_disable_direct_recycling(
+ void page_pool_destroy(struct page_pool *pool);
+ void page_pool_use_xdp_mem(struct page_pool *pool, void (*disconnect)(void *),
+ 			   const struct xdp_mem_info *mem);
+-void page_pool_put_netmem_bulk(struct page_pool *pool, netmem_ref *data,
+-			       u32 count);
++void page_pool_put_netmem_bulk(netmem_ref *data, u32 count);
+ #else
+ static inline void page_pool_destroy(struct page_pool *pool)
+ {
+@@ -272,8 +271,7 @@ static inline void page_pool_use_xdp_mem
+ {
+ }
+ 
+-static inline void page_pool_put_netmem_bulk(struct page_pool *pool,
+-					     netmem_ref *data, u32 count)
++static inline void page_pool_put_netmem_bulk(netmem_ref *data, u32 count)
+ {
+ }
+ #endif
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@ -11,6 +11,8 @@
+ #include <linux/netdevice.h>
+ #include <linux/skbuff.h> /* skb_shared_info */
+ 
++#include <net/page_pool/types.h>
++
+ /**
+  * DOC: XDP RX-queue information
+  *
+@@ -193,14 +195,12 @@ xdp_frame_is_frag_pfmemalloc(const struc
+ #define XDP_BULK_QUEUE_SIZE	16
+ struct xdp_frame_bulk {
+ 	int count;
+-	void *xa;
+ 	netmem_ref q[XDP_BULK_QUEUE_SIZE];
+ };
+ 
+ static __always_inline void xdp_frame_bulk_init(struct xdp_frame_bulk *bq)
+ {
+-	/* bq->count will be zero'ed when bq->xa gets updated */
+-	bq->xa = NULL;
++	bq->count = 0;
+ }
+ 
+ static inline struct skb_shared_info *
+@@ -317,10 +317,18 @@ void __xdp_return(void *data, struct xdp
+ void xdp_return_frame(struct xdp_frame *xdpf);
+ void xdp_return_frame_rx_napi(struct xdp_frame *xdpf);
+ void xdp_return_buff(struct xdp_buff *xdp);
+-void xdp_flush_frame_bulk(struct xdp_frame_bulk *bq);
+ void xdp_return_frame_bulk(struct xdp_frame *xdpf,
+ 			   struct xdp_frame_bulk *bq);
+ 
++static inline void xdp_flush_frame_bulk(struct xdp_frame_bulk *bq)
++{
++	if (unlikely(!bq->count))
++		return;
++
++	page_pool_put_netmem_bulk(bq->q, bq->count);
++	bq->count = 0;
++}
++
+ static __always_inline unsigned int
+ xdp_get_frame_len(const struct xdp_frame *xdpf)
+ {
+--- a/net/core/page_pool.c
++++ b/net/core/page_pool.c
+@@ -839,9 +839,41 @@ void page_pool_put_unrefed_page(struct p
+ }
+ EXPORT_SYMBOL(page_pool_put_unrefed_page);
+ 
++static void page_pool_recycle_ring_bulk(struct page_pool *pool,
++					netmem_ref *bulk,
++					u32 bulk_len)
++{
++	bool in_softirq;
++	u32 i;
++
++	/* Bulk produce into ptr_ring page_pool cache */
++	in_softirq = page_pool_producer_lock(pool);
++
++	for (i = 0; i < bulk_len; i++) {
++		if (__ptr_ring_produce(&pool->ring, (__force void *)bulk[i])) {
++			/* ring full */
++			recycle_stat_inc(pool, ring_full);
++			break;
++		}
++	}
++
++	page_pool_producer_unlock(pool, in_softirq);
++	recycle_stat_add(pool, ring, i);
++
++	/* Hopefully all pages were returned into ptr_ring */
++	if (likely(i == bulk_len))
++		return;
++
++	/*
++	 * ptr_ring cache is full, free remaining pages outside producer lock
++	 * since put_page() with refcnt == 1 can be an expensive operation.
++	 */
++	for (; i < bulk_len; i++)
++		page_pool_return_page(pool, bulk[i]);
++}
++
+ /**
+  * page_pool_put_netmem_bulk() - release references on multiple netmems
+- * @pool:	pool from which pages were allocated
+  * @data:	array holding netmem references
+  * @count:	number of entries in @data
+  *
+@@ -854,52 +886,55 @@ EXPORT_SYMBOL(page_pool_put_unrefed_page
+  * Please note the caller must not use data area after running
+  * page_pool_put_netmem_bulk(), as this function overwrites it.
+  */
+-void page_pool_put_netmem_bulk(struct page_pool *pool, netmem_ref *data,
+-			       u32 count)
++void page_pool_put_netmem_bulk(netmem_ref *data, u32 count)
+ {
+-	int i, bulk_len = 0;
+-	bool allow_direct;
+-	bool in_softirq;
++	u32 bulk_len = 0;
+ 
+-	allow_direct = page_pool_napi_local(pool);
+-
+-	for (i = 0; i < count; i++) {
++	for (u32 i = 0; i < count; i++) {
+ 		netmem_ref netmem = netmem_compound_head(data[i]);
+ 
+-		/* It is not the last user for the page frag case */
+-		if (!page_pool_is_last_ref(netmem))
+-			continue;
+-
+-		netmem = __page_pool_put_page(pool, netmem, -1, allow_direct);
+-		/* Approved for bulk recycling in ptr_ring cache */
+-		if (netmem)
++		if (page_pool_is_last_ref(netmem))
+ 			data[bulk_len++] = netmem;
+ 	}
+ 
+-	if (!bulk_len)
+-		return;
+-
+-	/* Bulk producer into ptr_ring page_pool cache */
+-	in_softirq = page_pool_producer_lock(pool);
+-	for (i = 0; i < bulk_len; i++) {
+-		if (__ptr_ring_produce(&pool->ring, (__force void *)data[i])) {
+-			/* ring full */
+-			recycle_stat_inc(pool, ring_full);
+-			break;
++	count = bulk_len;
++	while (count) {
++		netmem_ref bulk[XDP_BULK_QUEUE_SIZE];
++		struct page_pool *pool = NULL;
++		bool allow_direct;
++		u32 foreign = 0;
++
++		bulk_len = 0;
++
++		for (u32 i = 0; i < count; i++) {
++			struct page_pool *netmem_pp;
++			netmem_ref netmem = data[i];
++
++			netmem_pp = netmem_get_pp(netmem);
++			if (unlikely(!pool)) {
++				pool = netmem_pp;
++				allow_direct = page_pool_napi_local(pool);
++			} else if (netmem_pp != pool) {
++				/*
++				 * If the netmem belongs to a different
++				 * page_pool, save it for another round.
++				 */
++				data[foreign++] = netmem;
++				continue;
++			}
++
++			netmem = __page_pool_put_page(pool, netmem, -1,
++						      allow_direct);
++			/* Approved for bulk recycling in ptr_ring cache */
++			if (netmem)
++				bulk[bulk_len++] = netmem;
+ 		}
+-	}
+-	recycle_stat_add(pool, ring, i);
+-	page_pool_producer_unlock(pool, in_softirq);
+ 
+-	/* Hopefully all pages was return into ptr_ring */
+-	if (likely(i == bulk_len))
+-		return;
++		if (bulk_len)
++			page_pool_recycle_ring_bulk(pool, bulk, bulk_len);
+ 
+-	/* ptr_ring cache full, free remaining pages outside producer lock
+-	 * since put_page() with refcnt == 1 can be an expensive operation
+-	 */
+-	for (; i < bulk_len; i++)
+-		page_pool_return_page(pool, data[i]);
++		count = foreign;
++	}
+ }
+ EXPORT_SYMBOL(page_pool_put_netmem_bulk);
+ 
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@ -511,46 +511,19 @@ EXPORT_SYMBOL_GPL(xdp_return_frame_rx_na
+  * xdp_frame_bulk is usually stored/allocated on the function
+  * call-stack to avoid locking penalties.
+  */
+-void xdp_flush_frame_bulk(struct xdp_frame_bulk *bq)
+-{
+-	struct xdp_mem_allocator *xa = bq->xa;
+-
+-	if (unlikely(!xa || !bq->count))
+-		return;
+-
+-	page_pool_put_netmem_bulk(xa->page_pool, bq->q, bq->count);
+-	/* bq->xa is not cleared to save lookup, if mem.id same in next bulk */
+-	bq->count = 0;
+-}
+-EXPORT_SYMBOL_GPL(xdp_flush_frame_bulk);
+ 
+ /* Must be called with rcu_read_lock held */
+ void xdp_return_frame_bulk(struct xdp_frame *xdpf,
+ 			   struct xdp_frame_bulk *bq)
+ {
+-	struct xdp_mem_info *mem = &xdpf->mem;
+-	struct xdp_mem_allocator *xa;
+-
+-	if (mem->type != MEM_TYPE_PAGE_POOL) {
++	if (xdpf->mem.type != MEM_TYPE_PAGE_POOL) {
+ 		xdp_return_frame(xdpf);
+ 		return;
+ 	}
+ 
+-	xa = bq->xa;
+-	if (unlikely(!xa)) {
+-		xa = rhashtable_lookup(mem_id_ht, &mem->id, mem_id_rht_params);
+-		bq->count = 0;
+-		bq->xa = xa;
+-	}
+-
+ 	if (bq->count == XDP_BULK_QUEUE_SIZE)
+ 		xdp_flush_frame_bulk(bq);
+ 
+-	if (unlikely(mem->id != xa->mem.id)) {
+-		xdp_flush_frame_bulk(bq);
+-		bq->xa = rhashtable_lookup(mem_id_ht, &mem->id, mem_id_rht_params);
+-	}
+-
+ 	if (unlikely(xdp_frame_has_frags(xdpf))) {
+ 		struct skb_shared_info *sinfo;
+ 		int i;
