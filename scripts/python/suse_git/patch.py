@@ -54,7 +54,7 @@ class PatchChecker:
 class Patch(object):
     # This pattern was copied from quilt/scripts/patchfns.in:patch_header() in
     # the quilt sources
-    break_matcher = re.compile(b"(---|\*\*\*|Index:)[ \t][^ \t]|^diff -")
+    break_matcher = re.compile(rb"(---|\*\*\*|Index:)[ \t][^ \t]|^diff -")
 
     def __init__(self, f):
         assert(f.tell() == 0)
