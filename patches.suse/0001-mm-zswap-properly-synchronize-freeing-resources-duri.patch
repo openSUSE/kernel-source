@@ -1,0 +1,251 @@
+From 12dcb0ef540629a281533f9dedc1b6b8e14cfb65 Mon Sep 17 00:00:00 2001
+From: Yosry Ahmed <yosryahmed@google.com>
+Date: Wed, 8 Jan 2025 22:24:41 +0000
+Subject: [PATCH] mm: zswap: properly synchronize freeing resources during CPU
+ hotunplug
+References: bsc#1237029 CVE-2025-21693
+Git-commit: 12dcb0ef540629a281533f9dedc1b6b8e14cfb65
+Patch-mainline: v6.13
+
+In zswap_compress() and zswap_decompress(), the per-CPU acomp_ctx of the
+current CPU at the beginning of the operation is retrieved and used
+throughout.  However, since neither preemption nor migration are disabled,
+it is possible that the operation continues on a different CPU.
+
+If the original CPU is hotunplugged while the acomp_ctx is still in use,
+we run into a UAF bug as some of the resources attached to the acomp_ctx
+are freed during hotunplug in zswap_cpu_comp_dead() (i.e.
+acomp_ctx.buffer, acomp_ctx.req, or acomp_ctx.acomp).
+
+The problem was introduced in commit 1ec3b5fe6eec ("mm/zswap: move to use
+crypto_acomp API for hardware acceleration") when the switch to the
+crypto_acomp API was made.  Prior to that, the per-CPU crypto_comp was
+retrieved using get_cpu_ptr() which disables preemption and makes sure the
+CPU cannot go away from under us.  Preemption cannot be disabled with the
+crypto_acomp API as a sleepable context is needed.
+
+Use the acomp_ctx.mutex to synchronize CPU hotplug callbacks allocating
+and freeing resources with compression/decompression paths.  Make sure
+that acomp_ctx.req is NULL when the resources are freed.  In the
+compression/decompression paths, check if acomp_ctx.req is NULL after
+acquiring the mutex (meaning the CPU was offlined) and retry on the new
+CPU.
+
+The initialization of acomp_ctx.mutex is moved from the CPU hotplug
+callback to the pool initialization where it belongs (where the mutex is
+allocated).  In addition to adding clarity, this makes sure that CPU
+hotplug cannot reinitialize a mutex that is already locked by
+compression/decompression.
+
+Previously a fix was attempted by holding cpus_read_lock() [1].  This
+would have caused a potential deadlock as it is possible for code already
+holding the lock to fall into reclaim and enter zswap (causing a
+deadlock).  A fix was also attempted using SRCU for synchronization, but
+Johannes pointed out that synchronize_srcu() cannot be used in CPU hotplug
+notifiers [2].
+
+Alternative fixes that were considered/attempted and could have worked:
+- Refcounting the per-CPU acomp_ctx. This involves complexity in
+  handling the race between the refcount dropping to zero in
+  zswap_[de]compress() and the refcount being re-initialized when the
+  CPU is onlined.
+- Disabling migration before getting the per-CPU acomp_ctx [3], but
+  that's discouraged and is a much bigger hammer than needed, and could
+  result in subtle performance issues.
+
+[1]https://lkml.kernel.org/20241219212437.2714151-1-yosryahmed@google.com/
+[2]https://lkml.kernel.org/20250107074724.1756696-2-yosryahmed@google.com/
+[3]https://lkml.kernel.org/20250107222236.2715883-2-yosryahmed@google.com/
+
+[yosryahmed@google.com: remove comment]
+  Link: https://lkml.kernel.org/r/CAJD7tkaxS1wjn+swugt8QCvQ-rVF5RZnjxwPGX17k8x9zSManA@mail.gmail.com
+Link: https://lkml.kernel.org/r/20250108222441.3622031-1-yosryahmed@google.com
+Fixes: 1ec3b5fe6eec ("mm/zswap: move to use crypto_acomp API for hardware acceleration")
+Signed-off-by: Yosry Ahmed <yosryahmed@google.com>
+Reported-by: Johannes Weiner <hannes@cmpxchg.org>
+Closes: https://lore.kernel.org/lkml/20241113213007.GB1564047@cmpxchg.org/
+Reported-by: Sam Sun <samsun1006219@gmail.com>
+Closes: https://lore.kernel.org/lkml/CAEkJfYMtSdM5HceNsXUDf5haghD5+o2e7Qv4OcuruL4tPg6OaQ@mail.gmail.com/
+Cc: Barry Song <baohua@kernel.org>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Kanchana P Sridhar <kanchana.p.sridhar@intel.com>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Vitaly Wool <vitalywool@gmail.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Oscar Salvador <osalvador@suse.de>
+---
+ mm/zswap.c |   63 +++++++++++++++++++++++++++++++++++++++++++++----------------
+ 1 file changed, 47 insertions(+), 16 deletions(-)
+
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@ -417,11 +417,12 @@ static int zswap_cpu_comp_prepare(unsign
+ 	struct acomp_req *req;
+ 	int ret;
+ 
+-	mutex_init(&acomp_ctx->mutex);
+-
++	mutex_lock(&acomp_ctx->mutex);
+ 	acomp_ctx->buffer = kmalloc_node(PAGE_SIZE * 2, GFP_KERNEL, cpu_to_node(cpu));
+-	if (!acomp_ctx->buffer)
+-		return -ENOMEM;
++	if (!acomp_ctx->buffer) {
++		ret = -ENOMEM;
++		goto buffer_fail;
++	}
+ 
+ 	acomp = crypto_alloc_acomp_node(pool->tfm_name, 0, 0, cpu_to_node(cpu));
+ 	if (IS_ERR(acomp)) {
+@@ -450,12 +451,15 @@ static int zswap_cpu_comp_prepare(unsign
+ 	acomp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+ 				   crypto_req_done, &acomp_ctx->wait);
+ 
++	mutex_unlock(&acomp_ctx->mutex);
+ 	return 0;
+ 
+ req_fail:
+ 	crypto_free_acomp(acomp_ctx->acomp);
+ acomp_fail:
+ 	kfree(acomp_ctx->buffer);
++buffer_fail:
++	mutex_unlock(&acomp_ctx->mutex);
+ 	return ret;
+ }
+ 
+@@ -464,17 +468,45 @@ static int zswap_cpu_comp_dead(unsigned
+ 	struct zswap_pool *pool = hlist_entry(node, struct zswap_pool, node);
+ 	struct crypto_acomp_ctx *acomp_ctx = per_cpu_ptr(pool->acomp_ctx, cpu);
+ 
++	mutex_lock(&acomp_ctx->mutex);
+ 	if (!IS_ERR_OR_NULL(acomp_ctx)) {
+ 		if (!IS_ERR_OR_NULL(acomp_ctx->req))
+ 			acomp_request_free(acomp_ctx->req);
++		acomp_ctx->req = NULL;
+ 		if (!IS_ERR_OR_NULL(acomp_ctx->acomp))
+ 			crypto_free_acomp(acomp_ctx->acomp);
+ 		kfree(acomp_ctx->buffer);
+ 	}
++	mutex_unlock(&acomp_ctx->mutex);
+ 
+ 	return 0;
+ }
+ 
++static struct crypto_acomp_ctx *acomp_ctx_get_cpu_lock(struct zswap_pool *pool)
++{
++	struct crypto_acomp_ctx *acomp_ctx;
++
++	for (;;) {
++		acomp_ctx = raw_cpu_ptr(pool->acomp_ctx);
++		mutex_lock(&acomp_ctx->mutex);
++		if (likely(acomp_ctx->req))
++		        return acomp_ctx;
++		/*
++		 * It is possible that we were migrated to a different CPU after
++		 * getting the per-CPU ctx but before the mutex was acquired. If
++		 * the old CPU got offlined, zswap_cpu_comp_dead() could have
++		 * already freed ctx->req (among other things) and set it to
++		 * NULL. Just try again on the new CPU that we ended up on.
++		 */
++		mutex_unlock(&acomp_ctx->mutex);
++	}
++}
++
++static void acomp_ctx_put_unlock(struct crypto_acomp_ctx *acomp_ctx)
++{
++       mutex_unlock(&acomp_ctx->mutex);
++}
++
+ /*********************************
+ * pool functions
+ **********************************/
+@@ -576,7 +608,7 @@ static struct zswap_pool *zswap_pool_cre
+ 	struct zswap_pool *pool;
+ 	char name[38]; /* 'zswap' + 32 char (max) num + \0 */
+ 	gfp_t gfp = __GFP_NORETRY | __GFP_NOWARN | __GFP_KSWAPD_RECLAIM;
+-	int ret;
++	int ret, cpu;
+ 
+ 	if (!zswap_has_pool) {
+ 		/* if either are unset, pool initialization failed, and we
+@@ -611,6 +643,9 @@ static struct zswap_pool *zswap_pool_cre
+ 		goto error;
+ 	}
+ 
++	for_each_possible_cpu(cpu)
++		mutex_init(&per_cpu_ptr(pool->acomp_ctx, cpu)->mutex);
++
+ 	ret = cpuhp_state_add_instance(CPUHP_MM_ZSWP_POOL_PREPARE,
+ 				       &pool->node);
+ 	if (ret)
+@@ -1017,7 +1052,7 @@ static int zswap_writeback_entry(struct
+ 		spin_unlock(&tree->lock);
+ 
+ 		/* decompress */
+-		acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
++		acomp_ctx = acomp_ctx_get_cpu_lock(entry->pool);
+ 		dlen = PAGE_SIZE;
+ 
+ 		zhdr = zpool_map_handle(pool, handle, ZPOOL_MM_RO);
+@@ -1028,14 +1063,13 @@ static int zswap_writeback_entry(struct
+ 			zpool_unmap_handle(pool, handle);
+ 		}
+ 
+-		mutex_lock(&acomp_ctx->mutex);
+ 		sg_init_one(&input, src, entry->length);
+ 		sg_init_table(&output, 1);
+ 		sg_set_page(&output, page, PAGE_SIZE, 0);
+ 		acomp_request_set_params(acomp_ctx->req, &input, &output, entry->length, dlen);
+ 		ret = crypto_wait_req(crypto_acomp_decompress(acomp_ctx->req), &acomp_ctx->wait);
+ 		dlen = acomp_ctx->req->dlen;
+-		mutex_unlock(&acomp_ctx->mutex);
++		acomp_ctx_put_unlock(acomp_ctx);
+ 
+ 		if (!zpool_can_sleep_mapped(pool))
+ 			kfree(tmp);
+@@ -1214,9 +1248,7 @@ static int zswap_frontswap_store(unsigne
+ 	}
+ 
+ 	/* compress */
+-	acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
+-
+-	mutex_lock(&acomp_ctx->mutex);
++	acomp_ctx = acomp_ctx_get_cpu_lock(entry->pool);
+ 
+ 	dst = acomp_ctx->buffer;
+ 	sg_init_table(&input, 1);
+@@ -1267,7 +1299,7 @@ static int zswap_frontswap_store(unsigne
+ 	memcpy(buf, &zhdr, hlen);
+ 	memcpy(buf + hlen, dst, dlen);
+ 	zpool_unmap_handle(entry->pool->zpool, handle);
+-	mutex_unlock(&acomp_ctx->mutex);
++	acomp_ctx_put_unlock(acomp_ctx);
+ 
+ 	/* populate entry */
+ 	entry->offset = offset;
+@@ -1303,7 +1335,7 @@ insert_entry:
+ 	return 0;
+ 
+ put_dstmem:
+-	mutex_unlock(&acomp_ctx->mutex);
++	acomp_ctx_put_unlock(acomp_ctx);
+ 	zswap_pool_put(entry->pool);
+ freepage:
+ 	zswap_entry_cache_free(entry);
+@@ -1373,14 +1405,13 @@ static int zswap_frontswap_load(unsigned
+ 		zpool_unmap_handle(entry->pool->zpool, entry->handle);
+ 	}
+ 
+-	acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
+-	mutex_lock(&acomp_ctx->mutex);
++	acomp_ctx = acomp_ctx_get_cpu_lock(entry->pool);
+ 	sg_init_one(&input, src, entry->length);
+ 	sg_init_table(&output, 1);
+ 	sg_set_page(&output, page, PAGE_SIZE, 0);
+ 	acomp_request_set_params(acomp_ctx->req, &input, &output, entry->length, dlen);
+ 	ret = crypto_wait_req(crypto_acomp_decompress(acomp_ctx->req), &acomp_ctx->wait);
+-	mutex_unlock(&acomp_ctx->mutex);
++	acomp_ctx_put_unlock(acomp_ctx);
+ 
+ 	if (zpool_can_sleep_mapped(entry->pool->zpool))
+ 		zpool_unmap_handle(entry->pool->zpool, entry->handle);
