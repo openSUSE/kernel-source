@@ -1,0 +1,240 @@
+From: Kanchan Joshi <joshi.k@samsung.com>
+Date: Thu, 28 Nov 2024 16:52:40 +0530
+Subject: [PATCH] block: add support to pass user meta buffer
+Git-commit: 3d8b5a22d40435b4a7e58f06ae2cd3506b222898
+Patch-mainline: v6.14-rc1
+References: jsc#PED-9651
+
+If an iocb contains metadata, extract that and prepare the bip.
+Based on flags specified by the user, set corresponding guard/app/ref
+tags to be checked in bip.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+Signed-off-by: Kanchan Joshi <joshi.k@samsung.com>
+Reviewed-by: Keith Busch <kbusch@kernel.org>
+Link: https://lore.kernel.org/r/20241128112240.8867-11-anuj20.g@samsung.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/bio-integrity.c         | 50 +++++++++++++++++++++++++++++++++++
+ block/fops.c                  | 45 ++++++++++++++++++++++++-------
+ include/linux/bio-integrity.h |  7 +++++
+ 3 files changed, 92 insertions(+), 10 deletions(-)
+
+diff --git a/block/bio-integrity.c b/block/bio-integrity.c
+index 3bee43b87001..5d81ad9a3d20 100644
+--- a/block/bio-integrity.c
++++ b/block/bio-integrity.c
+@@ -364,6 +364,55 @@ int bio_integrity_map_user(struct bio *bio, struct iov_iter *iter)
+ 	return ret;
+ }
+ 
++static void bio_uio_meta_to_bip(struct bio *bio, struct uio_meta *meta)
++{
++	struct bio_integrity_payload *bip = bio_integrity(bio);
++
++	if (meta->flags & IO_INTEGRITY_CHK_GUARD)
++		bip->bip_flags |= BIP_CHECK_GUARD;
++	if (meta->flags & IO_INTEGRITY_CHK_APPTAG)
++		bip->bip_flags |= BIP_CHECK_APPTAG;
++	if (meta->flags & IO_INTEGRITY_CHK_REFTAG)
++		bip->bip_flags |= BIP_CHECK_REFTAG;
++
++	bip->app_tag = meta->app_tag;
++}
++
++int bio_integrity_map_iter(struct bio *bio, struct uio_meta *meta)
++{
++	struct blk_integrity *bi = blk_get_integrity(bio->bi_bdev->bd_disk);
++	unsigned int integrity_bytes;
++	int ret;
++	struct iov_iter it;
++
++	if (!bi)
++		return -EINVAL;
++	/*
++	 * original meta iterator can be bigger.
++	 * process integrity info corresponding to current data buffer only.
++	 */
++	it = meta->iter;
++	integrity_bytes = bio_integrity_bytes(bi, bio_sectors(bio));
++	if (it.count < integrity_bytes)
++		return -EINVAL;
++
++	/* should fit into two bytes */
++	BUILD_BUG_ON(IO_INTEGRITY_VALID_FLAGS >= (1 << 16));
++
++	if (meta->flags && (meta->flags & ~IO_INTEGRITY_VALID_FLAGS))
++		return -EINVAL;
++
++	it.count = integrity_bytes;
++	ret = bio_integrity_map_user(bio, &it);
++	if (!ret) {
++		bio_uio_meta_to_bip(bio, meta);
++		bip_set_seed(bio_integrity(bio), meta->seed);
++		iov_iter_advance(&meta->iter, integrity_bytes);
++		meta->seed += bio_integrity_intervals(bi, bio_sectors(bio));
++	}
++	return ret;
++}
++
+ /**
+  * bio_integrity_prep - Prepare bio for integrity I/O
+  * @bio:	bio to prepare
+@@ -564,6 +613,7 @@ int bio_integrity_clone(struct bio *bio, struct bio *bio_src,
+ 	bip->bip_vec = bip_src->bip_vec;
+ 	bip->bip_iter = bip_src->bip_iter;
+ 	bip->bip_flags = bip_src->bip_flags & BIP_CLONE_FLAGS;
++	bip->app_tag = bip_src->app_tag;
+ 
+ 	return 0;
+ }
+diff --git a/block/fops.c b/block/fops.c
+index 13a67940d040..6d5c4fc5a216 100644
+--- a/block/fops.c
++++ b/block/fops.c
+@@ -54,6 +54,7 @@ static ssize_t __blkdev_direct_IO_simple(struct kiocb *iocb,
+ 	struct bio bio;
+ 	ssize_t ret;
+ 
++	WARN_ON_ONCE(iocb->ki_flags & IOCB_HAS_METADATA);
+ 	if (nr_pages <= DIO_INLINE_BIO_VECS)
+ 		vecs = inline_vecs;
+ 	else {
+@@ -124,12 +125,16 @@ static void blkdev_bio_end_io(struct bio *bio)
+ {
+ 	struct blkdev_dio *dio = bio->bi_private;
+ 	bool should_dirty = dio->flags & DIO_SHOULD_DIRTY;
++	bool is_sync = dio->flags & DIO_IS_SYNC;
+ 
+ 	if (bio->bi_status && !dio->bio.bi_status)
+ 		dio->bio.bi_status = bio->bi_status;
+ 
++	if (!is_sync && (dio->iocb->ki_flags & IOCB_HAS_METADATA))
++		bio_integrity_unmap_user(bio);
++
+ 	if (atomic_dec_and_test(&dio->ref)) {
+-		if (!(dio->flags & DIO_IS_SYNC)) {
++		if (!is_sync) {
+ 			struct kiocb *iocb = dio->iocb;
+ 			ssize_t ret;
+ 
+@@ -221,14 +226,16 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
+ 			 * a retry of this from blocking context.
+ 			 */
+ 			if (unlikely(iov_iter_count(iter))) {
+-				bio_release_pages(bio, false);
+-				bio_clear_flag(bio, BIO_REFFED);
+-				bio_put(bio);
+-				blk_finish_plug(&plug);
+-				return -EAGAIN;
++				ret = -EAGAIN;
++				goto fail;
+ 			}
+ 			bio->bi_opf |= REQ_NOWAIT;
+ 		}
++		if (!is_sync && (iocb->ki_flags & IOCB_HAS_METADATA)) {
++			ret = bio_integrity_map_iter(bio, iocb->private);
++			if (unlikely(ret))
++				goto fail;
++		}
+ 
+ 		if (is_read) {
+ 			if (dio->flags & DIO_SHOULD_DIRTY)
+@@ -269,6 +276,12 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
+ 
+ 	bio_put(&dio->bio);
+ 	return ret;
++fail:
++	bio_release_pages(bio, false);
++	bio_clear_flag(bio, BIO_REFFED);
++	bio_put(bio);
++	blk_finish_plug(&plug);
++	return ret;
+ }
+ 
+ static void blkdev_bio_end_io_async(struct bio *bio)
+@@ -286,6 +299,9 @@ static void blkdev_bio_end_io_async(struct bio *bio)
+ 		ret = blk_status_to_errno(bio->bi_status);
+ 	}
+ 
++	if (iocb->ki_flags & IOCB_HAS_METADATA)
++		bio_integrity_unmap_user(bio);
++
+ 	iocb->ki_complete(iocb, ret);
+ 
+ 	if (dio->flags & DIO_SHOULD_DIRTY) {
+@@ -330,10 +346,8 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
+ 		bio_iov_bvec_set(bio, iter);
+ 	} else {
+ 		ret = bio_iov_iter_get_pages(bio, iter);
+-		if (unlikely(ret)) {
+-			bio_put(bio);
+-			return ret;
+-		}
++		if (unlikely(ret))
++			goto out_bio_put;
+ 	}
+ 	dio->size = bio->bi_iter.bi_size;
+ 
+@@ -346,6 +360,13 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
+ 		task_io_account_write(bio->bi_iter.bi_size);
+ 	}
+ 
++	if (iocb->ki_flags & IOCB_HAS_METADATA) {
++		ret = bio_integrity_map_iter(bio, iocb->private);
++		WRITE_ONCE(iocb->private, NULL);
++		if (unlikely(ret))
++			goto out_bio_put;
++	}
++
+ 	if (iocb->ki_flags & IOCB_ATOMIC)
+ 		bio->bi_opf |= REQ_ATOMIC;
+ 
+@@ -360,6 +381,10 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
+ 		submit_bio(bio);
+ 	}
+ 	return -EIOCBQUEUED;
++
++out_bio_put:
++	bio_put(bio);
++	return ret;
+ }
+ 
+ static ssize_t blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
+diff --git a/include/linux/bio-integrity.h b/include/linux/bio-integrity.h
+index 2195bc06dcde..de0a6c9de4d1 100644
+--- a/include/linux/bio-integrity.h
++++ b/include/linux/bio-integrity.h
+@@ -23,6 +23,7 @@ struct bio_integrity_payload {
+ 	unsigned short		bip_vcnt;	/* # of integrity bio_vecs */
+ 	unsigned short		bip_max_vcnt;	/* integrity bio_vec slots */
+ 	unsigned short		bip_flags;	/* control flags */
++	u16			app_tag;	/* application tag value */
+ 
+ 	struct bvec_iter	bio_iter;	/* for rewinding parent bio */
+ 
+@@ -78,6 +79,7 @@ struct bio_integrity_payload *bio_integrity_alloc(struct bio *bio, gfp_t gfp,
+ int bio_integrity_add_page(struct bio *bio, struct page *page, unsigned int len,
+ 		unsigned int offset);
+ int bio_integrity_map_user(struct bio *bio, struct iov_iter *iter);
++int bio_integrity_map_iter(struct bio *bio, struct uio_meta *meta);
+ void bio_integrity_unmap_user(struct bio *bio);
+ bool bio_integrity_prep(struct bio *bio);
+ void bio_integrity_advance(struct bio *bio, unsigned int bytes_done);
+@@ -108,6 +110,11 @@ static int bio_integrity_map_user(struct bio *bio, struct iov_iter *iter)
+ 	return -EINVAL;
+ }
+ 
++static inline int bio_integrity_map_iter(struct bio *bio, struct uio_meta *meta)
++{
++	return -EINVAL;
++}
++
+ static inline void bio_integrity_unmap_user(struct bio *bio)
+ {
+ }
+-- 
+2.35.3
+
