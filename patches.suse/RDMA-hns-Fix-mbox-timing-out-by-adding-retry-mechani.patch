@@ -1,0 +1,166 @@
+From 9747c0c7791d4a5a62018a0c9c563dd2e6f6c1c0 Mon Sep 17 00:00:00 2001
+From: Junxian Huang <huangjunxian6@hisilicon.com>
+Date: Sat, 8 Feb 2025 18:59:30 +0800
+Subject: [PATCH 1/1] RDMA/hns: Fix mbox timing out by adding retry mechanism
+Git-commit: 9747c0c7791d4a5a62018a0c9c563dd2e6f6c1c0
+Patch-mainline: v6.14 or v6.14-rc5 (next release)
+References: git-fixes
+
+If a QP is modified to error state and a flush CQE process is triggered,
+the subsequent QP destruction mbox can still be successfully posted but
+will be blocked in HW until the flush CQE process finishes. This causes
+further mbox posting timeouts in driver. The blocking time is related
+to QP depth. Considering an extreme case where SQ depth and RQ depth
+are both 32K, the blocking time can reach about 135ms.
+
+This patch adds a retry mechanism for mbox posting. For each try, FW
+waits 15ms for HW to complete the previous mbox, otherwise return a
+timeout error code to driver. Counting other time consumption in FW,
+set 8 tries for mbox posting and a 5ms time gap before each retry to
+increase to a sufficient timeout limit.
+
+Fixes: 0425e3e6e0c7 ("RDMA/hns: Support flush cqe for hip08 in kernel space")
+Signed-off-by: Junxian Huang <huangjunxian6@hisilicon.com>
+Link: https://patch.msgid.link/20250208105930.522796-1-huangjunxian6@hisilicon.com
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c | 64 ++++++++++++++++------
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.h |  2 +
+ 2 files changed, 50 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+index dded339802b3..160e8927d364 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -1286,10 +1286,8 @@ static u32 hns_roce_cmdq_tx_timeout(u16 opcode, u32 tx_timeout)
+ 	return tx_timeout;
+ }
+ 
+-static void hns_roce_wait_csq_done(struct hns_roce_dev *hr_dev, u16 opcode)
++static void hns_roce_wait_csq_done(struct hns_roce_dev *hr_dev, u32 tx_timeout)
+ {
+-	struct hns_roce_v2_priv *priv = hr_dev->priv;
+-	u32 tx_timeout = hns_roce_cmdq_tx_timeout(opcode, priv->cmq.tx_timeout);
+ 	u32 timeout = 0;
+ 
+ 	do {
+@@ -1299,8 +1297,9 @@ static void hns_roce_wait_csq_done(struct hns_roce_dev *hr_dev, u16 opcode)
+ 	} while (++timeout < tx_timeout);
+ }
+ 
+-static int __hns_roce_cmq_send(struct hns_roce_dev *hr_dev,
+-			       struct hns_roce_cmq_desc *desc, int num)
++static int __hns_roce_cmq_send_one(struct hns_roce_dev *hr_dev,
++				   struct hns_roce_cmq_desc *desc,
++				   int num, u32 tx_timeout)
+ {
+ 	struct hns_roce_v2_priv *priv = hr_dev->priv;
+ 	struct hns_roce_v2_cmq_ring *csq = &priv->cmq.csq;
+@@ -1309,8 +1308,6 @@ static int __hns_roce_cmq_send(struct hns_roce_dev *hr_dev,
+ 	int ret;
+ 	int i;
+ 
+-	spin_lock_bh(&csq->lock);
+-
+ 	tail = csq->head;
+ 
+ 	for (i = 0; i < num; i++) {
+@@ -1324,22 +1321,17 @@ static int __hns_roce_cmq_send(struct hns_roce_dev *hr_dev,
+ 
+ 	atomic64_inc(&hr_dev->dfx_cnt[HNS_ROCE_DFX_CMDS_CNT]);
+ 
+-	hns_roce_wait_csq_done(hr_dev, le16_to_cpu(desc->opcode));
++	hns_roce_wait_csq_done(hr_dev, tx_timeout);
+ 	if (hns_roce_cmq_csq_done(hr_dev)) {
+ 		ret = 0;
+ 		for (i = 0; i < num; i++) {
+ 			/* check the result of hardware write back */
+-			desc[i] = csq->desc[tail++];
++			desc_ret = le16_to_cpu(csq->desc[tail++].retval);
+ 			if (tail == csq->desc_num)
+ 				tail = 0;
+-
+-			desc_ret = le16_to_cpu(desc[i].retval);
+ 			if (likely(desc_ret == CMD_EXEC_SUCCESS))
+ 				continue;
+ 
+-			dev_err_ratelimited(hr_dev->dev,
+-					    "Cmdq IO error, opcode = 0x%x, return = 0x%x.\n",
+-					    desc->opcode, desc_ret);
+ 			ret = hns_roce_cmd_err_convert_errno(desc_ret);
+ 		}
+ 	} else {
+@@ -1354,14 +1346,54 @@ static int __hns_roce_cmq_send(struct hns_roce_dev *hr_dev,
+ 		ret = -EAGAIN;
+ 	}
+ 
+-	spin_unlock_bh(&csq->lock);
+-
+ 	if (ret)
+ 		atomic64_inc(&hr_dev->dfx_cnt[HNS_ROCE_DFX_CMDS_ERR_CNT]);
+ 
+ 	return ret;
+ }
+ 
++static int __hns_roce_cmq_send(struct hns_roce_dev *hr_dev,
++			       struct hns_roce_cmq_desc *desc, int num)
++{
++	struct hns_roce_v2_priv *priv = hr_dev->priv;
++	struct hns_roce_v2_cmq_ring *csq = &priv->cmq.csq;
++	u16 opcode = le16_to_cpu(desc->opcode);
++	u32 tx_timeout = hns_roce_cmdq_tx_timeout(opcode, priv->cmq.tx_timeout);
++	u8 try_cnt = HNS_ROCE_OPC_POST_MB_TRY_CNT;
++	u32 rsv_tail;
++	int ret;
++	int i;
++
++	while (try_cnt) {
++		try_cnt--;
++
++		spin_lock_bh(&csq->lock);
++		rsv_tail = csq->head;
++		ret = __hns_roce_cmq_send_one(hr_dev, desc, num, tx_timeout);
++		if (opcode == HNS_ROCE_OPC_POST_MB && ret == -ETIME &&
++		    try_cnt) {
++			spin_unlock_bh(&csq->lock);
++			mdelay(HNS_ROCE_OPC_POST_MB_RETRY_GAP_MSEC);
++			continue;
++		}
++
++		for (i = 0; i < num; i++) {
++			desc[i] = csq->desc[rsv_tail++];
++			if (rsv_tail == csq->desc_num)
++				rsv_tail = 0;
++		}
++		spin_unlock_bh(&csq->lock);
++		break;
++	}
++
++	if (ret)
++		dev_err_ratelimited(hr_dev->dev,
++				    "Cmdq IO error, opcode = 0x%x, return = %d.\n",
++				    opcode, ret);
++
++	return ret;
++}
++
+ static int hns_roce_cmq_send(struct hns_roce_dev *hr_dev,
+ 			     struct hns_roce_cmq_desc *desc, int num)
+ {
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.h b/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
+index cbdbc9edbce6..91a5665465ff 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
+@@ -230,6 +230,8 @@ enum hns_roce_opcode_type {
+ };
+ 
+ #define HNS_ROCE_OPC_POST_MB_TIMEOUT 35000
++#define HNS_ROCE_OPC_POST_MB_TRY_CNT 8
++#define HNS_ROCE_OPC_POST_MB_RETRY_GAP_MSEC 5
+ struct hns_roce_cmdq_tx_timeout_map {
+ 	u16 opcode;
+ 	u32 tx_timeout;
+-- 
+2.48.1.1.g25877ef7d4f1
+
