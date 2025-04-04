@@ -1,0 +1,159 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Date: Tue, 3 Dec 2024 18:05:10 +0000
+Subject: mm: abstract get_arg_page() stack expansion and mmap read lock
+Git-commit: 7a5714991872f0a4805cc6004a5bff19a71d0459
+Patch-mainline: v6.14-rc1
+References: bsc#1236648
+
+Right now fs/exec.c invokes expand_downwards(), an otherwise internal
+implementation detail of the VMA logic in order to ensure that an arg page
+can be obtained by get_user_pages_remote().
+
+In order to be able to move the stack expansion logic into mm/vma.c to
+make it available to userland testing we need to find an alternative
+approach here.
+
+We do so by providing the mmap_read_lock_maybe_expand() function which
+also helpfully documents what get_arg_page() is doing here and adds an
+additional check against VM_GROWSDOWN to make explicit that the stack
+expansion logic is only invoked when the VMA is indeed a downward-growing
+stack.
+
+This allows expand_downwards() to become a static function.
+
+Importantly, the VMA referenced by mmap_read_maybe_expand() must NOT be
+currently user-visible in any way, that is place within an rmap or VMA
+tree.  It must be a newly allocated VMA.
+
+This is the case when exec invokes this function.
+
+Link: https://lkml.kernel.org/r/5295d1c70c58e6aa63d14be68d4e1de9fa1c8e6d.1733248985.git.lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Eric W. Biederman <ebiederm@xmission.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jann Horn <jannh@google.com>
+Cc: Kees Cook <kees@kernel.org>
+Cc: Liam R. Howlett <Liam.Howlett@Oracle.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+---
+ fs/exec.c          |   14 ++-----------
+ include/linux/mm.h |    5 +---
+ mm/mmap.c          |   54 ++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 58 insertions(+), 15 deletions(-)
+
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -205,18 +205,10 @@ static struct page *get_arg_page(struct
+ 	/*
+ 	 * Avoid relying on expanding the stack down in GUP (which
+ 	 * does not work for STACK_GROWSUP anyway), and just do it
+-	 * by hand ahead of time.
++	 * ahead of time.
+ 	 */
+-	if (write && pos < vma->vm_start) {
+-		mmap_write_lock(mm);
+-		ret = expand_downwards(vma, pos);
+-		if (unlikely(ret < 0)) {
+-			mmap_write_unlock(mm);
+-			return NULL;
+-		}
+-		mmap_write_downgrade(mm);
+-	} else
+-		mmap_read_lock(mm);
++	if (!mmap_read_lock_maybe_expand(mm, vma, pos, write))
++		return NULL;
+ 
+ 	/*
+ 	 * We are doing an exec().  'current' is the process
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -3299,6 +3299,8 @@ extern int __vm_enough_memory(struct mm_
+ extern int insert_vm_struct(struct mm_struct *, struct vm_area_struct *);
+ extern void exit_mmap(struct mm_struct *);
+ int relocate_vma_down(struct vm_area_struct *vma, unsigned long shift);
++bool mmap_read_lock_maybe_expand(struct mm_struct *mm, struct vm_area_struct *vma,
++				 unsigned long addr, bool write);
+ 
+ static inline int check_data_rlimit(unsigned long rlim,
+ 				    unsigned long new,
+@@ -3412,9 +3414,6 @@ extern unsigned long stack_guard_gap;
+ int expand_stack_locked(struct vm_area_struct *vma, unsigned long address);
+ struct vm_area_struct *expand_stack(struct mm_struct * mm, unsigned long addr);
+ 
+-/* CONFIG_STACK_GROWSUP still needs to grow downwards at some places */
+-int expand_downwards(struct vm_area_struct *vma, unsigned long address);
+-
+ /* Look up the first VMA which satisfies  addr < vm_end,  NULL if none. */
+ extern struct vm_area_struct * find_vma(struct mm_struct * mm, unsigned long addr);
+ extern struct vm_area_struct * find_vma_prev(struct mm_struct * mm, unsigned long addr,
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1005,7 +1005,7 @@ static int expand_upwards(struct vm_area
+  * vma is the first one with address < vma->vm_start.  Have to extend vma.
+  * mmap_lock held for writing.
+  */
+-int expand_downwards(struct vm_area_struct *vma, unsigned long address)
++static int expand_downwards(struct vm_area_struct *vma, unsigned long address)
+ {
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	struct vm_area_struct *prev;
+@@ -1936,3 +1936,55 @@ int relocate_vma_down(struct vm_area_str
+ 	/* Shrink the vma to just the new range */
+ 	return vma_shrink(&vmi, vma, new_start, new_end, vma->vm_pgoff);
+ }
++
++#ifdef CONFIG_MMU
++/*
++ * Obtain a read lock on mm->mmap_lock, if the specified address is below the
++ * start of the VMA, the intent is to perform a write, and it is a
++ * downward-growing stack, then attempt to expand the stack to contain it.
++ *
++ * This function is intended only for obtaining an argument page from an ELF
++ * image, and is almost certainly NOT what you want to use for any other
++ * purpose.
++ *
++ * IMPORTANT - VMA fields are accessed without an mmap lock being held, so the
++ * VMA referenced must not be linked in any user-visible tree, i.e. it must be a
++ * new VMA being mapped.
++ *
++ * The function assumes that addr is either contained within the VMA or below
++ * it, and makes no attempt to validate this value beyond that.
++ *
++ * Returns true if the read lock was obtained and a stack was perhaps expanded,
++ * false if the stack expansion failed.
++ *
++ * On stack expansion the function temporarily acquires an mmap write lock
++ * before downgrading it.
++ */
++bool mmap_read_lock_maybe_expand(struct mm_struct *mm,
++				 struct vm_area_struct *new_vma,
++				 unsigned long addr, bool write)
++{
++	if (!write || addr >= new_vma->vm_start) {
++		mmap_read_lock(mm);
++		return true;
++	}
++
++	if (!(new_vma->vm_flags & VM_GROWSDOWN))
++		return false;
++
++	mmap_write_lock(mm);
++	if (expand_downwards(new_vma, addr)) {
++		mmap_write_unlock(mm);
++		return false;
++	}
++
++	mmap_write_downgrade(mm);
++	return true;
++}
++#else
++bool mmap_read_lock_maybe_expand(struct mm_struct *mm, struct vm_area_struct *vma,
++				 unsigned long addr, bool write)
++{
++	return false;
++}
++#endif
