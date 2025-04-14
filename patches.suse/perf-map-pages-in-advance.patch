@@ -1,0 +1,288 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Date: Fri, 3 Jan 2025 15:31:51 +0000
+Subject: perf: map pages in advance
+Git-commit: b709eb872e19a19607bbb6d2975bc264d59735cf
+Patch-mainline: v6.14-rc1
+References: git-fixes
+
+We are adjusting struct page to make it smaller, removing unneeded fields
+which correctly belong to struct folio.
+
+Two of those fields are page->index and page->mapping. Perf is currently
+making use of both of these. This is unnecessary. This patch eliminates
+this.
+
+Perf establishes its own internally controlled memory-mapped pages using
+vm_ops hooks. The first page in the mapping is the read/write user control
+page, and the rest of the mapping consists of read-only pages.
+
+The VMA is backed by kernel memory either from the buddy allocator or
+vmalloc depending on configuration. It is intended to be mapped read/write,
+but because it has a page_mkwrite() hook, vma_wants_writenotify() indicates
+that it should be mapped read-only.
+
+When a write fault occurs, the provided page_mkwrite() hook,
+perf_mmap_fault() (doing double duty handing faults as well) uses the
+vmf->pgoff field to determine if this is the first page, allowing for the
+desired read/write first page, read-only rest mapping.
+
+For this to work the implementation has to carefully work around faulting
+logic. When a page is write-faulted, the fault() hook is called first, then
+its page_mkwrite() hook is called (to allow for dirty tracking in file
+systems).
+
+On fault we set the folio's mapping in perf_mmap_fault(), this is because
+when do_page_mkwrite() is subsequently invoked, it treats a missing mapping
+as an indicator that the fault should be retried.
+
+We also set the folio's index so, given the folio is being treated as faux
+user memory, it correctly references its offset within the VMA.
+
+This explains why the mapping and index fields are used - but it's not
+necessary.
+
+We preallocate pages when perf_mmap() is called for the first time via
+rb_alloc(), and further allocate auxiliary pages via rb_aux_alloc() as
+needed if the mapping requires it.
+
+This allocation is done in the f_ops->mmap() hook provided in perf_mmap(),
+and so we can instead simply map all the memory right away here - there's
+no point in handling (read) page faults when we don't demand page nor need
+to be notified about them (perf does not).
+
+This patch therefore changes this logic to map everything when the mmap()
+hook is called, establishing a PFN map. It implements vm_ops->pfn_mkwrite()
+to provide the required read/write vs. read-only behaviour, which does not
+require the previously implemented workarounds.
+
+While it is not ideal to use a VM_PFNMAP here, doing anything else will
+result in the page_mkwrite() hook need to be provided, which requires the
+same page->mapping hack this patch seeks to undo.
+
+It will also result in the pages being treated as folios and placed on the
+rmap, which really does not make sense for these mappings.
+
+Semantically it makes sense to establish this as some kind of special
+mapping, as the pages are managed by perf and are not strictly user pages,
+but currently the only means by which we can do so functionally while
+maintaining the required R/W and R/O behaviour is a PFN map.
+
+There should be no change to actual functionality as a result of this
+change.
+
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20250103153151.124163-1-lorenzo.stoakes@oracle.com
+
+Signed-off-by: Tony Jones <tonyj@suse.de>
+---
+ kernel/events/core.c        | 118 ++++++++++++++++++++++++++++++--------------
+ kernel/events/ring_buffer.c |  19 +------
+ 2 files changed, 82 insertions(+), 55 deletions(-)
+
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index b2bc67791f84..bcb09e011e9e 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -6277,41 +6277,6 @@ void perf_event_update_userpage(struct perf_event *event)
+ }
+ EXPORT_SYMBOL_GPL(perf_event_update_userpage);
+ 
+-static vm_fault_t perf_mmap_fault(struct vm_fault *vmf)
+-{
+-	struct perf_event *event = vmf->vma->vm_file->private_data;
+-	struct perf_buffer *rb;
+-	vm_fault_t ret = VM_FAULT_SIGBUS;
+-
+-	if (vmf->flags & FAULT_FLAG_MKWRITE) {
+-		if (vmf->pgoff == 0)
+-			ret = 0;
+-		return ret;
+-	}
+-
+-	rcu_read_lock();
+-	rb = rcu_dereference(event->rb);
+-	if (!rb)
+-		goto unlock;
+-
+-	if (vmf->pgoff && (vmf->flags & FAULT_FLAG_WRITE))
+-		goto unlock;
+-
+-	vmf->page = perf_mmap_to_page(rb, vmf->pgoff);
+-	if (!vmf->page)
+-		goto unlock;
+-
+-	get_page(vmf->page);
+-	vmf->page->mapping = vmf->vma->vm_file->f_mapping;
+-	vmf->page->index   = vmf->pgoff;
+-
+-	ret = 0;
+-unlock:
+-	rcu_read_unlock();
+-
+-	return ret;
+-}
+-
+ static void ring_buffer_attach(struct perf_event *event,
+ 			       struct perf_buffer *rb)
+ {
+@@ -6551,13 +6516,87 @@ static void perf_mmap_close(struct vm_area_struct *vma)
+ 	ring_buffer_put(rb); /* could be last */
+ }
+ 
++static vm_fault_t perf_mmap_pfn_mkwrite(struct vm_fault *vmf)
++{
++	/* The first page is the user control page, others are read-only. */
++	return vmf->pgoff == 0 ? 0 : VM_FAULT_SIGBUS;
++}
++
+ static const struct vm_operations_struct perf_mmap_vmops = {
+ 	.open		= perf_mmap_open,
+ 	.close		= perf_mmap_close, /* non mergeable */
+-	.fault		= perf_mmap_fault,
+-	.page_mkwrite	= perf_mmap_fault,
++	.pfn_mkwrite	= perf_mmap_pfn_mkwrite,
+ };
+ 
++static int map_range(struct perf_buffer *rb, struct vm_area_struct *vma)
++{
++	unsigned long nr_pages = vma_pages(vma);
++	int err = 0;
++	unsigned long pagenum;
++
++	/*
++	 * We map this as a VM_PFNMAP VMA.
++	 *
++	 * This is not ideal as this is designed broadly for mappings of PFNs
++	 * referencing memory-mapped I/O ranges or non-system RAM i.e. for which
++	 * !pfn_valid(pfn).
++	 *
++	 * We are mapping kernel-allocated memory (memory we manage ourselves)
++	 * which would more ideally be mapped using vm_insert_page() or a
++	 * similar mechanism, that is as a VM_MIXEDMAP mapping.
++	 *
++	 * However this won't work here, because:
++	 *
++	 * 1. It uses vma->vm_page_prot, but this field has not been completely
++	 *    setup at the point of the f_op->mmp() hook, so we are unable to
++	 *    indicate that this should be mapped CoW in order that the
++	 *    mkwrite() hook can be invoked to make the first page R/W and the
++	 *    rest R/O as desired.
++	 *
++	 * 2. Anything other than a VM_PFNMAP of valid PFNs will result in
++	 *    vm_normal_page() returning a struct page * pointer, which means
++	 *    vm_ops->page_mkwrite() will be invoked rather than
++	 *    vm_ops->pfn_mkwrite(), and this means we have to set page->mapping
++	 *    to work around retry logic in the fault handler, however this
++	 *    field is no longer allowed to be used within struct page.
++	 *
++	 * 3. Having a struct page * made available in the fault logic also
++	 *    means that the page gets put on the rmap and becomes
++	 *    inappropriately accessible and subject to map and ref counting.
++	 *
++	 * Ideally we would have a mechanism that could explicitly express our
++	 * desires, but this is not currently the case, so we instead use
++	 * VM_PFNMAP.
++	 *
++	 * We manage the lifetime of these mappings with internal refcounts (see
++	 * perf_mmap_open() and perf_mmap_close()) so we ensure the lifetime of
++	 * this mapping is maintained correctly.
++	 */
++	for (pagenum = 0; pagenum < nr_pages; pagenum++) {
++		unsigned long va = vma->vm_start + PAGE_SIZE * pagenum;
++		struct page *page = perf_mmap_to_page(rb, vma->vm_pgoff + pagenum);
++
++		if (page == NULL) {
++			err = -EINVAL;
++			break;
++		}
++
++		/* Map readonly, perf_mmap_pfn_mkwrite() called on write fault. */
++		err = remap_pfn_range(vma, va, page_to_pfn(page), PAGE_SIZE,
++				      vm_get_page_prot(vma->vm_flags & ~VM_SHARED));
++		if (err)
++			break;
++	}
++
++#ifdef CONFIG_MMU
++	/* Clear any partial mappings on error. */
++	if (err)
++		zap_page_range_single(vma, vma->vm_start, nr_pages * PAGE_SIZE, NULL);
++#endif
++
++	return err;
++}
++
+ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
+ {
+ 	struct perf_event *event = file->private_data;
+@@ -6682,6 +6721,8 @@ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
+ 			goto again;
+ 		}
+ 
++		/* We need the rb to map pages. */
++		rb = event->rb;
+ 		goto unlock;
+ 	}
+ 
+@@ -6776,6 +6817,9 @@ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
+ 	vm_flags_set(vma, VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP);
+ 	vma->vm_ops = &perf_mmap_vmops;
+ 
++	if (!ret)
++		ret = map_range(rb, vma);
++
+ 	if (event->pmu->event_mapped)
+ 		event->pmu->event_mapped(event, vma->vm_mm);
+ 
+diff --git a/kernel/events/ring_buffer.c b/kernel/events/ring_buffer.c
+index 4f46f688d0d4..180509132d4b 100644
+--- a/kernel/events/ring_buffer.c
++++ b/kernel/events/ring_buffer.c
+@@ -643,7 +643,6 @@ static void rb_free_aux_page(struct perf_buffer *rb, int idx)
+ 	struct page *page = virt_to_page(rb->aux_pages[idx]);
+ 
+ 	ClearPagePrivate(page);
+-	page->mapping = NULL;
+ 	__free_page(page);
+ }
+ 
+@@ -819,7 +818,6 @@ static void perf_mmap_free_page(void *addr)
+ {
+ 	struct page *page = virt_to_page(addr);
+ 
+-	page->mapping = NULL;
+ 	__free_page(page);
+ }
+ 
+@@ -890,28 +888,13 @@ __perf_mmap_to_page(struct perf_buffer *rb, unsigned long pgoff)
+ 	return vmalloc_to_page((void *)rb->user_page + pgoff * PAGE_SIZE);
+ }
+ 
+-static void perf_mmap_unmark_page(void *addr)
+-{
+-	struct page *page = vmalloc_to_page(addr);
+-
+-	page->mapping = NULL;
+-}
+-
+ static void rb_free_work(struct work_struct *work)
+ {
+ 	struct perf_buffer *rb;
+-	void *base;
+-	int i, nr;
+ 
+ 	rb = container_of(work, struct perf_buffer, work);
+-	nr = data_page_nr(rb);
+-
+-	base = rb->user_page;
+-	/* The '<=' counts in the user page. */
+-	for (i = 0; i <= nr; i++)
+-		perf_mmap_unmark_page(base + (i * PAGE_SIZE));
+ 
+-	vfree(base);
++	vfree(rb->user_page);
+ 	kfree(rb);
+ }
+ 
+
