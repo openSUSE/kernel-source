@@ -1,0 +1,149 @@
+Patch-mainline: v6.13-rc1
+Git-commit: 3e7f43188ee227bcf0f07f60a00f1fd1aca10e6a
+References: jsc#PED-348
+From: Sean Christopherson <seanjc@google.com>
+Date: Fri, 2 Aug 2024 13:01:36 -0700
+Subject: [PATCH] KVM: Protect vCPU's "last run PID" with rwlock, not RCU
+
+To avoid jitter on KVM_RUN due to synchronize_rcu(), use a rwlock instead
+of RCU to protect vcpu->pid, a.k.a. the pid of the task last used to a
+vCPU.  When userspace is doing M:N scheduling of tasks to vCPUs, e.g. to
+run SEV migration helper vCPUs during post-copy, the synchronize_rcu()
+needed to change the PID associated with the vCPU can stall for hundreds
+of milliseconds, which is problematic for latency sensitive post-copy
+operations.
+
+In the directed yield path, do not acquire the lock if it's contended,
+i.e. if the associated PID is changing, as that means the vCPU's task is
+already running.
+
+Reported-by: Steve Rutherford <srutherford@google.com>
+Reviewed-by: Steve Rutherford <srutherford@google.com>
+Acked-by: Oliver Upton <oliver.upton@linux.dev>
+Link: https://lore.kernel.org/r/20240802200136.329973-3-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/arm64/include/asm/kvm_host.h |  2 +-
+ include/linux/kvm_host.h          |  3 ++-
+ virt/kvm/kvm_main.c               | 39 ++++++++++++++++++++-----------
+ 3 files changed, 28 insertions(+), 16 deletions(-)
+
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index bf64fed9820e..04febe60c88e 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -1140,7 +1140,7 @@ int __kvm_arm_vcpu_set_events(struct kvm_vcpu *vcpu,
+ void kvm_arm_halt_guest(struct kvm *kvm);
+ void kvm_arm_resume_guest(struct kvm *kvm);
+ 
+-#define vcpu_has_run_once(vcpu)	!!rcu_access_pointer((vcpu)->pid)
++#define vcpu_has_run_once(vcpu)	(!!READ_ONCE((vcpu)->pid))
+ 
+ #ifndef __KVM_NVHE_HYPERVISOR__
+ #define kvm_call_hyp_nvhe(f, ...)						\
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 02f0206fd2dc..18a1672ffcbf 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -334,7 +334,8 @@ struct kvm_vcpu {
+ #ifndef __KVM_HAVE_ARCH_WQP
+ 	struct rcuwait wait;
+ #endif
+-	struct pid __rcu *pid;
++	struct pid *pid;
++	rwlock_t pid_lock;
+ 	int sigset_active;
+ 	sigset_t sigset;
+ 	unsigned int halt_poll_ns;
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 17048d9575e3..c1876b9ed213 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -447,6 +447,7 @@ static void kvm_vcpu_init(struct kvm_vcpu *vcpu, struct kvm *kvm, unsigned id)
+ 	vcpu->kvm = kvm;
+ 	vcpu->vcpu_id = id;
+ 	vcpu->pid = NULL;
++	rwlock_init(&vcpu->pid_lock);
+ #ifndef __KVM_HAVE_ARCH_WQP
+ 	rcuwait_init(&vcpu->wait);
+ #endif
+@@ -474,7 +475,7 @@ static void kvm_vcpu_destroy(struct kvm_vcpu *vcpu)
+ 	 * the vcpu->pid pointer, and at destruction time all file descriptors
+ 	 * are already gone.
+ 	 */
+-	put_pid(rcu_dereference_protected(vcpu->pid, 1));
++	put_pid(vcpu->pid);
+ 
+ 	free_page((unsigned long)vcpu->run);
+ 	kmem_cache_free(kvm_vcpu_cache, vcpu);
+@@ -3770,15 +3771,17 @@ EXPORT_SYMBOL_GPL(kvm_vcpu_kick);
+ 
+ int kvm_vcpu_yield_to(struct kvm_vcpu *target)
+ {
+-	struct pid *pid;
+ 	struct task_struct *task = NULL;
+ 	int ret;
+ 
+-	rcu_read_lock();
+-	pid = rcu_dereference(target->pid);
+-	if (pid)
+-		task = get_pid_task(pid, PIDTYPE_PID);
+-	rcu_read_unlock();
++	if (!read_trylock(&target->pid_lock))
++		return 0;
++
++	if (target->pid)
++		task = get_pid_task(target->pid, PIDTYPE_PID);
++
++	read_unlock(&target->pid_lock);
++
+ 	if (!task)
+ 		return 0;
+ 	ret = yield_to(task, 1);
+@@ -4030,9 +4033,9 @@ static int vcpu_get_pid(void *data, u64 *val)
+ {
+ 	struct kvm_vcpu *vcpu = data;
+ 
+-	rcu_read_lock();
+-	*val = pid_nr(rcu_dereference(vcpu->pid));
+-	rcu_read_unlock();
++	read_lock(&vcpu->pid_lock);
++	*val = pid_nr(vcpu->pid);
++	read_unlock(&vcpu->pid_lock);
+ 	return 0;
+ }
+ 
+@@ -4318,7 +4321,14 @@ static long kvm_vcpu_ioctl(struct file *filp,
+ 		r = -EINVAL;
+ 		if (arg)
+ 			goto out;
+-		oldpid = rcu_access_pointer(vcpu->pid);
++
++		/*
++		 * Note, vcpu->pid is primarily protected by vcpu->mutex. The
++		 * dedicated r/w lock allows other tasks, e.g. other vCPUs, to
++		 * read vcpu->pid while this vCPU is in KVM_RUN, e.g. to yield
++		 * directly to this vCPU
++		 */
++		oldpid = vcpu->pid;
+ 		if (unlikely(oldpid != task_pid(current))) {
+ 			/* The thread running this VCPU changed. */
+ 			struct pid *newpid;
+@@ -4328,9 +4338,10 @@ static long kvm_vcpu_ioctl(struct file *filp,
+ 				break;
+ 
+ 			newpid = get_task_pid(current, PIDTYPE_PID);
+-			rcu_assign_pointer(vcpu->pid, newpid);
+-			if (oldpid)
+-				synchronize_rcu();
++			write_lock(&vcpu->pid_lock);
++			vcpu->pid = newpid;
++			write_unlock(&vcpu->pid_lock);
++
+ 			put_pid(oldpid);
+ 		}
+ 		vcpu->wants_to_run = !READ_ONCE(vcpu->run->immediate_exit__unsafe);
+-- 
+2.43.0
+
