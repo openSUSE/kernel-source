@@ -1,0 +1,134 @@
+Patch-mainline: v6.13-rc1
+Git-commit: 35ef80eb29ab5f7b7c7264c7f21a64b3aa046921
+References: jsc#PED-348
+From: David Matlack <dmatlack@google.com>
+Date: Fri, 23 Aug 2024 16:56:44 -0700
+Subject: [PATCH] KVM: x86/mmu: Batch TLB flushes when zapping collapsible TDP
+ MMU SPTEs
+
+Set SPTEs directly to SHADOW_NONPRESENT_VALUE and batch up TLB flushes
+when zapping collapsible SPTEs, rather than freezing them first.
+
+Freezing the SPTE first is not required. It is fine for another thread
+holding mmu_lock for read to immediately install a present entry before
+TLBs are flushed because the underlying mapping is not changing. vCPUs
+that translate through the stale 4K mappings or a new huge page mapping
+will still observe the same GPA->HPA translations.
+
+KVM must only flush TLBs before dropping RCU (to avoid use-after-free of
+the zapped page tables) and before dropping mmu_lock (to synchronize
+with mmu_notifiers invalidating mappings).
+
+In VMs backed with 2MiB pages, batching TLB flushes improves the time it
+takes to zap collapsible SPTEs to disable dirty logging:
+
+ $ ./dirty_log_perf_test -s anonymous_hugetlb_2mb -v 64 -e -b 4g
+
+ Before: Disabling dirty logging time: 14.334453428s (131072 flushes)
+ After:  Disabling dirty logging time: 4.794969689s  (76 flushes)
+
+Skipping freezing SPTEs also avoids stalling vCPU threads on the frozen
+SPTE for the time it takes to perform a remote TLB flush. vCPUs faulting
+on the zapped mapping can now immediately install a new huge mapping and
+proceed with guest execution.
+
+Signed-off-by: David Matlack <dmatlack@google.com>
+Link: https://lore.kernel.org/r/20240823235648.3236880-3-dmatlack@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/kvm/mmu/tdp_mmu.c | 55 +++++++-------------------------------
+ 1 file changed, 10 insertions(+), 45 deletions(-)
+
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index 07ffd34150cc..076343c3c8a7 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -583,48 +583,6 @@ static inline int __must_check tdp_mmu_set_spte_atomic(struct kvm *kvm,
+ 	return 0;
+ }
+ 
+-static inline int __must_check tdp_mmu_zap_spte_atomic(struct kvm *kvm,
+-						       struct tdp_iter *iter)
+-{
+-	int ret;
+-
+-	lockdep_assert_held_read(&kvm->mmu_lock);
+-
+-	/*
+-	 * Freeze the SPTE by setting it to a special, non-present value. This
+-	 * will stop other threads from immediately installing a present entry
+-	 * in its place before the TLBs are flushed.
+-	 *
+-	 * Delay processing of the zapped SPTE until after TLBs are flushed and
+-	 * the FROZEN_SPTE is replaced (see below).
+-	 */
+-	ret = __tdp_mmu_set_spte_atomic(iter, FROZEN_SPTE);
+-	if (ret)
+-		return ret;
+-
+-	kvm_flush_remote_tlbs_gfn(kvm, iter->gfn, iter->level);
+-
+-	/*
+-	 * No other thread can overwrite the frozen SPTE as they must either
+-	 * wait on the MMU lock or use tdp_mmu_set_spte_atomic() which will not
+-	 * overwrite the special frozen SPTE value. Use the raw write helper to
+-	 * avoid an unnecessary check on volatile bits.
+-	 */
+-	__kvm_tdp_mmu_write_spte(iter->sptep, SHADOW_NONPRESENT_VALUE);
+-
+-	/*
+-	 * Process the zapped SPTE after flushing TLBs, and after replacing
+-	 * FROZEN_SPTE with 0. This minimizes the amount of time vCPUs are
+-	 * blocked by the FROZEN_SPTE and reduces contention on the child
+-	 * SPTEs.
+-	 */
+-	handle_changed_spte(kvm, iter->as_id, iter->gfn, iter->old_spte,
+-			    SHADOW_NONPRESENT_VALUE, iter->level, true);
+-
+-	return 0;
+-}
+-
+-
+ /*
+  * tdp_mmu_set_spte - Set a TDP MMU SPTE and handle the associated bookkeeping
+  * @kvm:	      KVM instance
+@@ -1596,13 +1554,16 @@ static void zap_collapsible_spte_range(struct kvm *kvm,
+ 	gfn_t end = start + slot->npages;
+ 	struct tdp_iter iter;
+ 	int max_mapping_level;
++	bool flush = false;
+ 
+ 	rcu_read_lock();
+ 
+ 	for_each_tdp_pte_min_level(iter, root, PG_LEVEL_2M, start, end) {
+ retry:
+-		if (tdp_mmu_iter_cond_resched(kvm, &iter, false, true))
++		if (tdp_mmu_iter_cond_resched(kvm, &iter, flush, true)) {
++			flush = false;
+ 			continue;
++		}
+ 
+ 		if (iter.level > KVM_MAX_HUGEPAGE_LEVEL ||
+ 		    !is_shadow_present_pte(iter.old_spte))
+@@ -1630,11 +1591,15 @@ static void zap_collapsible_spte_range(struct kvm *kvm,
+ 		if (max_mapping_level < iter.level)
+ 			continue;
+ 
+-		/* Note, a successful atomic zap also does a remote TLB flush. */
+-		if (tdp_mmu_zap_spte_atomic(kvm, &iter))
++		if (tdp_mmu_set_spte_atomic(kvm, &iter, SHADOW_NONPRESENT_VALUE))
+ 			goto retry;
++
++		flush = true;
+ 	}
+ 
++	if (flush)
++		kvm_flush_remote_tlbs_memslot(kvm, slot);
++
+ 	rcu_read_unlock();
+ }
+ 
+-- 
+2.43.0
+
