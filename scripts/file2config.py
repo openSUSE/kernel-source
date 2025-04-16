@@ -2,7 +2,7 @@
 
 import re
 
-from pathlib import Path, PurePath
+from pathlib import Path
 from os import chdir
 from argparse import ArgumentParser
 from os.path import expanduser
@@ -28,19 +28,23 @@ def _sanitize_config(target):
     return config
 
 
-def _find_config(obj_path, deep):
+def _find_config(base_dir, relative_obj_path, deep):
 
     if deep > 10:
         return None
 
-    make_file = Path(obj_path.parent, "Makefile")
+    make_file = Path(base_dir, "Makefile")
+
+    if not make_file.exists() and base_dir != Path("."):
+        # Search Makefile in parent directory
+        relative_obj_path = base_dir.name + '/' + relative_obj_path
+        return _find_config(base_dir.parent, relative_obj_path, deep)
 
     lines = _load_makefile(make_file)
 
-    obj_name = PurePath(obj_path).name
     for line in lines:
         sep = line.split()
-        if obj_name not in sep:
+        if relative_obj_path not in sep:
             continue
 
         # target found, check if this one with config
@@ -56,7 +60,7 @@ def _find_config(obj_path, deep):
             # print(ve)
             continue
 
-        return _find_config(Path(obj_path.parent, target + '.o'), deep + 1)
+        return _find_config(base_dir, target + '.o', deep + 1)
 
 
 def find_configs_for_files(linux_dir: str, file_paths: list):
@@ -76,8 +80,8 @@ def find_configs_for_files(linux_dir: str, file_paths: list):
 
     for path in file_paths:
         path = path.strip()
-        obj_file = path.replace('.c', '.o')
-        config = _find_config(Path(obj_file), 0)
+        obj_file = Path(path.replace('.c', '.o'))
+        config = _find_config(obj_file.parent, obj_file.name, 0)
         if not config:
             missing.append(path)
         elif config == 'y' or config == 'm':
