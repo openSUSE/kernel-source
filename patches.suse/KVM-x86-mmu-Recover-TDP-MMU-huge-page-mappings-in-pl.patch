@@ -1,0 +1,301 @@
+Patch-mainline: v6.13-rc1
+Git-commit: 13e2e4f62a4bb1288688e7218818f6f655600028
+References: jsc#PED-348
+From: David Matlack <dmatlack@google.com>
+Date: Fri, 23 Aug 2024 16:56:46 -0700
+Subject: [PATCH] KVM: x86/mmu: Recover TDP MMU huge page mappings in-place
+ instead of zapping
+
+Recover TDP MMU huge page mappings in-place instead of zapping them when
+dirty logging is disabled, and rename functions that recover huge page
+mappings when dirty logging is disabled to move away from the "zap
+collapsible spte" terminology.
+
+Before KVM flushes TLBs, guest accesses may be translated through either
+the (stale) small SPTE or the (new) huge SPTE. This is already possible
+when KVM is doing eager page splitting (where TLB flushes are also
+batched), and when vCPUs are faulting in huge mappings (where TLBs are
+flushed after the new huge SPTE is installed).
+
+Recovering huge pages reduces the number of page faults when dirty
+logging is disabled:
+
+ $ perf stat -e kvm:kvm_page_fault -- ./dirty_log_perf_test -s anonymous_hugetlb_2mb -v 64 -e -b 4g
+
+ Before: 393,599      kvm:kvm_page_fault
+ After:  262,575      kvm:kvm_page_fault
+
+vCPU throughput and the latency of disabling dirty-logging are about
+equal compared to zapping, but avoiding faults can be beneficial to
+remove vCPU jitter in extreme scenarios.
+
+Signed-off-by: David Matlack <dmatlack@google.com>
+Link: https://lore.kernel.org/r/20240823235648.3236880-5-dmatlack@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |  4 +--
+ arch/x86/kvm/mmu/mmu.c          |  6 ++--
+ arch/x86/kvm/mmu/spte.c         | 36 +++++++++++++++++++++--
+ arch/x86/kvm/mmu/spte.h         |  1 +
+ arch/x86/kvm/mmu/tdp_mmu.c      | 52 +++++++++++++++++++++++++++------
+ arch/x86/kvm/mmu/tdp_mmu.h      |  4 +--
+ arch/x86/kvm/x86.c              | 18 +++++-------
+ 7 files changed, 91 insertions(+), 30 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 6d9f763a7bb9..aa8007bc520a 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1955,8 +1955,8 @@ void kvm_mmu_try_split_huge_pages(struct kvm *kvm,
+ 				  const struct kvm_memory_slot *memslot,
+ 				  u64 start, u64 end,
+ 				  int target_level);
+-void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
+-				   const struct kvm_memory_slot *memslot);
++void kvm_mmu_recover_huge_pages(struct kvm *kvm,
++				const struct kvm_memory_slot *memslot);
+ void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
+ 				   const struct kvm_memory_slot *memslot);
+ void kvm_mmu_invalidate_mmio_sptes(struct kvm *kvm, u64 gen);
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 3c2322440d9c..33542ee4bbb1 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -6946,8 +6946,8 @@ static void kvm_rmap_zap_collapsible_sptes(struct kvm *kvm,
+ 		kvm_flush_remote_tlbs_memslot(kvm, slot);
+ }
+ 
+-void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
+-				   const struct kvm_memory_slot *slot)
++void kvm_mmu_recover_huge_pages(struct kvm *kvm,
++				const struct kvm_memory_slot *slot)
+ {
+ 	if (kvm_memslots_have_rmaps(kvm)) {
+ 		write_lock(&kvm->mmu_lock);
+@@ -6957,7 +6957,7 @@ void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
+ 
+ 	if (tdp_mmu_enabled) {
+ 		read_lock(&kvm->mmu_lock);
+-		kvm_tdp_mmu_zap_collapsible_sptes(kvm, slot);
++		kvm_tdp_mmu_recover_huge_pages(kvm, slot);
+ 		read_unlock(&kvm->mmu_lock);
+ 	}
+ }
+diff --git a/arch/x86/kvm/mmu/spte.c b/arch/x86/kvm/mmu/spte.c
+index fd8c3c92ade0..4bc107dc6b45 100644
+--- a/arch/x86/kvm/mmu/spte.c
++++ b/arch/x86/kvm/mmu/spte.c
+@@ -262,15 +262,15 @@ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
+ 	return wrprot;
+ }
+ 
+-static u64 make_spte_executable(u64 spte)
++static u64 modify_spte_protections(u64 spte, u64 set, u64 clear)
+ {
+ 	bool is_access_track = is_access_track_spte(spte);
+ 
+ 	if (is_access_track)
+ 		spte = restore_acc_track_spte(spte);
+ 
+-	spte &= ~shadow_nx_mask;
+-	spte |= shadow_x_mask;
++	KVM_MMU_WARN_ON(set & clear);
++	spte = (spte | set) & ~clear;
+ 
+ 	if (is_access_track)
+ 		spte = mark_spte_for_access_track(spte);
+@@ -278,6 +278,16 @@ static u64 make_spte_executable(u64 spte)
+ 	return spte;
+ }
+ 
++static u64 make_spte_executable(u64 spte)
++{
++	return modify_spte_protections(spte, shadow_x_mask, shadow_nx_mask);
++}
++
++static u64 make_spte_nonexecutable(u64 spte)
++{
++	return modify_spte_protections(spte, shadow_nx_mask, shadow_x_mask);
++}
++
+ /*
+  * Construct an SPTE that maps a sub-page of the given huge page SPTE where
+  * `index` identifies which sub-page.
+@@ -314,6 +324,26 @@ u64 make_huge_page_split_spte(struct kvm *kvm, u64 huge_spte,
+ 	return child_spte;
+ }
+ 
++u64 make_huge_spte(struct kvm *kvm, u64 small_spte, int level)
++{
++	u64 huge_spte;
++
++	KVM_BUG_ON(!is_shadow_present_pte(small_spte) || level == PG_LEVEL_4K, kvm);
++
++	huge_spte = small_spte | PT_PAGE_SIZE_MASK;
++
++	/*
++	 * huge_spte already has the address of the sub-page being collapsed
++	 * from small_spte, so just clear the lower address bits to create the
++	 * huge page address.
++	 */
++	huge_spte &= KVM_HPAGE_MASK(level) | ~PAGE_MASK;
++
++	if (is_nx_huge_page_enabled(kvm))
++		huge_spte = make_spte_nonexecutable(huge_spte);
++
++	return huge_spte;
++}
+ 
+ u64 make_nonleaf_spte(u64 *child_pt, bool ad_disabled)
+ {
+diff --git a/arch/x86/kvm/mmu/spte.h b/arch/x86/kvm/mmu/spte.h
+index 4d2b700c26dd..3a4147345e03 100644
+--- a/arch/x86/kvm/mmu/spte.h
++++ b/arch/x86/kvm/mmu/spte.h
+@@ -506,6 +506,7 @@ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
+ 	       bool host_writable, u64 *new_spte);
+ u64 make_huge_page_split_spte(struct kvm *kvm, u64 huge_spte,
+ 		      	      union kvm_mmu_page_role role, int index);
++u64 make_huge_spte(struct kvm *kvm, u64 small_spte, int level);
+ u64 make_nonleaf_spte(u64 *child_pt, bool ad_disabled);
+ u64 make_mmio_spte(struct kvm_vcpu *vcpu, u64 gfn, unsigned int access);
+ u64 mark_spte_for_access_track(u64 spte);
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index 3bc486537b39..2b5d30190557 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -1552,15 +1552,43 @@ void kvm_tdp_mmu_clear_dirty_pt_masked(struct kvm *kvm,
+ 		clear_dirty_pt_masked(kvm, root, gfn, mask, wrprot);
+ }
+ 
+-static void zap_collapsible_spte_range(struct kvm *kvm,
+-				       struct kvm_mmu_page *root,
+-				       const struct kvm_memory_slot *slot)
++static int tdp_mmu_make_huge_spte(struct kvm *kvm,
++				  struct tdp_iter *parent,
++				  u64 *huge_spte)
++{
++	struct kvm_mmu_page *root = spte_to_child_sp(parent->old_spte);
++	gfn_t start = parent->gfn;
++	gfn_t end = start + KVM_PAGES_PER_HPAGE(parent->level);
++	struct tdp_iter iter;
++
++	tdp_root_for_each_leaf_pte(iter, root, start, end) {
++		/*
++		 * Use the parent iterator when checking for forward progress so
++		 * that KVM doesn't get stuck continuously trying to yield (i.e.
++		 * returning -EAGAIN here and then failing the forward progress
++		 * check in the caller ad nauseam).
++		 */
++		if (tdp_mmu_iter_need_resched(kvm, parent))
++			return -EAGAIN;
++
++		*huge_spte = make_huge_spte(kvm, iter.old_spte, parent->level);
++		return 0;
++	}
++
++	return -ENOENT;
++}
++
++static void recover_huge_pages_range(struct kvm *kvm,
++				     struct kvm_mmu_page *root,
++				     const struct kvm_memory_slot *slot)
+ {
+ 	gfn_t start = slot->base_gfn;
+ 	gfn_t end = start + slot->npages;
+ 	struct tdp_iter iter;
+ 	int max_mapping_level;
+ 	bool flush = false;
++	u64 huge_spte;
++	int r;
+ 
+ 	rcu_read_lock();
+ 
+@@ -1597,7 +1625,13 @@ static void zap_collapsible_spte_range(struct kvm *kvm,
+ 		if (max_mapping_level < iter.level)
+ 			continue;
+ 
+-		if (tdp_mmu_set_spte_atomic(kvm, &iter, SHADOW_NONPRESENT_VALUE))
++		r = tdp_mmu_make_huge_spte(kvm, &iter, &huge_spte);
++		if (r == -EAGAIN)
++			goto retry;
++		else if (r)
++			continue;
++
++		if (tdp_mmu_set_spte_atomic(kvm, &iter, huge_spte))
+ 			goto retry;
+ 
+ 		flush = true;
+@@ -1610,17 +1644,17 @@ static void zap_collapsible_spte_range(struct kvm *kvm,
+ }
+ 
+ /*
+- * Zap non-leaf SPTEs (and free their associated page tables) which could
+- * be replaced by huge pages, for GFNs within the slot.
++ * Recover huge page mappings within the slot by replacing non-leaf SPTEs with
++ * huge SPTEs where possible.
+  */
+-void kvm_tdp_mmu_zap_collapsible_sptes(struct kvm *kvm,
+-				       const struct kvm_memory_slot *slot)
++void kvm_tdp_mmu_recover_huge_pages(struct kvm *kvm,
++				    const struct kvm_memory_slot *slot)
+ {
+ 	struct kvm_mmu_page *root;
+ 
+ 	lockdep_assert_held_read(&kvm->mmu_lock);
+ 	for_each_valid_tdp_mmu_root_yield_safe(kvm, root, slot->as_id)
+-		zap_collapsible_spte_range(kvm, root, slot);
++		recover_huge_pages_range(kvm, root, slot);
+ }
+ 
+ /*
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.h b/arch/x86/kvm/mmu/tdp_mmu.h
+index d842bfe103ab..f03ca0dd13d9 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@ -40,8 +40,8 @@ void kvm_tdp_mmu_clear_dirty_pt_masked(struct kvm *kvm,
+ 				       struct kvm_memory_slot *slot,
+ 				       gfn_t gfn, unsigned long mask,
+ 				       bool wrprot);
+-void kvm_tdp_mmu_zap_collapsible_sptes(struct kvm *kvm,
+-				       const struct kvm_memory_slot *slot);
++void kvm_tdp_mmu_recover_huge_pages(struct kvm *kvm,
++				    const struct kvm_memory_slot *slot);
+ 
+ bool kvm_tdp_mmu_write_protect_gfn(struct kvm *kvm,
+ 				   struct kvm_memory_slot *slot, gfn_t gfn,
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 83fe0a78146f..8507b300ff43 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -13104,19 +13104,15 @@ static void kvm_mmu_slot_apply_flags(struct kvm *kvm,
+ 
+ 	if (!log_dirty_pages) {
+ 		/*
+-		 * Dirty logging tracks sptes in 4k granularity, meaning that
+-		 * large sptes have to be split.  If live migration succeeds,
+-		 * the guest in the source machine will be destroyed and large
+-		 * sptes will be created in the destination.  However, if the
+-		 * guest continues to run in the source machine (for example if
+-		 * live migration fails), small sptes will remain around and
+-		 * cause bad performance.
++		 * Recover huge page mappings in the slot now that dirty logging
++		 * is disabled, i.e. now that KVM does not have to track guest
++		 * writes at 4KiB granularity.
+ 		 *
+-		 * Scan sptes if dirty logging has been stopped, dropping those
+-		 * which can be collapsed into a single large-page spte.  Later
+-		 * page faults will create the large-page sptes.
++		 * Dirty logging might be disabled by userspace if an ongoing VM
++		 * live migration is cancelled and the VM must continue running
++		 * on the source.
+ 		 */
+-		kvm_mmu_zap_collapsible_sptes(kvm, new);
++		kvm_mmu_recover_huge_pages(kvm, new);
+ 	} else {
+ 		/*
+ 		 * Initially-all-set does not require write protecting any page,
+-- 
+2.43.0
+
