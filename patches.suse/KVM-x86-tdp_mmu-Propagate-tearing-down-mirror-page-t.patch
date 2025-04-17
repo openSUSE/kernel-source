@@ -1,0 +1,179 @@
+Patch-mainline: v6.14-rc1
+Git-commit: 94faba8999b95d86a2eba47d2d78925dc80f38ed
+References: jsc#PED-348
+From: Isaku Yamahata <isaku.yamahata@intel.com>
+Date: Thu, 18 Jul 2024 14:12:27 -0700
+Subject: [PATCH] KVM: x86/tdp_mmu: Propagate tearing down mirror page tables
+
+Integrate hooks for mirroring page table operations for cases where TDX
+will zap PTEs or free page tables.
+
+Like other Coco technologies, TDX has the concept of private and shared
+memory. For TDX the private and shared mappings are managed on separate
+EPT roots. The private half is managed indirectly though calls into a
+protected runtime environment called the TDX module, where the shared half
+is managed within KVM in normal page tables.
+
+Since calls into the TDX module are relatively slow, walking private page
+tables by making calls into the TDX module would not be efficient. Because
+of this, previous changes have taught the TDP MMU to keep a mirror root,
+which is separate, unmapped TDP root that private operations can be
+directed to. Currently this root is disconnected from the guest. Now add
+plumbing to propagate changes to the "external" page tables being
+mirrored. Just create the x86_ops for now, leave plumbing the operations
+into the TDX module for future patches.
+
+Add two operations for tearing down page tables, one for freeing page
+tables (free_external_spt) and one for zapping PTEs (remove_external_spte).
+Define them such that remove_external_spte will perform a TLB flush as
+well. (in TDX terms "ensure there are no active translations").
+
+TDX MMU support will exclude certain MMU operations, so only plug in the
+mirroring x86 ops where they will be needed. For zapping/freeing, only
+hook tdp_mmu_iter_set_spte() which is used for mapping and linking PTs.
+Don't bother hooking tdp_mmu_set_spte_atomic() as it is only used for
+zapping PTEs in operations unsupported by TDX: zapping collapsible PTEs and
+kvm_mmu_zap_all_fast().
+
+In previous changes to address races around concurrent populating using
+tdp_mmu_set_spte_atomic(), a solution was introduced to temporarily set
+FROZEN_SPTE in the mirrored page tables while performing the external
+operations. Such a solution is not needed for the tear down paths in TDX
+as these will always be performed with the mmu_lock held for write.
+Sprinkle some KVM_BUG_ON()s to reflect this.
+
+Signed-off-by: Isaku Yamahata <isaku.yamahata@intel.com>
+Co-developed-by: Kai Huang <kai.huang@intel.com>
+Signed-off-by: Kai Huang <kai.huang@intel.com>
+Co-developed-by: Yan Zhao <yan.y.zhao@intel.com>
+Signed-off-by: Yan Zhao <yan.y.zhao@intel.com>
+Co-developed-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Signed-off-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Message-ID: <20240718211230.1492011-16-rick.p.edgecombe@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/include/asm/kvm-x86-ops.h |  2 ++
+ arch/x86/include/asm/kvm_host.h    |  8 +++++
+ arch/x86/kvm/mmu/tdp_mmu.c         | 51 +++++++++++++++++++++++++++++-
+ 3 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/asm/kvm-x86-ops.h b/arch/x86/include/asm/kvm-x86-ops.h
+index dbbdaa8586ab..c82cd6635402 100644
+--- a/arch/x86/include/asm/kvm-x86-ops.h
++++ b/arch/x86/include/asm/kvm-x86-ops.h
+@@ -96,6 +96,8 @@ KVM_X86_OP_OPTIONAL_RET0(get_mt_mask)
+ KVM_X86_OP(load_mmu_pgd)
+ KVM_X86_OP_OPTIONAL(link_external_spt)
+ KVM_X86_OP_OPTIONAL(set_external_spte)
++KVM_X86_OP_OPTIONAL(free_external_spt)
++KVM_X86_OP_OPTIONAL(remove_external_spte)
+ KVM_X86_OP(has_wbinvd_exit)
+ KVM_X86_OP(get_l2_tsc_offset)
+ KVM_X86_OP(get_l2_tsc_multiplier)
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 809788b343bf..0dad81d7e988 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1766,6 +1766,14 @@ struct kvm_x86_ops {
+ 	int (*set_external_spte)(struct kvm *kvm, gfn_t gfn, enum pg_level level,
+ 				 kvm_pfn_t pfn_for_gfn);
+ 
++	/* Update external page tables for page table about to be freed. */
++	int (*free_external_spt)(struct kvm *kvm, gfn_t gfn, enum pg_level level,
++				 void *external_spt);
++
++	/* Update external page table from spte getting removed, and flush TLB. */
++	int (*remove_external_spte)(struct kvm *kvm, gfn_t gfn, enum pg_level level,
++				    kvm_pfn_t pfn_for_gfn);
++
+ 	bool (*has_wbinvd_exit)(void);
+ 
+ 	u64 (*get_l2_tsc_offset)(struct kvm_vcpu *vcpu);
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index 865b5805f929..7ebadc7f2640 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -340,6 +340,29 @@ static void tdp_mmu_unlink_sp(struct kvm *kvm, struct kvm_mmu_page *sp)
+ 	spin_unlock(&kvm->arch.tdp_mmu_pages_lock);
+ }
+ 
++static void remove_external_spte(struct kvm *kvm, gfn_t gfn, u64 old_spte,
++				 int level)
++{
++	kvm_pfn_t old_pfn = spte_to_pfn(old_spte);
++	int ret;
++
++	/*
++	 * External (TDX) SPTEs are limited to PG_LEVEL_4K, and external
++	 * PTs are removed in a special order, involving free_external_spt().
++	 * But remove_external_spte() will be called on non-leaf PTEs via
++	 * __tdp_mmu_zap_root(), so avoid the error the former would return
++	 * in this case.
++	 */
++	if (!is_last_spte(old_spte, level))
++		return;
++
++	/* Zapping leaf spte is allowed only when write lock is held. */
++	lockdep_assert_held_write(&kvm->mmu_lock);
++	/* Because write lock is held, operation should success. */
++	ret = static_call(kvm_x86_remove_external_spte)(kvm, gfn, level, old_pfn);
++	KVM_BUG_ON(ret, kvm);
++}
++
+ /**
+  * handle_removed_pt() - handle a page table removed from the TDP structure
+  *
+@@ -435,6 +458,23 @@ static void handle_removed_pt(struct kvm *kvm, tdp_ptep_t pt, bool shared)
+ 		}
+ 		handle_changed_spte(kvm, kvm_mmu_page_as_id(sp), gfn,
+ 				    old_spte, FROZEN_SPTE, level, shared);
++
++		if (is_mirror_sp(sp)) {
++			KVM_BUG_ON(shared, kvm);
++			remove_external_spte(kvm, gfn, old_spte, level);
++		}
++	}
++
++	if (is_mirror_sp(sp) &&
++	    WARN_ON(static_call(kvm_x86_free_external_spt)(kvm, base_gfn, sp->role.level,
++							  sp->external_spt))) {
++		/*
++		 * Failed to free page table page in mirror page table and
++		 * there is nothing to do further.
++		 * Intentionally leak the page to prevent the kernel from
++		 * accessing the encrypted page.
++		 */
++		sp->external_spt = NULL;
+ 	}
+ 
+ 	call_rcu(&sp->rcu_head, tdp_mmu_free_sp_rcu_callback);
+@@ -608,6 +648,13 @@ static inline int __must_check __tdp_mmu_set_spte_atomic(struct kvm *kvm,
+ 	if (is_mirror_sptep(iter->sptep) && !is_frozen_spte(new_spte)) {
+ 		int ret;
+ 
++		/*
++		 * Users of atomic zapping don't operate on mirror roots,
++		 * so don't handle it and bug the VM if it's seen.
++		 */
++		if (KVM_BUG_ON(!is_shadow_present_pte(new_spte), kvm))
++			return -EBUSY;
++
+ 		ret = set_external_spte_present(kvm, iter->sptep, iter->gfn,
+ 						iter->old_spte, new_spte, iter->level);
+ 		if (ret)
+@@ -700,8 +747,10 @@ static u64 tdp_mmu_set_spte(struct kvm *kvm, int as_id, tdp_ptep_t sptep,
+ 	 * Users that do non-atomic setting of PTEs don't operate on mirror
+ 	 * roots, so don't handle it and bug the VM if it's seen.
+ 	 */
+-	if (is_mirror_sptep(sptep))
++	if (is_mirror_sptep(sptep)) {
+ 		KVM_BUG_ON(is_shadow_present_pte(new_spte), kvm);
++		remove_external_spte(kvm, gfn, old_spte, level);
++	}
+ 
+ 	return old_spte;
+ }
+-- 
+2.43.0
+
