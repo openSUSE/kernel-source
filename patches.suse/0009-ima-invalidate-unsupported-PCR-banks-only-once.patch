@@ -1,0 +1,150 @@
+From 69985ba84315ee15b0cdfaee5383773b203abc7c Mon Sep 17 00:00:00 2001
+From: Nicolai Stange <nstange@suse.de>
+Date: Mon, 21 Apr 2025 16:41:26 +0200
+References: jsc#PED-12225
+Patch-mainline: Submitted, RFC v2 security ML 2025-03-23, about to submit v3
+Subject: [PATCH 9/9] ima: invalidate unsupported PCR banks only once
+
+As it currently stands, IMA would invalidate a PCR bank corresponding to
+an unsupported hash algorithm over and over again by extending it with
+0xfe ... fe for each measurement list entry recorded (for
+CONFIG_IMA_COMPAT_FALLBACK_TPM_EXTEND=n).
+
+This however, makes the problem of deciding from the PCR bank value
+whether or not the bank had been invalidated or not linear in the
+measurement list length: one would have to reproduce the potential
+invalidation extension sequence incrementally for each event recorded
+and compare whether the PCR bank value would match at any given point.
+
+From a soundness POV, the repeated invalidations are not needed: a single
+one would suffice to ensure no verifier would (wrongly) verify any
+measurement list against the invalidated PCR bank value.
+
+With only a single invalidation, an invalidated PCR bank value can get
+recognized easily in O(1) by comparing against
+HASH(0x00 ... 00 | fe ... fe), i.e. the value a PCR bank would have if
+invalidated once in its initial state.
+
+This would potentially help userspace tools such as ima-evm-utils
+ima_measurement ([1]) which might want to filter unmaintained PCR banks
+and also, it will enable the kernel to log some meaningful meassages when
+the set of supported hash algorithm differs between kernel instances in a
+kexec chain.
+
+Start out by invalidating unsupported PCR banks exactly once from each
+kernel in a kexec chain. Skipping re-invalidations from subsequent kernels
+in a kexec chain will be the subject of a future patch.
+
+Make IMA's crypto __init code to fill in a bitmask of banks with
+unsupported hash algorithms, ima_unsupported_pcr_banks_mask.
+ima_unsupported_pcr_banks_mask has been chosen to be of type unsigned
+long, with the expectation that it will be sufficient to represent all
+banks allocated on a TPM in practice -- note that 32 > the number of hash
+algorithm identifiers defined by the TCG. If not, the code would
+implictly fall back to re-invalidating "excess" banks over and over again,
+so it is always sound.
+
+Make ima_pcr_extend() to skip the extension of a PCR's unsupported banks
+in case the given PCR had not been extend before, as already tracked in
+the ima_extended_pcrs_mask introduced by a previous patch. That is,
+invalidate unsupported banks only once at any given PCR's first extension.
+
+Note that ima_extended_pcrs_mask is not retained across kernels in a
+kexec chain, so each booted kernel would re-invalidate the unsupported
+banks again. As said above, taking care of this as well will be handled
+in a separate patch.
+
+[1] https://github.com/linux-integrity/ima-evm-utils.git
+
+Signed-off-by: Nicolai Stange <nstange@suse.de>
+---
+ security/integrity/ima/ima.h        |    1 +
+ security/integrity/ima/ima_crypto.c |   21 +++++++++++++++++----
+ security/integrity/ima/ima_queue.c  |   18 +++++++++++++++++-
+ 3 files changed, 35 insertions(+), 5 deletions(-)
+
+--- a/security/integrity/ima/ima.h
++++ b/security/integrity/ima/ima.h
+@@ -62,6 +62,7 @@ extern int ima_sha1_idx __ro_after_init;
+ extern int ima_hash_algo_idx __ro_after_init;
+ extern int ima_extra_slots __ro_after_init;
+ extern struct ima_algo_desc *ima_algo_array __ro_after_init;
++extern unsigned long ima_unsupported_pcr_banks_mask __ro_after_init;
+ 
+ extern unsigned long ima_extended_pcrs_mask;
+ 
+--- a/security/integrity/ima/ima_crypto.c
++++ b/security/integrity/ima/ima_crypto.c
+@@ -67,6 +67,8 @@ int ima_extra_slots __ro_after_init;
+ 
+ struct ima_algo_desc *ima_algo_array __ro_after_init;
+ 
++unsigned long ima_unsupported_pcr_banks_mask __ro_after_init;
++
+ static int __init ima_init_ima_crypto(void)
+ {
+ 	long rc;
+@@ -184,6 +186,16 @@ int __init ima_init_crypto(void)
+ 		}
+ 	}
+ 
++	for (i = 0; i < NR_BANKS(ima_tpm_chip); i++) {
++		if (i >= BITS_PER_LONG) {
++			pr_warn("Too many TPM PCR banks, invalidation tracking capped");
++			break;
++		}
++
++		if (!ima_algo_array[i].tfm)
++			ima_unsupported_pcr_banks_mask |= BIT(i);
++	}
++
+ 	return 0;
+ #if IS_ENABLED(CONFIG_IMA_COMPAT_FALLBACK_TPM_EXTEND)
+ out_array:
+@@ -644,10 +656,11 @@ int ima_calc_field_array_hash(struct ima
+ 		 * padded SHA1 if backwards-compatibility fallback PCR
+ 		 * extension is enabled. Otherwise fill with
+ 		 * 0xfes. This is the value to invalidate unsupported
+-		 * PCR banks with. Also, a non-all-zeroes value serves
+-		 * as an indicator to kexec measurement restoration
+-		 * that the entry is not a violation and all its
+-		 * template digests need to get recomputed.
++		 * PCR banks with once at first use. Also, a
++		 * non-all-zeroes value serves as an indicator to
++		 * kexec measurement restoration that the entry is not
++		 * a violation and all its template digests need to
++		 * get recomputed.
+ 		 */
+ 		if (!ima_algo_array[i].tfm) {
+ #if IS_ENABLED(CONFIG_IMA_COMPAT_FALLBACK_TPM_EXTEND)
+--- a/security/integrity/ima/ima_queue.c
++++ b/security/integrity/ima/ima_queue.c
+@@ -143,11 +143,27 @@ unsigned long ima_get_binary_runtime_siz
+ static int ima_pcr_extend(struct tpm_digest *digests_arg, int pcr)
+ {
+ 	int result;
++	unsigned long pcr_banks_skip_mask;
+ 
+ 	if (!ima_tpm_chip)
+ 		return 0;
+ 
+-	result = tpm_pcr_extend(ima_tpm_chip, pcr, digests_arg, 0);
++#if !IS_ENABLED(CONFIG_IMA_COMPAT_FALLBACK_TPM_EXTEND)
++	pcr_banks_skip_mask = ima_unsupported_pcr_banks_mask;
++	if (!(ima_extended_pcrs_mask & BIT(pcr))) {
++		/*
++		 * Invalidate unsupported banks once upon a PCR's
++		 * first usage. Note that the digests_arg[] entries for
++		 * unsupported algorithms have been filled with 0xfes.
++		 */
++		pcr_banks_skip_mask = 0;
++	}
++#else
++	pcr_banks_skip_mask = 0;
++#endif
++
++	result = tpm_pcr_extend(ima_tpm_chip, pcr, digests_arg,
++				pcr_banks_skip_mask);
+ 	if (result != 0) {
+ 		pr_err("Error Communicating to TPM chip, result: %d\n", result);
+ 		return result;
