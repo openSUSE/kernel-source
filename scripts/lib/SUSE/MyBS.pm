@@ -620,7 +620,7 @@ sub create_project {
 	for my $attr (qw(build publish debuginfo)) {
 		$writer->startTag($attr);
 		$writer->emptyTag($options->{$attr} ? "enable" : "disable");
-		if ($attr =~ /^(publish|build)/) {
+		if ($attr =~ /^(publish)/) {
 			for my $repo (@qa_repos) {
 				$writer->emptyTag("disable", repository => $repo);
 			}
@@ -652,37 +652,51 @@ sub create_project {
 		my $separator = $qa_expr ? " || " : "";
 		$qa_expr .= $separator . '("%_repository" == "' . $repo . '")';
 	}
+	my $package = $options->{package};
+	# Keep compatibility with sources that use %is_kotd_qa hack
 	$prjconf .= "%is_kotd_qa ($qa_expr)\n";
 	$prjconf .= ":Macros\n";
+	$prjconf .= "BuildFlags: excludebuild:$package:kernel-obs-qa\n";
+	$prjconf .= "BuildFlags: excludebuild:kernel-obs-qa\n";
+	$prjconf .= "BuildFlags: nouseforbuild:$package:kernel-obs-build\n";
+	$prjconf .= "BuildFlags: nouseforbuild:kernel-obs-build\n";
 	my $specfiles = $options->{limit_packages} || [];
-	if (@$specfiles && $multibuild) {
+	if (@$specfiles) {
 		my %specfiles = map { $_ => 1 } @$specfiles;
-		my $package = $options->{package};
 		for my $spec (keys(%specfiles)) {
-			$spec = ($spec eq $package) ? $package : "$package:$spec";
+			$spec = ($spec eq $package || not $multibuild) ? $package : "$package:$spec";
 			$prjconf .= "BuildFlags: onlybuild:$spec\n";
 		}
 	}
+	$prjconf .= "%if " . "$qa_expr\n";
+	$prjconf .= "BuildFlags: !excludebuild:$package:kernel-obs-qa\n";
+	$prjconf .= "BuildFlags: !excludebuild:kernel-obs-qa\n";
+	if (@$specfiles) {
+		my %specfiles = map { $_ => 1 } @$specfiles;
+		for my $spec (keys(%specfiles)) {
+			$spec = ($spec eq $package || not $multibuild) ? $package : "$package:$spec";
+			$prjconf .= "BuildFlags: !onlybuild:$spec\n";
+		}
+	}
+	$prjconf .= "BuildFlags: onlybuild:$package:kernel-obs-qa\n";
+	$prjconf .= "BuildFlags: onlybuild:kernel-obs-qa\n";
+	$prjconf .= "BuildFlags: onlybuild:$package:kernel-obs-build\n";
+	$prjconf .= "BuildFlags: onlybuild:kernel-obs-build\n";
+	$prjconf .= "BuildFlags: !nouseforbuild:$package:kernel-obs-build\n";
+	$prjconf .= "BuildFlags: !nouseforbuild:kernel-obs-build\n";
+	$prjconf .= "%endif\n";
 	$self->put("/source/$project/_config", $prjconf);
 	return { name => $project, qa_repos => \@qa_repos };
 }
 
 sub create_package {
-	my ($self, $prj, $package, $qa_package, $qa_std_package) = @_;
+	my ($self, $prj, $package) = @_;
 
 	my $meta;
 	my $writer = XML::Writer->new(OUTPUT => \$meta);
 	$writer->startTag("package", project => $prj->{name}, name => $package);
 	$writer->dataElement("title", $package);
 	$writer->dataElement("description", "");
-	if ($qa_package) {
-		$writer->startTag("build");
-		$writer->emptyTag("disable") unless $qa_std_package;
-		for my $repo (@{$prj->{qa_repos} || []}) {
-			$writer->emptyTag("enable", repository => $repo);
-		}
-		$writer->endTag("build");
-	}
 	$writer->endTag("package");
 	$writer->end();
 
@@ -752,7 +766,7 @@ sub upload_package {
 		die "Project $project does not exist\n";
 	}
 	if (!$no_init) {
-		$self->create_package($prj, $package, $multibuild, 1);
+		$self->create_package($prj, $package);
 		&$progresscb('CREATE', "$project/$package");
 	}
 	# delete stale kernel-obs-build
@@ -813,7 +827,7 @@ sub upload_package {
 		for my $spec (keys(%specfiles)) {
 			next if $remove_packages{$spec};
 			next if $spec eq $package;
-			$self->create_package($prj, $spec, ($spec =~ /^kernel-obs-(qa|build)/));
+			$self->create_package($prj, $spec);
 			$self->put("/source/$project/$spec/_link", $link_xml);
 			&$progresscb('LINK', "$project/$spec");
 			delete($links{$spec});
