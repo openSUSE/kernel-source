@@ -1,0 +1,144 @@
+Date: Thu Apr 17 06:33:23 PM UTC 2025
+From: Enzo Matsumiya <ematsumiya@suse.de>
+Subject: smb: client: fix folio leaks and perf improvements
+References: bsc#1239997, bsc1241265
+Patch-mainline: Never, upstream fix is in different module (netfs)
+
+This patch fixes several problems during writes, namely:
+1. hammering the server with write requests without throttling down
+2. (which leads to) imbalanced pagecache (too many dirty pages, few writebacks, or vice-versa)
+3. (which eventually leads to) folio leaks
+4. (which finally leads to) hangs when accessing files on the share
+
+An upstream fix [0] for #2 and #3 was embedded as part of this patch.
+
+For #1: when the server network/storage can't keep up with too many write requests, it starts
+returning responses with STATUS_PENDING.
+Currently, cifs doesn't handle such responses and will retry the write operation, which is wrong
+because the data has already been sent to the server, so this generates even more unnecessary
+traffic to an already overloaded server.  A follow up patch will address this properly.
+
+For now, use balance_dirty_pages_ratelimited().  This function (mm) is now called whenever a
+folio/page is dirtied (cifs_dirty_folio).  This might look excessive, but it's practically a no-op
+most of the time -- it will only trigger its balance mechanism based on internal heuristics that
+takes into account system-wide memory usage.
+
+The balance mechanism will, at first, start writeback on dirty pages when necessary.
+If the amount of dirty memory gets above the ratelimit (dynamically defined per-task), it will
+throttle the amount of new dirty pages for that task and will force the writeback on the existing
+ones.
+
+Being per-task provides fairness to the rest of the system as it prevents a single task of eating up
+alone the whole pagecache.
+
+Fix for #4 is actually a combination of all above.  The hang happens because pages-to-write starts
+accumulating in the pagecache, the server can't keep up with the writes and starts returning
+STATUS_PENDING, which is interpreted as a retryable error by cifs, which in turn will redirty those
+pages, and so on and so on.
+
+At some point, most SMB servers will abort the connection.  Upon reconnect, even though pagecache
+data might still exist, the surrounding cifs structs that enclosed them are gone/closed, so it can't
+pick it up again from where it got interrupted.
+
+To fix this, when there's an error sending write data AND the server is about to reconnect, treat it
+as a retryable error so there's no data loss.
+(this shouldn't be needed anymore when the STATUS_PENDING handling patch is implemented)
+
+[0] https://lists.linaro.org/archives/list/linux-stable-mirror@lists.linaro.org/message/FY4GYKLWIMQKGPI4CDDANZH2AFIK6NM4/
+
+Signed-off-by: Enzo Matsumiya <ematsumiya@suse.de>
+---
+ fs/smb/client/file.c    |   25 +++++++++++++++++++++----
+ fs/smb/client/smb2pdu.c |    7 +++++++
+ 2 files changed, 28 insertions(+), 4 deletions(-)
+
+--- a/fs/smb/client/file.c
++++ b/fs/smb/client/file.c
+@@ -2884,17 +2884,21 @@
+ 	rc = cifs_get_writable_file(CIFS_I(inode), FIND_WR_ANY, &cfile);
+ 	if (rc) {
+ 		cifs_dbg(VFS, "No writable handle in writepages rc=%d\n", rc);
++		folio_unlock(folio);
+ 		goto err_xid;
+ 	}
+ 
+ 	rc = server->ops->wait_mtu_credits(server, cifs_sb->ctx->wsize,
+ 					   &wsize, credits);
+-	if (rc != 0)
++	if (rc != 0) {
++		folio_unlock(folio);
+ 		goto err_close;
++	}
+ 
+ 	wdata = cifs_writedata_alloc(cifs_writev_complete);
+ 	if (!wdata) {
+ 		rc = -ENOMEM;
++		folio_unlock(folio);
+ 		goto err_uncredit;
+ 	}
+ 
+@@ -3042,17 +3046,22 @@
+ lock_again:
+ 	if (wbc->sync_mode != WB_SYNC_NONE) {
+ 		ret = folio_lock_killable(folio);
+-		if (ret < 0)
++		if (ret < 0) {
++			folio_put(folio);
+ 			return ret;
++		}
+ 	} else {
+-		if (!folio_trylock(folio))
++		if (!folio_trylock(folio)) {
++			folio_put(folio);
+ 			goto search_again;
++		}
+ 	}
+ 
+ 	if (folio->mapping != mapping ||
+ 	    !folio_test_dirty(folio)) {
+ 		start += folio_size(folio);
+ 		folio_unlock(folio);
++		folio_put(folio);
+ 		goto search_again;
+ 	}
+ 
+@@ -3082,6 +3091,7 @@
+ out:
+ 	if (ret > 0)
+ 		*_start = start + ret;
++	folio_put(folio);
+ 	return ret;
+ }
+ 
+@@ -5206,7 +5216,14 @@
+ 					cifs_inode_cookie(mapping->host));
+ }
+ #else
+-#define cifs_dirty_folio filemap_dirty_folio
++static bool cifs_dirty_folio(struct address_space *mapping, struct folio *folio)
++{
++	bool ret = filemap_dirty_folio(mapping, folio);
++
++	balance_dirty_pages_ratelimited(mapping);
++
++	return ret;
++}
+ #endif
+ 
+ const struct address_space_operations cifs_addr_ops = {
+--- a/fs/smb/client/smb2pdu.c
++++ b/fs/smb/client/smb2pdu.c
+@@ -4792,6 +4792,13 @@
+ 				     rc);
+ 		kref_put(&wdata->refcount, release);
+ 		cifs_stats_fail_inc(tcon, SMB2_WRITE_HE);
++
++		/*
++		 * If the server is going to reconnect, we must return a retryable error so we don't
++		 * lose/discard data by ensuring it gets sent again.
++		 */
++		if (server->tcpStatus != CifsExiting)
++			rc = -EAGAIN;
+ 	}
+ 
+ async_writev_out:
