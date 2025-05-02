@@ -5,8 +5,8 @@ import re
 from . import patch
 from io import StringIO
 
-diffstart = re.compile("^(---|\*\*\*|Index:|\+\+\+)[ \t][^ \t]\S+/|^diff -")
-tag_regex = re.compile("(\S+):[ \t]*(.*)")
+diffstart = re.compile(r"^(---|\*\*\*|Index:|\+\+\+)[ \t][^ \t]\S+/|^diff -")
+tag_regex = re.compile(r"(\S+):[ \t]*(.*)")
 
 tag_map = {
     'Patch-mainline' : {
@@ -16,12 +16,12 @@ tag_map = {
             {
                 # In mainline repo, tagged for release
                 'name' : 'Version',
-                'match': 'v?(\d+\.)+\d+(-rc\d+)?\s*$',
+                'match': r'v?(\d+\.)+\d+(-rc\d+)?\s*$',
                 'requires' : [ 'Git-commit' ],
                 'excludes' : [ 'Git-repo' ],
             }, {    # In mainline repo but not tagged yet
                 'name' : 'Version',
-                'match': 'v?(\d+\.)+\d+(-rc\d+)?\s+or\s+v?(\d+\.)+\d+(-rc\d+)?\s+\(next release\)\s*$',
+                'match': r'v?(\d+\.)+\d+(-rc\d+)?\s+or\s+v?(\d+\.)+\d+(-rc\d+)?\s+\(next release\)\s*$',
                 'requires' : [ 'Git-commit' ],
                 'excludes' : [ 'Git-repo' ],
             }, {
@@ -32,13 +32,13 @@ tag_map = {
             }, {
                 # Depends on another non-upstream patch
                 'name' : 'Depends',
-                'match' : 'Depends on\s+.+',
+                'match' : r'Depends on\s+.+',
                 'excludes' : [ 'Git-commit', 'Git-repo' ],
             }, {
                 # No, typically used for patches that have review issues
                 # but are not fundamentally rejected
                 'name' : 'No',
-                'match' : 'No,?\s+.+',
+                'match' : r'No,?\s+.+',
                 'excludes' : [ 'Git-commit', 'Git-repo' ],
                 'error' : "Please use 'Not yet' or 'Never'",
             }, {
@@ -48,38 +48,38 @@ tag_map = {
                 # inappropriate for upstream inclusion (packaging, kABI,
                 # SLES-only feature.)
                 'name' : 'Never',
-                'match' : 'Never,?\s+.+',
+                'match' : r'Never,?\s+.+',
                 'excludes' : [ 'Git-commit', 'Git-repo' ],
             }, {
                 # Submitted upstream.  Description should provide either
                 # a date and a mailing list or a URL to an archived post.
                 'name' : 'Submitted',
-                'match' : 'Submitted,?\s+.+',
+                'match' : r'Submitted,?\s+.+',
                 'excludes' : [ 'Git-commit', 'Git-repo' ],
             }, {
                 # Catch a frequent misuse of 'Not yet'.
-                'match' : 'Not yet,\s+submitted',
+                'match' : r'Not yet,\s+submitted',
                 'error' : "Please use 'Submitted'",
                 'excludes' : [ 'Git-commit', 'Git-repo' ],
             }, {
                 # Should be used rarely.  Description should provide
                 # reason for the patch not being accepted upstream.
                 'name' : 'Not yet',
-                'match' : 'Not yet,?\s+.+',
+                'match' : r'Not yet,?\s+.+',
                 'excludes' : [ 'Git-commit', 'Git-repo' ],
             }, {
-                'match' : 'Submitted\s*$',
+                'match' : r'Submitted\s*$',
                 'error' : 'Requires a description: <date> <list> or <url>',
                 'excludes' : [ 'Git-commit', 'Git-repo' ],
             }, {
-                'match' : 'Yes\s+$',
+                'match' : r'Yes\s+$',
                 'error' : 'Exact version required',
             }, {
-                'match' : 'Yes.*(\d+\.)+\d+',
+                'match' : r'Yes.*(\d+\.)+\d+',
                 'error' : '`Yes\' keyword is invalid',
                 'excludes' : [ 'Git-commit', 'Git-repo' ],
             }, {
-                'match' : '(Never|Not yet|No)\s*$',
+                'match' : r'(Never|Not yet|No)\s*$',
                 'error' : 'Requires a reason',
                 'excludes' : [ 'Git-commit', 'Git-repo' ],
             },
@@ -92,7 +92,7 @@ tag_map = {
         'accepted' : [
             {
                 # 40-character SHA1 hash with optional partial tag
-                'match' : '([0-9a-fA-F]){40}(\s+\(partial\))?',
+                'match' : r'([0-9a-fA-F]){40}(\s+\(partial\))?',
             }
         ],
         'requires_any' : [ 'Patch-mainline:Version', 'Patch-mainline:Queued' ],
@@ -123,7 +123,7 @@ tag_map = {
         'accepted' : [
             {
                 'name' : 'SUSE',
-                'match' : '.*@suse\.(com|de|cz)',
+                'match' : r'.*@suse\.(com|de|cz)',
             },
             {
                 'match' : '.*',
@@ -135,7 +135,7 @@ tag_map = {
         'accepted' : [
             {
                 'name' : 'SUSE',
-                'match' : '.*@suse\.(com|de|cz)',
+                'match' : r'.*@suse\.(com|de|cz)',
             },
             {
                 'match' : '.*',
@@ -147,7 +147,7 @@ tag_map = {
         'accepted' : [
             {
                 'name' : 'SUSE',
-                'match' : '.*@suse\.(com|de|cz)',
+                'match' : r'.*@suse\.(com|de|cz)',
             },
             {
                 'match' : '.*',
@@ -160,7 +160,7 @@ tag_map = {
         'accepted' : [
             {
                 'name' : 'SUSE',
-                'match' : '.*@suse\.(com|de|cz)',
+                'match' : r'.*@suse\.(com|de|cz)',
             },
             {
                 'match' : '.*',
@@ -171,7 +171,7 @@ tag_map = {
         'required' : True,
         'accepted' :  [
             {
-                'match' : '\S+',
+                'match' : r'\S+',
             },
         ],
     },
@@ -182,10 +182,10 @@ tag_map = {
         'accepted' : [
             {
                 'name' : 'SUSE',
-                'match' : '((bsc|boo|bnc|fate)#\d+|jsc#\w+-\d+)',
+                'match' : r'((bsc|boo|bnc|fate)#\d+|jsc#\w+-\d+)',
             },
             {
-                'match' : '\S+',
+                'match' : r'\S+',
             },
         ],
         'error' : "must contain list of references",
@@ -355,7 +355,7 @@ class HeaderChecker(patch.PatchChecker):
                 if tag.name not in tag_map:
                     continue;
 
-                if re.match("\s*$", tag.value):
+                if re.match(r"\s*$", tag.value):
                     self.errors.append(EmptyTagError(tag.name))
                     continue
 

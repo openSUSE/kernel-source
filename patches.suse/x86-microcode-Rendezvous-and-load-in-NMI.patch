@@ -1,0 +1,220 @@
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Mon, 2 Oct 2023 14:00:05 +0200
+Subject: x86/microcode: Rendezvous and load in NMI
+Git-commit: 7eb314a22800457396f541c655697dabd71e44a7
+Patch-mainline: v6.7-rc1
+References: git-fixes
+
+stop_machine() does not prevent the spin-waiting sibling from handling
+an NMI, which is obviously violating the whole concept of rendezvous.
+
+Implement a static branch right in the beginning of the NMI handler
+which is nopped out except when enabled by the late loading mechanism.
+
+The late loader enables the static branch before stop_machine() is
+invoked. Each CPU has an nmi_enable in its control structure which
+indicates whether the CPU should go into the update routine.
+
+This is required to bridge the gap between enabling the branch and
+actually being at the point where it is required to enter the loader
+wait loop.
+
+Each CPU which arrives in the stopper thread function sets that flag and
+issues a self NMI right after that. If the NMI function sees the flag
+clear, it returns. If it's set it clears the flag and enters the
+rendezvous.
+
+This is safe against a real NMI which hits in between setting the flag
+and sending the NMI to itself. The real NMI will be swallowed by the
+microcode update and the self NMI will then let stuff continue.
+Otherwise this would end up with a spurious NMI.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Link: https://lore.kernel.org/r/20231002115903.489900814@linutronix.de
+
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/include/asm/microcode.h         | 12 +++++++++
+ arch/x86/kernel/cpu/microcode/core.c     | 42 +++++++++++++++++++++++++++++---
+ arch/x86/kernel/cpu/microcode/intel.c    |  1 +
+ arch/x86/kernel/cpu/microcode/internal.h |  3 ++-
+ arch/x86/kernel/nmi.c                    |  4 +++
+ 5 files changed, 57 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/include/asm/microcode.h b/arch/x86/include/asm/microcode.h
+index 78f1eb2532dc..82924828a94b 100644
+--- a/arch/x86/include/asm/microcode.h
++++ b/arch/x86/include/asm/microcode.h
+@@ -72,4 +72,16 @@ static inline u32 intel_get_microcode_revision(void)
+ }
+ #endif /* !CONFIG_CPU_SUP_INTEL */
+ 
++bool microcode_nmi_handler(void);
++
++#ifdef CONFIG_MICROCODE_LATE_LOADING
++DECLARE_STATIC_KEY_FALSE(microcode_nmi_handler_enable);
++static __always_inline bool microcode_nmi_handler_enabled(void)
++{
++	return static_branch_unlikely(&microcode_nmi_handler_enable);
++}
++#else
++static __always_inline bool microcode_nmi_handler_enabled(void) { return false; }
++#endif
++
+ #endif /* _ASM_X86_MICROCODE_H */
+diff --git a/arch/x86/kernel/cpu/microcode/core.c b/arch/x86/kernel/cpu/microcode/core.c
+index 1c2710b7db6d..7b8ade552b55 100644
+--- a/arch/x86/kernel/cpu/microcode/core.c
++++ b/arch/x86/kernel/cpu/microcode/core.c
+@@ -23,6 +23,7 @@
+ #include <linux/miscdevice.h>
+ #include <linux/capability.h>
+ #include <linux/firmware.h>
++#include <linux/cpumask.h>
+ #include <linux/kernel.h>
+ #include <linux/delay.h>
+ #include <linux/mutex.h>
+@@ -31,6 +32,7 @@
+ #include <linux/fs.h>
+ #include <linux/mm.h>
+ 
++#include <asm/apic.h>
+ #include <asm/cpu_device_id.h>
+ #include <asm/perf_event.h>
+ #include <asm/processor.h>
+@@ -265,8 +267,10 @@ struct microcode_ctrl {
+ 	enum sibling_ctrl	ctrl;
+ 	enum ucode_state	result;
+ 	unsigned int		ctrl_cpu;
++	bool			nmi_enabled;
+ };
+ 
++DEFINE_STATIC_KEY_FALSE(microcode_nmi_handler_enable);
+ static DEFINE_PER_CPU(struct microcode_ctrl, ucode_ctrl);
+ static atomic_t late_cpus_in;
+ 
+@@ -282,7 +286,8 @@ static bool wait_for_cpus(atomic_t *cnt)
+ 
+ 		udelay(1);
+ 
+-		if (!(timeout % USEC_PER_MSEC))
++		/* If invoked directly, tickle the NMI watchdog */
++		if (!microcode_ops->use_nmi && !(timeout % USEC_PER_MSEC))
+ 			touch_nmi_watchdog();
+ 	}
+ 	/* Prevent the late comers from making progress and let them time out */
+@@ -298,7 +303,8 @@ static bool wait_for_ctrl(void)
+ 		if (this_cpu_read(ucode_ctrl.ctrl) != SCTRL_WAIT)
+ 			return true;
+ 		udelay(1);
+-		if (!(timeout % 1000))
++		/* If invoked directly, tickle the NMI watchdog */
++		if (!microcode_ops->use_nmi && !(timeout % 1000))
+ 			touch_nmi_watchdog();
+ 	}
+ 	return false;
+@@ -374,7 +380,7 @@ static void load_primary(unsigned int cpu)
+ 	}
+ }
+ 
+-static int load_cpus_stopped(void *unused)
++static bool microcode_update_handler(void)
+ {
+ 	unsigned int cpu = smp_processor_id();
+ 
+@@ -383,7 +389,29 @@ static int load_cpus_stopped(void *unused)
+ 	else
+ 		load_secondary(cpu);
+ 
+-	/* No point to wait here. The CPUs will all wait in stop_machine(). */
++	touch_nmi_watchdog();
++	return true;
++}
++
++bool microcode_nmi_handler(void)
++{
++	if (!this_cpu_read(ucode_ctrl.nmi_enabled))
++		return false;
++
++	this_cpu_write(ucode_ctrl.nmi_enabled, false);
++	return microcode_update_handler();
++}
++
++static int load_cpus_stopped(void *unused)
++{
++	if (microcode_ops->use_nmi) {
++		/* Enable the NMI handler and raise NMI */
++		this_cpu_write(ucode_ctrl.nmi_enabled, true);
++		apic->send_IPI(smp_processor_id(), NMI_VECTOR);
++	} else {
++		/* Just invoke the handler directly */
++		microcode_update_handler();
++	}
+ 	return 0;
+ }
+ 
+@@ -404,8 +432,14 @@ static int load_late_stop_cpus(void)
+ 	 */
+ 	store_cpu_caps(&prev_info);
+ 
++	if (microcode_ops->use_nmi)
++		static_branch_enable_cpuslocked(&microcode_nmi_handler_enable);
++
+ 	stop_machine_cpuslocked(load_cpus_stopped, NULL, cpu_online_mask);
+ 
++	if (microcode_ops->use_nmi)
++		static_branch_disable_cpuslocked(&microcode_nmi_handler_enable);
++
+ 	/* Analyze the results */
+ 	for_each_cpu_and(cpu, cpu_present_mask, &cpus_booted_once_mask) {
+ 		switch (per_cpu(ucode_ctrl.result, cpu)) {
+diff --git a/arch/x86/kernel/cpu/microcode/intel.c b/arch/x86/kernel/cpu/microcode/intel.c
+index e5c5ddfd6831..905ed3b557fb 100644
+--- a/arch/x86/kernel/cpu/microcode/intel.c
++++ b/arch/x86/kernel/cpu/microcode/intel.c
+@@ -611,6 +611,7 @@ static struct microcode_ops microcode_intel_ops = {
+ 	.collect_cpu_info	= collect_cpu_info,
+ 	.apply_microcode	= apply_microcode_late,
+ 	.finalize_late_load	= finalize_late_load,
++	.use_nmi		= IS_ENABLED(CONFIG_X86_64),
+ };
+ 
+ static __init void calc_llc_size_per_core(struct cpuinfo_x86 *c)
+diff --git a/arch/x86/kernel/cpu/microcode/internal.h b/arch/x86/kernel/cpu/microcode/internal.h
+index c6990431b5de..627d23809b89 100644
+--- a/arch/x86/kernel/cpu/microcode/internal.h
++++ b/arch/x86/kernel/cpu/microcode/internal.h
+@@ -31,7 +31,8 @@ struct microcode_ops {
+ 	enum ucode_state	(*apply_microcode)(int cpu);
+ 	int			(*collect_cpu_info)(int cpu, struct cpu_signature *csig);
+ 	void			(*finalize_late_load)(int result);
+-	unsigned int		nmi_safe	: 1;
++	unsigned int		nmi_safe	: 1,
++				use_nmi		: 1;
+ };
+ 
+ extern struct ucode_cpu_info ucode_cpu_info[];
+diff --git a/arch/x86/kernel/nmi.c b/arch/x86/kernel/nmi.c
+index a0c551846b35..a87d856a3808 100644
+--- a/arch/x86/kernel/nmi.c
++++ b/arch/x86/kernel/nmi.c
+@@ -33,6 +33,7 @@
+ #include <asm/reboot.h>
+ #include <asm/cache.h>
+ #include <asm/nospec-branch.h>
++#include <asm/microcode.h>
+ #include <asm/sev.h>
+ 
+ #define CREATE_TRACE_POINTS
+@@ -343,6 +344,9 @@ static noinstr void default_do_nmi(struct pt_regs *regs)
+ 
+ 	instrumentation_begin();
+ 
++	if (microcode_nmi_handler_enabled() && microcode_nmi_handler())
++		goto out;
++
+ 	handled = nmi_handle(NMI_LOCAL, regs);
+ 	__this_cpu_add(nmi_stats.normal, handled);
+ 	if (handled) {
+
