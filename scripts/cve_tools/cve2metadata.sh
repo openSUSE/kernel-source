@@ -18,7 +18,8 @@ then
 	export CVEKERNELTREE=$LINUX_GIT
 fi
 
-. scripts/common-functions
+[ -z "$KSOURCE_GIT" ] && KSOURCE_GIT="."
+. $KSOURCE_GIT/scripts/common-functions
 
 while [ $# -gt 0 ]
 do
