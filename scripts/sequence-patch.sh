@@ -27,13 +27,7 @@ source $(dirname $0)/wd-functions.sh
 
 set -o pipefail
 
-have_arch_patches=false
 fuzz="-F0"
-case "$IBS_PROJECT" in
-SUSE:SLE-9*)
-	fuzz=
-	have_arch_patches=true
-esac
 
 usage() {
     cat <<END
@@ -210,12 +204,7 @@ show_skipped() {
 # Allow to pass in default arguments via SEQUENCE_PATCH_ARGS.
 set -- $SEQUENCE_PATCH_ARGS "$@"
 
-if $have_arch_patches; then
-	arch_opt="arch:"
-else
-	arch_opt=""
-fi
-options="$(getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,rapid,vanilla,fuzz:,patch-dir:,build-dir:,config:,kabi,ctags,cscope,etags,skip-reverse,dry-run,signing-key: -- "$@")"
+options="$(getopt -o qvd:F: --long quilt,no-quilt,symbol:,dir:,combine,fast,rapid,vanilla,fuzz:,patch-dir:,build-dir:,config:,kabi,ctags,cscope,etags,skip-reverse,dry-run,signing-key: -- "$@")"
 
 if [ $? -ne 0 ]
 then
@@ -437,29 +426,6 @@ PATCH_LOG=$SCRATCH_AREA/patch-$SRCVERSION${TAG:+-$TAG}.log
 if [ ! -r series.conf ]; then
     echo "Configuration file \`series.conf' not found"
     exit 1
-fi
-if $have_arch_patches; then
-    if [ -z "$ARCH_SYMBOLS" ]; then
-        if [ -x ./arch-symbols ]; then
-            ARCH_SYMBOLS=./arch-symbols
-        elif [ -x scripts/arch-symbols ]; then
-            ARCH_SYMBOLS=scripts/arch-symbols
-        else
-            echo "Cannot locate \`arch-symbols' script (export ARCH_SYMBOLS)"
-            exit 1
-        fi
-    else
-        if [ ! -x "$ARCH_SYMBOLS" ]; then
-            echo "Cannot execute \`arch-symbols' script"
-            exit 1
-        fi
-    fi
-    SYMBOLS=$($ARCH_SYMBOLS)
-    if [ -z "$SYMBOLS" ]; then
-        echo "Unsupported architecture \`$ARCH'" >&2
-        exit 1
-    fi
-echo "Architecture symbol(s): $SYMBOLS"
 fi
 
 if [ -s extra-symbols ]; then

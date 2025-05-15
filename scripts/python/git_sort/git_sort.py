@@ -487,7 +487,7 @@ class IndexedCommit(object):
 
 
 class SortIndex(object):
-    version_match = re.compile("refs/tags/v(2\.6\.\d+|\d\.\d+)(-rc\d+)?$")
+    version_match = re.compile(r"refs/tags/v(2\.6\.\d+|\d\.\d+)(-rc\d+)?$")
 
 
     def __init__(self, repo):
@@ -575,7 +575,7 @@ class SortIndex(object):
         i = bisect.bisect_left(indexes, index)
         if i == len(tags):
             # not yet part of a tagged release
-            m = re.search("v([0-9]+)\.([0-9]+)(|-rc([0-9]+))$", tags[-1])
+            m = re.search(r"v([0-9]+)\.([0-9]+)(|-rc([0-9]+))$", tags[-1])
             if m:
                 # Post-release commit with no rc, it'll be rc1
                 if m.group(3) == "":
