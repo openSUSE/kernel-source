@@ -1,0 +1,255 @@
+From: "Mike Rapoport (Microsoft)" <rppt@kernel.org>
+Date: Sun, 26 Jan 2025 09:47:30 +0200
+Subject: module: switch to execmem API for remapping as RW and restoring ROX
+Git-commit: c287c072332905b7d878a8aade86cfef6b396343
+Patch-mainline: v6.15-rc1
+References: git-fixes
+
+Instead of using writable copy for module text sections, temporarily remap
+the memory allocated from execmem's ROX cache as writable and restore its
+ROX permissions after the module is formed.
+
+This will allow removing nasty games with writable copy in alternatives
+patching on x86.
+
+Signed-off-by: "Mike Rapoport (Microsoft)" <rppt@kernel.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20250126074733.1384926-7-rppt@kernel.org
+
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ include/linux/module.h       |    7 ----
+ include/linux/moduleloader.h |    4 --
+ kernel/module/main.c         |   75 ++++++++++++-------------------------------
+ kernel/module/strict_rwx.c   |    9 ++---
+ 4 files changed, 27 insertions(+), 68 deletions(-)
+
+--- a/include/linux/module.h
++++ b/include/linux/module.h
+@@ -367,7 +367,6 @@ enum mod_mem_type {
+ 
+ struct module_memory {
+ 	void *base;
+-	void *rw_copy;
+ 	bool is_rox;
+ 	unsigned int size;
+ 
+@@ -769,14 +768,10 @@ static inline bool is_livepatch_module(s
+ 
+ void set_module_sig_enforced(void);
+ 
+-void *__module_writable_address(struct module *mod, void *loc);
+ 
+ static inline void *module_writable_address(struct module *mod, void *loc)
+ {
+-	if (!IS_ENABLED(CONFIG_ARCH_HAS_EXECMEM_ROX) || !mod ||
+-	    mod->state != MODULE_STATE_UNFORMED)
+-		return loc;
+-	return __module_writable_address(mod, loc);
++	return loc;
+ }
+ 
+ #else /* !CONFIG_MODULES... */
+--- a/include/linux/moduleloader.h
++++ b/include/linux/moduleloader.h
+@@ -108,10 +108,6 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 		    const Elf_Shdr *sechdrs,
+ 		    struct module *mod);
+ 
+-int module_post_finalize(const Elf_Ehdr *hdr,
+-			 const Elf_Shdr *sechdrs,
+-			 struct module *mod);
+-
+ #ifdef CONFIG_MODULES
+ void flush_module_init_free_work(void);
+ #else
+--- a/kernel/module/main.c
++++ b/kernel/module/main.c
+@@ -1189,18 +1189,6 @@ void __weak module_arch_freeing_init(str
+ {
+ }
+ 
+-void *__module_writable_address(struct module *mod, void *loc)
+-{
+-	for_class_mod_mem_type(type, text) {
+-		struct module_memory *mem = &mod->mem[type];
+-
+-		if (loc >= mem->base && loc < mem->base + mem->size)
+-			return loc + (mem->rw_copy - mem->base);
+-	}
+-
+-	return loc;
+-}
+-
+ static int module_memory_alloc(struct module *mod, enum mod_mem_type type)
+ {
+ 	unsigned int size = PAGE_ALIGN(mod->mem[type].size);
+@@ -1218,21 +1206,15 @@ static int module_memory_alloc(struct mo
+ 	if (!ptr)
+ 		return -ENOMEM;
+ 
+-	mod->mem[type].base = ptr;
+-
+ 	if (execmem_is_rox(execmem_type)) {
+-		ptr = vzalloc(size);
++		int err = execmem_make_temp_rw(ptr, size);
+ 
+-		if (!ptr) {
+-			execmem_free(mod->mem[type].base);
++		if (err) {
++			execmem_free(ptr);
+ 			return -ENOMEM;
+ 		}
+ 
+-		mod->mem[type].rw_copy = ptr;
+ 		mod->mem[type].is_rox = true;
+-	} else {
+-		mod->mem[type].rw_copy = mod->mem[type].base;
+-		memset(mod->mem[type].base, 0, size);
+ 	}
+ 
+ 	/*
+@@ -1248,18 +1230,28 @@ static int module_memory_alloc(struct mo
+ 	 */
+ 	kmemleak_not_leak(ptr);
+ 
++	memset(ptr, 0, size);
++	mod->mem[type].base = ptr;
++
+ 	return 0;
+ }
+ 
++static void module_memory_restore_rox(struct module *mod)
++{
++	for_class_mod_mem_type(type, text) {
++		struct module_memory *mem = &mod->mem[type];
++
++		if (mem->is_rox)
++			execmem_restore_rox(mem->base, mem->size);
++	}
++}
++
+ static void module_memory_free(struct module *mod, enum mod_mem_type type,
+ 			       bool unload_codetags)
+ {
+ 	struct module_memory *mem = &mod->mem[type];
+ 	void *ptr = mem->base;
+ 
+-	if (mem->is_rox)
+-		vfree(mem->rw_copy);
+-
+ 	if (!unload_codetags && mod_mem_type_is_core_data(type))
+ 		return;
+ 
+@@ -2281,7 +2273,6 @@ static int move_module(struct module *mo
+ 	for_each_mod_mem_type(type) {
+ 		if (!mod->mem[type].size) {
+ 			mod->mem[type].base = NULL;
+-			mod->mem[type].rw_copy = NULL;
+ 			continue;
+ 		}
+ 
+@@ -2305,7 +2296,7 @@ static int move_module(struct module *mo
+ 			continue;
+ 
+ 		addr = (unsigned long)mod->mem[type].base + offset;
+-		dest = mod->mem[type].rw_copy + offset;
++		dest = mod->mem[type].base + offset;
+ 
+ 		if (shdr->sh_type != SHT_NOBITS) {
+ 			/*
+@@ -2327,13 +2318,14 @@ static int move_module(struct module *mo
+ 		 * users of info can keep taking advantage and using the newly
+ 		 * minted official memory area.
+ 		 */
+-		shdr->sh_addr = addr;
++		shdr->sh_addr = (unsigned long)dest;
+ 		pr_debug("\t0x%lx 0x%.8lx %s\n", (long)shdr->sh_addr,
+ 			 (long)shdr->sh_size, info->secstrings + shdr->sh_name);
+ 	}
+ 
+ 	return 0;
+ out_enomem:
++	module_memory_restore_rox(mod);
+ 	for (t--; t >= 0; t--)
+ 		module_memory_free(mod, t, true);
+ 	return ret;
+@@ -2475,17 +2467,8 @@ int __weak module_finalize(const Elf_Ehd
+ 	return 0;
+ }
+ 
+-int __weak module_post_finalize(const Elf_Ehdr *hdr,
+-				const Elf_Shdr *sechdrs,
+-				struct module *me)
+-{
+-	return 0;
+-}
+-
+ static int post_relocation(struct module *mod, const struct load_info *info)
+ {
+-	int ret;
+-
+ 	/* Sort exception table now relocations are done. */
+ 	sort_extable(mod->extable, mod->extable + mod->num_exentries);
+ 
+@@ -2497,24 +2480,7 @@ static int post_relocation(struct module
+ 	add_kallsyms(mod, info);
+ 
+ 	/* Arch-specific module finalizing. */
+-	ret = module_finalize(info->hdr, info->sechdrs, mod);
+-	if (ret)
+-		return ret;
+-
+-	for_each_mod_mem_type(type) {
+-		struct module_memory *mem = &mod->mem[type];
+-
+-		if (mem->is_rox) {
+-			if (!execmem_update_copy(mem->base, mem->rw_copy,
+-						 mem->size))
+-				return -ENOMEM;
+-
+-			vfree(mem->rw_copy);
+-			mem->rw_copy = NULL;
+-		}
+-	}
+-
+-	return module_post_finalize(info->hdr, info->sechdrs, mod);
++	return module_finalize(info->hdr, info->sechdrs, mod);
+ }
+ 
+ /* Call module constructors. */
+@@ -3111,6 +3077,7 @@ static int load_module(struct load_info
+ 				       mod->mem[type].size);
+ 	}
+ 
++	module_memory_restore_rox(mod);
+ 	module_deallocate(mod, info);
+  free_copy:
+ 	/*
+--- a/kernel/module/strict_rwx.c
++++ b/kernel/module/strict_rwx.c
+@@ -9,6 +9,7 @@
+ #include <linux/mm.h>
+ #include <linux/vmalloc.h>
+ #include <linux/set_memory.h>
++#include <linux/execmem.h>
+ #include "internal.h"
+ 
+ static int module_set_memory(const struct module *mod, enum mod_mem_type type,
+@@ -32,12 +33,12 @@ static int module_set_memory(const struc
+ int module_enable_text_rox(const struct module *mod)
+ {
+ 	for_class_mod_mem_type(type, text) {
++		const struct module_memory *mem = &mod->mem[type];
+ 		int ret;
+ 
+-		if (mod->mem[type].is_rox)
+-			continue;
+-
+-		if (IS_ENABLED(CONFIG_STRICT_MODULE_RWX))
++		if (mem->is_rox)
++			ret = execmem_restore_rox(mem->base, mem->size);
++		else if (IS_ENABLED(CONFIG_STRICT_MODULE_RWX))
+ 			ret = module_set_memory(mod, type, set_memory_rox);
+ 		else
+ 			ret = module_set_memory(mod, type, set_memory_x);
