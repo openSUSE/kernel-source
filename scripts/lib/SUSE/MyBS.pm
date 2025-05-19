@@ -560,6 +560,7 @@ sub create_project {
 	}
 	my %seen_archs;
 	my @qa_repos;
+	my @repos;
 	for my $repo (sort(keys(%{$options->{repos}}))) {
 		my $base = $options->{repos}{$repo};
 		my %repo_archs;
@@ -614,6 +615,7 @@ sub create_project {
 				$writer->dataElement("arch", $arch);
 			}
 			$writer->endTag("repository");
+			push(@repos, $name);
 			push(@qa_repos, $qa_name);
 		}
 	}
@@ -680,13 +682,11 @@ sub create_project {
 	}
 	$prjconf .= "BuildFlags: onlybuild:$package:kernel-obs-qa\n";
 	$prjconf .= "BuildFlags: onlybuild:kernel-obs-qa\n";
-	$prjconf .= "BuildFlags: onlybuild:$package:kernel-obs-build\n";
-	$prjconf .= "BuildFlags: onlybuild:kernel-obs-build\n";
 	$prjconf .= "BuildFlags: !nouseforbuild:$package:kernel-obs-build\n";
 	$prjconf .= "BuildFlags: !nouseforbuild:kernel-obs-build\n";
 	$prjconf .= "%endif\n";
 	$self->put("/source/$project/_config", $prjconf);
-	return { name => $project, qa_repos => \@qa_repos };
+	return { name => $project, repos => \@repos, qa_repos => \@qa_repos };
 }
 
 sub create_package {
@@ -738,14 +738,6 @@ sub get_directory_revision {
 	return $p->{res}[0];
 }
 
-sub wipe_package {
-	my ($self, $project, $package, $progresscb) = @_;
-	$errok = 1;
-	$self->post("/build/$project?cmd=wipe&package=$package");
-	$errok = ();
-	&$progresscb('WIPE', "$project/$package");
-}
-
 sub upload_package {
 	my ($self, $dir, $prj, $package, $commit, $options) = @_;
 	$options ||= {};
@@ -761,6 +753,8 @@ sub upload_package {
 		$prj = { name => $prj };
 	}
 	my $project = $prj->{name};
+	my $repos = $prj->{repos};
+	my $qa_repos = $prj->{qa_repos};
 
 	if (!$self->project_exists($project)) {
 		die "Project $project does not exist\n";
@@ -768,14 +762,6 @@ sub upload_package {
 	if (!$no_init) {
 		$self->create_package($prj, $package);
 		&$progresscb('CREATE', "$project/$package");
-	}
-	# delete stale kernel-obs-build
-	my $wipe = 'kernel-obs-build';
-	if (($specfiles{$wipe} or $multibuild) and not $no_init) {
-		$wipe = ($multibuild ? $package . ":" : "") . $wipe;
-		$self->wipe_package($project, $wipe, $progresscb);
-	} else {
-		$wipe = ();
 	}
 	opendir(my $dh, $dir) or die "$dir: $!\n";
 	my $remote = $self->readdir("/source/$project/$package");
@@ -838,10 +824,38 @@ sub upload_package {
 		$self->delete("/source/$project/$link");
 		&$progresscb('DELETE', "$project/$link");
 	}
-	# delete stale kernel-obs-build
-	if ($wipe) {
-		$self->wipe_package($project, $wipe, $progresscb);
+	# aggregate kernel-obs-build
+	my $agg = 'kernel-obs-build';
+	if (not $no_init) {
+		my $agg_pkg = $agg . '.agg';
+		if ($specfiles{$agg}) {
+			my $agg_xml;
+			my $writer = XML::Writer->new(OUTPUT => \$agg_xml, NEWLINES => 1);
+			$writer->startTag('aggregatelist');
+			$writer->startTag('aggregate', 'project' => $project);
+			$writer->startTag('package');
+			$writer->characters($agg);
+			$writer->endTag('package');
+			$writer->startTag('package');
+			$writer->characters($package . ':' . $agg);
+			$writer->endTag('package');
+			for my $i ((0 .. $#{$repos})) {
+				$writer->emptyTag('repository', 'target' => ${$qa_repos}[$i], 'source' => ${$repos}[$i]);
+			}
+			$writer->endTag('aggregate');
+			$writer->endTag('aggregatelist');
+			$writer->end();
+			$self->create_package($prj, $agg_pkg);
+			$self->put("/source/$project/$agg_pkg/_aggregate", $agg_xml);
+			&$progresscb('AGGREGATE', "$project/$agg_pkg");
+		} else {
+			if ($self->package_exists($project, $agg_pkg)) {
+				$self->delete("/source/$project/$agg_pkg");
+				&$progresscb('DELETE', "$project/$agg_pkg");
+			}
+		}
 	}
+
 	return $revision;
 }
 
