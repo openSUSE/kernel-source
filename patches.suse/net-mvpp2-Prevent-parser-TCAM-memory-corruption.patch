@@ -1,0 +1,648 @@
+From: Tobias Waldekranz <tobias@waldekranz.com>
+Date: Tue, 1 Apr 2025 08:58:04 +0200
+Subject: net: mvpp2: Prevent parser TCAM memory corruption
+Patch-mainline: v6.15-rc1
+Git-commit: 96844075226b49af25a69a1d084b648ec2d9b08d
+References: CVE-2025-22060 bsc#1241526
+
+Protect the parser TCAM/SRAM memory, and the cached (shadow) SRAM
+information, from concurrent modifications.
+
+Both the TCAM and SRAM tables are indirectly accessed by configuring
+an index register that selects the row to read or write to. This means
+that operations must be atomic in order to, e.g., avoid spreading
+writes across multiple rows. Since the shadow SRAM array is used to
+find free rows in the hardware table, it must also be protected in
+order to avoid TOCTOU errors where multiple cores allocate the same
+row.
+
+This issue was detected in a situation where `mvpp2_set_rx_mode()` ran
+concurrently on two CPUs. In this particular case the
+MVPP2_PE_MAC_UC_PROMISCUOUS entry was corrupted, causing the
+classifier unit to drop all incoming unicast - indicated by the
+`rx_classifier_drops` counter.
+
+Fixes: 3f518509dedc ("ethernet: Add new driver for Marvell Armada 375 network unit")
+Signed-off-by: Tobias Waldekranz <tobias@waldekranz.com>
+Reviewed-by: Maxime Chevallier <maxime.chevallier@bootlin.com>
+Tested-by: Maxime Chevallier <maxime.chevallier@bootlin.com>
+Link: https://patch.msgid.link/20250401065855.3113635-1-tobias@waldekranz.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/marvell/mvpp2/mvpp2.h      |    3 
+ drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c |    3 
+ drivers/net/ethernet/marvell/mvpp2/mvpp2_prs.c  |  201 ++++++++++++++++--------
+ 3 files changed, 140 insertions(+), 67 deletions(-)
+
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
+@@ -1108,6 +1108,9 @@ struct mvpp2 {
+ 
+ 	/* Spinlocks for CM3 shared memory configuration */
+ 	spinlock_t mss_spinlock;
++
++	/* Spinlock for shared PRS parser memory and shadow table */
++	spinlock_t prs_spinlock;
+ };
+ 
+ struct mvpp2_pcpu_stats {
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@ -7546,8 +7546,9 @@ static int mvpp2_probe(struct platform_d
+ 	if (mvpp2_read(priv, MVPP2_VER_ID_REG) == MVPP2_VER_PP23)
+ 		priv->hw_version = MVPP23;
+ 
+-	/* Init mss lock */
++	/* Init locks for shared packet processor resources */
+ 	spin_lock_init(&priv->mss_spinlock);
++	spin_lock_init(&priv->prs_spinlock);
+ 
+ 	/* Initialize network controller */
+ 	err = mvpp2_init(pdev, priv);
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_prs.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_prs.c
+@@ -23,6 +23,8 @@ static int mvpp2_prs_hw_write(struct mvp
+ {
+ 	int i;
+ 
++	lockdep_assert_held(&priv->prs_spinlock);
++
+ 	if (pe->index > MVPP2_PRS_TCAM_SRAM_SIZE - 1)
+ 		return -EINVAL;
+ 
+@@ -43,11 +45,13 @@ static int mvpp2_prs_hw_write(struct mvp
+ }
+ 
+ /* Initialize tcam entry from hw */
+-int mvpp2_prs_init_from_hw(struct mvpp2 *priv, struct mvpp2_prs_entry *pe,
+-			   int tid)
++static int __mvpp2_prs_init_from_hw(struct mvpp2 *priv,
++				    struct mvpp2_prs_entry *pe, int tid)
+ {
+ 	int i;
+ 
++	lockdep_assert_held(&priv->prs_spinlock);
++
+ 	if (tid > MVPP2_PRS_TCAM_SRAM_SIZE - 1)
+ 		return -EINVAL;
+ 
+@@ -73,6 +77,18 @@ int mvpp2_prs_init_from_hw(struct mvpp2
+ 	return 0;
+ }
+ 
++int mvpp2_prs_init_from_hw(struct mvpp2 *priv, struct mvpp2_prs_entry *pe,
++			   int tid)
++{
++	int err;
++
++	spin_lock_bh(&priv->prs_spinlock);
++	err = __mvpp2_prs_init_from_hw(priv, pe, tid);
++	spin_unlock_bh(&priv->prs_spinlock);
++
++	return err;
++}
++
+ /* Invalidate tcam hw entry */
+ static void mvpp2_prs_hw_inv(struct mvpp2 *priv, int index)
+ {
+@@ -374,7 +390,7 @@ static int mvpp2_prs_flow_find(struct mv
+ 		    priv->prs_shadow[tid].lu != MVPP2_PRS_LU_FLOWS)
+ 			continue;
+ 
+-		mvpp2_prs_init_from_hw(priv, &pe, tid);
++		__mvpp2_prs_init_from_hw(priv, &pe, tid);
+ 		bits = mvpp2_prs_sram_ai_get(&pe);
+ 
+ 		/* Sram store classification lookup ID in AI bits [5:0] */
+@@ -441,7 +457,7 @@ static void mvpp2_prs_mac_drop_all_set(s
+ 
+ 	if (priv->prs_shadow[MVPP2_PE_DROP_ALL].valid) {
+ 		/* Entry exist - update port only */
+-		mvpp2_prs_init_from_hw(priv, &pe, MVPP2_PE_DROP_ALL);
++		__mvpp2_prs_init_from_hw(priv, &pe, MVPP2_PE_DROP_ALL);
+ 	} else {
+ 		/* Entry doesn't exist - create new */
+ 		memset(&pe, 0, sizeof(pe));
+@@ -469,14 +485,17 @@ static void mvpp2_prs_mac_drop_all_set(s
+ }
+ 
+ /* Set port to unicast or multicast promiscuous mode */
+-void mvpp2_prs_mac_promisc_set(struct mvpp2 *priv, int port,
+-			       enum mvpp2_prs_l2_cast l2_cast, bool add)
++static void __mvpp2_prs_mac_promisc_set(struct mvpp2 *priv, int port,
++					enum mvpp2_prs_l2_cast l2_cast,
++					bool add)
+ {
+ 	struct mvpp2_prs_entry pe;
+ 	unsigned char cast_match;
+ 	unsigned int ri;
+ 	int tid;
+ 
++	lockdep_assert_held(&priv->prs_spinlock);
++
+ 	if (l2_cast == MVPP2_PRS_L2_UNI_CAST) {
+ 		cast_match = MVPP2_PRS_UCAST_VAL;
+ 		tid = MVPP2_PE_MAC_UC_PROMISCUOUS;
+@@ -489,7 +508,7 @@ void mvpp2_prs_mac_promisc_set(struct mv
+ 
+ 	/* promiscuous mode - Accept unknown unicast or multicast packets */
+ 	if (priv->prs_shadow[tid].valid) {
+-		mvpp2_prs_init_from_hw(priv, &pe, tid);
++		__mvpp2_prs_init_from_hw(priv, &pe, tid);
+ 	} else {
+ 		memset(&pe, 0, sizeof(pe));
+ 		mvpp2_prs_tcam_lu_set(&pe, MVPP2_PRS_LU_MAC);
+@@ -522,6 +541,14 @@ void mvpp2_prs_mac_promisc_set(struct mv
+ 	mvpp2_prs_hw_write(priv, &pe);
+ }
+ 
++void mvpp2_prs_mac_promisc_set(struct mvpp2 *priv, int port,
++			       enum mvpp2_prs_l2_cast l2_cast, bool add)
++{
++	spin_lock_bh(&priv->prs_spinlock);
++	__mvpp2_prs_mac_promisc_set(priv, port, l2_cast, add);
++	spin_unlock_bh(&priv->prs_spinlock);
++}
++
+ /* Set entry for dsa packets */
+ static void mvpp2_prs_dsa_tag_set(struct mvpp2 *priv, int port, bool add,
+ 				  bool tagged, bool extend)
+@@ -539,7 +566,7 @@ static void mvpp2_prs_dsa_tag_set(struct
+ 
+ 	if (priv->prs_shadow[tid].valid) {
+ 		/* Entry exist - update port only */
+-		mvpp2_prs_init_from_hw(priv, &pe, tid);
++		__mvpp2_prs_init_from_hw(priv, &pe, tid);
+ 	} else {
+ 		/* Entry doesn't exist - create new */
+ 		memset(&pe, 0, sizeof(pe));
+@@ -610,7 +637,7 @@ static void mvpp2_prs_dsa_tag_ethertype_
+ 
+ 	if (priv->prs_shadow[tid].valid) {
+ 		/* Entry exist - update port only */
+-		mvpp2_prs_init_from_hw(priv, &pe, tid);
++		__mvpp2_prs_init_from_hw(priv, &pe, tid);
+ 	} else {
+ 		/* Entry doesn't exist - create new */
+ 		memset(&pe, 0, sizeof(pe));
+@@ -673,7 +700,7 @@ static int mvpp2_prs_vlan_find(struct mv
+ 		    priv->prs_shadow[tid].lu != MVPP2_PRS_LU_VLAN)
+ 			continue;
+ 
+-		mvpp2_prs_init_from_hw(priv, &pe, tid);
++		__mvpp2_prs_init_from_hw(priv, &pe, tid);
+ 		match = mvpp2_prs_tcam_data_cmp(&pe, 0, tpid);
+ 		if (!match)
+ 			continue;
+@@ -726,7 +753,7 @@ static int mvpp2_prs_vlan_add(struct mvp
+ 			    priv->prs_shadow[tid_aux].lu != MVPP2_PRS_LU_VLAN)
+ 				continue;
+ 
+-			mvpp2_prs_init_from_hw(priv, &pe, tid_aux);
++			__mvpp2_prs_init_from_hw(priv, &pe, tid_aux);
+ 			ri_bits = mvpp2_prs_sram_ri_get(&pe);
+ 			if ((ri_bits & MVPP2_PRS_RI_VLAN_MASK) ==
+ 			    MVPP2_PRS_RI_VLAN_DOUBLE)
+@@ -760,7 +787,7 @@ static int mvpp2_prs_vlan_add(struct mvp
+ 
+ 		mvpp2_prs_shadow_set(priv, pe.index, MVPP2_PRS_LU_VLAN);
+ 	} else {
+-		mvpp2_prs_init_from_hw(priv, &pe, tid);
++		__mvpp2_prs_init_from_hw(priv, &pe, tid);
+ 	}
+ 	/* Update ports' mask */
+ 	mvpp2_prs_tcam_port_map_set(&pe, port_map);
+@@ -800,7 +827,7 @@ static int mvpp2_prs_double_vlan_find(st
+ 		    priv->prs_shadow[tid].lu != MVPP2_PRS_LU_VLAN)
+ 			continue;
+ 
+-		mvpp2_prs_init_from_hw(priv, &pe, tid);
++		__mvpp2_prs_init_from_hw(priv, &pe, tid);
+ 
+ 		match = mvpp2_prs_tcam_data_cmp(&pe, 0, tpid1) &&
+ 			mvpp2_prs_tcam_data_cmp(&pe, 4, tpid2);
+@@ -849,7 +876,7 @@ static int mvpp2_prs_double_vlan_add(str
+ 			    priv->prs_shadow[tid_aux].lu != MVPP2_PRS_LU_VLAN)
+ 				continue;
+ 
+-			mvpp2_prs_init_from_hw(priv, &pe, tid_aux);
++			__mvpp2_prs_init_from_hw(priv, &pe, tid_aux);
+ 			ri_bits = mvpp2_prs_sram_ri_get(&pe);
+ 			ri_bits &= MVPP2_PRS_RI_VLAN_MASK;
+ 			if (ri_bits == MVPP2_PRS_RI_VLAN_SINGLE ||
+@@ -880,7 +907,7 @@ static int mvpp2_prs_double_vlan_add(str
+ 
+ 		mvpp2_prs_shadow_set(priv, pe.index, MVPP2_PRS_LU_VLAN);
+ 	} else {
+-		mvpp2_prs_init_from_hw(priv, &pe, tid);
++		__mvpp2_prs_init_from_hw(priv, &pe, tid);
+ 	}
+ 
+ 	/* Update ports' mask */
+@@ -1213,8 +1240,8 @@ static void mvpp2_prs_mac_init(struct mv
+ 	/* Create dummy entries for drop all and promiscuous modes */
+ 	mvpp2_prs_drop_fc(priv);
+ 	mvpp2_prs_mac_drop_all_set(priv, 0, false);
+-	mvpp2_prs_mac_promisc_set(priv, 0, MVPP2_PRS_L2_UNI_CAST, false);
+-	mvpp2_prs_mac_promisc_set(priv, 0, MVPP2_PRS_L2_MULTI_CAST, false);
++	__mvpp2_prs_mac_promisc_set(priv, 0, MVPP2_PRS_L2_UNI_CAST, false);
++	__mvpp2_prs_mac_promisc_set(priv, 0, MVPP2_PRS_L2_MULTI_CAST, false);
+ }
+ 
+ /* Set default entries for various types of dsa packets */
+@@ -1533,12 +1560,6 @@ static int mvpp2_prs_vlan_init(struct pl
+ 	struct mvpp2_prs_entry pe;
+ 	int err;
+ 
+-	priv->prs_double_vlans = devm_kcalloc(&pdev->dev, sizeof(bool),
+-					      MVPP2_PRS_DBL_VLANS_MAX,
+-					      GFP_KERNEL);
+-	if (!priv->prs_double_vlans)
+-		return -ENOMEM;
+-
+ 	/* Double VLAN: 0x88A8, 0x8100 */
+ 	err = mvpp2_prs_double_vlan_add(priv, ETH_P_8021AD, ETH_P_8021Q,
+ 					MVPP2_PRS_PORT_MASK);
+@@ -1955,7 +1976,7 @@ static int mvpp2_prs_vid_range_find(stru
+ 		    port->priv->prs_shadow[tid].lu != MVPP2_PRS_LU_VID)
+ 			continue;
+ 
+-		mvpp2_prs_init_from_hw(port->priv, &pe, tid);
++		__mvpp2_prs_init_from_hw(port->priv, &pe, tid);
+ 
+ 		mvpp2_prs_tcam_data_byte_get(&pe, 2, &byte[0], &enable[0]);
+ 		mvpp2_prs_tcam_data_byte_get(&pe, 3, &byte[1], &enable[1]);
+@@ -1984,6 +2005,8 @@ int mvpp2_prs_vid_entry_add(struct mvpp2
+ 
+ 	memset(&pe, 0, sizeof(pe));
+ 
++	spin_lock_bh(&priv->prs_spinlock);
++
+ 	/* Scan TCAM and see if entry with this <vid,port> already exist */
+ 	tid = mvpp2_prs_vid_range_find(port, vid, mask);
+ 
+@@ -2002,8 +2025,10 @@ int mvpp2_prs_vid_entry_add(struct mvpp2
+ 						MVPP2_PRS_VLAN_FILT_MAX_ENTRY);
+ 
+ 		/* There isn't room for a new VID filter */
+-		if (tid < 0)
++		if (tid < 0) {
++			spin_unlock_bh(&priv->prs_spinlock);
+ 			return tid;
++		}
+ 
+ 		mvpp2_prs_tcam_lu_set(&pe, MVPP2_PRS_LU_VID);
+ 		pe.index = tid;
+@@ -2011,7 +2036,7 @@ int mvpp2_prs_vid_entry_add(struct mvpp2
+ 		/* Mask all ports */
+ 		mvpp2_prs_tcam_port_map_set(&pe, 0);
+ 	} else {
+-		mvpp2_prs_init_from_hw(priv, &pe, tid);
++		__mvpp2_prs_init_from_hw(priv, &pe, tid);
+ 	}
+ 
+ 	/* Enable the current port */
+@@ -2033,6 +2058,7 @@ int mvpp2_prs_vid_entry_add(struct mvpp2
+ 	mvpp2_prs_shadow_set(priv, pe.index, MVPP2_PRS_LU_VID);
+ 	mvpp2_prs_hw_write(priv, &pe);
+ 
++	spin_unlock_bh(&priv->prs_spinlock);
+ 	return 0;
+ }
+ 
+@@ -2042,15 +2068,16 @@ void mvpp2_prs_vid_entry_remove(struct m
+ 	struct mvpp2 *priv = port->priv;
+ 	int tid;
+ 
+-	/* Scan TCAM and see if entry with this <vid,port> already exist */
+-	tid = mvpp2_prs_vid_range_find(port, vid, 0xfff);
++	spin_lock_bh(&priv->prs_spinlock);
+ 
+-	/* No such entry */
+-	if (tid < 0)
+-		return;
++	/* Invalidate TCAM entry with this <vid,port>, if it exists */
++	tid = mvpp2_prs_vid_range_find(port, vid, 0xfff);
++	if (tid >= 0) {
++		mvpp2_prs_hw_inv(priv, tid);
++		priv->prs_shadow[tid].valid = false;
++	}
+ 
+-	mvpp2_prs_hw_inv(priv, tid);
+-	priv->prs_shadow[tid].valid = false;
++	spin_unlock_bh(&priv->prs_spinlock);
+ }
+ 
+ /* Remove all existing VID filters on this port */
+@@ -2059,6 +2086,8 @@ void mvpp2_prs_vid_remove_all(struct mvp
+ 	struct mvpp2 *priv = port->priv;
+ 	int tid;
+ 
++	spin_lock_bh(&priv->prs_spinlock);
++
+ 	for (tid = MVPP2_PRS_VID_PORT_FIRST(port->id);
+ 	     tid <= MVPP2_PRS_VID_PORT_LAST(port->id); tid++) {
+ 		if (priv->prs_shadow[tid].valid) {
+@@ -2066,6 +2095,8 @@ void mvpp2_prs_vid_remove_all(struct mvp
+ 			priv->prs_shadow[tid].valid = false;
+ 		}
+ 	}
++
++	spin_unlock_bh(&priv->prs_spinlock);
+ }
+ 
+ /* Remove VID filering entry for this port */
+@@ -2074,10 +2105,14 @@ void mvpp2_prs_vid_disable_filtering(str
+ 	unsigned int tid = MVPP2_PRS_VID_PORT_DFLT(port->id);
+ 	struct mvpp2 *priv = port->priv;
+ 
++	spin_lock_bh(&priv->prs_spinlock);
++
+ 	/* Invalidate the guard entry */
+ 	mvpp2_prs_hw_inv(priv, tid);
+ 
+ 	priv->prs_shadow[tid].valid = false;
++
++	spin_unlock_bh(&priv->prs_spinlock);
+ }
+ 
+ /* Add guard entry that drops packets when no VID is matched on this port */
+@@ -2093,6 +2128,8 @@ void mvpp2_prs_vid_enable_filtering(stru
+ 
+ 	memset(&pe, 0, sizeof(pe));
+ 
++	spin_lock_bh(&priv->prs_spinlock);
++
+ 	pe.index = tid;
+ 
+ 	reg_val = mvpp2_read(priv, MVPP2_MH_REG(port->id));
+@@ -2125,6 +2162,8 @@ void mvpp2_prs_vid_enable_filtering(stru
+ 	/* Update shadow table */
+ 	mvpp2_prs_shadow_set(priv, pe.index, MVPP2_PRS_LU_VID);
+ 	mvpp2_prs_hw_write(priv, &pe);
++
++	spin_unlock_bh(&priv->prs_spinlock);
+ }
+ 
+ /* Parser default initialization */
+@@ -2132,6 +2171,20 @@ int mvpp2_prs_default_init(struct platfo
+ {
+ 	int err, index, i;
+ 
++	priv->prs_shadow = devm_kcalloc(&pdev->dev, MVPP2_PRS_TCAM_SRAM_SIZE,
++					sizeof(*priv->prs_shadow),
++					GFP_KERNEL);
++	if (!priv->prs_shadow)
++		return -ENOMEM;
++
++	priv->prs_double_vlans = devm_kcalloc(&pdev->dev, sizeof(bool),
++					      MVPP2_PRS_DBL_VLANS_MAX,
++					      GFP_KERNEL);
++	if (!priv->prs_double_vlans)
++		return -ENOMEM;
++
++	spin_lock_bh(&priv->prs_spinlock);
++
+ 	/* Enable tcam table */
+ 	mvpp2_write(priv, MVPP2_PRS_TCAM_CTRL_REG, MVPP2_PRS_TCAM_EN_MASK);
+ 
+@@ -2150,12 +2203,6 @@ int mvpp2_prs_default_init(struct platfo
+ 	for (index = 0; index < MVPP2_PRS_TCAM_SRAM_SIZE; index++)
+ 		mvpp2_prs_hw_inv(priv, index);
+ 
+-	priv->prs_shadow = devm_kcalloc(&pdev->dev, MVPP2_PRS_TCAM_SRAM_SIZE,
+-					sizeof(*priv->prs_shadow),
+-					GFP_KERNEL);
+-	if (!priv->prs_shadow)
+-		return -ENOMEM;
+-
+ 	/* Always start from lookup = 0 */
+ 	for (index = 0; index < MVPP2_MAX_PORTS; index++)
+ 		mvpp2_prs_hw_port_init(priv, index, MVPP2_PRS_LU_MH,
+@@ -2172,26 +2219,13 @@ int mvpp2_prs_default_init(struct platfo
+ 	mvpp2_prs_vid_init(priv);
+ 
+ 	err = mvpp2_prs_etype_init(priv);
+-	if (err)
+-		return err;
+-
+-	err = mvpp2_prs_vlan_init(pdev, priv);
+-	if (err)
+-		return err;
+-
+-	err = mvpp2_prs_pppoe_init(priv);
+-	if (err)
+-		return err;
+-
+-	err = mvpp2_prs_ip6_init(priv);
+-	if (err)
+-		return err;
+-
+-	err = mvpp2_prs_ip4_init(priv);
+-	if (err)
+-		return err;
++	err = err ? : mvpp2_prs_vlan_init(pdev, priv);
++	err = err ? : mvpp2_prs_pppoe_init(priv);
++	err = err ? : mvpp2_prs_ip6_init(priv);
++	err = err ? : mvpp2_prs_ip4_init(priv);
+ 
+-	return 0;
++	spin_unlock_bh(&priv->prs_spinlock);
++	return err;
+ }
+ 
+ /* Compare MAC DA with tcam entry data */
+@@ -2231,7 +2265,7 @@ mvpp2_prs_mac_da_range_find(struct mvpp2
+ 		    (priv->prs_shadow[tid].udf != udf_type))
+ 			continue;
+ 
+-		mvpp2_prs_init_from_hw(priv, &pe, tid);
++		__mvpp2_prs_init_from_hw(priv, &pe, tid);
+ 		entry_pmap = mvpp2_prs_tcam_port_map_get(&pe);
+ 
+ 		if (mvpp2_prs_mac_range_equals(&pe, da, mask) &&
+@@ -2243,7 +2277,8 @@ mvpp2_prs_mac_da_range_find(struct mvpp2
+ }
+ 
+ /* Update parser's mac da entry */
+-int mvpp2_prs_mac_da_accept(struct mvpp2_port *port, const u8 *da, bool add)
++static int __mvpp2_prs_mac_da_accept(struct mvpp2_port *port,
++				     const u8 *da, bool add)
+ {
+ 	unsigned char mask[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+ 	struct mvpp2 *priv = port->priv;
+@@ -2275,7 +2310,7 @@ int mvpp2_prs_mac_da_accept(struct mvpp2
+ 		/* Mask all ports */
+ 		mvpp2_prs_tcam_port_map_set(&pe, 0);
+ 	} else {
+-		mvpp2_prs_init_from_hw(priv, &pe, tid);
++		__mvpp2_prs_init_from_hw(priv, &pe, tid);
+ 	}
+ 
+ 	mvpp2_prs_tcam_lu_set(&pe, MVPP2_PRS_LU_MAC);
+@@ -2331,6 +2366,17 @@ int mvpp2_prs_mac_da_accept(struct mvpp2
+ 	return 0;
+ }
+ 
++int mvpp2_prs_mac_da_accept(struct mvpp2_port *port, const u8 *da, bool add)
++{
++	int err;
++
++	spin_lock_bh(&port->priv->prs_spinlock);
++	err = __mvpp2_prs_mac_da_accept(port, da, add);
++	spin_unlock_bh(&port->priv->prs_spinlock);
++
++	return err;
++}
++
+ int mvpp2_prs_update_mac_da(struct net_device *dev, const u8 *da)
+ {
+ 	struct mvpp2_port *port = netdev_priv(dev);
+@@ -2359,6 +2405,8 @@ void mvpp2_prs_mac_del_all(struct mvpp2_
+ 	unsigned long pmap;
+ 	int index, tid;
+ 
++	spin_lock_bh(&priv->prs_spinlock);
++
+ 	for (tid = MVPP2_PE_MAC_RANGE_START;
+ 	     tid <= MVPP2_PE_MAC_RANGE_END; tid++) {
+ 		unsigned char da[ETH_ALEN], da_mask[ETH_ALEN];
+@@ -2368,7 +2416,7 @@ void mvpp2_prs_mac_del_all(struct mvpp2_
+ 		    (priv->prs_shadow[tid].udf != MVPP2_PRS_UDF_MAC_DEF))
+ 			continue;
+ 
+-		mvpp2_prs_init_from_hw(priv, &pe, tid);
++		__mvpp2_prs_init_from_hw(priv, &pe, tid);
+ 
+ 		pmap = mvpp2_prs_tcam_port_map_get(&pe);
+ 
+@@ -2389,14 +2437,17 @@ void mvpp2_prs_mac_del_all(struct mvpp2_
+ 			continue;
+ 
+ 		/* Remove entry from TCAM */
+-		mvpp2_prs_mac_da_accept(port, da, false);
++		__mvpp2_prs_mac_da_accept(port, da, false);
+ 	}
++
++	spin_unlock_bh(&priv->prs_spinlock);
+ }
+ 
+ int mvpp2_prs_tag_mode_set(struct mvpp2 *priv, int port, int type)
+ {
+ 	switch (type) {
+ 	case MVPP2_TAG_TYPE_EDSA:
++		spin_lock_bh(&priv->prs_spinlock);
+ 		/* Add port to EDSA entries */
+ 		mvpp2_prs_dsa_tag_set(priv, port, true,
+ 				      MVPP2_PRS_TAGGED, MVPP2_PRS_EDSA);
+@@ -2407,9 +2458,11 @@ int mvpp2_prs_tag_mode_set(struct mvpp2
+ 				      MVPP2_PRS_TAGGED, MVPP2_PRS_DSA);
+ 		mvpp2_prs_dsa_tag_set(priv, port, false,
+ 				      MVPP2_PRS_UNTAGGED, MVPP2_PRS_DSA);
++		spin_unlock_bh(&priv->prs_spinlock);
+ 		break;
+ 
+ 	case MVPP2_TAG_TYPE_DSA:
++		spin_lock_bh(&priv->prs_spinlock);
+ 		/* Add port to DSA entries */
+ 		mvpp2_prs_dsa_tag_set(priv, port, true,
+ 				      MVPP2_PRS_TAGGED, MVPP2_PRS_DSA);
+@@ -2420,10 +2473,12 @@ int mvpp2_prs_tag_mode_set(struct mvpp2
+ 				      MVPP2_PRS_TAGGED, MVPP2_PRS_EDSA);
+ 		mvpp2_prs_dsa_tag_set(priv, port, false,
+ 				      MVPP2_PRS_UNTAGGED, MVPP2_PRS_EDSA);
++		spin_unlock_bh(&priv->prs_spinlock);
+ 		break;
+ 
+ 	case MVPP2_TAG_TYPE_MH:
+ 	case MVPP2_TAG_TYPE_NONE:
++		spin_lock_bh(&priv->prs_spinlock);
+ 		/* Remove port form EDSA and DSA entries */
+ 		mvpp2_prs_dsa_tag_set(priv, port, false,
+ 				      MVPP2_PRS_TAGGED, MVPP2_PRS_DSA);
+@@ -2433,6 +2488,7 @@ int mvpp2_prs_tag_mode_set(struct mvpp2
+ 				      MVPP2_PRS_TAGGED, MVPP2_PRS_EDSA);
+ 		mvpp2_prs_dsa_tag_set(priv, port, false,
+ 				      MVPP2_PRS_UNTAGGED, MVPP2_PRS_EDSA);
++		spin_unlock_bh(&priv->prs_spinlock);
+ 		break;
+ 
+ 	default:
+@@ -2451,11 +2507,15 @@ int mvpp2_prs_add_flow(struct mvpp2 *pri
+ 
+ 	memset(&pe, 0, sizeof(pe));
+ 
++	spin_lock_bh(&priv->prs_spinlock);
++
+ 	tid = mvpp2_prs_tcam_first_free(priv,
+ 					MVPP2_PE_LAST_FREE_TID,
+ 					MVPP2_PE_FIRST_FREE_TID);
+-	if (tid < 0)
++	if (tid < 0) {
++		spin_unlock_bh(&priv->prs_spinlock);
+ 		return tid;
++	}
+ 
+ 	pe.index = tid;
+ 
+@@ -2475,6 +2535,7 @@ int mvpp2_prs_add_flow(struct mvpp2 *pri
+ 	mvpp2_prs_tcam_port_map_set(&pe, MVPP2_PRS_PORT_MASK);
+ 	mvpp2_prs_hw_write(priv, &pe);
+ 
++	spin_unlock_bh(&priv->prs_spinlock);
+ 	return 0;
+ }
+ 
+@@ -2486,6 +2547,8 @@ int mvpp2_prs_def_flow(struct mvpp2_port
+ 
+ 	memset(&pe, 0, sizeof(pe));
+ 
++	spin_lock_bh(&port->priv->prs_spinlock);
++
+ 	tid = mvpp2_prs_flow_find(port->priv, port->id);
+ 
+ 	/* Such entry not exist */
+@@ -2494,8 +2557,10 @@ int mvpp2_prs_def_flow(struct mvpp2_port
+ 		tid = mvpp2_prs_tcam_first_free(port->priv,
+ 						MVPP2_PE_LAST_FREE_TID,
+ 					       MVPP2_PE_FIRST_FREE_TID);
+-		if (tid < 0)
++		if (tid < 0) {
++			spin_unlock_bh(&port->priv->prs_spinlock);
+ 			return tid;
++		}
+ 
+ 		pe.index = tid;
+ 
+@@ -2506,13 +2571,14 @@ int mvpp2_prs_def_flow(struct mvpp2_port
+ 		/* Update shadow table */
+ 		mvpp2_prs_shadow_set(port->priv, pe.index, MVPP2_PRS_LU_FLOWS);
+ 	} else {
+-		mvpp2_prs_init_from_hw(port->priv, &pe, tid);
++		__mvpp2_prs_init_from_hw(port->priv, &pe, tid);
+ 	}
+ 
+ 	mvpp2_prs_tcam_lu_set(&pe, MVPP2_PRS_LU_FLOWS);
+ 	mvpp2_prs_tcam_port_map_set(&pe, (1 << port->id));
+ 	mvpp2_prs_hw_write(port->priv, &pe);
+ 
++	spin_unlock_bh(&port->priv->prs_spinlock);
+ 	return 0;
+ }
+ 
+@@ -2523,11 +2589,14 @@ int mvpp2_prs_hits(struct mvpp2 *priv, i
+ 	if (index > MVPP2_PRS_TCAM_SRAM_SIZE)
+ 		return -EINVAL;
+ 
++	spin_lock_bh(&priv->prs_spinlock);
++
+ 	mvpp2_write(priv, MVPP2_PRS_TCAM_HIT_IDX_REG, index);
+ 
+ 	val = mvpp2_read(priv, MVPP2_PRS_TCAM_HIT_CNT_REG);
+ 
+ 	val &= MVPP2_PRS_TCAM_HIT_CNT_MASK;
+ 
++	spin_unlock_bh(&priv->prs_spinlock);
+ 	return val;
+ }
