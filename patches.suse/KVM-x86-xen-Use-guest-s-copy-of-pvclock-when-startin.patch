@@ -1,0 +1,132 @@
+Patch-mainline: v6.15
+Git-commit: ca28aa63918b304d77803d5ae952ed875fdad56b
+References: git-fixes
+From: Sean Christopherson <seanjc@google.com>
+Date: Fri, 31 Jan 2025 17:38:21 -0800
+Subject: [PATCH] KVM: x86/xen: Use guest's copy of pvclock when starting timer
+
+Use the guest's copy of its pvclock when starting a Xen timer, as KVM's
+reference copy may not be up-to-date, i.e. may yield a false positive of
+sorts.  In the unlikely scenario that the guest is starting a Xen timer
+and has used a Xen pvclock in the past, but has since but turned it "off",
+then vcpu->arch.hv_clock may be stale, as KVM's reference copy is updated
+if and only if at least one pvclock is enabled.
+
+Furthermore, vcpu->arch.hv_clock is currently used by three different
+pvclocks: kvmclock, Xen, and Xen compat.  While it's extremely unlikely a
+guest would ever enable multiple pvclocks, effectively sharing KVM's
+reference clock could yield very weird behavior.  Using the guest's active
+Xen pvclock instead of KVM's reference will allow dropping KVM's
+reference copy.
+
+Fixes: 451a707813ae ("KVM: x86/xen: improve accuracy of Xen timers")
+Cc: Paul Durrant <pdurrant@amazon.com>
+Cc: David Woodhouse <dwmw@amazon.co.uk>
+Reviewed-by: Paul Durrant <paul@xen.org>
+Link: https://lore.kernel.org/r/20250201013827.680235-6-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/kvm/xen.c | 65 ++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 60 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/kvm/xen.c b/arch/x86/kvm/xen.c
+index a909b817b9c0..300a79f1fae5 100644
+--- a/arch/x86/kvm/xen.c
++++ b/arch/x86/kvm/xen.c
+@@ -150,11 +150,46 @@ static enum hrtimer_restart xen_timer_callback(struct hrtimer *timer)
+ 	return HRTIMER_NORESTART;
+ }
+ 
++static int xen_get_guest_pvclock(struct kvm_vcpu *vcpu,
++				 struct pvclock_vcpu_time_info *hv_clock,
++				 struct gfn_to_pfn_cache *gpc,
++				 unsigned int offset)
++{
++	unsigned long flags;
++	int r;
++
++	read_lock_irqsave(&gpc->lock, flags);
++	while (!kvm_gpc_check(gpc, offset + sizeof(*hv_clock))) {
++		read_unlock_irqrestore(&gpc->lock, flags);
++
++		r = kvm_gpc_refresh(gpc, offset + sizeof(*hv_clock));
++		if (r)
++			return r;
++
++		read_lock_irqsave(&gpc->lock, flags);
++	}
++
++	memcpy(hv_clock, gpc->khva + offset, sizeof(*hv_clock));
++	read_unlock_irqrestore(&gpc->lock, flags);
++
++	/*
++	 * Sanity check TSC shift+multiplier to verify the guest's view of time
++	 * is more or less consistent.
++	 */
++	if (hv_clock->tsc_shift != vcpu->arch.hv_clock.tsc_shift ||
++	    hv_clock->tsc_to_system_mul != vcpu->arch.hv_clock.tsc_to_system_mul)
++		return -EINVAL;
++
++	return 0;
++}
++
+ static void kvm_xen_start_timer(struct kvm_vcpu *vcpu, u64 guest_abs,
+ 				bool linux_wa)
+ {
++	struct kvm_vcpu_xen *xen = &vcpu->arch.xen;
+ 	int64_t kernel_now, delta;
+ 	uint64_t guest_now;
++	int r = -EOPNOTSUPP;
+ 
+ 	/*
+ 	 * The guest provides the requested timeout in absolute nanoseconds
+@@ -173,10 +208,29 @@ static void kvm_xen_start_timer(struct kvm_vcpu *vcpu, u64 guest_abs,
+ 	 * the absolute CLOCK_MONOTONIC time at which the timer should
+ 	 * fire.
+ 	 */
+-	if (vcpu->arch.hv_clock.version && vcpu->kvm->arch.use_master_clock &&
+-	    static_cpu_has(X86_FEATURE_CONSTANT_TSC)) {
++	do {
++		struct pvclock_vcpu_time_info hv_clock;
+ 		uint64_t host_tsc, guest_tsc;
+ 
++		if (!static_cpu_has(X86_FEATURE_CONSTANT_TSC) ||
++		    !vcpu->kvm->arch.use_master_clock)
++			break;
++
++		/*
++		 * If both Xen PV clocks are active, arbitrarily try to use the
++		 * compat clock first, but also try to use the non-compat clock
++		 * if the compat clock is unusable.  The two PV clocks hold the
++		 * same information, but it's possible one (or both) is stale
++		 * and/or currently unreachable.
++		 */
++		if (xen->vcpu_info_cache.active)
++			r = xen_get_guest_pvclock(vcpu, &hv_clock, &xen->vcpu_info_cache,
++						  offsetof(struct compat_vcpu_info, time));
++		if (r && xen->vcpu_time_info_cache.active)
++			r = xen_get_guest_pvclock(vcpu, &hv_clock, &xen->vcpu_time_info_cache, 0);
++		if (r)
++			break;
++
+ 		if (!IS_ENABLED(CONFIG_64BIT) ||
+ 		    !kvm_get_monotonic_and_clockread(&kernel_now, &host_tsc)) {
+ 			/*
+@@ -197,9 +251,10 @@ static void kvm_xen_start_timer(struct kvm_vcpu *vcpu, u64 guest_abs,
+ 
+ 		/* Calculate the guest kvmclock as the guest would do it. */
+ 		guest_tsc = kvm_read_l1_tsc(vcpu, host_tsc);
+-		guest_now = __pvclock_read_cycles(&vcpu->arch.hv_clock,
+-						  guest_tsc);
+-	} else {
++		guest_now = __pvclock_read_cycles(&hv_clock, guest_tsc);
++	} while (0);
++
++	if (r) {
+ 		/*
+ 		 * Without CONSTANT_TSC, get_kvmclock_ns() is the only option.
+ 		 *
+-- 
+2.43.0
+
