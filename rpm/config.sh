@@ -1,5 +1,5 @@
 # The version of the main tarball to use
-SRCVERSION=6.14
+SRCVERSION=6.15
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=
 # enable kernel module compression
@@ -27,3 +27,5 @@ BUILD_HTML=Yes
 BUILD_PDF=No
 # Generate compile_commands.json
 GENERATE_COMPILE_COMMANDS=Yes
+# Set gcc version to the one available across openSUSE releases
+GCC_VERSION=13
