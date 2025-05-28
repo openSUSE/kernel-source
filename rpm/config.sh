@@ -27,5 +27,5 @@ BUILD_HTML=Yes
 BUILD_PDF=No
 # Generate compile_commands.json
 GENERATE_COMPILE_COMMANDS=Yes
-# Set gcc version to the one available across openSUSE releases
-GCC_VERSION=13
+# Set gcc version to the one used for build in Factory
+GCC_VERSION=14
