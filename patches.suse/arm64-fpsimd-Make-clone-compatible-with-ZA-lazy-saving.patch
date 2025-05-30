@@ -1,0 +1,258 @@
+From: Mark Rutland <mark.rutland@arm.com>
+Date: Thu, 8 May 2025 14:26:33 +0100
+Subject: arm64/fpsimd: Make clone() compatible with ZA lazy saving
+Git-commit: cde5c32db55740659fca6d56c09b88800d88fd29
+Patch-mainline: v6.16-rc1
+References: git-fixes
+
+Linux is intended to be compatible with userspace written to Arm's
+AAPCS64 procedure call standard [1,2]. For the Scalable Matrix Extension
+(SME), AAPCS64 was extended with a "ZA lazy saving scheme", where SME's
+ZA tile is lazily callee-saved and caller-restored. In this scheme,
+TPIDR2_EL0 indicates whether the ZA tile is live or has been saved by
+pointing to a "TPIDR2 block" in memory, which has a "za_save_buffer"
+pointer. This scheme has been implemented in GCC and LLVM, with
+necessary runtime support implemented in glibc and bionic.
+
+AAPCS64 does not specify how the ZA lazy saving scheme is expected to
+interact with thread creation mechanisms such as fork() and
+pthread_create(), which would be implemented in terms of the Linux clone
+syscall. The behaviour implemented by Linux and glibc/bionic doesn't
+always compose safely, as explained below.
+
+Currently the clone syscall is implemented such that PSTATE.ZA and the
+ZA tile are always inherited by the new task, and TPIDR2_EL0 is
+inherited unless the 'flags' argument includes CLONE_SETTLS,
+in which case TPIDR2_EL0 is set to 0/NULL. This doesn't make much sense:
+
+(a) TPIDR2_EL0 is part of the calling convention, and changes as control
+    is passed between functions. It is *NOT* used for thread local
+    storage, despite superficial similarity to TPIDR_EL0, which is is
+    used as the TLS register.
+
+(b) TPIDR2_EL0 and PSTATE.ZA are tightly coupled in the procedure call
+    standard, and some combinations of states are illegal. In general,
+    manipulating the two independently is not guaranteed to be safe.
+
+In practice, code which is compliant with the procedure call standard
+may issue a clone syscall while in the "ZA dormant" state, where
+PSTATE.ZA==1 and TPIDR2_EL0 is non-null and indicates that ZA needs to
+be saved. This can cause a variety of problems, including:
+
+* If the implementation of pthread_create() passes CLONE_SETTLS, the
+  new thread will start with PSTATE.ZA==1 and TPIDR2==NULL. Per the
+  procedure call standard this is not a legitimate state for most
+  functions. This can cause data corruption (e.g. as code may rely on
+  PSTATE.ZA being 0 to guarantee that an SMSTART ZA instruction will
+  zero the ZA tile contents), and may result in other undefined
+  behaviour.
+
+* If the implementation of pthread_create() does not pass CLONE_SETTLS, the
+  new thread will start with PSTATE.ZA==1 and TPIDR2 pointing to a
+  TPIDR2 block on the parent thread's stack. This can result in a
+  variety of problems, e.g.
+
+  - The child may write back to the parent's za_save_buffer, corrupting
+    its contents.
+
+  - The child may read from the TPIDR2 block after the parent has reused
+    this memory for something else, and consequently the child may abort
+    or clobber arbitrary memory.
+
+Ideally we'd require that userspace ensures that a task is in the "ZA
+off" state (with PSTATE.ZA==0 and TPIDR2_EL0==NULL) prior to issuing a
+clone syscall, and have the kernel force this state for new threads.
+Unfortunately, contemporary C libraries do not do this, and simply
+forcing this state within the implementation of clone would break
+fork().
+
+Instead, we can bodge around this by considering the CLONE_VM flag, and
+manipulate PSTATE.ZA and TPIDR2_EL0 as a pair. CLONE_VM indicates that
+the new task will run in the same address space as its parent, and in
+that case it doesn't make sense to inherit a stale pointer to the
+parent's TPIDR2 block:
+
+* For fork(), CLONE_VM will not be set, and it is safe to inherit both
+  PSTATE.ZA and TPIDR2_EL0 as the new task will have its own copy of the
+  address space, and cannot clobber its parent's stack.
+
+* For pthread_create() and vfork(), CLONE_VM will be set, and discarding
+  PSTATE.ZA and TPIDR2_EL0 for the new task doesn't break any existing
+  assumptions in userspace.
+
+Implement this behaviour for clone(). We currently inherit PSTATE.ZA in
+arch_dup_task_struct(), but this does not have access to the clone
+flags, so move this logic under copy_thread(). Documentation is updated
+to describe the new behaviour.
+
+[1] https://github.com/ARM-software/abi-aa/releases/download/2025Q1/aapcs64.pdf
+[2] https://github.com/ARM-software/abi-aa/blob/c51addc3dc03e73a016a1e4edf25440bcac76431/aapcs64/aapcs64.rst
+
+Suggested-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Daniel Kiss <daniel.kiss@arm.com>
+Cc: Marc Zyngier <maz@kernel.org>
+Cc: Mark Brown <broonie@kernel.org>
+Cc: Richard Sandiford <richard.sandiford@arm.com>
+Cc: Sander De Smalen <sander.desmalen@arm.com>
+Cc: Tamas Petz <tamas.petz@arm.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Yury Khrustalev <yury.khrustalev@arm.com>
+Acked-by: Yury Khrustalev <yury.khrustalev@arm.com>
+Link: https://lore.kernel.org/r/20250508132644.1395904-14-mark.rutland@arm.com
+Signed-off-by: Will Deacon <will@kernel.org>
+Acked-by: Ivan T. Ivanov <iivanov@suse.de>
+---
+ Documentation/arch/arm64/sme.rst |    4 -
+ arch/arm64/kernel/process.c      |   95 ++++++++++++++++++++++++++-------------
+ 2 files changed, 66 insertions(+), 33 deletions(-)
+
+--- a/Documentation/arch/arm64/sme.rst
++++ b/Documentation/arch/arm64/sme.rst
+@@ -69,8 +69,8 @@ model features for SME is included in Ap
+   vectors from 0 to VL/8-1 stored in the same endianness invariant format as is
+   used for SVE vectors.
+ 
+-* On thread creation TPIDR2_EL0 is preserved unless CLONE_SETTLS is specified,
+-  in which case it is set to 0.
++* On thread creation PSTATE.ZA and TPIDR2_EL0 are preserved unless CLONE_VM
++  is specified, in which case PSTATE.ZA is set to 0 and TPIDR2_EL0 is set to 0.
+ 
+ 2.  Vector lengths
+ ------------------
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@ -316,31 +316,14 @@ int arch_dup_task_struct(struct task_str
+ 	task_smstop_sm(dst);
+ 
+ 	/*
+-	 * In the unlikely event that we create a new thread with ZA
+-	 * enabled we should retain the ZA and ZT state so duplicate
+-	 * it here.  This may be shortly freed if we exec() or if
+-	 * CLONE_SETTLS but it's simpler to do it here. To avoid
+-	 * confusing the rest of the code ensure that we have a
+-	 * sve_state allocated whenever sme_state is allocated.
++	 * Drop stale reference to src's sme_state and ensure dst has ZA
++	 * disabled.
++	 *
++	 * When necessary, ZA will be inherited later in copy_thread_za().
+ 	 */
+-	if (thread_za_enabled(&src->thread)) {
+-		dst->thread.sve_state = kzalloc(sve_state_size(src),
+-						GFP_KERNEL);
+-		if (!dst->thread.sve_state)
+-			return -ENOMEM;
+-
+-		dst->thread.sme_state = kmemdup(src->thread.sme_state,
+-						sme_state_size(src),
+-						GFP_KERNEL);
+-		if (!dst->thread.sme_state) {
+-			kfree(dst->thread.sve_state);
+-			dst->thread.sve_state = NULL;
+-			return -ENOMEM;
+-		}
+-	} else {
+-		dst->thread.sme_state = NULL;
+-		clear_tsk_thread_flag(dst, TIF_SME);
+-	}
++	dst->thread.sme_state = NULL;
++	clear_tsk_thread_flag(dst, TIF_SME);
++	dst->thread.svcr &= ~SVCR_ZA_MASK;
+ 
+ 	/* clear any pending asynchronous tag fault raised by the parent */
+ 	clear_tsk_thread_flag(dst, TIF_MTE_ASYNC_FAULT);
+@@ -348,6 +331,31 @@ int arch_dup_task_struct(struct task_str
+ 	return 0;
+ }
+ 
++static int copy_thread_za(struct task_struct *dst, struct task_struct *src)
++{
++	if (!thread_za_enabled(&src->thread))
++		return 0;
++
++	dst->thread.sve_state = kzalloc(sve_state_size(src),
++					GFP_KERNEL);
++	if (!dst->thread.sve_state)
++		return -ENOMEM;
++
++	dst->thread.sme_state = kmemdup(src->thread.sme_state,
++					sme_state_size(src),
++					GFP_KERNEL);
++	if (!dst->thread.sme_state) {
++		kfree(dst->thread.sve_state);
++		dst->thread.sve_state = NULL;
++		return -ENOMEM;
++	}
++
++	set_tsk_thread_flag(dst, TIF_SME);
++	dst->thread.svcr |= SVCR_ZA_MASK;
++
++	return 0;
++}
++
+ asmlinkage void ret_from_fork(void) asm("ret_from_fork");
+ 
+ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+@@ -356,6 +364,7 @@ int copy_thread(struct task_struct *p, c
+ 	unsigned long stack_start = args->stack;
+ 	unsigned long tls = args->tls;
+ 	struct pt_regs *childregs = task_pt_regs(p);
++	int ret;
+ 
+ 	memset(&p->thread.cpu_context, 0, sizeof(struct cpu_context));
+ 
+@@ -379,8 +388,6 @@ int copy_thread(struct task_struct *p, c
+ 		 * out-of-sync with the saved value.
+ 		 */
+ 		*task_user_tls(p) = read_sysreg(tpidr_el0);
+-		if (system_supports_tpidr2())
+-			p->thread.tpidr2_el0 = read_sysreg_s(SYS_TPIDR2_EL0);
+ 
+ 		if (system_supports_poe())
+ 			p->thread.por_el0 = read_sysreg_s(SYS_POR_EL0);
+@@ -393,13 +400,39 @@ int copy_thread(struct task_struct *p, c
+ 		}
+ 
+ 		/*
+-		 * If a TLS pointer was passed to clone, use it for the new
+-		 * thread.  We also reset TPIDR2 if it's in use.
++		 * Due to the AAPCS64 "ZA lazy saving scheme", PSTATE.ZA and
++		 * TPIDR2 need to be manipulated as a pair, and either both
++		 * need to be inherited or both need to be reset.
++		 *
++		 * Within a process, child threads must not inherit their
++		 * parent's TPIDR2 value or they may clobber their parent's
++		 * stack at some later point.
++		 *
++		 * When a process is fork()'d, the child must inherit ZA and
++		 * TPIDR2 from its parent in case there was dormant ZA state.
++		 *
++		 * Use CLONE_VM to determine when the child will share the
++		 * address space with the parent, and cannot safely inherit the
++		 * state.
+ 		 */
+-		if (clone_flags & CLONE_SETTLS) {
+-			p->thread.uw.tp_value = tls;
+-			p->thread.tpidr2_el0 = 0;
++		if (system_supports_sme()) {
++			if (!(clone_flags & CLONE_VM)) {
++				p->thread.tpidr2_el0 = read_sysreg_s(SYS_TPIDR2_EL0);
++				ret = copy_thread_za(p, current);
++				if (ret)
++					return ret;
++			} else {
++				p->thread.tpidr2_el0 = 0;
++				WARN_ON_ONCE(p->thread.svcr & SVCR_ZA_MASK);
++			}
+ 		}
++
++ 		/*
++ 		 * If a TLS pointer was passed to clone, use it for the new
++		 * thread.
++ 		 */
++		if (clone_flags & CLONE_SETTLS)
++ 			p->thread.uw.tp_value = tls;
+ 	} else {
+ 		/*
+ 		 * A kthread has no context to ERET to, so ensure any buggy
