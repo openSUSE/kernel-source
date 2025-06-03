@@ -1,0 +1,165 @@
+Patch-mainline: v6.16-rc1
+Git-commit: 94c477a751c7b835f52e9171f1266027dd06aa1d
+References: jsc#PED-348
+From: Isaku Yamahata <isaku.yamahata@intel.com>
+Date: Tue, 12 Nov 2024 15:36:36 +0800
+Subject: [PATCH] x86/virt/tdx: Add SEAMCALL wrappers to add TD private pages
+
+TDX architecture introduces the concept of private GPA vs shared GPA,
+depending on the GPA.SHARED bit. The TDX module maintains a Secure EPT
+(S-EPT or SEPT) tree per TD to translate TD's private memory accessed
+using a private GPA. Wrap the SEAMCALL TDH.MEM.PAGE.ADD with
+tdh_mem_page_add() and TDH.MEM.PAGE.AUG with tdh_mem_page_aug() to add TD
+private pages and map them to the TD's private GPAs in the SEPT.
+
+Callers of tdh_mem_page_add() and tdh_mem_page_aug() allocate and provide
+normal pages to the wrappers, who further pass those pages to the TDX
+module. Before passing the pages to the TDX module, tdh_mem_page_add() and
+tdh_mem_page_aug() perform a CLFLUSH on the page mapped with keyID 0 to
+ensure that any dirty cache lines don't write back later and clobber TD
+memory or control structures. Don't worry about the other MK-TME keyIDs
+because the kernel doesn't use them. The TDX docs specify that this flush
+is not needed unless the TDX module exposes the CLFLUSH_BEFORE_ALLOC
+feature bit. Do the CLFLUSH unconditionally for two reasons: make the
+solution simpler by having a single path that can handle both
+!CLFLUSH_BEFORE_ALLOC and CLFLUSH_BEFORE_ALLOC cases. Avoid wading into any
+correctness uncertainty by going with a conservative solution to start.
+
+Call tdh_mem_page_add() to add a private page to a TD during the TD's build
+time (i.e., before TDH.MR.FINALIZE). Specify which GPA the 4K private page
+will map to. No need to specify level info since TDH.MEM.PAGE.ADD only adds
+pages at 4K level. To provide initial contents to TD, provide an additional
+source page residing in memory managed by the host kernel itself (encrypted
+with a shared keyID). The TDX module will copy the initial contents from
+the source page in shared memory into the private page after mapping the
+page in the SEPT to the specified private GPA. The TDX module allows the
+source page to be the same page as the private page to be added. In that
+case, the TDX module converts and encrypts the source page as a TD private
+page.
+
+Call tdh_mem_page_aug() to add a private page to a TD during the TD's
+runtime (i.e., after TDH.MR.FINALIZE). TDH.MEM.PAGE.AUG supports adding
+huge pages. Specify which GPA the private page will map to, along with
+level info embedded in the lower bits of the GPA. The TDX module will
+recognize the added page as the TD's private page after the TD's acceptance
+with TDCALL TDG.MEM.PAGE.ACCEPT.
+
+tdh_mem_page_add() and tdh_mem_page_aug() may fail. Callers can check
+function return value and retrieve extended error info from the function
+output parameters.
+
+The TDX module has many internal locks. To avoid staying in SEAM mode for
+too long, SEAMCALLs returns a BUSY error code to the kernel instead of
+spinning on the locks. Depending on the specific SEAMCALL, the caller
+may need to handle this error in specific ways (e.g., retry). Therefore,
+return the SEAMCALL error code directly to the caller. Don't attempt to
+handle it in the core kernel.
+
+[Kai: Switched from generic seamcall export]
+[Yan: Re-wrote the changelog]
+Co-developed-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Signed-off-by: Isaku Yamahata <isaku.yamahata@intel.com>
+Signed-off-by: Kai Huang <kai.huang@intel.com>
+Signed-off-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Signed-off-by: Yan Zhao <yan.y.zhao@intel.com>
+Message-ID: <20241112073636.22129-1-yan.y.zhao@intel.com>
+Acked-by: Dave Hansen <dave.hansen@linux.intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/include/asm/tdx.h  |  2 ++
+ arch/x86/virt/vmx/tdx/tdx.c | 39 +++++++++++++++++++++++++++++++++++++
+ arch/x86/virt/vmx/tdx/tdx.h |  2 ++
+ 3 files changed, 43 insertions(+)
+
+diff --git a/arch/x86/include/asm/tdx.h b/arch/x86/include/asm/tdx.h
+index c3be3742f347..af1c6036b214 100644
+--- a/arch/x86/include/asm/tdx.h
++++ b/arch/x86/include/asm/tdx.h
+@@ -166,8 +166,10 @@ static inline int pg_level_to_tdx_sept_level(enum pg_level level)
+ }
+ 
+ u64 tdh_mng_addcx(struct tdx_td *td, struct page *tdcs_page);
++u64 tdh_mem_page_add(struct tdx_td *td, u64 gpa, struct page *page, struct page *source, u64 *ext_err1, u64 *ext_err2);
+ u64 tdh_mem_sept_add(struct tdx_td *td, u64 gpa, int level, struct page *page, u64 *ext_err1, u64 *ext_err2);
+ u64 tdh_vp_addcx(struct tdx_vp *vp, struct page *tdcx_page);
++u64 tdh_mem_page_aug(struct tdx_td *td, u64 gpa, int level, struct page *page, u64 *ext_err1, u64 *ext_err2);
+ u64 tdh_mng_key_config(struct tdx_td *td);
+ u64 tdh_mng_create(struct tdx_td *td, u16 hkid);
+ u64 tdh_vp_create(struct tdx_td *td, struct tdx_vp *vp);
+diff --git a/arch/x86/virt/vmx/tdx/tdx.c b/arch/x86/virt/vmx/tdx/tdx.c
+index 506a75fbac0b..4ae10246260e 100644
+--- a/arch/x86/virt/vmx/tdx/tdx.c
++++ b/arch/x86/virt/vmx/tdx/tdx.c
+@@ -1529,6 +1529,26 @@ u64 tdh_mng_addcx(struct tdx_td *td, struct page *tdcs_page)
+ }
+ EXPORT_SYMBOL_GPL(tdh_mng_addcx);
+ 
++u64 tdh_mem_page_add(struct tdx_td *td, u64 gpa, struct page *page, struct page *source, u64 *ext_err1, u64 *ext_err2)
++{
++	struct tdx_module_args args = {
++		.rcx = gpa,
++		.rdx = tdx_tdr_pa(td),
++		.r8 = page_to_phys(page),
++		.r9 = page_to_phys(source),
++	};
++	u64 ret;
++
++	tdx_clflush_page(page);
++	ret = seamcall_ret(TDH_MEM_PAGE_ADD, &args);
++
++	*ext_err1 = args.rcx;
++	*ext_err2 = args.rdx;
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(tdh_mem_page_add);
++
+ u64 tdh_mem_sept_add(struct tdx_td *td, u64 gpa, int level, struct page *page, u64 *ext_err1, u64 *ext_err2)
+ {
+ 	struct tdx_module_args args = {
+@@ -1560,6 +1580,25 @@ u64 tdh_vp_addcx(struct tdx_vp *vp, struct page *tdcx_page)
+ }
+ EXPORT_SYMBOL_GPL(tdh_vp_addcx);
+ 
++u64 tdh_mem_page_aug(struct tdx_td *td, u64 gpa, int level, struct page *page, u64 *ext_err1, u64 *ext_err2)
++{
++	struct tdx_module_args args = {
++		.rcx = gpa | level,
++		.rdx = tdx_tdr_pa(td),
++		.r8 = page_to_phys(page),
++	};
++	u64 ret;
++
++	tdx_clflush_page(page);
++	ret = seamcall_ret(TDH_MEM_PAGE_AUG, &args);
++
++	*ext_err1 = args.rcx;
++	*ext_err2 = args.rdx;
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(tdh_mem_page_aug);
++
+ u64 tdh_mng_key_config(struct tdx_td *td)
+ {
+ 	struct tdx_module_args args = {
+diff --git a/arch/x86/virt/vmx/tdx/tdx.h b/arch/x86/virt/vmx/tdx/tdx.h
+index f3e37df4c63a..5879bdb0045f 100644
+--- a/arch/x86/virt/vmx/tdx/tdx.h
++++ b/arch/x86/virt/vmx/tdx/tdx.h
+@@ -15,8 +15,10 @@
+  * TDX module SEAMCALL leaf functions
+  */
+ #define TDH_MNG_ADDCX			1
++#define TDH_MEM_PAGE_ADD		2
+ #define TDH_MEM_SEPT_ADD		3
+ #define TDH_VP_ADDCX			4
++#define TDH_MEM_PAGE_AUG		6
+ #define TDH_MNG_KEY_CONFIG		8
+ #define TDH_MNG_CREATE			9
+ #define TDH_MNG_RD			11
+-- 
+2.43.0
+
