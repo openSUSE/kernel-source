@@ -1,0 +1,179 @@
+Patch-mainline: v6.16-rc1
+Git-commit: 4b2abc49712b2f50ee57d71a47f6a771b86f1bd8
+References: jsc#PED-348
+From: Yan Zhao <yan.y.zhao@intel.com>
+Date: Thu, 27 Feb 2025 09:20:05 +0800
+Subject: [PATCH] KVM: TDX: Kick off vCPUs when SEAMCALL is busy during TD page
+ removal
+
+Kick off all vCPUs and prevent tdh_vp_enter() from executing whenever
+tdh_mem_range_block()/tdh_mem_track()/tdh_mem_page_remove() encounters
+contention, since the page removal path does not expect error and is less
+sensitive to the performance penalty caused by kicking off vCPUs.
+
+Although KVM has protected SEPT zap-related SEAMCALLs with kvm->mmu_lock,
+KVM may still encounter TDX_OPERAND_BUSY due to the contention in the TDX
+module.
+- tdh_mem_track() may contend with tdh_vp_enter().
+- tdh_mem_range_block()/tdh_mem_page_remove() may contend with
+  tdh_vp_enter() and TDCALLs.
+
+Resources     SHARED users      EXCLUSIVE users
+------------------------------------------------------------
+TDCS epoch    tdh_vp_enter      tdh_mem_track
+------------------------------------------------------------
+SEPT tree  tdh_mem_page_remove  tdh_vp_enter (0-step mitigation)
+                                tdh_mem_range_block
+------------------------------------------------------------
+SEPT entry                      tdh_mem_range_block (Host lock)
+                                tdh_mem_page_remove (Host lock)
+                                tdg_mem_page_accept (Guest lock)
+                                tdg_mem_page_attr_rd (Guest lock)
+                                tdg_mem_page_attr_wr (Guest lock)
+
+Use a TDX specific per-VM flag wait_for_sept_zap along with
+KVM_REQ_OUTSIDE_GUEST_MODE to kick off vCPUs and prevent them from entering
+TD, thereby avoiding the potential contention. Apply the kick-off and no
+vCPU entering only after each SEAMCALL busy error to minimize the window of
+no TD entry, as the contention due to 0-step mitigation or TDCALLs is
+expected to be rare.
+
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Yan Zhao <yan.y.zhao@intel.com>
+Message-ID: <20250227012021.1778144-5-binbin.wu@linux.intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/kvm/vmx/tdx.c | 63 ++++++++++++++++++++++++++++++++++++------
+ arch/x86/kvm/vmx/tdx.h |  7 +++++
+ 2 files changed, 61 insertions(+), 9 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index b8c94156f10f..9a03b189f64a 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -295,6 +295,26 @@ static void tdx_clear_page(struct page *page)
+ 	__mb();
+ }
+ 
++static void tdx_no_vcpus_enter_start(struct kvm *kvm)
++{
++	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
++
++	lockdep_assert_held_write(&kvm->mmu_lock);
++
++	WRITE_ONCE(kvm_tdx->wait_for_sept_zap, true);
++
++	kvm_make_all_cpus_request(kvm, KVM_REQ_OUTSIDE_GUEST_MODE);
++}
++
++static void tdx_no_vcpus_enter_stop(struct kvm *kvm)
++{
++	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
++
++	lockdep_assert_held_write(&kvm->mmu_lock);
++
++	WRITE_ONCE(kvm_tdx->wait_for_sept_zap, false);
++}
++
+ /* TDH.PHYMEM.PAGE.RECLAIM is allowed only when destroying the TD. */
+ static int __tdx_reclaim_page(struct page *page)
+ {
+@@ -980,6 +1000,14 @@ fastpath_t tdx_vcpu_run(struct kvm_vcpu *vcpu, bool force_immediate_exit)
+ 	 */
+ 	WARN_ON_ONCE(force_immediate_exit);
+ 
++	/*
++	 * Wait until retry of SEPT-zap-related SEAMCALL completes before
++	 * allowing vCPU entry to avoid contention with tdh_vp_enter() and
++	 * TDCALLs.
++	 */
++	if (unlikely(READ_ONCE(to_kvm_tdx(vcpu->kvm)->wait_for_sept_zap)))
++		return EXIT_FASTPATH_EXIT_HANDLED;
++
+ 	trace_kvm_entry(vcpu, force_immediate_exit);
+ 
+ 	if (pi_test_on(&vt->pi_desc)) {
+@@ -1493,15 +1521,24 @@ static int tdx_sept_drop_private_spte(struct kvm *kvm, gfn_t gfn,
+ 	if (KVM_BUG_ON(!is_hkid_assigned(kvm_tdx), kvm))
+ 		return -EINVAL;
+ 
+-	do {
++	/*
++	 * When zapping private page, write lock is held. So no race condition
++	 * with other vcpu sept operation.
++	 * Race with TDH.VP.ENTER due to (0-step mitigation) and Guest TDCALLs.
++	 */
++	err = tdh_mem_page_remove(&kvm_tdx->td, gpa, tdx_level, &entry,
++				  &level_state);
++
++	if (unlikely(tdx_operand_busy(err))) {
+ 		/*
+-		 * When zapping private page, write lock is held. So no race
+-		 * condition with other vcpu sept operation.  Race only with
+-		 * TDH.VP.ENTER.
++		 * The second retry is expected to succeed after kicking off all
++		 * other vCPUs and prevent them from invoking TDH.VP.ENTER.
+ 		 */
++		tdx_no_vcpus_enter_start(kvm);
+ 		err = tdh_mem_page_remove(&kvm_tdx->td, gpa, tdx_level, &entry,
+ 					  &level_state);
+-	} while (unlikely(tdx_operand_busy(err)));
++		tdx_no_vcpus_enter_stop(kvm);
++	}
+ 
+ 	if (KVM_BUG_ON(err, kvm)) {
+ 		pr_tdx_error_2(TDH_MEM_PAGE_REMOVE, err, entry, level_state);
+@@ -1585,9 +1622,13 @@ static int tdx_sept_zap_private_spte(struct kvm *kvm, gfn_t gfn,
+ 	WARN_ON_ONCE(level != PG_LEVEL_4K);
+ 
+ 	err = tdh_mem_range_block(&kvm_tdx->td, gpa, tdx_level, &entry, &level_state);
+-	if (unlikely(tdx_operand_busy(err)))
+-		return -EBUSY;
+ 
++	if (unlikely(tdx_operand_busy(err))) {
++		/* After no vCPUs enter, the second retry is expected to succeed */
++		tdx_no_vcpus_enter_start(kvm);
++		err = tdh_mem_range_block(&kvm_tdx->td, gpa, tdx_level, &entry, &level_state);
++		tdx_no_vcpus_enter_stop(kvm);
++	}
+ 	if (tdx_is_sept_zap_err_due_to_premap(kvm_tdx, err, entry, level) &&
+ 	    !KVM_BUG_ON(!atomic64_read(&kvm_tdx->nr_premapped), kvm)) {
+ 		atomic64_dec(&kvm_tdx->nr_premapped);
+@@ -1637,9 +1678,13 @@ static void tdx_track(struct kvm *kvm)
+ 
+ 	lockdep_assert_held_write(&kvm->mmu_lock);
+ 
+-	do {
++	err = tdh_mem_track(&kvm_tdx->td);
++	if (unlikely(tdx_operand_busy(err))) {
++		/* After no vCPUs enter, the second retry is expected to succeed */
++		tdx_no_vcpus_enter_start(kvm);
+ 		err = tdh_mem_track(&kvm_tdx->td);
+-	} while (unlikely(tdx_operand_busy(err)));
++		tdx_no_vcpus_enter_stop(kvm);
++	}
+ 
+ 	if (KVM_BUG_ON(err, kvm))
+ 		pr_tdx_error(TDH_MEM_TRACK, err);
+diff --git a/arch/x86/kvm/vmx/tdx.h b/arch/x86/kvm/vmx/tdx.h
+index 93858959baf9..591fc09f3a8a 100644
+--- a/arch/x86/kvm/vmx/tdx.h
++++ b/arch/x86/kvm/vmx/tdx.h
+@@ -37,6 +37,13 @@ struct kvm_tdx {
+ 
+ 	/* For KVM_TDX_INIT_MEM_REGION. */
+ 	atomic64_t nr_premapped;
++
++	/*
++	 * Prevent vCPUs from TD entry to ensure SEPT zap related SEAMCALLs do
++	 * not contend with tdh_vp_enter() and TDCALLs.
++	 * Set/unset is protected with kvm->mmu_lock.
++	 */
++	bool wait_for_sept_zap;
+ };
+ 
+ /* TDX module vCPU states */
+-- 
+2.43.0
+
