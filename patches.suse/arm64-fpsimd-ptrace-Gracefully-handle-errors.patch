@@ -1,0 +1,191 @@
+From: Mark Rutland <mark.rutland@arm.com>
+Date: Thu, 8 May 2025 14:26:39 +0100
+Subject: arm64/fpsimd: ptrace: Gracefully handle errors
+Git-commit: 9f8bf718f29230e38a048d08fc3063e316cd60c1
+Patch-mainline: v6.16-rc1
+References: git-fixes
+
+Within sve_set_common() we do not handle error conditions correctly:
+
+* When writing to NT_ARM_SSVE, if sme_alloc() fails, the task will be
+  left with task->thread.sme_state==NULL, but TIF_SME will be set and
+  task->thread.fp_type==FP_STATE_SVE. This will result in a subsequent
+  null pointer dereference when the task's state is loaded or otherwise
+  manipulated.
+
+* When writing to NT_ARM_SSVE, if sve_alloc() fails, the task will be
+  left with task->thread.sve_state==NULL, but TIF_SME will be set,
+  PSTATE.SM will be set, and task->thread.fp_type==FP_STATE_FPSIMD.
+  This is not a legitimate state, and can result in various problems,
+  including a subsequent null pointer dereference and/or the task
+  inheriting stale streaming mode register state the next time its state
+  is loaded into hardware.
+
+* When writing to NT_ARM_SSVE, if the VL is changed but the resulting VL
+  differs from that in the header, the task will be left with TIF_SME
+  set, PSTATE.SM set, but task->thread.fp_type==FP_STATE_FPSIMD. This is
+  not a legitimate state, and can result in various problems as
+  described above.
+
+Avoid these problems by allocating memory earlier, and by changing the
+task's saved fp_type to FP_STATE_SVE before skipping register writes due
+to a change of VL.
+
+To make early returns simpler, I've moved the call to
+fpsimd_flush_task_state() earlier. As the tracee's state has already
+been saved, and the tracee is known to be blocked for the duration of
+sve_set_common(), it doesn't matter whether this is called at the start
+or the end.
+
+For consistency I've moved the setting of TIF_SVE earlier. This will be
+cleared when loading FPSIMD-only state, and so moving this has no
+resulting functional change.
+
+Note that we only allocate the memory for SVE state when SVE register
+contents are provided, avoiding unnecessary memory allocations for tasks
+which only use FPSIMD.
+
+Fixes: e12310a0d30f ("arm64/sme: Implement ptrace support for streaming mode SVE registers")
+Fixes: baa8515281b3 ("arm64/fpsimd: Track the saved FPSIMD state type separately to TIF_SVE")
+Fixes: 5d0a8d2fba50 ("arm64/ptrace: Ensure that SME is set up for target when writing SSVE state")
+Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: David Spickett <david.spickett@arm.com>
+Cc: Luis Machado <luis.machado@arm.com>
+Cc: Marc Zyngier <maz@kernel.org>
+Cc: Mark Brown <broonie@kernel.org>
+Cc: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20250508132644.1395904-20-mark.rutland@arm.com
+Signed-off-by: Will Deacon <will@kernel.org>
+Acked-by: Ivan T. Ivanov <iivanov@suse.de>
+---
+ arch/arm64/kernel/ptrace.c |   61 +++++++++++++++++++--------------------------
+ 1 file changed, 26 insertions(+), 35 deletions(-)
+
+--- a/arch/arm64/kernel/ptrace.c
++++ b/arch/arm64/kernel/ptrace.c
+@@ -891,13 +891,15 @@ static int sve_set_common(struct task_st
+ 	unsigned long start, end;
+ 	bool fpsimd;
+ 
++	fpsimd_flush_task_state(target);
++
+ 	/* Header */
+ 	if (count < sizeof(header))
+ 		return -EINVAL;
+ 	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &header,
+ 				 0, sizeof(header));
+ 	if (ret)
+-		goto out;
++		return ret;
+ 
+ 	/*
+ 	 * Streaming SVE data is always stored and presented in SVE format.
+@@ -915,7 +917,21 @@ static int sve_set_common(struct task_st
+ 	ret = vec_set_vector_length(target, type, header.vl,
+ 		((unsigned long)header.flags & ~SVE_PT_REGS_MASK) << 16);
+ 	if (ret)
+-		goto out;
++		return ret;
++
++	/* Allocate SME storage if necessary, preserving any existing ZA/ZT state */
++	if (type == ARM64_VEC_SME) {
++		sme_alloc(target, false);
++		if (!target->thread.sme_state)
++			return -ENOMEM;
++	}
++
++	/* Allocate SVE storage if necessary, zeroing any existing SVE state */
++	if (!fpsimd) {
++		sve_alloc(target, true);
++		if (!target->thread.sve_state)
++			return -ENOMEM;
++	}
+ 
+ 	/* Actual VL set may be less than the user asked for: */
+ 	vq = sve_vq_from_vl(task_get_vl(target, type));
+@@ -925,21 +941,15 @@ static int sve_set_common(struct task_st
+ 		switch (type) {
+ 		case ARM64_VEC_SVE:
+ 			target->thread.svcr &= ~SVCR_SM_MASK;
++			set_tsk_thread_flag(target, TIF_SVE);
+ 			break;
+ 		case ARM64_VEC_SME:
+ 			target->thread.svcr |= SVCR_SM_MASK;
+-
+-			/*
+-			 * Disable traps and ensure there is SME storage but
+-			 * preserve any currently set values in ZA/ZT.
+-			 */
+-			sme_alloc(target, false);
+ 			set_tsk_thread_flag(target, TIF_SME);
+ 			break;
+ 		default:
+ 			WARN_ON_ONCE(1);
+-			ret = -EINVAL;
+-			goto out;
++			return -EINVAL;
+ 		}
+ 	}
+ 
+@@ -955,37 +965,20 @@ static int sve_set_common(struct task_st
+ 		target->thread.fp_type = FP_STATE_FPSIMD;
+ 		ret = __fpr_set(target, regset, pos, count, kbuf, ubuf,
+ 				SVE_PT_FPSIMD_OFFSET);
+-		goto out;
++		return ret;
+ 	}
+ 
+ 	/* Otherwise: no registers or full SVE case. */
+ 
++	target->thread.fp_type = FP_STATE_SVE;
++
+ 	/*
+ 	 * If setting a different VL from the requested VL and there is
+ 	 * register data, the data layout will be wrong: don't even
+ 	 * try to set the registers in this case.
+ 	 */
+-	if (count && vq != sve_vq_from_vl(header.vl)) {
+-		ret = -EIO;
+-		goto out;
+-	}
+-
+-	/* Always zero SVE state */
+-	sve_alloc(target, true);
+-	if (!target->thread.sve_state) {
+-		ret = -ENOMEM;
+-		clear_tsk_thread_flag(target, TIF_SVE);
+-		target->thread.fp_type = FP_STATE_FPSIMD;
+-		goto out;
+-	}
+-
+-	/*
+-	 * Only enable SVE if we are configuring normal SVE, a system with
+-	 * streaming SVE may not have normal SVE.
+-	 */
+-	if (type == ARM64_VEC_SVE)
+-		set_tsk_thread_flag(target, TIF_SVE);
+-	target->thread.fp_type = FP_STATE_SVE;
++	if (count && vq != sve_vq_from_vl(header.vl))
++		return -EIO;
+ 
+ 	BUILD_BUG_ON(SVE_PT_SVE_OFFSET != sizeof(header));
+ 	start = SVE_PT_SVE_OFFSET;
+@@ -994,7 +987,7 @@ static int sve_set_common(struct task_st
+ 				 target->thread.sve_state,
+ 				 start, end);
+ 	if (ret)
+-		goto out;
++		return ret;
+ 
+ 	start = end;
+ 	end = SVE_PT_SVE_FPSR_OFFSET(vq);
+@@ -1010,8 +1003,6 @@ static int sve_set_common(struct task_st
+ 				 &target->thread.uw.fpsimd_state.fpsr,
+ 				 start, end);
+ 
+-out:
+-	fpsimd_flush_task_state(target);
+ 	return ret;
+ }
+ 
