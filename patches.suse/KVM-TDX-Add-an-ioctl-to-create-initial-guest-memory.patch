@@ -1,0 +1,256 @@
+Patch-mainline: v6.16-rc1
+Git-commit: c846b451d3c5d4ba304bbeeaf7aa9a04bb432408
+References: jsc#PED-348
+From: Isaku Yamahata <isaku.yamahata@intel.com>
+Date: Tue, 12 Nov 2024 15:38:37 +0800
+Subject: [PATCH] KVM: TDX: Add an ioctl to create initial guest memory
+
+Add a new ioctl for the user space VMM to initialize guest memory with the
+specified memory contents.
+
+Because TDX protects the guest's memory, the creation of the initial guest
+memory requires a dedicated TDX module API, TDH.MEM.PAGE.ADD(), instead of
+directly copying the memory contents into the guest's memory in the case of
+the default VM type.
+
+Define a new subcommand, KVM_TDX_INIT_MEM_REGION, of vCPU-scoped
+KVM_MEMORY_ENCRYPT_OP.  Check if the GFN is already pre-allocated, assign
+the guest page in Secure-EPT, copy the initial memory contents into the
+guest memory, and encrypt the guest memory.  Optionally, extend the memory
+measurement of the TDX guest.
+
+The ioctl uses the vCPU file descriptor because of the TDX module's
+requirement that the memory is added to the S-EPT (via TDH.MEM.SEPT.ADD)
+prior to initialization (TDH.MEM.PAGE.ADD).  Accessing the MMU in turn
+requires a vCPU file descriptor, just like for KVM_PRE_FAULT_MEMORY.  In
+fact, the post-populate callback is able to reuse the same logic used by
+KVM_PRE_FAULT_MEMORY, so that userspace can do everything with a single
+ioctl.
+
+Note that this is the only way to invoke TDH.MEM.SEPT.ADD before the TD
+in finalized, as userspace cannot use KVM_PRE_FAULT_MEMORY at that
+point.  This ensures that there cannot be pages in the S-EPT awaiting
+TDH.MEM.PAGE.ADD, which would be treated incorrectly as spurious by
+tdp_mmu_map_handle_target_level() (KVM would see the SPTE as PRESENT,
+but the corresponding S-EPT entry will be !PRESENT).
+
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Isaku Yamahata <isaku.yamahata@intel.com>
+Co-developed-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Signed-off-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Co-developed-by: Yan Zhao <yan.y.zhao@intel.com>
+Signed-off-by: Yan Zhao <yan.y.zhao@intel.com>
+---
+ - KVM_BUG_ON() for kvm_tdx->nr_premapped (Paolo)
+ - Use tdx_operand_busy()
+ - Merge first patch in SEPT SEAMCALL retry series in to this base
+   (Paolo)
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/include/uapi/asm/kvm.h |   9 ++
+ arch/x86/kvm/vmx/tdx.c          | 144 ++++++++++++++++++++++++++++++++
+ 2 files changed, 153 insertions(+)
+
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index cd55484e3f0c..ee1b517351a3 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -932,6 +932,7 @@ enum kvm_tdx_cmd_id {
+ 	KVM_TDX_CAPABILITIES = 0,
+ 	KVM_TDX_INIT_VM,
+ 	KVM_TDX_INIT_VCPU,
++	KVM_TDX_INIT_MEM_REGION,
+ 	KVM_TDX_GET_CPUID,
+ 
+ 	KVM_TDX_CMD_NR_MAX,
+@@ -987,4 +988,12 @@ struct kvm_tdx_init_vm {
+ 	struct kvm_cpuid2 cpuid;
+ };
+ 
++#define KVM_TDX_MEASURE_MEMORY_REGION   _BITULL(0)
++
++struct kvm_tdx_init_mem_region {
++	__u64 source_addr;
++	__u64 gpa;
++	__u64 nr_pages;
++};
++
+ #endif /* _ASM_X86_KVM_H */
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index 3e8c99d731d6..6132eac61ed5 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -1,4 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
++#include <linux/cleanup.h>
+ #include <linux/cpu.h>
+ #include <asm/cpufeature.h>
+ #include <linux/misc_cgroup.h>
+@@ -10,6 +11,7 @@
+ #include "tdx.h"
+ #include "vmx.h"
+ #include "mmu/spte.h"
++#include "common.h"
+ 
+ #pragma GCC poison to_vmx
+ 
+@@ -1606,6 +1608,145 @@ static int tdx_vcpu_init(struct kvm_vcpu *vcpu, struct kvm_tdx_cmd *cmd)
+ 	return 0;
+ }
+ 
++struct tdx_gmem_post_populate_arg {
++	struct kvm_vcpu *vcpu;
++	__u32 flags;
++};
++
++static int tdx_gmem_post_populate(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn,
++				  void __user *src, int order, void *_arg)
++{
++	u64 error_code = PFERR_GUEST_FINAL_MASK | PFERR_PRIVATE_ACCESS;
++	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
++	struct tdx_gmem_post_populate_arg *arg = _arg;
++	struct kvm_vcpu *vcpu = arg->vcpu;
++	gpa_t gpa = gfn_to_gpa(gfn);
++	u8 level = PG_LEVEL_4K;
++	struct page *src_page;
++	int ret, i;
++	u64 err, entry, level_state;
++
++	/*
++	 * Get the source page if it has been faulted in. Return failure if the
++	 * source page has been swapped out or unmapped in primary memory.
++	 */
++	ret = get_user_pages_fast((unsigned long)src, 1, 0, &src_page);
++	if (ret < 0)
++		return ret;
++	if (ret != 1)
++		return -ENOMEM;
++
++	ret = kvm_tdp_map_page(vcpu, gpa, error_code, &level);
++	if (ret < 0)
++		goto out;
++
++	/*
++	 * The private mem cannot be zapped after kvm_tdp_map_page()
++	 * because all paths are covered by slots_lock and the
++	 * filemap invalidate lock.  Check that they are indeed enough.
++	 */
++	if (IS_ENABLED(CONFIG_KVM_PROVE_MMU)) {
++		scoped_guard(read_lock, &kvm->mmu_lock) {
++			if (KVM_BUG_ON(!kvm_tdp_mmu_gpa_is_mapped(vcpu, gpa), kvm)) {
++				ret = -EIO;
++				goto out;
++			}
++		}
++	}
++
++	ret = 0;
++	err = tdh_mem_page_add(&kvm_tdx->td, gpa, pfn_to_page(pfn),
++			       src_page, &entry, &level_state);
++	if (err) {
++		ret = unlikely(tdx_operand_busy(err)) ? -EBUSY : -EIO;
++		goto out;
++	}
++
++	if (arg->flags & KVM_TDX_MEASURE_MEMORY_REGION) {
++		for (i = 0; i < PAGE_SIZE; i += TDX_EXTENDMR_CHUNKSIZE) {
++			err = tdh_mr_extend(&kvm_tdx->td, gpa + i, &entry,
++					    &level_state);
++			if (err) {
++				ret = -EIO;
++				break;
++			}
++		}
++	}
++
++out:
++	put_page(src_page);
++	return ret;
++}
++
++static int tdx_vcpu_init_mem_region(struct kvm_vcpu *vcpu, struct kvm_tdx_cmd *cmd)
++{
++	struct vcpu_tdx *tdx = to_tdx(vcpu);
++	struct kvm *kvm = vcpu->kvm;
++	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
++	struct kvm_tdx_init_mem_region region;
++	struct tdx_gmem_post_populate_arg arg;
++	long gmem_ret;
++	int ret;
++
++	if (tdx->state != VCPU_TD_STATE_INITIALIZED)
++		return -EINVAL;
++
++	guard(mutex)(&kvm->slots_lock);
++
++	/* Once TD is finalized, the initial guest memory is fixed. */
++	if (kvm_tdx->state == TD_STATE_RUNNABLE)
++		return -EINVAL;
++
++	if (cmd->flags & ~KVM_TDX_MEASURE_MEMORY_REGION)
++		return -EINVAL;
++
++	if (copy_from_user(&region, u64_to_user_ptr(cmd->data), sizeof(region)))
++		return -EFAULT;
++
++	if (!PAGE_ALIGNED(region.source_addr) || !PAGE_ALIGNED(region.gpa) ||
++	    !region.nr_pages ||
++	    region.gpa + (region.nr_pages << PAGE_SHIFT) <= region.gpa ||
++	    !vt_is_tdx_private_gpa(kvm, region.gpa) ||
++	    !vt_is_tdx_private_gpa(kvm, region.gpa + (region.nr_pages << PAGE_SHIFT) - 1))
++		return -EINVAL;
++
++	kvm_mmu_reload(vcpu);
++	ret = 0;
++	while (region.nr_pages) {
++		if (signal_pending(current)) {
++			ret = -EINTR;
++			break;
++		}
++
++		arg = (struct tdx_gmem_post_populate_arg) {
++			.vcpu = vcpu,
++			.flags = cmd->flags,
++		};
++		gmem_ret = kvm_gmem_populate(kvm, gpa_to_gfn(region.gpa),
++					     u64_to_user_ptr(region.source_addr),
++					     1, tdx_gmem_post_populate, &arg);
++		if (gmem_ret < 0) {
++			ret = gmem_ret;
++			break;
++		}
++
++		if (gmem_ret != 1) {
++			ret = -EIO;
++			break;
++		}
++
++		region.source_addr += PAGE_SIZE;
++		region.gpa += PAGE_SIZE;
++		region.nr_pages--;
++
++		cond_resched();
++	}
++
++	if (copy_to_user(u64_to_user_ptr(cmd->data), &region, sizeof(region)))
++		ret = -EFAULT;
++	return ret;
++}
++
+ int tdx_vcpu_ioctl(struct kvm_vcpu *vcpu, void __user *argp)
+ {
+ 	struct kvm_tdx *kvm_tdx = to_kvm_tdx(vcpu->kvm);
+@@ -1625,6 +1766,9 @@ int tdx_vcpu_ioctl(struct kvm_vcpu *vcpu, void __user *argp)
+ 	case KVM_TDX_INIT_VCPU:
+ 		ret = tdx_vcpu_init(vcpu, &cmd);
+ 		break;
++	case KVM_TDX_INIT_MEM_REGION:
++		ret = tdx_vcpu_init_mem_region(vcpu, &cmd);
++		break;
+ 	case KVM_TDX_GET_CPUID:
+ 		ret = tdx_vcpu_get_cpuid(vcpu, &cmd);
+ 		break;
+-- 
+2.43.0
+
