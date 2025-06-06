@@ -6,6 +6,8 @@ VARIANT=-rt
 COMPRESS_MODULES="zstd"
 # Use new style livepatch package names
 LIVEPATCH=livepatch
+# Enable livepatching related packages on -rt variant
+LIVEPATCH_RT=1
 # Compile binary devicetrees for Leap
 BUILD_DTBS="Yes"
 # buildservice projects to build the kernel against
