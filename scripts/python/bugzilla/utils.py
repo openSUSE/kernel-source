@@ -16,8 +16,8 @@ def get_score(s):
     m = re.search(CVSS_PATTERN, s)
     return m.group(1) if m else ''
 
-def get_bugzilla_api():
-    return bugzilla.Bugzilla(DEFAULT_BZ)
+def get_bugzilla_api(rest=False):
+    return bugzilla.Bugzilla(DEFAULT_BZ, force_rest=rest)
 
 def check_being_logged_in(bzapi):
     if not bzapi.logged_in:
