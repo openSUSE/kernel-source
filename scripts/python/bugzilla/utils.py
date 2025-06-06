@@ -1,8 +1,23 @@
-import bugzilla, datetime, os
+import bugzilla, datetime, os, re, sys
 from bugzilla._cli import DEFAULT_BZ
 
-def get_bugzilla_api():
-    return bugzilla.Bugzilla(DEFAULT_BZ)
+CVSS_PATTERN = re.compile(r"CVSSv3.1:SUSE:CVE-[0-9]{4}-[0-9]{4,}:([0-9].[0-9])")
+
+def handle_email(email):
+    if email == '__empty-env-var__':
+        print("Please set the environment variable BUGZILLA_ACCOUNT_EMAIL to your bugzilla email or provide it after --email (-e).", file=sys.stderr)
+        sys.exit(1)
+    if len(email) < 9 or "@suse." not in email:
+        print("no valid bz email provided", file=sys.stderr)
+        sys.exit(1)
+    return email
+
+def get_score(s):
+    m = re.search(CVSS_PATTERN, s)
+    return m.group(1) if m else ''
+
+def get_bugzilla_api(rest=False):
+    return bugzilla.Bugzilla(DEFAULT_BZ, force_rest=rest)
 
 def check_being_logged_in(bzapi):
     if not bzapi.logged_in:

@@ -1,13 +1,12 @@
 #!/usr/bin/python3
 import sys, re, os, argparse, datetime, bugzilla, subprocess, multiprocessing, json
 import git_sort.pygit2_wrapper as git
-from bugzilla.utils import get_bugzilla_api, check_being_logged_in, format_time, get_backport_string, make_url
+from bugzilla.utils import get_bugzilla_api, check_being_logged_in, format_time, get_backport_string, make_url, get_score, handle_email
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # dashboard kss script - work in progress
 
 CVE_PATTERN = re.compile(r"CVE-[0-9]{4}-[0-9]{4,}")
-CVSS_PATTERN = re.compile(r"CVSSv3.1:SUSE:CVE-[0-9]{4}-[0-9]{4,}:([0-9].[0-9])")
 VECTOR_PATTERN = re.compile(r"CVSSv3.1:SUSE:CVE-[0-9]{4}-[0-9]{4,}:[0-9]{1,}.[0-9]:\(AV:(.)\/AC:(.)\/PR:(.)\/UI:(.)\/S:(.)\/C:(.)\/I:(.)\/A:(.)\)")
 ZDI_PATTERN = re.compile(r"ZDI-[0-9]{2}-[0-9]{3,}")
 FIXES_PATTERN = re.compile(r"Fixes: ([0-9a-f]{12,})")
@@ -62,10 +61,6 @@ def get_cve(s):
     m = re.search(CVE_PATTERN, s)
     return m.group(0) if m else ''
 
-def get_score(s):
-    m = re.search(CVSS_PATTERN, s)
-    return m.group(1) if m else ''
-
 def make_deadline(score):
     base_score = 0
     try:
@@ -78,12 +73,35 @@ def make_deadline(score):
         return 90
     return None
 
-def fetch_cves():
+def validate_characters(sha):
+    for c in sha:
+        if c not in "0123456789abcdefABCDEF":
+            return True
+    return False
+
+def validate_hashes(cves):
+    for k, cve in cves.items():
+        for v in cve:
+            if v and (len(v) != 40 or validate_characters(v)):
+                print(color_format(T_RED, f'{v} is not a valid hash for a cve {k}'), file=sys.stderr)
+                cves[k] = [e for e in cves[k] if e != v]
+
+def fetch_cves(cves):
     repo = git.Repository(check_envvar('VULNS_GIT'))
     tree_index = git.Index()
     tree_index.read_tree(repo.revparse_single('origin/master').tree)
-    return ( { get_cve(t.path): repo[t.id].data.decode('ascii').rstrip() for t in tree_index if t.path.startswith('cve/published/') and t.path.endswith('.sha1') },
-             { get_cve(t.path): repo[t.id].data.decode('ascii').rstrip() for t in tree_index if t.path.startswith('cve/rejected/') and t.path.endswith('.sha1') } )
+    def path_contains_one_of(path, elements):
+        for e in elements:
+            if e in path:
+                return True
+        return False
+    path_filtered_tree_data = [ t for t in tree_index if t.path.startswith('cve/') and t.path.endswith('.sha1') and path_contains_one_of(t.path, cves) ]
+    published_data = [ (t.path, t.id) for t in path_filtered_tree_data if t.path.startswith('cve/published/') ]
+    rejected_data = [ (t.path, t.id) for t in path_filtered_tree_data if t.path.startswith('cve/rejected/') ]
+    path_filtered_tree_vulnerable_data = [ t for t in tree_index if t.path.startswith('cve/') and t.path.endswith('.vulnerable') and path_contains_one_of(t.path, cves) ]
+    return ( { get_cve(t[0]): repo[t[1]].data.decode('ascii').rstrip().split() for t in published_data },
+             { get_cve(t[0]): repo[t[1]].data.decode('ascii').rstrip().split() for t in rejected_data },
+             { get_cve(t.path): repo[t.id].data.decode('ascii').rstrip().split() for t in path_filtered_tree_vulnerable_data })
 
 def show_patch(p, h):
     yield f'--- Begin {h} ---\n'
@@ -167,22 +185,23 @@ class MainlineRepo:
         return { p.lstrip() for p in re.findall(PATCH_PATTERN, self.get_patch(h)) }
 
 class BugData:
-    def __init__(self, bug, published, rejected):
+    def __init__(self, bug):
         self.is_rejected = False
         self.data = bug
         self.cve = get_cve(self.data.summary)
         self.zdi = get_zdi(self.data.summary)
-        self.sha = published.get(self.cve, '')
-        if not self.sha:
-            self.sha = rejected.get(self.cve, '')
-            if self.sha:
-                self.is_rejected = True
+        self.shas = []
+        self.breakers = []
         self.score = get_score(self.data.status_whiteboard)
+        self.bz_deadline = datetime.datetime.strptime(self.data.deadline, "%Y-%m-%d").date() if hasattr(self.data, 'deadline') else None
         self.deadline = make_deadline(self.score)
         self.mtime = format_time(bug.last_change_time)
         self.btime = format_time(bug.creation_time)
         self.age = (today - self.btime.date()).days
-        self.overdue = None if not self.deadline else - (self.deadline - self.age)
+        if self.bz_deadline:
+            self.overdue = (today - self.bz_deadline).days
+        else:
+            self.overdue = None if not self.deadline else - (self.deadline - self.age)
         self.paths = None
         self.vector = None
         self.comments = []
@@ -193,24 +212,33 @@ class BugData:
         self.embargoed = 'EMBARGOED' in self.data.summary
         self.sgm_data = {}
 
+    def update_vulns(self, published, rejected, breakers):
+        self.breakers = list(set(breakers.get(self.cve, '')))
+        self.shas = published.get(self.cve, '')
+        if not self.shas:
+            self.shas = rejected.get(self.cve, '')
+            if self.shas:
+                self.is_rejected = True
+
     def grep_paths(self, regex, linux_git):
-        if not self.sha:
-            return False
-        self.paths = linux_git.get_all_paths(self.sha)
-        if [ p for p in self.paths if re.search(regex, p) ]:
-            return True
+        for s in self.shas:
+            self.paths = linux_git.get_all_paths(s)
+            if [ p for p in self.paths if re.search(regex, p) ]:
+                return True
+        return False
 
     def get_stats(self, linux_git):
-        if self.sha:
-            linux_git.get_patch(self.sha)
-            self.changes = linux_git.pstats[self.sha]['added'] + linux_git.pstats[self.sha]['removed']
+        for s in self.shas:
+            linux_git.get_patch(s)
+            self.changes += (linux_git.pstats[s]['added'] + linux_git.pstats[s]['removed'])
         return self.changes
 
     def grep_patch(self, regex, linux_git):
-        if not self.sha:
-            return False
-        patch = linux_git.get_patch(self.sha)
-        return re.search(regex, patch)
+        for s in self.shas:
+            patch = linux_git.get_patch(s)
+            if re.search(regex, patch):
+                return True
+        return False
 
     def store_comments(self, raw_comments):
         self.comments = [ { 'no': rc['count'], 'time': format_time(rc['time']), 'text': rc['text'], 'author': rc['creator'] } for rc in raw_comments
@@ -302,8 +330,8 @@ def banlist_emails_in_bz_query(query, emails):
 
 class BZApi:
     @ExitOnException("connect to bugzilla")
-    def __init__(self):
-        self.bzapi = get_bugzilla_api()
+    def __init__(self, rest):
+        self.bzapi = get_bugzilla_api(rest)
         if not check_being_logged_in(self.bzapi):
             sys.exit(1)
 
@@ -326,7 +354,7 @@ class BZApi:
         kvargs = { 'status': ['NEW', 'IN_PROGRESS', 'CONFIRMED', 'REOPENED'],
                    'product': 'SUSE Security Incidents',
                    'component': 'Incidents',
-                   'include_fields': ["id", "status", "summary", "status_whiteboard", "last_change_time", "creation_time", "assigned_to", "url"] }
+                   'include_fields': ["id", "status", "summary", "status_whiteboard", "last_change_time", "creation_time", "assigned_to", "url", "deadline"] }
         if bug_list:
             kvargs['bug_id'] = bug_list
             kvargs['status'].append('RESOLVED')
@@ -354,41 +382,55 @@ def show_bug(n, b, linux_git, args):
     color = T_RED
     fixes = []
     paths = []
-    if b.sha:
-        fixes = linux_git.get_all_fixes(b.sha)
-        if fixes and b.score and b.sha:
+    if b.shas:
+        for s in b.shas:
+            fixes.extend(linux_git.get_all_fixes(s))
+        if fixes and b.score and b.shas:
             color = T_GREEN
         if args.files:
             if b.paths:
                 paths = b.paths
             else:
-                paths = linux_git.get_all_paths(b.sha)
+                for s in b.shas:
+                    paths.extend(linux_git.get_all_paths(s))
         if args.short:
             fixes = []
     if not args.short:
         yield f'{n:>3}; '
-    middle = b.data.assigned_to if args.short and args.assigned_queue else color_format(color, b.sha)
+    middle = b.data.assigned_to if args.short and args.assigned_queue else ('' if not b.shas else color_format(color, b.shas[0]))
     padding_middle = 30 if args.short and args.assigned_queue else 40
     yield "{} ; {:<11} ; {:<14} ; {:>{}}".format(b.data.id, b.data.status, color_format(T_RED, b.cve) if b.is_rejected else b.cve, middle, padding_middle)
     yield " ; {:>4} ; {} ; {:>3} ; {}\n".format(b.score, b.btime if args.birth_time else b.mtime, b.age, color_format(T_RED, '[cve is rejected] ') + b.data.summary if b.is_rejected else b.data.summary)
-    for f in sorted(fixes):
-        yield f'{"":>46}{f}\n'
+    if len(b.shas) > 1:
+        for s in b.shas[1:]:
+            yield f'{"":>26}   {"additional fix":>14} : {color_format(color, s)}\n'
+    for f in sorted(set(fixes)):
+        in_vulns_str = ''
+        if f in b.breakers:
+            in_vulns_str = ', vulns'
+        yield f'{"":>26}   {"breaker":>14} : {f} : from patch{in_vulns_str}\n'
+    if not args.short:
+        for f in sorted(set(b.breakers)):
+            if f not in fixes:
+                yield f'{"":>26}   {"breaker":>14} : {f} : from vulns\n'
     if not args.short and not args.comments_short and b.data.assigned_to not in ('kernel-bugs@suse.de', 'cve-kpm@suse.de'):
         yield from b.show_last_comment_header()
-    if args.patch and b.sha:
-        yield from show_patch(linux_git.get_patch(b.sha), b.sha)
+    if args.patch and b.shas:
+        for s in b.shas:
+            yield from show_patch(linux_git.get_patch(s), s)
     else:
-        for p in sorted(paths):
+        for p in sorted(set(paths)):
             yield f'{"":>46}{color_format(T_PURPLE, p)}\n'
     if args.breakers and fixes:
-        for f in sorted(fixes):
+        for f in sorted(set(fixes) | set(b.breakers)):
             if f == GIT_ROOT:
                 yield f'{color_format(T_RED, "Warning")}: the breaker {color_format(T_YELLOW, GIT_ROOT)} is the initial commit (Linux-2.6.12-rc2)\n'
             else:
                 yield from show_patch(linux_git.get_patch(f), f)
-    if args.stats_info and b.sha:
-        linux_git.get_patch(b.sha)
-        yield from show_stats(linux_git, b.sha)
+    if args.stats_info and b.shas:
+        for s in b.shas:
+            linux_git.get_patch(s)
+            yield from show_stats(linux_git, s)
     for c in b.matched_comments:
         yield c + '\n'
     if b.vector:
@@ -419,13 +461,23 @@ def show_bug(n, b, linux_git, args):
             yield f'{color_format(T_RED, "Warning: ")}{b.cve} has more than 5 human comments\n'
         if not args.deadlines and b.overdue and b.overdue > 0:
             yield f'{color_format(T_RED, "Warning: ")}{b.cve} is {b.overdue} days overdue\n'
+        if not b.bz_deadline:
+            yield f'{color_format(T_RED, "Warning: ")}{b.cve} has no deadline in bugzilla\n'
         if b.data.assigned_to == 'kernel-bugs@suse.de':
             c_no = b.already_dispatched()
             if c_no:
                 yield f'{color_format(T_RED, "Warning: ")}{make_url(b.data.id)}#c{c_no} seems to have been already dispatched\n'
 
 def exportpatch(b):
-    yield get_backport_string([f'bsc#{b.data.id}', b.cve], b.sha, re.sub(CVE_PATTERN, '', b.data.summary.removeprefix('VUL-0: ').replace('kernel: ', ''))) + '\n'
+    for s in b.shas:
+        yield get_backport_string([f'bsc#{b.data.id}', b.cve], s, re.sub(CVE_PATTERN, '', b.data.summary.removeprefix('VUL-0: ').replace('kernel: ', ''))) + '\n'
+
+def output_exists(f, outdir, nopdir):
+    if os.path.isfile(f):
+        return f
+    elif nopdir and os.path.isfile(nopdir + f[len(outdir):]):
+        return nopdir + f[len(outdir):]
+    return ''
 
 class ParallelRunner:
     def __init__(self, blist, directory_pair, j):
@@ -447,11 +499,18 @@ class ParallelRunner:
                 yield f'{script} > {path}\n'
             return
         with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
+            mod_jobs = []
             for job in self.jobs:
-                yield color_format(T_PURPLE, f"Schedule '{job[0]} > {job[1]}' ... (with {self.n_workers} workers...)\n")
-            futures = { executor.submit(one_job, job): job for job in self.jobs }
+                output_f = output_exists(job[1], self.out_idr, self.nop_dir)
+                if bool(output_f):
+                    yield color_format(T_BLUE, f"Skipping '{job[0]} > {output_f}' ... (already exists)\n")
+                else:
+                    mod_jobs.append(job)
+                    yield color_format(T_PURPLE, f"Schedule '{job[0]} > {job[1]}' ... (with {self.n_workers} workers...)\n")
+            futures = { executor.submit(one_job, job): job for job in mod_jobs }
             for f in as_completed(futures):
                 job = futures[f]
+                file_to_store = str(job[1])
                 yield color_format(T_YELLOW, f"$ {job[0]} > {job[1]}\n")
                 try:
                     res = f.result()
@@ -459,12 +518,12 @@ class ParallelRunner:
                     if res.stderr:
                         yield color_format(T_RED, res.stderr)
                     yield color_format(T_PURPLE, f"Store '{job[1]}' ...\n")
-                    file_to_store = str(job[1])
                     if self.nop_dir and ('NO ACTION NEEDED: ' in res.stdout or 'NO CODESTREAM AFFECTED' in res.stdout):
                         file_to_store = self.nop_dir + file_to_store[len(self.out_idr):]
                         yield color_format(T_PURPLE, f"Moving from {self.out_idr} to {self.nop_dir}\n")
                     store_into_file(file_to_store, res.stdout)
                 except subprocess.CalledProcessError as e:
+                    store_into_file(file_to_store, e.stderr)
                     yield color_format(T_RED, f"{job} failed\n{e}\n{e.stderr}")
                 except Exception as e:
                     print(color_format(T_RED, f"{job} failed\n{e}"), file=sys.stderr)
@@ -538,15 +597,6 @@ def handle_ages(ages):
     except Exception:
         print(ages, ": expected format is X or X:Y were X >= 0 and Y >= 0 and X >= Y", file=sys.stderr)
     sys.exit(1)
-
-def handle_email(email):
-    if email == '__empty-env-var__':
-        print("Please set the environment variable BUGZILLA_ACCOUNT_EMAIL to your bugzilla email or provide it after --email (-e).", file=sys.stderr)
-        sys.exit(1)
-    if len(email) < 9 or "@suse." not in email:
-        print("no valid bz email provided", file=sys.stderr)
-        sys.exit(1)
-    return email
 
 def handle_bugs(bug_string):
     if not bug_string:
@@ -674,6 +724,8 @@ def parse_args():
     parser.add_argument("-a", "--ages", help="show only tickets of a particular age in days; X means X days old or older and X:Y means betwen X and Y days old, inclusive", default=None, type=str)
     parser.add_argument("-m", "--modulo", help="takes two integers in the format \"Q:R\" and shows only bugs with IDs that satisfy N %% Q == R", default=None, type=str)
     parser.add_argument("-Z", "--pager", help="user pager for output (less -iR)", action="store_true", default=False)
+    parser.add_argument("--rest", help="Use REST API instead of XMLRPC APII (experimental, for debugging purposes)", action="store_true", default=False)
+    parser.add_argument("--debug", help="Enable Bugzilla RPC debugging", action="store_true", default=False)
     return parser.parse_args()
 
 def generate_output(linux_git, bugs, args, key_functions, jobs):
@@ -724,6 +776,9 @@ def load_sgm_data(cves):
 
 def main():
     args = parse_args()
+    if args.debug:
+        import logging
+        logging.basicConfig(level=logging.DEBUG)
     grep = handle_grep(args.grep)
     grep_paths = handle_grep(args.grep_paths)
     grep_patch = handle_grep(args.grep_patch)
@@ -743,9 +798,8 @@ def main():
     if args.assigned_queue:
         email = None
     jobs = handle_parallelism(args.jobs, args.check_kernel_fix)
-    bzapi = BZApi()
+    bzapi = BZApi(args.rest)
     bugs = bzapi.fetch_bugs(email, bug_list, cve_list)
-    published, rejected = fetch_cves()
     linux_git = MainlineRepo()
 
     global show_colors
@@ -754,7 +808,16 @@ def main():
     elif args.no_colors:
         show_colors = False
 
-    bugs = [ BugData(b, published, rejected) for b in bugs ]
+    bugs = [ BugData(b) for b in bugs ]
+
+    cves = [ b.cve for b in bugs if b.cve ]
+    published, rejected, breakers = fetch_cves(cves)
+    validate_hashes(published)
+    validate_hashes(rejected)
+    validate_hashes(breakers)
+
+    for b in bugs:
+        b.update_vulns(published, rejected, breakers)
 
     if args.suse_get_maintainers or args.grep_subsystem or args.grep_maintainers or SortActions.settings['subsystem']:
         cves_for_sgm = [ b.cve for b in bugs ]
@@ -781,7 +844,7 @@ def main():
         bugs = [ b for b in bugs if not b.data.status_whiteboard ]
 
     if args.exportpatch:
-        bugs = [ b for b in bugs if b.sha and b.data.status_whiteboard ]
+        bugs = [ b for b in bugs if b.shas and b.data.status_whiteboard ]
 
     if grep:
         bugs = [ b for b in bugs if re.search(grep, b.data.summary) ]
