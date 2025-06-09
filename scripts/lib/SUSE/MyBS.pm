@@ -666,7 +666,7 @@ sub create_project {
 	if (@$specfiles) {
 		my %specfiles = map { $_ => 1 } @$specfiles;
 		for my $spec (keys(%specfiles)) {
-			$spec = ($spec eq $package || not $multibuild) ? $package : "$package:$spec";
+			$spec = ($spec eq $package || not $multibuild) ? $spec : "$package:$spec";
 			$prjconf .= "BuildFlags: onlybuild:$spec\n";
 		}
 	}
@@ -676,7 +676,7 @@ sub create_project {
 	if (@$specfiles) {
 		my %specfiles = map { $_ => 1 } @$specfiles;
 		for my $spec (keys(%specfiles)) {
-			$spec = ($spec eq $package || not $multibuild) ? $package : "$package:$spec";
+			$spec = ($spec eq $package || not $multibuild) ? $spec : "$package:$spec";
 			$prjconf .= "BuildFlags: !onlybuild:$spec\n";
 		}
 	}
