@@ -649,10 +649,9 @@ sub create_project {
 	for my $macro (@{$options->{macros} || []}) {
 		$prjconf .= "$macro\n";
 	}
-	my $qa_expr = "";
+	my $qa_expr = "0";
 	for my $repo (@qa_repos) {
-		my $separator = $qa_expr ? " || " : "";
-		$qa_expr .= $separator . '("%_repository" == "' . $repo . '")';
+		$qa_expr .= '||' . '("%_repository" == "' . $repo . '")';
 	}
 	my $package = $options->{package};
 	# Keep compatibility with sources that use %is_kotd_qa hack
