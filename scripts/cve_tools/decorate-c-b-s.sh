@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # Add more information to CVEs that need fixing. This should be part of
-# scripts/cve_tools/check-branch-status.sh but we want to run that script
+# scripts/cve_tools/check-branch-status but we want to run that script
 # in parallel for performance reasons and then we can easily hit bugzilla
 # throttling even when we batch queries like in this script.
 #
-# scripts/cve_tools/check-branch-status.sh output should be used as an input
+# scripts/cve_tools/check-branch-status output should be used as an input
 
 add_age()
 {
