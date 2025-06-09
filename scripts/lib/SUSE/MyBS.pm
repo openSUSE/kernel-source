@@ -670,17 +670,19 @@ sub create_project {
 		}
 	}
 	$prjconf .= "%if " . "$qa_expr\n";
-	$prjconf .= "BuildFlags: !excludebuild:$package:kernel-obs-qa\n";
-	$prjconf .= "BuildFlags: !excludebuild:kernel-obs-qa\n";
 	if (@$specfiles) {
 		my %specfiles = map { $_ => 1 } @$specfiles;
 		for my $spec (keys(%specfiles)) {
 			$spec = ($spec eq $package || not $multibuild) ? $spec : "$package:$spec";
 			$prjconf .= "BuildFlags: !onlybuild:$spec\n";
 		}
+	} else {
+		$prjconf .= "BuildFlags: !excludebuild:$package:kernel-obs-qa\n";
+		$prjconf .= "BuildFlags: !excludebuild:kernel-obs-qa\n";
+		$prjconf .= "BuildFlags: onlybuild:$package:kernel-obs-qa\n";
+		$prjconf .= "BuildFlags: onlybuild:kernel-obs-qa\n";
 	}
-	$prjconf .= "BuildFlags: onlybuild:$package:kernel-obs-qa\n";
-	$prjconf .= "BuildFlags: onlybuild:kernel-obs-qa\n";
+	$prjconf .= "BuildFlags: onlybuild:nonexistent-package\n";
 	$prjconf .= "BuildFlags: !nouseforbuild:$package:kernel-obs-build\n";
 	$prjconf .= "BuildFlags: !nouseforbuild:kernel-obs-build\n";
 	$prjconf .= "%endif\n";
