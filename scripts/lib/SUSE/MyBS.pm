@@ -649,10 +649,9 @@ sub create_project {
 	for my $macro (@{$options->{macros} || []}) {
 		$prjconf .= "$macro\n";
 	}
-	my $qa_expr = "";
+	my $qa_expr = "0";
 	for my $repo (@qa_repos) {
-		my $separator = $qa_expr ? " || " : "";
-		$qa_expr .= $separator . '("%_repository" == "' . $repo . '")';
+		$qa_expr .= '||' . '("%_repository" == "' . $repo . '")';
 	}
 	my $package = $options->{package};
 	# Keep compatibility with sources that use %is_kotd_qa hack
@@ -666,22 +665,24 @@ sub create_project {
 	if (@$specfiles) {
 		my %specfiles = map { $_ => 1 } @$specfiles;
 		for my $spec (keys(%specfiles)) {
-			$spec = ($spec eq $package || not $multibuild) ? $package : "$package:$spec";
+			$spec = ($spec eq $package || not $multibuild) ? $spec : "$package:$spec";
 			$prjconf .= "BuildFlags: onlybuild:$spec\n";
 		}
 	}
 	$prjconf .= "%if " . "$qa_expr\n";
-	$prjconf .= "BuildFlags: !excludebuild:$package:kernel-obs-qa\n";
-	$prjconf .= "BuildFlags: !excludebuild:kernel-obs-qa\n";
 	if (@$specfiles) {
 		my %specfiles = map { $_ => 1 } @$specfiles;
 		for my $spec (keys(%specfiles)) {
-			$spec = ($spec eq $package || not $multibuild) ? $package : "$package:$spec";
+			$spec = ($spec eq $package || not $multibuild) ? $spec : "$package:$spec";
 			$prjconf .= "BuildFlags: !onlybuild:$spec\n";
 		}
+	} else {
+		$prjconf .= "BuildFlags: !excludebuild:$package:kernel-obs-qa\n";
+		$prjconf .= "BuildFlags: !excludebuild:kernel-obs-qa\n";
+		$prjconf .= "BuildFlags: onlybuild:$package:kernel-obs-qa\n";
+		$prjconf .= "BuildFlags: onlybuild:kernel-obs-qa\n";
 	}
-	$prjconf .= "BuildFlags: onlybuild:$package:kernel-obs-qa\n";
-	$prjconf .= "BuildFlags: onlybuild:kernel-obs-qa\n";
+	$prjconf .= "BuildFlags: onlybuild:nonexistent-package\n";
 	$prjconf .= "BuildFlags: !nouseforbuild:$package:kernel-obs-build\n";
 	$prjconf .= "BuildFlags: !nouseforbuild:kernel-obs-build\n";
 	$prjconf .= "%endif\n";
