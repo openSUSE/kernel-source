@@ -1,0 +1,221 @@
+Patch-mainline: v6.16-rc1
+Git-commit: bb723bebde1eee606ab0bd56bbc9aafda96d3801
+References: jsc#PED-348
+From: Sean Christopherson <sean.j.christopherson@intel.com>
+Date: Sat, 22 Feb 2025 09:42:25 +0800
+Subject: [PATCH] KVM: TDX: Handle TDX PV MMIO hypercall
+
+Handle TDX PV MMIO hypercall when TDX guest calls TDVMCALL with the
+leaf #VE.RequestMMIO (same value as EXIT_REASON_EPT_VIOLATION) according
+to TDX Guest Host Communication Interface (GHCI) spec.
+
+For TDX guests, VMM is not allowed to access vCPU registers and the private
+memory, and the code instructions must be fetched from the private memory.
+So MMIO emulation implemented for non-TDX VMs is not possible for TDX
+guests.
+
+In TDX the MMIO regions are instead configured by VMM to trigger a #VE
+exception in the guest.  The #VE handling is supposed to emulate the MMIO
+instruction inside the guest and convert it into a TDVMCALL with the
+leaf #VE.RequestMMIO, which equals to EXIT_REASON_EPT_VIOLATION.
+
+The requested MMIO address must be in shared GPA space.  The shared bit
+is stripped after check because the existing code for MMIO emulation is
+not aware of the shared bit.
+
+The MMIO GPA shouldn't have a valid memslot, also the attribute of the GPA
+should be shared.  KVM could do the checks before exiting to userspace,
+however, even if KVM does the check, there still will be race conditions
+between the check in KVM and the emulation of MMIO access in userspace due
+to a memslot hotplug, or a memory attribute conversion.  If userspace
+doesn't check the attribute of the GPA and the attribute happens to be
+private, it will not pose a security risk or cause an MCE, but it can lead
+to another issue. E.g., in QEMU, treating a GPA with private attribute as
+shared when it falls within RAM's range can result in extra memory
+consumption during the emulation to the access to the HVA of the GPA.
+There are two options: 1) Do the check both in KVM and userspace.  2) Do
+the check only in QEMU.  This patch chooses option 2, i.e. KVM omits the
+memslot and attribute checks, and expects userspace to do the checks.
+
+Similar to normal MMIO emulation, try to handle the MMIO in kernel first,
+if kernel can't support it, forward the request to userspace.  Export
+needed symbols used for MMIO handling.
+
+Fragments handling is not needed for TDX PV MMIO because GPA is provided,
+if a MMIO access crosses page boundary, it should be continuous in GPA.
+Also, the size is limited to 1, 2, 4, 8 bytes.  No further split needed.
+Allow cross page access because no extra handling needed after checking
+both start and end GPA are shared GPAs.
+
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Signed-off-by: Isaku Yamahata <isaku.yamahata@intel.com>
+Co-developed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Signed-off-by: Binbin Wu <binbin.wu@linux.intel.com>
+Reviewed-by: Paolo Bonzini <pbonzini@redhat.com>
+Message-ID: <20250222014225.897298-10-binbin.wu@linux.intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/kvm/vmx/tdx.c | 105 +++++++++++++++++++++++++++++++++++++++++
+ arch/x86/kvm/x86.c     |   1 +
+ virt/kvm/kvm_main.c    |   1 +
+ 3 files changed, 107 insertions(+)
+
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index ac37d714bf02..35f28e165417 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -810,6 +810,8 @@ static __always_inline u32 tdcall_to_vmx_exit_reason(struct kvm_vcpu *vcpu)
+ 	switch (tdvmcall_leaf(vcpu)) {
+ 	case EXIT_REASON_IO_INSTRUCTION:
+ 		return tdvmcall_leaf(vcpu);
++	case EXIT_REASON_EPT_VIOLATION:
++		return EXIT_REASON_EPT_MISCONFIG;
+ 	default:
+ 		break;
+ 	}
+@@ -1190,6 +1192,107 @@ static int tdx_emulate_io(struct kvm_vcpu *vcpu)
+ 	return ret;
+ }
+ 
++static int tdx_complete_mmio_read(struct kvm_vcpu *vcpu)
++{
++	unsigned long val = 0;
++	gpa_t gpa;
++	int size;
++
++	gpa = vcpu->mmio_fragments[0].gpa;
++	size = vcpu->mmio_fragments[0].len;
++
++	memcpy(&val, vcpu->run->mmio.data, size);
++	tdvmcall_set_return_val(vcpu, val);
++	trace_kvm_mmio(KVM_TRACE_MMIO_READ, size, gpa, &val);
++	return 1;
++}
++
++static inline int tdx_mmio_write(struct kvm_vcpu *vcpu, gpa_t gpa, int size,
++				 unsigned long val)
++{
++	if (!kvm_io_bus_write(vcpu, KVM_FAST_MMIO_BUS, gpa, 0, NULL)) {
++		trace_kvm_fast_mmio(gpa);
++		return 0;
++	}
++
++	trace_kvm_mmio(KVM_TRACE_MMIO_WRITE, size, gpa, &val);
++	if (kvm_io_bus_write(vcpu, KVM_MMIO_BUS, gpa, size, &val))
++		return -EOPNOTSUPP;
++
++	return 0;
++}
++
++static inline int tdx_mmio_read(struct kvm_vcpu *vcpu, gpa_t gpa, int size)
++{
++	unsigned long val;
++
++	if (kvm_io_bus_read(vcpu, KVM_MMIO_BUS, gpa, size, &val))
++		return -EOPNOTSUPP;
++
++	tdvmcall_set_return_val(vcpu, val);
++	trace_kvm_mmio(KVM_TRACE_MMIO_READ, size, gpa, &val);
++	return 0;
++}
++
++static int tdx_emulate_mmio(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_tdx *tdx = to_tdx(vcpu);
++	int size, write, r;
++	unsigned long val;
++	gpa_t gpa;
++
++	size = tdx->vp_enter_args.r12;
++	write = tdx->vp_enter_args.r13;
++	gpa = tdx->vp_enter_args.r14;
++	val = write ? tdx->vp_enter_args.r15 : 0;
++
++	if (size != 1 && size != 2 && size != 4 && size != 8)
++		goto error;
++	if (write != 0 && write != 1)
++		goto error;
++
++	/*
++	 * TDG.VP.VMCALL<MMIO> allows only shared GPA, it makes no sense to
++	 * do MMIO emulation for private GPA.
++	 */
++	if (vt_is_tdx_private_gpa(vcpu->kvm, gpa) ||
++	    vt_is_tdx_private_gpa(vcpu->kvm, gpa + size - 1))
++		goto error;
++
++	gpa = gpa & ~gfn_to_gpa(kvm_gfn_direct_bits(vcpu->kvm));
++
++	if (write)
++		r = tdx_mmio_write(vcpu, gpa, size, val);
++	else
++		r = tdx_mmio_read(vcpu, gpa, size);
++	if (!r)
++		/* Kernel completed device emulation. */
++		return 1;
++
++	/* Request the device emulation to userspace device model. */
++	vcpu->mmio_is_write = write;
++	if (!write)
++		vcpu->arch.complete_userspace_io = tdx_complete_mmio_read;
++
++	vcpu->run->mmio.phys_addr = gpa;
++	vcpu->run->mmio.len = size;
++	vcpu->run->mmio.is_write = write;
++	vcpu->run->exit_reason = KVM_EXIT_MMIO;
++
++	if (write) {
++		memcpy(vcpu->run->mmio.data, &val, size);
++	} else {
++		vcpu->mmio_fragments[0].gpa = gpa;
++		vcpu->mmio_fragments[0].len = size;
++		trace_kvm_mmio(KVM_TRACE_MMIO_READ_UNSATISFIED, size, gpa, NULL);
++	}
++	return 0;
++
++error:
++	tdvmcall_set_return_code(vcpu, TDVMCALL_STATUS_INVALID_OPERAND);
++	return 1;
++}
++
+ static int handle_tdvmcall(struct kvm_vcpu *vcpu)
+ {
+ 	switch (tdvmcall_leaf(vcpu)) {
+@@ -1569,6 +1672,8 @@ int tdx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t fastpath)
+ 		return tdx_emulate_vmcall(vcpu);
+ 	case EXIT_REASON_IO_INSTRUCTION:
+ 		return tdx_emulate_io(vcpu);
++	case EXIT_REASON_EPT_MISCONFIG:
++		return tdx_emulate_mmio(vcpu);
+ 	default:
+ 		break;
+ 	}
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 3cae210ffaa4..5c37bc4fb80e 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -14024,6 +14024,7 @@ EXPORT_SYMBOL_GPL(kvm_sev_es_string_io);
+ 
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_entry);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_exit);
++EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_mmio);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_fast_mmio);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_inj_virq);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_page_fault);
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 549537da3062..08f237bf4107 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -5842,6 +5842,7 @@ int kvm_io_bus_read(struct kvm_vcpu *vcpu, enum kvm_bus bus_idx, gpa_t addr,
+ 	r = __kvm_io_bus_read(vcpu, bus, &range, val);
+ 	return r < 0 ? r : 0;
+ }
++EXPORT_SYMBOL_GPL(kvm_io_bus_read);
+ 
+ int kvm_io_bus_register_dev(struct kvm *kvm, enum kvm_bus bus_idx, gpa_t addr,
+ 			    int len, struct kvm_io_device *dev)
+-- 
+2.43.0
+

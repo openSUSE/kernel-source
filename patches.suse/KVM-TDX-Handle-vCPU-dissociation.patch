@@ -1,0 +1,388 @@
+Patch-mainline: v6.16-rc1
+Git-commit: d789fa6efac9328c9db5a1e45bc2a665a13b7a65
+References: jsc#PED-348
+From: Isaku Yamahata <isaku.yamahata@intel.com>
+Date: Tue, 12 Nov 2024 15:38:58 +0800
+Subject: [PATCH] KVM: TDX: Handle vCPU dissociation
+
+Handle vCPUs dissociations by invoking SEAMCALL TDH.VP.FLUSH which flushes
+the address translation caches and cached TD VMCS of a TD vCPU in its
+associated pCPU.
+
+In TDX, a vCPUs can only be associated with one pCPU at a time, which is
+done by invoking SEAMCALL TDH.VP.ENTER. For a successful association, the
+vCPU must be dissociated from its previous associated pCPU.
+
+To facilitate vCPU dissociation, introduce a per-pCPU list
+associated_tdvcpus. Add a vCPU into this list when it's loaded into a new
+pCPU (i.e. when a vCPU is loaded for the first time or migrated to a new
+pCPU).
+
+vCPU dissociations can happen under below conditions:
+- On the op hardware_disable is called.
+  This op is called when virtualization is disabled on a given pCPU, e.g.
+  when hot-unplug a pCPU or machine shutdown/suspend.
+  In this case, dissociate all vCPUs from the pCPU by iterating its
+  per-pCPU list associated_tdvcpus.
+
+- On vCPU migration to a new pCPU.
+  Before adding a vCPU into associated_tdvcpus list of the new pCPU,
+  dissociation from its old pCPU is required, which is performed by issuing
+  an IPI and executing SEAMCALL TDH.VP.FLUSH on the old pCPU.
+  On a successful dissociation, the vCPU will be removed from the
+  associated_tdvcpus list of its previously associated pCPU.
+
+- On tdx_mmu_release_hkid() is called.
+  TDX mandates that all vCPUs must be disassociated prior to the release of
+  an hkid. Therefore, dissociation of all vCPUs is a must before executing
+  the SEAMCALL TDH.MNG.VPFLUSHDONE and subsequently freeing the hkid.
+
+Signed-off-by: Isaku Yamahata <isaku.yamahata@intel.com>
+Co-developed-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Signed-off-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Co-developed-by: Yan Zhao <yan.y.zhao@intel.com>
+Signed-off-by: Yan Zhao <yan.y.zhao@intel.com>
+Message-ID: <20241112073858.22312-1-yan.y.zhao@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/kvm/vmx/main.c    |  22 ++++-
+ arch/x86/kvm/vmx/tdx.c     | 159 +++++++++++++++++++++++++++++++++++--
+ arch/x86/kvm/vmx/tdx.h     |   2 +
+ arch/x86/kvm/vmx/x86_ops.h |   4 +
+ 4 files changed, 177 insertions(+), 10 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/main.c b/arch/x86/kvm/vmx/main.c
+index 828168e67d4e..abb0fc723a0b 100644
+--- a/arch/x86/kvm/vmx/main.c
++++ b/arch/x86/kvm/vmx/main.c
+@@ -10,6 +10,14 @@
+ #include "tdx.h"
+ #include "tdx_arch.h"
+ 
++static void vt_disable_virtualization_cpu(void)
++{
++	/* Note, TDX *and* VMX need to be disabled if TDX is enabled. */
++	if (enable_tdx)
++		tdx_disable_virtualization_cpu();
++	vmx_disable_virtualization_cpu();
++}
++
+ static __init int vt_hardware_setup(void)
+ {
+ 	int ret;
+@@ -111,6 +119,16 @@ static void vt_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+ 	vmx_vcpu_reset(vcpu, init_event);
+ }
+ 
++static void vt_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
++{
++	if (is_td_vcpu(vcpu)) {
++		tdx_vcpu_load(vcpu, cpu);
++		return;
++	}
++
++	vmx_vcpu_load(vcpu, cpu);
++}
++
+ static void vt_flush_tlb_all(struct kvm_vcpu *vcpu)
+ {
+ 	if (is_td_vcpu(vcpu)) {
+@@ -199,7 +217,7 @@ struct kvm_x86_ops vt_x86_ops __initdata = {
+ 	.hardware_unsetup = vmx_hardware_unsetup,
+ 
+ 	.enable_virtualization_cpu = vmx_enable_virtualization_cpu,
+-	.disable_virtualization_cpu = vmx_disable_virtualization_cpu,
++	.disable_virtualization_cpu = vt_disable_virtualization_cpu,
+ 	.emergency_disable_virtualization_cpu = vmx_emergency_disable_virtualization_cpu,
+ 
+ 	.has_emulated_msr = vmx_has_emulated_msr,
+@@ -216,7 +234,7 @@ struct kvm_x86_ops vt_x86_ops __initdata = {
+ 	.vcpu_reset = vt_vcpu_reset,
+ 
+ 	.prepare_switch_to_guest = vmx_prepare_switch_to_guest,
+-	.vcpu_load = vmx_vcpu_load,
++	.vcpu_load = vt_vcpu_load,
+ 	.vcpu_put = vmx_vcpu_put,
+ 
+ 	.update_exception_bitmap = vmx_update_exception_bitmap,
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index 4ea25660f84d..314387728e82 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -162,6 +162,21 @@ static bool tdx_operand_busy(u64 err)
+ }
+ 
+ 
++/*
++ * A per-CPU list of TD vCPUs associated with a given CPU.
++ * Protected by interrupt mask. Only manipulated by the CPU owning this per-CPU
++ * list.
++ * - When a vCPU is loaded onto a CPU, it is removed from the per-CPU list of
++ *   the old CPU during the IPI callback running on the old CPU, and then added
++ *   to the per-CPU list of the new CPU.
++ * - When a TD is tearing down, all vCPUs are disassociated from their current
++ *   running CPUs and removed from the per-CPU list during the IPI callback
++ *   running on those CPUs.
++ * - When a CPU is brought down, traverse the per-CPU list to disassociate all
++ *   associated TD vCPUs and remove them from the per-CPU list.
++ */
++static DEFINE_PER_CPU(struct list_head, associated_tdvcpus);
++
+ static inline void tdx_hkid_free(struct kvm_tdx *kvm_tdx)
+ {
+ 	tdx_guest_keyid_free(kvm_tdx->hkid);
+@@ -177,6 +192,22 @@ static inline bool is_hkid_assigned(struct kvm_tdx *kvm_tdx)
+ 	return kvm_tdx->hkid > 0;
+ }
+ 
++static inline void tdx_disassociate_vp(struct kvm_vcpu *vcpu)
++{
++	lockdep_assert_irqs_disabled();
++
++	list_del(&to_tdx(vcpu)->cpu_list);
++
++	/*
++	 * Ensure tdx->cpu_list is updated before setting vcpu->cpu to -1,
++	 * otherwise, a different CPU can see vcpu->cpu = -1 and add the vCPU
++	 * to its list before it's deleted from this CPU's list.
++	 */
++	smp_wmb();
++
++	vcpu->cpu = -1;
++}
++
+ static void tdx_clear_page(struct page *page)
+ {
+ 	const void *zero_page = (const void *) page_to_virt(ZERO_PAGE(0));
+@@ -243,6 +274,83 @@ static void tdx_reclaim_control_page(struct page *ctrl_page)
+ 	__free_page(ctrl_page);
+ }
+ 
++struct tdx_flush_vp_arg {
++	struct kvm_vcpu *vcpu;
++	u64 err;
++};
++
++static void tdx_flush_vp(void *_arg)
++{
++	struct tdx_flush_vp_arg *arg = _arg;
++	struct kvm_vcpu *vcpu = arg->vcpu;
++	u64 err;
++
++	arg->err = 0;
++	lockdep_assert_irqs_disabled();
++
++	/* Task migration can race with CPU offlining. */
++	if (unlikely(vcpu->cpu != raw_smp_processor_id()))
++		return;
++
++	/*
++	 * No need to do TDH_VP_FLUSH if the vCPU hasn't been initialized.  The
++	 * list tracking still needs to be updated so that it's correct if/when
++	 * the vCPU does get initialized.
++	 */
++	if (to_tdx(vcpu)->state != VCPU_TD_STATE_UNINITIALIZED) {
++		/*
++		 * No need to retry.  TDX Resources needed for TDH.VP.FLUSH are:
++		 * TDVPR as exclusive, TDR as shared, and TDCS as shared.  This
++		 * vp flush function is called when destructing vCPU/TD or vCPU
++		 * migration.  No other thread uses TDVPR in those cases.
++		 */
++		err = tdh_vp_flush(&to_tdx(vcpu)->vp);
++		if (unlikely(err && err != TDX_VCPU_NOT_ASSOCIATED)) {
++			/*
++			 * This function is called in IPI context. Do not use
++			 * printk to avoid console semaphore.
++			 * The caller prints out the error message, instead.
++			 */
++			if (err)
++				arg->err = err;
++		}
++	}
++
++	tdx_disassociate_vp(vcpu);
++}
++
++static void tdx_flush_vp_on_cpu(struct kvm_vcpu *vcpu)
++{
++	struct tdx_flush_vp_arg arg = {
++		.vcpu = vcpu,
++	};
++	int cpu = vcpu->cpu;
++
++	if (unlikely(cpu == -1))
++		return;
++
++	smp_call_function_single(cpu, tdx_flush_vp, &arg, 1);
++	if (KVM_BUG_ON(arg.err, vcpu->kvm))
++		pr_tdx_error(TDH_VP_FLUSH, arg.err);
++}
++
++void tdx_disable_virtualization_cpu(void)
++{
++	int cpu = raw_smp_processor_id();
++	struct list_head *tdvcpus = &per_cpu(associated_tdvcpus, cpu);
++	struct tdx_flush_vp_arg arg;
++	struct vcpu_tdx *tdx, *tmp;
++	unsigned long flags;
++
++	local_irq_save(flags);
++	/* Safe variant needed as tdx_disassociate_vp() deletes the entry. */
++	list_for_each_entry_safe(tdx, tmp, tdvcpus, cpu_list) {
++		arg.vcpu = &tdx->vcpu;
++		tdx_flush_vp(&arg);
++	}
++	local_irq_restore(flags);
++}
++
+ #define TDX_SEAMCALL_RETRIES 10000
+ 
+ static void smp_func_do_phymem_cache_wb(void *unused)
+@@ -281,22 +389,21 @@ void tdx_mmu_release_hkid(struct kvm *kvm)
+ 	bool packages_allocated, targets_allocated;
+ 	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
+ 	cpumask_var_t packages, targets;
+-	u64 err;
++	struct kvm_vcpu *vcpu;
++	unsigned long j;
+ 	int i;
++	u64 err;
+ 
+ 	if (!is_hkid_assigned(kvm_tdx))
+ 		return;
+ 
+-	/* KeyID has been allocated but guest is not yet configured */
+-	if (!kvm_tdx->td.tdr_page) {
+-		tdx_hkid_free(kvm_tdx);
+-		return;
+-	}
+-
+ 	packages_allocated = zalloc_cpumask_var(&packages, GFP_KERNEL);
+ 	targets_allocated = zalloc_cpumask_var(&targets, GFP_KERNEL);
+ 	cpus_read_lock();
+ 
++	kvm_for_each_vcpu(j, vcpu, kvm)
++		tdx_flush_vp_on_cpu(vcpu);
++
+ 	/*
+ 	 * TDH.PHYMEM.CACHE.WB tries to acquire the TDX module global lock
+ 	 * and can fail with TDX_OPERAND_BUSY when it fails to get the lock.
+@@ -310,6 +417,16 @@ void tdx_mmu_release_hkid(struct kvm *kvm)
+ 	 * After the above flushing vps, there should be no more vCPU
+ 	 * associations, as all vCPU fds have been released at this stage.
+ 	 */
++	err = tdh_mng_vpflushdone(&kvm_tdx->td);
++	if (err == TDX_FLUSHVP_NOT_DONE)
++		goto out;
++	if (KVM_BUG_ON(err, kvm)) {
++		pr_tdx_error(TDH_MNG_VPFLUSHDONE, err);
++		pr_err("tdh_mng_vpflushdone() failed. HKID %d is leaked.\n",
++		       kvm_tdx->hkid);
++		goto out;
++	}
++
+ 	for_each_online_cpu(i) {
+ 		if (packages_allocated &&
+ 		    cpumask_test_and_set_cpu(topology_physical_package_id(i),
+@@ -335,6 +452,7 @@ void tdx_mmu_release_hkid(struct kvm *kvm)
+ 		tdx_hkid_free(kvm_tdx);
+ 	}
+ 
++out:
+ 	mutex_unlock(&tdx_lock);
+ 	cpus_read_unlock();
+ 	free_cpumask_var(targets);
+@@ -488,6 +606,27 @@ int tdx_vcpu_create(struct kvm_vcpu *vcpu)
+ 	return 0;
+ }
+ 
++void tdx_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
++{
++	struct vcpu_tdx *tdx = to_tdx(vcpu);
++
++	if (vcpu->cpu == cpu || !is_hkid_assigned(to_kvm_tdx(vcpu->kvm)))
++		return;
++
++	tdx_flush_vp_on_cpu(vcpu);
++
++	KVM_BUG_ON(cpu != raw_smp_processor_id(), vcpu->kvm);
++	local_irq_disable();
++	/*
++	 * Pairs with the smp_wmb() in tdx_disassociate_vp() to ensure
++	 * vcpu->cpu is read before tdx->cpu_list.
++	 */
++	smp_rmb();
++
++	list_add(&tdx->cpu_list, &per_cpu(associated_tdvcpus, cpu));
++	local_irq_enable();
++}
++
+ void tdx_vcpu_free(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_tdx *kvm_tdx = to_kvm_tdx(vcpu->kvm);
+@@ -2044,7 +2183,11 @@ void tdx_cleanup(void)
+ 
+ int __init tdx_bringup(void)
+ {
+-	int r;
++	int r, i;
++
++	/* tdx_disable_virtualization_cpu() uses associated_tdvcpus. */
++	for_each_possible_cpu(i)
++		INIT_LIST_HEAD(&per_cpu(associated_tdvcpus, i));
+ 
+ 	if (!enable_tdx)
+ 		return 0;
+diff --git a/arch/x86/kvm/vmx/tdx.h b/arch/x86/kvm/vmx/tdx.h
+index cde3acc805db..5f34b79d16dd 100644
+--- a/arch/x86/kvm/vmx/tdx.h
++++ b/arch/x86/kvm/vmx/tdx.h
+@@ -48,6 +48,8 @@ struct vcpu_tdx {
+ 
+ 	struct tdx_vp vp;
+ 
++	struct list_head cpu_list;
++
+ 	enum vcpu_tdx_state state;
+ };
+ 
+diff --git a/arch/x86/kvm/vmx/x86_ops.h b/arch/x86/kvm/vmx/x86_ops.h
+index 27b8ae74424a..f47d739051cf 100644
+--- a/arch/x86/kvm/vmx/x86_ops.h
++++ b/arch/x86/kvm/vmx/x86_ops.h
+@@ -122,6 +122,7 @@ void vmx_cancel_hv_timer(struct kvm_vcpu *vcpu);
+ void vmx_setup_mce(struct kvm_vcpu *vcpu);
+ 
+ #ifdef CONFIG_KVM_INTEL_TDX
++void tdx_disable_virtualization_cpu(void);
+ int tdx_vm_init(struct kvm *kvm);
+ void tdx_mmu_release_hkid(struct kvm *kvm);
+ void tdx_vm_destroy(struct kvm *kvm);
+@@ -129,6 +130,7 @@ int tdx_vm_ioctl(struct kvm *kvm, void __user *argp);
+ 
+ int tdx_vcpu_create(struct kvm_vcpu *vcpu);
+ void tdx_vcpu_free(struct kvm_vcpu *vcpu);
++void tdx_vcpu_load(struct kvm_vcpu *vcpu, int cpu);
+ 
+ int tdx_vcpu_ioctl(struct kvm_vcpu *vcpu, void __user *argp);
+ 
+@@ -146,6 +148,7 @@ void tdx_flush_tlb_all(struct kvm_vcpu *vcpu);
+ void tdx_load_mmu_pgd(struct kvm_vcpu *vcpu, hpa_t root_hpa, int root_level);
+ int tdx_gmem_private_max_mapping_level(struct kvm *kvm, kvm_pfn_t pfn);
+ #else
++static inline void tdx_disable_virtualization_cpu(void) {}
+ static inline int tdx_vm_init(struct kvm *kvm) { return -EOPNOTSUPP; }
+ static inline void tdx_mmu_release_hkid(struct kvm *kvm) {}
+ static inline void tdx_vm_destroy(struct kvm *kvm) {}
+@@ -153,6 +156,7 @@ static inline int tdx_vm_ioctl(struct kvm *kvm, void __user *argp) { return -EOP
+ 
+ static inline int tdx_vcpu_create(struct kvm_vcpu *vcpu) { return -EOPNOTSUPP; }
+ static inline void tdx_vcpu_free(struct kvm_vcpu *vcpu) {}
++static inline void tdx_vcpu_load(struct kvm_vcpu *vcpu, int cpu) {}
+ 
+ static inline int tdx_vcpu_ioctl(struct kvm_vcpu *vcpu, void __user *argp) { return -EOPNOTSUPP; }
+ 
+-- 
+2.43.0
+

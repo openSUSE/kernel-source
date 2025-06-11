@@ -1,0 +1,260 @@
+Patch-mainline: v6.16-rc1
+Git-commit: acc64eb4e2931a09e3f33625511b90e8af29503d
+References: jsc#PED-348
+From: Isaku Yamahata <isaku.yamahata@intel.com>
+Date: Sat, 22 Feb 2025 09:47:48 +0800
+Subject: [PATCH] KVM: TDX: Implement methods to inject NMI
+
+Inject NMI to TDX guest by setting the PEND_NMI TDVPS field to 1, i.e. make
+the NMI pending in the TDX module.  If there is a further pending NMI in
+KVM, collapse it to the one pending in the TDX module.
+
+VMM can request the TDX module to inject a NMI into a TDX vCPU by setting
+the PEND_NMI TDVPS field to 1.  Following that, VMM can call TDH.VP.ENTER
+to run the vCPU and the TDX module will attempt to inject the NMI as soon
+as possible.
+
+KVM has the following 3 cases to inject two NMIs when handling simultaneous
+NMIs and they need to be injected in a back-to-back way.  Otherwise, OS
+kernel may fire a warning about the unknown NMI [1]:
+K1. One NMI is being handled in the guest and one NMI pending in KVM.
+    KVM requests NMI window exit to inject the pending NMI.
+K2. Two NMIs are pending in KVM.
+    KVM injects the first NMI and requests NMI window exit to inject the
+    second NMI.
+K3. A previous NMI needs to be rejected and one NMI pending in KVM.
+    KVM first requests force immediate exit followed by a VM entry to
+    complete the NMI rejection.  Then, during the force immediate exit, KVM
+    requests NMI window exit to inject the pending NMI.
+
+For TDX, PEND_NMI TDVPS field is a 1-bit field, i.e. KVM can only pend one
+NMI in the TDX module.  Also, the vCPU state is protected, KVM doesn't know
+the NMI blocking states of TDX vCPU, KVM has to assume NMI is always
+unmasked and allowed.  When KVM sees PEND_NMI is 1 after a TD exit, it
+means the previous NMI needs to be re-injected.
+
+Based on KVM's NMI handling flow, there are following 6 cases:
+    In NMI handler    TDX module    KVM
+T1. No                PEND_NMI=0    1 pending NMI
+T2. No                PEND_NMI=0    2 pending NMIs
+T3. No                PEND_NMI=1    1 pending NMI
+T4. Yes               PEND_NMI=0    1 pending NMI
+T5. Yes               PEND_NMI=0    2 pending NMIs
+T6. Yes               PEND_NMI=1    1 pending NMI
+K1 is mapped to T4.
+K2 is mapped to T2 or T5.
+K3 is mapped to T3 or T6.
+Note: KVM doesn't know whether NMI is blocked by a NMI or not, case T5 and
+T6 can happen.
+
+When handling pending NMI in KVM for TDX guest, what KVM can do is to add a
+pending NMI in TDX module when PEND_NMI is 0.  T1 and T4 can be handled by
+this way.  However, TDX doesn't allow KVM to request NMI window exit
+directly, if PEND_NMI is already set and there is still pending NMI in KVM,
+the only way KVM could try is to request a force immediate exit.  But for
+case T5 and T6, force immediate exit will result in infinite loop because
+force immediate exit makes it no progress in the NMI handler, so that the
+pending NMI in the TDX module can never be injected.
+
+Considering on X86 bare metal, multiple NMIs could collapse into one NMI,
+e.g. when NMI is blocked by SMI.  It's OS's responsibility to poll all NMI
+sources in the NMI handler to avoid missing handling of some NMI events.
+
+Based on that, for the above 3 cases (K1-K3), only case K1 must inject the
+second NMI because the guest NMI handler may have already polled some of
+the NMI sources, which could include the source of the pending NMI, the
+pending NMI must be injected to avoid the lost of NMI.  For case K2 and K3,
+the guest OS will poll all NMI sources (including the sources caused by the
+second NMI and further NMI collapsed) when the delivery of the first NMI,
+KVM doesn't have the necessity to inject the second NMI.
+
+To handle the NMI injection properly for TDX, there are two options:
+- Option 1: Modify the KVM's NMI handling common code, to collapse the
+  second pending NMI for K2 and K3.
+- Option 2: Do it in TDX specific way. When the previous NMI is still
+  pending in the TDX module, i.e. it has not been delivered to TDX guest
+  yet, collapse the pending NMI in KVM into the previous one.
+
+This patch goes with option 2 because it is simple and doesn't impact other
+VM types.  Option 1 may need more discussions.
+
+This is the first need to access vCPU scope metadata in the "management"
+class. Make needed accessors available.
+
+[1] https://lore.kernel.org/all/1317409584-23662-5-git-send-email-dzickus@redhat.com/
+
+Signed-off-by: Isaku Yamahata <isaku.yamahata@intel.com>
+Co-developed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Signed-off-by: Binbin Wu <binbin.wu@linux.intel.com>
+Reviewed-by: Paolo Bonzini <pbonzini@redhat.com>
+Message-ID: <20250222014757.897978-8-binbin.wu@linux.intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/kvm/vmx/main.c    | 61 ++++++++++++++++++++++++++++++++++----
+ arch/x86/kvm/vmx/tdx.c     | 22 ++++++++++++++
+ arch/x86/kvm/vmx/tdx.h     |  5 ++++
+ arch/x86/kvm/vmx/x86_ops.h |  2 ++
+ 4 files changed, 85 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/main.c b/arch/x86/kvm/vmx/main.c
+index 57bbe0e7cc34..4021c00fdee8 100644
+--- a/arch/x86/kvm/vmx/main.c
++++ b/arch/x86/kvm/vmx/main.c
+@@ -255,6 +255,57 @@ static void vt_flush_tlb_guest(struct kvm_vcpu *vcpu)
+ 	vmx_flush_tlb_guest(vcpu);
+ }
+ 
++static void vt_inject_nmi(struct kvm_vcpu *vcpu)
++{
++	if (is_td_vcpu(vcpu)) {
++		tdx_inject_nmi(vcpu);
++		return;
++	}
++
++	vmx_inject_nmi(vcpu);
++}
++
++static int vt_nmi_allowed(struct kvm_vcpu *vcpu, bool for_injection)
++{
++	/*
++	 * The TDX module manages NMI windows and NMI reinjection, and hides NMI
++	 * blocking, all KVM can do is throw an NMI over the wall.
++	 */
++	if (is_td_vcpu(vcpu))
++		return true;
++
++	return vmx_nmi_allowed(vcpu, for_injection);
++}
++
++static bool vt_get_nmi_mask(struct kvm_vcpu *vcpu)
++{
++	/*
++	 * KVM can't get NMI blocking status for TDX guest, assume NMIs are
++	 * always unmasked.
++	 */
++	if (is_td_vcpu(vcpu))
++		return false;
++
++	return vmx_get_nmi_mask(vcpu);
++}
++
++static void vt_set_nmi_mask(struct kvm_vcpu *vcpu, bool masked)
++{
++	if (is_td_vcpu(vcpu))
++		return;
++
++	vmx_set_nmi_mask(vcpu, masked);
++}
++
++static void vt_enable_nmi_window(struct kvm_vcpu *vcpu)
++{
++	/* Refer to the comments in tdx_inject_nmi(). */
++	if (is_td_vcpu(vcpu))
++		return;
++
++	vmx_enable_nmi_window(vcpu);
++}
++
+ static void vt_load_mmu_pgd(struct kvm_vcpu *vcpu, hpa_t root_hpa,
+ 			    int pgd_level)
+ {
+@@ -439,14 +490,14 @@ struct kvm_x86_ops vt_x86_ops __initdata = {
+ 	.get_interrupt_shadow = vt_get_interrupt_shadow,
+ 	.patch_hypercall = vmx_patch_hypercall,
+ 	.inject_irq = vt_inject_irq,
+-	.inject_nmi = vmx_inject_nmi,
++	.inject_nmi = vt_inject_nmi,
+ 	.inject_exception = vmx_inject_exception,
+ 	.cancel_injection = vt_cancel_injection,
+ 	.interrupt_allowed = vt_interrupt_allowed,
+-	.nmi_allowed = vmx_nmi_allowed,
+-	.get_nmi_mask = vmx_get_nmi_mask,
+-	.set_nmi_mask = vmx_set_nmi_mask,
+-	.enable_nmi_window = vmx_enable_nmi_window,
++	.nmi_allowed = vt_nmi_allowed,
++	.get_nmi_mask = vt_get_nmi_mask,
++	.set_nmi_mask = vt_set_nmi_mask,
++	.enable_nmi_window = vt_enable_nmi_window,
+ 	.enable_irq_window = vt_enable_irq_window,
+ 	.update_cr8_intercept = vmx_update_cr8_intercept,
+ 
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index b98eab24114c..d1848b02c3b9 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -1001,6 +1001,28 @@ fastpath_t tdx_vcpu_run(struct kvm_vcpu *vcpu, bool force_immediate_exit)
+ 	return tdx_exit_handlers_fastpath(vcpu);
+ }
+ 
++void tdx_inject_nmi(struct kvm_vcpu *vcpu)
++{
++	++vcpu->stat.nmi_injections;
++	td_management_write8(to_tdx(vcpu), TD_VCPU_PEND_NMI, 1);
++	/*
++	 * From KVM's perspective, NMI injection is completed right after
++	 * writing to PEND_NMI.  KVM doesn't care whether an NMI is injected by
++	 * the TDX module or not.
++	 */
++	vcpu->arch.nmi_injected = false;
++	/*
++	 * TDX doesn't support KVM to request NMI window exit.  If there is
++	 * still a pending vNMI, KVM is not able to inject it along with the
++	 * one pending in TDX module in a back-to-back way.  Since the previous
++	 * vNMI is still pending in TDX module, i.e. it has not been delivered
++	 * to TDX guest yet, it's OK to collapse the pending vNMI into the
++	 * previous one.  The guest is expected to handle all the NMI sources
++	 * when handling the first vNMI.
++	 */
++	vcpu->arch.nmi_pending = 0;
++}
++
+ static int complete_hypercall_exit(struct kvm_vcpu *vcpu)
+ {
+ 	tdvmcall_set_return_code(vcpu, vcpu->run->hypercall.ret);
+diff --git a/arch/x86/kvm/vmx/tdx.h b/arch/x86/kvm/vmx/tdx.h
+index 3aa36ddcd472..93858959baf9 100644
+--- a/arch/x86/kvm/vmx/tdx.h
++++ b/arch/x86/kvm/vmx/tdx.h
+@@ -115,6 +115,8 @@ static __always_inline void tdvps_vmcs_check(u32 field, u8 bits)
+ 			 "Invalid TD VMCS access for 16-bit field");
+ }
+ 
++static __always_inline void tdvps_management_check(u64 field, u8 bits) {}
++
+ #define TDX_BUILD_TDVPS_ACCESSORS(bits, uclass, lclass)				\
+ static __always_inline u##bits td_##lclass##_read##bits(struct vcpu_tdx *tdx,	\
+ 							u32 field)		\
+@@ -164,6 +166,9 @@ static __always_inline void td_##lclass##_clearbit##bits(struct vcpu_tdx *tdx,	\
+ TDX_BUILD_TDVPS_ACCESSORS(16, VMCS, vmcs);
+ TDX_BUILD_TDVPS_ACCESSORS(32, VMCS, vmcs);
+ TDX_BUILD_TDVPS_ACCESSORS(64, VMCS, vmcs);
++
++TDX_BUILD_TDVPS_ACCESSORS(8, MANAGEMENT, management);
++
+ #else
+ static inline int tdx_bringup(void) { return 0; }
+ static inline void tdx_cleanup(void) {}
+diff --git a/arch/x86/kvm/vmx/x86_ops.h b/arch/x86/kvm/vmx/x86_ops.h
+index a6e388f73be2..8de276285214 100644
+--- a/arch/x86/kvm/vmx/x86_ops.h
++++ b/arch/x86/kvm/vmx/x86_ops.h
+@@ -140,6 +140,7 @@ int tdx_handle_exit(struct kvm_vcpu *vcpu,
+ 
+ void tdx_deliver_interrupt(struct kvm_lapic *apic, int delivery_mode,
+ 			   int trig_mode, int vector);
++void tdx_inject_nmi(struct kvm_vcpu *vcpu);
+ void tdx_get_exit_info(struct kvm_vcpu *vcpu, u32 *reason,
+ 		u64 *info1, u64 *info2, u32 *intr_info, u32 *error_code);
+ 
+@@ -181,6 +182,7 @@ static inline int tdx_handle_exit(struct kvm_vcpu *vcpu,
+ 
+ static inline void tdx_deliver_interrupt(struct kvm_lapic *apic, int delivery_mode,
+ 					 int trig_mode, int vector) {}
++static inline void tdx_inject_nmi(struct kvm_vcpu *vcpu) {}
+ static inline void tdx_get_exit_info(struct kvm_vcpu *vcpu, u32 *reason, u64 *info1,
+ 				     u64 *info2, u32 *intr_info, u32 *error_code) {}
+ 
+-- 
+2.43.0
+

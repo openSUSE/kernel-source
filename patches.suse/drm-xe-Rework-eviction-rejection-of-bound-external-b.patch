@@ -1,0 +1,221 @@
+From 5cc3325584c425069c1c3355c775314d64bf8770 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Thomas=20Hellstr=C3=B6m?= <thomas.hellstrom@linux.intel.com>
+Date: Wed, 28 May 2025 18:41:05 +0200
+Subject: [PATCH] drm/xe: Rework eviction rejection of bound external bos
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 5cc3325584c425069c1c3355c775314d64bf8770
+Patch-mainline: v6.16-rc1
+Alt-commit: 9d5558649f68e2e84a87a909631b30e15ca0f8ec
+References: git-fixes
+
+For preempt_fence mode VM's we're rejecting eviction of
+shared bos during VM_BIND. However, since we do this in the
+move() callback, we're getting an eviction failure warning from
+TTM. The TTM callback intended for these things is
+eviction_valuable().
+
+However, the latter doesn't pass in the struct ttm_operation_ctx
+needed to determine whether the caller needs this.
+
+Instead, attach the needed information to the vm under the
+vm->resv, until we've been able to update TTM to provide the
+needed information. And add sufficient lockdep checks to prevent
+misuse and races.
+
+V2: 
+- Fix a copy-paste error in xe_vm_clear_validating()
+V3: 
+- Fix kerneldoc errors.
+
+Signed-off-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Fixes: 0af944f0e308 ("drm/xe: Reject BO eviction if BO is bound to current VM")
+Reviewed-by: Matthew Brost <matthew.brost@intel.com>
+Link: https://lore.kernel.org/r/20250528164105.234718-1-thomas.hellstrom@linux.intel.com
+(cherry picked from commit 9d5558649f68e2e84a87a909631b30e15ca0f8ec)
+
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_bo.c       |   44 +++++++++++++++---------
+ drivers/gpu/drm/xe/xe_vm.h       |   69 +++++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_vm_types.h |    8 ++++
+ 3 files changed, 104 insertions(+), 17 deletions(-)
+
+--- a/drivers/gpu/drm/xe/xe_bo.c
++++ b/drivers/gpu/drm/xe/xe_bo.c
+@@ -702,21 +702,6 @@ static int xe_bo_move(struct ttm_buffer_
+ 		goto out;
+ 	}
+ 
+-	/* Reject BO eviction if BO is bound to current VM. */
+-	if (evict && ctx->resv) {
+-		struct drm_gpuvm_bo *vm_bo;
+-
+-		drm_gem_for_each_gpuvm_bo(vm_bo, &bo->ttm.base) {
+-			struct xe_vm *vm = gpuvm_to_vm(vm_bo->vm);
+-
+-			if (xe_vm_resv(vm) == ctx->resv &&
+-			    xe_vm_in_preempt_fence_mode(vm)) {
+-				ret = -EBUSY;
+-				goto out;
+-			}
+-		}
+-	}
+-
+ 	/*
+ 	 * Failed multi-hop where the old_mem is still marked as
+ 	 * TTM_PL_FLAG_TEMPORARY, should just be a dummy move.
+@@ -875,6 +860,25 @@ out:
+ 	return ret;
+ }
+ 
++static bool
++xe_bo_eviction_valuable(struct ttm_buffer_object *bo, const struct ttm_place *place)
++{
++	struct drm_gpuvm_bo *vm_bo;
++
++	if (!ttm_bo_eviction_valuable(bo, place))
++		return false;
++
++	if (!xe_bo_is_xe_bo(bo))
++		return true;
++
++	drm_gem_for_each_gpuvm_bo(vm_bo, &bo->base) {
++		if (xe_vm_is_validating(gpuvm_to_vm(vm_bo->vm)))
++			return false;
++	}
++
++	return true;
++}
++
+ /**
+  * xe_bo_evict_pinned() - Evict a pinned VRAM object to system memory
+  * @bo: The buffer object to move.
+@@ -1122,7 +1126,7 @@ const struct ttm_device_funcs xe_ttm_fun
+ 	.io_mem_reserve = xe_ttm_io_mem_reserve,
+ 	.io_mem_pfn = xe_ttm_io_mem_pfn,
+ 	.release_notify = xe_ttm_bo_release_notify,
+-	.eviction_valuable = ttm_bo_eviction_valuable,
++	.eviction_valuable = xe_bo_eviction_valuable,
+ 	.delete_mem_notify = xe_ttm_bo_delete_mem_notify,
+ };
+ 
+@@ -1877,6 +1881,8 @@ int xe_bo_validate(struct xe_bo *bo, str
+ 		.interruptible = true,
+ 		.no_wait_gpu = false,
+ 	};
++	struct pin_cookie cookie;
++	int ret;
+ 
+ 	if (vm) {
+ 		lockdep_assert_held(&vm->lock);
+@@ -1886,7 +1892,11 @@ int xe_bo_validate(struct xe_bo *bo, str
+ 		ctx.resv = xe_vm_resv(vm);
+ 	}
+ 
+-	return ttm_bo_validate(&bo->ttm, &bo->placement, &ctx);
++	cookie = xe_vm_set_validating(vm, allow_res_evict);
++	ret = ttm_bo_validate(&bo->ttm, &bo->placement, &ctx);
++	xe_vm_clear_validating(vm, allow_res_evict, cookie);
++
++	return ret;
+ }
+ 
+ bool xe_bo_is_xe_bo(struct ttm_buffer_object *bo)
+--- a/drivers/gpu/drm/xe/xe_vm.h
++++ b/drivers/gpu/drm/xe/xe_vm.h
+@@ -281,6 +281,75 @@ void xe_vm_snapshot_capture_delayed(stru
+ void xe_vm_snapshot_print(struct xe_vm_snapshot *snap, struct drm_printer *p);
+ void xe_vm_snapshot_free(struct xe_vm_snapshot *snap);
+ 
++/**
++ * xe_vm_set_validating() - Register this task as currently making bos resident
++ * @allow_res_evict: Allow eviction of buffer objects bound to @vm when
++ * validating.
++ * @vm: Pointer to the vm or NULL.
++ *
++ * Register this task as currently making bos resident for the vm. Intended
++ * to avoid eviction by the same task of shared bos bound to the vm.
++ * Call with the vm's resv lock held.
++ *
++ * Return: A pin cookie that should be used for xe_vm_clear_validating().
++ */
++static inline struct pin_cookie xe_vm_set_validating(struct xe_vm *vm,
++						     bool allow_res_evict)
++{
++	struct pin_cookie cookie = {};
++
++	if (vm && !allow_res_evict) {
++		xe_vm_assert_held(vm);
++		cookie = lockdep_pin_lock(&xe_vm_resv(vm)->lock.base);
++		/* Pairs with READ_ONCE in xe_vm_is_validating() */
++		WRITE_ONCE(vm->validating, current);
++	}
++
++	return cookie;
++}
++
++/**
++ * xe_vm_clear_validating() - Unregister this task as currently making bos resident
++ * @vm: Pointer to the vm or NULL
++ * @allow_res_evict: Eviction from @vm was allowed. Must be set to the same
++ * value as for xe_vm_set_validation().
++ * @cookie: Cookie obtained from xe_vm_set_validating().
++ *
++ * Register this task as currently making bos resident for the vm. Intended
++ * to avoid eviction by the same task of shared bos bound to the vm.
++ * Call with the vm's resv lock held.
++ */
++static inline void xe_vm_clear_validating(struct xe_vm *vm, bool allow_res_evict,
++					  struct pin_cookie cookie)
++{
++	if (vm && !allow_res_evict) {
++		lockdep_unpin_lock(&xe_vm_resv(vm)->lock.base, cookie);
++		/* Pairs with READ_ONCE in xe_vm_is_validating() */
++		WRITE_ONCE(vm->validating, NULL);
++	}
++}
++
++/**
++ * xe_vm_is_validating() - Whether bos bound to the vm are currently being made resident
++ * by the current task.
++ * @vm: Pointer to the vm.
++ *
++ * If this function returns %true, we should be in a vm resv locked region, since
++ * the current process is the same task that called xe_vm_set_validating().
++ * The function asserts that that's indeed the case.
++ *
++ * Return: %true if the task is currently making bos resident, %false otherwise.
++ */
++static inline bool xe_vm_is_validating(struct xe_vm *vm)
++{
++	/* Pairs with WRITE_ONCE in xe_vm_is_validating() */
++	if (READ_ONCE(vm->validating) == current) {
++		xe_vm_assert_held(vm);
++		return true;
++	}
++	return false;
++}
++
+ #if IS_ENABLED(CONFIG_DRM_XE_USERPTR_INVAL_INJECT)
+ void xe_vma_userptr_force_invalidate(struct xe_userptr_vma *uvma);
+ #else
+--- a/drivers/gpu/drm/xe/xe_vm_types.h
++++ b/drivers/gpu/drm/xe/xe_vm_types.h
+@@ -282,6 +282,14 @@ struct xe_vm {
+ 	 * protected by the vm resv.
+ 	 */
+ 	u64 tlb_flush_seqno;
++	/**
++	 * @validating: The task that is currently making bos resident for this vm.
++	 * Protected by the VM's resv for writing. Opportunistic reading can be done
++	 * using READ_ONCE. Note: This is a workaround for the
++	 * TTM eviction_valuable() callback not being passed a struct
++	 * ttm_operation_context(). Future work might want to address this.
++	 */
++	struct task_struct *validating;
+ 	/** @batch_invalidate_tlb: Always invalidate TLB before batch start */
+ 	bool batch_invalidate_tlb;
+ 	/** @xef: XE file handle for tracking this VM's drm client */

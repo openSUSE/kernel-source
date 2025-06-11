@@ -1,0 +1,159 @@
+Patch-mainline: v6.16-rc1
+Git-commit: b0327bb2e7e0016b1d19d8797668c418c7e0df7b
+References: jsc#PED-348
+From: Yan Zhao <yan.y.zhao@intel.com>
+Date: Thu, 27 Feb 2025 09:20:04 +0800
+Subject: [PATCH] KVM: TDX: Retry locally in TDX EPT violation handler on
+ RET_PF_RETRY
+
+Retry locally in the TDX EPT violation handler for private memory to reduce
+the chances for tdh_mem_sept_add()/tdh_mem_page_aug() to contend with
+tdh_vp_enter().
+
+TDX EPT violation installs private pages via tdh_mem_sept_add() and
+tdh_mem_page_aug(). The two may have contention with tdh_vp_enter() or
+TDCALLs.
+
+Resources    SHARED  users      EXCLUSIVE users
+------------------------------------------------------------
+SEPT tree  tdh_mem_sept_add     tdh_vp_enter(0-step mitigation)
+           tdh_mem_page_aug
+------------------------------------------------------------
+SEPT entry                      tdh_mem_sept_add (Host lock)
+                                tdh_mem_page_aug (Host lock)
+                                tdg_mem_page_accept (Guest lock)
+                                tdg_mem_page_attr_rd (Guest lock)
+                                tdg_mem_page_attr_wr (Guest lock)
+
+Though the contention between tdh_mem_sept_add()/tdh_mem_page_aug() and
+TDCALLs may be removed in future TDX module, their contention with
+tdh_vp_enter() due to 0-step mitigation still persists.
+
+The TDX module may trigger 0-step mitigation in SEAMCALL TDH.VP.ENTER,
+which works as follows:
+0. Each TDH.VP.ENTER records the guest RIP on TD entry.
+1. When the TDX module encounters a VM exit with reason EPT_VIOLATION, it
+   checks if the guest RIP is the same as last guest RIP on TD entry.
+   -if yes, it means the EPT violation is caused by the same instruction
+            that caused the last VM exit.
+            Then, the TDX module increases the guest RIP no-progress count.
+            When the count increases from 0 to the threshold (currently 6),
+            the TDX module records the faulting GPA into a
+            last_epf_gpa_list.
+   -if no,  it means the guest RIP has made progress.
+            So, the TDX module resets the RIP no-progress count and the
+            last_epf_gpa_list.
+2. On the next TDH.VP.ENTER, the TDX module (after saving the guest RIP on
+   TD entry) checks if the last_epf_gpa_list is empty.
+   -if yes, TD entry continues without acquiring the lock on the SEPT tree.
+   -if no,  it triggers the 0-step mitigation by acquiring the exclusive
+            lock on SEPT tree, walking the EPT tree to check if all page
+            faults caused by the GPAs in the last_epf_gpa_list have been
+            resolved before continuing TD entry.
+
+Since KVM TDP MMU usually re-enters guest whenever it exits to userspace
+(e.g. for KVM_EXIT_MEMORY_FAULT) or encounters a BUSY, it is possible for a
+tdh_vp_enter() to be called more than the threshold count before a page
+fault is addressed, triggering contention when tdh_vp_enter() attempts to
+acquire exclusive lock on SEPT tree.
+
+Retry locally in TDX EPT violation handler to reduce the count of invoking
+tdh_vp_enter(), hence reducing the possibility of its contention with
+tdh_mem_sept_add()/tdh_mem_page_aug(). However, the 0-step mitigation and
+the contention are still not eliminated due to KVM_EXIT_MEMORY_FAULT,
+signals/interrupts, and cases when one instruction faults more GFNs than
+the threshold count.
+
+Signed-off-by: Yan Zhao <yan.y.zhao@intel.com>
+Message-ID: <20250227012021.1778144-4-binbin.wu@linux.intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ arch/x86/kvm/vmx/tdx.c | 57 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 56 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index fa8d4f9b54bf..b8c94156f10f 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -1724,6 +1724,8 @@ static int tdx_handle_ept_violation(struct kvm_vcpu *vcpu)
+ {
+ 	unsigned long exit_qual;
+ 	gpa_t gpa = to_tdx(vcpu)->exit_gpa;
++	bool local_retry = false;
++	int ret;
+ 
+ 	if (vt_is_tdx_private_gpa(vcpu->kvm, gpa)) {
+ 		if (tdx_is_sept_violation_unexpected_pending(vcpu)) {
+@@ -1742,6 +1744,9 @@ static int tdx_handle_ept_violation(struct kvm_vcpu *vcpu)
+ 		 * due to aliasing a single HPA to multiple GPAs.
+ 		 */
+ 		exit_qual = EPT_VIOLATION_ACC_WRITE;
++
++		/* Only private GPA triggers zero-step mitigation */
++		local_retry = true;
+ 	} else {
+ 		exit_qual = vmx_get_exit_qual(vcpu);
+ 		/*
+@@ -1754,7 +1759,57 @@ static int tdx_handle_ept_violation(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	trace_kvm_page_fault(vcpu, gpa, exit_qual);
+-	return __vmx_handle_ept_violation(vcpu, gpa, exit_qual);
++
++	/*
++	 * To minimize TDH.VP.ENTER invocations, retry locally for private GPA
++	 * mapping in TDX.
++	 *
++	 * KVM may return RET_PF_RETRY for private GPA due to
++	 * - contentions when atomically updating SPTEs of the mirror page table
++	 * - in-progress GFN invalidation or memslot removal.
++	 * - TDX_OPERAND_BUSY error from TDH.MEM.PAGE.AUG or TDH.MEM.SEPT.ADD,
++	 *   caused by contentions with TDH.VP.ENTER (with zero-step mitigation)
++	 *   or certain TDCALLs.
++	 *
++	 * If TDH.VP.ENTER is invoked more times than the threshold set by the
++	 * TDX module before KVM resolves the private GPA mapping, the TDX
++	 * module will activate zero-step mitigation during TDH.VP.ENTER. This
++	 * process acquires an SEPT tree lock in the TDX module, leading to
++	 * further contentions with TDH.MEM.PAGE.AUG or TDH.MEM.SEPT.ADD
++	 * operations on other vCPUs.
++	 *
++	 * Breaking out of local retries for kvm_vcpu_has_events() is for
++	 * interrupt injection. kvm_vcpu_has_events() should not see pending
++	 * events for TDX. Since KVM can't determine if IRQs (or NMIs) are
++	 * blocked by TDs, false positives are inevitable i.e., KVM may re-enter
++	 * the guest even if the IRQ/NMI can't be delivered.
++	 *
++	 * Note: even without breaking out of local retries, zero-step
++	 * mitigation may still occur due to
++	 * - invoking of TDH.VP.ENTER after KVM_EXIT_MEMORY_FAULT,
++	 * - a single RIP causing EPT violations for more GFNs than the
++	 *   threshold count.
++	 * This is safe, as triggering zero-step mitigation only introduces
++	 * contentions to page installation SEAMCALLs on other vCPUs, which will
++	 * handle retries locally in their EPT violation handlers.
++	 */
++	while (1) {
++		ret = __vmx_handle_ept_violation(vcpu, gpa, exit_qual);
++
++		if (ret != RET_PF_RETRY || !local_retry)
++			break;
++
++		if (kvm_vcpu_has_events(vcpu) || signal_pending(current))
++			break;
++
++		if (kvm_check_request(KVM_REQ_VM_DEAD, vcpu)) {
++			ret = -EIO;
++			break;
++		}
++
++		cond_resched();
++	}
++	return ret;
+ }
+ 
+ int tdx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t fastpath)
+-- 
+2.43.0
+
