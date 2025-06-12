@@ -228,7 +228,7 @@ all config files as follows:
 
     $ ./scripts/sequence-patch
     $ cd /var/tmp/scratch/linux-5.14-SLE15-SP5
-    $ ./patches/scripts/run_oldconfig.sh
+    $ ./patches/scripts/run_oldconfig
 
 
 Committing and log messages
