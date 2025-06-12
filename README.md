@@ -33,7 +33,7 @@ Set up some Git hooks and helpers:
 
 To hack on the kernel sources:
 
-    $ ./scripts/sequence-patch.sh
+    $ ./scripts/sequence-patch
     $ cd tmp/linux-$version-$branch
     $ quilt new patches.suse/fix-foo-and-bar.patch
     $ quilt edit some/file.c
@@ -168,10 +168,10 @@ Before you commit -- things to check
 ------------------------------------
 
 Make sure that all patches still apply after your changes. One way of doing this
-is using `scripts/sequence-patch.sh`:
+is using `scripts/sequence-patch`:
 
     $ export SCRATCH_AREA=/var/tmp/scratch
-    $ ./scripts/sequence-patch.sh
+    $ ./scripts/sequence-patch
     Creating tree in /var/tmp/scratch/linux-5.14-SLE15-SP5
     Cleaning up from previous run
     Linking from /var/tmp/scratch/linux-5.14.orig
@@ -180,13 +180,13 @@ is using `scripts/sequence-patch.sh`:
     [ Generating Module.supported ]
     [ Copying config/x86_64/default ]
 
-Note the "Tree:" line output by the `sequence-patch.sh` script which specifies
+Note the "Tree:" line output by the `sequence-patch` script which specifies
 the location of the expanded kernel tree that is configured for local build.
 Please test-compile the kernel or even test-build kernel packages, depending on
 the impact of your changes. Use `scripts/tar-up` for creating an OBS package
 directory.
 
-The kernel source tree that `scripts/sequence-patch.sh` creates can be
+The kernel source tree that `scripts/sequence-patch` creates can be
 test-compiled. Before that, make sure all prerequisites are installed. These
 include libopenssl-devel, libelf-devel and dwarves. Have a look into
 `rpm/kernel-binary.spec.in` for a complete list. Then, the compilation can be
@@ -207,7 +207,7 @@ buildable and functional is to be avoided. Each patch from upstream should be
 modified as required to fit into the kernel it is backported to, both for build
 time and runtime.
 
-Applying all patches in the tree with `scripts/sequence-patch.sh` can take
+Applying all patches in the tree with `scripts/sequence-patch` can take
 a significant amount of time. The `--rapid` option is present to speed up the
 process and tells the script to use Rapidquilt instead of the regular Quilt.
 The Rapidquilt implementation applies patches in parallel and typically produces
@@ -226,7 +226,7 @@ those configuration files are missing necessary config options.
 When adding patches that introduce new kernel config options, please also update
 all config files as follows:
 
-    $ ./scripts/sequence-patch.sh
+    $ ./scripts/sequence-patch
     $ cd /var/tmp/scratch/linux-5.14-SLE15-SP5
     $ ./patches/scripts/run_oldconfig.sh
 

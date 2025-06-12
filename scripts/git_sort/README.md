@@ -91,7 +91,7 @@ For example, we want to backport f5a952c08e84 which is a fix for another
 commit which was already backported:
 ```
 # adjust the path to `sequence-insert` according to your environment
-ben@f1:~/local/src/kernel-source$ ./scripts/sequence-patch.sh $(./scripts/git_sort/sequence-insert f5a952c08e84)
+ben@f1:~/local/src/kernel-source$ ./scripts/sequence-patch $(./scripts/git_sort/sequence-insert f5a952c08e84)
 [...]
 ben@f1:~/local/src/kernel-source$ cd tmp/current
 ben@f1:~/local/src/kernel-source/tmp/current$ . ../../scripts/git_sort/quilt-mode.sh
@@ -176,7 +176,7 @@ Generate the work tree with patches applied up to the first patch in the
 list of commits to backport:
 ```
 # adjust the path to `sequence-insert` according to your environment
-kernel-source$ ./scripts/sequence-patch.sh $(./scripts/git_sort/sequence-insert $(head -n1 /tmp/list | awk '{print $1}'))
+kernel-source$ ./scripts/sequence-patch $(./scripts/git_sort/sequence-insert $(head -n1 /tmp/list | awk '{print $1}'))
 ```
 
 It is preferable to check that the driver builds before getting started:

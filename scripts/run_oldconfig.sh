@@ -282,7 +282,7 @@ menuconfig)
 	if test "$set_flavor" = "vanilla" -a -z "$VANILLA_ONLY" -a \
 			! -e .is_vanilla; then
 		echo "run_oldconfig.sh --vanilla only works in a tree created with" >&2
-		echo -n "sequence-patch.sh --vanilla. Do you really want to continue? [yN] " >&2
+		echo -n "sequence-patch --vanilla. Do you really want to continue? [yN] " >&2
 		read
 		case "$REPLY" in
 		"" | [Nn]*)
