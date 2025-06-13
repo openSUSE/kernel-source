@@ -49,7 +49,7 @@ above.
 
 To build RPM packages:
 
-    $ ./scripts/tar-up.sh
+    $ ./scripts/tar-up
 
 This creates a source package in the kernel-source directory. Use
 
@@ -183,7 +183,7 @@ is using `scripts/sequence-patch.sh`:
 Note the "Tree:" line output by the `sequence-patch.sh` script which specifies
 the location of the expanded kernel tree that is configured for local build.
 Please test-compile the kernel or even test-build kernel packages, depending on
-the impact of your changes. Use `scripts/tar-up.sh` for creating an OBS package
+the impact of your changes. Use `scripts/tar-up` for creating an OBS package
 directory.
 
 The kernel source tree that `scripts/sequence-patch.sh` creates can be
@@ -235,7 +235,7 @@ Committing and log messages
 ---------------------------
 
 Every commit to the kernel source repository should be properly documented.
-Tool `scripts/tar-up.sh` obtains change descriptions from a Git commit log and
+Tool `scripts/tar-up` obtains change descriptions from a Git commit log and
 automatically produces `.changes` files for use by the target RPM packages. All
 commits which affect the kernel package have their description collected, only
 changes modifying internals of the repository such as helper scripts are
@@ -304,7 +304,7 @@ not matter.
 
 All kernel ABI changes in all kernel packages can be ignored by creating a file
 called `IGNORE-KABI-BADNESS` in the `kernel-source/` sub-directory of the
-repository that `scripts/tar-up.sh` creates. Doing this may occasionally be
+repository that `scripts/tar-up` creates. Doing this may occasionally be
 necessary for PTF kernels.
 
 
