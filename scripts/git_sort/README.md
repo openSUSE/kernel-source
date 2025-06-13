@@ -120,7 +120,7 @@ ben@f1:~/local/src/kernel-source/tmp/current$ make olddefconfig
 scripts/kconfig/conf  --olddefconfig Kconfig
 ben@f1:~/local/src/kernel-source/tmp/current$ qfmake
 [...]
-ben@f1:~/local/src/kernel-source/tmp/current$ ./refresh_patch.sh
+ben@f1:~/local/src/kernel-source/tmp/current$ ./refresh_patch
 Refreshed patch patches/patches.drivers/of-of_mdio-Add-marvell-88e1145-to-whitelist-of-PHY-c.patch
 ben@f1:~/local/src/kernel-source/tmp/current$ cd ../../
 ben@f1:~/local/src/kernel-source$ git st
@@ -241,12 +241,12 @@ To address the situation,
 	  Then call `qskip` to skip the commit.
 	* remove the other copy, using `q delete -r <patch`, then call
 	  `qcp <commit>` and follow as indicated below (q push, qfmake,
-	  ./refresh_patch.sh)
+	  ./refresh_patch)
 * if a commit does not apply
 	`q push -f # or -fm`
 	`vi-conflicts # also from git-helpers`
 	`qfmake [...]`
-	`./refresh_patch.sh`
+	`./refresh_patch`
 * if one or more additional commits are necessary to fix the problem
 	Use `qedit` to add these additional commits to the list of commits to
 	backport.

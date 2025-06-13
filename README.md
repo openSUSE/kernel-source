@@ -37,7 +37,7 @@ To hack on the kernel sources:
     $ cd tmp/linux-$version-$branch
     $ quilt new patches.suse/fix-foo-and-bar.patch
     $ quilt edit some/file.c
-    $ ./refresh_patch.sh
+    $ ./refresh_patch
     $ quilt header -e # see next chapter
 
 Refer to the Quilt documentation for details. When you are done, add the new

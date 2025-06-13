@@ -400,7 +400,7 @@ qdoit () {
 			return 1
 		fi
 
-		./refresh_patch.sh
+		./refresh_patch
 
 		if ! qfmake "$@"; then
 			echo "The last applied commit results in a build failure. Please examine the situation." > /dev/stderr
