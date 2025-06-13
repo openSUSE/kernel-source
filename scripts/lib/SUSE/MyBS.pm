@@ -26,7 +26,6 @@ use SUSE::MyBS::Buildresults;
 my $cookiefile = "~/.local/state/MyBS/cookie";
 my $lockfile = $cookiefile . ".lock";
 my $locktime = 300;
-my $errok = ();
 
 sub new {
 	my ($class, $api_url) = @_;
@@ -365,12 +364,7 @@ sub api {
 	}
 	if ($res->code != 200) {
 		#print STDERR $res->as_string();
-		my $message = "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
-		if ($errok) {
-			print STDERR $message;
-		} else {
-			die $message;
-		}
+		die "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
 	}
 	my $headers = $res->headers();
 	my $cookie = $headers->{'set-cookie'};
