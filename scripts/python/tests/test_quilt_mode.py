@@ -195,7 +195,7 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
         with series.open('w') as f:
             f.writelines(entries)
         subprocess.check_call(
-            [lib.bindir / 'qgoto.py', str(self.commits[0])],
+            [lib.bindir / 'qgoto', str(self.commits[0])],
             cwd=self.current, stdout=subprocess.DEVNULL)
 
         # test qgoto
