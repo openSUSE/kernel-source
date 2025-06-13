@@ -90,8 +90,8 @@ Example workflow to backport a single commit
 For example, we want to backport f5a952c08e84 which is a fix for another
 commit which was already backported:
 ```
-# adjust the path to `sequence-insert.py` according to your environment
-ben@f1:~/local/src/kernel-source$ ./scripts/sequence-patch.sh $(./scripts/git_sort/sequence-insert.py f5a952c08e84)
+# adjust the path to `sequence-insert` according to your environment
+ben@f1:~/local/src/kernel-source$ ./scripts/sequence-patch.sh $(./scripts/git_sort/sequence-insert f5a952c08e84)
 [...]
 ben@f1:~/local/src/kernel-source$ cd tmp/current
 ben@f1:~/local/src/kernel-source/tmp/current$ . ../../scripts/git_sort/quilt-mode.sh

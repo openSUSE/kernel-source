@@ -157,7 +157,7 @@ After you've added a patch file to the main `patches.suse/` or a different patch
 directory, and supplemented the required tags described in the section [Patch
 headers](#patch-headers), run
 
-    $ ./scripts/git_sort/series_insert.py <patch>
+    $ ./scripts/git_sort/series_insert <patch>
 
 to insert an entry for a new patch file to the sorted section of `series.conf`.
 

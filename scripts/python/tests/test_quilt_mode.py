@@ -369,13 +369,13 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
             f.writelines(content)
         subprocess.check_call(("git", "add", name,), cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
-        # test merge_tool.py
+        # test series_merge_tool
         subprocess.check_call(("git", "checkout", "-q", "master",), cwd=self.ks_dir)
         shutil.rmtree(self.current)
         subprocess.check_call(
             ("git", "config", "--add", "mergetool.git-sort.cmd",
              "%s $LOCAL $BASE $REMOTE $MERGED" % (
-                 lib.bindir / 'merge_tool.py',),), cwd=self.ks_dir)
+                 lib.bindir / 'series_merge_tool',),), cwd=self.ks_dir)
         subprocess.check_call(("git", "config", "--add",
                                "mergetool.git-sort.trustexitcode", "true",), cwd=self.ks_dir)
         retval = subprocess.call(("git", "merge", "other",), cwd=self.ks_dir,
