@@ -675,6 +675,7 @@ sub create_project {
 		$prjconf .= "BuildFlags: !excludebuild:kernel-obs-qa\n";
 		$prjconf .= "BuildFlags: onlybuild:$package:kernel-obs-qa\n";
 		$prjconf .= "BuildFlags: onlybuild:kernel-obs-qa\n";
+		$prjconf .= "BuildFlags: onlybuild:kernel-obs-build.agg\n";
 	}
 	$prjconf .= "BuildFlags: onlybuild:nonexistent-package\n";
 	$prjconf .= "BuildFlags: !nouseforbuild:$package:kernel-obs-build\n";
@@ -836,6 +837,9 @@ sub upload_package {
 			$writer->endTag('package');
 			for my $i ((0 .. $#{$repos})) {
 				$writer->emptyTag('repository', 'target' => ${$qa_repos}[$i], 'source' => ${$repos}[$i]);
+				# undocumented: Unless spedified otherwise identitty mapping assumed.
+				# Prevent aggregating the package in non-QA repository by adding a mapping with no source.
+				$writer->emptyTag('repository', 'target' => ${$repos}[$i]);
 			}
 			$writer->endTag('aggregate');
 			$writer->endTag('aggregatelist');
