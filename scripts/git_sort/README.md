@@ -90,8 +90,8 @@ Example workflow to backport a single commit
 For example, we want to backport f5a952c08e84 which is a fix for another
 commit which was already backported:
 ```
-# adjust the path to `sequence-insert.py` according to your environment
-ben@f1:~/local/src/kernel-source$ ./scripts/sequence-patch.sh $(./scripts/git_sort/sequence-insert.py f5a952c08e84)
+# adjust the path to `sequence-insert` according to your environment
+ben@f1:~/local/src/kernel-source$ ./scripts/sequence-patch $(./scripts/git_sort/sequence-insert f5a952c08e84)
 [...]
 ben@f1:~/local/src/kernel-source$ cd tmp/current
 ben@f1:~/local/src/kernel-source/tmp/current$ . ../../scripts/git_sort/quilt-mode.sh
@@ -120,7 +120,7 @@ ben@f1:~/local/src/kernel-source/tmp/current$ make olddefconfig
 scripts/kconfig/conf  --olddefconfig Kconfig
 ben@f1:~/local/src/kernel-source/tmp/current$ qfmake
 [...]
-ben@f1:~/local/src/kernel-source/tmp/current$ ./refresh_patch.sh
+ben@f1:~/local/src/kernel-source/tmp/current$ ./refresh_patch
 Refreshed patch patches/patches.drivers/of-of_mdio-Add-marvell-88e1145-to-whitelist-of-PHY-c.patch
 ben@f1:~/local/src/kernel-source/tmp/current$ cd ../../
 ben@f1:~/local/src/kernel-source$ git st
@@ -176,7 +176,7 @@ Generate the work tree with patches applied up to the first patch in the
 list of commits to backport:
 ```
 # adjust the path to `sequence-insert` according to your environment
-kernel-source$ ./scripts/sequence-patch.sh $(./scripts/git_sort/sequence-insert $(head -n1 /tmp/list | awk '{print $1}'))
+kernel-source$ ./scripts/sequence-patch $(./scripts/git_sort/sequence-insert $(head -n1 /tmp/list | awk '{print $1}'))
 ```
 
 It is preferable to check that the driver builds before getting started:
@@ -241,12 +241,12 @@ To address the situation,
 	  Then call `qskip` to skip the commit.
 	* remove the other copy, using `q delete -r <patch`, then call
 	  `qcp <commit>` and follow as indicated below (q push, qfmake,
-	  ./refresh_patch.sh)
+	  ./refresh_patch)
 * if a commit does not apply
 	`q push -f # or -fm`
 	`vi-conflicts # also from git-helpers`
 	`qfmake [...]`
-	`./refresh_patch.sh`
+	`./refresh_patch`
 * if one or more additional commits are necessary to fix the problem
 	Use `qedit` to add these additional commits to the list of commits to
 	backport.
