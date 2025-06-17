@@ -1,9 +1,1 @@
-#!/bin/sh
-
-self="$0"
-
-target="$(dirname $0)/$(basename $0 .sh)"
-
-echo "$0 is deprecated, use $target please" >&2
-
-exec "$target" "$@"
+deprecated-shell
