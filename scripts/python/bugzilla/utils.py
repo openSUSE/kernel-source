@@ -39,7 +39,7 @@ def make_url(bug_id):
     return f'https://bugzilla.suse.com/show_bug.cgi?id={bug_id}'
 
 def get_backport_string(references, h, comment):
-    return f'./scripts/git_sort/series_insert.py patches.suse/$(exportpatch -w -s -d patches.suse {" ".join(f"-F {r}" for r in references)} {h}) # {comment}'
+    return f'./scripts/git_sort/series_insert patches.suse/$(exportpatch -w -s -d patches.suse {" ".join(f"-F {r}" for r in references)} {h}) # {comment}'
 
 def create_cache_dir(program_dir):
     cache_dir = os.getenv('XDG_CACHE_HOME', None)
