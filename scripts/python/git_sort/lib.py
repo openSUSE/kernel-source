@@ -658,6 +658,6 @@ def sequence_insert(series, rev, top):
 
     if new_patches != current_patches:
         raise exc.KSError("Subseries is not sorted. "
-                      "Please run scripts/series_sort.py.")
+                      "Please run scripts/series_sort.")
 
     return (name, commit_pos - top_index,)
