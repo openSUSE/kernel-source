@@ -76,14 +76,14 @@ if sorted_section_changed || sorted_patches_changed; then
 	trap '[ -n "$tmpdir" -a -d "$tmpdir" ] && rm -r "$tmpdir"' EXIT
 	tmpdir=$(mktemp --directory --tmpdir gs_pc.XXXXXXXXXX)
 
-	# series_sort.py should examine the patches in the index, not the
+	# series_sort should examine the patches in the index, not the
 	# working tree. Check them out.
 	git cat-file blob :series.conf |
 		"$_libdir"/series_conf --name-only |
 		git checkout-index --quiet --prefix="$tmpdir/" --stdin
 
 	git cat-file blob :series.conf |
-		"$_libdir"/series_sort.py --check --prefix="$tmpdir"
+		"$_libdir"/series_sort --check --prefix="$tmpdir"
 	retval=$?
 
 	rm -r "$tmpdir"
