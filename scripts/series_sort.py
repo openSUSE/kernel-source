@@ -1,1 +1,1 @@
-series_sort
+deprecated-python
