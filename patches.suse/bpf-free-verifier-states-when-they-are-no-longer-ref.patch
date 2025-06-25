@@ -1,0 +1,305 @@
+From: Eduard Zingerman <eddyz87@gmail.com>
+Date: Sat, 15 Feb 2025 03:04:00 -0800
+Subject: bpf: free verifier states when they are no longer referenced
+Patch-mainline: v6.15-rc1
+Git-commit: 408fcf946b2badb0a81c69ab837b6dfc0e76aa87
+References: CVE-2025-38060 bsc#1245155
+
+When fixes from patches 1 and 3 are applied, Patrick Somaru reported
+an increase in memory consumption for sched_ext iterator-based
+programs hitting 1M instructions limit. For example, 2Gb VMs ran out
+of memory while verifying a program. Similar behaviour could be
+reproduced on current bpf-next master.
+
+Here is an example of such program:
+
+    /* verification completes if given 16G or RAM,
+     * final env->free_list size is 369,960 entries.
+     */
+    SEC("raw_tp")
+    __flag(BPF_F_TEST_STATE_FREQ)
+    __success
+    int free_list_bomb(const void *ctx)
+    {
+        volatile char buf[48] = {};
+        unsigned i, j;
+
+        j = 0;
+        bpf_for(i, 0, 10) {
+            /* this forks verifier state:
+             * - verification of current path continues and
+             *   creates a checkpoint after 'if';
+             * - verification of forked path hits the
+             *   checkpoint and marks it as loop_entry.
+             */
+            if (bpf_get_prandom_u32())
+                asm volatile ("");
+            /* this marks 'j' as precise, thus any checkpoint
+             * created on current iteration would not be matched
+             * on the next iteration.
+             */
+            buf[j++] = 42;
+            j %= ARRAY_SIZE(buf);
+        }
+        asm volatile (""::"r"(buf));
+        return 0;
+    }
+
+Memory consumption increased due to more states being marked as loop
+entries and eventually added to env->free_list.
+
+This commit introduces logic to free states from env->free_list during
+verification. A state in env->free_list can be freed if:
+- it has no child states;
+- it is not used as a loop_entry.
+
+This commit:
+- updates bpf_verifier_state->used_as_loop_entry to be a counter
+  that tracks how many states use this one as a loop entry;
+- adds a function maybe_free_verifier_state(), which:
+  - frees a state if its ->branches and ->used_as_loop_entry counters
+    are both zero;
+  - if the state is freed, state->loop_entry->used_as_loop_entry is
+    decremented, and an attempt is made to free state->loop_entry.
+
+In the example above, this approach reduces the maximum number of
+states in the free list from 369,960 to 16,223.
+
+However, this approach has its limitations. If the buf size in the
+example above is modified to 64, state caching overflows: the state
+for j=0 is evicted from the cache before it can be used to stop
+traversal. As a result, states in the free list accumulate because
+their branch counters do not reach zero.
+
+The effect of this patch on the selftests looks as follows:
+
+File                              Program                               Max free list (A)  Max free list (B)  Max free list (DIFF)
+--------------------------------  ------------------------------------  -----------------  -----------------  --------------------
+arena_list.bpf.o                  arena_list_add                                       17                  3         -14 (-82.35%)
+bpf_iter_task_stack.bpf.o         dump_task_stack                                      39                  9         -30 (-76.92%)
+iters.bpf.o                       checkpoint_states_deletion                          265                 89        -176 (-66.42%)
+iters.bpf.o                       clean_live_states                                    19                  0        -19 (-100.00%)
+profiler2.bpf.o                   tracepoint__syscalls__sys_enter_kill                102                  1        -101 (-99.02%)
+profiler3.bpf.o                   tracepoint__syscalls__sys_enter_kill                144                  0       -144 (-100.00%)
+pyperf600_iter.bpf.o              on_event                                             15                  0        -15 (-100.00%)
+pyperf600_nounroll.bpf.o          on_event                                           1170               1158          -12 (-1.03%)
+setget_sockopt.bpf.o              skops_sockopt                                        18                  0        -18 (-100.00%)
+strobemeta_nounroll1.bpf.o        on_event                                            147                 83         -64 (-43.54%)
+strobemeta_nounroll2.bpf.o        on_event                                            312                209        -103 (-33.01%)
+strobemeta_subprogs.bpf.o         on_event                                            124                 86         -38 (-30.65%)
+test_cls_redirect_subprogs.bpf.o  cls_redirect                                         15                  0        -15 (-100.00%)
+timer.bpf.o                       test1                                                30                 15         -15 (-50.00%)
+
+Measured using "do-not-submit" patches from here:
+https://github.com/eddyz87/bpf/tree/get-loop-entry-hungup
+
+Reported-by: Patrick Somaru <patsomaru@meta.com>
+Signed-off-by: Eduard Zingerman <eddyz87@gmail.com>
+Link: https://lore.kernel.org/r/20250215110411.3236773-10-eddyz87@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/linux/bpf_verifier.h |   14 +++---
+ kernel/bpf/verifier.c        |   91 +++++++++++++++++++++++++++++++------------
+ 2 files changed, 75 insertions(+), 30 deletions(-)
+
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -438,11 +438,6 @@ struct bpf_verifier_state {
+ 	bool speculative;
+ 	bool active_rcu_lock;
+ 	u32 active_preempt_lock;
+-	/* If this state was ever pointed-to by other state's loop_entry field
+-	 * this flag would be set to true. Used to avoid freeing such states
+-	 * while they are still in use.
+-	 */
+-	bool used_as_loop_entry;
+ 	bool in_sleepable;
+ 
+ 	/* first and last insn idx of this verifier state */
+@@ -468,6 +463,11 @@ struct bpf_verifier_state {
+ 	u32 dfs_depth;
+ 	u32 callback_unroll_depth;
+ 	u32 may_goto_depth;
++	/* If this state was ever pointed-to by other state's loop_entry field
++	 * this flag would be set to true. Used to avoid freeing such states
++	 * while they are still in use.
++	 */
++	u32 used_as_loop_entry;
+ };
+ 
+ #define bpf_get_spilled_reg(slot, frame, mask)				\
+@@ -509,7 +509,9 @@ struct bpf_verifier_state {
+ struct bpf_verifier_state_list {
+ 	struct bpf_verifier_state state;
+ 	struct list_head node;
+-	int miss_cnt, hit_cnt;
++	u32 miss_cnt;
++	u32 hit_cnt:31;
++	u32 in_free_list:1;
+ };
+ 
+ struct bpf_loop_inline_state {
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -1397,6 +1397,50 @@ static void free_verifier_state(struct b
+ 		kfree(state);
+ }
+ 
++/* struct bpf_verifier_state->{parent,loop_entry} refer to states
++ * that are in either of env->{expored_states,free_list}.
++ * In both cases the state is contained in struct bpf_verifier_state_list.
++ */
++static struct bpf_verifier_state_list *state_parent_as_list(struct bpf_verifier_state *st)
++{
++	if (st->parent)
++		return container_of(st->parent, struct bpf_verifier_state_list, state);
++	return NULL;
++}
++
++static struct bpf_verifier_state_list *state_loop_entry_as_list(struct bpf_verifier_state *st)
++{
++	if (st->loop_entry)
++		return container_of(st->loop_entry, struct bpf_verifier_state_list, state);
++	return NULL;
++}
++
++/* A state can be freed if it is no longer referenced:
++ * - is in the env->free_list;
++ * - has no children states;
++ * - is not used as loop_entry.
++ *
++ * Freeing a state can make it's loop_entry free-able.
++ */
++static void maybe_free_verifier_state(struct bpf_verifier_env *env,
++				      struct bpf_verifier_state_list *sl)
++{
++	struct bpf_verifier_state_list *loop_entry_sl;
++
++	while (sl && sl->in_free_list &&
++		     sl->state.branches == 0 &&
++		     sl->state.used_as_loop_entry == 0) {
++		loop_entry_sl = state_loop_entry_as_list(&sl->state);
++		if (loop_entry_sl)
++			loop_entry_sl->state.used_as_loop_entry--;
++		list_del(&sl->node);
++		free_verifier_state(&sl->state, false);
++		kfree(sl);
++		env->peak_states--;
++		sl = loop_entry_sl;
++	}
++}
++
+ /* copy verifier state from src to dst growing dst stack space
+  * when necessary to accommodate larger src stack
+  */
+@@ -1625,7 +1669,8 @@ static struct bpf_verifier_state *get_lo
+ 	return topmost;
+ }
+ 
+-static void update_loop_entry(struct bpf_verifier_state *cur, struct bpf_verifier_state *hdr)
++static void update_loop_entry(struct bpf_verifier_env *env,
++			      struct bpf_verifier_state *cur, struct bpf_verifier_state *hdr)
+ {
+ 	/* The hdr->branches check decides between cases B and C in
+ 	 * comment for get_loop_entry(). If hdr->branches == 0 then
+@@ -1634,13 +1679,20 @@ static void update_loop_entry(struct bpf
+ 	 * no need to update cur->loop_entry.
+ 	 */
+ 	if (hdr->branches && hdr->dfs_depth < (cur->loop_entry ?: cur)->dfs_depth) {
++		if (cur->loop_entry) {
++			cur->loop_entry->used_as_loop_entry--;
++			maybe_free_verifier_state(env, state_loop_entry_as_list(cur));
++		}
+ 		cur->loop_entry = hdr;
+-		hdr->used_as_loop_entry = true;
++		hdr->used_as_loop_entry++;
+ 	}
+ }
+ 
+ static void update_branch_counts(struct bpf_verifier_env *env, struct bpf_verifier_state *st)
+ {
++	struct bpf_verifier_state_list *sl = NULL, *parent_sl;
++	struct bpf_verifier_state *parent;
++
+ 	while (st) {
+ 		u32 br = --st->branches;
+ 
+@@ -1650,7 +1702,7 @@ static void update_branch_counts(struct
+ 		 * This is a part of 'case A' in get_loop_entry() comment.
+ 		 */
+ 		if (br == 0 && st->parent && st->loop_entry)
+-			update_loop_entry(st->parent, st->loop_entry);
++			update_loop_entry(env, st->parent, st->loop_entry);
+ 
+ 		/* WARN_ON(br > 1) technically makes sense here,
+ 		 * but see comment in push_stack(), hence:
+@@ -1660,7 +1712,12 @@ static void update_branch_counts(struct
+ 			  br);
+ 		if (br)
+ 			break;
+-		st = st->parent;
++		parent = st->parent;
++		parent_sl = state_parent_as_list(st);
++		if (sl)
++			maybe_free_verifier_state(env, sl);
++		st = parent;
++		sl = parent_sl;
+ 	}
+ }
+ 
+@@ -18054,7 +18111,7 @@ static int is_state_visited(struct bpf_v
+ 					spi = __get_spi(iter_reg->off + iter_reg->var_off.value);
+ 					iter_state = &func(env, iter_reg)->stack[spi].spilled_ptr;
+ 					if (iter_state->iter.state == BPF_ITER_STATE_ACTIVE) {
+-						update_loop_entry(cur, &sl->state);
++						update_loop_entry(env, cur, &sl->state);
+ 						goto hit;
+ 					}
+ 				}
+@@ -18063,7 +18120,7 @@ static int is_state_visited(struct bpf_v
+ 			if (is_may_goto_insn_at(env, insn_idx)) {
+ 				if (sl->state.may_goto_depth != cur->may_goto_depth &&
+ 				    states_equal(env, &sl->state, cur, RANGE_WITHIN)) {
+-					update_loop_entry(cur, &sl->state);
++					update_loop_entry(env, cur, &sl->state);
+ 					goto hit;
+ 				}
+ 			}
+@@ -18136,7 +18193,7 @@ skip_inf_loop_check:
+ 		force_exact = loop_entry && loop_entry->branches > 0;
+ 		if (states_equal(env, &sl->state, cur, force_exact ? RANGE_WITHIN : NOT_EXACT)) {
+ 			if (force_exact)
+-				update_loop_entry(cur, loop_entry);
++				update_loop_entry(env, cur, loop_entry);
+ hit:
+ 			sl->hit_cnt++;
+ 			/* reached equivalent register/stack state,
+@@ -18185,24 +18242,10 @@ miss:
+ 			/* the state is unlikely to be useful. Remove it to
+ 			 * speed up verification
+ 			 */
++			sl->in_free_list = true;
+ 			list_del(&sl->node);
+-			if (sl->state.frame[0]->regs[0].live & REG_LIVE_DONE &&
+-			    !sl->state.used_as_loop_entry) {
+-				u32 br = sl->state.branches;
+-
+-				WARN_ONCE(br,
+-					  "BUG live_done but branches_to_explore %d\n",
+-					  br);
+-				free_verifier_state(&sl->state, false);
+-				kfree(sl);
+-				env->peak_states--;
+-			} else {
+-				/* cannot free this state, since parentage chain may
+-				 * walk it later. Add it for free_list instead to
+-				 * be freed at the end of verification
+-				 */
+-				list_add(&sl->node, &env->free_list);
+-			}
++			list_add(&sl->node, &env->free_list);
++			maybe_free_verifier_state(env, sl);
+ 		}
+ 	}
+ 
