@@ -1,0 +1,451 @@
+From: David Finkel <davidf@vimeo.com>
+Date: Mon, 29 Jul 2024 10:37:42 -0400
+Subject: mm, memcg: cg2 memory{.swap,}.peak write handlers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: c6f53ed8f213a66ae8bc40aa9112c32412c35a21
+Patch-mainline: v6.12-rc1
+References: jsc#PED-12551
+
+Patch series "mm, memcg: cg2 memory{.swap,}.peak write handlers", v7.
+
+
+This patch (of 2):
+
+Other mechanisms for querying the peak memory usage of either a process or
+v1 memory cgroup allow for resetting the high watermark.  Restore parity
+with those mechanisms, but with a less racy API.
+
+For example:
+ - Any write to memory.max_usage_in_bytes in a cgroup v1 mount resets
+   the high watermark.
+ - writing "5" to the clear_refs pseudo-file in a processes's proc
+   directory resets the peak RSS.
+
+This change is an evolution of a previous patch, which mostly copied the
+cgroup v1 behavior, however, there were concerns about races/ownership
+issues with a global reset, so instead this change makes the reset
+filedescriptor-local.
+
+Writing any non-empty string to the memory.peak and memory.swap.peak
+pseudo-files reset the high watermark to the current usage for subsequent
+reads through that same FD.
+
+Notably, following Johannes's suggestion, this implementation moves the
+O(FDs that have written) behavior onto the FD write(2) path.  Instead, on
+the page-allocation path, we simply add one additional watermark to
+conditionally bump per-hierarchy level in the page-counter.
+
+Additionally, this takes Longman's suggestion of nesting the
+page-charging-path checks for the two watermarks to reduce the number of
+common-case comparisons.
+
+This behavior is particularly useful for work scheduling systems that need
+to track memory usage of worker processes/cgroups per-work-item.  Since
+memory can't be squeezed like CPU can (the OOM-killer has opinions), these
+systems need to track the peak memory usage to compute system/container
+fullness when binpacking workitems.
+
+Most notably, Vimeo's use-case involves a system that's doing global
+binpacking across many Kubernetes pods/containers, and while we can use
+PSI for some local decisions about overload, we strive to avoid packing
+workloads too tightly in the first place.  To facilitate this, we track
+the peak memory usage.  However, since we run with long-lived workers (to
+amortize startup costs) we need a way to track the high watermark while a
+work-item is executing.  Polling runs the risk of missing short spikes
+that last for timescales below the polling interval, and peak memory
+tracking at the cgroup level is otherwise perfect for this use-case.
+
+As this data is used to ensure that binpacked work ends up with sufficient
+headroom, this use-case mostly avoids the inaccuracies surrounding
+reclaimable memory.
+
+Link: https://lkml.kernel.org/r/20240730231304.761942-1-davidf@vimeo.com
+Link: https://lkml.kernel.org/r/20240729143743.34236-1-davidf@vimeo.com
+Link: https://lkml.kernel.org/r/20240729143743.34236-2-davidf@vimeo.com
+Signed-off-by: David Finkel <davidf@vimeo.com>
+Suggested-by: Johannes Weiner <hannes@cmpxchg.org>
+Suggested-by: Waiman Long <longman@redhat.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Reviewed-by: Michal Koutný <mkoutny@suse.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+Reviewed-by: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Zefan Li <lizefan.x@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Acked-by: Michal Koutný <mkoutny@suse.com>
+---
+ Documentation/admin-guide/cgroup-v2.rst |   22 +++---
+ include/linux/cgroup-defs.h             |    5 +
+ include/linux/cgroup.h                  |    3 
+ include/linux/memcontrol.h              |    5 +
+ include/linux/page_counter.h            |   11 ++-
+ kernel/cgroup/cgroup-internal.h         |    2 
+ kernel/cgroup/cgroup.c                  |    7 +
+ mm/memcontrol.c                         |  116 +++++++++++++++++++++++++++++---
+ mm/page_counter.c                       |   29 +++++---
+ 9 files changed, 173 insertions(+), 27 deletions(-)
+
+--- a/Documentation/admin-guide/cgroup-v2.rst
++++ b/Documentation/admin-guide/cgroup-v2.rst
+@@ -1269,11 +1269,14 @@ PAGE_SIZE multiple when read back.
+ 	reclaim induced by memory.reclaim.
+ 
+   memory.peak
+-	A read-only single value file which exists on non-root
+-	cgroups.
++	A read-write single value file which exists on non-root cgroups.
++
++	The max memory usage recorded for the cgroup and its descendants since
++	either the creation of the cgroup or the most recent reset for that FD.
+ 
+-	The max memory usage recorded for the cgroup and its
+-	descendants since the creation of the cgroup.
++	A write of any non-empty string to this file resets it to the
++	current memory usage for subsequent reads through the same
++	file descriptor.
+ 
+   memory.oom.group
+ 	A read-write single value file which exists on non-root
+@@ -1581,11 +1584,14 @@ PAGE_SIZE multiple when read back.
+ 	Healthy workloads are not expected to reach this limit.
+ 
+   memory.swap.peak
+-	A read-only single value file which exists on non-root
+-	cgroups.
++	A read-write single value file which exists on non-root cgroups.
++
++	The max swap usage recorded for the cgroup and its descendants since
++	the creation of the cgroup or the most recent reset for that FD.
+ 
+-	The max swap usage recorded for the cgroup and its
+-	descendants since the creation of the cgroup.
++	A write of any non-empty string to this file resets it to the
++	current memory usage for subsequent reads through the same
++	file descriptor.
+ 
+   memory.swap.max
+ 	A read-write single value file which exists on non-root
+--- a/include/linux/cgroup-defs.h
++++ b/include/linux/cgroup-defs.h
+@@ -742,6 +742,11 @@ struct cgroup_subsys {
+ 
+ extern struct percpu_rw_semaphore cgroup_threadgroup_rwsem;
+ 
++struct cgroup_of_peak {
++	unsigned long		value;
++	struct list_head	list;
++};
++
+ /**
+  * cgroup_threadgroup_change_begin - threadgroup exclusion for cgroups
+  * @tsk: target task
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@ -12,6 +12,7 @@
+ #include <linux/sched.h>
+ #include <linux/cpumask.h>
+ #include <linux/nodemask.h>
++#include <linux/list.h>
+ #include <linux/rculist.h>
+ #include <linux/cgroupstats.h>
+ #include <linux/fs.h>
+@@ -857,4 +858,6 @@ static inline void cgroup_bpf_put(struct
+ 
+ #endif /* CONFIG_CGROUP_BPF */
+ 
++struct cgroup_of_peak *of_peak(struct kernfs_open_file *of);
++
+ #endif /* _LINUX_CGROUP_H */
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -222,6 +222,11 @@ struct mem_cgroup {
+ 	struct page_counter kmem;		/* v1 only */
+ 	struct page_counter tcpmem;		/* v1 only */
+ 
++	/* registered local peak watchers */
++	struct list_head memory_peaks;
++	struct list_head swap_peaks;
++	spinlock_t	 peaks_lock;
++
+ 	/* Range enforcement for interrupt charges */
+ 	struct work_struct high_work;
+ 
+--- a/include/linux/page_counter.h
++++ b/include/linux/page_counter.h
+@@ -26,6 +26,8 @@ struct page_counter {
+ 	atomic_long_t children_low_usage;
+ 
+ 	unsigned long watermark;
++	/* Latest cg2 reset watermark */
++	unsigned long local_watermark;
+ 	unsigned long failcnt;
+ 
+ 	/* Keep all the read most fields in a separete cacheline. */
+@@ -78,7 +80,14 @@ int page_counter_memparse(const char *bu
+ 
+ static inline void page_counter_reset_watermark(struct page_counter *counter)
+ {
+-	counter->watermark = page_counter_read(counter);
++	unsigned long usage = page_counter_read(counter);
++
++	/*
++	 * Update local_watermark first, so it's always <= watermark
++	 * (modulo CPU/compiler re-ordering)
++	 */
++	counter->local_watermark = usage;
++	counter->watermark = usage;
+ }
+ 
+ #endif /* _LINUX_PAGE_COUNTER_H */
+--- a/kernel/cgroup/cgroup-internal.h
++++ b/kernel/cgroup/cgroup-internal.h
+@@ -81,6 +81,8 @@ struct cgroup_file_ctx {
+ 	struct {
+ 		struct cgroup_pidlist	*pidlist;
+ 	} procs1;
++
++	struct cgroup_of_peak peak;
+ };
+ 
+ /*
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -1992,6 +1992,13 @@ static int cgroup2_parse_param(struct fs
+ 	return -EINVAL;
+ }
+ 
++struct cgroup_of_peak *of_peak(struct kernfs_open_file *of)
++{
++	struct cgroup_file_ctx *ctx = of->priv;
++
++	return &ctx->peak;
++}
++
+ static void apply_cgroup_root_flags(unsigned int root_flags)
+ {
+ 	if (current->nsproxy->cgroup_ns == &init_cgroup_ns) {
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -25,6 +25,7 @@
+  * Copyright (C) 2020 Alibaba, Inc, Alex Shi
+  */
+ 
++#include <linux/cgroup-defs.h>
+ #include <linux/page_counter.h>
+ #include <linux/memcontrol.h>
+ #include <linux/cgroup.h>
+@@ -41,6 +42,7 @@
+ #include <linux/rcupdate.h>
+ #include <linux/limits.h>
+ #include <linux/export.h>
++#include <linux/list.h>
+ #include <linux/mutex.h>
+ #include <linux/rbtree.h>
+ #include <linux/slab.h>
+@@ -5383,6 +5385,9 @@ static struct mem_cgroup *mem_cgroup_all
+ 	mutex_init(&memcg->thresholds_lock);
+ 	spin_lock_init(&memcg->move_lock);
+ 	vmpressure_init(&memcg->vmpressure);
++	INIT_LIST_HEAD(&memcg->memory_peaks);
++	INIT_LIST_HEAD(&memcg->swap_peaks);
++	spin_lock_init(&memcg->peaks_lock);
+ 	INIT_LIST_HEAD(&memcg->event_list);
+ 	spin_lock_init(&memcg->event_list_lock);
+ 	memcg->socket_pressure = jiffies;
+@@ -6477,14 +6482,91 @@ static u64 memory_current_read(struct cg
+ 	return (u64)page_counter_read(&memcg->memory) * PAGE_SIZE;
+ }
+ 
+-static u64 memory_peak_read(struct cgroup_subsys_state *css,
+-			    struct cftype *cft)
++#define OFP_PEAK_UNSET (((-1UL)))
++
++static int peak_show(struct seq_file *sf, void *v, struct page_counter *pc)
+ {
+-	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
++	struct cgroup_of_peak *ofp = of_peak(sf->private);
++	u64 fd_peak = READ_ONCE(ofp->value), peak;
++
++	/* User wants global or local peak? */
++	if (fd_peak == OFP_PEAK_UNSET)
++		peak = pc->watermark;
++	else
++		peak = max(fd_peak, READ_ONCE(pc->local_watermark));
++
++	seq_printf(sf, "%llu\n", peak * PAGE_SIZE);
++	return 0;
++}
++
++static int memory_peak_show(struct seq_file *sf, void *v)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(sf));
+ 
+-	return (u64)memcg->memory.watermark * PAGE_SIZE;
++	return peak_show(sf, v, &memcg->memory);
+ }
+ 
++static int peak_open(struct kernfs_open_file *of)
++{
++	struct cgroup_of_peak *ofp = of_peak(of);
++
++	ofp->value = OFP_PEAK_UNSET;
++	return 0;
++}
++
++static void peak_release(struct kernfs_open_file *of)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
++	struct cgroup_of_peak *ofp = of_peak(of);
++
++	if (ofp->value == OFP_PEAK_UNSET) {
++		/* fast path (no writes on this fd) */
++		return;
++	}
++	spin_lock(&memcg->peaks_lock);
++	list_del(&ofp->list);
++	spin_unlock(&memcg->peaks_lock);
++}
++
++static ssize_t peak_write(struct kernfs_open_file *of, char *buf, size_t nbytes,
++			  loff_t off, struct page_counter *pc,
++			  struct list_head *watchers)
++{
++	unsigned long usage;
++	struct cgroup_of_peak *peer_ctx;
++	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
++	struct cgroup_of_peak *ofp = of_peak(of);
++
++	spin_lock(&memcg->peaks_lock);
++
++	usage = page_counter_read(pc);
++	WRITE_ONCE(pc->local_watermark, usage);
++
++	list_for_each_entry(peer_ctx, watchers, list)
++		if (usage > peer_ctx->value)
++			WRITE_ONCE(peer_ctx->value, usage);
++
++	/* initial write, register watcher */
++	if (ofp->value == -1)
++		list_add(&ofp->list, watchers);
++
++	WRITE_ONCE(ofp->value, usage);
++	spin_unlock(&memcg->peaks_lock);
++
++	return nbytes;
++}
++
++static ssize_t memory_peak_write(struct kernfs_open_file *of, char *buf,
++				 size_t nbytes, loff_t off)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
++
++	return peak_write(of, buf, nbytes, off, &memcg->memory,
++			  &memcg->memory_peaks);
++}
++
++#undef OFP_PEAK_UNSET
++
+ static int memory_min_show(struct seq_file *m, void *v)
+ {
+ 	return seq_puts_memcg_tunable(m,
+@@ -6794,7 +6876,10 @@ static struct cftype memory_files[] = {
+ 	{
+ 		.name = "peak",
+ 		.flags = CFTYPE_NOT_ON_ROOT,
+-		.read_u64 = memory_peak_read,
++		.open = peak_open,
++		.release = peak_release,
++		.seq_show = memory_peak_show,
++		.write = memory_peak_write,
+ 	},
+ 	{
+ 		.name = "min",
+@@ -7691,12 +7776,20 @@ static u64 swap_current_read(struct cgro
+ 	return (u64)page_counter_read(&memcg->swap) * PAGE_SIZE;
+ }
+ 
+-static u64 swap_peak_read(struct cgroup_subsys_state *css,
+-			  struct cftype *cft)
++static int swap_peak_show(struct seq_file *sf, void *v)
+ {
+-	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
++	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(sf));
++
++	return peak_show(sf, v, &memcg->swap);
++}
++
++static ssize_t swap_peak_write(struct kernfs_open_file *of, char *buf,
++			       size_t nbytes, loff_t off)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+ 
+-	return (u64)memcg->swap.watermark * PAGE_SIZE;
++	return peak_write(of, buf, nbytes, off, &memcg->swap,
++			  &memcg->swap_peaks);
+ }
+ 
+ static int swap_high_show(struct seq_file *m, void *v)
+@@ -7780,7 +7873,10 @@ static struct cftype swap_files[] = {
+ 	{
+ 		.name = "swap.peak",
+ 		.flags = CFTYPE_NOT_ON_ROOT,
+-		.read_u64 = swap_peak_read,
++		.open = peak_open,
++		.release = peak_release,
++		.seq_show = swap_peak_show,
++		.write = swap_peak_write,
+ 	},
+ 	{
+ 		.name = "swap.events",
+--- a/mm/page_counter.c
++++ b/mm/page_counter.c
+@@ -79,9 +79,22 @@ void page_counter_charge(struct page_cou
+ 		/*
+ 		 * This is indeed racy, but we can live with some
+ 		 * inaccuracy in the watermark.
++		 *
++		 * Notably, we have two watermarks to allow for both a globally
++		 * visible peak and one that can be reset at a smaller scope.
++		 *
++		 * Since we reset both watermarks when the global reset occurs,
++		 * we can guarantee that watermark >= local_watermark, so we
++		 * don't need to do both comparisons every time.
++		 *
++		 * On systems with branch predictors, the inner condition should
++		 * be almost free.
+ 		 */
+-		if (new > READ_ONCE(c->watermark))
+-			WRITE_ONCE(c->watermark, new);
++		if (new > READ_ONCE(c->local_watermark)) {
++			WRITE_ONCE(c->local_watermark, new);
++			if (new > READ_ONCE(c->watermark))
++				WRITE_ONCE(c->watermark, new);
++		}
+ 	}
+ }
+ 
+@@ -129,12 +142,12 @@ bool page_counter_try_charge(struct page
+ 			goto failed;
+ 		}
+ 		propagate_protected_usage(c, new);
+-		/*
+-		 * Just like with failcnt, we can live with some
+-		 * inaccuracy in the watermark.
+-		 */
+-		if (new > READ_ONCE(c->watermark))
+-			WRITE_ONCE(c->watermark, new);
++		/* see comment on page_counter_charge */
++		if (new > READ_ONCE(c->local_watermark)) {
++			WRITE_ONCE(c->local_watermark, new);
++			if (new > READ_ONCE(c->watermark))
++				WRITE_ONCE(c->watermark, new);
++		}
+ 	}
+ 	return true;
+ 
