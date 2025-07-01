@@ -137,14 +137,14 @@ qf1 () {
 
 
 qgoto () {
-	if command=$("$_libdir"/qgoto.py "$@") && [ "$command" ]; then
+	if command=$("$_libdir"/qgoto "$@") && [ "$command" ]; then
 		quilt $command
 	fi
 }
 
 
 qdupcheck () {
-	"$_libdir"/qdupcheck.py "$@"
+	"$_libdir"/qdupcheck "$@"
 }
 
 
@@ -190,7 +190,7 @@ qcp () {
 		args=(-d "$_destination" "${args[@]}")
 	fi
 
-	"$_libdir"/qcp.py "${args[@]}"
+	"$_libdir"/qcp "${args[@]}"
 }
 
 
@@ -360,8 +360,8 @@ qdoit () {
 	local entry=$(qnext | awk '{print $1}')
 	while [ "$entry" ]; do
 		local command
-		if ! command=$("$_libdir"/qgoto.py "$entry"); then
-			echo "Error: qgoto.py exited with an error" > /dev/stderr
+		if ! command=$("$_libdir"/qgoto "$entry"); then
+			echo "Error: $_libdir/qgoto exited with an error" > /dev/stderr
 			return 1
 		fi
 		while [ "$command" ]; do
@@ -370,8 +370,8 @@ qdoit () {
 				return 1
 			fi
 
-			if ! command=$("$_libdir"/qgoto.py "$entry"); then
-				echo "Error: qgoto.py exited with an error" > /dev/stderr
+			if ! command=$("$_libdir"/qgoto "$entry"); then
+				echo "Error: $_libdir/qgoto exited with an error" > /dev/stderr
 				return 1
 			fi
 		done
@@ -400,7 +400,7 @@ qdoit () {
 			return 1
 		fi
 
-		./refresh_patch.sh
+		./refresh_patch
 
 		if ! qfmake "$@"; then
 			echo "The last applied commit results in a build failure. Please examine the situation." > /dev/stderr
