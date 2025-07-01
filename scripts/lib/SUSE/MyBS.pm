@@ -26,7 +26,6 @@ use SUSE::MyBS::Buildresults;
 my $cookiefile = "~/.local/state/MyBS/cookie";
 my $lockfile = $cookiefile . ".lock";
 my $locktime = 300;
-my $errok = ();
 
 sub new {
 	my ($class, $api_url) = @_;
@@ -365,12 +364,7 @@ sub api {
 	}
 	if ($res->code != 200) {
 		#print STDERR $res->as_string();
-		my $message = "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
-		if ($errok) {
-			print STDERR $message;
-		} else {
-			die $message;
-		}
+		die "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
 	}
 	my $headers = $res->headers();
 	my $cookie = $headers->{'set-cookie'};
@@ -681,6 +675,7 @@ sub create_project {
 		$prjconf .= "BuildFlags: !excludebuild:kernel-obs-qa\n";
 		$prjconf .= "BuildFlags: onlybuild:$package:kernel-obs-qa\n";
 		$prjconf .= "BuildFlags: onlybuild:kernel-obs-qa\n";
+		$prjconf .= "BuildFlags: onlybuild:kernel-obs-build.agg\n";
 	}
 	$prjconf .= "BuildFlags: onlybuild:nonexistent-package\n";
 	$prjconf .= "BuildFlags: !nouseforbuild:$package:kernel-obs-build\n";
@@ -842,6 +837,9 @@ sub upload_package {
 			$writer->endTag('package');
 			for my $i ((0 .. $#{$repos})) {
 				$writer->emptyTag('repository', 'target' => ${$qa_repos}[$i], 'source' => ${$repos}[$i]);
+				# undocumented: Unless spedified otherwise identitty mapping assumed.
+				# Prevent aggregating the package in non-QA repository by adding a mapping with no source.
+				$writer->emptyTag('repository', 'target' => ${$repos}[$i]);
 			}
 			$writer->endTag('aggregate');
 			$writer->endTag('aggregatelist');
