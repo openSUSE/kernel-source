@@ -1,1 +1,1 @@
-sequence-insert
+../deprecated-python
