@@ -30,3 +30,5 @@ BUILD_PDF=No
 GENERATE_COMPILE_COMMANDS=Yes
 # Set gcc version to the one used for build in IBS
 GCC_VERSION=13
+# Use the new kABI tool
+USE_SUSE_KABI_TOOLS=Yes
