@@ -18,25 +18,30 @@ then
 	export CVEKERNELTREE=$LINUX_GIT
 fi
 
-[ -z "$KSOURCE_GIT" ] && KSOURCE_GIT="."
-. $KSOURCE_GIT/scripts/common-functions
+. scripts/common-functions
 
 while [ $# -gt 0 ]
 do
 	arg=$1
-	cve_sha="$(cd $VULNS_GIT; scripts/cve_search $arg 2>/dev/null | cut -d" " -f1,7)"
-	cve=${cve_sha%% *}
-	sha=${cve_sha##* }
-	if [ $(echo $sha | wc -c) -eq 41 ]
+	shas="$(cve2sha $arg)"
+	if [ -n "$shas" ]
 	then
-		echo -n "$sha"
-		cvss="$(cve2cvss $cve)"
-		echo -n " score:${cvss:-unknown}"
-		bsc="$(cve2bugzilla $cve)"
-		echo " $cve $bsc"
-		is_cve_rejected $cve && echo "W: $cve has been rejected" >&2
+		cve=$arg
 	else
-		echo $arg cannot be resolved to a CVE >&2
+		cve=$(sha2cve $arg)
+		if [ -z $cve ]
+		then
+			echo $arg cannot be resolved to a CVE >&2
+			shift
+			continue
+		fi
+		shas="$(cve2sha $cve)"
 	fi
+	echo -n "$(echo $shas | tr "\n" " ")"
+	cvss="$(cve2cvss $cve)"
+	echo -n " score:${cvss:-unknown}"
+	bsc="$(cve2bugzilla $cve)"
+	echo " $cve $bsc"
+	is_cve_rejected $cve && echo "W: $cve has been rejected" >&2
 	shift
 done
