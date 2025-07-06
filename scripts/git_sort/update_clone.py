@@ -1,1 +1,1 @@
-update_clone
+../deprecated-python

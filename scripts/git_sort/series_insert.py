@@ -1,1 +1,1 @@
-series_insert
+../deprecated-python

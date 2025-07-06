@@ -50,7 +50,7 @@ def format_import(references, tmpdir, dstdir, rev, poi=[]):
                            "--commit=%s" % rev, "--reference=%s" % references,
                            src])
     subprocess.check_call(("quilt", "import", "-P", dst, src,))
-    # This will remind the user to run refresh_patch.sh
+    # This will remind the user to run refresh_patch
     target_dir = os.path.join(".pc", dstdir)
     if not os.path.isdir(target_dir):
         os.mkdir(target_dir)
