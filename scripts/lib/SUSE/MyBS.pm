@@ -26,7 +26,6 @@ use SUSE::MyBS::Buildresults;
 my $cookiefile = "~/.local/state/MyBS/cookie";
 my $lockfile = $cookiefile . ".lock";
 my $locktime = 300;
-my $errok = ();
 
 sub new {
 	my ($class, $api_url) = @_;
@@ -365,12 +364,7 @@ sub api {
 	}
 	if ($res->code != 200) {
 		#print STDERR $res->as_string();
-		my $message = "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
-		if ($errok) {
-			print STDERR $message;
-		} else {
-			die $message;
-		}
+		die "$method $path: @{[$res->message()]} (HTTP @{[$res->code()]})\n";
 	}
 	my $headers = $res->headers();
 	my $cookie = $headers->{'set-cookie'};
@@ -560,6 +554,7 @@ sub create_project {
 	}
 	my %seen_archs;
 	my @qa_repos;
+	my @repos;
 	for my $repo (sort(keys(%{$options->{repos}}))) {
 		my $base = $options->{repos}{$repo};
 		my %repo_archs;
@@ -614,13 +609,14 @@ sub create_project {
 				$writer->dataElement("arch", $arch);
 			}
 			$writer->endTag("repository");
+			push(@repos, $name);
 			push(@qa_repos, $qa_name);
 		}
 	}
 	for my $attr (qw(build publish debuginfo)) {
 		$writer->startTag($attr);
 		$writer->emptyTag($options->{$attr} ? "enable" : "disable");
-		if ($attr =~ /^(publish|build)/) {
+		if ($attr =~ /^(publish)/) {
 			for my $repo (@qa_repos) {
 				$writer->emptyTag("disable", repository => $repo);
 			}
@@ -647,42 +643,56 @@ sub create_project {
 	for my $macro (@{$options->{macros} || []}) {
 		$prjconf .= "$macro\n";
 	}
-	my $qa_expr = "";
+	my $qa_expr = "0";
 	for my $repo (@qa_repos) {
-		my $separator = $qa_expr ? " || " : "";
-		$qa_expr .= $separator . '("%_repository" == "' . $repo . '")';
+		$qa_expr .= '||' . '("%_repository" == "' . $repo . '")';
 	}
+	my $package = $options->{package};
+	# Keep compatibility with sources that use %is_kotd_qa hack
 	$prjconf .= "%is_kotd_qa ($qa_expr)\n";
 	$prjconf .= ":Macros\n";
+	$prjconf .= "BuildFlags: excludebuild:$package:kernel-obs-qa\n";
+	$prjconf .= "BuildFlags: excludebuild:kernel-obs-qa\n";
+	$prjconf .= "BuildFlags: nouseforbuild:$package:kernel-obs-build\n";
+	$prjconf .= "BuildFlags: nouseforbuild:kernel-obs-build\n";
 	my $specfiles = $options->{limit_packages} || [];
-	if (@$specfiles && $multibuild) {
+	if (@$specfiles) {
 		my %specfiles = map { $_ => 1 } @$specfiles;
-		my $package = $options->{package};
 		for my $spec (keys(%specfiles)) {
-			$spec = ($spec eq $package) ? $package : "$package:$spec";
+			$spec = ($spec eq $package || not $multibuild) ? $spec : "$package:$spec";
 			$prjconf .= "BuildFlags: onlybuild:$spec\n";
 		}
 	}
+	$prjconf .= "%if " . "$qa_expr\n";
+	if (@$specfiles) {
+		my %specfiles = map { $_ => 1 } @$specfiles;
+		for my $spec (keys(%specfiles)) {
+			$spec = ($spec eq $package || not $multibuild) ? $spec : "$package:$spec";
+			$prjconf .= "BuildFlags: !onlybuild:$spec\n";
+		}
+	} else {
+		$prjconf .= "BuildFlags: !excludebuild:$package:kernel-obs-qa\n";
+		$prjconf .= "BuildFlags: !excludebuild:kernel-obs-qa\n";
+		$prjconf .= "BuildFlags: onlybuild:$package:kernel-obs-qa\n";
+		$prjconf .= "BuildFlags: onlybuild:kernel-obs-qa\n";
+		$prjconf .= "BuildFlags: onlybuild:kernel-obs-build.agg\n";
+	}
+	$prjconf .= "BuildFlags: onlybuild:nonexistent-package\n";
+	$prjconf .= "BuildFlags: !nouseforbuild:$package:kernel-obs-build\n";
+	$prjconf .= "BuildFlags: !nouseforbuild:kernel-obs-build\n";
+	$prjconf .= "%endif\n";
 	$self->put("/source/$project/_config", $prjconf);
-	return { name => $project, qa_repos => \@qa_repos };
+	return { name => $project, repos => \@repos, qa_repos => \@qa_repos };
 }
 
 sub create_package {
-	my ($self, $prj, $package, $qa_package, $qa_std_package) = @_;
+	my ($self, $prj, $package) = @_;
 
 	my $meta;
 	my $writer = XML::Writer->new(OUTPUT => \$meta);
 	$writer->startTag("package", project => $prj->{name}, name => $package);
 	$writer->dataElement("title", $package);
 	$writer->dataElement("description", "");
-	if ($qa_package) {
-		$writer->startTag("build");
-		$writer->emptyTag("disable") unless $qa_std_package;
-		for my $repo (@{$prj->{qa_repos} || []}) {
-			$writer->emptyTag("enable", repository => $repo);
-		}
-		$writer->endTag("build");
-	}
 	$writer->endTag("package");
 	$writer->end();
 
@@ -724,14 +734,6 @@ sub get_directory_revision {
 	return $p->{res}[0];
 }
 
-sub wipe_package {
-	my ($self, $project, $package, $progresscb) = @_;
-	$errok = 1;
-	$self->post("/build/$project?cmd=wipe&package=$package");
-	$errok = ();
-	&$progresscb('WIPE', "$project/$package");
-}
-
 sub upload_package {
 	my ($self, $dir, $prj, $package, $commit, $options) = @_;
 	$options ||= {};
@@ -747,21 +749,15 @@ sub upload_package {
 		$prj = { name => $prj };
 	}
 	my $project = $prj->{name};
+	my $repos = $prj->{repos};
+	my $qa_repos = $prj->{qa_repos};
 
 	if (!$self->project_exists($project)) {
 		die "Project $project does not exist\n";
 	}
 	if (!$no_init) {
-		$self->create_package($prj, $package, $multibuild, 1);
+		$self->create_package($prj, $package);
 		&$progresscb('CREATE', "$project/$package");
-	}
-	# delete stale kernel-obs-build
-	my $wipe = 'kernel-obs-build';
-	if (($specfiles{$wipe} or $multibuild) and not $no_init) {
-		$wipe = ($multibuild ? $package . ":" : "") . $wipe;
-		$self->wipe_package($project, $wipe, $progresscb);
-	} else {
-		$wipe = ();
 	}
 	opendir(my $dh, $dir) or die "$dir: $!\n";
 	my $remote = $self->readdir("/source/$project/$package");
@@ -813,7 +809,7 @@ sub upload_package {
 		for my $spec (keys(%specfiles)) {
 			next if $remove_packages{$spec};
 			next if $spec eq $package;
-			$self->create_package($prj, $spec, ($spec =~ /^kernel-obs-(qa|build)/));
+			$self->create_package($prj, $spec);
 			$self->put("/source/$project/$spec/_link", $link_xml);
 			&$progresscb('LINK', "$project/$spec");
 			delete($links{$spec});
@@ -824,10 +820,41 @@ sub upload_package {
 		$self->delete("/source/$project/$link");
 		&$progresscb('DELETE', "$project/$link");
 	}
-	# delete stale kernel-obs-build
-	if ($wipe) {
-		$self->wipe_package($project, $wipe, $progresscb);
+	# aggregate kernel-obs-build
+	my $agg = 'kernel-obs-build';
+	if (not $no_init) {
+		my $agg_pkg = $agg . '.agg';
+		if ($specfiles{$agg}) {
+			my $agg_xml;
+			my $writer = XML::Writer->new(OUTPUT => \$agg_xml, NEWLINES => 1);
+			$writer->startTag('aggregatelist');
+			$writer->startTag('aggregate', 'project' => $project);
+			$writer->startTag('package');
+			$writer->characters($agg);
+			$writer->endTag('package');
+			$writer->startTag('package');
+			$writer->characters($package . ':' . $agg);
+			$writer->endTag('package');
+			for my $i ((0 .. $#{$repos})) {
+				$writer->emptyTag('repository', 'target' => ${$qa_repos}[$i], 'source' => ${$repos}[$i]);
+				# undocumented: Unless spedified otherwise identitty mapping assumed.
+				# Prevent aggregating the package in non-QA repository by adding a mapping with no source.
+				$writer->emptyTag('repository', 'target' => ${$repos}[$i]);
+			}
+			$writer->endTag('aggregate');
+			$writer->endTag('aggregatelist');
+			$writer->end();
+			$self->create_package($prj, $agg_pkg);
+			$self->put("/source/$project/$agg_pkg/_aggregate", $agg_xml);
+			&$progresscb('AGGREGATE', "$project/$agg_pkg");
+		} else {
+			if ($self->package_exists($project, $agg_pkg)) {
+				$self->delete("/source/$project/$agg_pkg");
+				&$progresscb('DELETE', "$project/$agg_pkg");
+			}
+		}
 	}
+
 	return $revision;
 }
 
