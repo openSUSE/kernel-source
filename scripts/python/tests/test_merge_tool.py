@@ -152,7 +152,7 @@ class TestMergeTool(unittest.TestCase):
         subprocess.check_call(("git", "commit", "-m", "Refresh mainline 1",),
                               cwd=self.ks_dir, stdout=subprocess.DEVNULL)
 
-        # test merge_tool.py
+        # test series_merge_tool
         subprocess.check_call(("git", "checkout", "-q", "master",), cwd=self.ks_dir)
         retval = subprocess.call(("git", "merge", "other",), cwd=self.ks_dir,
                                        stdout=subprocess.DEVNULL,

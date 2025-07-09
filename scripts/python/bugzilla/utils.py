@@ -1,7 +1,9 @@
-import bugzilla, datetime, os, re, sys
+import bugzilla, os, re, sys
 from bugzilla._cli import DEFAULT_BZ
 
 CVSS_PATTERN = re.compile(r"CVSSv3.1:SUSE:CVE-[0-9]{4}-[0-9]{4,}:([0-9].[0-9])")
+TIME_FORMAT_XML = '%Y%m%dT%H:%M:%S'
+TIME_FORMAT_REST = '%Y-%m-%dT%H:%M:%SZ'
 
 def handle_email(email):
     if email == '__empty-env-var__':
@@ -16,8 +18,8 @@ def get_score(s):
     m = re.search(CVSS_PATTERN, s)
     return m.group(1) if m else ''
 
-def get_bugzilla_api():
-    return bugzilla.Bugzilla(DEFAULT_BZ)
+def get_bugzilla_api(rest=False):
+    return bugzilla.Bugzilla(DEFAULT_BZ, force_rest=rest)
 
 def check_being_logged_in(bzapi):
     if not bzapi.logged_in:
@@ -36,11 +38,8 @@ def make_unique(alist):
 def make_url(bug_id):
     return f'https://bugzilla.suse.com/show_bug.cgi?id={bug_id}'
 
-def format_time(t):
-    return datetime.datetime.strptime(str(t), '%Y%m%dT%H:%M:%S')
-
 def get_backport_string(references, h, comment):
-    return f'./scripts/git_sort/series_insert.py patches.suse/$(exportpatch -w -s -d patches.suse {" ".join(f"-F {r}" for r in references)} {h}) # {comment}'
+    return f'./scripts/git_sort/series_insert patches.suse/$(exportpatch -w -s -d patches.suse {" ".join(f"-F {r}" for r in references)} {h}) # {comment}'
 
 def create_cache_dir(program_dir):
     cache_dir = os.getenv('XDG_CACHE_HOME', None)
