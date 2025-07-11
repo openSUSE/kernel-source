@@ -1,0 +1,172 @@
+From 408c97c4a5e0b634dcd15bf8b8808b382e888164 Mon Sep 17 00:00:00 2001
+From: Yeoreum Yun <yeoreum.yun@arm.com>
+Date: Wed, 14 May 2025 17:19:51 +0100
+Subject: [PATCH] coresight: prevent deactivate active config while enabling the config
+Git-commit: 408c97c4a5e0b634dcd15bf8b8808b382e888164
+Patch-mainline: v6.16-rc1
+References: CVE-2025-38131 bsc#1245677
+
+While enable active config via cscfg_csdev_enable_active_config(),
+active config could be deactivated via configfs' sysfs interface.
+This could make UAF issue in below scenario:
+
+CPU0                                          CPU1
+(sysfs enable)                                load module
+                                              cscfg_load_config_sets()
+                                              activate config. // sysfs
+                                              (sys_active_cnt == 1)
+...
+cscfg_csdev_enable_active_config()
+lock(csdev->cscfg_csdev_lock)
+// here load config activate by CPU1
+unlock(csdev->cscfg_csdev_lock)
+
+                                              deactivate config // sysfs
+                                              (sys_activec_cnt == 0)
+                                              cscfg_unload_config_sets()
+                                              unload module
+
+// access to config_desc which freed
+// while unloading module.
+cscfg_csdev_enable_config
+
+To address this, use cscfg_config_desc's active_cnt as a reference count
+ which will be holded when
+    - activate the config.
+    - enable the activated config.
+and put the module reference when config_active_cnt == 0.
+
+Fixes: f8cce2ff3c04 ("coresight: syscfg: Add API to activate and enable configurations")
+Suggested-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+Signed-off-by: Yeoreum Yun <yeoreum.yun@arm.com>
+Reviewed-by: Leo Yan <leo.yan@arm.com>
+Signed-off-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+Link: https://lore.kernel.org/r/20250514161951.3427590-4-yeoreum.yun@arm.com
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/hwtracing/coresight/coresight-config.h |    2 -
+ drivers/hwtracing/coresight/coresight-syscfg.c |   49 +++++++++++++++++--------
+ 2 files changed, 35 insertions(+), 16 deletions(-)
+
+--- a/drivers/hwtracing/coresight/coresight-config.h
++++ b/drivers/hwtracing/coresight/coresight-config.h
+@@ -228,7 +228,7 @@ struct cscfg_feature_csdev {
+  * @feats_csdev:references to the device features to enable.
+  */
+ struct cscfg_config_csdev {
+-	const struct cscfg_config_desc *config_desc;
++	struct cscfg_config_desc *config_desc;
+ 	struct coresight_device *csdev;
+ 	bool enabled;
+ 	struct list_head node;
+--- a/drivers/hwtracing/coresight/coresight-syscfg.c
++++ b/drivers/hwtracing/coresight/coresight-syscfg.c
+@@ -869,6 +869,25 @@ unlock_exit:
+ }
+ EXPORT_SYMBOL_GPL(cscfg_csdev_reset_feats);
+ 
++static bool cscfg_config_desc_get(struct cscfg_config_desc *config_desc)
++{
++	if (!atomic_fetch_inc(&config_desc->active_cnt)) {
++		/* must ensure that config cannot be unloaded in use */
++		if (unlikely(cscfg_owner_get(config_desc->load_owner))) {
++			atomic_dec(&config_desc->active_cnt);
++			return false;
++		}
++	}
++
++	return true;
++}
++
++static void cscfg_config_desc_put(struct cscfg_config_desc *config_desc)
++{
++	if (!atomic_dec_return(&config_desc->active_cnt))
++		cscfg_owner_put(config_desc->load_owner);
++}
++
+ /*
+  * This activate configuration for either perf or sysfs. Perf can have multiple
+  * active configs, selected per event, sysfs is limited to one.
+@@ -892,22 +911,17 @@ static int _cscfg_activate_config(unsign
+ 			if (config_desc->available == false)
+ 				return -EBUSY;
+ 
+-			/* must ensure that config cannot be unloaded in use */
+-			err = cscfg_owner_get(config_desc->load_owner);
+-			if (err)
++			if (!cscfg_config_desc_get(config_desc)) {
++				err = -EINVAL;
+ 				break;
++			}
++
+ 			/*
+ 			 * increment the global active count - control changes to
+ 			 * active configurations
+ 			 */
+ 			atomic_inc(&cscfg_mgr->sys_active_cnt);
+ 
+-			/*
+-			 * mark the descriptor as active so enable config on a
+-			 * device instance will use it
+-			 */
+-			atomic_inc(&config_desc->active_cnt);
+-
+ 			err = 0;
+ 			dev_dbg(cscfg_device(), "Activate config %s.\n", config_desc->name);
+ 			break;
+@@ -922,9 +936,8 @@ static void _cscfg_deactivate_config(uns
+ 
+ 	list_for_each_entry(config_desc, &cscfg_mgr->config_desc_list, item) {
+ 		if ((unsigned long)config_desc->event_ea->var == cfg_hash) {
+-			atomic_dec(&config_desc->active_cnt);
+ 			atomic_dec(&cscfg_mgr->sys_active_cnt);
+-			cscfg_owner_put(config_desc->load_owner);
++			cscfg_config_desc_put(config_desc);
+ 			dev_dbg(cscfg_device(), "Deactivate config %s.\n", config_desc->name);
+ 			break;
+ 		}
+@@ -1049,7 +1062,7 @@ int cscfg_csdev_enable_active_config(str
+ 				     unsigned long cfg_hash, int preset)
+ {
+ 	struct cscfg_config_csdev *config_csdev_active = NULL, *config_csdev_item;
+-	const struct cscfg_config_desc *config_desc;
++	struct cscfg_config_desc *config_desc;
+ 	unsigned long flags;
+ 	int err = 0;
+ 
+@@ -1064,8 +1077,8 @@ int cscfg_csdev_enable_active_config(str
+ 	spin_lock_irqsave(&csdev->cscfg_csdev_lock, flags);
+ 	list_for_each_entry(config_csdev_item, &csdev->config_csdev_list, node) {
+ 		config_desc = config_csdev_item->config_desc;
+-		if ((atomic_read(&config_desc->active_cnt)) &&
+-		    ((unsigned long)config_desc->event_ea->var == cfg_hash)) {
++		if (((unsigned long)config_desc->event_ea->var == cfg_hash) &&
++				cscfg_config_desc_get(config_desc)) {
+ 			config_csdev_active = config_csdev_item;
+ 			csdev->active_cscfg_ctxt = (void *)config_csdev_active;
+ 			break;
+@@ -1099,7 +1112,11 @@ int cscfg_csdev_enable_active_config(str
+ 				err = -EBUSY;
+ 			spin_unlock_irqrestore(&csdev->cscfg_csdev_lock, flags);
+ 		}
++
++		if (err)
++			cscfg_config_desc_put(config_desc);
+ 	}
++
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(cscfg_csdev_enable_active_config);
+@@ -1138,8 +1155,10 @@ void cscfg_csdev_disable_active_config(s
+ 	spin_unlock_irqrestore(&csdev->cscfg_csdev_lock, flags);
+ 
+ 	/* true if there was an enabled active config */
+-	if (config_csdev)
++	if (config_csdev) {
+ 		cscfg_csdev_disable_config(config_csdev);
++		cscfg_config_desc_put(config_csdev->config_desc);
++	}
+ }
+ EXPORT_SYMBOL_GPL(cscfg_csdev_disable_active_config);
+ 
