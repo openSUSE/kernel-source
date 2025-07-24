@@ -1,0 +1,139 @@
+From: David Howells <dhowells@redhat.com>
+Date: Fri, 11 Jul 2025 16:10:01 +0100
+Subject: [PATCH] netfs: Fix race between cache write completion and ALL_QUEUED
+ being set
+References: bsc#1012628
+Patch-mainline: 6.15.8
+Git-commit: 89635eae076cd8eaa5cb752f66538c9dc6c9fdc3
+
+commit 89635eae076cd8eaa5cb752f66538c9dc6c9fdc3 upstream.
+
+When netfslib is issuing subrequests, the subrequests start processing
+immediately and may complete before we reach the end of the issuing
+function.  At the end of the issuing function we set NETFS_RREQ_ALL_QUEUED
+to indicate to the collector that we aren't going to issue any more subreqs
+and that it can do the final notifications and cleanup.
+
+Now, this isn't a problem if the request is synchronous
+(NETFS_RREQ_OFFLOAD_COLLECTION is unset) as the result collection will be
+done in-thread and we're guaranteed an opportunity to run the collector.
+
+However, if the request is asynchronous, collection is primarily triggered
+by the termination of subrequests queuing it on a workqueue.  Now, a race
+can occur here if the app thread sets ALL_QUEUED after the last subrequest
+terminates.
+
+This can happen most easily with the copy2cache code (as used by Ceph)
+where, in the collection routine of a read request, an asynchronous write
+request is spawned to copy data to the cache.  Folios are added to the
+write request as they're unlocked, but there may be a delay before
+ALL_QUEUED is set as the write subrequests may complete before we get
+there.
+
+If all the write subreqs have finished by the ALL_QUEUED point, no further
+events happen and the collection never happens, leaving the request
+hanging.
+
+Fix this by queuing the collector after setting ALL_QUEUED.  This is a bit
+heavy-handed and it may be sufficient to do it only if there are no extant
+subreqs.
+
+Also add a tracepoint to cross-reference both requests in a copy-to-request
+operation and add a trace to the netfs_rreq tracepoint to indicate the
+setting of ALL_QUEUED.
+
+Fixes: e2d46f2ec332 ("netfs: Change the read result collector to only use one work item")
+Reported-by: Max Kellermann <max.kellermann@ionos.com>
+Link: https://lore.kernel.org/r/CAKPOu+8z_ijTLHdiCYGU_Uk7yYD=shxyGLwfe-L7AV3DhebS3w@mail.gmail.com/
+Signed-off-by: David Howells <dhowells@redhat.com>
+Link: https://lore.kernel.org/20250711151005.2956810-3-dhowells@redhat.com
+Reviewed-by: Paulo Alcantara (Red Hat) <pc@manguebit.org>
+cc: Paulo Alcantara <pc@manguebit.org>
+cc: Viacheslav Dubeyko <slava@dubeyko.com>
+cc: Alex Markuze <amarkuze@redhat.com>
+cc: Ilya Dryomov <idryomov@gmail.com>
+cc: netfs@lists.linux.dev
+cc: ceph-devel@vger.kernel.org
+cc: linux-fsdevel@vger.kernel.org
+cc: stable@vger.kernel.org
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/netfs/read_pgpriv2.c      |  4 ++++
+ include/trace/events/netfs.h | 30 ++++++++++++++++++++++++++++++
+ 2 files changed, 34 insertions(+)
+
+diff --git a/fs/netfs/read_pgpriv2.c b/fs/netfs/read_pgpriv2.c
+index 080d2a6a51d9..8097bc069c1d 100644
+--- a/fs/netfs/read_pgpriv2.c
++++ b/fs/netfs/read_pgpriv2.c
+@@ -111,6 +111,7 @@ static struct netfs_io_request *netfs_pgpriv2_begin_copy_to_cache(
+ 		goto cancel_put;
+ 
+ 	__set_bit(NETFS_RREQ_OFFLOAD_COLLECTION, &creq->flags);
++	trace_netfs_copy2cache(rreq, creq);
+ 	trace_netfs_write(creq, netfs_write_trace_copy_to_cache);
+ 	netfs_stat(&netfs_n_wh_copy_to_cache);
+ 	rreq->copy_to_cache = creq;
+@@ -155,6 +156,9 @@ void netfs_pgpriv2_end_copy_to_cache(struct netfs_io_request *rreq)
+ 	netfs_issue_write(creq, &creq->io_streams[1]);
+ 	smp_wmb(); /* Write lists before ALL_QUEUED. */
+ 	set_bit(NETFS_RREQ_ALL_QUEUED, &creq->flags);
++	trace_netfs_rreq(rreq, netfs_rreq_trace_end_copy_to_cache);
++	if (list_empty_careful(&creq->io_streams[1].subrequests))
++		netfs_wake_collector(creq);
+ 
+ 	netfs_put_request(creq, netfs_rreq_trace_put_return);
+ 	creq->copy_to_cache = NULL;
+diff --git a/include/trace/events/netfs.h b/include/trace/events/netfs.h
+index ecc1b852661e..18c1237ccb1e 100644
+--- a/include/trace/events/netfs.h
++++ b/include/trace/events/netfs.h
+@@ -55,6 +55,7 @@
+ 	EM(netfs_rreq_trace_complete,		"COMPLET")	\
+ 	EM(netfs_rreq_trace_dirty,		"DIRTY  ")	\
+ 	EM(netfs_rreq_trace_done,		"DONE   ")	\
++	EM(netfs_rreq_trace_end_copy_to_cache,	"END-C2C")	\
+ 	EM(netfs_rreq_trace_free,		"FREE   ")	\
+ 	EM(netfs_rreq_trace_recollect,		"RECLLCT")	\
+ 	EM(netfs_rreq_trace_redirty,		"REDIRTY")	\
+@@ -550,6 +551,35 @@ TRACE_EVENT(netfs_write,
+ 		      __entry->start, __entry->start + __entry->len - 1)
+ 	    );
+ 
++TRACE_EVENT(netfs_copy2cache,
++	    TP_PROTO(const struct netfs_io_request *rreq,
++		     const struct netfs_io_request *creq),
++
++	    TP_ARGS(rreq, creq),
++
++	    TP_STRUCT__entry(
++		    __field(unsigned int,		rreq)
++		    __field(unsigned int,		creq)
++		    __field(unsigned int,		cookie)
++		    __field(unsigned int,		ino)
++			     ),
++
++	    TP_fast_assign(
++		    struct netfs_inode *__ctx = netfs_inode(rreq->inode);
++		    struct fscache_cookie *__cookie = netfs_i_cookie(__ctx);
++		    __entry->rreq	= rreq->debug_id;
++		    __entry->creq	= creq->debug_id;
++		    __entry->cookie	= __cookie ? __cookie->debug_id : 0;
++		    __entry->ino	= rreq->inode->i_ino;
++			   ),
++
++	    TP_printk("R=%08x CR=%08x c=%08x i=%x ",
++		      __entry->rreq,
++		      __entry->creq,
++		      __entry->cookie,
++		      __entry->ino)
++	    );
++
+ TRACE_EVENT(netfs_collect,
+ 	    TP_PROTO(const struct netfs_io_request *wreq),
+ 
+-- 
+2.50.1
+
