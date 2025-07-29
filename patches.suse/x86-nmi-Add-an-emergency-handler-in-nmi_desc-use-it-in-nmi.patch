@@ -1,0 +1,170 @@
+From: Waiman Long <longman@redhat.com>
+Date: Thu, 6 Feb 2025 14:18:44 -0500
+Subject: x86/nmi: Add an emergency handler in nmi_desc & use it in
+ nmi_shootdown_cpus()
+Git-commit: fe37c699ae3eed6e02ee55fbf5cb9ceb7fcfd76c
+Patch-mainline: v6.15-rc1
+References: git-fixes
+
+Depending on the type of panics, it was found that the
+__register_nmi_handler() function can be called in NMI context from
+nmi_shootdown_cpus() leading to a lockdep splat:
+
+  WARNING: inconsistent lock state
+  inconsistent {INITIAL USE} -> {IN-NMI} usage.
+
+   lock(&nmi_desc[0].lock);
+   <Interrupt>
+     lock(&nmi_desc[0].lock);
+
+  Call Trace:
+    _raw_spin_lock_irqsave
+    __register_nmi_handler
+    nmi_shootdown_cpus
+    kdump_nmi_shootdown_cpus
+    native_machine_crash_shutdown
+    __crash_kexec
+
+In this particular case, the following panic message was printed before:
+
+  Kernel panic - not syncing: Fatal hardware error!
+
+This message seemed to be given out from __ghes_panic() running in
+NMI context.
+
+The __register_nmi_handler() function which takes the nmi_desc lock
+with irq disabled shouldn't be called from NMI context as this can
+lead to deadlock.
+
+The nmi_shootdown_cpus() function can only be invoked once. After the
+first invocation, all other CPUs should be stuck in the newly added
+crash_nmi_callback() and cannot respond to a second NMI.
+
+Fix it by adding a new emergency NMI handler to the nmi_desc
+structure and provide a new set_emergency_nmi_handler() helper to set
+crash_nmi_callback() in any context. The new emergency handler will
+preempt other handlers in the linked list. That will eliminate the need
+to take any lock and serve the panic in NMI use case.
+
+Signed-off-by: Waiman Long <longman@redhat.com>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Rik van Riel <riel@surriel.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/r/20250206191844.131700-1-longman@redhat.com
+
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/include/asm/nmi.h |  2 ++
+ arch/x86/kernel/nmi.c      | 42 ++++++++++++++++++++++++++++++++++++++++++
+ arch/x86/kernel/reboot.c   | 10 +++-------
+ 3 files changed, 47 insertions(+), 7 deletions(-)
+
+diff --git a/arch/x86/include/asm/nmi.h b/arch/x86/include/asm/nmi.h
+index 41a0ebb699ec..f677382093f3 100644
+--- a/arch/x86/include/asm/nmi.h
++++ b/arch/x86/include/asm/nmi.h
+@@ -56,6 +56,8 @@ int __register_nmi_handler(unsigned int, struct nmiaction *);
+ 
+ void unregister_nmi_handler(unsigned int, const char *);
+ 
++void set_emergency_nmi_handler(unsigned int type, nmi_handler_t handler);
++
+ void stop_nmi(void);
+ void restart_nmi(void);
+ void local_touch_nmi(void);
+diff --git a/arch/x86/kernel/nmi.c b/arch/x86/kernel/nmi.c
+index ed163c8c8604..9a95d00f1423 100644
+--- a/arch/x86/kernel/nmi.c
++++ b/arch/x86/kernel/nmi.c
+@@ -40,8 +40,12 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/nmi.h>
+ 
++/*
++ * An emergency handler can be set in any context including NMI
++ */
+ struct nmi_desc {
+ 	raw_spinlock_t lock;
++	nmi_handler_t emerg_handler;
+ 	struct list_head head;
+ };
+ 
+@@ -132,9 +136,22 @@ static void nmi_check_duration(struct nmiaction *action, u64 duration)
+ static int nmi_handle(unsigned int type, struct pt_regs *regs)
+ {
+ 	struct nmi_desc *desc = nmi_to_desc(type);
++	nmi_handler_t ehandler;
+ 	struct nmiaction *a;
+ 	int handled=0;
+ 
++	/*
++	 * Call the emergency handler, if set
++	 *
++	 * In the case of crash_nmi_callback() emergency handler, it will
++	 * return in the case of the crashing CPU to enable it to complete
++	 * other necessary crashing actions ASAP. Other handlers in the
++	 * linked list won't need to be run.
++	 */
++	ehandler = desc->emerg_handler;
++	if (ehandler)
++		return ehandler(type, regs);
++
+ 	rcu_read_lock();
+ 
+ 	/*
+@@ -224,6 +241,31 @@ void unregister_nmi_handler(unsigned int type, const char *name)
+ }
+ EXPORT_SYMBOL_GPL(unregister_nmi_handler);
+ 
++/**
++ * set_emergency_nmi_handler - Set emergency handler
++ * @type:    NMI type
++ * @handler: the emergency handler to be stored
++ *
++ * Set an emergency NMI handler which, if set, will preempt all the other
++ * handlers in the linked list. If a NULL handler is passed in, it will clear
++ * it. It is expected that concurrent calls to this function will not happen
++ * or the system is screwed beyond repair.
++ */
++void set_emergency_nmi_handler(unsigned int type, nmi_handler_t handler)
++{
++	struct nmi_desc *desc = nmi_to_desc(type);
++
++	if (WARN_ON_ONCE(desc->emerg_handler == handler))
++		return;
++	desc->emerg_handler = handler;
++
++	/*
++	 * Ensure the emergency handler is visible to other CPUs before
++	 * function return
++	 */
++	smp_wmb();
++}
++
+ static void
+ pci_serr_error(unsigned char reason, struct pt_regs *regs)
+ {
+diff --git a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
+index dc1dd3f3e67f..9aaac1f9f45b 100644
+--- a/arch/x86/kernel/reboot.c
++++ b/arch/x86/kernel/reboot.c
+@@ -926,15 +926,11 @@ void nmi_shootdown_cpus(nmi_shootdown_cb callback)
+ 	shootdown_callback = callback;
+ 
+ 	atomic_set(&waiting_for_crash_ipi, num_online_cpus() - 1);
+-	/* Would it be better to replace the trap vector here? */
+-	if (register_nmi_handler(NMI_LOCAL, crash_nmi_callback,
+-				 NMI_FLAG_FIRST, "crash"))
+-		return;		/* Return what? */
++
+ 	/*
+-	 * Ensure the new callback function is set before sending
+-	 * out the NMI
++	 * Set emergency handler to preempt other handlers.
+ 	 */
+-	wmb();
++	set_emergency_nmi_handler(NMI_LOCAL, crash_nmi_callback);
+ 
+ 	apic_send_IPI_allbutself(NMI_VECTOR);
+ 
+
