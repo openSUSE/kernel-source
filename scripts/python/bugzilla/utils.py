@@ -42,7 +42,7 @@ def get_exportpatch_string(references, h, patch_dir):
     return f'exportpatch -w -s -d {patch_dir} {" ".join(f"-F {r}" for r in references)} {h}'
 
 def get_insert_string(rel_path, name):
-    return f'{rel_path}/scripts/git_sort/series_insert patches.suse/{name}'
+    return f'{rel_path}/scripts/git_sort/series_insert {name}'
 
 def create_cache_dir(program_dir):
     cache_dir = os.getenv('XDG_CACHE_HOME', None)
