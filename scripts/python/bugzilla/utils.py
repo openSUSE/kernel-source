@@ -38,8 +38,11 @@ def make_unique(alist):
 def make_url(bug_id):
     return f'https://bugzilla.suse.com/show_bug.cgi?id={bug_id}'
 
-def get_backport_string(references, h, comment):
-    return f'./scripts/git_sort/series_insert patches.suse/$(exportpatch -w -s -d patches.suse {" ".join(f"-F {r}" for r in references)} {h}) # {comment}'
+def get_exportpatch_string(references, h, patch_dir):
+    return f'exportpatch -w -s -d {patch_dir} {" ".join(f"-F {r}" for r in references)} {h}'
+
+def get_insert_string(rel_path, name):
+    return f'{rel_path}/scripts/git_sort/series_insert {name}'
 
 def create_cache_dir(program_dir):
     cache_dir = os.getenv('XDG_CACHE_HOME', None)
