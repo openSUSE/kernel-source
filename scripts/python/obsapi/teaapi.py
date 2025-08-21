@@ -1,5 +1,4 @@
 from collections import namedtuple
-from obsapi.api import APIError
 from obsapi import api
 import subprocess
 import tempfile
@@ -10,16 +9,14 @@ import yaml
 import sys
 import os
 
-File = namedtuple('File',['oid', 'size', 'name', 'lfs', 'lfs_oid', 'lfs_size'])
-
 def ref_arg(ref):
     return { 'ref' : ref }
 
 class TeaAPI(api.API):
-    def __init__(self, URL, logfile=None, config=None):
+    def __init__(self, URL, logfile=None, config=None, ca=None):
         self.config = config
         URL = URL.rstrip('/')
-        super().__init__(URL, logfile)
+        super().__init__(URL, logfile, ca)
         self.get_token()
 
     def get_token(self):
@@ -38,20 +35,20 @@ class TeaAPI(api.API):
             sys.stderr.write('Cannot find gitea-tea configuration for ' + self.url + '\nPlease configure tea with a token that has readwrite access to user and repository with\ntea login add')
             exit(1)
 
-    def auth_header(self):
+    def auth_header(self, wwwa):
         return {'Authorization' : 'token ' + self.token}
 
-    def auth_header_json(self):
-        hdr = self.auth_header()
-        hdr['Content-type'] = 'application/json'
-        return hdr
+    def get_user(self):
+        r = self.check_get('/api/v1/user')
+        user = r.json()['login']
+        return user
 
     def repo_path(self, org, repo):
         return '/api/v1/repos/' + org + '/' + repo
 
     def update_gitattr(self, org, repo, branch):
         fn = '.gitattributes'
-        r = self.check_exists(self.repo_path(org, repo) + '/contents/' + fn, headers=self.auth_header(), params=ref_arg(branch))
+        r = self.check_exists(self.repo_path(org, repo) + '/contents/' + fn, params=ref_arg(branch))
         attributes = [
                 '*.tar.bz2 filter=lfs diff=lfs merge=lfs -text',
                 '*.tar.?z filter=lfs diff=lfs merge=lfs -text',
@@ -77,4 +74,4 @@ class TeaAPI(api.API):
             if sha:
                 data['sha'] = sha
                 method = 'PUT'
-            self.check(method, self.repo_path(org, repo) + '/contents/' + fn, headers=self.auth_header_json(), json=data)
+            self.check(method, self.repo_path(org, repo) + '/contents/' + fn, json=data)
