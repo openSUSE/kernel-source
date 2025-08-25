@@ -1,5 +1,15 @@
 import configparser
+import subprocess
 import os
+
+def init_repo(tmpdirname, repo, branch):
+    subprocess.check_call(['git', 'init', '-q', '--object-format=sha256', '-b', branch, repo], cwd=tmpdirname)
+    return os.path.join(tmpdirname, repo)
+
+def get_source_timestamp(directory):
+    with open(os.path.join(directory, 'source-timestamp'), 'r') as fd:
+        source_timestamp = fd.read().splitlines()
+    return '\n'.join(source_timestamp[1:] + [source_timestamp[0]])
 
 def list_files(directory):
     if len(directory) > 1:

@@ -1,3 +1,4 @@
+from kutil.config import init_repo, list_files
 from collections import namedtuple
 from obsapi import api
 import subprocess
@@ -8,6 +9,18 @@ import json
 import yaml
 import sys
 import os
+
+File = namedtuple('File',['oid', 'size', 'name', 'lfs', 'lfs_oid', 'lfs_size'])
+
+def ssv(text):
+    try:
+        result = {}
+        for l in text.splitlines():
+            k,v = l.split(' ', 1)
+            result[k] = v
+        return result
+    except Exception:
+        return {}
 
 def ref_arg(ref):
     return { 'ref' : ref }
@@ -46,6 +59,36 @@ class TeaAPI(api.API):
     def repo_path(self, org, repo):
         return '/api/v1/repos/' + org + '/' + repo
 
+    def repo_exists(self, org, repo):
+        return self.check_exists(self.repo_path(org, repo))
+
+    def fork_repo(self, src, user, repo):
+        if self.repo_exists(src, repo):
+            self.check_post(self.repo_path(src, repo) + '/forks', json={
+                'name' : repo,
+                })
+        else:
+            self.check_post('/api/v1/user/repos', json={
+                'name' : repo,
+                'object_format_name' : 'sha256',
+                })
+        self.check_patch(self.repo_path(user, repo), json={
+            'description' : 'Automatically generated; do not edit',
+            'has_actions' : False,
+            'has_issues' : False,
+            'has_packages' : False,
+            'has_projects' : False,
+            'has_pull_requests' : False,
+            'has_releases' : False,
+            'has_wiki' : False,
+            })
+        return self.repoinfo(user, repo)
+
+    def repoinfo(self, org, repo):
+        r = self.check_get(self.repo_path(org, repo))
+        repoinfo = r.json()
+        return repoinfo
+
     def repo_branches(self, org, repo):
         r = self.check_get(self.repo_path(org, repo) + '/branches', params={
             'limit' : 1000,
@@ -71,6 +114,11 @@ class TeaAPI(api.API):
             'stat' : False,
             'files' : False,
             'verification' : False,
+            })
+
+    def merge_upstream_branch(self, org, repo, branch):
+        return self.check_post(self.repo_path(org, repo) + '/merge-upstream', json = {
+            'branch': branch,
             })
 
     def create_branch(self, org, repo, branch, ref_branch, commit, reset=False):
@@ -138,3 +186,70 @@ class TeaAPI(api.API):
                 data['sha'] = sha
                 method = 'PUT'
             self.check(method, self.repo_path(org, repo) + '/contents/' + fn, json=data)
+
+    def update_content(self, org, repo, branch, src, message):
+        ign = ['.gitattributes', '.gitignore']
+        exc = ['.osc', '.git']
+        r = self.check_get(self.repo_path(org, repo) + '/contents', params=ref_arg(branch))
+        files = r.json()
+        filelist = [File(f['sha'], f['size'], f['name'], None, None, None) for f in files]
+
+        # in absence of https://github.com/go-gitea/gitea/pull/34822 (to be released in gitea 1.25) guesstimate what is LFS
+        basesize = 125
+        fuzz = 5
+        maxsize = basesize + len(str(1<<64))
+        for i, f in enumerate(filelist):
+            if f.size > basesize - fuzz and f.size <= maxsize + fuzz:
+                r = self.check_get(self.repo_path(org, repo) + '/raw/' + f.name, params=ref_arg(branch))
+                try:
+                    lfs = ssv(r.text)
+                except UnicodeDecodeError:
+                    lfs = None
+                if lfs and lfs.get('version') == 'https://git-lfs.github.com/spec/v1':
+                    filelist[i] = filelist[i]._replace(lfs=True, lfs_oid=lfs['oid'].split(':')[1], lfs_size=lfs['size'])
+                else:
+                    sys.stderr.write('%s/%s %s %s: Invalid LFS link\n' % (org, repo, branch, f.name))
+
+        files = {}
+        for f in filelist:
+            if f.name not in ign and f.name not in exc:
+                files[f.name] = f
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            hasher = init_repo(tmpdirname, repo, 'whatever')
+            rq = { 'branch' : branch, 'files' : [], 'message': message }
+            for filename in list_files(src):
+                pathname = os.path.join(os.getcwd(), src, filename)
+                excluded = False
+                for e in exc:
+                    if filename.startswith(e + '/'):
+                        excluded = True
+                basename = os.path.basename(filename)
+                if basename in ign or filename in exc or excluded:
+                    continue
+                with open(pathname, 'rb') as fd:
+                    content = fd.read()
+                if files.get(filename):
+                    if files[filename].lfs:
+                        sha = hashlib.sha256(content).hexdigest()
+                        reference = files[filename].lfs_oid
+                    else:
+                        sha = subprocess.check_output(['git', 'hash-object', pathname], cwd=hasher, universal_newlines=True).splitlines()[0]
+                        reference = files[filename].oid
+                if not files.get(filename) or reference != sha:
+                    content = base64.standard_b64encode(content).decode()
+                    frq = { 'content' : content, 'path' : filename}
+                    if files.get(filename):
+                        frq['operation'] = 'update'
+                        frq['sha'] = files[filename].oid
+                        sys.stderr.write('UPDATE %s\n' % (filename))
+                    else:
+                        frq['operation'] = 'create'
+                        sys.stderr.write('CREATE %s\n' % (filename))
+                    rq['files'].append(frq)
+                files.pop(filename, None)
+            for filename in sorted(files.keys()):
+                frq = { 'path' : filename, 'operation' : 'delete', 'sha' : files[filename].oid }
+                rq['files'].append(frq)
+                sys.stderr.write('DELETE %s\n' % (filename))
+            if len(rq['files']) > 0:
+                self.check_post(self.repo_path(org, repo) + '/contents', json=rq)

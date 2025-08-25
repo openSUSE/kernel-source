@@ -1,3 +1,4 @@
+from kutil.config import get_source_timestamp
 from obsapi.obsapi import OBSAPI
 from obsapi.teaapi import TeaAPI
 from obsapi.api import APIError
@@ -84,8 +85,9 @@ class TestRequest(http.server.BaseHTTPRequestHandler):
         body = None
         if 'Content-Length' in self.headers:
             body = self.rfile.read(int(self.headers['Content-Length']))
-        if data['request']['body'] != body and 'Content-Type' in self.headers and self.headers['Content-Type'] == 'application/json':
+        if sys.version_info.major == 3 and sys.version_info.minor < 6 and 'Content-Type' in self.headers and self.headers['Content-Type'] == 'application/json':
             body = json.dumps(json.loads(body.decode()), sort_keys=True).encode()  # At least on SLE12 the order is random
+            data['request']['body'] = json.dumps(json.loads(data['request']['body'].decode()), sort_keys=True).encode()
         if data['request']['body'] != body:
             raise ValueError('Expected %s but got %s' %(data['request']['body'], body))
 
@@ -143,7 +145,7 @@ class ServerThread():
         self.httpd.socket = self.get_ssl_context().wrap_socket(self.httpd.socket, server_side=True)
 
     def get_ssl_context(self):
-        if int(sys.version.split('.')[1]) < 6:  # SLE 12
+        if sys.version_info.major == 3 and sys.version_info.minor < 6:  # SLE 12
             self.servercert = 'tests/api/certificate12.pem'
             self.serverkey = 'tests/api/certkey12.pem'
         else:
@@ -222,6 +224,12 @@ class TestTea(unittest.TestCase):
         api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
         with self.assertRaisesRegex(APIError, '/api/v1/repos/michals/testrepo/contents/.gitattributes POST 404 Not Found'):
             api.update_gitattr('michals', 'testrepo', 'testbranch')
+
+    def test_content_update(self):
+        st = ServerThread('tests/api/update_content')
+        st.start_server(teaconfig=self.config)
+        api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
+        api.update_content('michals', 'testrepo', 'testbranch', 'tests/api/content/update', get_source_timestamp('tests/api/content/update'))
 
     def test_create_branch(self):
         st = ServerThread('tests/api/branch_new')
