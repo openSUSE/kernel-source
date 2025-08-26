@@ -1,14 +1,20 @@
+import xml.etree.ElementTree as ET
 from obsapi.api import APIError
 from obsapi import api
 import http.cookiejar
 import configparser
+import urllib.parse
+import collections
 import subprocess
 import tempfile
 import base64
 import time
 import bz2
 import sys
+import re
 import os
+
+PkgRepo = collections.namedtuple('PkgRepo', ['api', 'org', 'repo', 'branch', 'commit'])
 
 def expand_home(path):
     if path.startswith('~/'):
@@ -109,3 +115,41 @@ class OBSAPI(api.API):
         # checking the relevant combinations of cookies and authentication
         r = self.get('/')
         return r
+
+    def project_exists(self, project):
+        return self.check_exists('/'.join(['/source', project, '_meta']))
+
+    def package_exists(self, project, package):
+        return self.file_exists(project, package, '_meta')
+
+    def file_exists(self, project, package, file):
+        return self.check_exists('/'.join(['/source', project, package, file]))
+
+    def package_meta(self, project, package):
+        return ET.fromstring(self.check_get('/'.join(['/source', project, package, '_meta'])).content)
+
+    def package_scmsync(self, project, package):
+        return urllib.parse.urlparse(self.package_meta(project, package).find('scmsync').text)
+
+    def package_repo(self, project, package):
+        if self.package_exists(project, package) and self.package_meta(project, package).find('scmsync') != None:
+            sync = self.package_scmsync(project, package)
+            assert sync.scheme == 'https'
+            assert sync.netloc in ['src.suse.de', 'src.opensuse.org']
+            assert len(sync.fragment) == 64
+            assert re.fullmatch('(?ai)[a-f0-9]*',sync.fragment)
+            query = urllib.parse.parse_qs(sync.query)
+            assert list(query.keys()) == ['trackingbranch']
+            assert len(sync.path.split('/')) == 3
+            _, org, repo = sync.path.split('/')
+            assert _ == ''
+            return PkgRepo(sync.scheme + '://' + sync.netloc, org, repo, query['trackingbranch'][0], sync.fragment)
+        if self.url == 'https://api.suse.de':
+            api = 'https://src.suse.de'
+        elif self.url == 'https://api.opensuse.org':
+            api = 'https://src.opensuse.org'
+        elif self.url.startswith('https://127.0.0.1:'):
+            api = self.url  # test environment
+        else:
+            raise APIError('No default Gitea API for %s' % (self.url,))
+        return PkgRepo(api, 'pool', package, None, None)

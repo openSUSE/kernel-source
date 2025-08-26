@@ -1,5 +1,5 @@
 from kutil.config import get_source_timestamp
-from obsapi.obsapi import OBSAPI
+from obsapi.obsapi import OBSAPI, PkgRepo
 from obsapi.teaapi import TeaAPI
 from obsapi.api import APIError
 from threading import Thread
@@ -295,3 +295,24 @@ class TestOBS(unittest.TestCase):
         self.assertEqual(api.ssh_signature(1755779838, api.user, api.sshkey, 'some realm'),
                          'keyId="obsuser",algorithm="ssh",headers="(created)",created=1755779838,signature="U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAge7Wj9uPdUE8nqD2mPJ8R9tZLZ2Wgwqj1MT7sJlFhJj4AAAAKc29tZSByZWFsbQAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUxOQAAAEBNMTVv/cHwZMLNZ2UaNaVUX2fJw8J4LvTCcHTrpXQ2z2pr5ldM+UvKypyBExf42plNYEI3hw59V4Uzej/di5YA"')
         api.check_login()
+
+    def test_pkgrepo(self):
+        st = ServerThread('tests/api/obsapi_pkgrepo')
+        st.start_server(obsconfig=self.config)
+        api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
+        self.assertEqual(api.package_repo('SUSE:SLFO:1.2', 'kernel-source-azure'),
+                         PkgRepo(api='https://src.suse.de', org='pool', repo='kernel-source-azure', branch='slfo-1.2',
+                                 commit='b20dbdf296c74a2897e61205e5c9edcb7f85340ede6bbfd18c05dbfce87c267b'))
+
+    def test_pkgrepo_defalt(self):
+        st = ServerThread('tests/api/obsapi_pkgrepo_no_scmsync')
+        st.start_server(obsconfig=self.config)
+        api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
+        self.assertEqual(api.package_repo('SUSE:SLE-15-SP7:GA', 'kernel-source-azure'),
+                         PkgRepo(api=st.url(), org='pool', repo='kernel-source-azure', branch=None, commit=None))
+
+        st = ServerThread('tests/api/obsapi_pkgrepo_nonexistent_pkg')
+        st.start_server(obsconfig=self.config)
+        api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
+        self.assertEqual(api.package_repo('SUSE:SLFO:1.2', 'kernel-source-foobar'),
+                         PkgRepo(api=st.url(), org='pool', repo='kernel-source-foobar', branch=None, commit=None))
