@@ -4,6 +4,7 @@ from obsapi.api import APIError
 from threading import Thread
 import email.message
 import configparser
+import urllib.parse
 import email.policy
 import http.cookies
 import http.server
@@ -30,6 +31,8 @@ class TestRequest(http.server.BaseHTTPRequestHandler):
         self.do_request()
     def do_PATCH(self):
         self.do_request()
+    def do_DELETE(self):
+        self.do_request()
     def do_POST(self):
         self.do_request()
     def do_HEAD(self):
@@ -44,10 +47,16 @@ class TestRequest(http.server.BaseHTTPRequestHandler):
     def check_request(self, data):
         if data['method'] != self.command:
             raise TypeError('Expected %s but got %s' % (data['request']['method'], self.command))
-        if not self.path.startswith(data['path']):  # excluding query
-            raise ValueError('Expected %s but got %s' % (data['path'], self.path))
-        if not data['url'].endswith(self.path):  # excluding hostname
-            raise ValueError('Expected %s but got %s' % (data['url'], self.path))
+        parsed_path = urllib.parse.urlparse(self.path)
+        parsed_url = urllib.parse.urlparse(data['url'])
+        if parsed_url.path != parsed_path.path:
+            raise ValueError('Expected path %s but got %s' % (parsed_url.path, parsed_path.path))
+        if parsed_url.params != parsed_path.params:
+            raise ValueError('Expected params %s but got %s' % (parsed_url.params, parsed_path.params))
+        if parsed_url.fragment != parsed_path.fragment:
+            raise ValueError('Expected fragment %s but got %s' % (parsed_url.fragment, parsed_path.fragment))
+        if urllib.parse.parse_qs(parsed_url.query) != urllib.parse.parse_qs(parsed_path.query):
+            raise ValueError('Expected query %s but got %s' % (parsed_url.query, parsed_path.query))
         req_headers = email.message.EmailMessage(policy=email.policy.HTTP)
         req_headers.update(data['request']['headers'])
         req_headers.update(data['request']['unredirected_hdrs'])
@@ -107,7 +116,7 @@ class TestRequest(http.server.BaseHTTPRequestHandler):
                 else:
                     self.send_header('set-cookie', c + '=' + cookies[c] + '; Path=/; Max-Age=86400; Secure; HttpOnly;')
 
-        for hdr in ['Content-Type', 'www-authenticate', 'location']:
+        for hdr in ['Content-Type', 'www-authenticate', 'location', 'X-Total-Count']:
             if hdr in headers:
                 for value in headers.get_all(hdr):
                     self.send_header(hdr, value)
@@ -213,6 +222,24 @@ class TestTea(unittest.TestCase):
         api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
         with self.assertRaisesRegex(APIError, '/api/v1/repos/michals/testrepo/contents/.gitattributes POST 404 Not Found'):
             api.update_gitattr('michals', 'testrepo', 'testbranch')
+
+    def test_create_branch(self):
+        st = ServerThread('tests/api/branch_new')
+        st.start_server(teaconfig=self.config)
+        api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
+        api.create_branch('michals', 'testrepo', 'downstream', 'testbranch', '60298bc4bf915a41f8f16f64d05a4125b434ca63112c53ba6779b039123c6db6', True)
+        st = ServerThread('tests/api/branch_up_to_date')
+        st.start_server(teaconfig=self.config)
+        api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
+        api.create_branch('michals', 'testrepo', 'downstream', 'testbranch', '60298bc4bf915a41f8f16f64d05a4125b434ca63112c53ba6779b039123c6db6', True)
+        st = ServerThread('tests/api/branch_no_roll')
+        st.start_server(teaconfig=self.config)
+        api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
+        api.create_branch('michals', 'testrepo', 'downstream', 'testbranch', 'a0156cd1f6cc836cec02b406a8c5154311bcd800e431a4092e5b59f611049ee4', False)
+        st = ServerThread('tests/api/branch_roll_forward')
+        st.start_server(teaconfig=self.config)
+        api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
+        api.create_branch('michals', 'testrepo', 'downstream', 'testbranch', 'a0156cd1f6cc836cec02b406a8c5154311bcd800e431a4092e5b59f611049ee4', True)
 
 class TestOBS(unittest.TestCase):
     def setUp(self):
