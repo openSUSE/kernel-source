@@ -41,7 +41,7 @@ class OBSAPI(api.API):
             None
         except Exception as e:
             sys.stderr.write("Error loading cookies: %s\n" % (repr(e),))
-        cp = configparser.ConfigParser(delimiters=('='), interpolation=None)
+        cp = configparser.ConfigParser(delimiters=('=', ':'), interpolation=None)
         try:
             cp.read(self.config)
         except (FileNotFoundError, PermissionError) as e:
