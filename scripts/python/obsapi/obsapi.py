@@ -70,7 +70,14 @@ class OBSAPI(api.API):
         else:
             passw = config.get('pass', None)
         if not passw:
-            raise RuntimeError('No password found in ' + self.url + ' configuration. Keyring authentication not supported.')
+            cmc = config.get('credentials_mgr_class', None)
+            if 'keyring' in config or 'gnome_keyring' in config or cmc == 'osc.credentials.KeyringCredentialsManager:keyring.backends.SecretService.Keyring':
+                assert self.url.startswith('https://')
+                host = self.url[       len('https://'):]
+                passw = subprocess.check_output('secret-tool', 'lookup', 'service', host, 'username', self.user)
+                assert len(passw) > 0
+            else:
+                raise RuntimeError('No password found in ' + self.url + ' configuration. Authentication type ' + str(cmc) + ' not supported.')
         self.passw = passw
 
     def ssh_signature(self, created, user, sshkey, realm):
