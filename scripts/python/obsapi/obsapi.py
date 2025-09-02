@@ -165,3 +165,15 @@ class OBSAPI(api.API):
             result.append(e.get('name'))
         assert len(xml) == len(result)
         return result
+
+    def list_project_packages(self, project):
+        xml = ET.fromstring(self.check_get('/source/' + project).content)
+        assert xml.tag == 'directory'
+        assert len(xml.keys()) == 1
+        result = []
+        for e in xml.iter('entry'):
+            assert e.tag == 'entry'
+            assert len(e.keys()) == 1
+            result.append(e.get('name'))
+        assert (len(xml) == len(result)) and (len(result) == int(xml.get('count')))
+        return result
