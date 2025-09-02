@@ -316,3 +316,10 @@ class TestOBS(unittest.TestCase):
         api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
         self.assertEqual(api.package_repo('SUSE:SLFO:1.2', 'kernel-source-foobar'),
                          PkgRepo(api=st.url(), org='pool', repo='kernel-source-foobar', branch=None, commit=None))
+
+    def test_list_projects(self):
+        st = ServerThread('tests/api/obsapi_list_projects')
+        st.start_server(obsconfig=self.config)
+        api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
+        self.assertEqual(api.list_projects(),
+                ['AlmaLinux:10', 'AlmaLinux:8', 'AlmaLinux:9', 'Alpine:Edge', 'Alpine:Latest', 'Amazon:AL2023', 'Apache', 'Apache:MirrorBrain', 'Apache:MirrorBrain:development', 'Apache:Modules', 'zypp:SLE-15-SP7-Branch', 'zypp:TEST', 'zypp:TW', 'zypp:ci', 'zypp:ci:libzypp', 'zypp:ci:zypper', 'zypp:jezypp', 'zypp:jezypp:SuSE-RES-8-Branch', 'zypp:jezypp:SuSE-RES-9-Branch', 'zypp:plugins'])

@@ -153,3 +153,15 @@ class OBSAPI(api.API):
         else:
             raise APIError('No default Gitea API for %s' % (self.url,))
         return PkgRepo(api, 'pool', package, None, None)
+
+    def list_projects(self):
+        xml = ET.fromstring(self.check_get('/source').content)
+        assert xml.tag == 'directory'
+        assert len(xml.keys()) == 0
+        result = []
+        for e in xml.iter('entry'):
+            assert e.tag == 'entry'
+            assert len(e.keys()) == 1
+            result.append(e.get('name'))
+        assert len(xml) == len(result)
+        return result
