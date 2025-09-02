@@ -160,7 +160,6 @@ class OBSAPI(api.API):
         assert len(xml.keys()) == 0
         result = []
         for e in xml.iter('entry'):
-            assert e.tag == 'entry'
             assert len(e.keys()) == 1
             result.append(e.get('name'))
         assert len(xml) == len(result)
@@ -172,8 +171,22 @@ class OBSAPI(api.API):
         assert len(xml.keys()) == 1
         result = []
         for e in xml.iter('entry'):
-            assert e.tag == 'entry'
             assert len(e.keys()) == 1
             result.append(e.get('name'))
         assert (len(xml) == len(result)) and (len(result) == int(xml.get('count')))
+        return result
+
+    def list_package_links(self, project, package):
+        xml = ET.fromstring(self.check_post('/source/' + project + '/' + package, params={'cmd': 'showlinked'}).content)
+        assert xml.tag == 'collection'
+        assert len(xml.keys()) == 0
+        result = []
+        remote = 0
+        for e in xml.iter('package'):
+            assert len(e.keys()) == 2
+            if e.get('project') == project:
+                result.append(e.get('name'))
+            else:
+                remote += 1
+        assert len(xml) == len(result) + remote
         return result
