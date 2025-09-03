@@ -1,0 +1,386 @@
+From 8e4f21f2b13d6cc29b59ad7faaac7aafbf3569e3 Mon Sep 17 00:00:00 2001
+Message-ID: <8e4f21f2b13d6cc29b59ad7faaac7aafbf3569e3.1756886512.git.wqu@suse.com>
+Git-commit: 8e4f21f2b13d6cc29b59ad7faaac7aafbf3569e3
+References: bsc#1249038
+Patch-mainline: v6.16-rc1
+From: Qu Wenruo <wqu@suse.com>
+Date: Sat, 26 Apr 2025 08:06:49 +0930
+Subject: [PATCH] btrfs: handle unaligned EOF truncation correctly for subpage
+ cases
+
+[BUG]
+The following fsx sequence will fail on btrfs with 64K page size and 4K
+fs block size:
+
+  #fsx -d -e 1 -N 4 $mnt/junk -S 36386
+  READ BAD DATA: offset = 0xe9ba, size = 0x6dd5, fname = /mnt/btrfs/junk
+  OFFSET      GOOD    BAD     RANGE
+  0xe9ba      0x0000  0x03ac  0x0
+  operation# (mod 256) for the bad data may be 3
+  ...
+  LOG DUMP (4 total operations):
+  1(  1 mod 256): WRITE    0x6c62 thru 0x1147d	(0xa81c bytes) HOLE	***WWWW
+  2(  2 mod 256): TRUNCATE DOWN	from 0x1147e to 0x5448	******WWWW
+  3(  3 mod 256): ZERO     0x1c7aa thru 0x28fe2	(0xc839 bytes)
+  4(  4 mod 256): MAPREAD  0xe9ba thru 0x1578e	(0x6dd5 bytes)	***RRRR***
+
+[CAUSE]
+Only 2 operations are really involved in this case:
+
+  3 pollute_eof	0x5448 thru	0xffff	(0xabb8 bytes)
+  3 zero	from 0x1c7aa to 0x28fe3, (0xc839 bytes)
+  4 mapread	0xe9ba thru	0x1578e	(0x6dd5 bytes)
+
+At operation 3, fsx pollutes beyond EOF, that is done by mmap()
+and write into that mmap() range beyond EOF.
+
+Such write will fill the range beyond EOF, but it will never reach disk
+as ranges beyond EOF will not be marked dirty nor uptodate.
+
+Then we zero_range for [0x1c7aa, 0x28fe3], and since the range is beyond
+our isize (which was 0x5448), we should zero out any range beyond
+EOF (0x5448).
+
+During btrfs_zero_range(), we call btrfs_truncate_block() to dirty the
+unaligned head block.
+But that function only really zeroes out the block at [0x5000, 0x5fff], it
+doesn't bother any range other that that block, since those ranges will
+not be marked dirty nor written back.
+
+So the range [0x6000, 0xffff] is still polluted, and later mapread()
+will return the poisoned value.
+
+[FIX]
+Enhance btrfs_truncate_block() by:
+
+- Pass a @start/@end pair to indicate the full truncation range
+  This is to handle the following truncation case:
+
+    Page size is 64K, fs block size is 4K, truncate range is
+    [6K, 60K]
+
+    0                      32K                    64K
+    |   |///////////////////////////////////|     |
+        6K                                  60K
+
+    The range is not aligned for its head block, so we need to call
+    btrfs_truncate_block() with @from = 6K, @front = 0, @len = 0.
+
+    But with that information we only know to zero the range [6K, 8K),
+    if we zero out the range [6K, 64K), the last block will also be
+    zeroed, causing data loss.
+
+  So here we need the full range we're truncating, so that we can avoid
+  over-truncation.
+
+- Rename @from to @offset
+  As now the parameter is only utilized to locate a block, it's not
+  really carrying the old @from meaning well.
+
+- Remove @front parameter
+  With the full truncate range passed in, we can determine if the
+  @offset is at the head or tail block.
+
+- Skip truncation if @offset is not in the head nor tail blocks
+  The call site in hole punch unconditionally call
+  btrfs_truncate_block() without even checking the range is aligned or
+  not.
+  If the @offset is neither in the head nor in tail block, it means we can
+  safely ignore it.
+
+- Skip truncate if the range inside the target block is already aligned
+
+- Make btrfs_truncate_block() zero all blocks beyond EOF
+  Since we have the original range, we know exactly if we're doing
+  truncation beyond EOF (the @end will be (u64)-1).
+
+  If we're doing truncation beyond EOF, then enlarge the truncation
+  range to the folio end, to address the possibly polluted ranges.
+
+  Otherwise still keep the zero range inside the block, as we can have
+  large data folios soon, always truncating every blocks inside the same
+  folio can be costly for large folios.
+
+Reviewed-by: Boris Burkov <boris@bur.io>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/btrfs_inode.h |    3 -
+ fs/btrfs/file.c        |   33 +++++++--------
+ fs/btrfs/inode.c       |  107 ++++++++++++++++++++++++++++++++++++-------------
+ 3 files changed, 98 insertions(+), 45 deletions(-)
+
+--- a/fs/btrfs/btrfs_inode.h
++++ b/fs/btrfs/btrfs_inode.h
+@@ -538,8 +538,7 @@ int btrfs_add_link(struct btrfs_trans_ha
+ 		   struct btrfs_inode *parent_inode, struct btrfs_inode *inode,
+ 		   const struct fscrypt_str *name, int add_backref, u64 index);
+ int btrfs_delete_subvolume(struct btrfs_inode *dir, struct dentry *dentry);
+-int btrfs_truncate_block(struct btrfs_inode *inode, loff_t from, loff_t len,
+-			 int front);
++int btrfs_truncate_block(struct btrfs_inode *inode, u64 offset, u64 start, u64 end);
+ 
+ int btrfs_start_delalloc_snapshot(struct btrfs_root *root, bool in_reclaim_context);
+ int btrfs_start_delalloc_roots(struct btrfs_fs_info *fs_info, long nr,
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -2627,7 +2627,8 @@ static int btrfs_punch_hole(struct file
+ 	u64 lockend;
+ 	u64 tail_start;
+ 	u64 tail_len;
+-	u64 orig_start = offset;
++	const u64 orig_start = offset;
++	const u64 orig_end = offset + len - 1;
+ 	int ret = 0;
+ 	bool same_block;
+ 	u64 ino_size;
+@@ -2659,18 +2660,14 @@ static int btrfs_punch_hole(struct file
+ 	same_block = (BTRFS_BYTES_TO_BLKS(fs_info, offset))
+ 		== (BTRFS_BYTES_TO_BLKS(fs_info, offset + len - 1));
+ 	/*
+-	 * We needn't truncate any block which is beyond the end of the file
+-	 * because we are sure there is no data there.
+-	 */
+-	/*
+ 	 * Only do this if we are in the same block and we aren't doing the
+ 	 * entire block.
+ 	 */
+ 	if (same_block && len < fs_info->sectorsize) {
+ 		if (offset < ino_size) {
+ 			truncated_block = true;
+-			ret = btrfs_truncate_block(BTRFS_I(inode), offset, len,
+-						   0);
++			ret = btrfs_truncate_block(BTRFS_I(inode), offset + len - 1,
++						   orig_start, orig_end);
+ 		} else {
+ 			ret = 0;
+ 		}
+@@ -2680,7 +2677,7 @@ static int btrfs_punch_hole(struct file
+ 	/* zero back part of the first block */
+ 	if (offset < ino_size) {
+ 		truncated_block = true;
+-		ret = btrfs_truncate_block(BTRFS_I(inode), offset, 0, 0);
++		ret = btrfs_truncate_block(BTRFS_I(inode), offset, orig_start, orig_end);
+ 		if (ret) {
+ 			btrfs_inode_unlock(BTRFS_I(inode), BTRFS_ILOCK_MMAP);
+ 			return ret;
+@@ -2717,8 +2714,8 @@ static int btrfs_punch_hole(struct file
+ 			if (tail_start + tail_len < ino_size) {
+ 				truncated_block = true;
+ 				ret = btrfs_truncate_block(BTRFS_I(inode),
+-							tail_start + tail_len,
+-							0, 1);
++							tail_start + tail_len - 1,
++							orig_start, orig_end);
+ 				if (ret)
+ 					goto out_only_mutex;
+ 			}
+@@ -2886,6 +2883,8 @@ static int btrfs_zero_range(struct inode
+ 	int ret;
+ 	u64 alloc_hint = 0;
+ 	const u64 sectorsize = fs_info->sectorsize;
++	const u64 orig_start = offset;
++	const u64 orig_end = offset + len - 1;
+ 	u64 alloc_start = round_down(offset, sectorsize);
+ 	u64 alloc_end = round_up(offset + len, sectorsize);
+ 	u64 bytes_to_reserve = 0;
+@@ -2948,8 +2947,8 @@ static int btrfs_zero_range(struct inode
+ 		}
+ 		if (len < sectorsize && em->disk_bytenr != EXTENT_MAP_HOLE) {
+ 			free_extent_map(em);
+-			ret = btrfs_truncate_block(BTRFS_I(inode), offset, len,
+-						   0);
++			ret = btrfs_truncate_block(BTRFS_I(inode), offset + len - 1,
++						   orig_start, orig_end);
+ 			if (!ret)
+ 				ret = btrfs_fallocate_update_isize(inode,
+ 								   offset + len,
+@@ -2980,7 +2979,8 @@ static int btrfs_zero_range(struct inode
+ 			alloc_start = round_down(offset, sectorsize);
+ 			ret = 0;
+ 		} else if (ret == RANGE_BOUNDARY_WRITTEN_EXTENT) {
+-			ret = btrfs_truncate_block(BTRFS_I(inode), offset, 0, 0);
++			ret = btrfs_truncate_block(BTRFS_I(inode), offset,
++						   orig_start, orig_end);
+ 			if (ret)
+ 				goto out;
+ 		} else {
+@@ -2997,8 +2997,8 @@ static int btrfs_zero_range(struct inode
+ 			alloc_end = round_up(offset + len, sectorsize);
+ 			ret = 0;
+ 		} else if (ret == RANGE_BOUNDARY_WRITTEN_EXTENT) {
+-			ret = btrfs_truncate_block(BTRFS_I(inode), offset + len,
+-						   0, 1);
++			ret = btrfs_truncate_block(BTRFS_I(inode), offset + len - 1,
++						   orig_start, orig_end);
+ 			if (ret)
+ 				goto out;
+ 		} else {
+@@ -3118,7 +3118,8 @@ static long btrfs_fallocate(struct file
+ 		 * need to zero out the end of the block if i_size lands in the
+ 		 * middle of a block.
+ 		 */
+-		ret = btrfs_truncate_block(BTRFS_I(inode), inode->i_size, 0, 0);
++		ret = btrfs_truncate_block(BTRFS_I(inode), inode->i_size,
++					   inode->i_size, (u64)-1);
+ 		if (ret)
+ 			goto out;
+ 	}
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -4758,20 +4758,34 @@ out_notrans:
+ 	return ret;
+ }
+ 
++static bool is_inside_block(u64 bytenr, u64 blockstart, u32 blocksize)
++{
++	ASSERT(IS_ALIGNED(blockstart, blocksize), "blockstart=%llu blocksize=%u",
++		blockstart, blocksize);
++
++	if (blockstart <= bytenr && bytenr <= blockstart + blocksize - 1)
++		return true;
++	return false;
++}
++
+ /*
+- * Read, zero a chunk and write a block.
++ * Handle the truncation of a fs block.
+  *
+- * @inode - inode that we're zeroing
+- * @from - the offset to start zeroing
+- * @len - the length to zero, 0 to zero the entire range respective to the
+- *	offset
+- * @front - zero up to the offset instead of from the offset on
++ * @inode  - inode that we're zeroing
++ * @offset - the file offset of the block to truncate
++ *           The value must be inside [@start, @end], and the function will do
++ *           extra checks if the block that covers @offset needs to be zeroed.
++ * @start  - the start file offset of the range we want to zero
++ * @end    - the end (inclusive) file offset of the range we want to zero.
+  *
+- * This will find the block for the "from" offset and cow the block and zero the
+- * part we want to zero.  This is used with truncate and hole punching.
++ * If the range is not block aligned, read out the folio that covers @offset,
++ * and if needed zero blocks that are inside the folio and covered by [@start, @end).
++ * If @start or @end + 1 lands inside a block, that block will be marked dirty
++ * for writeback.
++ *
++ * This is utilized by hole punch, zero range, file expansion.
+  */
+-int btrfs_truncate_block(struct btrfs_inode *inode, loff_t from, loff_t len,
+-			 int front)
++int btrfs_truncate_block(struct btrfs_inode *inode, u64 offset, u64 start, u64 end)
+ {
+ 	struct btrfs_fs_info *fs_info = inode->root->fs_info;
+ 	struct address_space *mapping = inode->vfs_inode.i_mapping;
+@@ -4781,20 +4795,49 @@ int btrfs_truncate_block(struct btrfs_in
+ 	struct extent_changeset *data_reserved = NULL;
+ 	bool only_release_metadata = false;
+ 	u32 blocksize = fs_info->sectorsize;
+-	pgoff_t index = from >> PAGE_SHIFT;
+-	unsigned offset = from & (blocksize - 1);
++	pgoff_t index = (offset >> PAGE_SHIFT);
+ 	struct folio *folio;
+ 	gfp_t mask = btrfs_alloc_write_mask(mapping);
+ 	size_t write_bytes = blocksize;
+ 	int ret = 0;
++	const bool in_head_block = is_inside_block(offset, round_down(start, blocksize),
++						   blocksize);
++	const bool in_tail_block = is_inside_block(offset, round_down(end, blocksize),
++						   blocksize);
++	bool need_truncate_head = false;
++	bool need_truncate_tail = false;
++	u64 zero_start;
++	u64 zero_end;
+ 	u64 block_start;
+ 	u64 block_end;
+ 
+-	if (IS_ALIGNED(offset, blocksize) &&
+-	    (!len || IS_ALIGNED(len, blocksize)))
++	/* @offset should be inside the range. */
++	ASSERT(start <= offset && offset <= end, "offset=%llu start=%llu end=%llu",
++	       offset, start, end);
++
++	/* The range is aligned at both ends. */
++	if (IS_ALIGNED(start, blocksize) && IS_ALIGNED(end + 1, blocksize))
++		goto out;
++
++	/*
++	 * @offset may not be inside the head nor tail block. In that case we
++	 * don't need to do anything.
++	 */
++	if (!in_head_block && !in_tail_block)
++		goto out;
++
++	/*
++	 * Skip the truncatioin if the range in the target block is already aligned.
++	 * The seemingly complex check will also handle the same block case.
++	 */
++	if (in_head_block && !IS_ALIGNED(start, blocksize))
++		need_truncate_head = true;
++	if (in_tail_block && !IS_ALIGNED(end + 1, blocksize))
++		need_truncate_tail = true;
++	if (!need_truncate_head && !need_truncate_tail)
+ 		goto out;
+ 
+-	block_start = round_down(from, blocksize);
++	block_start = round_down(offset, blocksize);
+ 	block_end = block_start + blocksize - 1;
+ 
+ 	ret = btrfs_check_data_free_space(inode, &data_reserved, block_start,
+@@ -4874,17 +4917,26 @@ again:
+ 		goto out_unlock;
+ 	}
+ 
+-	if (offset != blocksize) {
+-		if (!len)
+-			len = blocksize - offset;
+-		if (front)
+-			folio_zero_range(folio, block_start - folio_pos(folio),
+-					 offset);
+-		else
+-			folio_zero_range(folio,
+-					 (block_start - folio_pos(folio)) + offset,
+-					 len);
++	if (end == (u64)-1) {
++		/*
++		 * We're truncating beyond EOF, the remaining blocks normally are
++		 * already holes thus no need to zero again, but it's possible for
++		 * fs block size < page size cases to have memory mapped writes
++		 * to pollute ranges beyond EOF.
++		 *
++		 * In that case although such polluted blocks beyond EOF will
++		 * not reach disk, it still affects our page caches.
++		 */
++		zero_start = max_t(u64, folio_pos(folio), start);
++		zero_end = min_t(u64, folio_pos(folio) + folio_size(folio) - 1,
++				 end);
++	} else {
++		zero_start = max_t(u64, block_start, start);
++		zero_end = min_t(u64, block_end, end);
+ 	}
++	folio_zero_range(folio, zero_start - folio_pos(folio),
++			 zero_end - zero_start + 1);
++
+ 	btrfs_folio_clear_checked(fs_info, folio, block_start,
+ 				  block_end + 1 - block_start);
+ 	btrfs_folio_set_dirty(fs_info, folio, block_start,
+@@ -4986,7 +5038,7 @@ int btrfs_cont_expand(struct btrfs_inode
+ 	 * rest of the block before we expand the i_size, otherwise we could
+ 	 * expose stale data.
+ 	 */
+-	ret = btrfs_truncate_block(inode, oldsize, 0, 0);
++	ret = btrfs_truncate_block(inode, oldsize, oldsize, -1);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -7642,7 +7694,8 @@ static int btrfs_truncate(struct btrfs_i
+ 		btrfs_end_transaction(trans);
+ 		btrfs_btree_balance_dirty(fs_info);
+ 
+-		ret = btrfs_truncate_block(inode, inode->vfs_inode.i_size, 0, 0);
++		ret = btrfs_truncate_block(inode, inode->vfs_inode.i_size,
++					   inode->vfs_inode.i_size, (u64)-1);
+ 		if (ret)
+ 			goto out;
+ 		trans = btrfs_start_transaction(root, 1);
