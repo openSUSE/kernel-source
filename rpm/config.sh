@@ -12,7 +12,7 @@ LIVEPATCH_RT=1
 BUILD_DTBS="Yes"
 # buildservice projects to build the kernel against
 OBS_PROJECT=SUSE:SLE-15-SP6:Update
-OBS_PROJECT_ARM=openSUSE:Step:15-SP5
+OBS_PROJECT_ARM=openSUSE:Leap:15.6:Update
 IBS_PROJECT=SUSE:SLE-15-SP6:Update
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
