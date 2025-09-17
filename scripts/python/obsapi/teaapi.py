@@ -253,3 +253,18 @@ class TeaAPI(api.API):
                 sys.stderr.write('DELETE %s\n' % (filename))
             if len(rq['files']) > 0:
                 self.check_post(self.repo_path(org, repo) + '/contents', json=rq)
+
+    def get_pr(self, org, repo, tgt, src):
+        pr =  self.check_exists(self.repo_path(org, repo) + '/pulls/' + tgt + '/' + src)
+        return pr.json() if pr else pr
+
+    def open_pr(self, org, repo, tgt, src, text):
+        text = list(text.splitlines())
+        title = text[0]
+        body = '\n'.join(text[1:])
+        return self.check_post(self.repo_path(org, repo) + '/pulls', json={
+            'base': tgt,
+            'head': src,
+            'title': title,
+            'body': body,
+            }).json()
