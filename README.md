@@ -296,12 +296,6 @@ It might sometimes be needed to tolerate particular kernel ABI changes and not
 abort the build. At the same time, you may not want to update the reference
 symvers and symtypes files in order to monitor the relative changes.
 
-A specific kernel can be marked so that kernel ABI changes are ignored. This is
-done by creating a `kabi/$ARCH/ignore-$FLAVOR` file, for example,
-`kabi/x86_64/ignore-default`. The kernel ABI checks are still performed, but the
-build does not abort if a problem is found. The content of the ignore file does
-not matter.
-
 All kernel ABI changes in all kernel packages can be ignored by creating a file
 called `IGNORE-KABI-BADNESS` in the `kernel-source/` sub-directory of the
 repository that `scripts/tar-up` creates. Doing this may occasionally be
