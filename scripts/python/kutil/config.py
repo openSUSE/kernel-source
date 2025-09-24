@@ -73,3 +73,18 @@ def get_kernel_project_package(package_tar_up_dir):
     assert '/' not in specname
     specname = specname[0:-len(ext)]
     return (project, specname)
+
+def get_kernel_projects(package_tar_up_dir):
+    config_filename = os.path.join(package_tar_up_dir, 'config.sh')
+    rpm_config = read_config_sh(config_filename)
+    ibs_projects = {}
+    obs_projects = {}
+    for var in sorted(list(rpm_config.keys())):
+        suffix = var[len('ibs_project_'):].upper()
+        if var.startswith('ibs_project'):
+            ibs_projects[suffix] = rpm_config[var]
+        if var.startswith('obs_project'):
+            obs_projects[suffix] = rpm_config[var]
+            if suffix not in ibs_projects:  # sorted so that IBS comes first
+                ibs_projects[suffix] = 'openSUSE.org:' + rpm_config[var]
+    return {'IBS': ibs_projects, 'OBS': obs_projects}
