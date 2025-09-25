@@ -1,0 +1,211 @@
+From: Shivank Garg <shivankg@amd.com>
+Date: Sun, 21 Sep 2025 10:39:53 -0400
+Subject: [PATCH] mm: add folio_expected_ref_count() for reference count
+ calculation
+References: bsc#1234429
+Patch-mainline: 6.12.49
+Git-commit: 86ebd50224c0734d965843260d0dc057a9431c61
+
+[ Upstream commit 86ebd50224c0734d965843260d0dc057a9431c61 ]
+
+Patch series " JFS: Implement migrate_folio for jfs_metapage_aops" v5.
+
+This patchset addresses a warning that occurs during memory compaction due
+to JFS's missing migrate_folio operation.  The warning was introduced by
+commit 7ee3647243e5 ("migrate: Remove call to ->writepage") which added
+explicit warnings when filesystem don't implement migrate_folio.
+
+The syzbot reported following [1]:
+  jfs_metapage_aops does not implement migrate_folio
+  WARNING: CPU: 1 PID: 5861 at mm/migrate.c:955 fallback_migrate_folio mm/migrate.c:953 [inline]
+  WARNING: CPU: 1 PID: 5861 at mm/migrate.c:955 move_to_new_folio+0x70e/0x840 mm/migrate.c:1007
+  Modules linked in:
+  CPU: 1 UID: 0 PID: 5861 Comm: syz-executor280 Not tainted 6.15.0-rc1-next-20250411-syzkaller #0 PREEMPT(full)
+  Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 02/12/2025
+  RIP: 0010:fallback_migrate_folio mm/migrate.c:953 [inline]
+  RIP: 0010:move_to_new_folio+0x70e/0x840 mm/migrate.c:1007
+
+To fix this issue, this series implement metapage_migrate_folio() for JFS
+which handles both single and multiple metapages per page configurations.
+
+While most filesystems leverage existing migration implementations like
+filemap_migrate_folio(), buffer_migrate_folio_norefs() or
+buffer_migrate_folio() (which internally used folio_expected_refs()),
+JFS's metapage architecture requires special handling of its private data
+during migration.  To support this, this series introduce the
+folio_expected_ref_count(), which calculates external references to a
+folio from page/swap cache, private data, and page table mappings.
+
+This standardized implementation replaces the previous ad-hoc
+folio_expected_refs() function and enables JFS to accurately determine
+whether a folio has unexpected references before attempting migration.
+
+Implement folio_expected_ref_count() to calculate expected folio reference
+counts from:
+- Page/swap cache (1 per page)
+- Private data (1)
+- Page table mappings (1 per map)
+
+While originally needed for page migration operations, this improved
+implementation standardizes reference counting by consolidating all
+refcount contributors into a single, reusable function that can benefit
+any subsystem needing to detect unexpected references to folios.
+
+The folio_expected_ref_count() returns the sum of these external
+references without including any reference the caller itself might hold.
+Callers comparing against the actual folio_ref_count() must account for
+their own references separately.
+
+Link: https://syzkaller.appspot.com/bug?extid=8bb6fd945af4e0ad9299 [1]
+Link: https://lkml.kernel.org/r/20250430100150.279751-1-shivankg@amd.com
+Link: https://lkml.kernel.org/r/20250430100150.279751-2-shivankg@amd.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Signed-off-by: Shivank Garg <shivankg@amd.com>
+Suggested-by: Matthew Wilcox <willy@infradead.org>
+Co-developed-by: David Hildenbrand <david@redhat.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Dave Kleikamp <shaggy@kernel.org>
+Cc: Donet Tom <donettom@linux.ibm.com>
+Cc: Jane Chu <jane.chu@oracle.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Stable-dep-of: 98c6d259319e ("mm/gup: check ref_count instead of lru before migration")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/linux/mm.h | 55 ++++++++++++++++++++++++++++++++++++++++++++++
+ mm/migrate.c       | 22 ++++---------------
+ 2 files changed, 59 insertions(+), 18 deletions(-)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index deeb535f920c..41f5c88bdf3b 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2200,6 +2200,61 @@ static inline bool folio_likely_mapped_shared(struct folio *folio)
+ 	return atomic_read(&folio->_mapcount) > 0;
+ }
+ 
++/**
++ * folio_expected_ref_count - calculate the expected folio refcount
++ * @folio: the folio
++ *
++ * Calculate the expected folio refcount, taking references from the pagecache,
++ * swapcache, PG_private and page table mappings into account. Useful in
++ * combination with folio_ref_count() to detect unexpected references (e.g.,
++ * GUP or other temporary references).
++ *
++ * Does currently not consider references from the LRU cache. If the folio
++ * was isolated from the LRU (which is the case during migration or split),
++ * the LRU cache does not apply.
++ *
++ * Calling this function on an unmapped folio -- !folio_mapped() -- that is
++ * locked will return a stable result.
++ *
++ * Calling this function on a mapped folio will not result in a stable result,
++ * because nothing stops additional page table mappings from coming (e.g.,
++ * fork()) or going (e.g., munmap()).
++ *
++ * Calling this function without the folio lock will also not result in a
++ * stable result: for example, the folio might get dropped from the swapcache
++ * concurrently.
++ *
++ * However, even when called without the folio lock or on a mapped folio,
++ * this function can be used to detect unexpected references early (for example,
++ * if it makes sense to even lock the folio and unmap it).
++ *
++ * The caller must add any reference (e.g., from folio_try_get()) it might be
++ * holding itself to the result.
++ *
++ * Returns the expected folio refcount.
++ */
++static inline int folio_expected_ref_count(const struct folio *folio)
++{
++	const int order = folio_order(folio);
++	int ref_count = 0;
++
++	if (WARN_ON_ONCE(folio_test_slab(folio)))
++		return 0;
++
++	if (folio_test_anon(folio)) {
++		/* One reference per page from the swapcache. */
++		ref_count += folio_test_swapcache(folio) << order;
++	} else if (!((unsigned long)folio->mapping & PAGE_MAPPING_FLAGS)) {
++		/* One reference per page from the pagecache. */
++		ref_count += !!folio->mapping << order;
++		/* One reference from PG_private. */
++		ref_count += folio_test_private(folio);
++	}
++
++	/* One reference per page table mapping. */
++	return ref_count + folio_mapcount(folio);
++}
++
+ #ifndef HAVE_ARCH_MAKE_FOLIO_ACCESSIBLE
+ static inline int arch_make_folio_accessible(struct folio *folio)
+ {
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 25e7438af968..8619aa884eaa 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -453,20 +453,6 @@ void pmd_migration_entry_wait(struct mm_struct *mm, pmd_t *pmd)
+ }
+ #endif
+ 
+-static int folio_expected_refs(struct address_space *mapping,
+-		struct folio *folio)
+-{
+-	int refs = 1;
+-	if (!mapping)
+-		return refs;
+-
+-	refs += folio_nr_pages(folio);
+-	if (folio_test_private(folio))
+-		refs++;
+-
+-	return refs;
+-}
+-
+ /*
+  * Replace the folio in the mapping.
+  *
+@@ -609,7 +595,7 @@ static int __folio_migrate_mapping(struct address_space *mapping,
+ int folio_migrate_mapping(struct address_space *mapping,
+ 		struct folio *newfolio, struct folio *folio, int extra_count)
+ {
+-	int expected_count = folio_expected_refs(mapping, folio) + extra_count;
++	int expected_count = folio_expected_ref_count(folio) + extra_count + 1;
+ 
+ 	if (folio_ref_count(folio) != expected_count)
+ 		return -EAGAIN;
+@@ -626,7 +612,7 @@ int migrate_huge_page_move_mapping(struct address_space *mapping,
+ 				   struct folio *dst, struct folio *src)
+ {
+ 	XA_STATE(xas, &mapping->i_pages, folio_index(src));
+-	int rc, expected_count = folio_expected_refs(mapping, src);
++	int rc, expected_count = folio_expected_ref_count(src) + 1;
+ 
+ 	if (folio_ref_count(src) != expected_count)
+ 		return -EAGAIN;
+@@ -756,7 +742,7 @@ static int __migrate_folio(struct address_space *mapping, struct folio *dst,
+ 			   struct folio *src, void *src_private,
+ 			   enum migrate_mode mode)
+ {
+-	int rc, expected_count = folio_expected_refs(mapping, src);
++	int rc, expected_count = folio_expected_ref_count(src) + 1;
+ 
+ 	/* Check whether src does not have extra refs before we do more work */
+ 	if (folio_ref_count(src) != expected_count)
+@@ -844,7 +830,7 @@ static int __buffer_migrate_folio(struct address_space *mapping,
+ 		return migrate_folio(mapping, dst, src, mode);
+ 
+ 	/* Check whether page does not have extra refs before we do more work */
+-	expected_count = folio_expected_refs(mapping, src);
++	expected_count = folio_expected_ref_count(src) + 1;
+ 	if (folio_ref_count(src) != expected_count)
+ 		return -EAGAIN;
+ 
+-- 
+2.51.0
+
