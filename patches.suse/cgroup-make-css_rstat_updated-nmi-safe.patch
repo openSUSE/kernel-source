@@ -1,0 +1,136 @@
+From: Shakeel Butt <shakeel.butt@linux.dev>
+Date: Tue, 17 Jun 2025 12:57:23 -0700
+Subject: cgroup: make css_rstat_updated nmi safe
+Git-commit: 36df6e3dbd7e7b074e55fec080012184e2fa3a46
+Patch-mainline: v6.16 or v6.16-rc5 (next release)
+References: bsc#1247963
+
+To make css_rstat_updated() able to safely run in nmi context, let's
+move the rstat update tree creation at the flush side and use per-cpu
+lockless lists in struct cgroup_subsys to track the css whose stats are
+updated on that cpu.
+
+The struct cgroup_subsys_state now has per-cpu lnode which needs to be
+inserted into the corresponding per-cpu lhead of struct cgroup_subsys.
+Since we want the insertion to be nmi safe, there can be multiple
+inserters on the same cpu for the same lnode. Here multiple inserters
+are from stacked contexts like softirq, hardirq and nmi.
+
+The current llist does not provide function to protect against the
+scenario where multiple inserters can use the same lnode. So, using
+llist_node() out of the box is not safe for this scenario.
+
+However we can protect against multiple inserters using the same lnode
+by using the fact llist node points to itself when not on the llist and
+atomically reset it and select the winner as the single inserter.
+
+Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
+Tested-by: JP Kobryn <inwardvessel@gmail.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+[ ptesarik: Since SUSE-2024 has not backported per-subsystem locks,
+  cgroup is used everywhere instead of css. ]
+Signed-off-by: Petr Tesarik <ptesarik@suse.com>
+---
+ kernel/cgroup/rstat.c |   66 ++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 53 insertions(+), 13 deletions(-)
+
+--- a/kernel/cgroup/rstat.c
++++ b/kernel/cgroup/rstat.c
+@@ -23,28 +23,55 @@ static struct cgroup_rstat_cpu *cgroup_r
+  * @cgrp: target cgroup
+  * @cpu: cpu on which rstat_cpu was updated
+  *
+- * @cgrp's rstat_cpu on @cpu was updated.  Put it on the parent's matching
+- * rstat_cpu->updated_children list.  See the comment on top of
+- * cgroup_rstat_cpu definition for details.
++ * Atomically inserts the cgrp in the llist for the given cpu. This is
++ * reentrant safe i.e. safe against softirq, hardirq and nmi. The llist
++ * will be processed at the flush time to create the update tree.
+  */
+ __bpf_kfunc void cgroup_rstat_updated(struct cgroup *cgrp, int cpu)
+ {
+-	raw_spinlock_t *cpu_lock = per_cpu_ptr(&cgroup_rstat_cpu_lock, cpu);
+-	unsigned long flags;
++	struct llist_head *lhead;
++	struct cgroup_rstat_cpu *rstatc;
++	struct cgroup_rstat_cpu __percpu *rstatc_pcpu;
++	struct llist_node *self;
++
++	lockdep_assert_preemption_disabled();
++
++	/*
++	 * For archs withnot nmi safe cmpxchg or percpu ops support, ignore
++	 * the requests from nmi context.
++	 */
++	if ((!IS_ENABLED(CONFIG_ARCH_HAVE_NMI_SAFE_CMPXCHG) ||
++	     !IS_ENABLED(CONFIG_ARCH_HAS_NMI_SAFE_THIS_CPU_OPS)) && in_nmi())
++		return;
++
++	rstatc = cgroup_rstat_cpu(cgrp, cpu);
++	/* If already on list return. */
++	if (llist_on_list(&rstatc->lnode))
++		return;
+ 
+ 	/*
+-	 * Speculative already-on-list test. This may race leading to
+-	 * temporary inaccuracies, which is fine.
++	 * This function can be renentered by irqs and nmis for the same cgroup
++	 * and may try to insert the same per-cpu lnode into the llist. Note
++	 * that llist_add() does not protect against such scenarios.
+ 	 *
+-	 * Because @parent's updated_children is terminated with @parent
+-	 * instead of NULL, we can tell whether @cgrp is on the list by
+-	 * testing the next pointer for NULL.
++	 * To protect against such stacked contexts of irqs/nmis, we use the
++	 * fact that lnode points to itself when not on a list and then use
++	 * this_cpu_cmpxchg() to atomically set to NULL to select the winner
++	 * which will call llist_add(). The losers can assume the insertion is
++	 * successful and the winner will eventually add the per-cpu lnode to
++	 * the llist.
+ 	 */
+-	if (data_race(cgroup_rstat_cpu(cgrp, cpu)->updated_next))
++	self = &rstatc->lnode;
++	rstatc_pcpu = cgrp->rstat_cpu;
++	if (this_cpu_cmpxchg(rstatc_pcpu->lnode.next, self, NULL) != self)
+ 		return;
+ 
+-	raw_spin_lock_irqsave(cpu_lock, flags);
++	lhead = per_cpu_ptr(&rstat_backlog_list, cpu);
++	llist_add(&rstatc->lnode, lhead);
++}
+ 
++static void __cgroup_process_update_tree(struct cgroup *cgrp, int cpu)
++{
+ 	/* put @cgrp and all ancestors on the corresponding updated lists */
+ 	while (true) {
+ 		struct cgroup_rstat_cpu *rstatc = cgroup_rstat_cpu(cgrp, cpu);
+@@ -70,8 +97,19 @@ __bpf_kfunc void cgroup_rstat_updated(st
+ 
+ 		cgrp = parent;
+ 	}
++}
+ 
+-	raw_spin_unlock_irqrestore(cpu_lock, flags);
++static void cgroup_process_update_tree(int cpu)
++{
++	struct llist_head *lhead = per_cpu_ptr(&rstat_backlog_list, cpu);
++	struct llist_node *lnode;
++
++	while ((lnode = llist_del_first_init(lhead))) {
++		struct cgroup_rstat_cpu *rstatc;
++
++		rstatc = container_of(lnode, struct cgroup_rstat_cpu, lnode);
++		__cgroup_process_update_tree(rstatc->owner, cpu);
++	}
+ }
+ 
+ /**
+@@ -162,6 +200,8 @@ static struct cgroup *cgroup_rstat_updat
+ 	 */
+ 	raw_spin_lock_irqsave(cpu_lock, flags);
+ 
++	cgroup_process_update_tree(cpu);
++
+ 	/* Return NULL if this subtree is not on-list */
+ 	if (!rstatc->updated_next)
+ 		goto unlock_ret;
