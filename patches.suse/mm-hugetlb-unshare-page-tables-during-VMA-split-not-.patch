@@ -1,0 +1,212 @@
+From 081056dc00a27bccb55ccc3c6f230a3d5fd3f7e0 Mon Sep 17 00:00:00 2001
+From: Jann Horn <jannh@google.com>
+Date: Tue, 27 May 2025 23:23:53 +0200
+Subject: [PATCH] mm/hugetlb: unshare page tables during VMA split, not before
+References: CVE-2025-38084 bsc#1245498
+Git-commit: 081056dc00a27bccb55ccc3c6f230a3d5fd3f7e0
+Patch-mainline: v6.16-rc1
+
+Currently, __split_vma() triggers hugetlb page table unsharing through
+vm_ops->may_split().  This happens before the VMA lock and rmap locks are
+taken - which is too early, it allows racing VMA-locked page faults in our
+process and racing rmap walks from other processes to cause page tables to
+be shared again before we actually perform the split.
+
+Fix it by explicitly calling into the hugetlb unshare logic from
+__split_vma() in the same place where THP splitting also happens.  At that
+point, both the VMA and the rmap(s) are write-locked.
+
+An annoying detail is that we can now call into the helper
+hugetlb_unshare_pmds() from two different locking contexts:
+
+1. from hugetlb_split(), holding:
+    - mmap lock (exclusively)
+    - VMA lock
+    - file rmap lock (exclusively)
+2. hugetlb_unshare_all_pmds(), which I think is designed to be able to
+   call us with only the mmap lock held (in shared mode), but currently
+   only runs while holding mmap lock (exclusively) and VMA lock
+
+Backporting note:
+This commit fixes a racy protection that was introduced in commit
+b30c14cd6102 ("hugetlb: unshare some PMDs when splitting VMAs"); that
+commit claimed to fix an issue introduced in 5.13, but it should actually
+also go all the way back.
+
+[jannh@google.com: v2]
+  Link: https://lkml.kernel.org/r/20250528-hugetlb-fixes-splitrace-v2-1-1329349bad1a@google.com
+Link: https://lkml.kernel.org/r/20250528-hugetlb-fixes-splitrace-v2-0-1329349bad1a@google.com
+Link: https://lkml.kernel.org/r/20250527-hugetlb-fixes-splitrace-v1-1-f4136f5ec58a@google.com
+Fixes: 39dde65c9940 ("[PATCH] shared page table for hugetlb page")
+Signed-off-by: Jann Horn <jannh@google.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Reviewed-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: <stable@vger.kernel.org>    [b30c14cd6102: hugetlb: unshare some PMDs when splitting VMAs]
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+[osalvador: integrate hugetlb-splat fix]
+---
+ include/linux/hugetlb.h |    2 +
+ mm/hugetlb.c            |   53 +++++++++++++++++++++++++++++++++++-------------
+ mm/mmap.c               |   12 +++++++++-
+ 3 files changed, 51 insertions(+), 16 deletions(-)
+
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -211,6 +211,7 @@ unsigned long hugetlb_change_protection(
+ 
+ bool is_hugetlb_entry_migration(pte_t pte);
+ void hugetlb_unshare_all_pmds(struct vm_area_struct *vma);
++void hugetlb_split(struct vm_area_struct *vma, unsigned long addr);
+ 
+ #else /* !CONFIG_HUGETLB_PAGE */
+ 
+@@ -401,6 +402,7 @@ static inline vm_fault_t hugetlb_fault(s
+ }
+ 
+ static inline void hugetlb_unshare_all_pmds(struct vm_area_struct *vma) { }
++static inline void hugetlb_split(struct vm_area_struct *vma, unsigned long addr) {}
+ 
+ #endif /* !CONFIG_HUGETLB_PAGE */
+ /*
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -83,7 +83,7 @@ struct mutex *hugetlb_fault_mutex_table
+ /* Forward declaration */
+ static int hugetlb_acct_memory(struct hstate *h, long delta);
+ static void hugetlb_unshare_pmds(struct vm_area_struct *vma,
+-	unsigned long start, unsigned long end);
++	unsigned long start, unsigned long end, bool take_locks);
+ 
+ static inline bool subpool_is_free(struct hugepage_subpool *spool)
+ {
+@@ -4166,26 +4166,37 @@ static int hugetlb_vm_op_split(struct vm
+ {
+ 	if (addr & ~(huge_page_mask(hstate_vma(vma))))
+ 		return -EINVAL;
++	return 0;
++}
+ 
++void hugetlb_split(struct vm_area_struct *vma, unsigned long addr)
++{
+ 	/*
+ 	 * PMD sharing is only possible for PUD_SIZE-aligned address ranges
+ 	 * in HugeTLB VMAs. If we will lose PUD_SIZE alignment due to this
+ 	 * split, unshare PMDs in the PUD_SIZE interval surrounding addr now.
+ 	 */
++	mmap_assert_write_locked(vma->vm_mm);
++	i_mmap_assert_write_locked(vma->vm_file->f_mapping);
++
+ 	if (addr & ~PUD_MASK) {
+-		/*
+-		 * hugetlb_vm_op_split is called right before we attempt to
+-		 * split the VMA. We will need to unshare PMDs in the old and
+-		 * new VMAs, so let's unshare before we split.
+-		 */
+ 		unsigned long floor = addr & PUD_MASK;
+ 		unsigned long ceil = floor + PUD_SIZE;
+ 
+-		if (floor >= vma->vm_start && ceil <= vma->vm_end)
+-			hugetlb_unshare_pmds(vma, floor, ceil);
++		if (floor >= vma->vm_start && ceil <= vma->vm_end) {
++			/*
++			 * Locking:
++			 * Use take_locks=false here.
++			 * The file rmap lock is already held.
++			 * The hugetlb VMA lock can't be taken when we already
++			 * hold the file rmap lock, and we don't need it because
++			 * its purpose is to synchronize against concurrent page
++			 * table walks, which are not possible thanks to the
++			 * locks held by our caller.
++			 */
++			hugetlb_unshare_pmds(vma, floor, ceil, /* take_locks = */ false);
++		}
+ 	}
+-
+-	return 0;
+ }
+ 
+ static unsigned long hugetlb_vm_op_pagesize(struct vm_area_struct *vma)
+@@ -6350,9 +6361,16 @@ void move_hugetlb_state(struct page *old
+ 	}
+ }
+ 
++/*
++* If @take_locks is false, the caller must ensure that no concurrent page table
++* access can happen (except for gup_fast() and hardware page walks).
++* If @take_locks is true, we take the hugetlb VMA lock (to lock out things like
++* concurrent page fault handling) and the file rmap lock.
++*/
+ static void hugetlb_unshare_pmds(struct vm_area_struct *vma,
+ 				 unsigned long start,
+-				 unsigned long end)
++				 unsigned long end,
++				 bool take_locks)
+ {
+ 	struct hstate *h = hstate_vma(vma);
+ 	unsigned long sz = huge_page_size(h);
+@@ -6376,7 +6394,11 @@ static void hugetlb_unshare_pmds(struct
+ 	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma, mm,
+ 				start, end);
+ 	mmu_notifier_invalidate_range_start(&range);
+-	i_mmap_lock_write(vma->vm_file->f_mapping);
++	if (take_locks) {
++		i_mmap_lock_write(vma->vm_file->f_mapping);
++	} else {
++		i_mmap_assert_write_locked(vma->vm_file->f_mapping);
++	}
+ 	for (address = start; address < end; address += PUD_SIZE) {
+ 		ptep = huge_pte_offset(mm, address, sz);
+ 		if (!ptep)
+@@ -6386,7 +6408,9 @@ static void hugetlb_unshare_pmds(struct
+ 		spin_unlock(ptl);
+ 	}
+ 	flush_hugetlb_tlb_range(vma, start, end);
+-	i_mmap_unlock_write(vma->vm_file->f_mapping);
++	if (take_locks) {
++		i_mmap_unlock_write(vma->vm_file->f_mapping);
++	}
+ 	/*
+ 	 * No need to call mmu_notifier_invalidate_range(), see
+ 	 * Documentation/mm/mmu_notifier.rst.
+@@ -6401,7 +6425,8 @@ static void hugetlb_unshare_pmds(struct
+ void hugetlb_unshare_all_pmds(struct vm_area_struct *vma)
+ {
+ 		hugetlb_unshare_pmds(vma, ALIGN(vma->vm_start, PUD_SIZE),
+-			ALIGN_DOWN(vma->vm_end, PUD_SIZE));
++			ALIGN_DOWN(vma->vm_end, PUD_SIZE),
++			/* take_locks = */ true);
+ }
+ 
+ #ifdef CONFIG_CMA
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -838,8 +838,6 @@ int __vma_adjust(struct vm_area_struct *
+ 		}
+ 	}
+ again:
+-	vma_adjust_trans_huge(orig_vma, start, end, adjust_next);
+-
+ 	if (file) {
+ 		mapping = file->f_mapping;
+ 		root = &mapping->i_mmap;
+@@ -879,6 +877,16 @@ again:
+ 			vma_interval_tree_remove(next, root);
+ 	}
+ 
++	/*
++	 * Get rid of huge pages and shared page tables straddling the split
++	 * boundary.
++	 */
++	vma_adjust_trans_huge(orig_vma, start, end, adjust_next);
++	if (is_vm_hugetlb_page(orig_vma)) {
++		hugetlb_split(orig_vma, start);
++		hugetlb_split(orig_vma, end);
++	}
++
+ 	if (start != vma->vm_start) {
+ 		vma->vm_start = start;
+ 		start_changed = true;
