@@ -19,11 +19,12 @@ from git_sort import lib
 
 class TestMergeTool(unittest.TestCase):
     def setUp(self):
-        os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
+        self.env = os.environ.copy()
+        self.env["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="gs_cache")
 
         # setup stub linux repository
-        os.environ["LINUX_GIT"] = tempfile.mkdtemp(prefix="gs_repo")
-        self.repo = pygit2.init_repository(os.environ["LINUX_GIT"])
+        self.env["LINUX_GIT"] = tempfile.mkdtemp(prefix="gs_repo")
+        self.repo = pygit2.init_repository(self.env["LINUX_GIT"])
 
         author = pygit2.Signature("Alice Author", "alice@authors.tld")
         committer = pygit2.Signature("Cecil Committer", "cecil@committers.tld")
@@ -67,22 +68,27 @@ class TestMergeTool(unittest.TestCase):
 
         # setup stub kernel-source content
         self.ks_dir = Path(tempfile.mkdtemp(prefix="gs_ks"))
+        self.env['HOME'] = str(self.ks_dir)
 
         pygit2.init_repository(self.ks_dir)
         subprocess.check_call(
             ("git", "config", "--add", "mergetool.git-sort.cmd",
              "%s $LOCAL $BASE $REMOTE $MERGED" % (
-                 lib.bindir / 'series_merge_tool',),), cwd=self.ks_dir)
+                 lib.bindir / 'series_merge_tool',),), cwd=self.ks_dir, env=self.env)
         subprocess.check_call(("git", "config", "--add",
-                               "mergetool.git-sort.trustexitcode", "true",), cwd=self.ks_dir)
+                               "mergetool.git-sort.trustexitcode", "true",), cwd=self.ks_dir, env=self.env)
+        subprocess.check_call(("git", "config", "--global", "user.email", "testuser@suse.de"),
+                              cwd=self.ks_dir, env=self.env)
+        subprocess.check_call(("git", "config", "--global", "user.name", "Test User"),
+                              cwd=self.ks_dir, env=self.env)
 
         self.patch_dir = self.ks_dir / 'patches.suse'
         self.patch_dir.mkdir()
 
 
     def tearDown(self):
-        shutil.rmtree(os.environ["XDG_CACHE_HOME"])
-        shutil.rmtree(os.environ["LINUX_GIT"])
+        shutil.rmtree(self.env["XDG_CACHE_HOME"])
+        shutil.rmtree(self.env["LINUX_GIT"])
         shutil.rmtree(self.ks_dir)
 
 
@@ -108,9 +114,9 @@ class TestMergeTool(unittest.TestCase):
             )))
 
         subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
-                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, env=self.env, stdout=subprocess.DEVNULL)
         subprocess.check_call(("git", "commit", "-m", "mainline 0",),
-                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, env=self.env, stdout=subprocess.DEVNULL)
 
         names["mainline 2"] = tests.support.format_patch(
             self.repo.get(self.commits["mainline 2"]), mainline="v0",
@@ -128,13 +134,13 @@ class TestMergeTool(unittest.TestCase):
             )))
 
         subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
-                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, env=self.env, stdout=subprocess.DEVNULL)
         subprocess.check_call(("git", "commit", "-m", "mainline 2",),
-                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, env=self.env, stdout=subprocess.DEVNULL)
 
         # remote branch
         subprocess.check_call(("git", "checkout", "-q", "-b", "other",
-                               "HEAD^",), cwd=self.ks_dir)
+                               "HEAD^",), cwd=self.ks_dir, env=self.env)
         names["mainline 1"] = tests.support.format_patch(
             self.repo.get(self.commits["mainline 1"]), mainline="v0",
             directory=self.patch_dir)
@@ -148,19 +154,19 @@ class TestMergeTool(unittest.TestCase):
             )))
 
         subprocess.check_call(("git", "add", "series.conf", "patches.suse",),
-                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, env=self.env, stdout=subprocess.DEVNULL)
         subprocess.check_call(("git", "commit", "-m", "Refresh mainline 1",),
-                              cwd=self.ks_dir, stdout=subprocess.DEVNULL)
+                              cwd=self.ks_dir, env=self.env, stdout=subprocess.DEVNULL)
 
         # test series_merge_tool
-        subprocess.check_call(("git", "checkout", "-q", "master",), cwd=self.ks_dir)
-        retval = subprocess.call(("git", "merge", "other",), cwd=self.ks_dir,
+        subprocess.check_call(("git", "checkout", "-q", "master",), cwd=self.ks_dir, env=self.env)
+        retval = subprocess.call(("git", "merge", "other",), cwd=self.ks_dir, env=self.env,
                                        stdout=subprocess.DEVNULL,
                                        stderr=subprocess.DEVNULL)
         self.assertEqual(retval, 1)
         #sys.stdin.readline()
         retval = subprocess.check_output(
-            ("git", "mergetool", "--tool=git-sort", "series.conf",), cwd=self.ks_dir,
+            ("git", "mergetool", "--tool=git-sort", "series.conf",), cwd=self.ks_dir, env=self.env,
             stdin=subprocess.DEVNULL)
         self.assertEqual(
             "1 commits changed section from base to remote.",
@@ -175,5 +181,5 @@ class TestMergeTool(unittest.TestCase):
                 )),
                 (self.ks_dir / 'series.conf').read_text())
         retval = subprocess.check_output(("git", "status", "--porcelain",
-                                          "series.conf",), cwd=self.ks_dir)
+                                          "series.conf",), cwd=self.ks_dir, env=self.env)
         self.assertEqual(retval.decode().strip(), "M  series.conf")
