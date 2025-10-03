@@ -1,4 +1,4 @@
-from kutil.config import read_config_sh, get_kernel_project_package, list_files, get_kernel_projects
+from kutil.config import read_config_sh, get_kernel_project_package, list_files, get_kernel_projects, get_package_archs
 import unittest
 
 class MiscTests(unittest.TestCase):
@@ -62,3 +62,17 @@ another file
             'IBS': {'': 'SUSE:SLE-15-SP7:Update:Products:SLERT'},
             'OBS': {},
             })
+
+    def test_package_archs(self):
+        self.assertEqual(get_package_archs('tests/kutil/rpm/krn'),
+                          ['aarch64', 'armv7hl', 'armv7l', 'ppc64le', 's390x', 'x86_64'])
+        self.assertEqual(get_package_archs('tests/kutil/rpm/krna'),
+                          ['aarch64', 'x86_64'])
+        self.assertEqual(get_package_archs('tests/kutil/rpm/krnf'),
+                          ['aarch64', 'armv6hl', 'armv6l', 'armv7hl', 'armv7l', 'i386', 'i486', 'i586', 'i686', 'ppc64le', 'riscv64', 's390x', 'x86_64'])
+        self.assertEqual(get_package_archs('tests/kutil/rpm/krnf', ['kernel-zfcpdump']),
+                          ['s390x'])
+        self.assertEqual(get_package_archs('tests/kutil/rpm/kgr'),
+                          ['ppc64le', 'x86_64'])
+        self.assertEqual(get_package_archs('tests/kutil/rpm/klp'),
+                          ['x86_64'])

@@ -88,3 +88,41 @@ def get_kernel_projects(package_tar_up_dir):
             if suffix not in ibs_projects:  # sorted so that IBS comes first
                 ibs_projects[suffix] = 'openSUSE.org:' + rpm_config[var]
     return {'IBS': ibs_projects, 'OBS': obs_projects}
+
+# While the sources do contain config.conf the tar-up can produce sources
+# for fewer architectures than specified in config.conf when using -a
+# option (ie. disable some architectures)
+# The architectures to build for have to be read from the spec file
+# ExclusiveArch tags as a result. While not every spec file may have one
+# for all binary packages the tag is generated based on the list of
+# architectures for which the config is enabled.
+# In general the tag coulld be wrapped as e-mail headers can but we only
+# need to support spec files generated from kernel spec file templates in
+# which the list of architectures is always on one line.
+# Multiple ExclusiveArgs tags may exist because of repository conditionals.
+# Dummy architectures like do_not_build or noarch are not provided by
+# repositories and do not affect the repository selection.
+def get_package_archs(package_tar_up_dir, limit_packages=None):
+    ext = '.spec'
+    tag = 'ExclusiveArch:'.lower()
+    limit_packages = limit_packages if limit_packages else []
+    limit_packages = [ spec if spec.endswith(ext) else spec + ext for spec in limit_packages ]
+    limit_packages = limit_packages + [ 'kernel-' + spec for spec in limit_packages ] # limit-packages fuzzing, this may need to go to caller
+    lst = list_files(package_tar_up_dir)
+    lst = [f for f in lst if f.endswith(ext)]
+    archs = []
+    for spec in lst:
+        if limit_packages and spec not in limit_packages:
+            continue
+        with open(os.path.join(package_tar_up_dir, spec), 'r') as f:
+            for l in f.read().splitlines():
+                if l.lower().startswith(tag):
+                    l = l[len(tag):]
+                    # limit expansion to what can realistically be expected in OBS project configuration
+                    # local rpm may have different ideas or be completely unavailable, use fixed expansion
+                    l = l.replace('%ix86', 'i386 i486 i586 i686')
+                    l = l.replace('%arm', 'armv6l armv6hl armv7l armv7hl')
+                    l = l.replace('\t', ' ').strip()
+                    assert '%' not in l  # will need to do more macro expansion otherwise
+                    archs += l.split(' ')
+    return sorted(list(set(archs)))
