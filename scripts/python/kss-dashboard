@@ -1,8 +1,9 @@
 #!/usr/bin/python3
-import sys, re, os, argparse, datetime, bugzilla, subprocess, multiprocessing, json
+import sys, re, os, argparse, datetime, bugzilla, subprocess, multiprocessing, json, time, requests
 import git_sort.pygit2_wrapper as git
 from bugzilla.utils import get_bugzilla_api, check_being_logged_in, get_exportpatch_string, get_insert_string, make_url, get_score, handle_email, TIME_FORMAT_XML, TIME_FORMAT_REST
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import reduce
 
 # dashboard kss script - is based on pygit2, python-bugzilla (our in-tree patched copy) and requests libraries
 # for now this script should be kept Python 3.6 compatible (SLE15-SP7)
@@ -27,6 +28,8 @@ FIXES_PATTERN = re.compile(r"Fixes: ([0-9a-f]{12,})")
 PATCH_PATTERN = re.compile(r"\+\+\+ b/([^ ]{1,})\n")
 COMMENT_BANLIST = [ 'swamp@suse.de', 'bwiedemann+obsbugzillabot@suse.com', 'maint-coord+maintenance-robot@suse.de', 'smash_bz@suse.de' ]
 GIT_ROOT = '1da177e4c3f41524e886b7f1b8a0c1fc7321cac2'
+SMASH_URL = 'https://smash.suse.de/api/issues/'
+REPO_EXPIRATION = 3600 * 8
 
 T_RED = "\033[01;31m"
 T_GREEN = "\033[01;32m"
@@ -38,6 +41,69 @@ show_colors = os.isatty(sys.stdout.fileno())
 today = datetime.date.today()
 sgm_present = False
 time_format = None
+smash_token = None
+
+def get_smash_token():
+    homedir = os.getenv('HOME', None)
+    if not homedir:
+        sys.exit(2)
+    smash_file = homedir + os.sep + '.smashrc'
+    token = None
+    try:
+        with open(smash_file, 'r') as f:
+            token = f.read().strip()
+    except:
+        print(f"Cannot read: {smash_file}")
+    return token
+
+def fetch_smash_data(token, issue):
+    headers = { "Authorization": f"Token {token}" }
+    try:
+        response = requests.get(SMASH_URL + "/" + str(issue), headers=headers)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError as http_err:
+        print(f"HTTP error occurred: {http_err}", file=sys.stderr)
+        if response:
+            print(f"Response content: {response.text}", file=sys.stderr)
+    except requests.exceptions.ConnectionError as conn_err:
+        print(f"Connection error occurred: {conn_err}", file=sys.stderr)
+    except requests.exceptions.Timeout as timeout_err:
+        print(f"Timeout error occurred: {timeout_err}", file=sys.stderr)
+    except requests.exceptions.RequestException as req_err:
+        print(f"An error occurred: {req_err}", file=sys.stderr)
+    except json.JSONDecodeError:
+        print(f"Failed to decode JSON from response: {response.text if response is not None else 'No response'}", file=sys.stderr)
+    return None
+
+def get_issue_from_smash_url(url):
+    return url.strip('/').split('/')[-1]
+
+def get_smash_score(rd):
+    suse_score = None
+    cvss_array = rd.get('cvss', [])
+    for cvss in cvss_array:
+        if cvss.get('source', '') == 'SUSE' and str(cvss.get('version', 0)) == "3.1":
+            suse_score = cvss.get('score', None)
+            break
+    return suse_score
+
+def show_smash_data(url, score):
+    issue = get_issue_from_smash_url(url)
+    raw_data = fetch_smash_data(smash_token, issue)
+    smash_score = get_smash_score(raw_data)
+    if smash_score and str(smash_score) != score:
+        yield f'{color_format(T_RED, "Warning: ")}CVSSv3.1 score ({smash_score}) from SMASH is different from score ({score}) in Bugzilla\n'
+    aps = raw_data.get('affected_packages', [])
+    for package in aps:
+        if package.get('relation', '') != 'Affected':
+            continue
+        codestream = package.get("codestream", "")
+        if codestream:
+            yield f'{"":>46}{color_format(T_PURPLE, codestream + "/" + package.get("package", ""))}\n'
+        product = package.get("product", "")
+        if product:
+            yield f'{"":>46}{color_format(T_YELLOW, product.get("cpe", "") + "/" + package.get("package", ""))}\n'
 
 def format_time(t):
     return datetime.datetime.strptime(str(t), time_format)
@@ -52,14 +118,21 @@ class ExitOnException:
     def __init__(self, msg):
         self.msg = msg
 
+    def _override(self, *args):
+        return "failed to "
+
     def __call__(self, f):
         def wrapper(*args, **kwargs):
             try:
                 return f(*args, **kwargs)
             except Exception as e:
-                print(f'{color_format(T_RED, "failed to " + self.msg)}: {e}', file=sys.stderr)
+                print(f'{color_format(T_RED, self._override(*args) + self.msg)}: {e}', file=sys.stderr)
                 sys.exit(1)
         return wrapper
+
+class ExitOnExceptionHandle(ExitOnException):
+    def _override(self, *args):
+        return args[0]
 
 def check_envvar(var):
     result = os.environ.get(var)
@@ -106,11 +179,23 @@ def validate_hashes(cves):
                 print(color_format(T_RED, f'{v} is not a valid hash for a cve {k}'), file=sys.stderr)
                 cves[k] = [e for e in cves[k] if e != v]
 
+def check_stale_data(path_to_repo):
+    path = f'{path_to_repo}{os.sep}.git/refs/remotes/origin/master'
+    delta = time.time() - os.path.getmtime(path)
+    return delta > REPO_EXPIRATION
+
 # if kernel CNA decides to change/reinterpret the layout of the vulnerability DB again, this needs to be reworked
-def fetch_cves(cves):
-    repo = git.Repository(check_envvar('VULNS_GIT'))
+def fetch_cves(cves, branch):
+    path_to_repo = check_envvar('VULNS_GIT')
+    repo = git.Repository(path_to_repo)
+    if (check_stale_data(path_to_repo)):
+        repo.remotes["origin"].fetch()
     tree_index = git.Index()
-    tree_index.read_tree(repo.revparse_single('origin/master').tree)
+    try:
+        tree_index.read_tree(repo.revparse_single(branch).tree)
+    except Exception as e:
+        print(color_format(T_RED, f'branch {branch} probably does not exist: {e}'), file=sys.stderr)
+        sys.exit(1)
     def path_contains_one_of(path, elements):
         for e in elements:
             if e in path:
@@ -175,7 +260,10 @@ def sha_or_nothing(repo, f):
 # keeps not only the libgit2 repository instance, but also caches for its patches and patch statistics, so they don't have to be recalculated
 class MainlineRepo:
     def __init__(self):
-        self.repo = git.Repository(check_envvar('LINUX_GIT'))
+        path_to_repo = check_envvar('LINUX_GIT')
+        self.repo = git.Repository(path_to_repo)
+        if (check_stale_data(path_to_repo)):
+            self.repo.remotes["origin"].fetch()
         self.patches = dict()
         self.pstats = dict()
 
@@ -472,6 +560,8 @@ def show_bug(n, b, linux_git, args):
         yield f'{color_format(T_RED, "FAIL") if b.overdue and b.overdue > 0 else color_format(T_GREEN, "OK")} : {msg}\n'
     if args.url and b.data.url:
         yield f'{"":>46}{color_format(T_PURPLE, b.data.url)}\n'
+    if args.affected and smash_token and b.data.url:
+        yield from show_smash_data(b.data.url, b.score)
     if args.comments_short:
         yield from b.show_comments_short()
     elif args.comments_long:
@@ -498,6 +588,41 @@ def show_bug(n, b, linux_git, args):
             if c_no:
                 yield f'{color_format(T_RED, "Warning: ")}{make_url(b.data.id)}#c{c_no} seems to have been already dispatched\n'
 
+def chunks(a, n):
+    for i in range(0, len(a), n):
+        yield a[i:i+n]
+
+def do_work(batch):
+    ret = dict()
+    for p in batch:
+        with open(p, 'r', errors='ignore') as f:
+            for l in f:
+                if l.startswith('Alt-commit: ') or l.startswith('Git-commit: '):
+                    sha = l.split()[1]
+                    if not validate_characters(sha):
+                        ret[sha] = p
+    return ret
+
+def get_hashdict(path):
+    patches_to_process = [ f'{subdir}{os.sep}{f}' for subdir, _, files in os.walk(path) for f in files ]
+    batches_to_process = [ b for b in chunks(patches_to_process, 256) ]
+    result = []
+    with ProcessPoolExecutor() as executor:
+        futures = { executor.submit(do_work, batch): batch for batch in batches_to_process }
+        for f in as_completed(futures):
+            result.append(f.result())
+    return reduce(lambda a, b: {**a, **b}, result)
+
+def get_banlist(path):
+    ret = set()
+    with open(path, 'r') as f:
+        for l in f:
+            if len(l) > 40:
+                sha = l[:40]
+                if not validate_characters(sha):
+                    ret.add(sha)
+    return ret
+
 # the purpose of this is to allow execution of exportpatch and series_insert from somewhere else than the root of KSOURCE_GIT
 def get_relative_ksource():
     d = os.path.dirname
@@ -507,9 +632,22 @@ def get_relative_ksource():
 def exportpatch(bs):
     patches = []
     ksource_dir = get_relative_ksource()
+    banlist, hashdict = set(), dict()
+    try:
+        banlist = get_banlist(ksource_dir + os.sep + 'blacklist.conf')
+        hashdict = get_hashdict(ksource_dir + os.sep + 'patches.suse')
+    except Exception as e:
+        print(color_format(T_RED, e), file=sys.stderr)
+        sys.exit(1)
+    for b in bs:
+        for s in b.shas:
+            if s in banlist:
+                print(color_format(T_PURPLE, f'{s} is in blacklist.conf'), file=sys.stderr)
+            if s in hashdict:
+                print(color_format(T_PURPLE, f'{s} is already in {hashdict[s]}'), file=sys.stderr)
     patch_dir = ksource_dir + os.sep + 'patches.suse'
     with ProcessPoolExecutor() as executor:
-        job_descs = [(get_exportpatch_string([f'bsc#{b.data.id}', b.cve], s, patch_dir) + '\n', None) for b in bs for s in b.shas]
+        job_descs = [(get_exportpatch_string([f'bsc#{b.data.id}', b.cve], s, patch_dir) + '\n', None) for b in bs for s in b.shas if s not in banlist and s not in hashdict]
         futures = { executor.submit(one_job, job): job for job in job_descs }
         for f in as_completed(futures):
             try:
@@ -604,65 +742,53 @@ def store_into_file(path, content):
     except Exception as e:
         print(color_format(T_RED, f"failed to store a file {path}: {e}"), file=sys.stderr)
 
+@ExitOnExceptionHandle(" must be at least 1")
 def handle_parallelism(njobs, ckf):
     if not njobs:
         return None
     if not ckf:
         print("--jobs (-j) doesn't make sense without --check-kernel-fix (-0)", file=sys.stderr)
         sys.exit(1)
-    try:
-        r = int(njobs)
-        if r == -1:
-            return r
-        if r < 1:
-            raise Exception()
+    r = int(njobs)
+    if r == -1:
         return r
-    except Exception:
-        print(njobs, "must be at least 1", file=sys.stderr)
-    sys.exit(1)
+    if r < 1:
+        raise Exception("r < 1")
+    return r
 
+@ExitOnExceptionHandle(": ")
 def handle_grep(regex):
     if not regex:
         return None
-    try:
-        return re.compile(regex, flags=re.IGNORECASE)
-    except Exception as e:
-        print(regex, ": ", e, file=sys.stderr)
-    sys.exit(1)
+    return re.compile(regex, flags=re.IGNORECASE)
 
+@ExitOnExceptionHandle(": expected format is Q:R were Q > 0 and R < Q")
 def handle_modulo(qr):
     if not qr:
         return 0, 0
-    try:
-        q, r = qr.split(':')
-        q = int(q)
-        r = int(r)
-        if q < 1 or r < 0 or r >= q:
-            raise Exception()
-        return (q, r)
-    except Exception:
-        print(qr, ": expected format is Q:R were Q > 0 and R < Q", file=sys.stderr)
-    sys.exit(1)
+    q, r = qr.split(':')
+    q = int(q)
+    r = int(r)
+    if q < 1 or r < 0 or r >= q:
+        raise Exception("q < 1 or r < 0 or r >= q")
+    return (q, r)
 
+@ExitOnExceptionHandle(": expected format is X or X:Y were X >= 0 and Y >= 0 and X >= Y")
 def handle_ages(ages):
     if not ages:
         return (None, None)
-    try:
-        if ':' in ages:
-            x, y = ages.split(':')
-            x = int(x)
-            y = int(y)
-            if x < y or x < 0 or y < 0:
-                raise Exception()
-            return (x, y)
-        else:
-            x = int(ages)
-            if x < 0:
-                raise Exception()
-            return (x, None)
-    except Exception:
-        print(ages, ": expected format is X or X:Y were X >= 0 and Y >= 0 and X >= Y", file=sys.stderr)
-    sys.exit(1)
+    if ':' in ages:
+        x, y = ages.split(':')
+        x = int(x)
+        y = int(y)
+        if x < y or x < 0 or y < 0:
+            raise Exception("x < y or x < 0 or y < 0")
+        return (x, y)
+    else:
+        x = int(ages)
+        if x < 0:
+            raise Exception("x < 0")
+        return (x, None)
 
 def handle_bugs(bug_string):
     if not bug_string:
@@ -696,20 +822,17 @@ def handle_cves(cve_string):
         sys.exit(1)
     return ret
 
+@ExitOnExceptionHandle(" is not a valid CVE score")
 def handle_score(score_string):
     if not score_string:
         return None
-    try:
-        ret = [ int(n) for n in score_string.split('.') ]
-        if len(ret) == 1 and ret[0] >= 0 and ret[0] <= 10:
-            ret.append(0)
-            return ret
-        elif len(ret) == 2 and ret[0] >= 0 and ret[0] <= 10 and ret[1] >= 0 and ret[1] <= 9:
-            return ret
-        raise Exception()
-    except:
-        print(f'{score_string} is not a valid CVE score', file=sys.stderr)
-        sys.exit(1)
+    ret = [ int(n) for n in score_string.split('.') ]
+    if len(ret) == 1 and ret[0] >= 0 and ret[0] <= 10:
+        ret.append(0)
+        return ret
+    elif len(ret) == 2 and ret[0] >= 0 and ret[0] <= 10 and ret[1] >= 0 and ret[1] <= 9:
+        return ret
+    raise Exception()
 
 # stateful options (whose order matter); the other options are handled by handle_* functions
 class SortActions(argparse.Action):
@@ -765,6 +888,7 @@ def parse_args():
     parser.add_argument("-N", "--sort-cve", help="sort bugs by CVE number instead of their bug ids", action=SortActions, nargs=0)
     parser.add_argument("-t", "--sort-time", help="sort bugs by the last comment (excluding the bots)", action=SortActions, nargs=0)
     parser.add_argument("-M", "--sort-changes", help="sort by the number of insertion/deletion introduced by the patch", action=SortActions, nargs=0)
+    parser.add_argument("--affected", help="print affected codestreams according to SMASH if available", action="store_true", default=False)
     parser.add_argument("--sort-age", help="sort bugs by the age in days; useful with --ages and --birth-time", action=SortActions, nargs=0)
     parser.add_argument("--sort-subsystem", help="sort bugs by the subsystem (according to suse-get-maintainers)", action=SortActions, nargs=0)
     parser.add_argument("--sort-deadline", help="sort bugs by the deadline determined by the CVE score", action=SortActions, nargs=0)
@@ -791,6 +915,7 @@ def parse_args():
     parser.add_argument("-a", "--ages", help="show only tickets of a particular age in days; X means X days old or older and X:Y means betwen X and Y days old, inclusive", default=None, type=str)
     parser.add_argument("-m", "--modulo", help="takes two integers in the format \"Q:R\" and shows only bugs with IDs that satisfy N %% Q == R", default=None, type=str)
     parser.add_argument("-Z", "--pager", help="user pager for output (less -iR)", action="store_true", default=False)
+    parser.add_argument("--cve-branch", help="which branch we care about in $VULNS_GIT repository (by default origin/master)", default='origin/master', type=str)
     parser.add_argument("--rest", help="Use REST API instead of XMLRPC APII (experimental, for debugging purposes)", action="store_true", default=False)
     parser.add_argument("--debug", help="Enable Bugzilla RPC debugging", action="store_true", default=False)
     return parser.parse_args()
@@ -896,10 +1021,14 @@ def main():
 
     # fetch_cves function might need rework in case the kernel CNA get strange ideas about the format of their repo again
     cves = [ b.cve for b in bugs if b.cve ]
-    published, rejected, breakers = fetch_cves(cves)
+    published, rejected, breakers = fetch_cves(cves, args.cve_branch)
     validate_hashes(published)
     validate_hashes(rejected)
     validate_hashes(breakers)
+
+    if args.affected:
+        global smash_token
+        smash_token = get_smash_token()
 
     for b in bugs:
         b.update_vulns(published, rejected, breakers)
