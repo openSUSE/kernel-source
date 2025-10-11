@@ -19,7 +19,18 @@ def get_score(s):
     return m.group(1) if m else ''
 
 def get_bugzilla_api(rest=False):
-    return bugzilla.Bugzilla(DEFAULT_BZ, force_rest=rest)
+    bzapi = bugzilla.Bugzilla(url=None, force_rest=rest)
+    configpath = os.getenv('HOME') + os.sep + '.bugzillarc'
+    user_email = os.environ.get('BUGZILLA_ACCOUNT_EMAIL', None)
+    if user_email and '@' in user_email:
+        name = user_email.split('@')[0]
+        new_configpath = f'{configpath}.{name}'
+        if os.path.exists(new_configpath):
+            configpath = new_configpath
+    if os.path.exists(configpath):
+        bzapi.readconfig(configpath=configpath, overwrite=True)
+    bzapi.connect(DEFAULT_BZ)
+    return bzapi
 
 def check_being_logged_in(bzapi):
     if not bzapi.logged_in:
