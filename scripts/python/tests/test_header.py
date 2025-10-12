@@ -789,3 +789,29 @@ Acked-by: developer@suse.com
         e = cm.exception
         self.assertEqual(1, e.errors(header.FormatError))
         self.assertEqual(1, e.errors())
+
+    def test_patch_subject_too_long(self):
+        text = """
+From: Michal Suchanek <developer@suse.de>
+Subject: [PATCH] This patch does not do anything useful but has a very long
+ subject. This should not pass the patch checker now that it does validate the
+ filename length.
+
+References: bsc#123456
+
+--- a/Makefile
++++ b/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
++
+ VERSION = 6
+ PATCHLEVEL = 17
+ SUBLEVEL = 0
+"""
+        with self.assertRaises(header.HeaderException) as cm:
+            self.header = header.Checker(text, False,
+                                         "patches.kabi/This-patch-does-not-do-anything-useful-but-has-a-very-long-subject.-This-should-not-pass-the-patch-checker-now-that-it-does-validate-the-filename-length.patch")
+
+        e = cm.exception
+        self.assertEqual(1, e.errors(header.FilenameTooLongError))
+        self.assertEqual(1, e.errors())
