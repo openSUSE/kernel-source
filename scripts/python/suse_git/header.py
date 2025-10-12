@@ -2,6 +2,7 @@
 # vim: sw=4 ts=4 et si:
 
 import re
+import os
 from . import patch
 from io import StringIO
 
@@ -250,6 +251,17 @@ class EmptyTagError(ValidationError):
         msg = "%s: Value cannot be empty." % name
         super(EmptyTagError, self).__init__(name, msg)
 
+class FilenameTooLongError(ValidationError):
+    def __init__(self, filename):
+        basename = os.path.basename(filename)
+        if basename.endswith('.patch'):
+            newname = basename[0:94] + '.patch'
+        else:
+            newname = basename[0:100]
+        newname = os.path.dirname(filename) + '/' + newname
+        msg = "%s: Filename too long, consider renaming to %s" % (filename, newname)
+        super(FilenameTooLongError, self).__init__(filename, msg)
+
 class HeaderException(patch.PatchException):
     def tag_is_missing(self, name):
         try:
@@ -306,6 +318,10 @@ class HeaderChecker(patch.PatchChecker):
         self.excludes = {}
         self.tags = []
         self.errors = []
+
+        basename = os.path.basename(filename)
+        if len(basename) > 100:
+            self.errors.append(FilenameTooLongError(filename))
 
         self.do_patch()
 
