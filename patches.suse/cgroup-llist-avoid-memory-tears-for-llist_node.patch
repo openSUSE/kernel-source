@@ -1,0 +1,166 @@
+From: Shakeel Butt <shakeel.butt@linux.dev>
+Date: Fri, 4 Jul 2025 11:08:04 -0700
+Subject: cgroup: llist: avoid memory tears for llist_node
+Git-commit: dfe25fbaedfc2a07281ed5ff0442270217d25b31
+Patch-mainline: v6.17-rc1
+References: bsc#1247963
+
+Before the commit 36df6e3dbd7e ("cgroup: make css_rstat_updated nmi
+safe"), the struct llist_node is expected to be private to the one
+inserting the node to the lockless list or the one removing the node
+from the lockless list. After the mentioned commit, the llist_node in
+the rstat code is per-cpu shared between the stacked contexts i.e.
+process, softirq, hardirq & nmi. It is possible the compiler may tear
+the loads or stores of llist_node. Let's avoid that.
+
+KCSAN reported the following race:
+
+ Reported by Kernel Concurrency Sanitizer on:
+ CPU: 60 UID: 0 PID: 5425 ... 6.16.0-rc3-next-20250626 #1 NONE
+ Tainted: [E]=UNSIGNED_MODULE
+ Hardware name: ...
+ ==================================================================
+ ==================================================================
+ BUG: KCSAN: data-race in css_rstat_flush / css_rstat_updated
+ write to 0xffffe8fffe1c85f0 of 8 bytes by task 1061 on cpu 1:
+  css_rstat_flush+0x1b8/0xeb0
+  __mem_cgroup_flush_stats+0x184/0x190
+  flush_memcg_stats_dwork+0x22/0x50
+  process_one_work+0x335/0x630
+  worker_thread+0x5f1/0x8a0
+  kthread+0x197/0x340
+  ret_from_fork+0xd3/0x110
+  ret_from_fork_asm+0x11/0x20
+ read to 0xffffe8fffe1c85f0 of 8 bytes by task 3551 on cpu 15:
+  css_rstat_updated+0x81/0x180
+  mod_memcg_lruvec_state+0x113/0x2d0
+  __mod_lruvec_state+0x3d/0x50
+  lru_add+0x21e/0x3f0
+  folio_batch_move_lru+0x80/0x1b0
+  __folio_batch_add_and_move+0xd7/0x160
+  folio_add_lru_vma+0x42/0x50
+  do_anonymous_page+0x892/0xe90
+  __handle_mm_fault+0xfaa/0x1520
+  handle_mm_fault+0xdc/0x350
+  do_user_addr_fault+0x1dc/0x650
+  exc_page_fault+0x5c/0x110
+  asm_exc_page_fault+0x22/0x30
+ value changed: 0xffffe8fffe18e0d0 -> 0xffffe8fffe1c85f0
+
+$ ./scripts/faddr2line vmlinux css_rstat_flush+0x1b8/0xeb0
+css_rstat_flush+0x1b8/0xeb0:
+init_llist_node at include/linux/llist.h:86
+(inlined by) llist_del_first_init at include/linux/llist.h:308
+(inlined by) css_process_update_tree at kernel/cgroup/rstat.c:148
+(inlined by) css_rstat_updated_list at kernel/cgroup/rstat.c:258
+(inlined by) css_rstat_flush at kernel/cgroup/rstat.c:389
+
+$ ./scripts/faddr2line vmlinux css_rstat_updated+0x81/0x180
+css_rstat_updated+0x81/0x180:
+css_rstat_updated at kernel/cgroup/rstat.c:90 (discriminator 1)
+
+These are expected race and a simple READ_ONCE/WRITE_ONCE resolves these
+reports. However let's add comments to explain the race and the need for
+memory barriers if stronger guarantees are needed.
+
+More specifically the rstat updater and the flusher can race and cause a
+scenario where the stats updater skips adding the css to the lockless
+list but the flusher might not see those updates done by the skipped
+updater. This is benign race and the subsequent flusher will flush those
+stats and at the moment there aren't any rstat users which are not fine
+with this kind of race. However some future user might want more
+stricter guarantee, so let's add appropriate comments to ease the job of
+future users.
+
+Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
+Reviewed-by: Paul E. McKenney <paulmck@kernel.org>
+Fixes: 36df6e3dbd7e ("cgroup: make css_rstat_updated nmi safe")
+Signed-off-by: Tejun Heo <tj@kernel.org>
+[ ptesarik: Adjusted some function names, because per-ss locks have
+  not been backported to SL-16.0. ]
+Signed-off-by: Petr Tesarik <ptesarik@suse.com>
+---
+ include/linux/llist.h |    6 +++---
+ kernel/cgroup/rstat.c |   28 +++++++++++++++++++++++++++-
+ 2 files changed, 30 insertions(+), 4 deletions(-)
+
+--- a/include/linux/llist.h
++++ b/include/linux/llist.h
+@@ -83,7 +83,7 @@ static inline void init_llist_head(struc
+  */
+ static inline void init_llist_node(struct llist_node *node)
+ {
+-	node->next = node;
++	WRITE_ONCE(node->next, node);
+ }
+ 
+ /**
+@@ -97,7 +97,7 @@ static inline void init_llist_node(struc
+  */
+ static inline bool llist_on_list(const struct llist_node *node)
+ {
+-	return node->next != node;
++	return READ_ONCE(node->next) != node;
+ }
+ 
+ /**
+@@ -220,7 +220,7 @@ static inline bool llist_empty(const str
+ 
+ static inline struct llist_node *llist_next(struct llist_node *node)
+ {
+-	return node->next;
++	return READ_ONCE(node->next);
+ }
+ 
+ extern bool llist_add_batch(struct llist_node *new_first,
+--- a/kernel/cgroup/rstat.c
++++ b/kernel/cgroup/rstat.c
+@@ -27,6 +27,12 @@ static struct cgroup_rstat_cpu *cgroup_r
+  * Atomically inserts the cgrp in the llist for the given cpu. This is
+  * reentrant safe i.e. safe against softirq, hardirq and nmi. The llist
+  * will be processed at the flush time to create the update tree.
++ *
++ * NOTE: if the user needs the guarantee that the updater either add itself in
++ * the lockless list or the concurrent flusher flushes its updated stats, a
++ * memory barrier is needed before the call to cgroup_rstat_updated() i.e. a
++ * barrier after updating the per-cpu stats and before calling
++ * cgroup_rstat_updated().
+  */
+ __bpf_kfunc void cgroup_rstat_updated(struct cgroup *cgrp, int cpu)
+ {
+@@ -46,7 +52,12 @@ __bpf_kfunc void cgroup_rstat_updated(st
+ 		return;
+ 
+ 	rstatc = cgroup_rstat_cpu(cgrp, cpu);
+-	/* If already on list return. */
++	/*
++	 * If already on list return. This check is racy and smp_mb() is needed
++	 * to pair it with the smp_mb() in cgroup_process_update_tree() if the
++	 * guarantee that the updated stats are visible to concurrent flusher is
++	 * needed.
++	 */
+ 	if (llist_on_list(&rstatc->lnode))
+ 		return;
+ 
+@@ -108,6 +119,21 @@ static void cgroup_process_update_tree(i
+ 	while ((lnode = llist_del_first_init(lhead))) {
+ 		struct cgroup_rstat_cpu *rstatc;
+ 
++		/*
++		 * smp_mb() is needed here (more specifically in between
++		 * init_llist_node() and per-cpu stats flushing) if the
++		 * guarantee is required by a rstat user where etiher the
++		 * updater should add itself on the lockless list or the
++		 * flusher flush the stats updated by the updater who have
++		 * observed that they are already on the list. The
++		 * corresponding barrier pair for this one should be before
++		 * css_rstat_updated() by the user.
++		 *
++		 * For now, there aren't any such user, so not adding the
++		 * barrier here but if such a use-case arise, please add
++		 * smp_mb() here.
++		 */
++
+ 		rstatc = container_of(lnode, struct cgroup_rstat_cpu, lnode);
+ 		__cgroup_process_update_tree(rstatc->owner, cpu);
+ 	}
