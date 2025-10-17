@@ -16,6 +16,11 @@ class Uploader:
         sys.stderr.write('commit sha: %s\n' % (self.commit,))
         return self.commit
 
+    def ignore_kabi(self):
+        file = 'IGNORE-KABI-BADNESS'
+        sys.stderr.write('Uploading %s\n' % (file,))
+        self.tea.update_file(self.user, self.upstream.repo, self.user_branch, file, [])
+
     def sync_url(self):
         return self.upstream.api + '/' + self.user + '/' + self.upstream.repo + '?trackingbranch=' + self.user_branch + '#' + self.commit
 

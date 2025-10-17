@@ -158,12 +158,13 @@ class TeaAPI(api.API):
         return self.check_post(self.repo_path(org, repo) + '/branches', json=json)
 
     def update_gitattr(self, org, repo, branch):
-        fn = '.gitattributes'
-        r = self.check_exists(self.repo_path(org, repo) + '/contents/' + fn, params=ref_arg(branch))
-        attributes = [
+        self.update_file(org, repo, branch, '.gitattributes', [
                 '*.tar.bz2 filter=lfs diff=lfs merge=lfs -text',
                 '*.tar.?z filter=lfs diff=lfs merge=lfs -text',
-                ]
+                ])
+
+    def update_file(self, org, repo, branch, fn, lines):
+        r = self.check_exists(self.repo_path(org, repo) + '/contents/' + fn, params=ref_arg(branch))
         sha = None
         if r:
             fileinfo = r.json()
@@ -171,7 +172,7 @@ class TeaAPI(api.API):
             content = base64.standard_b64decode(fileinfo['content']).decode().splitlines()
         else:
             content = []
-        for a in attributes:
+        for a in lines:
             if a not in content:
                 content.append(a)
         content = '\n'.join(content) + '\n'
