@@ -1,4 +1,4 @@
-from kutil.config import read_config_sh, get_kernel_project_package, list_files, get_kernel_projects, get_package_archs
+from kutil.config import read_config_sh, get_kernel_project_package, list_files, list_specs, get_kernel_projects, get_package_archs
 import unittest
 
 class MiscTests(unittest.TestCase):
@@ -17,6 +17,10 @@ class MiscTests(unittest.TestCase):
                          ('SUSE:Maintenance:9216', 'kernel-livepatch-SLE15_Update_7'))
         self.assertEqual(get_kernel_project_package('tests/kutil/rpm/klp'),
                          ('SUSE:SLE-15-SP7:Update:Products:SLERT', 'kernel-livepatch-SLE15-SP7-RT_Update_0'))
+
+    def test_lsspec(self):
+        self.assertEqual(list_specs('tests/kutil/rpm/krna'), ['kernel-azure', 'kernel-source-azure', 'kernel-syms-azure'])
+        self.assertEqual(list_specs('tests/kutil/rpm/kgr'), ['kernel-livepatch-SLE15_Update_7'])
 
     def test_list_files(self):
         result = [ f for f in sorted( '''

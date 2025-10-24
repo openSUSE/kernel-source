@@ -20,6 +20,10 @@ def list_files(directory):
             result.append(os.path.join(root, f)[len(directory)+1:])
     return sorted(result)
 
+def list_specs(directory):
+    ext = '.spec'
+    return [f[0:-len(ext)] for f in list_files(directory) if f.endswith(ext)]
+
 def _unquote(val):
     # From kbuild2.conf parser.
     ret = ''
@@ -82,13 +86,10 @@ def get_kernel_project_package(package_tar_up_dir):
     if 'variant' in rpm_config:
         return (project, 'kernel-source' + rpm_config.get('variant'))
     # kgraft patches have only one spec file, use file list
-    ext = '.spec'
-    lst = list_files(package_tar_up_dir)
-    lst = [f for f in lst if f.endswith(ext)]
+    lst = list_specs(package_tar_up_dir)
     assert len(lst) == 1
     specname = lst[0]
     assert '/' not in specname
-    specname = specname[0:-len(ext)]
     return (project, specname)
 
 def get_kernel_projects(package_tar_up_dir):

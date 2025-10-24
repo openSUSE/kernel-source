@@ -1,4 +1,4 @@
-from kutil.config import get_kernel_projects, get_package_archs, read_source_timestamp
+from kutil.config import get_kernel_projects, get_package_archs, read_source_timestamp, get_kernel_project_package, list_files
 import xml.etree.ElementTree as ET
 from obsapi.obsapi import OBSAPI
 from obsapi.teaapi import TeaAPI
@@ -21,6 +21,7 @@ class UploaderBase:
         return self.commit
 
     def ignore_kabi(self):
+        self.ignore_kabi_badness = True
         file = 'IGNORE-KABI-BADNESS'
         sys.stderr.write('Uploading %s\n' % (file,))
         self.tea.update_file(self.user, self.upstream.repo, self.user_branch, file, [])
@@ -60,6 +61,8 @@ class UploaderBase:
             raise APIError('Getting build repositories not supported for %s' % (self.obs.url,))
 
     def get_project_repo_archs(self, limit_packages=None):
+        if hasattr(self, 'repo_archs'):
+            return self.repo_archs
         architectures = get_package_archs(self.data, limit_packages)
         projects = self.get_kernel_projects()
         projects_meta = {}
@@ -106,6 +109,7 @@ class UploaderBase:
                         results[k][prj][name] = archs
             else:
                 raise APIError('Could not retrieve metadata for project %s' % (prj,))
+        self.repo_archs = results
         return results
 
     def prjmeta(self, limit_packages=None, rebuild=False, debuginfo=False, maintainers=[]):
@@ -160,6 +164,59 @@ class UploaderBase:
         ET.indent(xml)
         return ET.tostring(xml, encoding='unicode')
 
+    def prjconf(self, limit_packages=None, rpm_checks=False, debuginfo=False):
+        is_qa_repo = '0'
+        multibuild = '_multibuild' in list_files(self.data)
+        repo_archs = self.get_project_repo_archs(limit_packages)
+        package = get_kernel_project_package(self.data)[1]
+        qa_packages = ['kernel-obs-qa', 'kernel-obs-build']
+        for r in repo_archs.keys():
+            is_qa_repo += '||("%%_repository" == "%s")' % (self.get_qa_repo(r),)
+        result = []
+        if '_constraints' not in list_files(self.data):
+            disk_needed = 14 if debuginfo else 4
+            result.append(
+'''%%ifarch %%ix86 x86_64
+Constraint: hardware:processors 8
+%%endif
+%%ifarch %%ix86 x86_64 ia64 ppc ppc64 ppc64le
+Constraint: hardware:disk:size unit=G %i
+%%else
+Constraint: hardware:disk:size unit=G %i
+%%endif''' % (disk_needed, disk_needed / 2))
+        result.append('Substitute: kernel-dummy')
+        if not rpm_checks:
+            result.append('Substitute: rpmlint-Factory')
+            result.append('Substitute: post-build-checks-malwarescan')
+        result.append('Macros:')
+        result.append('%is_kotd 1')
+        if self.ignore_kabi_badness:
+            result.append('%ignore_kabi_badness 1')
+        result.append('%klp_ipa_clones 1')
+        result.append('%%is_kotd_qa (%s)' % (is_qa_repo,))
+        result.append(':Macros')
+        if limit_packages:
+            for p in limit_packages:
+                l = p if not multibuild or p == package else package + ':' + p
+                result.append('BuildFlags: onlybuild:%s' % (l,))
+        else:
+            result.append('BuildFlags: excludebuild:%s:kernel-obs-qa' % (package,))
+            result.append('BuildFlags: excludebuild:kernel-obs-qa')
+            result.append('BuildFlags: nouseforbuild:%s:kernel-obs-build' % (package,))
+            result.append('BuildFlags: nouseforbuild:kernel-obs-build')
+            result.append('%%if %s' % (is_qa_repo,))
+            result.append('BuildFlags: !excludebuild:%s:kernel-obs-qa' % (package,))
+            result.append('BuildFlags: !excludebuild:kernel-obs-qa')
+            result.append('BuildFlags: onlybuild:%s:kernel-obs-qa' % (package,))
+            result.append('BuildFlags: onlybuild:kernel-obs-qa')
+            result.append('BuildFlags: onlybuild:kernel-obs-build.agg')
+            result.append('BuildFlags: onlybuild:nonexistent-package')
+            result.append('BuildFlags: !nouseforbuild:%s:kernel-obs-build' % (package,))
+            result.append('BuildFlags: !nouseforbuild:kernel-obs-build')
+            result.append('%endif')
+        return '\n'.join(result) + '\n'
+
+
 class Uploader(UploaderBase):
     def __init__(self, api, upstream_project, user_project, package, reset_branch=False, logfile=None):
         self.package = package
@@ -200,3 +257,4 @@ class Uploader(UploaderBase):
         else:
             sys.stderr.write('Creating branch %s.\n' % (self.user_branch,))
         self.tea.create_branch(self.user, self.upstream.repo, self.user_branch, self.upstream.branch, self.upstream.commit, reset_branch)
+        self.ignore_kabi_badness = False

@@ -625,6 +625,10 @@ class TestUploader(unittest.TestCase):
 
     def xmldiff(self, reference, result):
         reference = ET.tostring(ET.fromstring(reference), encoding='unicode')  # OBS uses <tag/> but ET uses <tag />
+        self.printdiff(reference, result)
+
+    def printdiff(self, reference, result):
+        self.maxDiff = None
         print('\n'.join(unified_diff(reference.splitlines(), result.splitlines(), fromfile='reference', tofile='result')))
         # Output is not stable on python 3.4, probably a bug
         # The difference is irrelevant for prjmeta but makes test output unreproducible
@@ -632,3 +636,98 @@ class TestUploader(unittest.TestCase):
             self.assertEqual(len(reference), len(result))
         else:
             self.assertEqual(reference.splitlines(), result.splitlines())
+
+    def test_prjconf_factory(self):
+        ul = UploaderBase()
+        project = 'Devel:Kernel:master'
+        ul.obs = FakeOBS(self.testdata[project]['in'])
+        ul.project = project
+        ul.ignore_kabi_badness = True
+        ul.data = 'tests/kutil/rpm/krnf'
+        ul.obs.url = 'https://api.suse.de'
+        reference = '''Substitute: kernel-dummy
+Substitute: rpmlint-Factory
+Substitute: post-build-checks-malwarescan
+Macros:
+%is_kotd 1
+%ignore_kabi_badness 1
+%klp_ipa_clones 1
+%is_kotd_qa (0||("%_repository" == "QA")||("%_repository" == "QA_ARM")||("%_repository" == "QA_LEGACYX86")||("%_repository" == "QA_PPC")||("%_repository" == "QA_RISCV")||("%_repository" == "QA_S390"))
+:Macros
+BuildFlags: excludebuild:kernel-source:kernel-obs-qa
+BuildFlags: excludebuild:kernel-obs-qa
+BuildFlags: nouseforbuild:kernel-source:kernel-obs-build
+BuildFlags: nouseforbuild:kernel-obs-build
+%if 0||("%_repository" == "QA")||("%_repository" == "QA_ARM")||("%_repository" == "QA_LEGACYX86")||("%_repository" == "QA_PPC")||("%_repository" == "QA_RISCV")||("%_repository" == "QA_S390")
+BuildFlags: !excludebuild:kernel-source:kernel-obs-qa
+BuildFlags: !excludebuild:kernel-obs-qa
+BuildFlags: onlybuild:kernel-source:kernel-obs-qa
+BuildFlags: onlybuild:kernel-obs-qa
+BuildFlags: onlybuild:kernel-obs-build.agg
+BuildFlags: onlybuild:nonexistent-package
+BuildFlags: !nouseforbuild:kernel-source:kernel-obs-build
+BuildFlags: !nouseforbuild:kernel-obs-build
+%endif
+'''
+        self.printdiff(reference, ul.prjconf(debuginfo=True))
+
+    def test_prjconf_factory_limit(self):
+        ul = UploaderBase()
+        project = 'Devel:Kernel:master'
+        ul.obs = FakeOBS(self.testdata[project]['in'])
+        ul.project = project
+        ul.ignore_kabi_badness = True
+        ul.data = 'tests/kutil/rpm/krnf'
+        ul.obs.url = 'https://api.suse.de'
+        reference = '''Substitute: kernel-dummy
+Substitute: rpmlint-Factory
+Substitute: post-build-checks-malwarescan
+Macros:
+%is_kotd 1
+%ignore_kabi_badness 1
+%klp_ipa_clones 1
+%is_kotd_qa (0||("%_repository" == "QA_ARM")||("%_repository" == "QA_S390"))
+:Macros
+BuildFlags: onlybuild:kernel-zfcpdump
+BuildFlags: onlybuild:dtb-armv6l
+'''
+        self.printdiff(reference, ul.prjconf(debuginfo=True, limit_packages=['kernel-zfcpdump', 'dtb-armv6l']))
+
+    def test_prjconf_klp(self):
+        ul = UploaderBase()
+        project = 'Devel:kGraft:patches:SLE15-SP7-RT_Update_0'
+        ul.obs = FakeOBS(self.testdata[project]['in'])
+        ul.project = project
+        ul.ignore_kabi_badness = False
+        ul.data = 'tests/kutil/rpm/klp'
+        ul.obs.url = 'https://api.suse.de'
+        reference = '''%ifarch %ix86 x86_64
+Constraint: hardware:processors 8
+%endif
+%ifarch %ix86 x86_64 ia64 ppc ppc64 ppc64le
+Constraint: hardware:disk:size unit=G 14
+%else
+Constraint: hardware:disk:size unit=G 7
+%endif
+Substitute: kernel-dummy
+Macros:
+%is_kotd 1
+%klp_ipa_clones 1
+%is_kotd_qa (0||("%_repository" == "QA"))
+:Macros
+BuildFlags: excludebuild:kernel-livepatch-SLE15-SP7-RT_Update_0:kernel-obs-qa
+BuildFlags: excludebuild:kernel-obs-qa
+BuildFlags: nouseforbuild:kernel-livepatch-SLE15-SP7-RT_Update_0:kernel-obs-build
+BuildFlags: nouseforbuild:kernel-obs-build
+%if 0||("%_repository" == "QA")
+BuildFlags: !excludebuild:kernel-livepatch-SLE15-SP7-RT_Update_0:kernel-obs-qa
+BuildFlags: !excludebuild:kernel-obs-qa
+BuildFlags: onlybuild:kernel-livepatch-SLE15-SP7-RT_Update_0:kernel-obs-qa
+BuildFlags: onlybuild:kernel-obs-qa
+BuildFlags: onlybuild:kernel-obs-build.agg
+BuildFlags: onlybuild:nonexistent-package
+BuildFlags: !nouseforbuild:kernel-livepatch-SLE15-SP7-RT_Update_0:kernel-obs-build
+BuildFlags: !nouseforbuild:kernel-obs-build
+%endif
+'''
+        self.printdiff(reference, ul.prjconf(debuginfo=True, rpm_checks=True))
