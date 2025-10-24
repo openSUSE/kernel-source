@@ -1,4 +1,4 @@
-from kutil.config import get_kernel_projects, get_package_archs
+from kutil.config import get_kernel_projects, get_package_archs, read_source_timestamp
 import xml.etree.ElementTree as ET
 from obsapi.obsapi import OBSAPI
 from obsapi.teaapi import TeaAPI
@@ -46,6 +46,9 @@ class UploaderBase:
         pr = pr['html_url']
         sys.stderr.write('%s\n' % (pr,))
         return pr
+
+    def get_qa_repo(self, r):
+        return 'QA_' + r if r not in ['standard', 'pool'] else 'QA'
 
     def get_kernel_projects(self):
         projects = get_kernel_projects(self.data)
@@ -104,6 +107,58 @@ class UploaderBase:
             else:
                 raise APIError('Could not retrieve metadata for project %s' % (prj,))
         return results
+
+    def prjmeta(self, limit_packages=None, rebuild=False, debuginfo=False, maintainers=[]):
+        repo_archs = self.get_project_repo_archs(limit_packages)
+        source_timestamp = read_source_timestamp(os.path.join(self.data, 'source-timestamp'))
+        branch = source_timestamp.get('git branch', None)
+        xml = ET.Element('project', name=self.project)
+        e = ET.SubElement(xml, 'title')
+        e.text = 'Kernel builds for branch ' + branch
+        ET.SubElement(xml, 'description')
+        if not maintainers:
+            maintainers = []
+        for m in maintainers:
+            if self.obs.group_exists(m):
+                ET.SubElement(xml, 'group', groupid=m, role='maintainer')
+            elif self.obs.user_exists(m):
+                ET.SubElement(xml, 'person', userid=m, role='maintainer')
+            else:
+                sys.stderr.write('User id "%s" does not exist at %s\n' % (m, self.obs.url));
+        e = ET.SubElement(xml, 'build')
+        ET.SubElement(e, 'enable')
+        e = ET.SubElement(xml, 'publish')
+        ET.SubElement(e, 'enable')
+        publish = e
+        e = ET.SubElement(xml, 'debuginfo')
+        ET.SubElement(e, 'enable') if debuginfo else ET.SubElement(e, 'disable')
+        repolist = []
+        for r in repo_archs.keys():
+            if rebuild:
+                repo = ET.Element('repository', name=r)
+            else:
+                repo = ET.Element('repository', name=r, rebuild='local', block='local')
+            repolist.append(repo)
+            assert len(repo_archs[r]) == 1
+            prj = list(repo_archs[r].keys())[0]
+            assert len(repo_archs[r][prj]) == 1
+            prj_repo = list(repo_archs[r][prj].keys())[0]
+            ET.SubElement(repo, 'path', project=prj, repository=prj_repo)
+            for a in repo_archs[r][prj][prj_repo]:
+                arch = ET.SubElement(repo, 'arch')
+                arch.text = a
+            qa_repo = self.get_qa_repo(r)
+            ET.SubElement(publish, 'disable', repository=qa_repo)
+            repo = ET.Element('repository', name=qa_repo)
+            repolist.append(repo)
+            ET.SubElement(repo, 'path', project=self.project, repository=r)
+            for a in repo_archs[r][prj][prj_repo]:
+                arch = ET.SubElement(repo, 'arch')
+                arch.text = a
+        for r in sorted(repolist, key=lambda x: x.get('name'), reverse=True):
+            xml.append(r)
+        ET.indent(xml)
+        return ET.tostring(xml, encoding='unicode')
 
 class Uploader(UploaderBase):
     def __init__(self, api, upstream_project, user_project, package, reset_branch=False, logfile=None):

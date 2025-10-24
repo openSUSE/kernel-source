@@ -49,6 +49,13 @@ def _unquote(val):
             idx = endidx + 1
     return ret
 
+def read_source_timestamp(file):
+    cp = configparser.ConfigParser(delimiters=(':'), interpolation=None)
+    with open(file, 'r') as fd:
+        cp.read_string('[section]\nDate: ' + fd.read())
+    config = cp['section']
+    return config
+
 def read_config_sh(file):
     cp = configparser.ConfigParser(delimiters=('='), interpolation=None)
     with open(file, 'r') as fd:

@@ -1,6 +1,7 @@
 from kutil.config import get_source_timestamp, get_package_archs, get_kernel_projects
 from obsapi.obsapi import OBSAPI, PkgRepo
 from obsapi.uploader import UploaderBase
+import xml.etree.ElementTree as ET
 from obsapi.teaapi import TeaAPI
 from difflib import unified_diff
 from obsapi.api import APIError
@@ -364,6 +365,12 @@ class FakeOBS:
         prj = self.prjmeta.get(project, None)
         return FakeRequest(prj) if prj else None
 
+    def group_exists(self, group):
+        return group in self.groups
+
+    def user_exists(self, user):
+        return user in self.users
+
 class TestUploader(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -385,3 +392,243 @@ class TestUploader(unittest.TestCase):
             else:
                 ul.obs.url = 'https://api.opensuse.org'
             self.assertEqual(ul.get_project_repo_archs(), self.testdata[project]['out'])
+
+    def test_prjmeta_factory(self):
+        ul = UploaderBase()
+        project = 'Devel:Kernel:master'
+        ul.obs = FakeOBS(self.testdata[project]['in'])
+        ul.project = project
+        ul.data = 'tests/kutil/rpm/krnf'
+        ul.obs.url = 'https://api.suse.de'
+        reference = '''
+<project name="Devel:Kernel:master">
+  <title>Kernel builds for branch master</title>
+  <description/>
+  <build>
+    <enable/>
+  </build>
+  <publish>
+    <enable/>
+    <disable repository="QA"/>
+    <disable repository="QA_ARM"/>
+    <disable repository="QA_LEGACYX86"/>
+    <disable repository="QA_PPC"/>
+    <disable repository="QA_RISCV"/>
+    <disable repository="QA_S390"/>
+  </publish>
+  <debuginfo>
+    <disable/>
+  </debuginfo>
+  <repository name="standard" rebuild="local" block="local">
+    <path project="openSUSE.org:openSUSE:Factory" repository="standard"/>
+    <arch>x86_64</arch>
+  </repository>
+  <repository name="S390" rebuild="local" block="local">
+    <path project="openSUSE.org:openSUSE:Factory:zSystems" repository="standard"/>
+    <arch>s390x</arch>
+  </repository>
+  <repository name="RISCV" rebuild="local" block="local">
+    <path project="openSUSE.org:openSUSE:Factory:RISCV" repository="standard"/>
+    <arch>riscv64</arch>
+  </repository>
+  <repository name="QA_S390">
+    <path project="Devel:Kernel:master" repository="S390"/>
+    <arch>s390x</arch>
+  </repository>
+  <repository name="QA_RISCV">
+    <path project="Devel:Kernel:master" repository="RISCV"/>
+    <arch>riscv64</arch>
+  </repository>
+  <repository name="QA_PPC">
+    <path project="Devel:Kernel:master" repository="PPC"/>
+    <arch>ppc64le</arch>
+  </repository>
+  <repository name="QA_LEGACYX86">
+    <path project="Devel:Kernel:master" repository="LEGACYX86"/>
+    <arch>i586</arch>
+  </repository>
+  <repository name="QA_ARM">
+    <path project="Devel:Kernel:master" repository="ARM"/>
+    <arch>aarch64</arch>
+    <arch>armv7l</arch>
+    <arch>armv6l</arch>
+  </repository>
+  <repository name="QA">
+    <path project="Devel:Kernel:master" repository="standard"/>
+    <arch>x86_64</arch>
+  </repository>
+  <repository name="PPC" rebuild="local" block="local">
+    <path project="openSUSE.org:openSUSE:Factory:PowerPC" repository="standard"/>
+    <arch>ppc64le</arch>
+  </repository>
+  <repository name="LEGACYX86" rebuild="local" block="local">
+    <path project="openSUSE.org:openSUSE:Factory:LegacyX86" repository="standard"/>
+    <arch>i586</arch>
+  </repository>
+  <repository name="ARM" rebuild="local" block="local">
+    <path project="openSUSE.org:openSUSE:Factory:ARM" repository="standard"/>
+    <arch>aarch64</arch>
+    <arch>armv7l</arch>
+    <arch>armv6l</arch>
+  </repository>
+</project>
+'''
+        self.xmldiff(reference, ul.prjmeta())
+
+    def test_prjmeta_factory_limit(self):
+        ul = UploaderBase()
+        project = 'Devel:Kernel:master'
+        ul.obs = FakeOBS(self.testdata[project]['in'])
+        ul.project = project
+        ul.data = 'tests/kutil/rpm/krnf'
+        ul.obs.url = 'https://api.suse.de'
+        reference = '''
+<project name="Devel:Kernel:master">
+  <title>Kernel builds for branch master</title>
+  <description/>
+  <build>
+    <enable/>
+  </build>
+  <publish>
+    <enable/>
+    <disable repository="QA_ARM"/>
+    <disable repository="QA_S390"/>
+  </publish>
+  <debuginfo>
+    <disable/>
+  </debuginfo>
+  <repository name="S390" rebuild="local" block="local">
+    <path project="openSUSE.org:openSUSE:Factory:zSystems" repository="standard"/>
+    <arch>s390x</arch>
+  </repository>
+  <repository name="QA_S390">
+    <path project="Devel:Kernel:master" repository="S390"/>
+    <arch>s390x</arch>
+  </repository>
+  <repository name="QA_ARM">
+    <path project="Devel:Kernel:master" repository="ARM"/>
+    <arch>armv6l</arch>
+  </repository>
+  <repository name="ARM" rebuild="local" block="local">
+    <path project="openSUSE.org:openSUSE:Factory:ARM" repository="standard"/>
+    <arch>armv6l</arch>
+  </repository>
+</project>
+'''
+        self.xmldiff(reference, ul.prjmeta(limit_packages=['kernel-zfcpdump','dtb-armv6l']))
+
+    def test_prjmeta_sle(self):
+        ul = UploaderBase()
+        project = 'Devel:Kernel:SLE15-SP6'
+        ul.obs = FakeOBS(self.testdata[project]['in'])
+        ul.project = project
+        ul.obs.users = ['jones_tony', 'kernelbugs', 'michals', 'osalvador', 'sthackarajan', 'tiwai']
+        ul.obs.groups = ['kernel-maintainers']
+        ul.data = 'tests/kutil/rpm/krn'
+        ul.obs.url = 'https://api.suse.de'
+        reference = '''
+<project name="Devel:Kernel:SLE15-SP6">
+  <title>Kernel builds for branch SLE15-SP6</title>
+  <description/>
+  <group groupid="kernel-maintainers" role="maintainer"/>
+  <person userid="jones_tony" role="maintainer"/>
+  <person userid="kernelbugs" role="maintainer"/>
+  <person userid="michals" role="maintainer"/>
+  <person userid="osalvador" role="maintainer"/>
+  <person userid="sthackarajan" role="maintainer"/>
+  <person userid="tiwai" role="maintainer"/>
+  <build>
+    <enable/>
+  </build>
+  <publish>
+    <enable/>
+    <disable repository="QA"/>
+    <disable repository="QA_ARM"/>
+  </publish>
+  <debuginfo>
+    <enable/>
+  </debuginfo>
+  <repository name="standard" rebuild="local" block="local">
+    <path project="SUSE:SLE-15-SP6:Update" repository="standard"/>
+    <arch>x86_64</arch>
+    <arch>s390x</arch>
+    <arch>ppc64le</arch>
+    <arch>aarch64</arch>
+  </repository>
+  <repository name="QA_ARM">
+    <path project="Devel:Kernel:SLE15-SP6" repository="ARM"/>
+    <arch>armv7l</arch>
+  </repository>
+  <repository name="QA">
+    <path project="Devel:Kernel:SLE15-SP6" repository="standard"/>
+    <arch>x86_64</arch>
+    <arch>s390x</arch>
+    <arch>ppc64le</arch>
+    <arch>aarch64</arch>
+  </repository>
+  <repository name="ARM" rebuild="local" block="local">
+    <path project="openSUSE.org:openSUSE:Step:15-SP6" repository="standard"/>
+    <arch>armv7l</arch>
+  </repository>
+</project>
+'''
+        self.xmldiff(reference, ul.prjmeta(debuginfo=True, maintainers=ul.obs.groups + ul.obs.users + ['vzzchlt']))
+
+        reference = '''
+<project name="Devel:Kernel:SLE15-SP6">
+  <title>Kernel builds for branch SLE15-SP6</title>
+  <description/>
+  <group groupid="kernel-maintainers" role="maintainer"/>
+  <person userid="jones_tony" role="maintainer"/>
+  <person userid="kernelbugs" role="maintainer"/>
+  <person userid="michals" role="maintainer"/>
+  <person userid="osalvador" role="maintainer"/>
+  <person userid="sthackarajan" role="maintainer"/>
+  <person userid="tiwai" role="maintainer"/>
+  <build>
+    <enable/>
+  </build>
+  <publish>
+    <enable/>
+    <disable repository="QA"/>
+    <disable repository="QA_ARM"/>
+  </publish>
+  <debuginfo>
+    <disable/>
+  </debuginfo>
+  <repository name="standard">
+    <path project="SUSE:SLE-15-SP6:Update" repository="standard"/>
+    <arch>x86_64</arch>
+    <arch>s390x</arch>
+    <arch>ppc64le</arch>
+    <arch>aarch64</arch>
+  </repository>
+  <repository name="QA_ARM">
+    <path project="Devel:Kernel:SLE15-SP6" repository="ARM"/>
+    <arch>armv7l</arch>
+  </repository>
+  <repository name="QA">
+    <path project="Devel:Kernel:SLE15-SP6" repository="standard"/>
+    <arch>x86_64</arch>
+    <arch>s390x</arch>
+    <arch>ppc64le</arch>
+    <arch>aarch64</arch>
+  </repository>
+  <repository name="ARM">
+    <path project="openSUSE.org:openSUSE:Step:15-SP6" repository="standard"/>
+    <arch>armv7l</arch>
+  </repository>
+</project>
+'''
+        self.xmldiff(reference, ul.prjmeta(rebuild=True, maintainers=ul.obs.groups + ul.obs.users))
+
+
+    def xmldiff(self, reference, result):
+        reference = ET.tostring(ET.fromstring(reference), encoding='unicode')  # OBS uses <tag/> but ET uses <tag />
+        print('\n'.join(unified_diff(reference.splitlines(), result.splitlines(), fromfile='reference', tofile='result')))
+        # Output is not stable on python 3.4, probably a bug
+        # The difference is irrelevant for prjmeta but makes test output unreproducible
+        if sys.version_info.major == 3 and sys.version_info.minor < 6:
+            self.assertEqual(len(reference), len(result))
+        else:
+            self.assertEqual(reference.splitlines(), result.splitlines())
