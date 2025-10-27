@@ -13,7 +13,7 @@ MULTIBUILD="Yes"
 LIVEPATCH=livepatch
 # buildservice projects to build the kernel against
 OBS_PROJECT=SUSE:ALP:Source:Standard:Core:1.0:Build
-IBS_PROJECT=SUSE:ALP:Source:Standard:Core:1.0:Build
+IBS_PROJECT=SUSE:SLFO:Kernel:1.0
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
 BUGZILLA_PRODUCT="SUSE Linux Enterprise Micro 6.0"
