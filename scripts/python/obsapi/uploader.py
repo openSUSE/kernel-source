@@ -1,4 +1,4 @@
-from kutil.config import get_kernel_projects, get_package_archs, read_source_timestamp, get_kernel_project_package, list_files
+from kutil.config import get_kernel_projects, get_package_archs, read_source_timestamp, get_kernel_project_package, list_files, list_specs
 import xml.etree.ElementTree as ET
 from obsapi.obsapi import OBSAPI
 from obsapi.teaapi import TeaAPI
@@ -215,6 +215,76 @@ Constraint: hardware:disk:size unit=G %i
             result.append('BuildFlags: !nouseforbuild:kernel-obs-build')
             result.append('%endif')
         return '\n'.join(result) + '\n'
+
+    def filter_limit_packages(self, packages):
+        ext = ".spec"
+        if not packages:
+            packages = []
+        packages = [p[0:-len(ext)] if p.endswith(ext) else p for p in packages]
+        packages = packages + [ 'kernel-' + p for p in packages]
+        filist = list_files(self.data)
+        packages = [p for p in packages if p + ext in filelist]
+        return packages
+
+    def create_project(self, maintainers=None, limit_packages=None, debuginfo=None, rpm_checks=None, rebuild=None):
+        limit_packages = self.filter_limit_packages(limit_packages)
+        sys.stderr.write('Creating %s...' % (self.project,))
+        self.obs.create_project(self.project, meta=self.prjmeta(maintainers=maintainers, limit_packages=limit_packages, rebuild=rebuild, debuginfo=debuginfo),
+                                       conf=self.prjconf(limit_packages=limit_packages, debuginfo=debuginfo, rpm_checks=rpm_checks))
+        sys.stderr.write('ok\n')
+
+    def pkgmeta(self):
+        pkgmeta = ET.Element('package', name=self.package, project=self.project)
+        title = ET.SubElement(pkgmeta, 'title')
+        title.text = self.package
+        ET.SubElement(pkgmeta, 'description')
+        scmsync = ET.SubElement(pkgmeta, 'scmsync')
+        scmsync.text = self.sync_url()
+        ET.indent(pkgmeta)
+        return ET.tostring(pkgmeta)
+
+    def create_package(self, limit_packages=None):
+        limit_packages = self.filter_limit_packages(limit_packages)
+        repo_archs = self.get_project_repo_archs(limit_packages)
+        multibuild = '_multibuild' in list_files(self.data)
+        specs = list_specs(self.data)
+        repo_archs = self.get_project_repo_archs(limit_packages)
+        package = get_kernel_project_package(self.data)[1]
+        sys.stderr.write('Creating %s/%s...' % (self.project, self.package))
+        sys.stderr.write('ok\n')
+        self.obs.create_package_meta(self.project, self.package, self.pkgmeta())
+        kob = 'kernel-obs-build'
+        kob_agg = kob + '.agg'
+        sys.stderr.write('Aggregating %s/%s...' % (self.project, kob_agg))
+        self.obs.create_package(self.project, kob_agg)
+        aggxml = ET.Element('aggregatelist')
+        agg = ET.SubElement(aggxml, 'aggregate', project = self.project)
+        pkg = ET.SubElement(agg, 'package')
+        pkg.text = kob
+        pkg = ET.SubElement(agg, 'package')
+        pkg.text = package + ':' + kob
+        for r in repo_archs.keys():
+            ET.SubElement(agg, 'repository', target=self.get_qa_repo(r), source=r)
+            # default aggregetio is identity, target=source.
+            # target with no souce disables aggregation
+            ET.SubElement(agg, 'repository', target=r)
+        ET.indent(aggxml)
+        self.obs.upload_file(self.project, kob_agg, '_aggregate', ET.tostring(aggxml), 'application/xml')
+        sys.stderr.write('ok\n')
+        links = self.obs.list_package_links(self.project, self.package)
+        if not multibuild:
+            for s in specs:
+                if s == package:
+                    continue
+                sys.stderr.write('Linking %s/%s...' % (self.project, s))
+                self.obs.create_link(self.project, s, self.package)
+                while s in links:
+                    links.remove(s)
+                sys.stderr.write('ok\n')
+        for s in links:
+            sys.stderr.write('Deleting %s/%s...' % (self.project, s))
+            self.obs.delete_package(self.project, s)
+            sys.stderr.write('ok\n')
 
 
 class Uploader(UploaderBase):
