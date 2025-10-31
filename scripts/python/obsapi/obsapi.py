@@ -119,6 +119,14 @@ class OBSAPI(api.API):
     def project_exists(self, project):
         return self.check_exists('/'.join(['/source', project, '_meta']))
 
+    def create_project(self, project, meta, conf):
+        self.check_put('/'.join(['/source', project, '_meta?force=1']), headers={'Content-type': 'application/xml'}, data=meta)
+        # OBS insists on content type for this file
+        self.check_put('/'.join(['/source', project, '_config']), headers={'Content-type': 'text/plain'}, data=conf)
+
+    def delete_project(self, project):
+        return self.check_delete('/'.join(['/source', project] + '?force=1'))
+
     def package_exists(self, project, package):
         return self.file_exists(project, package, '_meta')
 

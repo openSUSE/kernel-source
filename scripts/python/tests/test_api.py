@@ -62,6 +62,9 @@ class TestRequest(http.server.BaseHTTPRequestHandler):
         req_headers.update(data['request']['headers'])
         req_headers.update(data['request']['unredirected_hdrs'])
 
+        for hdr in ['Content-type']:
+            if req_headers.get(hdr, None) != self.headers.get(hdr, None):
+                raise ValueError('Expected %s %s but got %s' % (hdr, req_headers.get(hdr, None), self.headers.get(hdr, None)))
         if 'Authorization' in req_headers and 'Authorization' not in self.headers:
             raise ValueError('Authorization expected but not sent')
         if 'Authorization' not in req_headers and 'Authorization' in self.headers:
@@ -337,3 +340,11 @@ class TestOBS(unittest.TestCase):
         api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
         self.assertEqual(api.list_package_links('Kernel:SLE15-SP7', 'kernel-source'),
                 ['dtb-aarch64', 'kernel-64kb', 'kernel-default', 'kernel-docs', 'kernel-kvmsmall', 'kernel-obs-build', 'kernel-obs-qa', 'kernel-syms', 'kernel-zfcpdump'])
+
+    def test_create_project(self):
+        st = ServerThread('tests/api/obsapi_create_project')
+        st.start_server(obsconfig=self.config)
+        api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
+        api.create_project('home:michals:kernel-test',
+                           conf='Substitute: kernel-dummy\nSubstitute: rpmlint-Factory\nSubstitute: post-build-checks-malwarescan\nMacros:\n%is_kotd 1\n%klp_ipa_clones 1\n%is_kotd_qa (0||("%_repository" == "QA"))\n:Macros\nBuildFlags: excludebuild:kernel-source:kernel-obs-qa\nBuildFlags: excludebuild:kernel-obs-qa\nBuildFlags: nouseforbuild:kernel-source:kernel-obs-build\nBuildFlags: nouseforbuild:kernel-obs-build\n%if 0||("%_repository" == "QA")\nBuildFlags: !excludebuild:kernel-source:kernel-obs-qa\nBuildFlags: !excludebuild:kernel-obs-qa\nBuildFlags: onlybuild:kernel-source:kernel-obs-qa\nBuildFlags: onlybuild:kernel-obs-qa\nBuildFlags: onlybuild:kernel-obs-build.agg\nBuildFlags: onlybuild:nonexistent-package\nBuildFlags: !nouseforbuild:kernel-source:kernel-obs-build\nBuildFlags: !nouseforbuild:kernel-obs-build\n%endif\n',
+                           meta='<project name="home:michals:kernel-test">\n  <title>Kernel builds for branch SL-16.0</title>\n  <description />\n  <build>\n    <enable />\n  </build>\n  <publish>\n    <enable />\n    <disable repository="QA" />\n  </publish>\n  <debuginfo>\n    <enable />\n  </debuginfo>\n  <repository block="local" name="standard" rebuild="local">\n    <path project="SUSE:SLFO:1.2" repository="standard" />\n    <arch>aarch64</arch>\n    <arch>ppc64le</arch>\n    <arch>s390x</arch>\n    <arch>x86_64</arch>\n  </repository>\n  <repository name="QA">\n    <path project="home:michals:kernel-test" repository="standard" />\n    <arch>aarch64</arch>\n    <arch>ppc64le</arch>\n    <arch>s390x</arch>\n    <arch>x86_64</arch>\n  </repository>\n</project>')
