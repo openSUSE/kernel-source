@@ -14,6 +14,10 @@ import sys
 import re
 import os
 
+if not hasattr(ET, 'indent'):  # should be available since python 3.9
+    import ETindent
+    ET.indent = ETindent.indent
+
 PkgRepo = collections.namedtuple('PkgRepo', ['api', 'org', 'repo', 'branch', 'commit'])
 
 def expand_home(path):
@@ -116,6 +120,12 @@ class OBSAPI(api.API):
         r = self.get('/')
         return r
 
+    def group_exists(self, group):
+        return self.check_exists('/'.join(['/group', group]))
+
+    def user_exists(self, user):
+        return self.check_exists('/'.join(['/person', user]))
+
     def project_exists(self, project):
         return self.check_exists('/'.join(['/source', project, '_meta']))
 
@@ -130,11 +140,33 @@ class OBSAPI(api.API):
     def package_exists(self, project, package):
         return self.file_exists(project, package, '_meta')
 
+    def create_package_meta(self, project, package, meta):
+        return self.upload_file(project, package, '_meta', meta, 'application/xml')
+
+    def create_package(self, project, package):
+        pkgmeta = ET.Element('package', name=package, project=project)
+        title = ET.SubElement(pkgmeta, 'title')
+        title.text = package
+        ET.SubElement(pkgmeta, 'description')
+        ET.indent(pkgmeta)
+        return self.create_package_meta(project, package, ET.tostring(pkgmeta))
+
+    def delete_package(self, project, package):
+        self.check_delete('/'.join(['/source', project, package]))
+
+    def create_link(self, project, link, package):
+        linkxml = ET.Element('link', package=package, cicount='copy')
+        self.create_package(project, link)
+        self.upload_file(project, link, '_link', ET.tostring(linkxml), 'application/xml')
+
     def file_exists(self, project, package, file):
         return self.check_exists('/'.join(['/source', project, package, file]))
 
     def package_meta(self, project, package):
         return ET.fromstring(self.check_get('/'.join(['/source', project, package, '_meta'])).content)
+
+    def upload_file(self, project, package, file, data, content_type='application/octet-stream'):
+        return self.check_put('/'.join(['/source', project, package, file]), headers={'Content-type': content_type}, data=data)
 
     def package_scmsync(self, project, package):
         return urllib.parse.urlparse(self.package_meta(project, package).find('scmsync').text)
