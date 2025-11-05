@@ -9,9 +9,6 @@ def handle_email(email):
     if email == '__empty-env-var__':
         print("Please set the environment variable BUGZILLA_ACCOUNT_EMAIL to your bugzilla email or provide it after --email (-e).", file=sys.stderr)
         sys.exit(1)
-    if len(email) < 9 or "@suse." not in email:
-        print("no valid bz email provided", file=sys.stderr)
-        sys.exit(1)
     return email
 
 def get_score(s):
