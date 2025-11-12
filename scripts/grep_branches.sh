@@ -8,9 +8,8 @@ grep_branch()
 {
 	local branch=$1
 	shift
-	local args="$@"
 
-	git --no-pager grep $args origin/$branch
+	git --no-pager grep "$@" origin/$branch
 	return 0
 }
 
