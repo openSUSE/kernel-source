@@ -1,0 +1,384 @@
+From e584b13571845783d916294bc201a5e2278e5d7e Mon Sep 17 00:00:00 2001
+From: Xinpeng Sun <xinpeng.sun@intel.com>
+Date: Mon, 6 Jan 2025 10:31:33 +0800
+Subject: [PATCH] HID: intel-thc-hid: intel-thc: Add THC PIO operation APIs
+Git-commit: e584b13571845783d916294bc201a5e2278e5d7e
+Patch-mainline: v6.14-rc1
+References: jsc#PED-14033
+
+[ backport note: dropped quotes from EXPORT_SYMBOL_NS_GPL() -- tiwai ]
+
+THC PIO (programmed I/O) operations are very similar with general
+SPI/I2C read/write operation to access external slave device on the bus
+through internal FIFO.
+
+THC PIO operations are split into 4 steps:
+1. prepare: configure hardware with correct opcode, slave address, and
+            fill the PIO FIFO
+2. start: set start bit to issue a bus send/receive
+3. wait: wait for bus sending/receiving completion
+4. complete: check send/receive data in FIFO and return
+
+Co-developed-by: Even Xu <even.xu@intel.com>
+Signed-off-by: Even Xu <even.xu@intel.com>
+Signed-off-by: Xinpeng Sun <xinpeng.sun@intel.com>
+Tested-by: Rui Zhang <rui1.zhang@intel.com>
+Tested-by: Mark Pearson <mpearson-lenovo@squebb.ca>
+Reviewed-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Reviewed-by: Mark Pearson <mpearson-lenovo@squebb.ca>
+Tested-by: Aaron Ma <aaron.ma@canonical.com>
+Signed-off-by: Jiri Kosina <jkosina@suse.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/hid/intel-thc-hid/intel-thc/intel-thc-dev.c |  245 ++++++++++++++++++++
+ drivers/hid/intel-thc-hid/intel-thc/intel-thc-dev.h |   24 +
+ drivers/hid/intel-thc-hid/intel-thc/intel-thc-hw.h  |   23 +
+ 3 files changed, 292 insertions(+)
+
+--- a/drivers/hid/intel-thc-hid/intel-thc/intel-thc-dev.c
++++ b/drivers/hid/intel-thc-hid/intel-thc/intel-thc-dev.c
+@@ -1,9 +1,11 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ /* Copyright (c) 2024 Intel Corporation */
+ 
++#include <linux/bitfield.h>
+ #include <linux/regmap.h>
+ 
+ #include "intel-thc-dev.h"
++#include "intel-thc-hw.h"
+ 
+ static int thc_regmap_read(void *context, unsigned int reg,
+ 			   unsigned int *val)
+@@ -208,10 +210,253 @@ struct thc_device *thc_dev_init(struct d
+ 
+ 	thc_clear_state(thc_dev);
+ 
++	mutex_init(&thc_dev->thc_bus_lock);
++
+ 	return thc_dev;
+ }
+ EXPORT_SYMBOL_NS_GPL(thc_dev_init, INTEL_THC);
+ 
++static int prepare_pio(const struct thc_device *dev, const u8 pio_op,
++		       const u32 address, const u32 size)
++{
++	u32 sts, ctrl, addr, mask;
++
++	regmap_read(dev->thc_regmap, THC_M_PRT_SW_SEQ_STS_OFFSET, &sts);
++
++	/* Check if THC previous PIO still in progress */
++	if (sts & THC_M_PRT_SW_SEQ_STS_THC_SS_CIP) {
++		dev_err_once(dev->dev, "THC PIO is still busy!\n");
++		return -EBUSY;
++	}
++
++	/* Clear error bit and complete bit in state register */
++	sts |= THC_M_PRT_SW_SEQ_STS_THC_SS_ERR |
++	       THC_M_PRT_SW_SEQ_STS_TSSDONE;
++	regmap_write(dev->thc_regmap, THC_M_PRT_SW_SEQ_STS_OFFSET, sts);
++
++	/* Set PIO data size, opcode and interrupt capability */
++	ctrl = FIELD_PREP(THC_M_PRT_SW_SEQ_CNTRL_THC_SS_BC, size) |
++	       FIELD_PREP(THC_M_PRT_SW_SEQ_CNTRL_THC_SS_CMD, pio_op);
++	if (dev->pio_int_supported)
++		ctrl |= THC_M_PRT_SW_SEQ_CNTRL_THC_SS_CD_IE;
++
++	mask = THC_M_PRT_SW_SEQ_CNTRL_THC_SS_BC |
++	       THC_M_PRT_SW_SEQ_CNTRL_THC_SS_CMD |
++	       THC_M_PRT_SW_SEQ_CNTRL_THC_SS_CD_IE;
++	regmap_write_bits(dev->thc_regmap,
++			  THC_M_PRT_SW_SEQ_CNTRL_OFFSET, mask, ctrl);
++
++	/* Set PIO target address */
++	addr = FIELD_PREP(THC_M_PRT_SW_SEQ_DATA0_ADDR_THC_SW_SEQ_DATA0_ADDR, address);
++	mask = THC_M_PRT_SW_SEQ_DATA0_ADDR_THC_SW_SEQ_DATA0_ADDR;
++	regmap_write_bits(dev->thc_regmap,
++			  THC_M_PRT_SW_SEQ_DATA0_ADDR_OFFSET, mask, addr);
++	return 0;
++}
++
++static void pio_start(const struct thc_device *dev,
++		      u32 size_in_bytes, const u32 *buffer)
++{
++	if (size_in_bytes && buffer)
++		regmap_bulk_write(dev->thc_regmap, THC_M_PRT_SW_SEQ_DATA1_OFFSET,
++				  buffer, size_in_bytes / sizeof(u32));
++
++	/* Enable Start bit */
++	regmap_write_bits(dev->thc_regmap,
++			  THC_M_PRT_SW_SEQ_CNTRL_OFFSET,
++			  THC_M_PRT_SW_SEQ_CNTRL_TSSGO,
++			  THC_M_PRT_SW_SEQ_CNTRL_TSSGO);
++}
++
++static int pio_complete(const struct thc_device *dev,
++			u32 *buffer, u32 *size)
++{
++	u32 sts, ctrl;
++
++	regmap_read(dev->thc_regmap, THC_M_PRT_SW_SEQ_STS_OFFSET, &sts);
++	if (sts & THC_M_PRT_SW_SEQ_STS_THC_SS_ERR) {
++		dev_err_once(dev->dev, "PIO operation error\n");
++		return -EBUSY;
++	}
++
++	if (buffer && size) {
++		regmap_read(dev->thc_regmap, THC_M_PRT_SW_SEQ_CNTRL_OFFSET, &ctrl);
++		*size = FIELD_GET(THC_M_PRT_SW_SEQ_CNTRL_THC_SS_BC, ctrl);
++
++		regmap_bulk_read(dev->thc_regmap, THC_M_PRT_SW_SEQ_DATA1_OFFSET,
++				 buffer, *size / sizeof(u32));
++	}
++
++	sts |= THC_M_PRT_SW_SEQ_STS_THC_SS_ERR | THC_M_PRT_SW_SEQ_STS_TSSDONE;
++	regmap_write(dev->thc_regmap, THC_M_PRT_SW_SEQ_STS_OFFSET, sts);
++	return 0;
++}
++
++static int pio_wait(const struct thc_device *dev)
++{
++	u32 sts = 0;
++	int ret;
++
++	ret = regmap_read_poll_timeout(dev->thc_regmap, THC_M_PRT_SW_SEQ_STS_OFFSET, sts,
++				       !(sts & THC_M_PRT_SW_SEQ_STS_THC_SS_CIP ||
++				       !(sts & THC_M_PRT_SW_SEQ_STS_TSSDONE)),
++				       THC_REGMAP_POLLING_INTERVAL_US, THC_PIO_DONE_TIMEOUT_US);
++	if (ret)
++		dev_err_once(dev->dev, "Timeout while polling PIO operation done\n");
++
++	return ret;
++}
++
++/**
++ * thc_tic_pio_read - Read data from touch device by PIO
++ *
++ * @dev: The pointer of THC private device context
++ * @address: Slave address for the PIO operation
++ * @size: Expected read data size
++ * @actual_size: The pointer of the actual data size read from touch device
++ * @buffer: The pointer of data buffer to store the data read from touch device
++ *
++ * Return: 0 on success, other error codes on failed.
++ */
++int thc_tic_pio_read(struct thc_device *dev, const u32 address,
++		     const u32 size, u32 *actual_size, u32 *buffer)
++{
++	u8 opcode;
++	int ret;
++
++	if (size <= 0 || !actual_size || !buffer) {
++		dev_err(dev->dev, "Invalid input parameters, size %u, actual_size %p, buffer %p\n",
++			size, actual_size, buffer);
++		return -EINVAL;
++	}
++
++	if (mutex_lock_interruptible(&dev->thc_bus_lock))
++		return -EINTR;
++
++	opcode = (dev->port_type == THC_PORT_TYPE_SPI) ?
++		 THC_PIO_OP_SPI_TIC_READ : THC_PIO_OP_I2C_TIC_READ;
++
++	ret = prepare_pio(dev, opcode, address, size);
++	if (ret < 0)
++		goto end;
++
++	pio_start(dev, 0, NULL);
++
++	ret = pio_wait(dev);
++	if (ret < 0)
++		goto end;
++
++	ret = pio_complete(dev, buffer, actual_size);
++
++end:
++	mutex_unlock(&dev->thc_bus_lock);
++	return ret;
++}
++EXPORT_SYMBOL_NS_GPL(thc_tic_pio_read, INTEL_THC);
++
++/**
++ * thc_tic_pio_write - Write data to touch device by PIO
++ *
++ * @dev: The pointer of THC private device context
++ * @address: Slave address for the PIO operation
++ * @size: PIO write data size
++ * @buffer: The pointer of the write data buffer
++ *
++ * Return: 0 on success, other error codes on failed.
++ */
++int thc_tic_pio_write(struct thc_device *dev, const u32 address,
++		      const u32 size, const u32 *buffer)
++{
++	u8 opcode;
++	int ret;
++
++	if (size <= 0 || !buffer) {
++		dev_err(dev->dev, "Invalid input parameters, size %u, buffer %p\n",
++			size, buffer);
++		return -EINVAL;
++	}
++
++	if (mutex_lock_interruptible(&dev->thc_bus_lock))
++		return -EINTR;
++
++	opcode = (dev->port_type == THC_PORT_TYPE_SPI) ?
++		 THC_PIO_OP_SPI_TIC_WRITE : THC_PIO_OP_I2C_TIC_WRITE;
++
++	ret = prepare_pio(dev, opcode, address, size);
++	if (ret < 0)
++		goto end;
++
++	pio_start(dev, size, buffer);
++
++	ret = pio_wait(dev);
++	if (ret < 0)
++		goto end;
++
++	ret = pio_complete(dev, NULL, NULL);
++
++end:
++	mutex_unlock(&dev->thc_bus_lock);
++	return ret;
++}
++EXPORT_SYMBOL_NS_GPL(thc_tic_pio_write, INTEL_THC);
++
++/**
++ * thc_tic_pio_write_and_read - Write data followed by read data by PIO
++ *
++ * @dev: The pointer of THC private device context
++ * @address: Slave address for the PIO operation
++ * @write_size: PIO write data size
++ * @write_buffer: The pointer of the write data buffer
++ * @read_size: Expected PIO read data size
++ * @actual_size: The pointer of the actual read data size
++ * @read_buffer: The pointer of PIO read data buffer
++ *
++ * Return: 0 on success, other error codes on failed.
++ */
++int thc_tic_pio_write_and_read(struct thc_device *dev, const u32 address,
++			       const u32 write_size, const u32 *write_buffer,
++			       const u32 read_size, u32 *actual_size, u32 *read_buffer)
++{
++	u32 i2c_ctrl, mask;
++	int ret;
++
++	if (dev->port_type == THC_PORT_TYPE_SPI) {
++		dev_err(dev->dev, "SPI port type doesn't support pio write and read!");
++		return -EINVAL;
++	}
++
++	if (mutex_lock_interruptible(&dev->thc_bus_lock))
++		return -EINTR;
++
++	/* Config i2c PIO write and read sequence */
++	i2c_ctrl = FIELD_PREP(THC_M_PRT_SW_SEQ_I2C_WR_CNTRL_THC_PIO_I2C_WBC, write_size);
++	mask = THC_M_PRT_SW_SEQ_I2C_WR_CNTRL_THC_PIO_I2C_WBC;
++
++	regmap_write_bits(dev->thc_regmap, THC_M_PRT_SW_SEQ_I2C_WR_CNTRL_OFFSET,
++			  mask, i2c_ctrl);
++
++	regmap_write_bits(dev->thc_regmap, THC_M_PRT_SW_SEQ_I2C_WR_CNTRL_OFFSET,
++			  THC_M_PRT_SW_SEQ_I2C_WR_CNTRL_THC_I2C_RW_PIO_EN,
++			  THC_M_PRT_SW_SEQ_I2C_WR_CNTRL_THC_I2C_RW_PIO_EN);
++
++	ret = prepare_pio(dev, THC_PIO_OP_I2C_TIC_WRITE_AND_READ, address, read_size);
++	if (ret < 0)
++		goto end;
++
++	pio_start(dev, write_size, write_buffer);
++
++	ret = pio_wait(dev);
++	if (ret < 0)
++		goto end;
++
++	ret = pio_complete(dev, read_buffer, actual_size);
++
++end:
++	mutex_unlock(&dev->thc_bus_lock);
++	return ret;
++}
++EXPORT_SYMBOL_NS_GPL(thc_tic_pio_write_and_read, INTEL_THC);
++
+ MODULE_AUTHOR("Xinpeng Sun <xinpeng.sun@intel.com>");
+ MODULE_AUTHOR("Even Xu <even.xu@intel.com>");
+ 
+--- a/drivers/hid/intel-thc-hid/intel-thc/intel-thc-dev.h
++++ b/drivers/hid/intel-thc-hid/intel-thc/intel-thc-dev.h
+@@ -5,21 +5,45 @@
+ #define _INTEL_THC_DEV_H_
+ 
+ #include <linux/cdev.h>
++#include <linux/mutex.h>
+ 
+ #define THC_REGMAP_COMMON_OFFSET  0x10
+ #define THC_REGMAP_MMIO_OFFSET    0x1000
+ 
++/*
++ * THC Port type
++ * @THC_PORT_TYPE_SPI: This port is used for HIDSPI
++ * @THC_PORT_TYPE_I2C: This port is used for HIDI2C
++ */
++enum thc_port_type {
++	THC_PORT_TYPE_SPI = 0,
++	THC_PORT_TYPE_I2C = 1,
++};
++
+ /**
+  * struct thc_device - THC private device struct
+  * @thc_regmap: MMIO regmap structure for accessing THC registers
+  * @mmio_addr: MMIO registers address
++ * @thc_bus_lock: mutex locker for THC config
++ * @port_type: port type of THC port instance
++ * @pio_int_supported: PIO interrupt supported flag
+  */
+ struct thc_device {
+ 	struct device *dev;
+ 	struct regmap *thc_regmap;
+ 	void __iomem *mmio_addr;
++	struct mutex thc_bus_lock;
++	enum thc_port_type port_type;
++	bool pio_int_supported;
+ };
+ 
+ struct thc_device *thc_dev_init(struct device *device, void __iomem *mem_addr);
++int thc_tic_pio_read(struct thc_device *dev, const u32 address,
++		     const u32 size, u32 *actual_size, u32 *buffer);
++int thc_tic_pio_write(struct thc_device *dev, const u32 address,
++		      const u32 size, const u32 *buffer);
++int thc_tic_pio_write_and_read(struct thc_device *dev, const u32 address,
++			       const u32 write_size, const u32 *write_buffer,
++			       const u32 read_size, u32 *actual_size, u32 *read_buffer);
+ 
+ #endif /* _INTEL_THC_DEV_H_ */
+--- a/drivers/hid/intel-thc-hid/intel-thc/intel-thc-hw.h
++++ b/drivers/hid/intel-thc-hid/intel-thc/intel-thc-hw.h
+@@ -636,4 +636,27 @@
+ 
+ #define THC_M_PRT_SW_DMA_PRD_TABLE_LEN_THC_M_PRT_SW_DMA_PRD_TABLE_LEN	GENMASK(23, 0)
+ 
++#define THC_REGMAP_POLLING_INTERVAL_US		10 /* 10us */
++#define THC_PIO_DONE_TIMEOUT_US			USEC_PER_SEC /* 1s */
++
++/*
++ * THC PIO opcode default value
++ * @THC_PIO_OP_SPI_TIC_READ: THC opcode for SPI PIO read
++ * @THC_PIO_OP_SPI_TIC_WRITE: THC opcode for SPI PIO write
++ * @THC_PIO_OP_I2C_SUBSYSTEM_READ: THC opcode for read I2C subsystem registers
++ * @THC_PIO_OP_I2C_SUBSYSTEM_WRITE: THC opcode for write I2C subsystem registers
++ * @THC_PIO_OP_I2C_TIC_READ: THC opcode for read I2C device
++ * @THC_PIO_OP_I2C_TIC_WRITE: THC opcode for write I2C device
++ * @THC_PIO_OP_I2C_TIC_WRITE_AND_READ: THC opcode for write followed by read I2C device
++ */
++enum thc_pio_opcode {
++	THC_PIO_OP_SPI_TIC_READ = 0x4,
++	THC_PIO_OP_SPI_TIC_WRITE = 0x6,
++	THC_PIO_OP_I2C_SUBSYSTEM_READ = 0x12,
++	THC_PIO_OP_I2C_SUBSYSTEM_WRITE = 0x13,
++	THC_PIO_OP_I2C_TIC_READ = 0x14,
++	THC_PIO_OP_I2C_TIC_WRITE = 0x18,
++	THC_PIO_OP_I2C_TIC_WRITE_AND_READ = 0x1C,
++};
++
+ #endif /* _INTEL_THC_HW_H_  */
