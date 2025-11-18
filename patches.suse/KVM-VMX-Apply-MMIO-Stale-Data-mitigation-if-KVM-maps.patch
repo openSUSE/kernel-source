@@ -1,0 +1,177 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Thu, 22 May 2025 18:17:54 -0700
+Subject: KVM: VMX: Apply MMIO Stale Data mitigation if KVM maps MMIO into the
+ guest
+Patch-mainline: v6.17-rc1
+Git-commit: 83ebe715748314331f9639de2220d02debfe926d
+References: git-fixes
+
+Enforce the MMIO State Data mitigation if KVM has ever mapped host MMIO
+into the VM, not if the VM has an assigned device.  VFIO is but one of
+many ways to map host MMIO into a KVM guest, and even within VFIO,
+formally attaching a device to a VM via KVM_DEV_VFIO_FILE_ADD is entirely
+optional.
+
+Track whether or not the guest can access host MMIO on a per-MMU basis,
+i.e. based on whether or not the vCPU has a mapping to host MMIO.  For
+simplicity, track MMIO mappings in "special" rools (those without a
+kvm_mmu_page) at the VM level, as only Intel CPUs are vulnerable, and so
+only legacy 32-bit shadow paging is affected, i.e. lack of precise
+tracking is a complete non-issue.
+
+Make the per-MMU and per-VM flags sticky.  Detecting when *all* MMIO
+mappings have been removed would be absurdly complex.  And in practice,
+removing MMIO from a guest will be done by deleting the associated memslot,
+which by default will force KVM to re-allocate all roots.  Special roots
+will forever be mitigated, but as above, the affected scenarios are not
+expected to be performance sensitive.
+
+Use a VMX_RUN flag to communicate the need for a buffers flush to
+vmx_vcpu_enter_exit() so that kvm_vcpu_can_access_host_mmio() and all its
+dependencies don't need to be marked __always_inline, e.g. so that KASAN
+doesn't trigger a noinstr violation.
+
+Cc: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Cc: Borislav Petkov <bp@alien8.de>
+Fixes: 8cb861e9e3c9 ("x86/speculation/mmio: Add mitigation for Processor MMIO Stale Data")
+Tested-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Link: https://lore.kernel.org/r/20250523011756.3243624-4-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/include/asm/kvm_host.h |    1 +
+ arch/x86/kvm/mmu/mmu_internal.h |    3 +++
+ arch/x86/kvm/mmu/spte.c         |   21 +++++++++++++++++++++
+ arch/x86/kvm/mmu/spte.h         |   10 ++++++++++
+ arch/x86/kvm/vmx/run_flags.h    |   10 ++++++----
+ arch/x86/kvm/vmx/vmx.c          |    8 +++++++-
+ 6 files changed, 48 insertions(+), 5 deletions(-)
+
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1418,6 +1418,7 @@ struct kvm_arch {
+ 	bool x2apic_format;
+ 	bool x2apic_broadcast_quirk_disabled;
+ 
++	bool has_mapped_host_mmio;
+ 	bool guest_can_read_msr_platform_info;
+ 	bool exception_payload_enabled;
+ 
+--- a/arch/x86/kvm/mmu/mmu_internal.h
++++ b/arch/x86/kvm/mmu/mmu_internal.h
+@@ -101,6 +101,9 @@ struct kvm_mmu_page {
+ 		int root_count;
+ 		refcount_t tdp_mmu_root_count;
+ 	};
++
++	bool has_mapped_host_mmio;
++
+ 	unsigned int unsync_children;
+ 	union {
+ 		struct kvm_rmap_head parent_ptes; /* rmap pointers to parent sptes */
+--- a/arch/x86/kvm/mmu/spte.c
++++ b/arch/x86/kvm/mmu/spte.c
+@@ -139,6 +139,22 @@ static bool kvm_is_mmio_pfn(kvm_pfn_t pf
+ 	return *is_host_mmio;
+ }
+ 
++static void kvm_track_host_mmio_mapping(struct kvm_vcpu *vcpu)
++{
++	struct kvm_mmu_page *root = root_to_sp(vcpu->arch.mmu->root.hpa);
++
++	if (root)
++		WRITE_ONCE(root->has_mapped_host_mmio, true);
++	else
++		WRITE_ONCE(vcpu->kvm->arch.has_mapped_host_mmio, true);
++
++	/*
++	 * Force vCPUs to exit and flush CPU buffers if the vCPU is using the
++	 * affected root(s).
++	 */
++	kvm_make_all_cpus_request(vcpu->kvm, KVM_REQ_OUTSIDE_GUEST_MODE);
++}
++
+ /*
+  * Returns true if the SPTE has bits that may be set without holding mmu_lock.
+  * The caller is responsible for checking if the SPTE is shadow-present, and
+@@ -286,6 +302,11 @@ out:
+ 		mark_page_dirty_in_slot(vcpu->kvm, slot, gfn);
+ 	}
+ 
++	if (static_branch_unlikely(&mmio_stale_data_clear) &&
++	    !kvm_vcpu_can_access_host_mmio(vcpu) &&
++	    kvm_is_mmio_pfn(pfn, &is_host_mmio))
++		kvm_track_host_mmio_mapping(vcpu);
++
+ 	*new_spte = spte;
+ 	return wrprot;
+ }
+--- a/arch/x86/kvm/mmu/spte.h
++++ b/arch/x86/kvm/mmu/spte.h
+@@ -267,6 +267,16 @@ static inline struct kvm_mmu_page *root_
+ 	return spte_to_child_sp(root);
+ }
+ 
++static inline bool kvm_vcpu_can_access_host_mmio(struct kvm_vcpu *vcpu)
++{
++	struct kvm_mmu_page *root = root_to_sp(vcpu->arch.mmu->root.hpa);
++
++	if (root)
++		return READ_ONCE(root->has_mapped_host_mmio);
++
++	return READ_ONCE(vcpu->kvm->arch.has_mapped_host_mmio);
++}
++
+ static inline bool is_mmio_spte(struct kvm *kvm, u64 spte)
+ {
+ 	return (spte & shadow_mmio_mask) == kvm->arch.shadow_mmio_value &&
+--- a/arch/x86/kvm/vmx/run_flags.h
++++ b/arch/x86/kvm/vmx/run_flags.h
+@@ -2,10 +2,12 @@
+ #ifndef __KVM_X86_VMX_RUN_FLAGS_H
+ #define __KVM_X86_VMX_RUN_FLAGS_H
+ 
+-#define VMX_RUN_VMRESUME_SHIFT		0
+-#define VMX_RUN_SAVE_SPEC_CTRL_SHIFT	1
++#define VMX_RUN_VMRESUME_SHIFT				0
++#define VMX_RUN_SAVE_SPEC_CTRL_SHIFT			1
++#define VMX_RUN_CLEAR_CPU_BUFFERS_FOR_MMIO_SHIFT	2
+ 
+-#define VMX_RUN_VMRESUME		BIT(VMX_RUN_VMRESUME_SHIFT)
+-#define VMX_RUN_SAVE_SPEC_CTRL		BIT(VMX_RUN_SAVE_SPEC_CTRL_SHIFT)
++#define VMX_RUN_VMRESUME			BIT(VMX_RUN_VMRESUME_SHIFT)
++#define VMX_RUN_SAVE_SPEC_CTRL			BIT(VMX_RUN_SAVE_SPEC_CTRL_SHIFT)
++#define VMX_RUN_CLEAR_CPU_BUFFERS_FOR_MMIO	BIT(VMX_RUN_CLEAR_CPU_BUFFERS_FOR_MMIO_SHIFT)
+ 
+ #endif /* __KVM_X86_VMX_RUN_FLAGS_H */
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -73,6 +73,8 @@
+ #include "vmx_onhyperv.h"
+ #include "posted_intr.h"
+ 
++#include "mmu/spte.h"
++
+ MODULE_AUTHOR("Qumranet");
+ MODULE_DESCRIPTION("KVM support for VMX (Intel VT-x) extensions");
+ MODULE_LICENSE("GPL");
+@@ -959,6 +961,10 @@ unsigned int __vmx_vcpu_run_flags(struct
+ 	if (!msr_write_intercepted(vmx, MSR_IA32_SPEC_CTRL))
+ 		flags |= VMX_RUN_SAVE_SPEC_CTRL;
+ 
++	if (static_branch_unlikely(&mmio_stale_data_clear) &&
++	    kvm_vcpu_can_access_host_mmio(&vmx->vcpu))
++		flags |= VMX_RUN_CLEAR_CPU_BUFFERS_FOR_MMIO;
++
+ 	return flags;
+ }
+ 
+@@ -7305,7 +7311,7 @@ static noinstr void vmx_vcpu_enter_exit(
+ 	if (static_branch_unlikely(&vmx_l1d_should_flush))
+ 		vmx_l1d_flush(vcpu);
+ 	else if (static_branch_unlikely(&mmio_stale_data_clear) &&
+-		 kvm_arch_has_assigned_device(vcpu->kvm))
++		 (flags & VMX_RUN_CLEAR_CPU_BUFFERS_FOR_MMIO))
+ 		mds_clear_cpu_buffers();
+ 
+ 	vmx_disable_fb_clear(vmx);
