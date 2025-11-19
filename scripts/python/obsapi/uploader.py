@@ -226,7 +226,7 @@ Constraint: hardware:disk:size unit=G %i
             packages = []
         packages = [p[0:-len(ext)] if p.endswith(ext) else p for p in packages]
         packages = packages + [ 'kernel-' + p for p in packages]
-        filist = list_files(self.data)
+        filelist = list_files(self.data)
         packages = [p for p in packages if p + ext in filelist]
         return packages
 
