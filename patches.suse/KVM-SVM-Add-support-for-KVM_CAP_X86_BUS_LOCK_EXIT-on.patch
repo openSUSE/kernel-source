@@ -1,0 +1,201 @@
+Patch-mainline: v6.16-rc1
+Git-commit: 89f9edf4c69ddd345b07be414e6a99ace0757ff5
+References: jsc#PED-14346
+From: Manali Shukla <manali.shukla@amd.com>
+Date: Fri, 2 May 2025 05:03:45 +0000
+Subject: [PATCH] KVM: SVM: Add support for KVM_CAP_X86_BUS_LOCK_EXIT on SVM
+ CPUs
+
+Add support for KVM_CAP_X86_BUS_LOCK_EXIT on SVM CPUs with Bus Lock
+Threshold, which is close enough to VMX's Bus Lock Detection VM-Exit to
+allow reusing KVM_CAP_X86_BUS_LOCK_EXIT.
+
+The biggest difference between the two features is that Threshold is
+fault-like, whereas Detection is trap-like.  To allow the guest to make
+forward progress, Threshold provides a per-VMCB counter which is
+decremented every time a bus lock occurs, and a VM-Exit is triggered if
+and only if the counter is '0'.
+
+To provide Detection-like semantics, initialize the counter to '0', i.e.
+exit on every bus lock, and when re-executing the guilty instruction, set
+the counter to '1' to effectively step past the instruction.
+
+Note, in the unlikely scenario that re-executing the instruction doesn't
+trigger a bus lock, e.g. because the guest has changed memory types or
+patched the guilty instruction, the bus lock counter will be left at '1',
+i.e. the guest will be able to do a bus lock on a different instruction.
+In a perfect world, KVM would ensure the counter is '0' if the guest has
+made forward progress, e.g. if RIP has changed.  But trying to close that
+hole would incur non-trivial complexity, for marginal benefit; the intent
+of KVM_CAP_X86_BUS_LOCK_EXIT is to allow userspace rate-limit bus locks,
+not to allow for precise detection of problematic guest code.  And, it's
+simply not feasible to fully close the hole, e.g. if an interrupt arrives
+before the original instruction can re-execute, the guest could step past
+a different bus lock.
+
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Manali Shukla <manali.shukla@amd.com>
+Link: https://lore.kernel.org/r/20250502050346.14274-5-manali.shukla@amd.com
+[sean: fix typo in comment]
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ Documentation/virt/kvm/api.rst |  5 +++++
+ arch/x86/kvm/svm/nested.c      | 34 ++++++++++++++++++++++++++++++
+ arch/x86/kvm/svm/svm.c         | 38 ++++++++++++++++++++++++++++++++++
+ arch/x86/kvm/svm/svm.h         |  1 +
+ 4 files changed, 78 insertions(+)
+
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index ad1859f4699e..f7d2d477c3cf 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -7989,6 +7989,11 @@ apply some other policy-based mitigation. When exiting to userspace, KVM sets
+ KVM_RUN_X86_BUS_LOCK in vcpu-run->flags, and conditionally sets the exit_reason
+ to KVM_EXIT_X86_BUS_LOCK.
+ 
++Due to differences in the underlying hardware implementation, the vCPU's RIP at
++the time of exit diverges between Intel and AMD.  On Intel hosts, RIP points at
++the next instruction, i.e. the exit is trap-like.  On AMD hosts, RIP points at
++the offending instruction, i.e. the exit is fault-like.
++
+ Note! Detected bus locks may be coincident with other exits to userspace, i.e.
+ KVM_RUN_X86_BUS_LOCK should be checked regardless of the primary exit reason if
+ userspace wants to take action on all detected bus locks.
+diff --git a/arch/x86/kvm/svm/nested.c b/arch/x86/kvm/svm/nested.c
+index 834b67672d50..6221a341f500 100644
+--- a/arch/x86/kvm/svm/nested.c
++++ b/arch/x86/kvm/svm/nested.c
+@@ -678,6 +678,33 @@ static void nested_vmcb02_prepare_control(struct vcpu_svm *svm,
+ 	vmcb02->control.iopm_base_pa = vmcb01->control.iopm_base_pa;
+ 	vmcb02->control.msrpm_base_pa = vmcb01->control.msrpm_base_pa;
+ 
++	/*
++	 * Stash vmcb02's counter if the guest hasn't moved past the guilty
++	 * instruction; otherwise, reset the counter to '0'.
++	 *
++	 * In order to detect if L2 has made forward progress or not, track the
++	 * RIP at which a bus lock has occurred on a per-vmcb12 basis.  If RIP
++	 * is changed, guest has clearly made forward progress, bus_lock_counter
++	 * still remained '1', so reset bus_lock_counter to '0'. Eg. In the
++	 * scenario, where a buslock happened in L1 before VMRUN, the bus lock
++	 * firmly happened on an instruction in the past. Even if vmcb01's
++	 * counter is still '1', (because the guilty instruction got patched),
++	 * the vCPU has clearly made forward progress and so KVM should reset
++	 * vmcb02's counter to '0'.
++	 *
++	 * If the RIP hasn't changed, stash the bus lock counter at nested VMRUN
++	 * to prevent the same guilty instruction from triggering a VM-Exit. Eg.
++	 * if userspace rate-limits the vCPU, then it's entirely possible that
++	 * L1's tick interrupt is pending by the time userspace re-runs the
++	 * vCPU.  If KVM unconditionally clears the counter on VMRUN, then when
++	 * L1 re-enters L2, the same instruction will trigger a VM-Exit and the
++	 * entire cycle start over.
++	 */
++	if (vmcb02->save.rip && (svm->nested.ctl.bus_lock_rip == vmcb02->save.rip))
++		vmcb02->control.bus_lock_counter = 1;
++	else
++		vmcb02->control.bus_lock_counter = 0;
++
+ 	/* Done at vmrun: asid.  */
+ 
+ 	/* Also overwritten later if necessary.  */
+@@ -1039,6 +1066,13 @@ int nested_svm_vmexit(struct vcpu_svm *svm)
+ 
+ 	}
+ 
++	/*
++	 * Invalidate bus_lock_rip unless KVM is still waiting for the guest
++	 * to make forward progress before re-enabling bus lock detection.
++	 */
++	if (!vmcb02->control.bus_lock_counter)
++		svm->nested.ctl.bus_lock_rip = INVALID_GPA;
++
+ 	nested_svm_copy_common_state(svm->nested.vmcb02.ptr, svm->vmcb01.ptr);
+ 
+ 	svm_switch_vmcb(svm, &svm->vmcb01);
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 1ed5aa76e06c..d4a0843d0ec9 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -1384,6 +1384,9 @@ static void init_vmcb(struct kvm_vcpu *vcpu)
+ 		svm->vmcb->control.int_ctl |= V_GIF_ENABLE_MASK;
+ 	}
+ 
++	if (vcpu->kvm->arch.bus_lock_detection_enabled)
++		svm_set_intercept(svm, INTERCEPT_BUSLOCK);
++
+ 	if (sev_guest(vcpu->kvm))
+ 		sev_init_vmcb(svm);
+ 
+@@ -3306,6 +3309,37 @@ static int invpcid_interception(struct kvm_vcpu *vcpu)
+ 	return kvm_handle_invpcid(vcpu, type, gva);
+ }
+ 
++static inline int complete_userspace_buslock(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_svm *svm = to_svm(vcpu);
++
++	/*
++	 * If userspace has NOT changed RIP, then KVM's ABI is to let the guest
++	 * execute the bus-locking instruction.  Set the bus lock counter to '1'
++	 * to effectively step past the bus lock.
++	 */
++	if (kvm_is_linear_rip(vcpu, vcpu->arch.cui_linear_rip))
++		svm->vmcb->control.bus_lock_counter = 1;
++
++	return 1;
++}
++
++static int bus_lock_exit(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_svm *svm = to_svm(vcpu);
++
++	vcpu->run->exit_reason = KVM_EXIT_X86_BUS_LOCK;
++	vcpu->run->flags |= KVM_RUN_X86_BUS_LOCK;
++
++	vcpu->arch.cui_linear_rip = kvm_get_linear_rip(vcpu);
++	vcpu->arch.complete_userspace_io = complete_userspace_buslock;
++
++	if (is_guest_mode(vcpu))
++		svm->nested.ctl.bus_lock_rip = vcpu->arch.cui_linear_rip;
++
++	return 0;
++}
++
+ static int (*const svm_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+ 	[SVM_EXIT_READ_CR0]			= cr_interception,
+ 	[SVM_EXIT_READ_CR3]			= cr_interception,
+@@ -3375,6 +3409,7 @@ static int (*const svm_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+ 	[SVM_EXIT_INVPCID]                      = invpcid_interception,
+ 	[SVM_EXIT_IDLE_HLT]			= kvm_emulate_halt,
+ 	[SVM_EXIT_NPF]				= npf_interception,
++	[SVM_EXIT_BUS_LOCK]			= bus_lock_exit,
+ 	[SVM_EXIT_RSM]                          = rsm_interception,
+ 	[SVM_EXIT_AVIC_INCOMPLETE_IPI]		= avic_incomplete_ipi_interception,
+ 	[SVM_EXIT_AVIC_UNACCELERATED_ACCESS]	= avic_unaccelerated_access_interception,
+@@ -5377,6 +5412,9 @@ static __init void svm_set_cpu_caps(void)
+ 		kvm_cpu_cap_set(X86_FEATURE_SVME_ADDR_CHK);
+ 	}
+ 
++	if (cpu_feature_enabled(X86_FEATURE_BUS_LOCK_THRESHOLD))
++		kvm_caps.has_bus_lock_exit = true;
++
+ 	/* CPUID 0x80000008 */
+ 	if (boot_cpu_has(X86_FEATURE_LS_CFG_SSBD) ||
+ 	    boot_cpu_has(X86_FEATURE_AMD_SSBD))
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index 5ce34a1faf6a..a991a839bb6d 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -173,6 +173,7 @@ struct vmcb_ctrl_area_cached {
+ 	u64 nested_cr3;
+ 	u64 virt_ext;
+ 	u32 clean;
++	u64 bus_lock_rip;
+ 	union {
+ #if IS_ENABLED(CONFIG_HYPERV) || IS_ENABLED(CONFIG_KVM_HYPERV)
+ 		struct hv_vmcb_enlightenments hv_enlightenments;
+-- 
+2.51.0
+
