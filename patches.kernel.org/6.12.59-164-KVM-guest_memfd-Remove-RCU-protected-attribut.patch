@@ -1,0 +1,163 @@
+From: Yan Zhao <yan.y.zhao@intel.com>
+Date: Thu, 20 Nov 2025 12:36:30 -0500
+Subject: [PATCH] KVM: guest_memfd: Remove RCU-protected attribute from
+ slot->gmem.file
+References: bsc#1234429
+Patch-mainline: 6.12.59
+Git-commit: 67b43038ce14d6b0673bdffb2052d879065c94ae
+
+[ Upstream commit 67b43038ce14d6b0673bdffb2052d879065c94ae ]
+
+Remove the RCU-protected attribute from slot->gmem.file. No need to use RCU
+primitives rcu_assign_pointer()/synchronize_rcu() to update this pointer.
+
+- slot->gmem.file is updated in 3 places:
+  kvm_gmem_bind(), kvm_gmem_unbind(), kvm_gmem_release().
+  All of them are protected by kvm->slots_lock.
+
+- slot->gmem.file is read in 2 paths:
+  (1) kvm_gmem_populate
+        kvm_gmem_get_file
+        __kvm_gmem_get_pfn
+
+  (2) kvm_gmem_get_pfn
+         kvm_gmem_get_file
+         __kvm_gmem_get_pfn
+
+  Path (1) kvm_gmem_populate() requires holding kvm->slots_lock, so
+  slot->gmem.file is protected by the kvm->slots_lock in this path.
+
+  Path (2) kvm_gmem_get_pfn() does not require holding kvm->slots_lock.
+  However, it's also not guarded by rcu_read_lock() and rcu_read_unlock().
+  So synchronize_rcu() in kvm_gmem_unbind()/kvm_gmem_release() actually
+  will not wait for the readers in kvm_gmem_get_pfn() due to lack of RCU
+  read-side critical section.
+
+  The path (2) kvm_gmem_get_pfn() is safe without RCU protection because:
+  a) kvm_gmem_bind() is called on a new memslot, before the memslot is
+     visible to kvm_gmem_get_pfn().
+  b) kvm->srcu ensures that kvm_gmem_unbind() and freeing of a memslot
+     occur after the memslot is no longer visible to kvm_gmem_get_pfn().
+  c) get_file_active() ensures that kvm_gmem_get_pfn() will not access the
+     stale file if kvm_gmem_release() sets it to NULL.  This is because if
+     kvm_gmem_release() occurs before kvm_gmem_get_pfn(), get_file_active()
+     will return NULL; if get_file_active() does not return NULL,
+     kvm_gmem_release() should not occur until after kvm_gmem_get_pfn()
+     releases the file reference.
+
+Signed-off-by: Yan Zhao <yan.y.zhao@intel.com>
+Message-ID: <20241104084303.29909-1-yan.y.zhao@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Stable-dep-of: ae431059e75d ("KVM: guest_memfd: Remove bindings on memslot deletion when gmem is dying")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/linux/kvm_host.h |  7 ++++++-
+ virt/kvm/guest_memfd.c   | 34 +++++++++++++++++++++-------------
+ 2 files changed, 27 insertions(+), 14 deletions(-)
+
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 2e836d44f738..a2ebc37a29ff 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -608,7 +608,12 @@ struct kvm_memory_slot {
+ 
+ #ifdef CONFIG_KVM_PRIVATE_MEM
+ 	struct {
+-		struct file __rcu *file;
++		/*
++		 * Writes protected by kvm->slots_lock.  Acquiring a
++		 * reference via kvm_gmem_get_file() is protected by
++		 * either kvm->slots_lock or kvm->srcu.
++		 */
++		struct file *file;
+ 		pgoff_t pgoff;
+ 	} gmem;
+ #endif
+diff --git a/virt/kvm/guest_memfd.c b/virt/kvm/guest_memfd.c
+index 73e5db8ef161..343ed456b89b 100644
+--- a/virt/kvm/guest_memfd.c
++++ b/virt/kvm/guest_memfd.c
+@@ -261,15 +261,19 @@ static int kvm_gmem_release(struct inode *inode, struct file *file)
+ 	 * dereferencing the slot for existing bindings needs to be protected
+ 	 * against memslot updates, specifically so that unbind doesn't race
+ 	 * and free the memslot (kvm_gmem_get_file() will return NULL).
++	 *
++	 * Since .release is called only when the reference count is zero,
++	 * after which file_ref_get() and get_file_active() fail,
++	 * kvm_gmem_get_pfn() cannot be using the file concurrently.
++	 * file_ref_put() provides a full barrier, and get_file_active() the
++	 * matching acquire barrier.
+ 	 */
+ 	mutex_lock(&kvm->slots_lock);
+ 
+ 	filemap_invalidate_lock(inode->i_mapping);
+ 
+ 	xa_for_each(&gmem->bindings, index, slot)
+-		rcu_assign_pointer(slot->gmem.file, NULL);
+-
+-	synchronize_rcu();
++		WRITE_ONCE(slot->gmem.file, NULL);
+ 
+ 	/*
+ 	 * All in-flight operations are gone and new bindings can be created.
+@@ -298,8 +302,7 @@ static inline struct file *kvm_gmem_get_file(struct kvm_memory_slot *slot)
+ 	/*
+ 	 * Do not return slot->gmem.file if it has already been closed;
+ 	 * there might be some time between the last fput() and when
+-	 * kvm_gmem_release() clears slot->gmem.file, and you do not
+-	 * want to spin in the meanwhile.
++	 * kvm_gmem_release() clears slot->gmem.file.
+ 	 */
+ 	return get_file_active(&slot->gmem.file);
+ }
+@@ -510,11 +513,11 @@ int kvm_gmem_bind(struct kvm *kvm, struct kvm_memory_slot *slot,
+ 	}
+ 
+ 	/*
+-	 * No synchronize_rcu() needed, any in-flight readers are guaranteed to
+-	 * be see either a NULL file or this new file, no need for them to go
+-	 * away.
++	 * memslots of flag KVM_MEM_GUEST_MEMFD are immutable to change, so
++	 * kvm_gmem_bind() must occur on a new memslot.  Because the memslot
++	 * is not visible yet, kvm_gmem_get_pfn() is guaranteed to see the file.
+ 	 */
+-	rcu_assign_pointer(slot->gmem.file, file);
++	WRITE_ONCE(slot->gmem.file, file);
+ 	slot->gmem.pgoff = start;
+ 
+ 	xa_store_range(&gmem->bindings, start, end - 1, slot, GFP_KERNEL);
+@@ -550,8 +553,12 @@ void kvm_gmem_unbind(struct kvm_memory_slot *slot)
+ 
+ 	filemap_invalidate_lock(file->f_mapping);
+ 	xa_store_range(&gmem->bindings, start, end - 1, NULL, GFP_KERNEL);
+-	rcu_assign_pointer(slot->gmem.file, NULL);
+-	synchronize_rcu();
++
++	/*
++	 * synchronize_srcu(&kvm->srcu) ensured that kvm_gmem_get_pfn()
++	 * cannot see this memslot.
++	 */
++	WRITE_ONCE(slot->gmem.file, NULL);
+ 	filemap_invalidate_unlock(file->f_mapping);
+ 
+ 	fput(file);
+@@ -563,11 +570,12 @@ static struct folio *__kvm_gmem_get_pfn(struct file *file,
+ 					pgoff_t index, kvm_pfn_t *pfn,
+ 					bool *is_prepared, int *max_order)
+ {
++	struct file *gmem_file = READ_ONCE(slot->gmem.file);
+ 	struct kvm_gmem *gmem = file->private_data;
+ 	struct folio *folio;
+ 
+-	if (file != slot->gmem.file) {
+-		WARN_ON_ONCE(slot->gmem.file);
++	if (file != gmem_file) {
++		WARN_ON_ONCE(gmem_file);
+ 		return ERR_PTR(-EFAULT);
+ 	}
+ 
+-- 
+2.51.0
+
