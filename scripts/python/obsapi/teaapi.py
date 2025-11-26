@@ -26,7 +26,8 @@ def ref_arg(ref):
     return { 'ref' : ref }
 
 class TeaAPI(api.API):
-    def __init__(self, URL, logfile=None, config=None, ca=None):
+    def __init__(self, URL, logfile=None, config=None, ca=None, progress=sys.stderr):
+        self.progress = progress
         self.config = config
         URL = URL.rstrip('/')
         super().__init__(URL, logfile, ca)
@@ -45,7 +46,7 @@ class TeaAPI(api.API):
         try:
             self.token = [login['token'] for login in config['logins'] if login['url'] == self.url][0]
         except IndexError:
-            sys.stderr.write('Cannot find gitea-tea configuration for ' + self.url + '\nPlease configure tea with a token that has readwrite access to user and repository with\ntea login add')
+            sys.stderr.write('Cannot find gitea-tea configuration for ' + self.url + '\nPlease configure tea with a token that has readwrite access to user and repository with\ntea login add\n')
             exit(1)
 
     def auth_header(self, wwwa):
@@ -55,6 +56,10 @@ class TeaAPI(api.API):
         r = self.check_get('/api/v1/user')
         user = r.json()['login']
         return user
+
+    def log_progress(self, string):
+        if self.progress:
+            self.progress.write(string)
 
     def repo_path(self, org, repo):
         return '/api/v1/repos/' + org + '/' + repo
@@ -209,7 +214,7 @@ class TeaAPI(api.API):
                 if lfs and lfs.get('version') == 'https://git-lfs.github.com/spec/v1':
                     filelist[i] = filelist[i]._replace(lfs=True, lfs_oid=lfs['oid'].split(':')[1], lfs_size=lfs['size'])
                 else:
-                    sys.stderr.write('%s/%s %s %s: Invalid LFS link\n' % (org, repo, branch, f.name))
+                    self.log_progress('%s/%s %s %s: Invalid LFS link\n' % (org, repo, branch, f.name))
 
         files = {}
         for f in filelist:
@@ -242,16 +247,16 @@ class TeaAPI(api.API):
                     if files.get(filename):
                         frq['operation'] = 'update'
                         frq['sha'] = files[filename].oid
-                        sys.stderr.write('UPDATE %s\n' % (filename))
+                        self.log_progress('UPDATE %s\n' % (filename))
                     else:
                         frq['operation'] = 'create'
-                        sys.stderr.write('CREATE %s\n' % (filename))
+                        self.log_progress('CREATE %s\n' % (filename))
                     rq['files'].append(frq)
                 files.pop(filename, None)
             for filename in sorted(files.keys()):
                 frq = { 'path' : filename, 'operation' : 'delete', 'sha' : files[filename].oid }
                 rq['files'].append(frq)
-                sys.stderr.write('DELETE %s\n' % (filename))
+                self.log_progress('DELETE %s\n' % (filename))
             if len(rq['files']) > 0:
                 self.check_post(self.repo_path(org, repo) + '/contents', json=rq)
 
