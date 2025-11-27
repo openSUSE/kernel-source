@@ -1,0 +1,181 @@
+From e21ca19b655aadd050a783f60cf310d7dec8c4fb Mon Sep 17 00:00:00 2001
+From: Tim Chen <tim.c.chen@linux.intel.com>
+Date: Mon, 10 Nov 2025 10:47:35 -0800
+Subject: [PATCH] sched/fair: Skip sched_balance_running cmpxchg when balance
+ is not due
+
+References: bsc#1248792
+Patch-mainline: Queued in subsystem maintainer repository
+Git-commit: 3324b2180c17b21c31c16966cc85ca41a7c93703
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git
+
+The NUMA sched domain sets the SD_SERIALIZE flag by default, allowing
+only one NUMA load balancing operation to run system-wide at a time.
+
+Currently, each sched group leader directly under NUMA domain attempts
+to acquire the global sched_balance_running flag via cmpxchg() before
+checking whether load balancing is due or whether it is the designated
+load balancer for that NUMA domain. On systems with a large number
+of cores, this causes significant cache contention on the shared
+sched_balance_running flag.
+
+This patch reduces unnecessary cmpxchg() operations by first checking
+that the balancer is the designated leader for a NUMA domain from
+should_we_balance(), and the balance interval has expired before
+trying to acquire sched_balance_running to load balance a NUMA
+domain.
+
+On a 2-socket Granite Rapids system with sub-NUMA clustering enabled,
+running an OLTP workload, 7.8% of total CPU cycles were previously spent
+in sched_balance_domain() contending on sched_balance_running before
+this change.
+
+         : 104              static __always_inline int arch_atomic_cmpxchg(atomic_t *v, int old, int new)
+         : 105              {
+         : 106              return arch_cmpxchg(&v->counter, old, new);
+    0.00 :   ffffffff81326e6c:       xor    %eax,%eax
+    0.00 :   ffffffff81326e6e:       mov    $0x1,%ecx
+    0.00 :   ffffffff81326e73:       lock cmpxchg %ecx,0x2394195(%rip)        # ffffffff836bb010 <sched_balance_running>
+         : 110              sched_balance_domains():
+         : 12234            if (atomic_cmpxchg_acquire(&sched_balance_running, 0, 1))
+   99.39 :   ffffffff81326e7b:       test   %eax,%eax
+    0.00 :   ffffffff81326e7d:       jne    ffffffff81326e99 <sched_balance_domains+0x209>
+         : 12238            if (time_after_eq(jiffies, sd->last_balance + interval)) {
+    0.00 :   ffffffff81326e7f:       mov    0x14e2b3a(%rip),%rax        # ffffffff828099c0 <jiffies_64>
+    0.00 :   ffffffff81326e86:       sub    0x48(%r14),%rax
+    0.00 :   ffffffff81326e8a:       cmp    %rdx,%rax
+
+After applying this fix, sched_balance_domain() is gone from the profile
+and there is a 5% throughput improvement.
+
+[peterz: made it so that redo retains the 'lock' and split out the
+         CPU_NEWLY_IDLE change to a separate patch]
+Signed-off-by: Tim Chen <tim.c.chen@linux.intel.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Chen Yu <yu.c.chen@intel.com>
+Reviewed-by: Vincent Guittot <vincent.guittot@linaro.org>
+Reviewed-by: Shrikanth Hegde <sshegde@linux.ibm.com>
+Reviewed-by: K Prateek Nayak <kprateek.nayak@amd.com>
+Reviewed-by: Srikar Dronamraju <srikar@linux.ibm.com>
+Tested-by: Mohini Narkhede <mohini.narkhede@intel.com>
+Tested-by: Shrikanth Hegde <sshegde@linux.ibm.com>
+Link: https://patch.msgid.link/6fed119b723c71552943bfe5798c93851b30a361.1762800251.git.tim.c.chen@linux.intel.com
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ kernel/sched/fair.c | 54 +++++++++++++++++++++++++++--------------------------
+ 1 file changed, 28 insertions(+), 26 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 8f55da13a689..d5d5b2e558c3 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -11843,6 +11843,21 @@ static void update_lb_imbalance_stat(struct lb_env *env, struct sched_domain *sd
+ 	}
+ }
+ 
++/*
++ * This flag serializes load-balancing passes over large domains
++ * (above the NODE topology level) - only one load-balancing instance
++ * may run at a time, to reduce overhead on very large systems with
++ * lots of CPUs and large NUMA distances.
++ *
++ * - Note that load-balancing passes triggered while another one
++ *   is executing are skipped and not re-tried.
++ *
++ * - Also note that this does not serialize rebalance_domains()
++ *   execution, as non-SD_SERIALIZE domains will still be
++ *   load-balanced in parallel.
++ */
++static atomic_t sched_balance_running = ATOMIC_INIT(0);
++
+ /*
+  * Check this_cpu to ensure it is balanced within domain. Attempt to move
+  * tasks if there is an imbalance.
+@@ -11868,6 +11883,7 @@ static int sched_balance_rq(int this_cpu, struct rq *this_rq,
+ 		.fbq_type	= all,
+ 		.tasks		= LIST_HEAD_INIT(env.tasks),
+ 	};
++	bool need_unlock = false;
+ 
+ 	cpumask_and(cpus, sched_domain_span(sd), cpu_active_mask);
+ 
+@@ -11879,6 +11895,14 @@ static int sched_balance_rq(int this_cpu, struct rq *this_rq,
+ 		goto out_balanced;
+ 	}
+ 
++	if (!need_unlock && (sd->flags & SD_SERIALIZE) && idle != CPU_NEWLY_IDLE) {
++		int zero = 0;
++		if (!atomic_try_cmpxchg_acquire(&sched_balance_running, &zero, 1))
++			goto out_balanced;
++
++		need_unlock = true;
++	}
++
+ 	group = sched_balance_find_src_group(&env);
+ 	if (!group) {
+ 		schedstat_inc(sd->lb_nobusyg[idle]);
+@@ -12119,6 +12143,9 @@ static int sched_balance_rq(int this_cpu, struct rq *this_rq,
+ 	    sd->balance_interval < sd->max_interval)
+ 		sd->balance_interval *= 2;
+ out:
++	if (need_unlock)
++		atomic_set_release(&sched_balance_running, 0);
++
+ 	return ld_moved;
+ }
+ 
+@@ -12243,21 +12270,6 @@ static int active_load_balance_cpu_stop(void *data)
+ 	return 0;
+ }
+ 
+-/*
+- * This flag serializes load-balancing passes over large domains
+- * (above the NODE topology level) - only one load-balancing instance
+- * may run at a time, to reduce overhead on very large systems with
+- * lots of CPUs and large NUMA distances.
+- *
+- * - Note that load-balancing passes triggered while another one
+- *   is executing are skipped and not re-tried.
+- *
+- * - Also note that this does not serialize rebalance_domains()
+- *   execution, as non-SD_SERIALIZE domains will still be
+- *   load-balanced in parallel.
+- */
+-static atomic_t sched_balance_running = ATOMIC_INIT(0);
+-
+ /*
+  * Scale the max sched_balance_rq interval with the number of CPUs in the system.
+  * This trades load-balance latency on larger machines for less cross talk.
+@@ -12313,7 +12325,7 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
+ 	/* Earliest time when we have to do rebalance again */
+ 	unsigned long next_balance = jiffies + 60*HZ;
+ 	int update_next_balance = 0;
+-	int need_serialize, need_decay = 0;
++	int need_decay = 0;
+ 	u64 max_cost = 0;
+ 
+ 	rcu_read_lock();
+@@ -12337,13 +12349,6 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
+ 		}
+ 
+ 		interval = get_sd_balance_interval(sd, busy);
+-
+-		need_serialize = sd->flags & SD_SERIALIZE;
+-		if (need_serialize) {
+-			if (atomic_cmpxchg_acquire(&sched_balance_running, 0, 1))
+-				goto out;
+-		}
+-
+ 		if (time_after_eq(jiffies, sd->last_balance + interval)) {
+ 			if (sched_balance_rq(cpu, rq, sd, idle, &continue_balancing)) {
+ 				/*
+@@ -12357,9 +12362,6 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
+ 			sd->last_balance = jiffies;
+ 			interval = get_sd_balance_interval(sd, busy);
+ 		}
+-		if (need_serialize)
+-			atomic_set_release(&sched_balance_running, 0);
+-out:
+ 		if (time_after(next_balance, sd->last_balance + interval)) {
+ 			next_balance = sd->last_balance + interval;
+ 			update_next_balance = 1;
