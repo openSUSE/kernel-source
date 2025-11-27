@@ -10,20 +10,24 @@ import re
 import os
 
 class UploaderBase:
+    def log_progress(self, string):
+        if hasattr(self, 'progress') and self.progress:
+            self.progress.write(string)
+
     def upload(self, data, message):
         self.data = data
-        sys.stderr.write('Updating .gitattributes to put tarballs into LFS.\n')
+        self.log_progress('Updating .gitattributes to put tarballs into LFS.\n')
         self.tea.update_gitattr(self.user, self.upstream.repo, self.user_branch)
-        sys.stderr.write('Updating branch %s with content of %s\n' % (self.user_branch, data))
+        self.log_progress('Updating branch %s with content of %s\n' % (self.user_branch, data))
         self.tea.update_content(self.user, self.upstream.repo, self.user_branch, data, message)
         self.commit = self.tea.repo_branches(self.user, self.upstream.repo)[self.user_branch]['commit']['id']
-        sys.stderr.write('commit sha: %s\n' % (self.commit,))
+        self.log_progress('commit sha: %s\n' % (self.commit,))
         return self.commit
 
     def ignore_kabi(self):
         self.ignore_kabi_badness = True
         file = 'IGNORE-KABI-BADNESS'
-        sys.stderr.write('Uploading %s\n' % (file,))
+        self.log_progress('Uploading %s\n' % (file,))
         self.tea.update_file(self.user, self.upstream.repo, self.user_branch, file, [])
 
     def sync_url(self):
@@ -42,10 +46,10 @@ class UploaderBase:
                         message = f.read()
             if not len(message) > 0:
                 raise APIError('Non-empty PR message needed')
-            sys.stderr.write('Creating PR for %s/%s %s from %s/%s %s\n' % (self.upstream.org, self.upstream.repo, self.upstream.branch, self.user, self.upstream.repo, self.user_branch))
+            self.log_progress('Creating PR for %s/%s %s from %s/%s %s\n' % (self.upstream.org, self.upstream.repo, self.upstream.branch, self.user, self.upstream.repo, self.user_branch))
             pr = self.tea.open_pr(self.upstream.org, self.upstream.repo, self.upstream.branch, self.user + ':' + self.user_branch, message)
         pr = pr['html_url']
-        sys.stderr.write('%s\n' % (pr,))
+        self.log_progress('%s\n' % (pr,))
         return pr
 
     def get_qa_repo(self, r):
@@ -128,7 +132,7 @@ class UploaderBase:
             elif self.obs.user_exists(m):
                 ET.SubElement(xml, 'person', userid=m, role='maintainer')
             else:
-                sys.stderr.write('User id "%s" does not exist at %s\n' % (m, self.obs.url));
+                self.log_progress('User id "%s" does not exist at %s\n' % (m, self.obs.url));
         e = ET.SubElement(xml, 'build')
         ET.SubElement(e, 'enable')
         e = ET.SubElement(xml, 'publish')
@@ -222,16 +226,16 @@ Constraint: hardware:disk:size unit=G %i
             packages = []
         packages = [p[0:-len(ext)] if p.endswith(ext) else p for p in packages]
         packages = packages + [ 'kernel-' + p for p in packages]
-        filist = list_files(self.data)
+        filelist = list_files(self.data)
         packages = [p for p in packages if p + ext in filelist]
         return packages
 
     def create_project(self, maintainers=None, limit_packages=None, debuginfo=None, rpm_checks=None, rebuild=None):
         limit_packages = self.filter_limit_packages(limit_packages)
-        sys.stderr.write('Creating %s...' % (self.project,))
+        self.log_progress('Creating %s...' % (self.project,))
         self.obs.create_project(self.project, meta=self.prjmeta(maintainers=maintainers, limit_packages=limit_packages, rebuild=rebuild, debuginfo=debuginfo),
                                        conf=self.prjconf(limit_packages=limit_packages, debuginfo=debuginfo, rpm_checks=rpm_checks))
-        sys.stderr.write('ok\n')
+        self.log_progress('ok\n')
 
     def pkgmeta(self):
         pkgmeta = ET.Element('package', name=self.package, project=self.project)
@@ -250,12 +254,12 @@ Constraint: hardware:disk:size unit=G %i
         specs = list_specs(self.data)
         repo_archs = self.get_project_repo_archs(limit_packages)
         package = get_kernel_project_package(self.data)[1]
-        sys.stderr.write('Creating %s/%s...' % (self.project, self.package))
-        sys.stderr.write('ok\n')
+        self.log_progress('Creating %s/%s...' % (self.project, self.package))
+        self.log_progress('ok\n')
         self.obs.create_package_meta(self.project, self.package, self.pkgmeta())
         kob = 'kernel-obs-build'
         kob_agg = kob + '.agg'
-        sys.stderr.write('Aggregating %s/%s...' % (self.project, kob_agg))
+        self.log_progress('Aggregating %s/%s...' % (self.project, kob_agg))
         self.obs.create_package(self.project, kob_agg)
         aggxml = ET.Element('aggregatelist')
         agg = ET.SubElement(aggxml, 'aggregate', project = self.project)
@@ -270,35 +274,36 @@ Constraint: hardware:disk:size unit=G %i
             ET.SubElement(agg, 'repository', target=r)
         ET.indent(aggxml)
         self.obs.upload_file(self.project, kob_agg, '_aggregate', ET.tostring(aggxml), 'application/xml')
-        sys.stderr.write('ok\n')
+        self.log_progress('ok\n')
         links = self.obs.list_package_links(self.project, self.package)
         if not multibuild:
             for s in specs:
                 if s == package:
                     continue
-                sys.stderr.write('Linking %s/%s...' % (self.project, s))
+                self.log_progress('Linking %s/%s...' % (self.project, s))
                 self.obs.create_link(self.project, s, self.package)
                 while s in links:
                     links.remove(s)
-                sys.stderr.write('ok\n')
+                self.log_progress('ok\n')
         for s in links:
-            sys.stderr.write('Deleting %s/%s...' % (self.project, s))
+            self.log_progress('Deleting %s/%s...' % (self.project, s))
             self.obs.delete_package(self.project, s)
-            sys.stderr.write('ok\n')
+            self.log_progress('ok\n')
 
 
 class Uploader(UploaderBase):
-    def __init__(self, api, upstream_project, user_project, package, reset_branch=False, logfile=None):
+    def __init__(self, api, upstream_project, user_project, package, reset_branch=False, logfile=None, progress=True):
+        self.progress = sys.stderr if progress else None
         self.package = package
         self.project = user_project
         self.obs = OBSAPI(api, logfile)
-        sys.stderr.write('Getting scmsync for %s/%s...' % (upstream_project, package))
+        self.log_progress('Getting scmsync for %s/%s...' % (upstream_project, package))
         self.upstream = self.obs.package_repo(upstream_project, package)
-        sys.stderr.write('%s\n' % (repr(self.upstream),))
-        self.tea = TeaAPI(self.upstream.api, logfile)
-        sys.stderr.write('Getting Gitea user...')
+        self.log_progress('%s\n' % (repr(self.upstream),))
+        self.tea = TeaAPI(self.upstream.api, logfile, progress=self.progress)
+        self.log_progress('Getting Gitea user...')
         self.user = self.tea.get_user()
-        sys.stderr.write('%s\n' % (self.user,))
+        self.log_progress('%s\n' % (self.user,))
         self.user_branch = user_project.translate(str.maketrans(':', '/')) if user_project else self.upstream.branch
         upstream_info = self.tea.repo_exists(self.upstream.org, self.upstream.repo)
         if upstream_info:
@@ -315,16 +320,16 @@ class Uploader(UploaderBase):
             assert self.tea.repo_commit(self.upstream.org, self.upstream.repo, self.upstream.commit)
         if not downstream_info:
             if upstream_info:
-                sys.stderr.write('Forking repository %s/%s from %s/%s.\n' % (self.user, self.upstream.repo, self.upstream.org, self.upstream.repo))
+                self.log_progress('Forking repository %s/%s from %s/%s.\n' % (self.user, self.upstream.repo, self.upstream.org, self.upstream.repo))
             else:
-                sys.stderr.write('Creating repository %s/%s.\n' % (self.user, self.upstream.repo))
+                self.log_progress('Creating repository %s/%s.\n' % (self.user, self.upstream.repo))
             downstream_info = self.tea.fork_repo(self.upstream.org, self.user, self.upstream.repo)
         if upstream_info and self.upstream.branch:
-            sys.stderr.write('Merging upstream branch %s.\n' % (self.upstream.branch,))
+            self.log_progress('Merging upstream branch %s.\n' % (self.upstream.branch,))
             self.tea.merge_upstream_branch(self.user, self.upstream.repo, self.upstream.branch)
         if reset_branch:
-            sys.stderr.write('Resetting branch %s.\n' % (self.user_branch,))
+            self.log_progress('Resetting branch %s.\n' % (self.user_branch,))
         else:
-            sys.stderr.write('Creating branch %s.\n' % (self.user_branch,))
+            self.log_progress('Creating branch %s.\n' % (self.user_branch,))
         self.tea.create_branch(self.user, self.upstream.repo, self.user_branch, self.upstream.branch, self.upstream.commit, reset_branch)
         self.ignore_kabi_badness = False
