@@ -119,7 +119,7 @@ class UploaderBase:
     def prjmeta(self, limit_packages=None, rebuild=False, debuginfo=False, maintainers=[]):
         repo_archs = self.get_project_repo_archs(limit_packages)
         source_timestamp = read_source_timestamp(os.path.join(self.data, 'source-timestamp'))
-        branch = source_timestamp.get('git branch', None)
+        branch = source_timestamp.get('git branch', 'unknown')
         xml = ET.Element('project', name=self.project)
         e = ET.SubElement(xml, 'title')
         e.text = 'Kernel builds for branch ' + branch
