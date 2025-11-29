@@ -115,22 +115,32 @@ class TeaAPI(api.API):
         return self.check_delete(self.repo_path(org, repo) + '/branches/' + branch)
 
     def repo_commit(self, org, repo, commit):
-        return self.check_get(self.repo_path(org, repo) + '/git/commits/' + commit, params = {
+        return self.get(self.repo_path(org, repo) + '/git/commits/' + commit, params = {
             'stat' : False,
             'files' : False,
             'verification' : False,
             })
 
+    def repo_commit_exists(self, org, repo, commit):
+        c = self.repo_commit(org, repo, commit)
+        if c.status == 404:
+            sys.stderr.write('Commit %s not in %s/%s %s\n' % (commit, org, repo, c.status_message_pretty))
+            return False
+        c.raise_for_status()
+        return c
+
     def merge_upstream_branch(self, org, repo, branch):
-        return self.check_post(self.repo_path(org, repo) + '/merge-upstream', json = {
+        if not branch in self.repo_branches(org, repo):
+            self.create_branch(org, repo, branch, None, None)
+        return self.post(self.repo_path(org, repo) + '/merge-upstream', json = {
             'branch': branch,
             })
 
     def create_branch(self, org, repo, branch, ref_branch, commit, reset=False):
         branches = self.repo_branches(org, repo)
-        if commit:
-            assert self.repo_commit(org, repo, commit)
-        elif ref_branch:
+        if commit and not self.repo_commit_exists(org, repo, commit):
+            commit = None
+        if not commit and  ref_branch:
             assert ref_branch in branches
         if branch in branches:
             if not reset:
