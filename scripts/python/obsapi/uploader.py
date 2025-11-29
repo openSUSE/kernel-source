@@ -317,7 +317,7 @@ class Uploader(UploaderBase):
         if self.upstream.branch:
             assert self.upstream.branch in self.tea.repo_branches(self.upstream.org, self.upstream.repo)
         if self.upstream.commit:  # Maybe check it's part of the branch as well?
-            assert self.tea.repo_commit(self.upstream.org, self.upstream.repo, self.upstream.commit)
+            self.tea.repo_commit_exists(self.upstream.org, self.upstream.repo, self.upstream.commit)  # may be missing because of sync error
         if not downstream_info:
             if upstream_info:
                 self.log_progress('Forking repository %s/%s from %s/%s.\n' % (self.user, self.upstream.repo, self.upstream.org, self.upstream.repo))
@@ -325,8 +325,12 @@ class Uploader(UploaderBase):
                 self.log_progress('Creating repository %s/%s.\n' % (self.user, self.upstream.repo))
             downstream_info = self.tea.fork_repo(self.upstream.org, self.user, self.upstream.repo)
         if upstream_info and self.upstream.branch:
-            self.log_progress('Merging upstream branch %s.\n' % (self.upstream.branch,))
-            self.tea.merge_upstream_branch(self.user, self.upstream.repo, self.upstream.branch)
+            self.log_progress('Merging upstream branch %s..' % (self.upstream.branch,))
+            pull = self.tea.merge_upstream_branch(self.user, self.upstream.repo, self.upstream.branch)
+            if not pull.ok:
+                self.log_progress(' '.join([pull.status_message_pretty, repr(pull.json())]) + '\n')
+            else:
+                self.log_progress('ok\n')
         if reset_branch:
             self.log_progress('Resetting branch %s.\n' % (self.user_branch,))
         else:
