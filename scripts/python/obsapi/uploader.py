@@ -331,9 +331,10 @@ class Uploader(UploaderBase):
                 self.log_progress(' '.join([pull.status_message_pretty, repr(pull.json())]) + '\n')
             else:
                 self.log_progress('ok\n')
-        if reset_branch:
-            self.log_progress('Resetting branch %s.\n' % (self.user_branch,))
-        else:
-            self.log_progress('Creating branch %s.\n' % (self.user_branch,))
-        self.tea.create_branch(self.user, self.upstream.repo, self.user_branch, self.upstream.branch, self.upstream.commit, reset_branch)
+        if not downstream_info['empty']:
+            if reset_branch:
+                self.log_progress('Resetting branch %s.\n' % (self.user_branch,))
+            else:
+                self.log_progress('Creating branch %s.\n' % (self.user_branch,))
+            self.tea.create_branch(self.user, self.upstream.repo, self.user_branch, self.upstream.branch, self.upstream.commit, reset_branch)
         self.ignore_kabi_badness = False
