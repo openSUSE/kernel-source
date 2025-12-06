@@ -27,3 +27,5 @@ BUILD_HTML=Yes
 BUILD_PDF=No
 # Generate compile_commands.json
 GENERATE_COMPILE_COMMANDS=Yes
+# Use the new kABI tool
+USE_SUSE_KABI_TOOLS=Yes
