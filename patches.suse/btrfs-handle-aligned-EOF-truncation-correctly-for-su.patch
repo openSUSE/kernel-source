@@ -1,0 +1,162 @@
+Message-ID: <4e2945f73b076bbd5c0bbb8f0da1e52180de9bda.1765938409.git.wqu@suse.com>
+From: Qu Wenruo <wqu@suse.com>
+Date: Sat, 26 Apr 2025 08:06:50 +0930
+Subject: btrfs: handle aligned EOF truncation correctly for subpage cases
+References: bsc#1253238
+Git-commit: 4e2945f73b076bbd5c0bbb8f0da1e52180de9bda
+Patch-mainline: 6.16-rc1
+
+[BUG]
+For the following fsx -e 1 run, the btrfs still fails the run on 64K
+page size with 4K fs block size:
+
+  READ BAD DATA: offset = 0x26b3a, size = 0xfafa, fname = /mnt/btrfs/junk
+  OFFSET      GOOD    BAD     RANGE
+  0x26b3a     0x0000  0x15b4  0x0
+  operation# (mod 256) for the bad data may be 21
+  [...]
+  LOG DUMP (28 total operations):
+  1(  1 mod 256): SKIPPED (no operation)
+  2(  2 mod 256): SKIPPED (no operation)
+  3(  3 mod 256): SKIPPED (no operation)
+  4(  4 mod 256): SKIPPED (no operation)
+  5(  5 mod 256): WRITE    0x1ea90 thru 0x285e0	(0x9b51 bytes) HOLE
+  6(  6 mod 256): ZERO     0x1b1a8 thru 0x20bd4	(0x5a2d bytes)
+  7(  7 mod 256): FALLOC   0x22b1a thru 0x272fa	(0x47e0 bytes) INTERIOR
+  8(  8 mod 256): WRITE    0x741d thru 0x13522	(0xc106 bytes)
+  9(  9 mod 256): MAPWRITE 0x73ee thru 0xdeeb	(0x6afe bytes)
+  10( 10 mod 256): FALLOC   0xb719 thru 0xb994	(0x27b bytes) INTERIOR
+  11( 11 mod 256): COPY 0x15ed8 thru 0x18be1	(0x2d0a bytes) to 0x25f6e thru 0x28c77
+  12( 12 mod 256): ZERO     0x1615e thru 0x1770e	(0x15b1 bytes)
+  13( 13 mod 256): SKIPPED (no operation)
+  14( 14 mod 256): DEDUPE 0x20000 thru 0x27fff	(0x8000 bytes) to 0x1000 thru 0x8fff
+  15( 15 mod 256): SKIPPED (no operation)
+  16( 16 mod 256): CLONE 0xa000 thru 0xffff	(0x6000 bytes) to 0x36000 thru 0x3bfff
+  17( 17 mod 256): ZERO     0x14adc thru 0x1b78a	(0x6caf bytes)
+  18( 18 mod 256): TRUNCATE DOWN	from 0x3c000 to 0x1e2e3	******WWWW
+  19( 19 mod 256): CLONE 0x4000 thru 0x11fff	(0xe000 bytes) to 0x16000 thru 0x23fff
+  20( 20 mod 256): FALLOC   0x311e1 thru 0x3681b	(0x563a bytes) PAST_EOF
+  21( 21 mod 256): FALLOC   0x351c5 thru 0x40000	(0xae3b bytes) EXTENDING
+  22( 22 mod 256): WRITE    0x920 thru 0x7e51	(0x7532 bytes)
+  23( 23 mod 256): COPY 0x2b58 thru 0xc508	(0x99b1 bytes) to 0x117b1 thru 0x1b161
+  24( 24 mod 256): TRUNCATE DOWN	from 0x40000 to 0x3c9a5
+  25( 25 mod 256): SKIPPED (no operation)
+  26( 26 mod 256): MAPWRITE 0x25020 thru 0x26b06	(0x1ae7 bytes)
+  27( 27 mod 256): SKIPPED (no operation)
+  28( 28 mod 256): READ     0x26b3a thru 0x36633	(0xfafa bytes)	***RRRR***
+
+[CAUSE]
+The involved operations are:
+
+  fallocating to largest ever: 0x40000
+  21 pollute_eof	0x24000 thru	0x2ffff	(0xc000 bytes)
+  21 falloc	from 0x351c5 to 0x40000 (0xae3b bytes)
+  28 read	0x26b3a thru	0x36633	(0xfafa bytes)
+
+At operation #21 a pollute_eof is done, by memory mapped write into
+range [0x24000, 0x2ffff).
+At this stage, the inode size is 0x24000, which is block aligned.
+
+Then fallocate happens, and since it's expanding the inode, it will call
+btrfs_truncate_block() to truncate any unaligned range.
+
+But since the inode size is already block aligned,
+btrfs_truncate_block() does nothing and exits.
+
+However remember the folio at 0x20000 has some range polluted already,
+although it will not be written back to disk, it still affects the
+page cache, resulting the later operation #28 to read out the polluted
+value.
+
+[FIX]
+Instead of early exit from btrfs_truncate_block() if the range is
+already block aligned, do extra filio zeroing if the fs block size is
+smaller than the page size and we're truncating beyond EOF.
+
+This is to address exactly the above case where memory mapped write can
+still leave some garbage beyond EOF.
+
+Reviewed-by: Boris Burkov <boris@bur.io>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/inode.c | 55 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index db46fda53770..9dfa9f421306 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -4785,6 +4785,52 @@ static bool is_inside_block(u64 bytenr, u64 blockstart, u32 blocksize)
+ 	return false;
+ }
+ 
++static int truncate_block_zero_beyond_eof(struct btrfs_inode *inode, u64 start)
++{
++	const pgoff_t index = (start >> PAGE_SHIFT);
++	struct address_space *mapping = inode->vfs_inode.i_mapping;
++	struct folio *folio;
++	u64 zero_start;
++	u64 zero_end;
++	int ret = 0;
++
++again:
++	folio = filemap_lock_folio(mapping, index);
++	/* No folio present. */
++	if (IS_ERR(folio))
++		return 0;
++
++	if (!folio_test_uptodate(folio)) {
++		ret = btrfs_read_folio(NULL, folio);
++		folio_lock(folio);
++		if (folio->mapping != mapping) {
++			folio_unlock(folio);
++			folio_put(folio);
++			goto again;
++		}
++		if (!folio_test_uptodate(folio)) {
++			ret = -EIO;
++			goto out_unlock;
++		}
++	}
++	folio_wait_writeback(folio);
++
++	/*
++	 * We do not need to lock extents nor wait for OE, as it's already
++	 * beyond EOF.
++	 */
++
++	zero_start = max_t(u64, folio_pos(folio), start);
++	zero_end = folio_pos(folio) + folio_size(folio) - 1;
++	folio_zero_range(folio, zero_start - folio_pos(folio),
++			 zero_end - zero_start + 1);
++
++out_unlock:
++	folio_unlock(folio);
++	folio_put(folio);
++	return ret;
++}
++
+ /*
+  * Handle the truncation of a fs block.
+  *
+@@ -4833,8 +4879,15 @@ int btrfs_truncate_block(struct btrfs_inode *inode, u64 offset, u64 start, u64 e
+ 	       offset, start, end);
+ 
+ 	/* The range is aligned at both ends. */
+-	if (IS_ALIGNED(start, blocksize) && IS_ALIGNED(end + 1, blocksize))
++	if (IS_ALIGNED(start, blocksize) && IS_ALIGNED(end + 1, blocksize)) {
++		/*
++		 * For block size < page size case, we may have polluted blocks
++		 * beyond EOF. So we also need to zero them out.
++		 */
++		if (end == (u64)-1 && blocksize < PAGE_SIZE)
++			ret = truncate_block_zero_beyond_eof(inode, start);
+ 		goto out;
++	}
+ 
+ 	/*
+ 	 * @offset may not be inside the head nor tail block. In that case we
+-- 
+2.52.0
+
