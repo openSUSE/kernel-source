@@ -1,0 +1,200 @@
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Tue, 7 Oct 2025 22:03:47 +0000
+Subject: [PATCH] bpf: Fix sleepable context for async callbacks
+References: bsc#1012628
+Patch-mainline: 6.18.2
+Git-commit: 469d638d1520a9332cd0d034690e75e845610a51
+
+[ Upstream commit 469d638d1520a9332cd0d034690e75e845610a51 ]
+
+Fix the BPF verifier to correctly determine the sleepable context of
+async callbacks based on the async primitive type rather than the arming
+program's context.
+
+The bug is in in_sleepable() which uses OR logic to check if the current
+execution context is sleepable. When a sleepable program arms a timer
+callback, the callback's state correctly has in_sleepable=false, but
+in_sleepable() would still return true due to env->prog->sleepable being
+true. This incorrectly allows sleepable helpers like
+bpf_copy_from_user() inside timer callbacks when armed from sleepable
+programs, even though timer callbacks always execute in non-sleepable
+context.
+
+Fix in_sleepable() to rely solely on env->cur_state->in_sleepable, and
+initialize state->in_sleepable to env->prog->sleepable in
+do_check_common() for the main program entry. This ensures the sleepable
+context is properly tracked per verification state rather than being
+overridden by the program's sleepability.
+
+The env->cur_state NULL check in in_sleepable() was only needed for
+do_misc_fixups() which runs after verification when env->cur_state is
+set to NULL. Update do_misc_fixups() to use env->prog->sleepable
+directly for the storage_get_function check, and remove the redundant
+NULL check from in_sleepable().
+
+Introduce is_async_cb_sleepable() helper to explicitly determine async
+callback sleepability based on the primitive type:
+  - bpf_timer callbacks are never sleepable
+  - bpf_wq and bpf_task_work callbacks are always sleepable
+
+Add verifier_bug() check to catch unhandled async callback types,
+ensuring future additions cannot be silently mishandled. Move the
+is_task_work_add_kfunc() forward declaration to the top alongside other
+callback-related helpers. We update push_async_cb() to adjust to the new
+changes.
+
+At the same time, while simplifying in_sleepable(), we notice a problem
+in do_misc_fixups. Fix storage_get helpers to use GFP_ATOMIC when called
+from non-sleepable contexts within sleepable programs, such as bpf_timer
+callbacks.
+
+Currently, the check in do_misc_fixups assumes that env->prog->sleepable,
+previously in_sleepable(env) which only resolved to this check before
+last commit, holds across the program's execution, but that is not true.
+Instead, the func_atomic bit must be set whenever we see the function
+being called in an atomic context. Previously, this is being done when
+the helper is invoked in atomic contexts in sleepable programs, we can
+simply just set the value to true without doing an in_sleepable() check.
+
+We must also do a standalone in_sleepable() check to handle cases where
+the async callback itself is armed from a sleepable program, but is
+itself non-sleepable (e.g., timer callback) and invokes such a helper,
+thus needing the func_atomic bit to be true for the said call.
+
+Adjust do_misc_fixups() to drop any checks regarding sleepable nature of
+the program, and just depend on the func_atomic bit to decide which GFP
+flag to pass.
+
+Fixes: 81f1d7a583fa ("bpf: wq: add bpf_wq_set_callback_impl")
+Fixes: b00fa38a9c1c ("bpf: Enable non-atomic allocations in local storage")
+Acked-by: Eduard Zingerman <eddyz87@gmail.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20251007220349.3852807-2-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ kernel/bpf/verifier.c | 41 ++++++++++++++++++++++++++++++-----------
+ 1 file changed, 30 insertions(+), 11 deletions(-)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index fbe4bb91c564..460107b0449f 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -515,6 +515,7 @@ static bool is_callback_calling_kfunc(u32 btf_id);
+ static bool is_bpf_throw_kfunc(struct bpf_insn *insn);
+ 
+ static bool is_bpf_wq_set_callback_impl_kfunc(u32 btf_id);
++static bool is_task_work_add_kfunc(u32 func_id);
+ 
+ static bool is_sync_callback_calling_function(enum bpf_func_id func_id)
+ {
+@@ -547,6 +548,21 @@ static bool is_async_callback_calling_insn(struct bpf_insn *insn)
+ 	       (bpf_pseudo_kfunc_call(insn) && is_async_callback_calling_kfunc(insn->imm));
+ }
+ 
++static bool is_async_cb_sleepable(struct bpf_verifier_env *env, struct bpf_insn *insn)
++{
++	/* bpf_timer callbacks are never sleepable. */
++	if (bpf_helper_call(insn) && insn->imm == BPF_FUNC_timer_set_callback)
++		return false;
++
++	/* bpf_wq and bpf_task_work callbacks are always sleepable. */
++	if (bpf_pseudo_kfunc_call(insn) && insn->off == 0 &&
++	    (is_bpf_wq_set_callback_impl_kfunc(insn->imm) || is_task_work_add_kfunc(insn->imm)))
++		return true;
++
++	verifier_bug(env, "unhandled async callback in is_async_cb_sleepable");
++	return false;
++}
++
+ static bool is_may_goto_insn(struct bpf_insn *insn)
+ {
+ 	return insn->code == (BPF_JMP | BPF_JCOND) && insn->src_reg == BPF_MAY_GOTO;
+@@ -5826,8 +5842,7 @@ static int map_kptr_match_type(struct bpf_verifier_env *env,
+ 
+ static bool in_sleepable(struct bpf_verifier_env *env)
+ {
+-	return env->prog->sleepable ||
+-	       (env->cur_state && env->cur_state->in_sleepable);
++	return env->cur_state->in_sleepable;
+ }
+ 
+ /* The non-sleepable programs and sleepable programs with explicit bpf_rcu_read_lock()
+@@ -10368,8 +10383,6 @@ typedef int (*set_callee_state_fn)(struct bpf_verifier_env *env,
+ 				   struct bpf_func_state *callee,
+ 				   int insn_idx);
+ 
+-static bool is_task_work_add_kfunc(u32 func_id);
+-
+ static int set_callee_state(struct bpf_verifier_env *env,
+ 			    struct bpf_func_state *caller,
+ 			    struct bpf_func_state *callee, int insn_idx);
+@@ -10588,8 +10601,7 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
+ 		env->subprog_info[subprog].is_async_cb = true;
+ 		async_cb = push_async_cb(env, env->subprog_info[subprog].start,
+ 					 insn_idx, subprog,
+-					 is_bpf_wq_set_callback_impl_kfunc(insn->imm) ||
+-					 is_task_work_add_kfunc(insn->imm));
++					 is_async_cb_sleepable(env, insn));
+ 		if (!async_cb)
+ 			return -EFAULT;
+ 		callee = async_cb->frame[0];
+@@ -11428,7 +11440,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
+ 			return -EINVAL;
+ 		}
+ 
+-		if (in_sleepable(env) && is_storage_get_function(func_id))
++		if (is_storage_get_function(func_id))
+ 			env->insn_aux_data[insn_idx].storage_get_func_atomic = true;
+ 	}
+ 
+@@ -11439,7 +11451,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
+ 			return -EINVAL;
+ 		}
+ 
+-		if (in_sleepable(env) && is_storage_get_function(func_id))
++		if (is_storage_get_function(func_id))
+ 			env->insn_aux_data[insn_idx].storage_get_func_atomic = true;
+ 	}
+ 
+@@ -11450,10 +11462,17 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
+ 			return -EINVAL;
+ 		}
+ 
+-		if (in_sleepable(env) && is_storage_get_function(func_id))
++		if (is_storage_get_function(func_id))
+ 			env->insn_aux_data[insn_idx].storage_get_func_atomic = true;
+ 	}
+ 
++	/*
++	 * Non-sleepable contexts in sleepable programs (e.g., timer callbacks)
++	 * are atomic and must use GFP_ATOMIC for storage_get helpers.
++	 */
++	if (!in_sleepable(env) && is_storage_get_function(func_id))
++		env->insn_aux_data[insn_idx].storage_get_func_atomic = true;
++
+ 	meta.func_id = func_id;
+ 	/* check args */
+ 	for (i = 0; i < MAX_BPF_FUNC_REG_ARGS; i++) {
+@@ -22485,8 +22504,7 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
+ 		}
+ 
+ 		if (is_storage_get_function(insn->imm)) {
+-			if (!in_sleepable(env) ||
+-			    env->insn_aux_data[i + delta].storage_get_func_atomic)
++			if (env->insn_aux_data[i + delta].storage_get_func_atomic)
+ 				insn_buf[0] = BPF_MOV64_IMM(BPF_REG_5, (__force __s32)GFP_ATOMIC);
+ 			else
+ 				insn_buf[0] = BPF_MOV64_IMM(BPF_REG_5, (__force __s32)GFP_KERNEL);
+@@ -23156,6 +23174,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+ 	state->curframe = 0;
+ 	state->speculative = false;
+ 	state->branches = 1;
++	state->in_sleepable = env->prog->sleepable;
+ 	state->frame[0] = kzalloc(sizeof(struct bpf_func_state), GFP_KERNEL_ACCOUNT);
+ 	if (!state->frame[0]) {
+ 		kfree(state);
+-- 
+2.52.0
+
