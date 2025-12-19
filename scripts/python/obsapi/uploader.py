@@ -37,7 +37,7 @@ class UploaderBase:
         if not self.upstream.branch:
             raise APIError("No upstream branch to submit to.")
         pr = self.tea.get_pr(self.upstream.org, self.upstream.repo, self.upstream.branch, self.user + ':' + self.user_branch)
-        if not pr:
+        if not pr or pr['merged']:
             if not message:
                 editor = os.environ.get('EDITOR', 'vi')
                 with tempfile.NamedTemporaryFile(prefix=self.upstream.org + '.' + self.upstream.repo + '.' + self.upstream.branch + '.') as tmp:
