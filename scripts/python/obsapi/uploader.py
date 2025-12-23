@@ -9,6 +9,8 @@ import sys
 import re
 import os
 
+ignore_kabi_file = 'IGNORE-KABI-BADNESS'
+
 class UploaderBase:
     def log_progress(self, string):
         if hasattr(self, 'progress') and self.progress:
@@ -19,16 +21,15 @@ class UploaderBase:
         self.log_progress('Updating .gitattributes to put tarballs into LFS.\n')
         self.tea.update_gitattr(self.user, self.upstream.repo, self.user_branch)
         self.log_progress('Updating branch %s with content of %s\n' % (self.user_branch, data))
-        self.tea.update_content(self.user, self.upstream.repo, self.user_branch, data, message)
+        self.tea.update_content(self.user, self.upstream.repo, self.user_branch, data, message, [ignore_kabi_file] if self.ignore_kabi_badness else None)
         self.commit = self.tea.repo_branches(self.user, self.upstream.repo)[self.user_branch]['commit']['id']
         self.log_progress('commit sha: %s\n' % (self.commit,))
         return self.commit
 
     def ignore_kabi(self):
         self.ignore_kabi_badness = True
-        file = 'IGNORE-KABI-BADNESS'
-        self.log_progress('Uploading %s\n' % (file,))
-        self.tea.update_file(self.user, self.upstream.repo, self.user_branch, file, [])
+        self.log_progress('Uploading %s\n' % (ignore_kabi_file,))
+        self.tea.update_file(self.user, self.upstream.repo, self.user_branch, ignore_kabi_file, [])
 
     def sync_url(self):
         return self.upstream.api + '/' + self.user + '/' + self.upstream.repo + '?trackingbranch=' + self.user_branch + '#' + self.commit
