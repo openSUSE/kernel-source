@@ -1,0 +1,142 @@
+From: Al Viro <viro@zeniv.linux.org.uk>
+Date: Fri, 14 Nov 2025 02:18:22 -0500
+Subject: [PATCH] functionfs: fix the open/removal races
+References: bsc#1012628
+Patch-mainline: 6.18.3
+Git-commit: e5bf5ee266633cb18fff6f98f0b7d59a62819eee
+
+[ Upstream commit e5bf5ee266633cb18fff6f98f0b7d59a62819eee ]
+
+ffs_epfile_open() can race with removal, ending up with file->private_data
+pointing to freed object.
+
+There is a total count of opened files on functionfs (both ep0 and
+dynamic ones) and when it hits zero, dynamic files get removed.
+Unfortunately, that removal can happen while another thread is
+in ffs_epfile_open(), but has not incremented the count yet.
+In that case open will succeed, leaving us with UAF on any subsequent
+read() or write().
+
+The root cause is that ffs->opened is misused; atomic_dec_and_test() vs.
+atomic_add_return() is not a good idea, when object remains visible all
+along.
+
+To untangle that
+	* serialize openers on ffs->mutex (both for ep0 and for dynamic files)
+	* have dynamic ones use atomic_inc_not_zero() and fail if we had
+zero ->opened; in that case the file we are opening is doomed.
+	* have the inodes of dynamic files marked on removal (from the
+callback of simple_recursive_removal()) - clear ->i_private there.
+	* have open of dynamic ones verify they hadn't been already removed,
+along with checking that state is FFS_ACTIVE.
+
+Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/usb/gadget/function/f_fs.c | 53 ++++++++++++++++++++++++------
+ 1 file changed, 43 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/usb/gadget/function/f_fs.c b/drivers/usb/gadget/function/f_fs.c
+index 47cfbe41fdff..69f6e3c0f7e0 100644
+--- a/drivers/usb/gadget/function/f_fs.c
++++ b/drivers/usb/gadget/function/f_fs.c
+@@ -640,13 +640,22 @@ static ssize_t ffs_ep0_read(struct file *file, char __user *buf,
+ 
+ static int ffs_ep0_open(struct inode *inode, struct file *file)
+ {
+-	struct ffs_data *ffs = inode->i_private;
++	struct ffs_data *ffs = inode->i_sb->s_fs_info;
++	int ret;
+ 
+-	if (ffs->state == FFS_CLOSING)
+-		return -EBUSY;
++	/* Acquire mutex */
++	ret = ffs_mutex_lock(&ffs->mutex, file->f_flags & O_NONBLOCK);
++	if (ret < 0)
++		return ret;
+ 
+-	file->private_data = ffs;
+ 	ffs_data_opened(ffs);
++	if (ffs->state == FFS_CLOSING) {
++		ffs_data_closed(ffs);
++		mutex_unlock(&ffs->mutex);
++		return -EBUSY;
++	}
++	mutex_unlock(&ffs->mutex);
++	file->private_data = ffs;
+ 
+ 	return stream_open(inode, file);
+ }
+@@ -1193,14 +1202,33 @@ static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
+ static int
+ ffs_epfile_open(struct inode *inode, struct file *file)
+ {
+-	struct ffs_epfile *epfile = inode->i_private;
++	struct ffs_data *ffs = inode->i_sb->s_fs_info;
++	struct ffs_epfile *epfile;
++	int ret;
+ 
+-	if (WARN_ON(epfile->ffs->state != FFS_ACTIVE))
++	/* Acquire mutex */
++	ret = ffs_mutex_lock(&ffs->mutex, file->f_flags & O_NONBLOCK);
++	if (ret < 0)
++		return ret;
++
++	if (!atomic_inc_not_zero(&ffs->opened)) {
++		mutex_unlock(&ffs->mutex);
++		return -ENODEV;
++	}
++	/*
++	 * we want the state to be FFS_ACTIVE; FFS_ACTIVE alone is
++	 * not enough, though - we might have been through FFS_CLOSING
++	 * and back to FFS_ACTIVE, with our file already removed.
++	 */
++	epfile = smp_load_acquire(&inode->i_private);
++	if (unlikely(ffs->state != FFS_ACTIVE || !epfile)) {
++		mutex_unlock(&ffs->mutex);
++		ffs_data_closed(ffs);
+ 		return -ENODEV;
++	}
++	mutex_unlock(&ffs->mutex);
+ 
+ 	file->private_data = epfile;
+-	ffs_data_opened(epfile->ffs);
+-
+ 	return stream_open(inode, file);
+ }
+ 
+@@ -1332,7 +1360,7 @@ static void ffs_dmabuf_put(struct dma_buf_attachment *attach)
+ static int
+ ffs_epfile_release(struct inode *inode, struct file *file)
+ {
+-	struct ffs_epfile *epfile = inode->i_private;
++	struct ffs_epfile *epfile = file->private_data;
+ 	struct ffs_dmabuf_priv *priv, *tmp;
+ 	struct ffs_data *ffs = epfile->ffs;
+ 
+@@ -2352,6 +2380,11 @@ static int ffs_epfiles_create(struct ffs_data *ffs)
+ 	return 0;
+ }
+ 
++static void clear_one(struct dentry *dentry)
++{
++	smp_store_release(&dentry->d_inode->i_private, NULL);
++}
++
+ static void ffs_epfiles_destroy(struct ffs_epfile *epfiles, unsigned count)
+ {
+ 	struct ffs_epfile *epfile = epfiles;
+@@ -2359,7 +2392,7 @@ static void ffs_epfiles_destroy(struct ffs_epfile *epfiles, unsigned count)
+ 	for (; count; --count, ++epfile) {
+ 		BUG_ON(mutex_is_locked(&epfile->mutex));
+ 		if (epfile->dentry) {
+-			simple_recursive_removal(epfile->dentry, NULL);
++			simple_recursive_removal(epfile->dentry, clear_one);
+ 			epfile->dentry = NULL;
+ 		}
+ 	}
+-- 
+2.52.0
+

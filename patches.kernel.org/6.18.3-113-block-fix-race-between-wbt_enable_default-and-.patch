@@ -1,0 +1,204 @@
+From: Ming Lei <ming.lei@redhat.com>
+Date: Fri, 12 Dec 2025 22:35:00 +0800
+Subject: [PATCH] block: fix race between wbt_enable_default and IO submission
+References: bsc#1012628
+Patch-mainline: 6.18.3
+Git-commit: 9869d3a6fed381f3b98404e26e1afc75d680cbf9
+
+[ Upstream commit 9869d3a6fed381f3b98404e26e1afc75d680cbf9 ]
+
+When wbt_enable_default() is moved out of queue freezing in elevator_change(),
+it can cause the wbt inflight counter to become negative (-1), leading to hung
+tasks in the writeback path. Tasks get stuck in wbt_wait() because the counter
+is in an inconsistent state.
+
+The issue occurs because wbt_enable_default() could race with IO submission,
+allowing the counter to be decremented before proper initialization. This manifests
+as:
+
+  rq_wait[0]:
+    inflight:             -1
+    has_waiters:        True
+
+rwb_enabled() checks the state, which can be updated exactly between wbt_wait()
+(rq_qos_throttle()) and wbt_track()(rq_qos_track()), then the inflight counter
+will become negative.
+
+And results in hung task warnings like:
+  task:kworker/u24:39 state:D stack:0 pid:14767
+  Call Trace:
+    rq_qos_wait+0xb4/0x150
+    wbt_wait+0xa9/0x100
+    __rq_qos_throttle+0x24/0x40
+    blk_mq_submit_bio+0x672/0x7b0
+    ...
+
+Fix this by:
+
+1. Splitting wbt_enable_default() into:
+   - __wbt_enable_default(): Returns true if wbt_init() should be called
+   - wbt_enable_default(): Wrapper for existing callers (no init)
+   - wbt_init_enable_default(): New function that checks and inits WBT
+
+2. Using wbt_init_enable_default() in blk_register_queue() to ensure
+   proper initialization during queue registration
+
+3. Move wbt_init() out of wbt_enable_default() which is only for enabling
+   disabled wbt from bfq and iocost, and wbt_init() isn't needed. Then the
+   original lock warning can be avoided.
+
+4. Removing the ELEVATOR_FLAG_ENABLE_WBT_ON_EXIT flag and its handling
+   code since it's no longer needed
+
+This ensures WBT is properly initialized before any IO can be submitted,
+preventing the counter from going negative.
+
+Cc: Nilay Shroff <nilay@linux.ibm.com>
+Cc: Yu Kuai <yukuai@fnnas.com>
+Cc: Guangwu Zhang <guazhang@redhat.com>
+Fixes: 78c271344b6f ("block: move wbt_enable_default() out of queue freezing from sched ->exit()")
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Reviewed-by: Nilay Shroff <nilay@linux.ibm.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ block/bfq-iosched.c |  2 +-
+ block/blk-sysfs.c   |  2 +-
+ block/blk-wbt.c     | 20 ++++++++++++++++----
+ block/blk-wbt.h     |  5 +++++
+ block/elevator.c    |  4 ----
+ block/elevator.h    |  1 -
+ 6 files changed, 23 insertions(+), 11 deletions(-)
+
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index 4a8d3d96bfe4..6e54b1d3d8bc 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -7181,7 +7181,7 @@ static void bfq_exit_queue(struct elevator_queue *e)
+ 
+ 	blk_stat_disable_accounting(bfqd->queue);
+ 	blk_queue_flag_clear(QUEUE_FLAG_DISABLE_WBT_DEF, bfqd->queue);
+-	set_bit(ELEVATOR_FLAG_ENABLE_WBT_ON_EXIT, &e->flags);
++	wbt_enable_default(bfqd->queue->disk);
+ 
+ 	kfree(bfqd);
+ }
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index 76c47fe9b8d6..c0e4daaf9610 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -942,7 +942,7 @@ int blk_register_queue(struct gendisk *disk)
+ 		elevator_set_default(q);
+ 
+ 	blk_queue_flag_set(QUEUE_FLAG_REGISTERED, q);
+-	wbt_enable_default(disk);
++	wbt_init_enable_default(disk);
+ 
+ 	/* Now everything is ready and send out KOBJ_ADD uevent */
+ 	kobject_uevent(&disk->queue_kobj, KOBJ_ADD);
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index eb8037bae0bd..0974875f77bd 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -699,7 +699,7 @@ static void wbt_requeue(struct rq_qos *rqos, struct request *rq)
+ /*
+  * Enable wbt if defaults are configured that way
+  */
+-void wbt_enable_default(struct gendisk *disk)
++static bool __wbt_enable_default(struct gendisk *disk)
+ {
+ 	struct request_queue *q = disk->queue;
+ 	struct rq_qos *rqos;
+@@ -716,19 +716,31 @@ void wbt_enable_default(struct gendisk *disk)
+ 		if (enable && RQWB(rqos)->enable_state == WBT_STATE_OFF_DEFAULT)
+ 			RQWB(rqos)->enable_state = WBT_STATE_ON_DEFAULT;
+ 		mutex_unlock(&disk->rqos_state_mutex);
+-		return;
++		return false;
+ 	}
+ 	mutex_unlock(&disk->rqos_state_mutex);
+ 
+ 	/* Queue not registered? Maybe shutting down... */
+ 	if (!blk_queue_registered(q))
+-		return;
++		return false;
+ 
+ 	if (queue_is_mq(q) && enable)
+-		wbt_init(disk);
++		return true;
++	return false;
++}
++
++void wbt_enable_default(struct gendisk *disk)
++{
++	__wbt_enable_default(disk);
+ }
+ EXPORT_SYMBOL_GPL(wbt_enable_default);
+ 
++void wbt_init_enable_default(struct gendisk *disk)
++{
++	if (__wbt_enable_default(disk))
++		WARN_ON_ONCE(wbt_init(disk));
++}
++
+ u64 wbt_default_latency_nsec(struct request_queue *q)
+ {
+ 	/*
+diff --git a/block/blk-wbt.h b/block/blk-wbt.h
+index e5fc653b9b76..925f22475738 100644
+--- a/block/blk-wbt.h
++++ b/block/blk-wbt.h
+@@ -5,6 +5,7 @@
+ #ifdef CONFIG_BLK_WBT
+ 
+ int wbt_init(struct gendisk *disk);
++void wbt_init_enable_default(struct gendisk *disk);
+ void wbt_disable_default(struct gendisk *disk);
+ void wbt_enable_default(struct gendisk *disk);
+ 
+@@ -16,6 +17,10 @@ u64 wbt_default_latency_nsec(struct request_queue *);
+ 
+ #else
+ 
++static inline void wbt_init_enable_default(struct gendisk *disk)
++{
++}
++
+ static inline void wbt_disable_default(struct gendisk *disk)
+ {
+ }
+diff --git a/block/elevator.c b/block/elevator.c
+index 5b37ef44f52d..a2f8b2251dc6 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -633,14 +633,10 @@ static int elevator_change_done(struct request_queue *q,
+ 			.et = ctx->old->et,
+ 			.data = ctx->old->elevator_data
+ 		};
+-		bool enable_wbt = test_bit(ELEVATOR_FLAG_ENABLE_WBT_ON_EXIT,
+-				&ctx->old->flags);
+ 
+ 		elv_unregister_queue(q, ctx->old);
+ 		blk_mq_free_sched_res(&res, ctx->old->type, q->tag_set);
+ 		kobject_put(&ctx->old->kobj);
+-		if (enable_wbt)
+-			wbt_enable_default(q->disk);
+ 	}
+ 	if (ctx->new) {
+ 		ret = elv_register_queue(q, ctx->new, !ctx->no_uevent);
+diff --git a/block/elevator.h b/block/elevator.h
+index 3ee1d494f48a..021726376042 100644
+--- a/block/elevator.h
++++ b/block/elevator.h
+@@ -156,7 +156,6 @@ struct elevator_queue
+ 
+ #define ELEVATOR_FLAG_REGISTERED	0
+ #define ELEVATOR_FLAG_DYING		1
+-#define ELEVATOR_FLAG_ENABLE_WBT_ON_EXIT	2
+ 
+ /*
+  * block elevator interface
+-- 
+2.52.0
+
