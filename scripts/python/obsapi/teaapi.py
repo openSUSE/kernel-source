@@ -187,8 +187,8 @@ class TeaAPI(api.API):
                 method = 'PUT'
             self.check(method, self.repo_path(org, repo) + '/contents/' + fn, json=data)
 
-    def update_content(self, org, repo, branch, src, message):
-        ign = ['.gitattributes', '.gitignore']
+    def update_content(self, org, repo, branch, src, message, ignored_files=None):
+        ign = ['.gitattributes', '.gitignore'] + (ignored_files if ignored_files else [])
         exc = ['.osc', '.git']
         r = self.check_get(self.repo_path(org, repo) + '/contents-ext', params={
             'ref': branch,
