@@ -45,22 +45,36 @@ class TeaAPI(api.API):
         if self.progress:
             self.progress.write(string)
 
-    def list_repos(self, org):
-        r = self.check_get('/api/v1/users/' + org + '/repos', params={
+    def _page_url(self, url):
+        r = self.check_get(url, params={
             'limit' : 1000,
             })
-        repo_count = int(r.headers['X-Total-Count'])
-        repos = r.json()
-        if repos:
+        items = r.json()
+        item_count = int(r.headers['X-Total-Count'])
+        page_size = len(items)
+        result = items
+        if page_size != item_count:
+            pages = int((item_count + page_size - 1)/page_size)  # ceil
+            for page in range(2, pages + 1):
+                items = self.check_get(url, params={
+                    'limit' : page_size,
+                    'page' : page,
+                    }).json()
+                result += items
+        assert len(result) == item_count
+        return result
+
+    def _name_dict(self, items):
+        if items:
             dic = {}
-            for r in repos:
-                dic[r['name']] = r
-            repos = dic
-        else:
-            repos = {}
-        if repo_count != len(repos.keys()):
-            sys.stderr.write('%s: Number of repositories retrieved %i is not equal repository count %i' % (org, repo_count, len(repos)))
-        return repos
+            for i in items:
+                dic[i['name']] = i
+            return dic
+        return {}
+
+    def list_repos(self, org):
+        repos = self._page_url('/api/v1/users/' + org + '/repos')
+        return self._name_dict(repos)
 
     def repo_path(self, org, repo):
         return '/api/v1/repos/' + org + '/' + repo
@@ -96,21 +110,8 @@ class TeaAPI(api.API):
         return repoinfo
 
     def repo_branches(self, org, repo):
-        r = self.check_get(self.repo_path(org, repo) + '/branches', params={
-            'limit' : 1000,
-            })
-        branch_count = int(r.headers['X-Total-Count'])
-        branches = r.json()
-        if branches:
-            dic = {}
-            for b in branches:
-                dic[b['name']] = b
-            branches = dic
-        else:
-            branches = {}
-        if branch_count != len(branches.keys()):
-            sys.stderr.write('%s/%s: Number of branches retrieved %i is not equal branch count %i' % (org, repo, branch_count, len(branches)))
-        return branches
+        branches = self._page_url(self.repo_path(org, repo) + '/branches')
+        return self._name_dict(branches)
 
     def delete_branch(self, org, repo, branch):
         return self.check_delete(self.repo_path(org, repo) + '/branches/' + branch)
