@@ -45,6 +45,23 @@ class TeaAPI(api.API):
         if self.progress:
             self.progress.write(string)
 
+    def list_repos(self, org):
+        r = self.check_get('/api/v1/users/' + org + '/repos', params={
+            'limit' : 1000,
+            })
+        repo_count = int(r.headers['X-Total-Count'])
+        repos = r.json()
+        if repos:
+            dic = {}
+            for r in repos:
+                dic[r['name']] = r
+            repos = dic
+        else:
+            repos = {}
+        if repo_count != len(repos.keys()):
+            sys.stderr.write('%s: Number of repositories retrieved %i is not equal repository count %i' % (org, repo_count, len(repos)))
+        return repos
+
     def repo_path(self, org, repo):
         return '/api/v1/repos/' + org + '/' + repo
 
