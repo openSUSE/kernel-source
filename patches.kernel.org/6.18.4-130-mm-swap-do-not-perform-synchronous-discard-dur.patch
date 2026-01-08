@@ -1,0 +1,149 @@
+From: Kairui Song <kasong@tencent.com>
+Date: Fri, 24 Oct 2025 02:34:11 +0800
+Subject: [PATCH] mm, swap: do not perform synchronous discard during
+ allocation
+References: bsc#1012628
+Patch-mainline: 6.18.4
+Git-commit: 9fb749cd15078c7bdc46e5d45c37493f83323e33
+
+commit 9fb749cd15078c7bdc46e5d45c37493f83323e33 upstream.
+
+Patch series "mm, swap: misc cleanup and bugfix", v2.
+
+A few cleanups and a bugfix that are either suitable after the swap table
+phase I or found during code review.
+
+Patch 1 is a bugfix and needs to be included in the stable branch, the
+rest have no behavioral change.
+
+
+This patch (of 5):
+
+Since commit 1b7e90020eb77 ("mm, swap: use percpu cluster as allocation
+fast path"), swap allocation is protected by a local lock, which means we
+can't do any sleeping calls during allocation.
+
+However, the discard routine is not taken well care of.  When the swap
+allocator failed to find any usable cluster, it would look at the pending
+discard cluster and try to issue some blocking discards.  It may not
+necessarily sleep, but the cond_resched at the bio layer indicates this is
+wrong when combined with a local lock.  And the bio GFP flag used for
+discard bio is also wrong (not atomic).
+
+It's arguable whether this synchronous discard is helpful at all.  In most
+cases, the async discard is good enough.  And the swap allocator is doing
+very differently at organizing the clusters since the recent change, so it
+is very rare to see discard clusters piling up.
+
+So far, no issues have been observed or reported with typical SSD setups
+under months of high pressure.  This issue was found during my code
+review.  But by hacking the kernel a bit: adding a mdelay(500) in the
+async discard path, this issue will be observable with WARNING triggered
+by the wrong GFP and cond_resched in the bio layer for debug builds.
+
+So now let's apply a hotfix for this issue: remove the synchronous discard
+in the swap allocation path.  And when order 0 is failing with all cluster
+list drained on all swap devices, try to do a discard following the swap
+device priority list.  If any discards released some cluster, try the
+allocation again.  This way, we can still avoid OOM due to swap failure if
+the hardware is very slow and memory pressure is extremely high.
+
+This may cause more fragmentation issues if the discarding hardware is
+really slow.  Ideally, we want to discard pending clusters before
+continuing to iterate the fragment cluster lists.  This can be implemented
+in a cleaner way if we clean up the device list iteration part first.
+
+Link: https://lkml.kernel.org/r/20251024-swap-clean-after-swap-table-p1-v2-0-a709469052e7@tencent.com
+Link: https://lkml.kernel.org/r/20251024-swap-clean-after-swap-table-p1-v2-1-c5b0e1092927@tencent.com
+Fixes: 1b7e90020eb7 ("mm, swap: use percpu cluster as allocation fast path")
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Acked-by: Nhat Pham <nphamcs@gmail.com>
+Acked-by: Chris Li <chrisl@kernel.org>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Huang, Ying" <ying.huang@linux.alibaba.com>
+Cc: Kemeng Shi <shikemeng@huaweicloud.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ mm/swapfile.c | 40 +++++++++++++++++++++++++++++++++-------
+ 1 file changed, 33 insertions(+), 7 deletions(-)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index a1b4b9d80e3b..82524f8595ed 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -1101,13 +1101,6 @@ static unsigned long cluster_alloc_swap_entry(struct swap_info_struct *si, int o
+ 			goto done;
+ 	}
+ 
+-	/*
+-	 * We don't have free cluster but have some clusters in discarding,
+-	 * do discard now and reclaim them.
+-	 */
+-	if ((si->flags & SWP_PAGE_DISCARD) && swap_do_scheduled_discard(si))
+-		goto new_cluster;
+-
+ 	if (order)
+ 		goto done;
+ 
+@@ -1394,6 +1387,33 @@ static bool swap_alloc_slow(swp_entry_t *entry,
+ 	return false;
+ }
+ 
++/*
++ * Discard pending clusters in a synchronized way when under high pressure.
++ * Return: true if any cluster is discarded.
++ */
++static bool swap_sync_discard(void)
++{
++	bool ret = false;
++	int nid = numa_node_id();
++	struct swap_info_struct *si, *next;
++
++	spin_lock(&swap_avail_lock);
++	plist_for_each_entry_safe(si, next, &swap_avail_heads[nid], avail_lists[nid]) {
++		spin_unlock(&swap_avail_lock);
++		if (get_swap_device_info(si)) {
++			if (si->flags & SWP_PAGE_DISCARD)
++				ret = swap_do_scheduled_discard(si);
++			put_swap_device(si);
++		}
++		if (ret)
++			return true;
++		spin_lock(&swap_avail_lock);
++	}
++	spin_unlock(&swap_avail_lock);
++
++	return false;
++}
++
+ /**
+  * folio_alloc_swap - allocate swap space for a folio
+  * @folio: folio we want to move to swap
+@@ -1432,11 +1452,17 @@ int folio_alloc_swap(struct folio *folio, gfp_t gfp)
+ 		}
+ 	}
+ 
++again:
+ 	local_lock(&percpu_swap_cluster.lock);
+ 	if (!swap_alloc_fast(&entry, order))
+ 		swap_alloc_slow(&entry, order);
+ 	local_unlock(&percpu_swap_cluster.lock);
+ 
++	if (unlikely(!order && !entry.val)) {
++		if (swap_sync_discard())
++			goto again;
++	}
++
+ 	/* Need to call this even if allocation failed, for MEMCG_SWAP_FAIL. */
+ 	if (mem_cgroup_try_charge_swap(folio, entry))
+ 		goto out_free;
+-- 
+2.52.0
+
