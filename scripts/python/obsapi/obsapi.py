@@ -176,14 +176,15 @@ class OBSAPI(api.API):
             sync = self.package_scmsync(project, package)
             assert sync.scheme == 'https'
             assert sync.netloc in ['src.suse.de', 'src.opensuse.org']
-            assert len(sync.fragment) == 64
+            assert len(sync.fragment) == 64 or len(sync.fragment) == 40
             assert re.fullmatch('(?ai)[a-f0-9]*',sync.fragment)
             query = urllib.parse.parse_qs(sync.query)
-            assert list(query.keys()) == ['trackingbranch']
+            assert list(query.keys()) == ['trackingbranch'] or list(query.keys()) == []
+            branch = query['trackingbranch'][0] if 'trackingbranch' in query else None
             assert len(sync.path.split('/')) == 3
             _, org, repo = sync.path.split('/')
             assert _ == ''
-            return PkgRepo(sync.scheme + '://' + sync.netloc, org, repo, query['trackingbranch'][0], sync.fragment)
+            return PkgRepo(sync.scheme + '://' + sync.netloc, org, repo, branch, sync.fragment)
         if self.url == 'https://api.suse.de':
             api = 'https://src.suse.de'
         elif self.url == 'https://api.opensuse.org':
