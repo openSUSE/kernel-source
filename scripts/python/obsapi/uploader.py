@@ -28,8 +28,6 @@ class UploaderBase:
 
     def ignore_kabi(self):
         self.ignore_kabi_badness = True
-        self.log_progress('Uploading %s\n' % (ignore_kabi_file,))
-        self.tea.update_file(self.user, self.upstream.repo, self.user_branch, ignore_kabi_file, [])
 
     def sync_url(self):
         return self.upstream.api + '/' + self.user + '/' + self.upstream.repo + '?trackingbranch=' + self.user_branch + '#' + self.commit
