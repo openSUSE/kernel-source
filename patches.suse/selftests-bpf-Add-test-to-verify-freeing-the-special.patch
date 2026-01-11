@@ -1,0 +1,159 @@
+From: Leon Hwang <leon.hwang@linux.dev>
+Date: Wed, 5 Nov 2025 23:14:07 +0800
+Subject: selftests/bpf: Add test to verify freeing the special fields in pcpu
+ maps
+Patch-mainline: v6.19-rc1
+Git-commit: c1cbf0d21c4194513248568e7ab935cf9bb92ff9
+References: CVE-2025-68744 bsc#1255709
+
+Add test to verify that updating [lru_,]percpu_hash maps decrements
+refcount when BPF_KPTR_REF objects are involved.
+
+The tests perform the following steps:
+. Call update_elem() to insert an initial value.
+. Use bpf_refcount_acquire() to increment the refcount.
+. Store the node pointer in the map value.
+. Add the node to a linked list.
+. Probe-read the refcount and verify it is *2*.
+. Call update_elem() again to trigger refcount decrement.
+. Probe-read the refcount and verify it is *1*.
+
+Signed-off-by: Leon Hwang <leon.hwang@linux.dev>
+Acked-by: Yonghong Song <yonghong.song@linux.dev>
+Link: https://lore.kernel.org/r/20251105151407.12723-3-leon.hwang@linux.dev
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/testing/selftests/bpf/prog_tests/refcounted_kptr.c |   56 ++++++++++++++
+ tools/testing/selftests/bpf/progs/refcounted_kptr.c      |   60 +++++++++++++++
+ 2 files changed, 116 insertions(+)
+
+--- a/tools/testing/selftests/bpf/prog_tests/refcounted_kptr.c
++++ b/tools/testing/selftests/bpf/prog_tests/refcounted_kptr.c
+@@ -44,3 +44,59 @@ void test_refcounted_kptr_wrong_owner(vo
+ 	ASSERT_OK(opts.retval, "rbtree_wrong_owner_remove_fail_a2 retval");
+ 	refcounted_kptr__destroy(skel);
+ }
++
++void test_percpu_hash_refcounted_kptr_refcount_leak(void)
++{
++	struct refcounted_kptr *skel;
++	int cpu_nr, fd, err, key = 0;
++	struct bpf_map *map;
++	size_t values_sz;
++	u64 *values;
++	LIBBPF_OPTS(bpf_test_run_opts, opts,
++		    .data_in = &pkt_v4,
++		    .data_size_in = sizeof(pkt_v4),
++		    .repeat = 1,
++	);
++
++	cpu_nr = libbpf_num_possible_cpus();
++	if (!ASSERT_GT(cpu_nr, 0, "libbpf_num_possible_cpus"))
++		return;
++
++	values = calloc(cpu_nr, sizeof(u64));
++	if (!ASSERT_OK_PTR(values, "calloc values"))
++		return;
++
++	skel = refcounted_kptr__open_and_load();
++	if (!ASSERT_OK_PTR(skel, "refcounted_kptr__open_and_load")) {
++		free(values);
++		return;
++	}
++
++	values_sz = cpu_nr * sizeof(u64);
++	memset(values, 0, values_sz);
++
++	map = skel->maps.percpu_hash;
++	err = bpf_map__update_elem(map, &key, sizeof(key), values, values_sz, 0);
++	if (!ASSERT_OK(err, "bpf_map__update_elem"))
++		goto out;
++
++	fd = bpf_program__fd(skel->progs.percpu_hash_refcount_leak);
++	err = bpf_prog_test_run_opts(fd, &opts);
++	if (!ASSERT_OK(err, "bpf_prog_test_run_opts"))
++		goto out;
++	if (!ASSERT_EQ(opts.retval, 2, "opts.retval"))
++		goto out;
++
++	err = bpf_map__update_elem(map, &key, sizeof(key), values, values_sz, 0);
++	if (!ASSERT_OK(err, "bpf_map__update_elem"))
++		goto out;
++
++	fd = bpf_program__fd(skel->progs.check_percpu_hash_refcount);
++	err = bpf_prog_test_run_opts(fd, &opts);
++	ASSERT_OK(err, "bpf_prog_test_run_opts");
++	ASSERT_EQ(opts.retval, 1, "opts.retval");
++
++out:
++	refcounted_kptr__destroy(skel);
++	free(values);
++}
+--- a/tools/testing/selftests/bpf/progs/refcounted_kptr.c
++++ b/tools/testing/selftests/bpf/progs/refcounted_kptr.c
+@@ -568,4 +568,64 @@ err_out:
+ 	return 0;
+ }
+ 
++private(kptr_ref) u64 ref;
++
++static int probe_read_refcount(void)
++{
++	u32 refcount;
++
++	bpf_probe_read_kernel(&refcount, sizeof(refcount), (void *) ref);
++	return refcount;
++}
++
++static int __insert_in_list(struct bpf_list_head *head, struct bpf_spin_lock *lock,
++			    struct node_data __kptr **node)
++{
++	struct node_data *node_new, *node_ref, *node_old;
++
++	node_new = bpf_obj_new(typeof(*node_new));
++	if (!node_new)
++		return -1;
++
++	node_ref = bpf_refcount_acquire(node_new);
++	node_old = bpf_kptr_xchg(node, node_new);
++	if (node_old) {
++		bpf_obj_drop(node_old);
++		bpf_obj_drop(node_ref);
++		return -2;
++	}
++
++	bpf_spin_lock(lock);
++	bpf_list_push_front(head, &node_ref->l);
++	ref = (u64)(void *) &node_ref->ref;
++	bpf_spin_unlock(lock);
++	return probe_read_refcount();
++}
++
++struct {
++	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
++	__type(key, int);
++	__type(value, struct map_value);
++	__uint(max_entries, 1);
++} percpu_hash SEC(".maps");
++
++SEC("tc")
++int percpu_hash_refcount_leak(void *ctx)
++{
++	struct map_value *v;
++	int key = 0;
++
++	v = bpf_map_lookup_elem(&percpu_hash, &key);
++	if (!v)
++		return 0;
++
++	return __insert_in_list(&head, &lock, &v->node);
++}
++
++SEC("tc")
++int check_percpu_hash_refcount(void *ctx)
++{
++	return probe_read_refcount();
++}
++
+ char _license[] SEC("license") = "GPL";
