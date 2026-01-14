@@ -1,0 +1,286 @@
+From: Akiva Goldberger <agoldberger@nvidia.com>
+Date: Sun, 9 Nov 2025 11:49:03 +0200
+Subject: mlx5: Fix default values in create CQ
+Patch-mainline: v6.18-rc6
+Git-commit: e5eba42f01340f73888dfe560be2806057c25913
+References: CVE-2025-68209 bsc#1255230
+
+Currently, CQs without a completion function are assigned the
+mlx5_add_cq_to_tasklet function by default. This is problematic since
+only user CQs created through the mlx5_ib driver are intended to use
+this function.
+
+Additionally, all CQs that will use doorbells instead of polling for
+completions must call mlx5_cq_arm. However, the default CQ creation flow
+leaves a valid value in the CQ's arm_db field, allowing FW to send
+interrupts to polling-only CQs in certain corner cases.
+
+These two factors would allow a polling-only kernel CQ to be triggered
+by an EQ interrupt and call a completion function intended only for user
+CQs, causing a null pointer exception.
+
+Some areas in the driver have prevented this issue with one-off fixes
+but did not address the root cause.
+
+This patch fixes the described issue by adding defaults to the create CQ
+flow. It adds a default dummy completion function to protect against
+null pointer exceptions, and it sets an invalid command sequence number
+by default in kernel CQs to prevent the FW from sending an interrupt to
+the CQ until it is armed. User CQs are responsible for their own
+initialization values.
+
+Callers of mlx5_core_create_cq are responsible for changing the
+completion function and arming the CQ per their needs.
+
+Fixes: cdd04f4d4d71 ("net/mlx5: Add support to create SQ and CQ for ASO")
+Signed-off-by: Akiva Goldberger <agoldberger@nvidia.com>
+Reviewed-by: Moshe Shemesh <moshe@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Acked-by: Leon Romanovsky <leon@kernel.org>
+Link: https://patch.msgid.link/1762681743-1084694-1-git-send-email-tariqt@nvidia.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/mlx5/cq.c                                |   11 ++-
+ drivers/net/ethernet/mellanox/mlx5/core/cq.c                   |   23 ++++++-
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c              |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.c            |   17 ++---
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/send.c    |    7 --
+ drivers/net/ethernet/mellanox/mlx5/core/steering/sws/dr_send.c |   30 ++--------
+ drivers/vdpa/mlx5/net/mlx5_vnet.c                              |    6 --
+ include/linux/mlx5/cq.h                                        |    1 
+ 8 files changed, 46 insertions(+), 50 deletions(-)
+
+--- a/drivers/infiniband/hw/mlx5/cq.c
++++ b/drivers/infiniband/hw/mlx5/cq.c
+@@ -1020,15 +1020,18 @@ int mlx5_ib_create_cq(struct ib_cq *ibcq
+ 	if (cq->create_flags & IB_UVERBS_CQ_FLAGS_IGNORE_OVERRUN)
+ 		MLX5_SET(cqc, cqc, oi, 1);
+ 
++	if (udata) {
++		cq->mcq.comp = mlx5_add_cq_to_tasklet;
++		cq->mcq.tasklet_ctx.comp = mlx5_ib_cq_comp;
++	} else {
++		cq->mcq.comp  = mlx5_ib_cq_comp;
++	}
++
+ 	err = mlx5_core_create_cq(dev->mdev, &cq->mcq, cqb, inlen, out, sizeof(out));
+ 	if (err)
+ 		goto err_cqb;
+ 
+ 	mlx5_ib_dbg(dev, "cqn 0x%x\n", cq->mcq.cqn);
+-	if (udata)
+-		cq->mcq.tasklet_ctx.comp = mlx5_ib_cq_comp;
+-	else
+-		cq->mcq.comp  = mlx5_ib_cq_comp;
+ 	cq->mcq.event = mlx5_ib_cq_event;
+ 
+ 	INIT_LIST_HEAD(&cq->wc_list);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/cq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/cq.c
+@@ -66,8 +66,8 @@ void mlx5_cq_tasklet_cb(struct tasklet_s
+ 		tasklet_schedule(&ctx->task);
+ }
+ 
+-static void mlx5_add_cq_to_tasklet(struct mlx5_core_cq *cq,
+-				   struct mlx5_eqe *eqe)
++void mlx5_add_cq_to_tasklet(struct mlx5_core_cq *cq,
++			    struct mlx5_eqe *eqe)
+ {
+ 	unsigned long flags;
+ 	struct mlx5_eq_tasklet *tasklet_ctx = cq->tasklet_ctx.priv;
+@@ -95,7 +95,15 @@ static void mlx5_add_cq_to_tasklet(struc
+ 	if (schedule_tasklet)
+ 		tasklet_schedule(&tasklet_ctx->task);
+ }
++EXPORT_SYMBOL(mlx5_add_cq_to_tasklet);
+ 
++static void mlx5_core_cq_dummy_cb(struct mlx5_core_cq *cq, struct mlx5_eqe *eqe)
++{
++	mlx5_core_err(cq->eq->core.dev,
++		      "CQ default completion callback, CQ #%u\n", cq->cqn);
++}
++
++#define MLX5_CQ_INIT_CMD_SN cpu_to_be32(2 << 28)
+ /* Callers must verify outbox status in case of err */
+ int mlx5_create_cq(struct mlx5_core_dev *dev, struct mlx5_core_cq *cq,
+ 		   u32 *in, int inlen, u32 *out, int outlen)
+@@ -121,10 +129,19 @@ int mlx5_create_cq(struct mlx5_core_dev
+ 	cq->arm_sn     = 0;
+ 	cq->eq         = eq;
+ 	cq->uid = MLX5_GET(create_cq_in, in, uid);
++
++	/* Kernel CQs must set the arm_db address prior to calling
++	 * this function, allowing for the proper value to be
++	 * initialized. User CQs are responsible for their own
++	 * initialization since they do not use the arm_db field.
++	 */
++	if (cq->arm_db)
++		*cq->arm_db = MLX5_CQ_INIT_CMD_SN;
++
+ 	refcount_set(&cq->refcount, 1);
+ 	init_completion(&cq->free);
+ 	if (!cq->comp)
+-		cq->comp = mlx5_add_cq_to_tasklet;
++		cq->comp = mlx5_core_cq_dummy_cb;
+ 	/* assuming CQ will be deleted before the EQ */
+ 	cq->tasklet_ctx.priv = &eq->tasklet_ctx;
+ 	INIT_LIST_HEAD(&cq->tasklet_ctx.list);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -2136,7 +2136,6 @@ static int mlx5e_alloc_cq_common(struct
+ 	mcq->set_ci_db  = cq->wq_ctrl.db.db;
+ 	mcq->arm_db     = cq->wq_ctrl.db.db + 1;
+ 	*mcq->set_ci_db = 0;
+-	*mcq->arm_db    = 0;
+ 	mcq->vector     = param->eq_ix;
+ 	mcq->comp       = mlx5e_completion_event;
+ 	mcq->event      = mlx5e_cq_error_event;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.c
+@@ -421,6 +421,14 @@ static int mlx5_fpga_conn_create_cq(stru
+ 	__be64 *pas;
+ 	u32 i;
+ 
++	conn->cq.mcq.cqe_sz     = 64;
++	conn->cq.mcq.set_ci_db  = conn->cq.wq_ctrl.db.db;
++	conn->cq.mcq.arm_db     = conn->cq.wq_ctrl.db.db + 1;
++	*conn->cq.mcq.set_ci_db = 0;
++	conn->cq.mcq.vector     = 0;
++	conn->cq.mcq.comp       = mlx5_fpga_conn_cq_complete;
++	conn->cq.mcq.uar        = fdev->conn_res.uar;
++
+ 	cq_size = roundup_pow_of_two(cq_size);
+ 	MLX5_SET(cqc, temp_cqc, log_cq_size, ilog2(cq_size));
+ 
+@@ -468,16 +476,7 @@ static int mlx5_fpga_conn_create_cq(stru
+ 	if (err)
+ 		goto err_cqwq;
+ 
+-	conn->cq.mcq.cqe_sz     = 64;
+-	conn->cq.mcq.set_ci_db  = conn->cq.wq_ctrl.db.db;
+-	conn->cq.mcq.arm_db     = conn->cq.wq_ctrl.db.db + 1;
+-	*conn->cq.mcq.set_ci_db = 0;
+-	*conn->cq.mcq.arm_db    = 0;
+-	conn->cq.mcq.vector     = 0;
+-	conn->cq.mcq.comp       = mlx5_fpga_conn_cq_complete;
+-	conn->cq.mcq.uar        = fdev->conn_res.uar;
+ 	tasklet_setup(&conn->cq.tasklet, mlx5_fpga_conn_cq_tasklet);
+-
+ 	mlx5_fpga_dbg(fdev, "Created CQ #0x%x\n", conn->cq.mcq.cqn);
+ 
+ 	goto out;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/send.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/send.c
+@@ -757,12 +757,6 @@ err_free_sqc:
+ 	return err;
+ }
+ 
+-static void hws_cq_complete(struct mlx5_core_cq *mcq,
+-			    struct mlx5_eqe *eqe)
+-{
+-	pr_err("CQ completion CQ: #%u\n", mcq->cqn);
+-}
+-
+ static int hws_send_ring_alloc_cq(struct mlx5_core_dev *mdev,
+ 				  int numa_node,
+ 				  struct mlx5hws_send_engine *queue,
+@@ -785,7 +779,6 @@ static int hws_send_ring_alloc_cq(struct
+ 	mcq->cqe_sz = 64;
+ 	mcq->set_ci_db = cq->wq_ctrl.db.db;
+ 	mcq->arm_db = cq->wq_ctrl.db.db + 1;
+-	mcq->comp = hws_cq_complete;
+ 
+ 	for (i = 0; i < mlx5_cqwq_get_size(&cq->wq); i++) {
+ 		cqe = mlx5_cqwq_get_wqe(&cq->wq, i);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/sws/dr_send.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/sws/dr_send.c
+@@ -1049,12 +1049,6 @@ static int dr_prepare_qp_to_rts(struct m
+ 	return 0;
+ }
+ 
+-static void dr_cq_complete(struct mlx5_core_cq *mcq,
+-			   struct mlx5_eqe *eqe)
+-{
+-	pr_err("CQ completion CQ: #%u\n", mcq->cqn);
+-}
+-
+ static struct mlx5dr_cq *dr_create_cq(struct mlx5_core_dev *mdev,
+ 				      struct mlx5_uars_page *uar,
+ 				      size_t ncqe)
+@@ -1089,6 +1083,14 @@ static struct mlx5dr_cq *dr_create_cq(st
+ 		cqe->op_own = MLX5_CQE_INVALID << 4 | MLX5_CQE_OWNER_MASK;
+ 	}
+ 
++	cq->mcq.cqe_sz = 64;
++	cq->mcq.set_ci_db = cq->wq_ctrl.db.db;
++	cq->mcq.arm_db = cq->wq_ctrl.db.db + 1;
++	*cq->mcq.set_ci_db = 0;
++	cq->mcq.vector = 0;
++	cq->mcq.uar = uar;
++	cq->mdev = mdev;
++
+ 	inlen = MLX5_ST_SZ_BYTES(create_cq_in) +
+ 		sizeof(u64) * cq->wq_ctrl.buf.npages;
+ 	in = kvzalloc(inlen, GFP_KERNEL);
+@@ -1112,28 +1114,12 @@ static struct mlx5dr_cq *dr_create_cq(st
+ 	pas = (__be64 *)MLX5_ADDR_OF(create_cq_in, in, pas);
+ 	mlx5_fill_page_frag_array(&cq->wq_ctrl.buf, pas);
+ 
+-	cq->mcq.comp  = dr_cq_complete;
+-
+ 	err = mlx5_core_create_cq(mdev, &cq->mcq, in, inlen, out, sizeof(out));
+ 	kvfree(in);
+ 
+ 	if (err)
+ 		goto err_cqwq;
+ 
+-	cq->mcq.cqe_sz = 64;
+-	cq->mcq.set_ci_db = cq->wq_ctrl.db.db;
+-	cq->mcq.arm_db = cq->wq_ctrl.db.db + 1;
+-	*cq->mcq.set_ci_db = 0;
+-
+-	/* set no-zero value, in order to avoid the HW to run db-recovery on
+-	 * CQ that used in polling mode.
+-	 */
+-	*cq->mcq.arm_db = cpu_to_be32(2 << 28);
+-
+-	cq->mcq.vector = 0;
+-	cq->mcq.uar = uar;
+-	cq->mdev = mdev;
+-
+ 	return cq;
+ 
+ err_cqwq:
+--- a/drivers/vdpa/mlx5/net/mlx5_vnet.c
++++ b/drivers/vdpa/mlx5/net/mlx5_vnet.c
+@@ -573,6 +573,8 @@ static int cq_create(struct mlx5_vdpa_ne
+ 	vcq->mcq.set_ci_db = vcq->db.db;
+ 	vcq->mcq.arm_db = vcq->db.db + 1;
+ 	vcq->mcq.cqe_sz = 64;
++	vcq->mcq.comp = mlx5_vdpa_cq_comp;
++	vcq->cqe = num_ent;
+ 
+ 	err = cq_frag_buf_alloc(ndev, &vcq->buf, num_ent);
+ 	if (err)
+@@ -612,10 +614,6 @@ static int cq_create(struct mlx5_vdpa_ne
+ 	if (err)
+ 		goto err_vec;
+ 
+-	vcq->mcq.comp = mlx5_vdpa_cq_comp;
+-	vcq->cqe = num_ent;
+-	vcq->mcq.set_ci_db = vcq->db.db;
+-	vcq->mcq.arm_db = vcq->db.db + 1;
+ 	mlx5_cq_arm(&mvq->cq.mcq, MLX5_CQ_DB_REQ_NOT, uar_page, mvq->cq.mcq.cons_index);
+ 	kfree(in);
+ 	return 0;
+--- a/include/linux/mlx5/cq.h
++++ b/include/linux/mlx5/cq.h
+@@ -184,6 +184,7 @@ static inline void mlx5_cq_put(struct ml
+ 		complete(&cq->free);
+ }
+ 
++void mlx5_add_cq_to_tasklet(struct mlx5_core_cq *cq, struct mlx5_eqe *eqe);
+ int mlx5_create_cq(struct mlx5_core_dev *dev, struct mlx5_core_cq *cq,
+ 		   u32 *in, int inlen, u32 *out, int outlen);
+ int mlx5_core_create_cq(struct mlx5_core_dev *dev, struct mlx5_core_cq *cq,
