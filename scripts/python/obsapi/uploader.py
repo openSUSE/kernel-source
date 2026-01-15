@@ -9,6 +9,8 @@ import sys
 import re
 import os
 
+ignore_kabi_file = 'IGNORE-KABI-BADNESS'
+
 class UploaderBase:
     def log_progress(self, string):
         if hasattr(self, 'progress') and self.progress:
@@ -19,16 +21,13 @@ class UploaderBase:
         self.log_progress('Updating .gitattributes to put tarballs into LFS.\n')
         self.tea.update_gitattr(self.user, self.upstream.repo, self.user_branch)
         self.log_progress('Updating branch %s with content of %s\n' % (self.user_branch, data))
-        self.tea.update_content(self.user, self.upstream.repo, self.user_branch, data, message)
+        self.tea.update_content(self.user, self.upstream.repo, self.user_branch, data, message, [ignore_kabi_file] if self.ignore_kabi_badness else None)
         self.commit = self.tea.repo_branches(self.user, self.upstream.repo)[self.user_branch]['commit']['id']
         self.log_progress('commit sha: %s\n' % (self.commit,))
         return self.commit
 
     def ignore_kabi(self):
         self.ignore_kabi_badness = True
-        file = 'IGNORE-KABI-BADNESS'
-        self.log_progress('Uploading %s\n' % (file,))
-        self.tea.update_file(self.user, self.upstream.repo, self.user_branch, file, [])
 
     def sync_url(self):
         return self.upstream.api + '/' + self.user + '/' + self.upstream.repo + '?trackingbranch=' + self.user_branch + '#' + self.commit
@@ -37,7 +36,7 @@ class UploaderBase:
         if not self.upstream.branch:
             raise APIError("No upstream branch to submit to.")
         pr = self.tea.get_pr(self.upstream.org, self.upstream.repo, self.upstream.branch, self.user + ':' + self.user_branch)
-        if not pr:
+        if not pr or pr['merged']:
             if not message:
                 editor = os.environ.get('EDITOR', 'vi')
                 with tempfile.NamedTemporaryFile(prefix=self.upstream.org + '.' + self.upstream.repo + '.' + self.upstream.branch + '.') as tmp:
@@ -119,7 +118,7 @@ class UploaderBase:
     def prjmeta(self, limit_packages=None, rebuild=False, debuginfo=False, maintainers=[]):
         repo_archs = self.get_project_repo_archs(limit_packages)
         source_timestamp = read_source_timestamp(os.path.join(self.data, 'source-timestamp'))
-        branch = source_timestamp.get('git branch', None)
+        branch = source_timestamp.get('git branch', 'unknown')
         xml = ET.Element('project', name=self.project)
         e = ET.SubElement(xml, 'title')
         e.text = 'Kernel builds for branch ' + branch
@@ -317,7 +316,7 @@ class Uploader(UploaderBase):
         if self.upstream.branch:
             assert self.upstream.branch in self.tea.repo_branches(self.upstream.org, self.upstream.repo)
         if self.upstream.commit:  # Maybe check it's part of the branch as well?
-            assert self.tea.repo_commit(self.upstream.org, self.upstream.repo, self.upstream.commit)
+            self.tea.repo_commit_exists(self.upstream.org, self.upstream.repo, self.upstream.commit)  # may be missing because of sync error
         if not downstream_info:
             if upstream_info:
                 self.log_progress('Forking repository %s/%s from %s/%s.\n' % (self.user, self.upstream.repo, self.upstream.org, self.upstream.repo))
@@ -325,11 +324,16 @@ class Uploader(UploaderBase):
                 self.log_progress('Creating repository %s/%s.\n' % (self.user, self.upstream.repo))
             downstream_info = self.tea.fork_repo(self.upstream.org, self.user, self.upstream.repo)
         if upstream_info and self.upstream.branch:
-            self.log_progress('Merging upstream branch %s.\n' % (self.upstream.branch,))
-            self.tea.merge_upstream_branch(self.user, self.upstream.repo, self.upstream.branch)
-        if reset_branch:
-            self.log_progress('Resetting branch %s.\n' % (self.user_branch,))
-        else:
-            self.log_progress('Creating branch %s.\n' % (self.user_branch,))
-        self.tea.create_branch(self.user, self.upstream.repo, self.user_branch, self.upstream.branch, self.upstream.commit, reset_branch)
+            self.log_progress('Merging upstream branch %s..' % (self.upstream.branch,))
+            pull = self.tea.merge_upstream_branch(self.user, self.upstream.repo, self.upstream.branch)
+            if not pull.ok:
+                self.log_progress(' '.join([pull.status_message_pretty, repr(pull.json())]) + '\n')
+            else:
+                self.log_progress('ok\n')
+        if not downstream_info['empty']:
+            if reset_branch:
+                self.log_progress('Resetting branch %s.\n' % (self.user_branch,))
+            else:
+                self.log_progress('Creating branch %s.\n' % (self.user_branch,))
+            self.tea.create_branch(self.user, self.upstream.repo, self.user_branch, self.upstream.branch, self.upstream.commit, reset_branch)
         self.ignore_kabi_badness = False
