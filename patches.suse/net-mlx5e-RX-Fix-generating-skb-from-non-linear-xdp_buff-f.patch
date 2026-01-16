@@ -1,0 +1,121 @@
+From: Amery Hung <ameryhung@gmail.com>
+Date: Thu, 16 Oct 2025 22:55:40 +0300
+Subject: net/mlx5e: RX, Fix generating skb from non-linear xdp_buff for
+ striding RQ
+Git-commit: 87bcef158ac1faca1bd7e0104588e8e2956d10be
+References: CVE-2025-40350 bsc#1255260
+Patch-mainline: v6.18-rc3
+
+XDP programs can change the layout of an xdp_buff through
+bpf_xdp_adjust_tail() and bpf_xdp_adjust_head(). Therefore, the driver
+cannot assume the size of the linear data area nor fragments. Fix the
+bug in mlx5 by generating skb according to xdp_buff after XDP programs
+run.
+
+Currently, when handling multi-buf XDP, the mlx5 driver assumes the
+layout of an xdp_buff to be unchanged. That is, the linear data area
+continues to be empty and fragments remain the same. This may cause
+the driver to generate erroneous skb or triggering a kernel
+warning. When an XDP program added linear data through
+bpf_xdp_adjust_head(), the linear data will be ignored as
+mlx5e_build_linear_skb() builds an skb without linear data and then
+pull data from fragments to fill the linear data area. When an XDP
+program has shrunk the non-linear data through bpf_xdp_adjust_tail(),
+the delta passed to __pskb_pull_tail() may exceed the actual nonlinear
+data size and trigger the BUG_ON in it.
+
+To fix the issue, first record the original number of fragments. If the
+number of fragments changes after the XDP program runs, rewind the end
+fragment pointer by the difference and recalculate the truesize. Then,
+build the skb with the linear data area matching the xdp_buff. Finally,
+only pull data in if there is non-linear data and fill the linear part
+up to 256 bytes.
+
+[jaeckel: backported to fixes/linux-6.4]
+
+Fixes: f52ac7028bec ("net/mlx5e: RX, Add XDP multi-buffer support in Striding RQ")
+Signed-off-by: Amery Hung <ameryhung@gmail.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1760644540-899148-3-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Steffen Jaeckel <sjaeckel@suse.de>
+
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_rx.c | 26 ++++++++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 4db9149eb3332..a8779a30cdada 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -1994,6 +1994,7 @@ mlx5e_skb_from_cqe_mpwrq_nonlinear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *w
+ 	struct skb_shared_info *sinfo;
+ 	struct mlx5e_xdp_buff mxbuf;
+ 	unsigned int truesize = 0;
++	u32 pg_consumed_bytes;
+ 	struct bpf_prog *prog;
+ 	struct sk_buff *skb;
+ 	u32 linear_frame_sz;
+@@ -2044,7 +2045,8 @@ mlx5e_skb_from_cqe_mpwrq_nonlinear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *w
+ 
+ 	while (byte_cnt) {
+ 		/* Non-linear mode, hence non-XSK, which always uses PAGE_SIZE. */
+-		u32 pg_consumed_bytes = min_t(u32, PAGE_SIZE - frag_offset, byte_cnt);
++		pg_consumed_bytes =
++			min_t(u32, PAGE_SIZE - frag_offset, byte_cnt);
+ 
+ 		if (test_bit(MLX5E_RQ_STATE_SHAMPO, &rq->state))
+ 			truesize += pg_consumed_bytes;
+@@ -2059,10 +2061,15 @@ mlx5e_skb_from_cqe_mpwrq_nonlinear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *w
+ 	}
+ 
+ 	if (prog) {
++		u8 nr_frags_free, old_nr_frags = sinfo->nr_frags;
++		u32 len;
++
+ 		if (mlx5e_xdp_handle(rq, prog, &mxbuf)) {
+ 			if (__test_and_clear_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags)) {
+ 				struct mlx5e_frag_page *pfp;
+ 
++				frag_page -= old_nr_frags - sinfo->nr_frags;
++
+ 				for (pfp = head_page; pfp < frag_page; pfp++)
+ 					pfp->frags++;
+ 
+@@ -2072,9 +2079,19 @@ mlx5e_skb_from_cqe_mpwrq_nonlinear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *w
+ 			return NULL; /* page/packet was consumed by XDP */
+ 		}
+ 
++		nr_frags_free = old_nr_frags - sinfo->nr_frags;
++		if (unlikely(nr_frags_free)) {
++			frag_page -= nr_frags_free;
++			truesize -= (nr_frags_free - 1) * PAGE_SIZE +
++				ALIGN(pg_consumed_bytes,
++				      BIT(rq->mpwqe.log_stride_sz));
++		}
++
++		len = mxbuf.xdp.data_end - mxbuf.xdp.data;
++
+ 		skb = mlx5e_build_linear_skb(rq, mxbuf.xdp.data_hard_start,
+ 					     linear_frame_sz,
+-					     mxbuf.xdp.data - mxbuf.xdp.data_hard_start, 0,
++					     mxbuf.xdp.data - mxbuf.xdp.data_hard_start, len,
+ 					     mxbuf.xdp.data - mxbuf.xdp.data_meta);
+ 		if (unlikely(!skb)) {
+ 			mlx5e_page_release_fragmented(rq, &wi->linear_page);
+@@ -2097,8 +2114,11 @@ mlx5e_skb_from_cqe_mpwrq_nonlinear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *w
+ 			do
+ 				pagep->frags++;
+ 			while (++pagep < frag_page);
++
++			headlen = min_t(u16, MLX5E_RX_MAX_HEAD - len,
++					skb->data_len);
++			__pskb_pull_tail(skb, headlen);
+ 		}
+-		__pskb_pull_tail(skb, headlen);
+ 	} else {
+ 		dma_addr_t addr;
+ 
+-- 
+2.52.0
+
