@@ -1,4 +1,4 @@
-from kutil.config import get_kernel_projects, get_package_archs, read_source_timestamp, get_kernel_project_package, list_files, list_specs
+from kutil.config import get_kernel_projects, get_package_archs, get_source_timestamp, read_source_timestamp, get_kernel_project_package, list_files, list_specs
 import xml.etree.ElementTree as ET
 from obsapi.obsapi import OBSAPI
 from obsapi.teaapi import TeaAPI
@@ -16,18 +16,16 @@ class UploaderBase:
         if hasattr(self, 'progress') and self.progress:
             self.progress.write(string)
 
-    def upload(self, data, message):
-        self.data = data
+    def upload(self, message=None):
+        if not message:
+            message = get_source_timestamp(self.data)
         self.log_progress('Updating .gitattributes to put tarballs into LFS.\n')
         self.tea.update_gitattr(self.user, self.upstream.repo, self.user_branch)
-        self.log_progress('Updating branch %s with content of %s\n' % (self.user_branch, data))
-        self.tea.update_content(self.user, self.upstream.repo, self.user_branch, data, message, [ignore_kabi_file] if self.ignore_kabi_badness else None)
+        self.log_progress('Updating branch %s with content of %s\n' % (self.user_branch, self.data))
+        self.tea.update_content(self.user, self.upstream.repo, self.user_branch, self.data, message, [ignore_kabi_file] if self.ignore_kabi_badness else None)
         self.commit = self.tea.repo_branches(self.user, self.upstream.repo)[self.user_branch]['commit']['id']
         self.log_progress('commit sha: %s\n' % (self.commit,))
         return self.commit
-
-    def ignore_kabi(self):
-        self.ignore_kabi_badness = True
 
     def sync_url(self):
         return self.upstream.api + '/' + self.user + '/' + self.upstream.repo + '?trackingbranch=' + self.user_branch + '#' + self.commit
@@ -291,19 +289,21 @@ Constraint: hardware:disk:size unit=G %i
 
 
 class Uploader(UploaderBase):
-    def __init__(self, api, upstream_project, user_project, package, reset_branch=False, logfile=None, progress=True):
+    def __init__(self, api, data, user_project, reset_branch=False, logfile=None, progress=True, ignore_kabi=False):
         self.progress = sys.stderr if progress else None
-        self.package = package
-        self.project = user_project
+        self.data = data
+        upstream_project, self.package = get_kernel_project_package(self.data)
+        self.project = user_project.replace('/',':')
         self.obs = OBSAPI(api, logfile)
-        self.log_progress('Getting scmsync for %s/%s...' % (upstream_project, package))
-        self.upstream = self.obs.package_repo(upstream_project, package)
+        self.log_progress('Getting scmsync for %s/%s...' % (upstream_project, self.package))
+        self.upstream = self.obs.package_repo(upstream_project, self.package)
         self.log_progress('%s\n' % (repr(self.upstream),))
         self.tea = TeaAPI(self.upstream.api, logfile, progress=self.progress)
         self.log_progress('Getting Gitea user...')
         self.user = self.tea.get_user()
         self.log_progress('%s\n' % (self.user,))
         self.user_branch = user_project.translate(str.maketrans(':', '/')) if user_project else self.upstream.branch
+        self.ignore_kabi_badness = ignore_kabi
         upstream_info = self.tea.repo_exists(self.upstream.org, self.upstream.repo)
         if upstream_info:
             upstream_info = upstream_info.json()
@@ -336,4 +336,3 @@ class Uploader(UploaderBase):
             else:
                 self.log_progress('Creating branch %s.\n' % (self.user_branch,))
             self.tea.create_branch(self.user, self.upstream.repo, self.user_branch, self.upstream.branch, self.upstream.commit, reset_branch)
-        self.ignore_kabi_badness = False
