@@ -1,10 +1,12 @@
 from kutil.config import get_kernel_projects, get_package_archs, get_source_timestamp, read_source_timestamp, get_kernel_project_package, list_files, list_specs
 import xml.etree.ElementTree as ET
+from obsapi.teaapi import TeaAPI, json_custom_dump
 from obsapi.obsapi import OBSAPI
-from obsapi.teaapi import TeaAPI
 from obsapi.api import APIError
 import subprocess
 import tempfile
+import difflib
+import json
 import sys
 import re
 import os
@@ -290,6 +292,31 @@ Constraint: hardware:disk:size unit=G %i
             self.obs.delete_package(self.project, s)
             self.log_progress('ok\n')
 
+    def set_git_maintainers(self, maintainers):
+        maintfile = '_maintainership.json'
+        self.log_progress('Getting scmsync for %s...' % (self.upstream_project,))
+        prjrepo = self.obs.project_repo(self.upstream_project)
+        self.log_progress('%s\n' % (repr(prjrepo),))
+        if prjrepo:
+            assert self.tea.url == prjrepo.api
+            self.log_progress('Getting %s...' % (maintfile,))
+            data = self.tea.get_file_data(prjrepo.org, prjrepo.repo, prjrepo.branch, maintfile)
+            data_decoded = json.loads(data)
+            assert json.loads(json_custom_dump(data_decoded)) == data_decoded
+            current_maintainers = json.loads(data).get(self.package, [])
+            if (maintainers and maintainers != current_maintainers) or (not maintainers and data_decoded != json_custom_dump(data_decoded)):
+                if maintainers:
+                    data_decoded[self.package] = maintainers
+                data_massaged = json_custom_dump(data_decoded)
+                sys.stderr.write('\n'.join(difflib.unified_diff(data.splitlines(), data_massaged.splitlines(), lineterm='')))
+                self.fork_repo(prjrepo, self.reset_branch)
+                self.log_progress('Updating %s.\n' % (maintfile,))
+                self.tea.update_file(self.user, prjrepo.repo, self.user_branch, maintfile, data_massaged)
+                commit = self.tea.repo_branches(self.user, prjrepo.repo)[self.user_branch]['commit']['id']
+                self.log_progress('commit sha: %s\n' % (commit,))
+                self._submit(prjrepo, 'Update ' + self.package + ' maintainer list.' if maintainers else
+                'Normalize ' + maintfile + ' formatting\nThe ' + maintfile + ' formatting is not entirely consistent.\nMake the formatting uniform across the whole file to facilitate automated updates.')
+
     def fork_repo(self, upstream_repo, reset_branch):
         upstream_info = self.tea.repo_exists(upstream_repo.org, upstream_repo.repo)
         if upstream_info:
@@ -329,11 +356,11 @@ class Uploader(UploaderBase):
     def __init__(self, api, data, user_project, reset_branch=False, logfile=None, progress=True, ignore_kabi=False):
         self.progress = sys.stderr if progress else None
         self.data = data
-        upstream_project, self.package = get_kernel_project_package(self.data)
+        self.upstream_project, self.package = get_kernel_project_package(self.data)
         self.project = user_project.replace('/',':')
         self.obs = OBSAPI(api, logfile)
-        self.log_progress('Getting scmsync for %s/%s...' % (upstream_project, self.package))
-        self.upstream = self.obs.package_repo(upstream_project, self.package)
+        self.log_progress('Getting scmsync for %s/%s...' % (self.upstream_project, self.package))
+        self.upstream = self.obs.package_repo(self.upstream_project, self.package)
         self.log_progress('%s\n' % (repr(self.upstream),))
         self.tea = TeaAPI(self.upstream.api, logfile, progress=self.progress)
         self.log_progress('Getting Gitea user...')
@@ -341,4 +368,5 @@ class Uploader(UploaderBase):
         self.log_progress('%s\n' % (self.user,))
         self.user_branch = user_project.translate(str.maketrans(':', '/')) if user_project else self.upstream.branch
         self.ignore_kabi_badness = ignore_kabi
-        self.fork_repo(self.upstream, reset_branch)
+        self.reset_branch = reset_branch
+        self.fork_repo(self.upstream, self.reset_branch)
