@@ -287,6 +287,40 @@ Constraint: hardware:disk:size unit=G %i
             self.obs.delete_package(self.project, s)
             self.log_progress('ok\n')
 
+    def fork_repo(self, upstream_repo, reset_branch):
+        upstream_info = self.tea.repo_exists(upstream_repo.org, upstream_repo.repo)
+        if upstream_info:
+            upstream_info = upstream_info.json()
+        downstream_info = self.tea.repo_exists(self.user, upstream_repo.repo)
+        if downstream_info:
+            downstream_info = downstream_info.json()
+        if upstream_info and downstream_info:
+            if not downstream_info['fork'] or downstream_info['parent']['full_name'] != upstream_repo.org + '/' + upstream_repo.repo:
+                raise APIError('Fork of ' + upstream_repo.org + '/' + upstream_repo.repo + ' needed.')
+        if upstream_repo.branch:
+            assert upstream_repo.branch in self.tea.repo_branches(upstream_repo.org, upstream_repo.repo)
+        if upstream_repo.commit:  # Maybe check it's part of the branch as well?
+            self.tea.repo_commit_exists(upstream_repo.org, upstream_repo.repo, upstream_repo.commit)  # may be missing because of sync error
+        if not downstream_info:
+            if upstream_info:
+                self.log_progress('Forking repository %s/%s from %s/%s.\n' % (self.user, upstream_repo.repo, upstream_repo.org, upstream_repo.repo))
+            else:
+                self.log_progress('Creating repository %s/%s.\n' % (self.user, upstream_repo.repo))
+            downstream_info = self.tea.fork_repo(upstream_repo.org, self.user, upstream_repo.repo)
+        if upstream_info and upstream_repo.branch:
+            self.log_progress('Merging upstream branch %s..' % (upstream_repo.branch,))
+            pull = self.tea.merge_upstream_branch(self.user, upstream_repo.repo, upstream_repo.branch)
+            if not pull.ok:
+                self.log_progress(' '.join([pull.status_message_pretty, repr(pull.json())]) + '\n')
+            else:
+                self.log_progress('ok\n')
+        if not downstream_info['empty']:
+            if reset_branch:
+                self.log_progress('Resetting branch %s.\n' % (self.user_branch,))
+            else:
+                self.log_progress('Creating branch %s.\n' % (self.user_branch,))
+            self.tea.create_branch(self.user, upstream_repo.repo, self.user_branch, upstream_repo.branch, upstream_repo.commit, reset_branch)
+
 
 class Uploader(UploaderBase):
     def __init__(self, api, data, user_project, reset_branch=False, logfile=None, progress=True, ignore_kabi=False):
@@ -304,35 +338,4 @@ class Uploader(UploaderBase):
         self.log_progress('%s\n' % (self.user,))
         self.user_branch = user_project.translate(str.maketrans(':', '/')) if user_project else self.upstream.branch
         self.ignore_kabi_badness = ignore_kabi
-        upstream_info = self.tea.repo_exists(self.upstream.org, self.upstream.repo)
-        if upstream_info:
-            upstream_info = upstream_info.json()
-        downstream_info = self.tea.repo_exists(self.user, self.upstream.repo)
-        if downstream_info:
-            downstream_info = downstream_info.json()
-        if upstream_info and downstream_info:
-            if not downstream_info['fork'] or downstream_info['parent']['full_name'] != self.upstream.org + '/' + self.upstream.repo:
-                raise APIError('Fork of ' + self.upstream.org + '/' + self.upstream.repo + ' needed.')
-        if self.upstream.branch:
-            assert self.upstream.branch in self.tea.repo_branches(self.upstream.org, self.upstream.repo)
-        if self.upstream.commit:  # Maybe check it's part of the branch as well?
-            self.tea.repo_commit_exists(self.upstream.org, self.upstream.repo, self.upstream.commit)  # may be missing because of sync error
-        if not downstream_info:
-            if upstream_info:
-                self.log_progress('Forking repository %s/%s from %s/%s.\n' % (self.user, self.upstream.repo, self.upstream.org, self.upstream.repo))
-            else:
-                self.log_progress('Creating repository %s/%s.\n' % (self.user, self.upstream.repo))
-            downstream_info = self.tea.fork_repo(self.upstream.org, self.user, self.upstream.repo)
-        if upstream_info and self.upstream.branch:
-            self.log_progress('Merging upstream branch %s..' % (self.upstream.branch,))
-            pull = self.tea.merge_upstream_branch(self.user, self.upstream.repo, self.upstream.branch)
-            if not pull.ok:
-                self.log_progress(' '.join([pull.status_message_pretty, repr(pull.json())]) + '\n')
-            else:
-                self.log_progress('ok\n')
-        if not downstream_info['empty']:
-            if reset_branch:
-                self.log_progress('Resetting branch %s.\n' % (self.user_branch,))
-            else:
-                self.log_progress('Creating branch %s.\n' % (self.user_branch,))
-            self.tea.create_branch(self.user, self.upstream.repo, self.user_branch, self.upstream.branch, self.upstream.commit, reset_branch)
+        self.fork_repo(self.upstream, reset_branch)
