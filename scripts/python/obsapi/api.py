@@ -36,9 +36,10 @@ def _get_encoding(r):  # another case for walrus
     return ct
 setattr(http.client.HTTPResponse, 'encoding', property(_get_encoding))
 
+setattr(http.client.HTTPResponse, 'status_message_pretty', property(lambda r: '%s %s %i %s' % (r.url, r.method, r.status, r.reason)))
 def _raise_for_status(r):
     if not r.ok:
-        raise APIError('%s %s %i %s' % (r.url, r.method, r.status, r.reason))
+        raise APIError(r.status_message_pretty)
 http.client.HTTPResponse.raise_for_status = _raise_for_status
 
 def _dic_update(self, dic):

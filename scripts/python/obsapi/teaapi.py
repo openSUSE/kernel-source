@@ -1,5 +1,4 @@
 from kutil.config import init_repo, list_files
-from collections import namedtuple
 from obsapi import api
 import subprocess
 import tempfile
@@ -9,21 +8,6 @@ import json
 import yaml
 import sys
 import os
-
-File = namedtuple('File',['oid', 'size', 'name', 'lfs', 'lfs_oid', 'lfs_size'])
-
-def ssv(text):
-    try:
-        result = {}
-        for l in text.splitlines():
-            k,v = l.split(' ', 1)
-            result[k] = v
-        return result
-    except Exception:
-        return {}
-
-def ref_arg(ref):
-    return { 'ref' : ref }
 
 class TeaAPI(api.API):
     def __init__(self, URL, logfile=None, config=None, ca=None, progress=sys.stderr):
@@ -61,6 +45,37 @@ class TeaAPI(api.API):
         if self.progress:
             self.progress.write(string)
 
+    def _page_url(self, url):
+        r = self.check_get(url, params={
+            'limit' : 1000,
+            })
+        items = r.json()
+        item_count = int(r.headers['X-Total-Count'])
+        page_size = len(items)
+        result = items
+        if page_size != item_count:
+            pages = int((item_count + page_size - 1)/page_size)  # ceil
+            for page in range(2, pages + 1):
+                items = self.check_get(url, params={
+                    'limit' : page_size,
+                    'page' : page,
+                    }).json()
+                result += items
+        assert len(result) == item_count
+        return result
+
+    def _name_dict(self, items):
+        if items:
+            dic = {}
+            for i in items:
+                dic[i['name']] = i
+            return dic
+        return {}
+
+    def list_repos(self, org):
+        repos = self._page_url('/api/v1/users/' + org + '/repos')
+        return self._name_dict(repos)
+
     def repo_path(self, org, repo):
         return '/api/v1/repos/' + org + '/' + repo
 
@@ -95,42 +110,39 @@ class TeaAPI(api.API):
         return repoinfo
 
     def repo_branches(self, org, repo):
-        r = self.check_get(self.repo_path(org, repo) + '/branches', params={
-            'limit' : 1000,
-            })
-        branch_count = int(r.headers['X-Total-Count'])
-        branches = r.json()
-        if branches:
-            dic = {}
-            for b in branches:
-                dic[b['name']] = b
-            branches = dic
-        else:
-            branches = {}
-        if branch_count != len(branches.keys()):
-            sys.stderr.write('%s/%s: Number of branches retrieved %i is not equal branch count %i' % (org, repo, branch_count, len(branches)))
-        return branches
+        branches = self._page_url(self.repo_path(org, repo) + '/branches')
+        return self._name_dict(branches)
 
     def delete_branch(self, org, repo, branch):
         return self.check_delete(self.repo_path(org, repo) + '/branches/' + branch)
 
     def repo_commit(self, org, repo, commit):
-        return self.check_get(self.repo_path(org, repo) + '/git/commits/' + commit, params = {
+        return self.get(self.repo_path(org, repo) + '/git/commits/' + commit, params = {
             'stat' : False,
             'files' : False,
             'verification' : False,
             })
 
+    def repo_commit_exists(self, org, repo, commit):
+        c = self.repo_commit(org, repo, commit)
+        if c.status == 404:
+            sys.stderr.write('Commit %s not in %s/%s %s\n' % (commit, org, repo, c.status_message_pretty))
+            return False
+        c.raise_for_status()
+        return c
+
     def merge_upstream_branch(self, org, repo, branch):
-        return self.check_post(self.repo_path(org, repo) + '/merge-upstream', json = {
+        if not branch in self.repo_branches(org, repo):
+            self.create_branch(org, repo, branch, None, None)
+        return self.post(self.repo_path(org, repo) + '/merge-upstream', json = {
             'branch': branch,
             })
 
     def create_branch(self, org, repo, branch, ref_branch, commit, reset=False):
         branches = self.repo_branches(org, repo)
-        if commit:
-            assert self.repo_commit(org, repo, commit)
-        elif ref_branch:
+        if commit and not self.repo_commit_exists(org, repo, commit):
+            commit = None
+        if not commit and  ref_branch:
             assert ref_branch in branches
         if branch in branches:
             if not reset:
@@ -169,7 +181,7 @@ class TeaAPI(api.API):
                 ])
 
     def update_file(self, org, repo, branch, fn, lines):
-        r = self.check_exists(self.repo_path(org, repo) + '/contents/' + fn, params=ref_arg(branch))
+        r = self.check_exists(self.repo_path(org, repo) + '/contents/' + fn, params={'ref': branch})
         sha = None
         if r:
             fileinfo = r.json()
@@ -193,33 +205,18 @@ class TeaAPI(api.API):
                 method = 'PUT'
             self.check(method, self.repo_path(org, repo) + '/contents/' + fn, json=data)
 
-    def update_content(self, org, repo, branch, src, message):
-        ign = ['.gitattributes', '.gitignore']
+    def update_content(self, org, repo, branch, src, message, ignored_files=None):
+        ign = ['.gitattributes', '.gitignore'] + (ignored_files if ignored_files else [])
         exc = ['.osc', '.git']
-        r = self.check_get(self.repo_path(org, repo) + '/contents', params=ref_arg(branch))
-        files = r.json()
-        filelist = [File(f['sha'], f['size'], f['name'], None, None, None) for f in files]
-
-        # in absence of https://github.com/go-gitea/gitea/pull/34822 (to be released in gitea 1.25) guesstimate what is LFS
-        basesize = 125
-        fuzz = 5
-        maxsize = basesize + len(str(1<<64))
-        for i, f in enumerate(filelist):
-            if f.size > basesize - fuzz and f.size <= maxsize + fuzz:
-                r = self.check_get(self.repo_path(org, repo) + '/raw/' + f.name, params=ref_arg(branch))
-                try:
-                    lfs = ssv(r.text)
-                except UnicodeDecodeError:
-                    lfs = None
-                if lfs and lfs.get('version') == 'https://git-lfs.github.com/spec/v1':
-                    filelist[i] = filelist[i]._replace(lfs=True, lfs_oid=lfs['oid'].split(':')[1], lfs_size=lfs['size'])
-                else:
-                    self.log_progress('%s/%s %s %s: Invalid LFS link\n' % (org, repo, branch, f.name))
-
+        r = self.check_get(self.repo_path(org, repo) + '/contents-ext', params={
+            'ref': branch,
+            'includes': 'lfs_metadata'
+            })
+        filelist = r.json()['dir_contents']
         files = {}
         for f in filelist:
-            if f.name not in ign and f.name not in exc:
-                files[f.name] = f
+            if f['name'] not in ign and f['name'] not in exc:
+                files[f['name']] = f
         with tempfile.TemporaryDirectory() as tmpdirname:
             hasher = init_repo(tmpdirname, repo, 'whatever')
             rq = { 'branch' : branch, 'files' : [], 'message': message }
@@ -235,18 +232,18 @@ class TeaAPI(api.API):
                 with open(pathname, 'rb') as fd:
                     content = fd.read()
                 if files.get(filename):
-                    if files[filename].lfs:
+                    if files[filename].get('lfs_oid', None):
                         sha = hashlib.sha256(content).hexdigest()
-                        reference = files[filename].lfs_oid
+                        reference = files[filename]['lfs_oid']
                     else:
                         sha = subprocess.check_output(['git', 'hash-object', pathname], cwd=hasher, universal_newlines=True).splitlines()[0]
-                        reference = files[filename].oid
+                        reference = files[filename]['sha']
                 if not files.get(filename) or reference != sha:
                     content = base64.standard_b64encode(content).decode()
                     frq = { 'content' : content, 'path' : filename}
                     if files.get(filename):
                         frq['operation'] = 'update'
-                        frq['sha'] = files[filename].oid
+                        frq['sha'] = files[filename]['sha']
                         self.log_progress('UPDATE %s\n' % (filename))
                     else:
                         frq['operation'] = 'create'
@@ -254,7 +251,7 @@ class TeaAPI(api.API):
                     rq['files'].append(frq)
                 files.pop(filename, None)
             for filename in sorted(files.keys()):
-                frq = { 'path' : filename, 'operation' : 'delete', 'sha' : files[filename].oid }
+                frq = { 'path' : filename, 'operation' : 'delete', 'sha' : files[filename]['sha'] }
                 rq['files'].append(frq)
                 self.log_progress('DELETE %s\n' % (filename))
             if len(rq['files']) > 0:

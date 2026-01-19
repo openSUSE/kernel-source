@@ -1,4 +1,4 @@
-from kutil.config import get_source_timestamp, get_package_archs, get_kernel_projects
+from kutil.config import get_package_archs, get_kernel_projects
 from obsapi.obsapi import OBSAPI, PkgRepo
 from obsapi.uploader import UploaderBase
 import xml.etree.ElementTree as ET
@@ -236,7 +236,7 @@ class TestTea(unittest.TestCase):
         st = ServerThread('tests/api/update_content')
         st.start_server(teaconfig=self.config)
         api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
-        api.update_content('michals', 'testrepo', 'testbranch', 'tests/api/content/update', get_source_timestamp('tests/api/content/update'))
+        api.update_content('michals', 'testrepo', 'testbranch', 'tests/api/content/update', 'Update flies')
 
     def test_create_branch(self):
         st = ServerThread('tests/api/branch_new')
