@@ -197,6 +197,8 @@ class ServerThread():
     def __del__(self):
         self.stop_server()
 
+    data_consumed = property(lambda self: self.httpd.index == len(self.httpd.data))
+
 class TestTea(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -212,18 +214,58 @@ class TestTea(unittest.TestCase):
         st.start_server(teaconfig=self.config)
         api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
         api.update_gitattr('michals', 'testrepo', 'testbranch')
+        self.assertTrue(st.data_consumed)
+
+    def test_file_up_to_date(self):
+        st = ServerThread('tests/api/gitattr_up_to_date')
+        st.start_server(teaconfig=self.config)
+        api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
+        api.update_file('michals', 'testrepo', 'testbranch', '.gitattributes', '''*.tar.?z filter=lfs diff=lfs merge=lfs -text
+foobar
+*.tar.bz2 filter=lfs diff=lfs merge=lfs -text
+''')
+        self.assertTrue(st.data_consumed)
 
     def test_gitattr_nonexistent_file(self):
         st = ServerThread('tests/api/gitattr_nonexistent_file')
         st.start_server(teaconfig=self.config)
         api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
         api.update_gitattr('michals', 'testrepo', 'testbranch')
+        self.assertTrue(st.data_consumed)
+
+    def test_file_nonexistent(self):
+        st = ServerThread('tests/api/gitattr_nonexistent_file')
+        st.start_server(teaconfig=self.config)
+        api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
+        api.update_file('michals', 'testrepo', 'testbranch', '.gitattributes', '''*.tar.bz2 filter=lfs diff=lfs merge=lfs -text
+*.tar.?z filter=lfs diff=lfs merge=lfs -text
+''')
+        self.assertTrue(st.data_consumed)
 
     def test_gitattr_needs_update(self):
         st = ServerThread('tests/api/gitattr_needs_update')
         st.start_server(teaconfig=self.config)
         api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
         api.update_gitattr('michals', 'testrepo', 'testbranch')
+        self.assertTrue(st.data_consumed)
+
+    def test_file_needs_update(self):
+        st = ServerThread('tests/api/gitattr_needs_update')
+        st.start_server(teaconfig=self.config)
+        api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
+        api.update_file('michals', 'testrepo', 'testbranch', '.gitattributes', '''*.tar.?z filter=lfs diff=lfs merge=lfs -text
+foobar
+*.tar.bz2 filter=lfs diff=lfs merge=lfs -text
+''')
+        self.assertTrue(st.data_consumed)
+
+    def test_file_needs_update_incomplete(self):
+        st = ServerThread('tests/api/gitattr_needs_update')
+        st.start_server(teaconfig=self.config)
+        api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
+        api.update_file('michals', 'testrepo', 'testbranch', '.gitattributes', '''*.tar.?z filter=lfs diff=lfs merge=lfs -text
+foobar''')
+        self.assertFalse(st.data_consumed)
 
     def test_gitattr_nonexistent_repo(self):
         st = ServerThread('tests/api/gitattr_nonexistent_repo')
@@ -231,30 +273,36 @@ class TestTea(unittest.TestCase):
         api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
         with self.assertRaisesRegex(APIError, '/api/v1/repos/michals/testrepo/contents/.gitattributes POST 404 Not Found'):
             api.update_gitattr('michals', 'testrepo', 'testbranch')
+        self.assertTrue(st.data_consumed)
 
     def test_content_update(self):
         st = ServerThread('tests/api/update_content')
         st.start_server(teaconfig=self.config)
         api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
         api.update_content('michals', 'testrepo', 'testbranch', 'tests/api/content/update', 'Update flies')
+        self.assertTrue(st.data_consumed)
 
     def test_create_branch(self):
         st = ServerThread('tests/api/branch_new')
         st.start_server(teaconfig=self.config)
         api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
         api.create_branch('michals', 'testrepo', 'downstream', 'testbranch', '60298bc4bf915a41f8f16f64d05a4125b434ca63112c53ba6779b039123c6db6', True)
+        self.assertTrue(st.data_consumed)
         st = ServerThread('tests/api/branch_up_to_date')
         st.start_server(teaconfig=self.config)
         api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
         api.create_branch('michals', 'testrepo', 'downstream', 'testbranch', '60298bc4bf915a41f8f16f64d05a4125b434ca63112c53ba6779b039123c6db6', True)
+        self.assertTrue(st.data_consumed)
         st = ServerThread('tests/api/branch_no_roll')
         st.start_server(teaconfig=self.config)
         api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
         api.create_branch('michals', 'testrepo', 'downstream', 'testbranch', 'a0156cd1f6cc836cec02b406a8c5154311bcd800e431a4092e5b59f611049ee4', False)
+        self.assertTrue(st.data_consumed)
         st = ServerThread('tests/api/branch_roll_forward')
         st.start_server(teaconfig=self.config)
         api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
         api.create_branch('michals', 'testrepo', 'downstream', 'testbranch', 'a0156cd1f6cc836cec02b406a8c5154311bcd800e431a4092e5b59f611049ee4', True)
+        self.assertTrue(st.data_consumed)
 
 class TestOBS(unittest.TestCase):
     def setUp(self):
@@ -265,6 +313,7 @@ class TestOBS(unittest.TestCase):
         st.start_server(obsconfig=self.config)
         api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
         api.check_login()
+        self.assertTrue(st.data_consumed)
 
     def tearDown(self):
         self.config = None
@@ -276,6 +325,7 @@ class TestOBS(unittest.TestCase):
         st.start_server(obsconfig=self.config)
         api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
         api.check_login()
+        self.assertTrue(st.data_consumed)
 
     def test_SSL(self):
         st = ServerThread('tests/api/obsapi_basic')
@@ -283,6 +333,7 @@ class TestOBS(unittest.TestCase):
         api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar)
         with self.assertRaisesRegex(Exception, 'certificate verify failed'):
             api.check_login()
+        self.assertFalse(st.data_consumed)
 
     def test_Y(self):
         st = ServerThread('tests/api/obsapi_log_in')
@@ -302,6 +353,7 @@ class TestOBS(unittest.TestCase):
         self.assertEqual(api.ssh_signature(1755779838, api.user, api.sshkey, 'some realm'),
                          'keyId="obsuser",algorithm="ssh",headers="(created)",created=1755779838,signature="U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAge7Wj9uPdUE8nqD2mPJ8R9tZLZ2Wgwqj1MT7sJlFhJj4AAAAKc29tZSByZWFsbQAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUxOQAAAEBNMTVv/cHwZMLNZ2UaNaVUX2fJw8J4LvTCcHTrpXQ2z2pr5ldM+UvKypyBExf42plNYEI3hw59V4Uzej/di5YA"')
         api.check_login()
+        self.assertTrue(st.data_consumed)
 
     def test_pkgrepo(self):
         st = ServerThread('tests/api/obsapi_pkgrepo')
@@ -310,6 +362,7 @@ class TestOBS(unittest.TestCase):
         self.assertEqual(api.package_repo('SUSE:SLFO:1.2', 'kernel-source-azure'),
                          PkgRepo(api='https://src.suse.de', org='pool', repo='kernel-source-azure', branch='slfo-1.2',
                                  commit='b20dbdf296c74a2897e61205e5c9edcb7f85340ede6bbfd18c05dbfce87c267b'))
+        self.assertTrue(st.data_consumed)
 
     def test_pkgrepo_defalt(self):
         st = ServerThread('tests/api/obsapi_pkgrepo_no_scmsync')
@@ -317,12 +370,14 @@ class TestOBS(unittest.TestCase):
         api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
         self.assertEqual(api.package_repo('SUSE:SLE-15-SP7:GA', 'kernel-source-azure'),
                          PkgRepo(api=st.url(), org='pool', repo='kernel-source-azure', branch=None, commit=None))
+        self.assertTrue(st.data_consumed)
 
         st = ServerThread('tests/api/obsapi_pkgrepo_nonexistent_pkg')
         st.start_server(obsconfig=self.config)
         api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
         self.assertEqual(api.package_repo('SUSE:SLFO:1.2', 'kernel-source-foobar'),
                          PkgRepo(api=st.url(), org='pool', repo='kernel-source-foobar', branch=None, commit=None))
+        self.assertTrue(st.data_consumed)
 
     def test_list_projects(self):
         st = ServerThread('tests/api/obsapi_list_projects')
@@ -330,6 +385,7 @@ class TestOBS(unittest.TestCase):
         api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
         self.assertEqual(api.list_projects(),
                 ['AlmaLinux:10', 'AlmaLinux:8', 'AlmaLinux:9', 'Alpine:Edge', 'Alpine:Latest', 'Amazon:AL2023', 'Apache', 'Apache:MirrorBrain', 'Apache:MirrorBrain:development', 'Apache:Modules', 'zypp:SLE-15-SP7-Branch', 'zypp:TEST', 'zypp:TW', 'zypp:ci', 'zypp:ci:libzypp', 'zypp:ci:zypper', 'zypp:jezypp', 'zypp:jezypp:SuSE-RES-8-Branch', 'zypp:jezypp:SuSE-RES-9-Branch', 'zypp:plugins'])
+        self.assertTrue(st.data_consumed)
 
     def test_list_packages(self):
         st = ServerThread('tests/api/obsapi_list_packages')
@@ -337,6 +393,7 @@ class TestOBS(unittest.TestCase):
         api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
         self.assertEqual(api.list_project_packages('Kernel:tools'),
                 ['ShellCheck', 'bash-git-prompt', 'bison', 'boottest-ramdisk', 'boottest-ramdisk-12', 'boottest-ramdisk-15', 'boottest-ramdisk-16', 'boottest-ramdisk-16.ARM', 'boottest-ramdisk-16.PowerPC', 'capstone', 'container-base', 'cross-aarch64-gcc48', 'cross-armv7hl-gcc48', 'cross-binutils', 'cross-gcc13', 'cross-gcc14', 'cross-gcc15', 'cross-gcc48', 'cross-gcc7', 'cross-ia64-gcc48', 'cross-ppc64-gcc48', 'cross-ppc64le-gcc48', 'cross-s390x-gcc48', 'cross-x86_64-gcc48', 'dwarves.Factory', 'elfutils', 'elfutils.Factory', 'gcc13', 'gcc13.build', 'gcc14', 'gcc14.build', 'gcc15', 'gcc48', 'gcc6', 'gcc7.build', 'git', 'git-credential-oauth', 'git-fixes', 'git-lfs', 'go1.12', 'go1.14', 'go1.4', 'golang-github-cpuguy83-go-md2man', 'golang-packaging', 'grub2', 'http-parser', 'kbuild-gcc', 'kbuild-support', 'kcov', 'kernel-install-tools', 'kernel-obs-build', 'kernel-source-component', 'libcontainers-common', 'libgit2', 'libgit2.1.7', 'libgit2.1.9', 'libssh2_org', 'liburing2', 'lua-alt-getopt', 'lua-argparse', 'lua-busted', 'lua-cliargs', 'lua-compat-5.3', 'lua-dkjson', 'lua-inspect', 'lua-jsregexp', 'lua-ldoc', 'lua-loadkit', 'lua-lpeg', 'lua-lua-ev', 'lua-luacheck', 'lua-luafilesystem', 'lua-luarocks', 'lua-luassert', 'lua-luasystem', 'lua-luaterm', 'lua-macros', 'lua-markdown', 'lua-mediator_lua', 'lua-moonscript', 'lua-penlight', 'lua-say', 'lua-serpent', 'lua-shell-games', 'lua-tl', 'lua53', 'lua54', 'memory-constraints', 'obs-service-kiwi_metainfo_helper', 'patchtools', 'perl-Text-Markdown', 'pesign-obs-integration', 'python-augeas', 'python-augeas.3.11', 'python-cffi', 'python-mypy', 'python-pygit2', 'python-pygit2.3.11', 'python-typed-ast', 'python36', 'qemu', 'quickjs', 'quilt', 'rapidquilt', 'rpmdevtools', 'rust', 'skopeo', 'suse-add-cves', 'suse-get-maintainers', 'suse-kabi-tools', 'uki-tool', 'umoci', 'zstd'])
+        self.assertTrue(st.data_consumed)
 
     def test_list_links(self):
         st = ServerThread('tests/api/obsapi_list_links')
@@ -344,6 +401,7 @@ class TestOBS(unittest.TestCase):
         api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
         self.assertEqual(api.list_package_links('Kernel:SLE15-SP7', 'kernel-source'),
                 ['dtb-aarch64', 'kernel-64kb', 'kernel-default', 'kernel-docs', 'kernel-kvmsmall', 'kernel-obs-build', 'kernel-obs-qa', 'kernel-syms', 'kernel-zfcpdump'])
+        self.assertTrue(st.data_consumed)
 
     def test_create_project(self):
         st = ServerThread('tests/api/obsapi_create_project')
@@ -352,6 +410,7 @@ class TestOBS(unittest.TestCase):
         api.create_project('home:michals:kernel-test',
                            conf='Substitute: kernel-dummy\nSubstitute: rpmlint-Factory\nSubstitute: post-build-checks-malwarescan\nMacros:\n%is_kotd 1\n%klp_ipa_clones 1\n%is_kotd_qa (0||("%_repository" == "QA"))\n:Macros\nBuildFlags: excludebuild:kernel-source:kernel-obs-qa\nBuildFlags: excludebuild:kernel-obs-qa\nBuildFlags: nouseforbuild:kernel-source:kernel-obs-build\nBuildFlags: nouseforbuild:kernel-obs-build\n%if 0||("%_repository" == "QA")\nBuildFlags: !excludebuild:kernel-source:kernel-obs-qa\nBuildFlags: !excludebuild:kernel-obs-qa\nBuildFlags: onlybuild:kernel-source:kernel-obs-qa\nBuildFlags: onlybuild:kernel-obs-qa\nBuildFlags: onlybuild:kernel-obs-build.agg\nBuildFlags: onlybuild:nonexistent-package\nBuildFlags: !nouseforbuild:kernel-source:kernel-obs-build\nBuildFlags: !nouseforbuild:kernel-obs-build\n%endif\n',
                            meta='<project name="home:michals:kernel-test">\n  <title>Kernel builds for branch SL-16.0</title>\n  <description />\n  <build>\n    <enable />\n  </build>\n  <publish>\n    <enable />\n    <disable repository="QA" />\n  </publish>\n  <debuginfo>\n    <enable />\n  </debuginfo>\n  <repository block="local" name="standard" rebuild="local">\n    <path project="SUSE:SLFO:1.2" repository="standard" />\n    <arch>aarch64</arch>\n    <arch>ppc64le</arch>\n    <arch>s390x</arch>\n    <arch>x86_64</arch>\n  </repository>\n  <repository name="QA">\n    <path project="home:michals:kernel-test" repository="standard" />\n    <arch>aarch64</arch>\n    <arch>ppc64le</arch>\n    <arch>s390x</arch>\n    <arch>x86_64</arch>\n  </repository>\n</project>')
+        self.assertTrue(st.data_consumed)
 
 class FakeRequest:
     def __init__(self, content):

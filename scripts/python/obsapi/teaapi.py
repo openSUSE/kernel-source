@@ -175,35 +175,60 @@ class TeaAPI(api.API):
         return self.check_post(self.repo_path(org, repo) + '/branches', json=json)
 
     def update_gitattr(self, org, repo, branch):
-        self.update_file(org, repo, branch, '.gitattributes', [
+        self.update_file_lines(org, repo, branch, '.gitattributes', [
                 '*.tar.bz2 filter=lfs diff=lfs merge=lfs -text',
                 '*.tar.?z filter=lfs diff=lfs merge=lfs -text',
                 ])
 
-    def update_file(self, org, repo, branch, fn, lines):
-        r = self.check_exists(self.repo_path(org, repo) + '/contents/' + fn, params={'ref': branch})
+    def get_file(self, org, repo, branch, fn):
+        return self.check_exists(self.repo_path(org, repo) + '/contents/' + fn, params={'ref': branch})
+
+    def get_file_data(self, org, repo, branch, fn):
+        r = self.get_file(org, repo, branch, fn)
+        if r:
+            return base64.standard_b64decode(r.json()['content']).decode()
+        return r
+
+    def update_file_lines(self, org, repo, branch, fn, lines):
+        r = self.get_file(org, repo, branch, fn)
         sha = None
         if r:
             fileinfo = r.json()
             sha = fileinfo['sha']
-            content = base64.standard_b64decode(fileinfo['content']).decode().splitlines()
+            content = fileinfo['content']
         else:
-            content = []
+            content = None
+        new_content = base64.standard_b64decode(content).decode().splitlines() if content else []
         for a in lines:
-            if a not in content:
-                content.append(a)
-        content = '\n'.join(content) + '\n'
-        content = base64.standard_b64encode(content.encode()).decode()
-        if not sha or (content != fileinfo['content']):
+            if a not in new_content:
+                new_content.append(a)
+        new_content = '\n'.join(new_content) + '\n'
+        new_content = base64.standard_b64encode(new_content.encode()).decode()
+        return self._update_file_content(org, repo, branch, fn, sha, content, new_content)
+
+    def _update_file_content(self, org, repo, branch, fn, sha, content, new_content):
+        if not sha or (content != new_content):
             data = {
                 'branch' : branch,
-                'content': content,
+                'content': new_content,
                 }
             method = 'POST'
             if sha:
                 data['sha'] = sha
                 method = 'PUT'
             self.check(method, self.repo_path(org, repo) + '/contents/' + fn, json=data)
+
+    def update_file(self, org, repo, branch, fn, new_content):
+        r = self.get_file(org, repo, branch, fn)
+        sha = None
+        if r:
+            fileinfo = r.json()
+            sha = fileinfo['sha']
+            content = fileinfo['content']
+        else:
+            content = None
+        new_content = base64.standard_b64encode(new_content.encode()).decode()
+        return self._update_file_content(org, repo, branch, fn, sha, content, new_content)
 
     def update_content(self, org, repo, branch, src, message, ignored_files=None):
         ign = ['.gitattributes', '.gitignore'] + (ignored_files if ignored_files else [])
