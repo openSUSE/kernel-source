@@ -1,6 +1,6 @@
 from kutil.config import get_package_archs, get_kernel_projects
+from obsapi.obsapi import OBSAPI, PkgRepo, process_scmsync
 from obsapi.teaapi import TeaAPI, json_custom_dump
-from obsapi.obsapi import OBSAPI, PkgRepo
 from obsapi.uploader import UploaderBase
 import xml.etree.ElementTree as ET
 from difflib import unified_diff
@@ -220,6 +220,28 @@ class TestMisc(unittest.TestCase):
                 ]
         for data, result in testdata:
             self.assertEqual(json_custom_dump(data), result)
+
+    def test_process_scmsync(self):
+        testdata = [
+                [urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=branch#' + 'cafedead' * 8),
+                 PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit='cafedead' * 8)],
+                [urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=branch#' + 'cafedead' * 5),
+                 PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit='cafedead' * 5)],
+                [urllib.parse.urlparse('https://src.suse.de/org/repo#' + 'cafedead' * 8),
+                 PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch=None, commit='cafedead' * 8)],
+                [urllib.parse.urlparse('https://src.suse.de/org/repo#' + 'branch'),
+                 PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit=None)],
+                ]
+        testexcept = [
+                urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=' + 'branch'),
+                urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=foo#' + 'bar'),
+                urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=branch#' + 'cafedead' * 6),
+                urllib.parse.urlparse('https://src.suse.de/org/repo'),
+                ]
+        for data, result in testdata:
+            self.assertEqual(process_scmsync(data), result)
+        for data in testexcept:
+            self.assertRaises(Exception)
 
 
 class TestTea(unittest.TestCase):
