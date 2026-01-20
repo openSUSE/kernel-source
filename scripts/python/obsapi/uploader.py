@@ -31,20 +31,23 @@ class UploaderBase:
         return self.upstream.api + '/' + self.user + '/' + self.upstream.repo + '?trackingbranch=' + self.user_branch + '#' + self.commit
 
     def submit(self, message=None):
-        if not self.upstream.branch:
+        return self._submit(self.upstream, message)
+
+    def _submit(self, upstream, message=None):
+        if not upstream.branch:
             raise APIError("No upstream branch to submit to.")
-        pr = self.tea.get_pr(self.upstream.org, self.upstream.repo, self.upstream.branch, self.user + ':' + self.user_branch)
+        pr = self.tea.get_pr(upstream.org, upstream.repo, upstream.branch, self.user + ':' + self.user_branch)
         if not pr or pr['merged']:
             if not message:
                 editor = os.environ.get('EDITOR', 'vi')
-                with tempfile.NamedTemporaryFile(prefix=self.upstream.org + '.' + self.upstream.repo + '.' + self.upstream.branch + '.') as tmp:
+                with tempfile.NamedTemporaryFile(prefix=upstream.org + '.' + upstream.repo + '.' + upstream.branch + '.') as tmp:
                     subprocess.check_call([editor, tmp.name]);
                     with open(tmp.name, 'r') as f:
                         message = f.read()
             if not len(message) > 0:
                 raise APIError('Non-empty PR message needed')
-            self.log_progress('Creating PR for %s/%s %s from %s/%s %s\n' % (self.upstream.org, self.upstream.repo, self.upstream.branch, self.user, self.upstream.repo, self.user_branch))
-            pr = self.tea.open_pr(self.upstream.org, self.upstream.repo, self.upstream.branch, self.user + ':' + self.user_branch, message)
+            self.log_progress('Creating PR for %s/%s %s from %s/%s %s\n' % (upstream.org, upstream.repo, upstream.branch, self.user, upstream.repo, self.user_branch))
+            pr = self.tea.open_pr(upstream.org, upstream.repo, upstream.branch, self.user + ':' + self.user_branch, message)
         pr = pr['html_url']
         self.log_progress('%s\n' % (pr,))
         return pr
