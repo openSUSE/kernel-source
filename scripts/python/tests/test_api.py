@@ -1,8 +1,8 @@
 from kutil.config import get_package_archs, get_kernel_projects
+from obsapi.teaapi import TeaAPI, json_custom_dump
 from obsapi.obsapi import OBSAPI, PkgRepo
 from obsapi.uploader import UploaderBase
 import xml.etree.ElementTree as ET
-from obsapi.teaapi import TeaAPI
 from difflib import unified_diff
 from obsapi.api import APIError
 from threading import Thread
@@ -198,6 +198,29 @@ class ServerThread():
         self.stop_server()
 
     data_consumed = property(lambda self: self.httpd.index == len(self.httpd.data))
+
+
+class TestMisc(unittest.TestCase):
+    def test_json_dump(self):
+        testdata = [
+                [
+                    { 'A': ['b', 'c', 'd'], 'E': ['f'], 'G': [], 'H': None },
+'''{
+  "A": [ "b","c","d" ],
+  "E": [ "f" ],
+  "G": [  ],
+  "H": [  ]
+}
+'''
+],
+                [ {}, '''{
+}
+'''
+                 ],
+                ]
+        for data, result in testdata:
+            self.assertEqual(json_custom_dump(data), result)
+
 
 class TestTea(unittest.TestCase):
     def setUp(self):

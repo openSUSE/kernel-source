@@ -9,6 +9,20 @@ import yaml
 import sys
 import os
 
+
+def json_custom_dump(data):
+    if sys.version_info.major == 3 and sys.version_info.minor < 6:
+        keys = sorted(data.keys())
+    else:
+        keys = data.keys()
+    return '{' + (
+            '\n  ' + ',\n  '.join([
+                json.dumps(k) + ': [ ' + (','.join([
+                    json.dumps(v) for v in data[k]]) if data[k] else '')
+                + ' ]' for k in keys ])
+            if data else '' ) +'\n}\n'
+
+
 class TeaAPI(api.API):
     def __init__(self, URL, logfile=None, config=None, ca=None, progress=sys.stderr):
         self.progress = progress
