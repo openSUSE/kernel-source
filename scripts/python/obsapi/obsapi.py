@@ -25,6 +25,30 @@ def expand_home(path):
         path = os.environ['HOME'] + path[1:]
     return path
 
+def is_git_sha(txt):
+    return (len(txt) == 64 or len(txt) == 40) and re.fullmatch('(?ai)[a-f0-9]*', txt)
+
+def process_scmsync(sync):
+    assert sync.scheme == 'https'
+    assert sync.netloc in ['src.suse.de', 'src.opensuse.org']
+    query = urllib.parse.parse_qs(sync.query)
+    assert list(query.keys()) == ['trackingbranch'] or list(query.keys()) == []
+    if 'trackingbranch' in query:
+        branch = query['trackingbranch'][0]
+        assert is_git_sha(sync.fragment)
+        commit = sync.fragment
+    else:
+        if is_git_sha(sync.fragment):
+            branch = None
+            commit = sync.fragment
+        else:
+            branch = sync.fragment
+            commit = None
+    assert len(sync.path.split('/')) == 3
+    _, org, repo = sync.path.split('/')
+    assert _ == ''
+    return PkgRepo(sync.scheme + '://' + sync.netloc, org, repo, branch, commit)
+
 class OBSAPI(api.API):
     def __init__(self, URL, logfile=None, config=None, cookiejar=None, ca=None):
         self.config = config
@@ -165,26 +189,26 @@ class OBSAPI(api.API):
     def package_meta(self, project, package):
         return ET.fromstring(self.check_get('/'.join(['/source', project, package, '_meta'])).content)
 
+    def project_meta(self, project):
+        return ET.fromstring(self.check_get('/'.join(['/source', project, '_meta'])).content)
+
     def upload_file(self, project, package, file, data, content_type='application/octet-stream'):
         return self.check_put('/'.join(['/source', project, package, file]), headers={'Content-type': content_type}, data=data)
 
     def package_scmsync(self, project, package):
         return urllib.parse.urlparse(self.package_meta(project, package).find('scmsync').text)
 
+    def project_scmsync(self, project):
+        return urllib.parse.urlparse(self.project_meta(project).find('scmsync').text)
+
+    def project_repo(self, project):
+        if self.project_exists(project) and self.project_meta(project).find('scmsync') != None:
+            return process_scmsync(self.project_scmsync(project))
+        return None
+
     def package_repo(self, project, package):
         if self.package_exists(project, package) and self.package_meta(project, package).find('scmsync') != None:
-            sync = self.package_scmsync(project, package)
-            assert sync.scheme == 'https'
-            assert sync.netloc in ['src.suse.de', 'src.opensuse.org']
-            assert len(sync.fragment) == 64 or len(sync.fragment) == 40
-            assert re.fullmatch('(?ai)[a-f0-9]*',sync.fragment)
-            query = urllib.parse.parse_qs(sync.query)
-            assert list(query.keys()) == ['trackingbranch'] or list(query.keys()) == []
-            branch = query['trackingbranch'][0] if 'trackingbranch' in query else None
-            assert len(sync.path.split('/')) == 3
-            _, org, repo = sync.path.split('/')
-            assert _ == ''
-            return PkgRepo(sync.scheme + '://' + sync.netloc, org, repo, branch, sync.fragment)
+            return process_scmsync(self.package_scmsync(project, package))
         if self.url == 'https://api.suse.de':
             api = 'https://src.suse.de'
         elif self.url == 'https://api.opensuse.org':
