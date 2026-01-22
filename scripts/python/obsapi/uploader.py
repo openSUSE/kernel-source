@@ -1,10 +1,12 @@
-from kutil.config import get_kernel_projects, get_package_archs, read_source_timestamp, get_kernel_project_package, list_files, list_specs
+from kutil.config import get_kernel_projects, get_package_archs, get_source_timestamp, read_source_timestamp, get_kernel_project_package, list_files, list_specs
 import xml.etree.ElementTree as ET
+from obsapi.teaapi import TeaAPI, json_custom_dump
 from obsapi.obsapi import OBSAPI
-from obsapi.teaapi import TeaAPI
 from obsapi.api import APIError
 import subprocess
 import tempfile
+import difflib
+import json
 import sys
 import re
 import os
@@ -16,37 +18,38 @@ class UploaderBase:
         if hasattr(self, 'progress') and self.progress:
             self.progress.write(string)
 
-    def upload(self, data, message):
-        self.data = data
+    def upload(self, message=None):
+        if not message:
+            message = get_source_timestamp(self.data)
         self.log_progress('Updating .gitattributes to put tarballs into LFS.\n')
         self.tea.update_gitattr(self.user, self.upstream.repo, self.user_branch)
-        self.log_progress('Updating branch %s with content of %s\n' % (self.user_branch, data))
-        self.tea.update_content(self.user, self.upstream.repo, self.user_branch, data, message, [ignore_kabi_file] if self.ignore_kabi_badness else None)
+        self.log_progress('Updating branch %s with content of %s\n' % (self.user_branch, self.data))
+        self.tea.update_content(self.user, self.upstream.repo, self.user_branch, self.data, message, [ignore_kabi_file] if self.ignore_kabi_badness else None)
         self.commit = self.tea.repo_branches(self.user, self.upstream.repo)[self.user_branch]['commit']['id']
         self.log_progress('commit sha: %s\n' % (self.commit,))
         return self.commit
-
-    def ignore_kabi(self):
-        self.ignore_kabi_badness = True
 
     def sync_url(self):
         return self.upstream.api + '/' + self.user + '/' + self.upstream.repo + '?trackingbranch=' + self.user_branch + '#' + self.commit
 
     def submit(self, message=None):
-        if not self.upstream.branch:
+        return self._submit(self.upstream, message)
+
+    def _submit(self, upstream, message=None):
+        if not upstream.branch:
             raise APIError("No upstream branch to submit to.")
-        pr = self.tea.get_pr(self.upstream.org, self.upstream.repo, self.upstream.branch, self.user + ':' + self.user_branch)
+        pr = self.tea.get_pr(upstream.org, upstream.repo, upstream.branch, self.user + ':' + self.user_branch)
         if not pr or pr['merged']:
             if not message:
                 editor = os.environ.get('EDITOR', 'vi')
-                with tempfile.NamedTemporaryFile(prefix=self.upstream.org + '.' + self.upstream.repo + '.' + self.upstream.branch + '.') as tmp:
+                with tempfile.NamedTemporaryFile(prefix=upstream.org + '.' + upstream.repo + '.' + upstream.branch + '.') as tmp:
                     subprocess.check_call([editor, tmp.name]);
                     with open(tmp.name, 'r') as f:
                         message = f.read()
             if not len(message) > 0:
                 raise APIError('Non-empty PR message needed')
-            self.log_progress('Creating PR for %s/%s %s from %s/%s %s\n' % (self.upstream.org, self.upstream.repo, self.upstream.branch, self.user, self.upstream.repo, self.user_branch))
-            pr = self.tea.open_pr(self.upstream.org, self.upstream.repo, self.upstream.branch, self.user + ':' + self.user_branch, message)
+            self.log_progress('Creating PR for %s/%s %s from %s/%s %s\n' % (upstream.org, upstream.repo, upstream.branch, self.user, upstream.repo, self.user_branch))
+            pr = self.tea.open_pr(upstream.org, upstream.repo, upstream.branch, self.user + ':' + self.user_branch, message)
         pr = pr['html_url']
         self.log_progress('%s\n' % (pr,))
         return pr
@@ -289,43 +292,54 @@ Constraint: hardware:disk:size unit=G %i
             self.obs.delete_package(self.project, s)
             self.log_progress('ok\n')
 
+    def set_git_maintainers(self, maintainers):
+        maintfile = '_maintainership.json'
+        self.log_progress('Getting scmsync for %s...' % (self.upstream_project,))
+        prjrepo = self.obs.project_repo(self.upstream_project)
+        self.log_progress('%s\n' % (repr(prjrepo),))
+        if prjrepo:
+            assert self.tea.url == prjrepo.api
+            self.log_progress('Getting %s...' % (maintfile,))
+            data = self.tea.get_file_data(prjrepo.org, prjrepo.repo, prjrepo.branch, maintfile)
+            data_decoded = json.loads(data)
+            assert json.loads(json_custom_dump(data_decoded)) == data_decoded
+            current_maintainers = json.loads(data).get(self.package, [])
+            if (maintainers and maintainers != current_maintainers) or (not maintainers and data_decoded != json_custom_dump(data_decoded)):
+                if maintainers:
+                    data_decoded[self.package] = maintainers
+                data_massaged = json_custom_dump(data_decoded)
+                sys.stderr.write('\n'.join(difflib.unified_diff(data.splitlines(), data_massaged.splitlines(), lineterm='')))
+                self.fork_repo(prjrepo, self.reset_branch)
+                self.log_progress('Updating %s.\n' % (maintfile,))
+                self.tea.update_file(self.user, prjrepo.repo, self.user_branch, maintfile, data_massaged)
+                commit = self.tea.repo_branches(self.user, prjrepo.repo)[self.user_branch]['commit']['id']
+                self.log_progress('commit sha: %s\n' % (commit,))
+                self._submit(prjrepo, 'Update ' + self.package + ' maintainer list.' if maintainers else
+                'Normalize ' + maintfile + ' formatting\nThe ' + maintfile + ' formatting is not entirely consistent.\nMake the formatting uniform across the whole file to facilitate automated updates.')
 
-class Uploader(UploaderBase):
-    def __init__(self, api, upstream_project, user_project, package, reset_branch=False, logfile=None, progress=True):
-        self.progress = sys.stderr if progress else None
-        self.package = package
-        self.project = user_project
-        self.obs = OBSAPI(api, logfile)
-        self.log_progress('Getting scmsync for %s/%s...' % (upstream_project, package))
-        self.upstream = self.obs.package_repo(upstream_project, package)
-        self.log_progress('%s\n' % (repr(self.upstream),))
-        self.tea = TeaAPI(self.upstream.api, logfile, progress=self.progress)
-        self.log_progress('Getting Gitea user...')
-        self.user = self.tea.get_user()
-        self.log_progress('%s\n' % (self.user,))
-        self.user_branch = user_project.translate(str.maketrans(':', '/')) if user_project else self.upstream.branch
-        upstream_info = self.tea.repo_exists(self.upstream.org, self.upstream.repo)
+    def fork_repo(self, upstream_repo, reset_branch):
+        upstream_info = self.tea.repo_exists(upstream_repo.org, upstream_repo.repo)
         if upstream_info:
             upstream_info = upstream_info.json()
-        downstream_info = self.tea.repo_exists(self.user, self.upstream.repo)
+        downstream_info = self.tea.repo_exists(self.user, upstream_repo.repo)
         if downstream_info:
             downstream_info = downstream_info.json()
         if upstream_info and downstream_info:
-            if not downstream_info['fork'] or downstream_info['parent']['full_name'] != self.upstream.org + '/' + self.upstream.repo:
-                raise APIError('Fork of ' + self.upstream.org + '/' + self.upstream.repo + ' needed.')
-        if self.upstream.branch:
-            assert self.upstream.branch in self.tea.repo_branches(self.upstream.org, self.upstream.repo)
-        if self.upstream.commit:  # Maybe check it's part of the branch as well?
-            self.tea.repo_commit_exists(self.upstream.org, self.upstream.repo, self.upstream.commit)  # may be missing because of sync error
+            if not downstream_info['fork'] or downstream_info['parent']['full_name'] != upstream_repo.org + '/' + upstream_repo.repo:
+                raise APIError('Fork of ' + upstream_repo.org + '/' + upstream_repo.repo + ' needed.')
+        if upstream_repo.branch:
+            assert upstream_repo.branch in self.tea.repo_branches(upstream_repo.org, upstream_repo.repo)
+        if upstream_repo.commit:  # Maybe check it's part of the branch as well?
+            self.tea.repo_commit_exists(upstream_repo.org, upstream_repo.repo, upstream_repo.commit)  # may be missing because of sync error
         if not downstream_info:
             if upstream_info:
-                self.log_progress('Forking repository %s/%s from %s/%s.\n' % (self.user, self.upstream.repo, self.upstream.org, self.upstream.repo))
+                self.log_progress('Forking repository %s/%s from %s/%s.\n' % (self.user, upstream_repo.repo, upstream_repo.org, upstream_repo.repo))
             else:
-                self.log_progress('Creating repository %s/%s.\n' % (self.user, self.upstream.repo))
-            downstream_info = self.tea.fork_repo(self.upstream.org, self.user, self.upstream.repo)
-        if upstream_info and self.upstream.branch:
-            self.log_progress('Merging upstream branch %s..' % (self.upstream.branch,))
-            pull = self.tea.merge_upstream_branch(self.user, self.upstream.repo, self.upstream.branch)
+                self.log_progress('Creating repository %s/%s.\n' % (self.user, upstream_repo.repo))
+            downstream_info = self.tea.fork_repo(upstream_repo.org, self.user, upstream_repo.repo)
+        if upstream_info and upstream_repo.branch:
+            self.log_progress('Merging upstream branch %s..' % (upstream_repo.branch,))
+            pull = self.tea.merge_upstream_branch(self.user, upstream_repo.repo, upstream_repo.branch)
             if not pull.ok:
                 self.log_progress(' '.join([pull.status_message_pretty, repr(pull.json())]) + '\n')
             else:
@@ -335,5 +349,24 @@ class Uploader(UploaderBase):
                 self.log_progress('Resetting branch %s.\n' % (self.user_branch,))
             else:
                 self.log_progress('Creating branch %s.\n' % (self.user_branch,))
-            self.tea.create_branch(self.user, self.upstream.repo, self.user_branch, self.upstream.branch, self.upstream.commit, reset_branch)
-        self.ignore_kabi_badness = False
+            self.tea.create_branch(self.user, upstream_repo.repo, self.user_branch, upstream_repo.branch, upstream_repo.commit, reset_branch)
+
+
+class Uploader(UploaderBase):
+    def __init__(self, api, data, user_project, reset_branch=False, logfile=None, progress=True, ignore_kabi=False):
+        self.progress = sys.stderr if progress else None
+        self.data = data
+        self.upstream_project, self.package = get_kernel_project_package(self.data)
+        self.project = user_project.replace('/',':')
+        self.obs = OBSAPI(api, logfile)
+        self.log_progress('Getting scmsync for %s/%s...' % (self.upstream_project, self.package))
+        self.upstream = self.obs.package_repo(self.upstream_project, self.package)
+        self.log_progress('%s\n' % (repr(self.upstream),))
+        self.tea = TeaAPI(self.upstream.api, logfile, progress=self.progress)
+        self.log_progress('Getting Gitea user...')
+        self.user = self.tea.get_user()
+        self.log_progress('%s\n' % (self.user,))
+        self.user_branch = user_project.translate(str.maketrans(':', '/')) if user_project else self.upstream.branch
+        self.ignore_kabi_badness = ignore_kabi
+        self.reset_branch = reset_branch
+        self.fork_repo(self.upstream, self.reset_branch)
