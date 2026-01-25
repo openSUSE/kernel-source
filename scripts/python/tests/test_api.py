@@ -1,4 +1,4 @@
-from kutil.config import get_package_archs, get_kernel_projects
+from kutil.config import get_package_archs, get_kernel_projects, uniq
 from obsapi.obsapi import OBSAPI, PkgRepo, process_scmsync
 from obsapi.teaapi import TeaAPI, json_custom_dump
 from obsapi.uploader import UploaderBase
@@ -220,6 +220,20 @@ class TestMisc(unittest.TestCase):
                 ]
         for data, result in testdata:
             self.assertEqual(json_custom_dump(data), result)
+
+    def test_uniq(self):
+        testdata = [
+                [
+                    ['a', 'c' ,'b' ,'a', 'f', 'e'],
+                    ['a', 'c' ,'b' ,'f', 'e'],
+                    ],
+                [
+                    ['a', 'c' ,'b' ,'a', 'f', 'b'],
+                    ['a', 'c' ,'b' ,'f'],
+                    ],
+                ]
+        for data, result in testdata:
+            self.assertEqual(uniq(data), result)
 
     def test_process_scmsync(self):
         testdata = [
