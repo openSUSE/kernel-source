@@ -1,0 +1,267 @@
+From 5bc493bf0c37c157bf2eb364e55a1c6f8bc43a69 Mon Sep 17 00:00:00 2001
+From: Charles Keepax <ckeepax@opensource.cirrus.com>
+Date: Tue, 7 Jan 2025 15:44:06 +0000
+Subject: [PATCH] regmap: sdw-mbq: Add support for SDCA deferred controls
+Git-commit: 5bc493bf0c37c157bf2eb364e55a1c6f8bc43a69
+Patch-mainline: v6.14-rc1
+References: jsc#PED-14430 jsc#PED-14297 jsc#PED-14024
+
+The SDCA specification allows for controls to be deferred. In the case
+of a deferred control the device will return COMMAND_IGNORED to the
+8-bit operation that would cause the value to commit. Which is the
+final 8-bits on a write, or the first 8-bits on a read. In the case of
+receiving a defer, the regmap will poll the SDCA function busy bit,
+after which the transaction will be retried, returning an error if the
+function busy does not clear within a chip specific timeout. Since
+this is common SDCA functionality which is the 99% use-case for MBQs
+it makes sense to incorporate this functionality into the register
+map. If no MBQ configuration is specified, the behaviour will default
+to the existing behaviour.
+
+Signed-off-by: Charles Keepax <ckeepax@opensource.cirrus.com>
+Link: https://patch.msgid.link/20250107154408.814455-5-ckeepax@opensource.cirrus.com
+Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.dev>
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/base/regmap/regmap-sdw-mbq.c | 129 ++++++++++++++++++++++++---
+ include/linux/regmap.h               |  15 ++++
+ 2 files changed, 130 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/base/regmap/regmap-sdw-mbq.c b/drivers/base/regmap/regmap-sdw-mbq.c
+index 1bd2773b11a4..86644bbd0710 100644
+--- a/drivers/base/regmap/regmap-sdw-mbq.c
++++ b/drivers/base/regmap/regmap-sdw-mbq.c
+@@ -2,12 +2,15 @@
+ // Copyright(c) 2020 Intel Corporation.
+ 
+ #include <linux/bits.h>
++#include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/errno.h>
++#include <linux/iopoll.h>
+ #include <linux/module.h>
+ #include <linux/regmap.h>
+ #include <linux/soundwire/sdw.h>
+ #include <linux/soundwire/sdw_registers.h>
++#include <sound/sdca_function.h>
+ #include "internal.h"
+ 
+ struct regmap_mbq_context {
+@@ -16,6 +19,7 @@ struct regmap_mbq_context {
+ 	struct regmap_sdw_mbq_cfg cfg;
+ 
+ 	int val_size;
++	bool (*readable_reg)(struct device *dev, unsigned int reg);
+ };
+ 
+ static int regmap_sdw_mbq_size(struct regmap_mbq_context *ctx, unsigned int reg)
+@@ -31,18 +35,48 @@ static int regmap_sdw_mbq_size(struct regmap_mbq_context *ctx, unsigned int reg)
+ 	return size;
+ }
+ 
+-static int regmap_sdw_mbq_write(void *context, unsigned int reg, unsigned int val)
++static bool regmap_sdw_mbq_deferrable(struct regmap_mbq_context *ctx, unsigned int reg)
++{
++	if (ctx->cfg.deferrable)
++		return ctx->cfg.deferrable(ctx->dev, reg);
++
++	return false;
++}
++
++static int regmap_sdw_mbq_poll_busy(struct sdw_slave *slave, unsigned int reg,
++				    struct regmap_mbq_context *ctx)
++{
++	struct device *dev = &slave->dev;
++	int val, ret = 0;
++
++	dev_dbg(dev, "Deferring transaction for 0x%x\n", reg);
++
++	reg = SDW_SDCA_CTL(SDW_SDCA_CTL_FUNC(reg), 0,
++			   SDCA_CTL_ENTITY_0_FUNCTION_STATUS, 0);
++
++	if (ctx->readable_reg(dev, reg)) {
++		ret = read_poll_timeout(sdw_read_no_pm, val,
++					val < 0 || !(val & SDCA_CTL_ENTITY_0_FUNCTION_BUSY),
++					ctx->cfg.timeout_us, ctx->cfg.retry_us,
++					false, slave, reg);
++		if (val < 0)
++			return val;
++		if (ret)
++			dev_err(dev, "Function busy timed out 0x%x: %d\n", reg, val);
++	} else {
++		fsleep(ctx->cfg.timeout_us);
++	}
++
++	return ret;
++}
++
++static int regmap_sdw_mbq_write_impl(struct sdw_slave *slave,
++				     unsigned int reg, unsigned int val,
++				     int mbq_size, bool deferrable)
+ {
+-	struct regmap_mbq_context *ctx = context;
+-	struct device *dev = ctx->dev;
+-	struct sdw_slave *slave = dev_to_sdw_dev(dev);
+-	int mbq_size = regmap_sdw_mbq_size(ctx, reg);
+ 	int shift = mbq_size * BITS_PER_BYTE;
+ 	int ret;
+ 
+-	if (mbq_size < 0)
+-		return mbq_size;
+-
+ 	while (--mbq_size > 0) {
+ 		shift -= BITS_PER_BYTE;
+ 
+@@ -52,24 +86,58 @@ static int regmap_sdw_mbq_write(void *context, unsigned int reg, unsigned int va
+ 			return ret;
+ 	}
+ 
+-	return sdw_write_no_pm(slave, reg, val & 0xff);
++	ret = sdw_write_no_pm(slave, reg, val & 0xff);
++	if (deferrable && ret == -ENODATA)
++		return -EAGAIN;
++
++	return ret;
+ }
+ 
+-static int regmap_sdw_mbq_read(void *context, unsigned int reg, unsigned int *val)
++static int regmap_sdw_mbq_write(void *context, unsigned int reg, unsigned int val)
+ {
+ 	struct regmap_mbq_context *ctx = context;
+ 	struct device *dev = ctx->dev;
+ 	struct sdw_slave *slave = dev_to_sdw_dev(dev);
++	bool deferrable = regmap_sdw_mbq_deferrable(ctx, reg);
+ 	int mbq_size = regmap_sdw_mbq_size(ctx, reg);
+-	int shift = BITS_PER_BYTE;
+-	int read;
++	int ret;
+ 
+ 	if (mbq_size < 0)
+ 		return mbq_size;
+ 
++	/*
++	 * Technically the spec does allow a device to set itself to busy for
++	 * internal reasons, but since it doesn't provide any information on
++	 * how to handle timeouts in that case, for now the code will only
++	 * process a single wait/timeout on function busy and a single retry
++	 * of the transaction.
++	 */
++	ret = regmap_sdw_mbq_write_impl(slave, reg, val, mbq_size, deferrable);
++	if (ret == -EAGAIN) {
++		ret = regmap_sdw_mbq_poll_busy(slave, reg, ctx);
++		if (ret)
++			return ret;
++
++		ret = regmap_sdw_mbq_write_impl(slave, reg, val, mbq_size, false);
++	}
++
++	return ret;
++}
++
++static int regmap_sdw_mbq_read_impl(struct sdw_slave *slave,
++				    unsigned int reg, unsigned int *val,
++				    int mbq_size, bool deferrable)
++{
++	int shift = BITS_PER_BYTE;
++	int read;
++
+ 	read = sdw_read_no_pm(slave, reg);
+-	if (read < 0)
++	if (read < 0) {
++		if (deferrable && read == -ENODATA)
++			return -EAGAIN;
++
+ 		return read;
++	}
+ 
+ 	*val = read;
+ 
+@@ -85,6 +153,37 @@ static int regmap_sdw_mbq_read(void *context, unsigned int reg, unsigned int *va
+ 	return 0;
+ }
+ 
++static int regmap_sdw_mbq_read(void *context, unsigned int reg, unsigned int *val)
++{
++	struct regmap_mbq_context *ctx = context;
++	struct device *dev = ctx->dev;
++	struct sdw_slave *slave = dev_to_sdw_dev(dev);
++	bool deferrable = regmap_sdw_mbq_deferrable(ctx, reg);
++	int mbq_size = regmap_sdw_mbq_size(ctx, reg);
++	int ret;
++
++	if (mbq_size < 0)
++		return mbq_size;
++
++	/*
++	 * Technically the spec does allow a device to set itself to busy for
++	 * internal reasons, but since it doesn't provide any information on
++	 * how to handle timeouts in that case, for now the code will only
++	 * process a single wait/timeout on function busy and a single retry
++	 * of the transaction.
++	 */
++	ret = regmap_sdw_mbq_read_impl(slave, reg, val, mbq_size, deferrable);
++	if (ret == -EAGAIN) {
++		ret = regmap_sdw_mbq_poll_busy(slave, reg, ctx);
++		if (ret)
++			return ret;
++
++		ret = regmap_sdw_mbq_read_impl(slave, reg, val, mbq_size, false);
++	}
++
++	return ret;
++}
++
+ static const struct regmap_bus regmap_sdw_mbq = {
+ 	.reg_read = regmap_sdw_mbq_read,
+ 	.reg_write = regmap_sdw_mbq_write,
+@@ -119,11 +218,13 @@ regmap_sdw_mbq_gen_context(struct device *dev,
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	ctx->dev = dev;
+-	ctx->val_size = config->val_bits / BITS_PER_BYTE;
+ 
+ 	if (mbq_config)
+ 		ctx->cfg = *mbq_config;
+ 
++	ctx->val_size = config->val_bits / BITS_PER_BYTE;
++	ctx->readable_reg = config->readable_reg;
++
+ 	return ctx;
+ }
+ 
+diff --git a/include/linux/regmap.h b/include/linux/regmap.h
+index dd96a22f5657..198067d3cf10 100644
+--- a/include/linux/regmap.h
++++ b/include/linux/regmap.h
+@@ -510,11 +510,26 @@ struct regmap_range_cfg {
+  * struct regmap_sdw_mbq_cfg - Configuration for Multi-Byte Quantities
+  *
+  * @mbq_size: Callback returning the actual size of the given register.
++ * @deferrable: Callback returning true if the hardware can defer
++ *              transactions to the given register. Deferral should
++ *              only be used by SDCA parts and typically which controls
++ *              are deferrable will be specified in either as a hard
++ *              coded list or from the DisCo tables in the platform
++ *              firmware.
++ *
++ * @timeout_us: The time in microseconds after which waiting for a deferred
++ *              transaction should time out.
++ * @retry_us: The time in microseconds between polls of the function busy
++ *            status whilst waiting for an opportunity to retry a deferred
++ *            transaction.
+  *
+  * Provides additional configuration required for SoundWire MBQ register maps.
+  */
+ struct regmap_sdw_mbq_cfg {
+ 	int (*mbq_size)(struct device *dev, unsigned int reg);
++	bool (*deferrable)(struct device *dev, unsigned int reg);
++	unsigned long timeout_us;
++	unsigned long retry_us;
+ };
+ 
+ struct regmap_async;
+-- 
+2.52.0
+
