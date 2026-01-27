@@ -1,0 +1,195 @@
+From: Stanislav Kinsburskii <skinsburskii@linux.microsoft.com>
+Date: Wed, 3 Dec 2025 21:41:02 +0000
+Patch-mainline: v6.19-rc1
+Subject: mshv: Add refcount and locking to mem regions
+Git-commit: c39dda08286f4d5ce4d114f8d5dbfdb85effbd6a
+References: git-fixes
+
+Introduce kref-based reference counting and spinlock protection for
+memory regions in Hyper-V partition management. This change improves
+memory region lifecycle management and ensures thread-safe access to the
+region list.
+
+Previously, the regions list was protected by the partition mutex.
+However, this approach is too heavy for frequent fault and invalidation
+operations. Finer grained locking is now used to improve efficiency and
+concurrency.
+
+This is a precursor to supporting movable memory regions. Fault and
+invalidation handling for movable regions will require safe traversal of
+the region list and holding a region reference while performing
+invalidation or fault operations.
+
+Signed-off-by: Stanislav Kinsburskii <skinsburskii@linux.microsoft.com>
+Signed-off-by: Wei Liu <wei.liu@kernel.org>
+Acked-by: Olaf Hering <ohering@suse.de>
+---
+ drivers/hv/mshv_regions.c   | 19 ++++-
+ drivers/hv/mshv_root.h      |  6 +-
+ drivers/hv/mshv_root_main.c | 32 ++++++---
+ 3 files changed, 45 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/hv/mshv_regions.c b/drivers/hv/mshv_regions.c
+--- a/drivers/hv/mshv_regions.c
++++ b/drivers/hv/mshv_regions.c
+@@ -7,6 +7,7 @@
+  * Authors: Microsoft Linux virtualization team
+  */
+ 
++#include <linux/kref.h>
+ #include <linux/mm.h>
+ #include <linux/vmalloc.h>
+ 
+@@ -154,6 +155,8 @@ struct mshv_mem_region *mshv_region_create(u64 guest_pfn, u64 nr_pages,
+ 	if (!is_mmio)
+ 		region->flags.range_pinned = true;
+ 
++	kref_init(&region->refcount);
++
+ 	return region;
+ }
+ 
+@@ -311,13 +314,13 @@ static int mshv_region_unmap(struct mshv_mem_region *region)
+ 					 mshv_region_chunk_unmap);
+ }
+ 
+-void mshv_region_destroy(struct mshv_mem_region *region)
++static void mshv_region_destroy(struct kref *ref)
+ {
++	struct mshv_mem_region *region =
++		container_of(ref, struct mshv_mem_region, refcount);
+ 	struct mshv_partition *partition = region->partition;
+ 	int ret;
+ 
+-	hlist_del(&region->hnode);
+-
+ 	if (mshv_partition_encrypted(partition)) {
+ 		ret = mshv_region_share(region);
+ 		if (ret) {
+@@ -334,3 +337,13 @@ void mshv_region_destroy(struct mshv_mem_region *region)
+ 
+ 	vfree(region);
+ }
++
++void mshv_region_put(struct mshv_mem_region *region)
++{
++	kref_put(&region->refcount, mshv_region_destroy);
++}
++
++int mshv_region_get(struct mshv_mem_region *region)
++{
++	return kref_get_unless_zero(&region->refcount);
++}
+diff --git a/drivers/hv/mshv_root.h b/drivers/hv/mshv_root.h
+--- a/drivers/hv/mshv_root.h
++++ b/drivers/hv/mshv_root.h
+@@ -72,6 +72,7 @@ do { \
+ 
+ struct mshv_mem_region {
+ 	struct hlist_node hnode;
++	struct kref refcount;
+ 	u64 nr_pages;
+ 	u64 start_gfn;
+ 	u64 start_uaddr;
+@@ -97,6 +98,8 @@ struct mshv_partition {
+ 	u64 pt_id;
+ 	refcount_t pt_ref_count;
+ 	struct mutex pt_mutex;
++
++	spinlock_t pt_mem_regions_lock;
+ 	struct hlist_head pt_mem_regions; // not ordered
+ 
+ 	u32 pt_vp_count;
+@@ -319,6 +322,7 @@ int mshv_region_unshare(struct mshv_mem_region *region);
+ int mshv_region_map(struct mshv_mem_region *region);
+ void mshv_region_invalidate(struct mshv_mem_region *region);
+ int mshv_region_pin(struct mshv_mem_region *region);
+-void mshv_region_destroy(struct mshv_mem_region *region);
++void mshv_region_put(struct mshv_mem_region *region);
++int mshv_region_get(struct mshv_mem_region *region);
+ 
+ #endif /* _MSHV_ROOT_H_ */
+diff --git a/drivers/hv/mshv_root_main.c b/drivers/hv/mshv_root_main.c
+--- a/drivers/hv/mshv_root_main.c
++++ b/drivers/hv/mshv_root_main.c
+@@ -1086,13 +1086,15 @@ static int mshv_partition_create_region(struct mshv_partition *partition,
+ 	u64 nr_pages = HVPFN_DOWN(mem->size);
+ 
+ 	/* Reject overlapping regions */
++	spin_lock(&partition->pt_mem_regions_lock);
+ 	hlist_for_each_entry(rg, &partition->pt_mem_regions, hnode) {
+ 		if (mem->guest_pfn + nr_pages <= rg->start_gfn ||
+ 		    rg->start_gfn + rg->nr_pages <= mem->guest_pfn)
+ 			continue;
+-
++		spin_unlock(&partition->pt_mem_regions_lock);
+ 		return -EEXIST;
+ 	}
++	spin_unlock(&partition->pt_mem_regions_lock);
+ 
+ 	rg = mshv_region_create(mem->guest_pfn, nr_pages,
+ 				mem->userspace_addr, mem->flags,
+@@ -1224,8 +1226,9 @@ mshv_map_user_memory(struct mshv_partition *partition,
+ 	if (ret)
+ 		goto errout;
+ 
+-	/* Install the new region */
++	spin_lock(&partition->pt_mem_regions_lock);
+ 	hlist_add_head(&region->hnode, &partition->pt_mem_regions);
++	spin_unlock(&partition->pt_mem_regions_lock);
+ 
+ 	return 0;
+ 
+@@ -1244,17 +1247,27 @@ mshv_unmap_user_memory(struct mshv_partition *partition,
+ 	if (!(mem.flags & BIT(MSHV_SET_MEM_BIT_UNMAP)))
+ 		return -EINVAL;
+ 
++	spin_lock(&partition->pt_mem_regions_lock);
++
+ 	region = mshv_partition_region_by_gfn(partition, mem.guest_pfn);
+-	if (!region)
+-		return -EINVAL;
++	if (!region) {
++		spin_unlock(&partition->pt_mem_regions_lock);
++		return -ENOENT;
++	}
+ 
+ 	/* Paranoia check */
+ 	if (region->start_uaddr != mem.userspace_addr ||
+ 	    region->start_gfn != mem.guest_pfn ||
+-	    region->nr_pages != HVPFN_DOWN(mem.size))
++	    region->nr_pages != HVPFN_DOWN(mem.size)) {
++		spin_unlock(&partition->pt_mem_regions_lock);
+ 		return -EINVAL;
++	}
++
++	hlist_del(&region->hnode);
+ 
+-	mshv_region_destroy(region);
++	spin_unlock(&partition->pt_mem_regions_lock);
++
++	mshv_region_put(region);
+ 
+ 	return 0;
+ }
+@@ -1657,8 +1670,10 @@ static void destroy_partition(struct mshv_partition *partition)
+ 	remove_partition(partition);
+ 
+ 	hlist_for_each_entry_safe(region, n, &partition->pt_mem_regions,
+-				  hnode)
+-		mshv_region_destroy(region);
++				  hnode) {
++		hlist_del(&region->hnode);
++		mshv_region_put(region);
++	}
+ 
+ 	/* Withdraw and free all pages we deposited */
+ 	hv_call_withdraw_memory(U64_MAX, NUMA_NO_NODE, partition->pt_id);
+@@ -1856,6 +1871,7 @@ mshv_ioctl_create_partition(void __user *user_arg, struct device *module_dev)
+ 
+ 	INIT_HLIST_HEAD(&partition->pt_devices);
+ 
++	spin_lock_init(&partition->pt_mem_regions_lock);
+ 	INIT_HLIST_HEAD(&partition->pt_mem_regions);
+ 
+ 	mshv_eventfd_init(partition);
