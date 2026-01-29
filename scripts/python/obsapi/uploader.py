@@ -307,7 +307,7 @@ Constraint: hardware:disk:size unit=G %i
             data_decoded = json.loads(data)
             assert json.loads(json_custom_dump(data_decoded)) == data_decoded
             current_maintainers = json.loads(data).get(self.package, [])
-            if (maintainers and maintainers != current_maintainers) or (not maintainers and data_decoded != json_custom_dump(data_decoded)):
+            if (maintainers and maintainers != current_maintainers) or (not maintainers and data != json_custom_dump(data_decoded)):
                 if maintainers:
                     data_decoded[self.package] = maintainers
                 data_massaged = json_custom_dump(data_decoded)
