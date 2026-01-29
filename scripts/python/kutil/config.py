@@ -2,6 +2,10 @@ import configparser
 import subprocess
 import os
 
+def uniq(lst):
+    # fairly slow but does not require any special property of elements nor ordered dictionaries
+    return [x for i, x in enumerate(lst) if i == lst.index(x)]
+
 def init_repo(tmpdirname, repo, branch):
     subprocess.check_call(['git', 'init', '-q', '--object-format=sha256', '-b', branch, repo], cwd=tmpdirname)
     return os.path.join(tmpdirname, repo)
