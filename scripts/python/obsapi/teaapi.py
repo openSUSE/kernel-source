@@ -300,6 +300,10 @@ class TeaAPI(api.API):
         pr =  self.check_exists(self.repo_path(org, repo) + '/pulls/' + tgt + '/' + src)
         return pr.json() if pr else pr
 
+    def is_pr_open(self, *args):
+        pr = self.get_pr(*args)
+        return pr if pr and not pr['merged'] and not pr['closed_at'] else None
+
     def open_pr(self, org, repo, tgt, src, text):
         text = list(text.splitlines())
         title = text[0]
