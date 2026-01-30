@@ -35,11 +35,14 @@ class UploaderBase:
     def submit(self, message=None):
         return self._submit(self.upstream, message)
 
+    def is_pr_open(self, upstream):
+        return self.tea.is_pr_open(upstream.org, upstream.repo, upstream.branch, self.user + ':' + self.user_branch)
+
     def _submit(self, upstream, message=None):
         if not upstream.branch:
             raise APIError("No upstream branch to submit to.")
-        pr = self.tea.get_pr(upstream.org, upstream.repo, upstream.branch, self.user + ':' + self.user_branch)
-        if not pr or pr['merged']:
+        pr = self.is_pr_open(upstream)
+        if not pr:
             if not message:
                 editor = os.environ.get('EDITOR', 'vi')
                 with tempfile.NamedTemporaryFile(prefix=upstream.org + '.' + upstream.repo + '.' + upstream.branch + '.') as tmp:
@@ -304,12 +307,12 @@ Constraint: hardware:disk:size unit=G %i
             data_decoded = json.loads(data)
             assert json.loads(json_custom_dump(data_decoded)) == data_decoded
             current_maintainers = json.loads(data).get(self.package, [])
-            if (maintainers and maintainers != current_maintainers) or (not maintainers and data_decoded != json_custom_dump(data_decoded)):
+            if (maintainers and maintainers != current_maintainers) or (not maintainers and data != json_custom_dump(data_decoded)):
                 if maintainers:
                     data_decoded[self.package] = maintainers
                 data_massaged = json_custom_dump(data_decoded)
                 sys.stderr.write('\n'.join(difflib.unified_diff(data.splitlines(), data_massaged.splitlines(), lineterm='')))
-                self.fork_repo(prjrepo, self.reset_branch)
+                self.fork_repo(prjrepo, True)
                 self.log_progress('Updating %s.\n' % (maintfile,))
                 self.tea.update_file(self.user, prjrepo.repo, self.user_branch, maintfile, data_massaged)
                 commit = self.tea.repo_branches(self.user, prjrepo.repo)[self.user_branch]['commit']['id']
@@ -344,6 +347,8 @@ Constraint: hardware:disk:size unit=G %i
                 self.log_progress(' '.join([pull.status_message_pretty, repr(pull.json())]) + '\n')
             else:
                 self.log_progress('ok\n')
+        if self.is_pr_open(upstream_repo):
+            reset_branch = False
         if not downstream_info['empty']:
             if reset_branch:
                 self.log_progress('Resetting branch %s.\n' % (self.user_branch,))
