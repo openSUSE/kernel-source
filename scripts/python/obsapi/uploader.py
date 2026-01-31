@@ -36,6 +36,8 @@ class UploaderBase:
         return self._submit(self.upstream, message)
 
     def is_pr_open(self, upstream):
+        if not upstream or not upstream.repo or not upstream.org or not upstream.branch:
+            return False
         return self.tea.is_pr_open(upstream.org, upstream.repo, upstream.branch, self.user + ':' + self.user_branch)
 
     def _submit(self, upstream, message=None):
