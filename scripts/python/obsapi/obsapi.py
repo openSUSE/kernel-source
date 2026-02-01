@@ -80,9 +80,12 @@ class OBSAPI(api.API):
             cp.read(self.config)
         except (FileNotFoundError, PermissionError) as e:
             sys.stderr.write('Error loading osc configuration file ' + self.config + ' : ' + str(e) + '\n')
-        if self.url not in cp:
+        config_section = self.url
+        if config_section not in cp:
+            config_section += '/'
+        if config_section not in cp:
             raise RuntimeError('No configuration for API ' + self.url + ' in ' + self.config)
-        config = cp[self.url]
+        config = cp[config_section]
         self.user = config.get('user', None)
         if not self.user:
             raise RuntimeError('No username found in ' + self.url + ' configuration.')
