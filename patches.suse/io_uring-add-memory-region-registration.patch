@@ -1,0 +1,144 @@
+From 93238e66185524aad925acefb2312203b9e26d63 Mon Sep 17 00:00:00 2001
+From: Pavel Begunkov <asml.silence@gmail.com>
+Date: Fri, 15 Nov 2024 16:54:42 +0000
+Subject: [PATCH] io_uring: add memory region registration
+Git-commit: 93238e66185524aad925acefb2312203b9e26d63
+Patch-mainline: v6.13-rc1
+References: bsc#1257958
+
+Regions will serve multiple purposes. First, with it we can decouple
+ring/etc. object creation from registration / mapping of the memory they
+will be placed in. We already have hacks that allow to put both SQ and
+CQ into the same huge page, in the future we should be able to:
+
+region = create_region(io_ring);
+create_pbuf_ring(io_uring, region, offset=0);
+create_pbuf_ring(io_uring, region, offset=N);
+
+The second use case is efficiently passing parameters. The following
+patch enables back on top of regions IORING_ENTER_EXT_ARG_REG, which
+optimises wait arguments. It'll also be useful for request arguments
+replacing iovecs, msghdr, etc. pointers. Eventually it would also be
+handy for BPF as well if it comes to fruition.
+
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+Link: https://lore.kernel.org/r/0798cf3a14fad19cfc96fc9feca5f3e11481691d.1731689588.git.asml.silence@gmail.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ include/linux/io_uring_types.h |  3 +++
+ include/uapi/linux/io_uring.h  |  8 ++++++++
+ io_uring/io_uring.c            |  1 +
+ io_uring/register.c            | 37 ++++++++++++++++++++++++++++++++++
+ 4 files changed, 49 insertions(+)
+
+diff --git a/include/linux/io_uring_types.h b/include/linux/io_uring_types.h
+index 1d3a37234ace..e1d69123e164 100644
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -429,6 +429,9 @@ struct io_ring_ctx {
+ 	unsigned short			n_sqe_pages;
+ 	struct page			**ring_pages;
+ 	struct page			**sqe_pages;
++
++	/* used for optimised request parameter and wait argument passing  */
++	struct io_mapped_region		param_region;
+ };
+ 
+ struct io_tw_state {
+diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+index 5cbfd330c688..1ee35890125b 100644
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -627,6 +627,8 @@ enum io_uring_register_op {
+ 	/* resize CQ ring */
+ 	IORING_REGISTER_RESIZE_RINGS		= 33,
+ 
++	IORING_REGISTER_MEM_REGION		= 34,
++
+ 	/* this goes last */
+ 	IORING_REGISTER_LAST,
+ 
+@@ -661,6 +663,12 @@ struct io_uring_region_desc {
+ 	__u64 __resv[4];
+ };
+ 
++struct io_uring_mem_region_reg {
++	__u64 region_uptr; /* struct io_uring_region_desc * */
++	__u64 flags;
++	__u64 __resv[2];
++};
++
+ /*
+  * Register a fully sparse file space, rather than pass in an array of all
+  * -1 file descriptors.
+diff --git a/io_uring/io_uring.c b/io_uring/io_uring.c
+index 286b7bb73978..c640b8a4ceee 100644
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -2709,6 +2709,7 @@ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
+ 	io_alloc_cache_free(&ctx->msg_cache, io_msg_cache_free);
+ 	io_futex_cache_free(ctx);
+ 	io_destroy_buffers(ctx);
++	io_free_region(ctx, &ctx->param_region);
+ 	mutex_unlock(&ctx->uring_lock);
+ 	if (ctx->sq_creds)
+ 		put_cred(ctx->sq_creds);
+diff --git a/io_uring/register.c b/io_uring/register.c
+index 3c5a3cfb186b..2cbac3d9b288 100644
+--- a/io_uring/register.c
++++ b/io_uring/register.c
+@@ -570,6 +570,37 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
+ 	return ret;
+ }
+ 
++static int io_register_mem_region(struct io_ring_ctx *ctx, void __user *uarg)
++{
++	struct io_uring_mem_region_reg __user *reg_uptr = uarg;
++	struct io_uring_mem_region_reg reg;
++	struct io_uring_region_desc __user *rd_uptr;
++	struct io_uring_region_desc rd;
++	int ret;
++
++	if (io_region_is_set(&ctx->param_region))
++		return -EBUSY;
++	if (copy_from_user(&reg, reg_uptr, sizeof(reg)))
++		return -EFAULT;
++	rd_uptr = u64_to_user_ptr(reg.region_uptr);
++	if (copy_from_user(&rd, rd_uptr, sizeof(rd)))
++		return -EFAULT;
++
++	if (memchr_inv(&reg.__resv, 0, sizeof(reg.__resv)))
++		return -EINVAL;
++	if (reg.flags)
++		return -EINVAL;
++
++	ret = io_create_region(ctx, &ctx->param_region, &rd);
++	if (ret)
++		return ret;
++	if (copy_to_user(rd_uptr, &rd, sizeof(rd))) {
++		io_free_region(ctx, &ctx->param_region);
++		return -EFAULT;
++	}
++	return 0;
++}
++
+ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
+ 			       void __user *arg, unsigned nr_args)
+ 	__releases(ctx->uring_lock)
+@@ -764,6 +795,12 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
+ 			break;
+ 		ret = io_register_resize_rings(ctx, arg);
+ 		break;
++	case IORING_REGISTER_MEM_REGION:
++		ret = -EINVAL;
++		if (!arg || nr_args != 1)
++			break;
++		ret = io_register_mem_region(ctx, arg);
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 		break;
+-- 
+2.52.0
+
