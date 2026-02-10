@@ -1,0 +1,257 @@
+From 01ee194d1aba1202f0926d5047a2a4cf84d0e45d Mon Sep 17 00:00:00 2001
+From: hexue <xue01.he@samsung.com>
+Date: Fri, 1 Nov 2024 17:19:57 +0800
+Subject: [PATCH] io_uring: add support for hybrid IOPOLL
+Git-commit: 01ee194d1aba1202f0926d5047a2a4cf84d0e45d
+Patch-mainline: v6.13-rc1
+References: bsc#1257958
+
+A new hybrid poll is implemented on the io_uring layer. Once an IO is
+issued, it will not poll immediately, but rather block first and re-run
+before IO complete, then poll to reap IO. While this poll method could
+be a suboptimal solution when running on a single thread, it offers
+performance lower than regular polling but higher than IRQ, and CPU
+utilization is also lower than polling.
+
+To use hybrid polling, the ring must be setup with both the
+IORING_SETUP_IOPOLL and IORING_SETUP_HYBRID)IOPOLL flags set. Hybrid
+polling has the same restrictions as IOPOLL, in that commands must
+explicitly support it.
+
+Signed-off-by: hexue <xue01.he@samsung.com>
+Link: https://lore.kernel.org/r/20241101091957.564220-2-xue01.he@samsung.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ include/linux/io_uring_types.h | 19 ++++++-
+ include/uapi/linux/io_uring.h  |  3 ++
+ io_uring/io_uring.c            |  8 ++-
+ io_uring/rw.c                  | 92 ++++++++++++++++++++++++++++++----
+ 4 files changed, 108 insertions(+), 14 deletions(-)
+
+diff --git a/include/linux/io_uring_types.h b/include/linux/io_uring_types.h
+index 77fd508d043a..d52fec533c51 100644
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -298,6 +298,11 @@ struct io_ring_ctx {
+ 		 * ->uring_cmd() by io_uring_cmd_insert_cancelable()
+ 		 */
+ 		struct hlist_head	cancelable_uring_cmd;
++		/*
++		 * For Hybrid IOPOLL, runtime in hybrid polling, without
++		 * scheduling time
++		 */
++		u64					hybrid_poll_time;
+ 	} ____cacheline_aligned_in_smp;
+ 
+ 	struct {
+@@ -449,6 +454,7 @@ enum {
+ 	REQ_F_LINK_TIMEOUT_BIT,
+ 	REQ_F_NEED_CLEANUP_BIT,
+ 	REQ_F_POLLED_BIT,
++	REQ_F_HYBRID_IOPOLL_STATE_BIT,
+ 	REQ_F_BUFFER_SELECTED_BIT,
+ 	REQ_F_BUFFER_RING_BIT,
+ 	REQ_F_REISSUE_BIT,
+@@ -507,6 +513,8 @@ enum {
+ 	REQ_F_NEED_CLEANUP	= IO_REQ_FLAG(REQ_F_NEED_CLEANUP_BIT),
+ 	/* already went through poll handler */
+ 	REQ_F_POLLED		= IO_REQ_FLAG(REQ_F_POLLED_BIT),
++	/* every req only blocks once in hybrid poll */
++	REQ_F_IOPOLL_STATE        = IO_REQ_FLAG(REQ_F_HYBRID_IOPOLL_STATE_BIT),
+ 	/* buffer already selected */
+ 	REQ_F_BUFFER_SELECTED	= IO_REQ_FLAG(REQ_F_BUFFER_SELECTED_BIT),
+ 	/* buffer selected from ring, needs commit */
+@@ -639,8 +647,15 @@ struct io_kiocb {
+ 	atomic_t			refs;
+ 	bool				cancel_seq_set;
+ 	struct io_task_work		io_task_work;
+-	/* for polled requests, i.e. IORING_OP_POLL_ADD and async armed poll */
+-	struct hlist_node		hash_node;
++	union {
++		/*
++		 * for polled requests, i.e. IORING_OP_POLL_ADD and async armed
++		 * poll
++		 */
++		struct hlist_node	hash_node;
++		/* For IOPOLL setup queues, with hybrid polling */
++		u64                     iopoll_start;
++	};
+ 	/* internal polling, see IORING_FEAT_FAST_POLL */
+ 	struct async_poll		*apoll;
+ 	/* opcode allocated if it needs to store data for async defer */
+diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+index ce58c4590de6..47977a5c65f5 100644
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -200,6 +200,9 @@ enum io_uring_sqe_flags_bit {
+  */
+ #define IORING_SETUP_NO_SQARRAY		(1U << 16)
+ 
++/* Use hybrid poll in iopoll process */
++#define IORING_SETUP_HYBRID_IOPOLL	(1U << 17)
++
+ enum io_uring_op {
+ 	IORING_OP_NOP,
+ 	IORING_OP_READV,
+diff --git a/io_uring/io_uring.c b/io_uring/io_uring.c
+index 44a772013c09..f08ea7fd5998 100644
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -307,6 +307,7 @@ static __cold struct io_ring_ctx *io_ring_ctx_alloc(struct io_uring_params *p)
+ 		goto err;
+ 
+ 	ctx->flags = p->flags;
++	ctx->hybrid_poll_time = LLONG_MAX;
+ 	atomic_set(&ctx->cq_wait_nr, IO_CQ_WAKE_INIT);
+ 	init_waitqueue_head(&ctx->sqo_sq_wait);
+ 	INIT_LIST_HEAD(&ctx->sqd_list);
+@@ -3630,6 +3631,11 @@ static __cold int io_uring_create(unsigned entries, struct io_uring_params *p,
+ 	if (!(ctx->flags & IORING_SETUP_NO_SQARRAY))
+ 		static_branch_inc(&io_key_has_sqarray);
+ 
++	/* HYBRID_IOPOLL only valid with IOPOLL */
++	if ((ctx->flags & (IORING_SETUP_IOPOLL|IORING_SETUP_HYBRID_IOPOLL)) ==
++			IORING_SETUP_HYBRID_IOPOLL)
++		return -EINVAL;
++
+ 	if ((ctx->flags & IORING_SETUP_DEFER_TASKRUN) &&
+ 	    !(ctx->flags & IORING_SETUP_IOPOLL) &&
+ 	    !(ctx->flags & IORING_SETUP_SQPOLL))
+@@ -3785,7 +3791,7 @@ static long io_uring_setup(u32 entries, struct io_uring_params __user *params)
+ 			IORING_SETUP_SQE128 | IORING_SETUP_CQE32 |
+ 			IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+ 			IORING_SETUP_NO_MMAP | IORING_SETUP_REGISTERED_FD_ONLY |
+-			IORING_SETUP_NO_SQARRAY))
++			IORING_SETUP_NO_SQARRAY | IORING_SETUP_HYBRID_IOPOLL))
+ 		return -EINVAL;
+ 
+ 	return io_uring_create(entries, &p, params);
+diff --git a/io_uring/rw.c b/io_uring/rw.c
+index 30448f343c7f..1ea6be2ccc90 100644
+--- a/io_uring/rw.c
++++ b/io_uring/rw.c
+@@ -817,6 +817,11 @@ static int io_rw_init_file(struct io_kiocb *req, fmode_t mode, int rw_type)
+ 		kiocb->ki_flags |= IOCB_HIPRI;
+ 		kiocb->ki_complete = io_complete_rw_iopoll;
+ 		req->iopoll_completed = 0;
++		if (ctx->flags & IORING_SETUP_HYBRID_IOPOLL) {
++			/* make sure every req only blocks once*/
++			req->flags &= ~REQ_F_IOPOLL_STATE;
++			req->iopoll_start = ktime_get_ns();
++		}
+ 	} else {
+ 		if (kiocb->ki_flags & IOCB_HIPRI)
+ 			return -EINVAL;
+@@ -1115,6 +1120,78 @@ void io_rw_fail(struct io_kiocb *req)
+ 	io_req_set_res(req, res, req->cqe.flags);
+ }
+ 
++static int io_uring_classic_poll(struct io_kiocb *req, struct io_comp_batch *iob,
++				unsigned int poll_flags)
++{
++	struct file *file = req->file;
++
++	if (req->opcode == IORING_OP_URING_CMD) {
++		struct io_uring_cmd *ioucmd;
++
++		ioucmd = io_kiocb_to_cmd(req, struct io_uring_cmd);
++		return file->f_op->uring_cmd_iopoll(ioucmd, iob, poll_flags);
++	} else {
++		struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
++
++		return file->f_op->iopoll(&rw->kiocb, iob, poll_flags);
++	}
++}
++
++static u64 io_hybrid_iopoll_delay(struct io_ring_ctx *ctx, struct io_kiocb *req)
++{
++	struct hrtimer_sleeper timer;
++	enum hrtimer_mode mode;
++	ktime_t kt;
++	u64 sleep_time;
++
++	if (req->flags & REQ_F_IOPOLL_STATE)
++		return 0;
++
++	if (ctx->hybrid_poll_time == LLONG_MAX)
++		return 0;
++
++	/* Using half the running time to do schedule */
++	sleep_time = ctx->hybrid_poll_time / 2;
++
++	kt = ktime_set(0, sleep_time);
++	req->flags |= REQ_F_IOPOLL_STATE;
++
++	mode = HRTIMER_MODE_REL;
++	hrtimer_setup_sleeper_on_stack(&timer, CLOCK_MONOTONIC, mode);
++	hrtimer_set_expires(&timer.timer, kt);
++	set_current_state(TASK_INTERRUPTIBLE);
++	hrtimer_sleeper_start_expires(&timer, mode);
++
++	if (timer.task)
++		io_schedule();
++
++	hrtimer_cancel(&timer.timer);
++	__set_current_state(TASK_RUNNING);
++	destroy_hrtimer_on_stack(&timer.timer);
++	return sleep_time;
++}
++
++static int io_uring_hybrid_poll(struct io_kiocb *req,
++				struct io_comp_batch *iob, unsigned int poll_flags)
++{
++	struct io_ring_ctx *ctx = req->ctx;
++	u64 runtime, sleep_time;
++	int ret;
++
++	sleep_time = io_hybrid_iopoll_delay(ctx, req);
++	ret = io_uring_classic_poll(req, iob, poll_flags);
++	runtime = ktime_get_ns() - req->iopoll_start - sleep_time;
++
++	/*
++	 * Use minimum sleep time if we're polling devices with different
++	 * latencies. We could get more completions from the faster ones.
++	 */
++	if (ctx->hybrid_poll_time > runtime)
++		ctx->hybrid_poll_time = runtime;
++
++	return ret;
++}
++
+ int io_do_iopoll(struct io_ring_ctx *ctx, bool force_nonspin)
+ {
+ 	struct io_wq_work_node *pos, *start, *prev;
+@@ -1131,7 +1208,6 @@ int io_do_iopoll(struct io_ring_ctx *ctx, bool force_nonspin)
+ 
+ 	wq_list_for_each(pos, start, &ctx->iopoll_list) {
+ 		struct io_kiocb *req = container_of(pos, struct io_kiocb, comp_list);
+-		struct file *file = req->file;
+ 		int ret;
+ 
+ 		/*
+@@ -1142,17 +1218,11 @@ int io_do_iopoll(struct io_ring_ctx *ctx, bool force_nonspin)
+ 		if (READ_ONCE(req->iopoll_completed))
+ 			break;
+ 
+-		if (req->opcode == IORING_OP_URING_CMD) {
+-			struct io_uring_cmd *ioucmd;
+-
+-			ioucmd = io_kiocb_to_cmd(req, struct io_uring_cmd);
+-			ret = file->f_op->uring_cmd_iopoll(ioucmd, &iob,
+-								poll_flags);
+-		} else {
+-			struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
++		if (ctx->flags & IORING_SETUP_HYBRID_IOPOLL)
++			ret = io_uring_hybrid_poll(req, &iob, poll_flags);
++		else
++			ret = io_uring_classic_poll(req, &iob, poll_flags);
+ 
+-			ret = file->f_op->iopoll(&rw->kiocb, &iob, poll_flags);
+-		}
+ 		if (unlikely(ret < 0))
+ 			return ret;
+ 		else if (ret)
+-- 
+2.52.0
+
