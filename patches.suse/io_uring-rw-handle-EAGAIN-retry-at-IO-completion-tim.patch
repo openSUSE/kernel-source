@@ -1,0 +1,223 @@
+From d803d123948feffbd992213e144df224097f82b0 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Tue, 7 Jan 2025 10:59:35 -0700
+Subject: [PATCH] io_uring/rw: handle -EAGAIN retry at IO completion time
+Git-commit: d803d123948feffbd992213e144df224097f82b0
+Patch-mainline: v6.14-rc1
+References: bsc#1257958
+
+Rather than try and have io_read/io_write turn REQ_F_REISSUE into
+-EAGAIN, catch the REQ_F_REISSUE when the request is otherwise
+considered as done. This is saner as we know this isn't happening
+during an actual submission, and it removes the need to randomly
+check REQ_F_REISSUE after read/write submission.
+
+If REQ_F_REISSUE is set, __io_submit_flush_completions() will skip over
+this request in terms of posting a CQE, and the regular request
+cleaning will ensure that it gets reissued via io-wq.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ io_uring/io_uring.c | 15 +++++++--
+ io_uring/rw.c       | 80 ++++++++++++++-------------------------------
+ 2 files changed, 38 insertions(+), 57 deletions(-)
+
+diff --git a/io_uring/io_uring.c b/io_uring/io_uring.c
+index db198bd435b5..92ba2fdcd087 100644
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -115,7 +115,7 @@
+ 				REQ_F_ASYNC_DATA)
+ 
+ #define IO_REQ_CLEAN_SLOW_FLAGS (REQ_F_REFCOUNT | REQ_F_LINK | REQ_F_HARDLINK |\
+-				 IO_REQ_CLEAN_FLAGS)
++				 REQ_F_REISSUE | IO_REQ_CLEAN_FLAGS)
+ 
+ #define IO_TCTX_REFS_CACHE_NR	(1U << 10)
+ 
+@@ -1403,6 +1403,12 @@ static void io_free_batch_list(struct io_ring_ctx *ctx,
+ 						    comp_list);
+ 
+ 		if (unlikely(req->flags & IO_REQ_CLEAN_SLOW_FLAGS)) {
++			if (req->flags & REQ_F_REISSUE) {
++				node = req->comp_list.next;
++				req->flags &= ~REQ_F_REISSUE;
++				io_queue_iowq(req);
++				continue;
++			}
+ 			if (req->flags & REQ_F_REFCOUNT) {
+ 				node = req->comp_list.next;
+ 				if (!req_ref_put_and_test(req))
+@@ -1442,7 +1448,12 @@ void __io_submit_flush_completions(struct io_ring_ctx *ctx)
+ 		struct io_kiocb *req = container_of(node, struct io_kiocb,
+ 					    comp_list);
+ 
+-		if (!(req->flags & REQ_F_CQE_SKIP) &&
++		/*
++		 * Requests marked with REQUEUE should not post a CQE, they
++		 * will go through the io-wq retry machinery and post one
++		 * later.
++		 */
++		if (!(req->flags & (REQ_F_CQE_SKIP | REQ_F_REISSUE)) &&
+ 		    unlikely(!io_fill_cqe_req(ctx, req))) {
+ 			if (ctx->lockless_cq) {
+ 				spin_lock(&ctx->completion_lock);
+diff --git a/io_uring/rw.c b/io_uring/rw.c
+index afc669048c5d..c52c0515f0a2 100644
+--- a/io_uring/rw.c
++++ b/io_uring/rw.c
+@@ -202,7 +202,7 @@ static void io_req_rw_cleanup(struct io_kiocb *req, unsigned int issue_flags)
+ 	 * mean that the underlying data can be gone at any time. But that
+ 	 * should be fixed seperately, and then this check could be killed.
+ 	 */
+-	if (!(req->flags & REQ_F_REFCOUNT)) {
++	if (!(req->flags & (REQ_F_REISSUE | REQ_F_REFCOUNT))) {
+ 		req->flags &= ~REQ_F_NEED_CLEANUP;
+ 		io_rw_recycle(req, issue_flags);
+ 	}
+@@ -455,19 +455,12 @@ static inline loff_t *io_kiocb_update_pos(struct io_kiocb *req)
+ 	return NULL;
+ }
+ 
+-#ifdef CONFIG_BLOCK
+-static void io_resubmit_prep(struct io_kiocb *req)
+-{
+-	struct io_async_rw *io = req->async_data;
+-	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
+-
+-	io_meta_restore(io, &rw->kiocb);
+-	iov_iter_restore(&io->iter, &io->iter_state);
+-}
+-
+ static bool io_rw_should_reissue(struct io_kiocb *req)
+ {
++#ifdef CONFIG_BLOCK
++	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
+ 	umode_t mode = file_inode(req->file)->i_mode;
++	struct io_async_rw *io = req->async_data;
+ 	struct io_ring_ctx *ctx = req->ctx;
+ 
+ 	if (!S_ISBLK(mode) && !S_ISREG(mode))
+@@ -488,17 +481,14 @@ static bool io_rw_should_reissue(struct io_kiocb *req)
+ 	 */
+ 	if (!same_thread_group(req->tctx->task, current) || !in_task())
+ 		return false;
++
++	io_meta_restore(io, &rw->kiocb);
++	iov_iter_restore(&io->iter, &io->iter_state);
+ 	return true;
+-}
+ #else
+-static void io_resubmit_prep(struct io_kiocb *req)
+-{
+-}
+-static bool io_rw_should_reissue(struct io_kiocb *req)
+-{
+ 	return false;
+-}
+ #endif
++}
+ 
+ static void io_req_end_write(struct io_kiocb *req)
+ {
+@@ -525,22 +515,16 @@ static void io_req_io_end(struct io_kiocb *req)
+ 	}
+ }
+ 
+-static bool __io_complete_rw_common(struct io_kiocb *req, long res)
++static void __io_complete_rw_common(struct io_kiocb *req, long res)
+ {
+-	if (unlikely(res != req->cqe.res)) {
+-		if (res == -EAGAIN && io_rw_should_reissue(req)) {
+-			/*
+-			 * Reissue will start accounting again, finish the
+-			 * current cycle.
+-			 */
+-			io_req_io_end(req);
+-			req->flags |= REQ_F_REISSUE | REQ_F_BL_NO_RECYCLE;
+-			return true;
+-		}
++	if (res == req->cqe.res)
++		return;
++	if (res == -EAGAIN && io_rw_should_reissue(req)) {
++		req->flags |= REQ_F_REISSUE | REQ_F_BL_NO_RECYCLE;
++	} else {
+ 		req_set_fail(req);
+ 		req->cqe.res = res;
+ 	}
+-	return false;
+ }
+ 
+ static inline int io_fixup_rw_res(struct io_kiocb *req, long res)
+@@ -583,8 +567,7 @@ static void io_complete_rw(struct kiocb *kiocb, long res)
+ 	struct io_kiocb *req = cmd_to_io_kiocb(rw);
+ 
+ 	if (!kiocb->dio_complete || !(kiocb->ki_flags & IOCB_DIO_CALLER_COMP)) {
+-		if (__io_complete_rw_common(req, res))
+-			return;
++		__io_complete_rw_common(req, res);
+ 		io_req_set_res(req, io_fixup_rw_res(req, res), 0);
+ 	}
+ 	req->io_task_work.func = io_req_rw_complete;
+@@ -646,26 +629,19 @@ static int kiocb_done(struct io_kiocb *req, ssize_t ret,
+ 	if (ret >= 0 && req->flags & REQ_F_CUR_POS)
+ 		req->file->f_pos = rw->kiocb.ki_pos;
+ 	if (ret >= 0 && (rw->kiocb.ki_complete == io_complete_rw)) {
+-		if (!__io_complete_rw_common(req, ret)) {
+-			/*
+-			 * Safe to call io_end from here as we're inline
+-			 * from the submission path.
+-			 */
+-			io_req_io_end(req);
+-			io_req_set_res(req, final_ret,
+-				       io_put_kbuf(req, ret, issue_flags));
+-			io_req_rw_cleanup(req, issue_flags);
+-			return IOU_OK;
+-		}
++		__io_complete_rw_common(req, ret);
++		/*
++		 * Safe to call io_end from here as we're inline
++		 * from the submission path.
++		 */
++		io_req_io_end(req);
++		io_req_set_res(req, final_ret, io_put_kbuf(req, ret, issue_flags));
++		io_req_rw_cleanup(req, issue_flags);
++		return IOU_OK;
+ 	} else {
+ 		io_rw_done(&rw->kiocb, ret);
+ 	}
+ 
+-	if (req->flags & REQ_F_REISSUE) {
+-		req->flags &= ~REQ_F_REISSUE;
+-		io_resubmit_prep(req);
+-		return -EAGAIN;
+-	}
+ 	return IOU_ISSUE_SKIP_COMPLETE;
+ }
+ 
+@@ -944,8 +920,7 @@ static int __io_read(struct io_kiocb *req, unsigned int issue_flags)
+ 	if (ret == -EOPNOTSUPP && force_nonblock)
+ 		ret = -EAGAIN;
+ 
+-	if (ret == -EAGAIN || (req->flags & REQ_F_REISSUE)) {
+-		req->flags &= ~REQ_F_REISSUE;
++	if (ret == -EAGAIN) {
+ 		/* If we can poll, just do that. */
+ 		if (io_file_can_poll(req))
+ 			return -EAGAIN;
+@@ -1154,11 +1129,6 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
+ 	else
+ 		ret2 = -EINVAL;
+ 
+-	if (req->flags & REQ_F_REISSUE) {
+-		req->flags &= ~REQ_F_REISSUE;
+-		ret2 = -EAGAIN;
+-	}
+-
+ 	/*
+ 	 * Raw bdev writes will return -EOPNOTSUPP for IOCB_NOWAIT. Just
+ 	 * retry them without IOCB_NOWAIT.
+-- 
+2.52.0
+
