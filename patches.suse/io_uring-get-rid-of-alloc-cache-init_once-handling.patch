@@ -1,0 +1,432 @@
+From fa3595523d72d13508befd28cf2ca642cafc69f7 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Wed, 22 Jan 2025 20:00:57 -0700
+Subject: [PATCH] io_uring: get rid of alloc cache init_once handling
+Git-commit: fa3595523d72d13508befd28cf2ca642cafc69f7
+Patch-mainline: v6.14-rc1
+References: bsc#1257958
+
+init_once is called when an object doesn't come from the cache, and
+hence needs initial clearing of certain members. While the whole
+struct could get cleared by memset() in that case, a few of the cache
+members are large enough that this may cause unnecessary overhead if
+the caches used aren't large enough to satisfy the workload. For those
+cases, some churn of kmalloc+kfree is to be expected.
+
+Ensure that the 3 users that need clearing put the members they need
+cleared at the start of the struct, and wrap the rest of the struct in
+a struct group so the offset is known.
+
+While at it, improve the interaction with KASAN such that when/if
+KASAN writes to members inside the struct that should be retained over
+caching, it won't trip over itself. For rw and net, the retaining of
+the iovec over caching is disabled if KASAN is enabled. A helper will
+free and clear those members in that case.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ include/linux/io_uring/cmd.h   |    2 -
+ include/linux/io_uring_types.h |    3 +-
+ io_uring/alloc_cache.h         |   43 ++++++++++++++++++++++++++++++++---------
+ io_uring/futex.c               |    4 +--
+ io_uring/io_uring.c            |   12 ++++++-----
+ io_uring/io_uring.h            |    5 +---
+ io_uring/net.c                 |   28 +++++---------------------
+ io_uring/net.h                 |   20 +++++++++++--------
+ io_uring/poll.c                |    2 -
+ io_uring/rw.c                  |   27 +++++--------------------
+ io_uring/rw.h                  |   27 +++++++++++++++----------
+ io_uring/uring_cmd.c           |    3 +-
+ 12 files changed, 91 insertions(+), 85 deletions(-)
+
+--- a/include/linux/io_uring/cmd.h
++++ b/include/linux/io_uring/cmd.h
+@@ -19,8 +19,8 @@ struct io_uring_cmd {
+ };
+ 
+ struct io_uring_cmd_data {
+-	struct io_uring_sqe	sqes[2];
+ 	void			*op_data;
++	struct io_uring_sqe	sqes[2];
+ };
+ 
+ static inline const void *io_uring_sqe_cmd(const struct io_uring_sqe *sqe)
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -222,7 +222,8 @@ struct io_alloc_cache {
+ 	void			**entries;
+ 	unsigned int		nr_cached;
+ 	unsigned int		max_cached;
+-	size_t			elem_size;
++	unsigned int		elem_size;
++	unsigned int		init_clear;
+ };
+ 
+ struct io_ring_ctx {
+--- a/io_uring/alloc_cache.h
++++ b/io_uring/alloc_cache.h
+@@ -6,6 +6,19 @@
+  */
+ #define IO_ALLOC_CACHE_MAX	128
+ 
++#if defined(CONFIG_KASAN)
++static inline void io_alloc_cache_kasan(struct iovec **iov, int *nr)
++{
++	kfree(*iov);
++	*iov = NULL;
++	*nr = 0;
++}
++#else
++static inline void io_alloc_cache_kasan(struct iovec **iov, int *nr)
++{
++}
++#endif
++
+ static inline bool io_alloc_cache_put(struct io_alloc_cache *cache,
+ 				      void *entry)
+ {
+@@ -23,35 +36,47 @@ static inline void *io_alloc_cache_get(s
+ 	if (cache->nr_cached) {
+ 		void *entry = cache->entries[--cache->nr_cached];
+ 
++		/*
++		 * If KASAN is enabled, always clear the initial bytes that
++		 * must be zeroed post alloc, in case any of them overlap
++		 * with KASAN storage.
++		 */
++#if defined(CONFIG_KASAN)
+ 		kasan_mempool_unpoison_object(entry, cache->elem_size);
++		if (cache->init_clear)
++			memset(entry, 0, cache->init_clear);
++#endif
+ 		return entry;
+ 	}
+ 
+ 	return NULL;
+ }
+ 
+-static inline void *io_cache_alloc(struct io_alloc_cache *cache, gfp_t gfp,
+-				   void (*init_once)(void *obj))
++static inline void *io_cache_alloc(struct io_alloc_cache *cache, gfp_t gfp)
+ {
+-	if (unlikely(!cache->nr_cached)) {
+-		void *obj = kmalloc(cache->elem_size, gfp);
++	void *obj;
+ 
+-		if (obj && init_once)
+-			init_once(obj);
++	obj = io_alloc_cache_get(cache);
++	if (obj)
+ 		return obj;
+-	}
+-	return io_alloc_cache_get(cache);
++
++	obj = kmalloc(cache->elem_size, gfp);
++	if (obj && cache->init_clear)
++		memset(obj, 0, cache->init_clear);
++	return obj;
+ }
+ 
+ /* returns false if the cache was initialized properly */
+ static inline bool io_alloc_cache_init(struct io_alloc_cache *cache,
+-				       unsigned max_nr, size_t size)
++				       unsigned max_nr, unsigned int size,
++				       unsigned int init_bytes)
+ {
+ 	cache->entries = kvmalloc_array(max_nr, sizeof(void *), GFP_KERNEL);
+ 	if (cache->entries) {
+ 		cache->nr_cached = 0;
+ 		cache->max_cached = max_nr;
+ 		cache->elem_size = size;
++		cache->init_clear = init_bytes;
+ 		return false;
+ 	}
+ 	return true;
+--- a/io_uring/futex.c
++++ b/io_uring/futex.c
+@@ -36,7 +36,7 @@ struct io_futex_data {
+ bool io_futex_cache_init(struct io_ring_ctx *ctx)
+ {
+ 	return io_alloc_cache_init(&ctx->futex_cache, IO_FUTEX_ALLOC_CACHE_MAX,
+-				sizeof(struct io_futex_data));
++				sizeof(struct io_futex_data), 0);
+ }
+ 
+ void io_futex_cache_free(struct io_ring_ctx *ctx)
+@@ -320,7 +320,7 @@ int io_futex_wait(struct io_kiocb *req,
+ 	}
+ 
+ 	io_ring_submit_lock(ctx, issue_flags);
+-	ifd = io_cache_alloc(&ctx->futex_cache, GFP_NOWAIT, NULL);
++	ifd = io_cache_alloc(&ctx->futex_cache, GFP_NOWAIT);
+ 	if (!ifd) {
+ 		ret = -ENOMEM;
+ 		goto done_unlock;
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -316,16 +316,18 @@ static __cold struct io_ring_ctx *io_rin
+ 	INIT_LIST_HEAD(&ctx->cq_overflow_list);
+ 	INIT_LIST_HEAD(&ctx->io_buffers_cache);
+ 	ret = io_alloc_cache_init(&ctx->apoll_cache, IO_POLL_ALLOC_CACHE_MAX,
+-			    sizeof(struct async_poll));
++			    sizeof(struct async_poll), 0);
+ 	ret |= io_alloc_cache_init(&ctx->netmsg_cache, IO_ALLOC_CACHE_MAX,
+-			    sizeof(struct io_async_msghdr));
++			    sizeof(struct io_async_msghdr),
++			    offsetof(struct io_async_msghdr, clear));
+ 	ret |= io_alloc_cache_init(&ctx->rw_cache, IO_ALLOC_CACHE_MAX,
+-			    sizeof(struct io_async_rw));
++			    sizeof(struct io_async_rw),
++			    offsetof(struct io_async_rw, clear));
+ 	ret |= io_alloc_cache_init(&ctx->uring_cache, IO_ALLOC_CACHE_MAX,
+-			    sizeof(struct io_uring_cmd_data));
++			    sizeof(struct io_uring_cmd_data), 0);
+ 	spin_lock_init(&ctx->msg_lock);
+ 	ret |= io_alloc_cache_init(&ctx->msg_cache, IO_ALLOC_CACHE_MAX,
+-			    sizeof(struct io_kiocb));
++			    sizeof(struct io_kiocb), 0);
+ 	ret |= io_futex_cache_init(ctx);
+ 	if (ret)
+ 		goto free_ref;
+--- a/io_uring/io_uring.h
++++ b/io_uring/io_uring.h
+@@ -226,10 +226,9 @@ static inline void io_req_set_res(struct
+ }
+ 
+ static inline void *io_uring_alloc_async_data(struct io_alloc_cache *cache,
+-					      struct io_kiocb *req,
+-					      void (*init_once)(void *obj))
++					      struct io_kiocb *req)
+ {
+-	req->async_data = io_cache_alloc(cache, GFP_KERNEL, init_once);
++	req->async_data = io_cache_alloc(cache, GFP_KERNEL);
+ 	if (req->async_data)
+ 		req->flags |= REQ_F_ASYNC_DATA;
+ 	return req->async_data;
+--- a/io_uring/net.c
++++ b/io_uring/net.c
+@@ -137,7 +137,6 @@ static void io_netmsg_iovec_free(struct
+ static void io_netmsg_recycle(struct io_kiocb *req, unsigned int issue_flags)
+ {
+ 	struct io_async_msghdr *hdr = req->async_data;
+-	struct iovec *iov;
+ 
+ 	/* can't recycle, ensure we free the iovec if we have one */
+ 	if (unlikely(issue_flags & IO_URING_F_UNLOCKED)) {
+@@ -146,39 +145,25 @@ static void io_netmsg_recycle(struct io_
+ 	}
+ 
+ 	/* Let normal cleanup path reap it if we fail adding to the cache */
+-	iov = hdr->free_iov;
++	io_alloc_cache_kasan(&hdr->free_iov, &hdr->free_iov_nr);
+ 	if (io_alloc_cache_put(&req->ctx->netmsg_cache, hdr)) {
+-		if (iov)
+-			kasan_mempool_poison_object(iov);
+ 		req->async_data = NULL;
+ 		req->flags &= ~REQ_F_ASYNC_DATA;
+ 	}
+ }
+ 
+-static void io_msg_async_data_init(void *obj)
+-{
+-	struct io_async_msghdr *hdr = (struct io_async_msghdr *)obj;
+-
+-	hdr->free_iov = NULL;
+-	hdr->free_iov_nr = 0;
+-}
+-
+ static struct io_async_msghdr *io_msg_alloc_async(struct io_kiocb *req)
+ {
+ 	struct io_ring_ctx *ctx = req->ctx;
+ 	struct io_async_msghdr *hdr;
+ 
+-	hdr = io_uring_alloc_async_data(&ctx->netmsg_cache, req,
+-					io_msg_async_data_init);
++	hdr = io_uring_alloc_async_data(&ctx->netmsg_cache, req);
+ 	if (!hdr)
+ 		return NULL;
+ 
+ 	/* If the async data was cached, we might have an iov cached inside. */
+-	if (hdr->free_iov) {
+-		kasan_mempool_unpoison_object(hdr->free_iov,
+-					      hdr->free_iov_nr * sizeof(struct iovec));
++	if (hdr->free_iov)
+ 		req->flags |= REQ_F_NEED_CLEANUP;
+-	}
+ 	return hdr;
+ }
+ 
+@@ -1813,11 +1798,10 @@ void io_netmsg_cache_free(const void *en
+ {
+ 	struct io_async_msghdr *kmsg = (struct io_async_msghdr *) entry;
+ 
+-	if (kmsg->free_iov) {
+-		kasan_mempool_unpoison_object(kmsg->free_iov,
+-				kmsg->free_iov_nr * sizeof(struct iovec));
++#if !defined(CONFIG_KASAN)
++	if (kmsg->free_iov)
+ 		io_netmsg_iovec_free(kmsg);
+-	}
++#endif
+ 	kfree(kmsg);
+ }
+ #endif
+--- a/io_uring/net.h
++++ b/io_uring/net.h
+@@ -5,16 +5,20 @@
+ 
+ struct io_async_msghdr {
+ #if defined(CONFIG_NET)
+-	struct iovec			fast_iov;
+-	/* points to an allocated iov, if NULL we use fast_iov instead */
+ 	struct iovec			*free_iov;
++	/* points to an allocated iov, if NULL we use fast_iov instead */
+ 	int				free_iov_nr;
+-	int				namelen;
+-	__kernel_size_t			controllen;
+-	__kernel_size_t			payloadlen;
+-	struct sockaddr __user		*uaddr;
+-	struct msghdr			msg;
+-	struct sockaddr_storage		addr;
++	struct_group(clear,
++		int				namelen;
++		struct iovec			fast_iov;
++		__kernel_size_t			controllen;
++		__kernel_size_t			payloadlen;
++		struct sockaddr __user		*uaddr;
++		struct msghdr			msg;
++		struct sockaddr_storage		addr;
++	);
++#else
++	struct_group(clear);
+ #endif
+ };
+ 
+--- a/io_uring/poll.c
++++ b/io_uring/poll.c
+@@ -650,7 +650,7 @@ static struct async_poll *io_req_alloc_a
+ 		kfree(apoll->double_poll);
+ 	} else {
+ 		if (!(issue_flags & IO_URING_F_UNLOCKED))
+-			apoll = io_cache_alloc(&ctx->apoll_cache, GFP_ATOMIC, NULL);
++			apoll = io_cache_alloc(&ctx->apoll_cache, GFP_ATOMIC);
+ 		else
+ 			apoll = kmalloc(sizeof(*apoll), GFP_ATOMIC);
+ 		if (!apoll)
+--- a/io_uring/rw.c
++++ b/io_uring/rw.c
+@@ -158,16 +158,13 @@ static void io_rw_iovec_free(struct io_a
+ static void io_rw_recycle(struct io_kiocb *req, unsigned int issue_flags)
+ {
+ 	struct io_async_rw *rw = req->async_data;
+-	struct iovec *iov;
+ 
+ 	if (unlikely(issue_flags & IO_URING_F_UNLOCKED)) {
+ 		io_rw_iovec_free(rw);
+ 		return;
+ 	}
+-	iov = rw->free_iovec;
++	io_alloc_cache_kasan(&rw->free_iovec, &rw->free_iov_nr);
+ 	if (io_alloc_cache_put(&req->ctx->rw_cache, rw)) {
+-		if (iov)
+-			kasan_mempool_poison_object(iov);
+ 		req->async_data = NULL;
+ 		req->flags &= ~REQ_F_ASYNC_DATA;
+ 	}
+@@ -208,27 +205,16 @@ static void io_req_rw_cleanup(struct io_
+ 	}
+ }
+ 
+-static void io_rw_async_data_init(void *obj)
+-{
+-	struct io_async_rw *rw = (struct io_async_rw *)obj;
+-
+-	rw->free_iovec = NULL;
+-	rw->bytes_done = 0;
+-}
+-
+ static int io_rw_alloc_async(struct io_kiocb *req)
+ {
+ 	struct io_ring_ctx *ctx = req->ctx;
+ 	struct io_async_rw *rw;
+ 
+-	rw = io_uring_alloc_async_data(&ctx->rw_cache, req, io_rw_async_data_init);
++	rw = io_uring_alloc_async_data(&ctx->rw_cache, req);
+ 	if (!rw)
+ 		return -ENOMEM;
+-	if (rw->free_iovec) {
+-		kasan_mempool_unpoison_object(rw->free_iovec,
+-					      rw->free_iov_nr * sizeof(struct iovec));
++	if (rw->free_iovec)
+ 		req->flags |= REQ_F_NEED_CLEANUP;
+-	}
+ 	rw->bytes_done = 0;
+ 	return 0;
+ }
+@@ -1323,10 +1309,9 @@ void io_rw_cache_free(const void *entry)
+ {
+ 	struct io_async_rw *rw = (struct io_async_rw *) entry;
+ 
+-	if (rw->free_iovec) {
+-		kasan_mempool_unpoison_object(rw->free_iovec,
+-				rw->free_iov_nr * sizeof(struct iovec));
++#if !defined(CONFIG_KASAN)
++	if (rw->free_iovec)
+ 		io_rw_iovec_free(rw);
+-	}
++#endif
+ 	kfree(rw);
+ }
+--- a/io_uring/rw.h
++++ b/io_uring/rw.h
+@@ -9,19 +9,24 @@ struct io_meta_state {
+ 
+ struct io_async_rw {
+ 	size_t				bytes_done;
+-	struct iov_iter			iter;
+-	struct iov_iter_state		iter_state;
+-	struct iovec			fast_iov;
+ 	struct iovec			*free_iovec;
+-	int				free_iov_nr;
+-	/* wpq is for buffered io, while meta fields are used with direct io */
+-	union {
+-		struct wait_page_queue		wpq;
+-		struct {
+-			struct uio_meta			meta;
+-			struct io_meta_state		meta_state;
++	struct_group(clear,
++		struct iov_iter			iter;
++		struct iov_iter_state		iter_state;
++		struct iovec			fast_iov;
++		int				free_iov_nr;
++		/*
++		 * wpq is for buffered io, while meta fields are used with
++		 * direct io
++		 */
++		union {
++			struct wait_page_queue		wpq;
++			struct {
++				struct uio_meta			meta;
++				struct io_meta_state		meta_state;
++			};
+ 		};
+-	};
++	);
+ };
+ 
+ int io_prep_read_fixed(struct io_kiocb *req, const struct io_uring_sqe *sqe);
+--- a/io_uring/uring_cmd.c
++++ b/io_uring/uring_cmd.c
+@@ -174,9 +174,10 @@ static int io_uring_cmd_prep_setup(struc
+ 	struct io_uring_cmd *ioucmd = io_kiocb_to_cmd(req, struct io_uring_cmd);
+ 	struct io_uring_cmd_data *cache;
+ 
+-	cache = io_uring_alloc_async_data(&req->ctx->uring_cache, req, NULL);
++	cache = io_uring_alloc_async_data(&req->ctx->uring_cache, req);
+ 	if (!cache)
+ 		return -ENOMEM;
++	cache->op_data = NULL;
+ 
+ 	if (!(req->flags & REQ_F_FORCE_ASYNC)) {
+ 		/* defer memcpy until we need it */
