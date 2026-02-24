@@ -64,7 +64,8 @@ def read_source_timestamp(file):
     config = cp['section']
     return config
 
-def read_config_sh(file):
+def read_config_sh(package_tar_up_dir):
+    file = os.path.join(package_tar_up_dir, 'config.sh')
     cp = configparser.ConfigParser(delimiters=('='), interpolation=None)
     with open(file, 'r') as fd:
         cp.read_string('[section]\n' + fd.read())
@@ -82,7 +83,7 @@ def read_config_sh(file):
     return config
 
 def get_kernel_project_package(package_tar_up_dir):
-    rpm_config = read_config_sh(os.path.join(package_tar_up_dir, 'config.sh'))
+    rpm_config = read_config_sh(package_tar_up_dir)
     if 'ibs_project' in rpm_config:
         project = rpm_config.get('ibs_project')
     else:
@@ -97,8 +98,7 @@ def get_kernel_project_package(package_tar_up_dir):
     return (project, specname)
 
 def get_kernel_projects(package_tar_up_dir):
-    config_filename = os.path.join(package_tar_up_dir, 'config.sh')
-    rpm_config = read_config_sh(config_filename)
+    rpm_config = read_config_sh(package_tar_up_dir)
     ibs_projects = {}
     obs_projects = {}
     for var in sorted(list(rpm_config.keys())):
