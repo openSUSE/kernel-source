@@ -31,9 +31,10 @@ def get_bugzilla_api(rest=False):
 
 def check_being_logged_in(bzapi):
     if not bzapi.logged_in:
-        print("You are not logged in the bugzilla!\n\nGo to https://bugzilla.suse.com/, log in via web interace with your credentials.\n"\
+        print("You are not logged in the bugzilla!\n\nGo to https://bugzilla.suse.com/, log in via web interface with your credentials.\n"\
              "Then go to Preferences, click on the tab API KEYS and generate a new api key\nif you don't have one already.  Then store "\
-             "the api_key in a file ~/.bugzillarc\nin the following format...\n\n# ~/.bugzillarc\n[apibugzilla.suse.com]\napi_key = YOUR_API_KEY")
+             "the api_key in a file ~/.bugzillarc\nin the following format...\n\n# ~/.bugzillarc\n[apibugzilla.suse.com]\napi_key = YOUR_API_KEY",
+             file=sys.stderr)
         return False
     return True
 

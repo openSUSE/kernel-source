@@ -3,7 +3,7 @@ import unittest
 
 class MiscTests(unittest.TestCase):
     def test_config_sh(self):
-        config = read_config_sh('tests/kutil/rpm/krnf/config.sh')
+        config = read_config_sh('tests/kutil/rpm/krnf')
         self.assertEqual(config['variant'], '')
         self.assertEqual(config['multibuild'], 'Yes')
         self.assertEqual(config.getboolean('multibuild'), True)
