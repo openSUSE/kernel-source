@@ -1,0 +1,156 @@
+From: Jiayuan Chen <jiayuan.chen@shopee.com>
+Date: Thu, 5 Feb 2026 17:54:51 +0800
+Subject: [PATCH] net: atm: fix crash due to unvalidated vcc pointer in
+ sigd_send()
+References: bsc#1258210
+Patch-mainline: 6.18.14
+Git-commit: ae88a5d2f29b69819dc7b04086734439d074a643
+
+[ Upstream commit ae88a5d2f29b69819dc7b04086734439d074a643 ]
+
+Reproducer available at [1].
+
+The ATM send path (sendmsg -> vcc_sendmsg -> sigd_send) reads the vcc
+pointer from msg->vcc and uses it directly without any validation. This
+pointer comes from userspace via sendmsg() and can be arbitrarily forged:
+
+    int fd = socket(AF_ATMSVC, SOCK_DGRAM, 0);
+    ioctl(fd, ATMSIGD_CTRL);  // become ATM signaling daemon
+    struct msghdr msg = { .msg_iov = &iov, ... };
+    *(unsigned long *)(buf + 4) = 0xdeadbeef;  // fake vcc pointer
+    sendmsg(fd, &msg, 0);  // kernel dereferences 0xdeadbeef
+
+In normal operation, the kernel sends the vcc pointer to the signaling
+daemon via sigd_enq() when processing operations like connect(), bind(),
+or listen(). The daemon is expected to return the same pointer when
+responding. However, a malicious daemon can send arbitrary pointer values.
+
+Fix this by introducing find_get_vcc() which validates the pointer by
+searching through vcc_hash (similar to how sigd_close() iterates over
+all VCCs), and acquires a reference via sock_hold() if found.
+
+Since struct atm_vcc embeds struct sock as its first member, they share
+the same lifetime. Therefore using sock_hold/sock_put is sufficient to
+keep the vcc alive while it is being used.
+
+Note that there may be a race with sigd_close() which could mark the vcc
+with various flags (e.g., ATM_VF_RELEASED) after find_get_vcc() returns.
+However, sock_hold() guarantees the memory remains valid, so this race
+only affects the logical state, not memory safety.
+
+[1]: https://gist.github.com/mrpre/1ba5949c45529c511152e2f4c755b0f3
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Reported-by: syzbot+1f22cb1769f249df9fa0@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/all/69039850.a70a0220.5b2ed.005d.GAE@google.com/T/
+Signed-off-by: Jiayuan Chen <jiayuan.chen@shopee.com>
+Link: https://patch.msgid.link/20260205095501.131890-1-jiayuan.chen@linux.dev
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ net/atm/signaling.c | 56 +++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/net/atm/signaling.c b/net/atm/signaling.c
+index e70ae2c113f9..358fbe5e4d1d 100644
+--- a/net/atm/signaling.c
++++ b/net/atm/signaling.c
+@@ -22,6 +22,36 @@
+ 
+ struct atm_vcc *sigd = NULL;
+ 
++/*
++ * find_get_vcc - validate and get a reference to a vcc pointer
++ * @vcc: the vcc pointer to validate
++ *
++ * This function validates that @vcc points to a registered VCC in vcc_hash.
++ * If found, it increments the socket reference count and returns the vcc.
++ * The caller must call sock_put(sk_atm(vcc)) when done.
++ *
++ * Returns the vcc pointer if valid, NULL otherwise.
++ */
++static struct atm_vcc *find_get_vcc(struct atm_vcc *vcc)
++{
++	int i;
++
++	read_lock(&vcc_sklist_lock);
++	for (i = 0; i < VCC_HTABLE_SIZE; i++) {
++		struct sock *s;
++
++		sk_for_each(s, &vcc_hash[i]) {
++			if (atm_sk(s) == vcc) {
++				sock_hold(s);
++				read_unlock(&vcc_sklist_lock);
++				return vcc;
++			}
++		}
++	}
++	read_unlock(&vcc_sklist_lock);
++	return NULL;
++}
++
+ static void sigd_put_skb(struct sk_buff *skb)
+ {
+ 	if (!sigd) {
+@@ -69,7 +99,14 @@ static int sigd_send(struct atm_vcc *vcc, struct sk_buff *skb)
+ 
+ 	msg = (struct atmsvc_msg *) skb->data;
+ 	WARN_ON(refcount_sub_and_test(skb->truesize, &sk_atm(vcc)->sk_wmem_alloc));
+-	vcc = *(struct atm_vcc **) &msg->vcc;
++
++	vcc = find_get_vcc(*(struct atm_vcc **)&msg->vcc);
++	if (!vcc) {
++		pr_debug("invalid vcc pointer in msg\n");
++		dev_kfree_skb(skb);
++		return -EINVAL;
++	}
++
+ 	pr_debug("%d (0x%lx)\n", (int)msg->type, (unsigned long)vcc);
+ 	sk = sk_atm(vcc);
+ 
+@@ -100,7 +137,16 @@ static int sigd_send(struct atm_vcc *vcc, struct sk_buff *skb)
+ 		clear_bit(ATM_VF_WAITING, &vcc->flags);
+ 		break;
+ 	case as_indicate:
+-		vcc = *(struct atm_vcc **)&msg->listen_vcc;
++		/* Release the reference from msg->vcc, we'll use msg->listen_vcc instead */
++		sock_put(sk);
++
++		vcc = find_get_vcc(*(struct atm_vcc **)&msg->listen_vcc);
++		if (!vcc) {
++			pr_debug("invalid listen_vcc pointer in msg\n");
++			dev_kfree_skb(skb);
++			return -EINVAL;
++		}
++
+ 		sk = sk_atm(vcc);
+ 		pr_debug("as_indicate!!!\n");
+ 		lock_sock(sk);
+@@ -115,6 +161,8 @@ static int sigd_send(struct atm_vcc *vcc, struct sk_buff *skb)
+ 		sk->sk_state_change(sk);
+ as_indicate_complete:
+ 		release_sock(sk);
++		/* Paired with find_get_vcc(msg->listen_vcc) above */
++		sock_put(sk);
+ 		return 0;
+ 	case as_close:
+ 		set_bit(ATM_VF_RELEASED, &vcc->flags);
+@@ -131,11 +179,15 @@ static int sigd_send(struct atm_vcc *vcc, struct sk_buff *skb)
+ 		break;
+ 	default:
+ 		pr_alert("bad message type %d\n", (int)msg->type);
++		/* Paired with find_get_vcc(msg->vcc) above */
++		sock_put(sk);
+ 		return -EINVAL;
+ 	}
+ 	sk->sk_state_change(sk);
+ out:
+ 	dev_kfree_skb(skb);
++	/* Paired with find_get_vcc(msg->vcc) above */
++	sock_put(sk);
+ 	return 0;
+ }
+ 
+-- 
+2.51.0
+
