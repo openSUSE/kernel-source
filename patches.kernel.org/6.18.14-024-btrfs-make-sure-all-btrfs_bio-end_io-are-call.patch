@@ -1,0 +1,202 @@
+From: Qu Wenruo <wqu@suse.com>
+Date: Thu, 23 Oct 2025 15:19:16 +1030
+Subject: [PATCH] btrfs: make sure all btrfs_bio::end_io are called in task
+ context
+References: bsc#1258210
+Patch-mainline: 6.18.14
+Git-commit: 4591c3ef751d861d7dd95ff4d2aadb1b5e95854e
+
+[ Upstream commit 4591c3ef751d861d7dd95ff4d2aadb1b5e95854e ]
+
+[BACKGROUND]
+Btrfs has a lot of different bi_end_io functions, to handle different
+raid profiles. But they introduced a lot of different contexts for
+btrfs_bio::end_io() calls:
+
+- Simple read bios
+  Run in task context, backed by either endio_meta_workers or
+  endio_workers.
+
+- Simple write bios
+  Run in IRQ context.
+
+- RAID56 write or rebuild bios
+  Run in task context, backed by rmw_workers.
+
+- Mirrored write bios
+  Run in irq context.
+
+This is inconsistent, and contributes to the number of workqueues used
+in btrfs.
+
+[ENHANCEMENT]
+Make all the above bios call their btrfs_bio::end_io() in task context,
+backed by either endio_meta_workers for metadata, or endio_workers for
+data.
+
+For simple write bios, merge the handling into simple_end_io_work().
+
+For mirrored write bios, it will be a little more complex, since both
+the original or the cloned bios can run the final btrfs_bio::end_io().
+
+Here we make sure the cloned bios are using btrfs_bioset, to reuse the
+end_io_work, and run both original and cloned work inside the workqueue.
+
+Add extra ASSERT()s to make sure btrfs_bio_end_io() is running in task
+context.
+
+This not only unifies the context for btrfs_bio::end_io() functions, but
+also opens a new door for further btrfs_bio::end_io() related cleanups.
+
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Stable-dep-of: b39b26e017c7 ("btrfs: zoned: don't zone append to conventional zone")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/btrfs/bio.c | 64 ++++++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 46 insertions(+), 18 deletions(-)
+
+diff --git a/fs/btrfs/bio.c b/fs/btrfs/bio.c
+index b85b6b21b545..52b8893f26f1 100644
+--- a/fs/btrfs/bio.c
++++ b/fs/btrfs/bio.c
+@@ -102,6 +102,9 @@ static struct btrfs_bio *btrfs_split_bio(struct btrfs_fs_info *fs_info,
+ 
+ void btrfs_bio_end_io(struct btrfs_bio *bbio, blk_status_t status)
+ {
++	/* Make sure we're already in task context. */
++	ASSERT(in_task());
++
+ 	bbio->bio.bi_status = status;
+ 	if (bbio->bio.bi_pool == &btrfs_clone_bioset) {
+ 		struct btrfs_bio *orig_bbio = bbio->private;
+@@ -318,15 +321,20 @@ static struct workqueue_struct *btrfs_end_io_wq(const struct btrfs_fs_info *fs_i
+ 	return fs_info->endio_workers;
+ }
+ 
+-static void btrfs_end_bio_work(struct work_struct *work)
++static void simple_end_io_work(struct work_struct *work)
+ {
+ 	struct btrfs_bio *bbio = container_of(work, struct btrfs_bio, end_io_work);
++	struct bio *bio = &bbio->bio;
+ 
+-	/* Metadata reads are checked and repaired by the submitter. */
+-	if (is_data_bbio(bbio))
+-		btrfs_check_read_bio(bbio, bbio->bio.bi_private);
+-	else
+-		btrfs_bio_end_io(bbio, bbio->bio.bi_status);
++	if (bio_op(bio) == REQ_OP_READ) {
++		/* Metadata reads are checked and repaired by the submitter. */
++		if (is_data_bbio(bbio))
++			return btrfs_check_read_bio(bbio, bbio->bio.bi_private);
++		return btrfs_bio_end_io(bbio, bbio->bio.bi_status);
++	}
++	if (bio_is_zone_append(bio) && !bio->bi_status)
++		btrfs_record_physical_zoned(bbio);
++	btrfs_bio_end_io(bbio, bbio->bio.bi_status);
+ }
+ 
+ static void btrfs_simple_end_io(struct bio *bio)
+@@ -340,14 +348,8 @@ static void btrfs_simple_end_io(struct bio *bio)
+ 	if (bio->bi_status)
+ 		btrfs_log_dev_io_error(bio, dev);
+ 
+-	if (bio_op(bio) == REQ_OP_READ) {
+-		INIT_WORK(&bbio->end_io_work, btrfs_end_bio_work);
+-		queue_work(btrfs_end_io_wq(fs_info, bio), &bbio->end_io_work);
+-	} else {
+-		if (bio_is_zone_append(bio) && !bio->bi_status)
+-			btrfs_record_physical_zoned(bbio);
+-		btrfs_bio_end_io(bbio, bbio->bio.bi_status);
+-	}
++	INIT_WORK(&bbio->end_io_work, simple_end_io_work);
++	queue_work(btrfs_end_io_wq(fs_info, bio), &bbio->end_io_work);
+ }
+ 
+ static void btrfs_raid56_end_io(struct bio *bio)
+@@ -355,6 +357,9 @@ static void btrfs_raid56_end_io(struct bio *bio)
+ 	struct btrfs_io_context *bioc = bio->bi_private;
+ 	struct btrfs_bio *bbio = btrfs_bio(bio);
+ 
++	/* RAID56 endio is always handled in workqueue. */
++	ASSERT(in_task());
++
+ 	btrfs_bio_counter_dec(bioc->fs_info);
+ 	bbio->mirror_num = bioc->mirror_num;
+ 	if (bio_op(bio) == REQ_OP_READ && is_data_bbio(bbio))
+@@ -365,11 +370,12 @@ static void btrfs_raid56_end_io(struct bio *bio)
+ 	btrfs_put_bioc(bioc);
+ }
+ 
+-static void btrfs_orig_write_end_io(struct bio *bio)
++static void orig_write_end_io_work(struct work_struct *work)
+ {
++	struct btrfs_bio *bbio = container_of(work, struct btrfs_bio, end_io_work);
++	struct bio *bio = &bbio->bio;
+ 	struct btrfs_io_stripe *stripe = bio->bi_private;
+ 	struct btrfs_io_context *bioc = stripe->bioc;
+-	struct btrfs_bio *bbio = btrfs_bio(bio);
+ 
+ 	btrfs_bio_counter_dec(bioc->fs_info);
+ 
+@@ -394,8 +400,18 @@ static void btrfs_orig_write_end_io(struct bio *bio)
+ 	btrfs_put_bioc(bioc);
+ }
+ 
+-static void btrfs_clone_write_end_io(struct bio *bio)
++static void btrfs_orig_write_end_io(struct bio *bio)
++{
++	struct btrfs_bio *bbio = btrfs_bio(bio);
++
++	INIT_WORK(&bbio->end_io_work, orig_write_end_io_work);
++	queue_work(btrfs_end_io_wq(bbio->inode->root->fs_info, bio), &bbio->end_io_work);
++}
++
++static void clone_write_end_io_work(struct work_struct *work)
+ {
++	struct btrfs_bio *bbio = container_of(work, struct btrfs_bio, end_io_work);
++	struct bio *bio = &bbio->bio;
+ 	struct btrfs_io_stripe *stripe = bio->bi_private;
+ 
+ 	if (bio->bi_status) {
+@@ -410,6 +426,14 @@ static void btrfs_clone_write_end_io(struct bio *bio)
+ 	bio_put(bio);
+ }
+ 
++static void btrfs_clone_write_end_io(struct bio *bio)
++{
++	struct btrfs_bio *bbio = btrfs_bio(bio);
++
++	INIT_WORK(&bbio->end_io_work, clone_write_end_io_work);
++	queue_work(btrfs_end_io_wq(bbio->inode->root->fs_info, bio), &bbio->end_io_work);
++}
++
+ static void btrfs_submit_dev_bio(struct btrfs_device *dev, struct bio *bio)
+ {
+ 	if (!dev || !dev->bdev ||
+@@ -456,6 +480,7 @@ static void btrfs_submit_dev_bio(struct btrfs_device *dev, struct bio *bio)
+ static void btrfs_submit_mirrored_bio(struct btrfs_io_context *bioc, int dev_nr)
+ {
+ 	struct bio *orig_bio = bioc->orig_bio, *bio;
++	struct btrfs_bio *orig_bbio = btrfs_bio(orig_bio);
+ 
+ 	ASSERT(bio_op(orig_bio) != REQ_OP_READ);
+ 
+@@ -464,8 +489,11 @@ static void btrfs_submit_mirrored_bio(struct btrfs_io_context *bioc, int dev_nr)
+ 		bio = orig_bio;
+ 		bio->bi_end_io = btrfs_orig_write_end_io;
+ 	} else {
+-		bio = bio_alloc_clone(NULL, orig_bio, GFP_NOFS, &fs_bio_set);
++		/* We need to use endio_work to run end_io in task context. */
++		bio = bio_alloc_clone(NULL, orig_bio, GFP_NOFS, &btrfs_bioset);
+ 		bio_inc_remaining(orig_bio);
++		btrfs_bio_init(btrfs_bio(bio), orig_bbio->inode,
++			       orig_bbio->file_offset, NULL, NULL);
+ 		bio->bi_end_io = btrfs_clone_write_end_io;
+ 	}
+ 
+-- 
+2.51.0
+
