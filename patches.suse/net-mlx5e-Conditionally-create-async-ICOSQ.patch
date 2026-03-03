@@ -1,0 +1,241 @@
+From: William Tu <witu@nvidia.com>
+Date: Wed, 14 Jan 2026 09:46:40 +0200
+Subject: net/mlx5e: Conditionally create async ICOSQ
+Patch-mainline: v7.0-rc1
+Git-commit: abed42f9cd809bf790c415c86f6dc41a3f69c91b
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+The async ICOSQ is only required by TLS RX (for re-sync flow) and XSK
+TX. Create it only when these features are enabled instead of always
+allocating it. This reduces per-channel memory usage, saves hardware
+resources, improves latency, and decreases the default number of SQs
+(from 3 to 2) and CQs (from 4 to 3). It also speeds up channel
+open/close operations for a netdev when async ICOSQ is not needed.
+
+Currently when TLS RX is enabled, there is no channel reset triggered.
+As a result, async ICOSQ allocation is not triggered, causing a NULL
+pointer crash. One solution is to do channel reset every time when
+toggling TLS RX. However, it's not straightforward as the offload
+state matters only on connection creation, and can go on beyond the
+channels reset.
+
+Instead, introduce a new field 'ktls_rx_was_enabled': if TLS RX is
+enabled for the first time: reset channels, create async ICOSQ, set
+the field. From that point on, no need to reset channels for any TLS
+RX enable/disable. Async ICOSQ will always be needed.
+
+For XSK TX, async ICOSQ is used in wakeup control and is guaranteed
+to have async ICOSQ allocated.
+
+This improves the latency of interface up/down operations when it
+applies.
+
+Perf numbers:
+NIC: Connect-X7.
+Test: Latency of interface up + down operations.
+
+Measured 20% speedup.
+Saving ~0.36 sec for 248 channels (~1.45 msec per channel).
+
+Signed-off-by: William Tu <witu@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1768376800-1607672-5-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en.h            |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls.c |   10 +++-
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c       |   30 ++++++++----
+ drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c       |   38 ++++++++--------
+ 4 files changed, 50 insertions(+), 29 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -938,6 +938,7 @@ struct mlx5e_priv {
+ 	u8                         max_opened_tc;
+ 	bool                       tx_ptp_opened;
+ 	bool                       rx_ptp_opened;
++	bool                       ktls_rx_was_enabled;
+ 	struct kernel_hwtstamp_config hwtstamp_config;
+ 	u16                        q_counter[MLX5_SD_MAX_GROUP_SZ];
+ 	u16                        drop_rq_q_counter;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls.c
+@@ -135,10 +135,15 @@ int mlx5e_ktls_set_feature_rx(struct net
+ 	int err = 0;
+ 
+ 	mutex_lock(&priv->state_lock);
+-	if (enable)
++	if (enable) {
+ 		err = mlx5e_accel_fs_tcp_create(priv->fs);
+-	else
++		if (!err && !priv->ktls_rx_was_enabled) {
++			priv->ktls_rx_was_enabled = true;
++			mlx5e_safe_reopen_channels(priv);
++		}
++	} else {
+ 		mlx5e_accel_fs_tcp_destroy(priv->fs);
++	}
+ 	mutex_unlock(&priv->state_lock);
+ 
+ 	return err;
+@@ -161,6 +166,7 @@ int mlx5e_ktls_init_rx(struct mlx5e_priv
+ 			destroy_workqueue(priv->tls->rx_wq);
+ 			return err;
+ 		}
++		priv->ktls_rx_was_enabled = true;
+ 	}
+ 
+ 	return 0;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -2617,7 +2617,8 @@ static void mlx5e_close_async_icosq(stru
+ 
+ static int mlx5e_open_queues(struct mlx5e_channel *c,
+ 			     struct mlx5e_params *params,
+-			     struct mlx5e_channel_param *cparam)
++			     struct mlx5e_channel_param *cparam,
++			     bool async_icosq_needed)
+ {
+ 	const struct net_device_ops *netdev_ops = c->netdev->netdev_ops;
+ 	struct dim_cq_moder icocq_moder = {0, 0};
+@@ -2653,10 +2654,13 @@ static int mlx5e_open_queues(struct mlx5
+ 	if (err)
+ 		goto err_close_rx_cq;
+ 
+-	c->async_icosq = mlx5e_open_async_icosq(c, params, cparam, &ccp);
+-	if (IS_ERR(c->async_icosq)) {
+-		err = PTR_ERR(c->async_icosq);
+-		goto err_close_rq_xdpsq_cq;
++	if (async_icosq_needed) {
++		c->async_icosq = mlx5e_open_async_icosq(c, params, cparam,
++							&ccp);
++		if (IS_ERR(c->async_icosq)) {
++			err = PTR_ERR(c->async_icosq);
++			goto err_close_rq_xdpsq_cq;
++		}
+ 	}
+ 
+ 	mutex_init(&c->icosq_recovery_lock);
+@@ -2693,7 +2697,8 @@ err_close_icosq:
+ 	mlx5e_close_icosq(&c->icosq);
+ 
+ err_close_async_icosq:
+-	mlx5e_close_async_icosq(c->async_icosq);
++	if (c->async_icosq)
++		mlx5e_close_async_icosq(c->async_icosq);
+ 
+ err_close_rq_xdpsq_cq:
+ 	if (c->xdp)
+@@ -2725,7 +2730,8 @@ static void mlx5e_close_queues(struct ml
+ 	mlx5e_close_sqs(c);
+ 	mlx5e_close_icosq(&c->icosq);
+ 	mutex_destroy(&c->icosq_recovery_lock);
+-	mlx5e_close_async_icosq(c->async_icosq);
++	if (c->async_icosq)
++		mlx5e_close_async_icosq(c->async_icosq);
+ 	if (c->xdp)
+ 		mlx5e_close_cq(&c->rq_xdpsq.cq);
+ 	mlx5e_close_cq(&c->rq.cq);
+@@ -2810,6 +2816,7 @@ static int mlx5e_open_channel(struct mlx
+ 	struct mlx5e_channel_param *cparam;
+ 	struct mlx5_core_dev *mdev;
+ 	struct mlx5e_xsk_param xsk;
++	bool async_icosq_needed;
+ 	struct mlx5e_channel *c;
+ 	unsigned int irq;
+ 	int vec_ix;
+@@ -2859,7 +2866,8 @@ static int mlx5e_open_channel(struct mlx
+ 	netif_napi_add_config(netdev, &c->napi, mlx5e_napi_poll, ix);
+ 	netif_napi_set_irq(&c->napi, irq);
+ 
+-	err = mlx5e_open_queues(c, params, cparam);
++	async_icosq_needed = !!xsk_pool || priv->ktls_rx_was_enabled;
++	err = mlx5e_open_queues(c, params, cparam, async_icosq_needed);
+ 	if (unlikely(err))
+ 		goto err_napi_del;
+ 
+@@ -2897,7 +2905,8 @@ static void mlx5e_activate_channel(struc
+ 	for (tc = 0; tc < c->num_tc; tc++)
+ 		mlx5e_activate_txqsq(&c->sq[tc]);
+ 	mlx5e_activate_icosq(&c->icosq);
+-	mlx5e_activate_icosq(c->async_icosq);
++	if (c->async_icosq)
++		mlx5e_activate_icosq(c->async_icosq);
+ 
+ 	if (test_bit(MLX5E_CHANNEL_STATE_XSK, c->state))
+ 		mlx5e_activate_xsk(c);
+@@ -2918,7 +2927,8 @@ static void mlx5e_deactivate_channel(str
+ 	else
+ 		mlx5e_deactivate_rq(&c->rq);
+ 
+-	mlx5e_deactivate_icosq(c->async_icosq);
++	if (c->async_icosq)
++		mlx5e_deactivate_icosq(c->async_icosq);
+ 	mlx5e_deactivate_icosq(&c->icosq);
+ 	for (tc = 0; tc < c->num_tc; tc++)
+ 		mlx5e_deactivate_txqsq(&c->sq[tc]);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+@@ -125,6 +125,7 @@ int mlx5e_napi_poll(struct napi_struct *
+ {
+ 	struct mlx5e_channel *c = container_of(napi, struct mlx5e_channel,
+ 					       napi);
++	struct mlx5e_icosq *aicosq = c->async_icosq;
+ 	struct mlx5e_ch_stats *ch_stats = c->stats;
+ 	struct mlx5e_xdpsq *xsksq = &c->xsksq;
+ 	struct mlx5e_txqsq __rcu **qos_sqs;
+@@ -180,16 +181,18 @@ int mlx5e_napi_poll(struct napi_struct *
+ 	busy |= work_done == budget;
+ 
+ 	mlx5e_poll_ico_cq(&c->icosq.cq);
+-	if (mlx5e_poll_ico_cq(&c->async_icosq->cq))
+-		/* Don't clear the flag if nothing was polled to prevent
+-		 * queueing more WQEs and overflowing the async ICOSQ.
+-		 */
+-		clear_bit(MLX5E_SQ_STATE_PENDING_XSK_TX,
+-			  &c->async_icosq->state);
+-
+-	/* Keep after async ICOSQ CQ poll */
+-	if (unlikely(mlx5e_ktls_rx_pending_resync_list(c, budget)))
+-		busy |= mlx5e_ktls_rx_handle_resync_list(c, budget);
++	if (aicosq) {
++		if (mlx5e_poll_ico_cq(&aicosq->cq))
++			/* Don't clear the flag if nothing was polled to prevent
++			 * queueing more WQEs and overflowing the async ICOSQ.
++			 */
++			clear_bit(MLX5E_SQ_STATE_PENDING_XSK_TX,
++				  &aicosq->state);
++
++		/* Keep after async ICOSQ CQ poll */
++		if (unlikely(mlx5e_ktls_rx_pending_resync_list(c, budget)))
++			busy |= mlx5e_ktls_rx_handle_resync_list(c, budget);
++	}
+ 
+ 	busy |= INDIRECT_CALL_2(rq->post_wqes,
+ 				mlx5e_post_rx_mpwqes,
+@@ -237,16 +240,17 @@ int mlx5e_napi_poll(struct napi_struct *
+ 
+ 	mlx5e_cq_arm(&rq->cq);
+ 	mlx5e_cq_arm(&c->icosq.cq);
+-	mlx5e_cq_arm(&c->async_icosq->cq);
++	if (aicosq) {
++		mlx5e_cq_arm(&aicosq->cq);
++		if (xsk_open) {
++			mlx5e_handle_rx_dim(xskrq);
++			mlx5e_cq_arm(&xsksq->cq);
++			mlx5e_cq_arm(&xskrq->cq);
++		}
++	}
+ 	if (c->xdpsq)
+ 		mlx5e_cq_arm(&c->xdpsq->cq);
+ 
+-	if (xsk_open) {
+-		mlx5e_handle_rx_dim(xskrq);
+-		mlx5e_cq_arm(&xsksq->cq);
+-		mlx5e_cq_arm(&xskrq->cq);
+-	}
+-
+ 	if (unlikely(aff_change && busy_xsk)) {
+ 		mlx5e_trigger_irq(&c->icosq);
+ 		ch_stats->force_irq++;
