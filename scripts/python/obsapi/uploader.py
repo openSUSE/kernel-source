@@ -24,7 +24,7 @@ class UploaderBase:
         self.log_progress('Updating .gitattributes to put tarballs into LFS.\n')
         self.tea.update_gitattr(self.user, self.upstream.repo, self.user_branch)
         self.log_progress('Updating branch %s with content of %s\n' % (self.user_branch, self.data))
-        self.tea.update_content(self.user, self.upstream.repo, self.user_branch, self.data, message, [ignore_kabi_file] if self.ignore_kabi_badness else None)
+        self.tea.update_content(self.user, self.upstream.repo, self.user_branch, self.data, message, [ignore_kabi_file] if self.ignore_kabi_badness else None, self.upload_all)
         self.commit = self.tea.repo_branches(self.user, self.upstream.repo)[self.user_branch]['commit']['id']
         self.log_progress('commit sha: %s\n' % (self.commit,))
         return self.commit
@@ -356,11 +356,11 @@ Constraint: hardware:disk:size unit=G %i
                 self.log_progress('Resetting branch %s.\n' % (self.user_branch,))
             else:
                 self.log_progress('Creating branch %s.\n' % (self.user_branch,))
-            self.tea.create_branch(self.user, upstream_repo.repo, self.user_branch, upstream_repo.branch, upstream_repo.commit, reset_branch)
+            self.tea.create_or_reset_branch(self.user, upstream_repo.repo, self.user_branch, upstream_repo.branch, upstream_repo.commit, reset_branch)
 
 
 class Uploader(UploaderBase):
-    def __init__(self, api, data, user_project, reset_branch=False, logfile=None, progress=True, ignore_kabi=False):
+    def __init__(self, api, data, user_project, reset_branch=False, logfile=None, progress=True, ignore_kabi=False, upload_all=False):
         self.progress = sys.stderr if progress else None
         self.data = data
         self.upstream_project, self.package = get_kernel_project_package(self.data)
@@ -376,4 +376,5 @@ class Uploader(UploaderBase):
         self.user_branch = user_project.translate(str.maketrans(':', '/')) if user_project else self.upstream.branch
         self.ignore_kabi_badness = ignore_kabi
         self.reset_branch = reset_branch
+        self.upload_all = upload_all
         self.fork_repo(self.upstream, self.reset_branch)
