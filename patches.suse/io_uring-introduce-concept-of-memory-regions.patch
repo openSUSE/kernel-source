@@ -1,0 +1,192 @@
+From dfbbfbf191878e8dd422768ce009858d8b5b761e Mon Sep 17 00:00:00 2001
+From: Pavel Begunkov <asml.silence@gmail.com>
+Date: Fri, 15 Nov 2024 16:54:41 +0000
+Subject: [PATCH] io_uring: introduce concept of memory regions
+Git-commit: dfbbfbf191878e8dd422768ce009858d8b5b761e
+Patch-mainline: v6.13-rc1
+References: bsc#1257958
+
+We've got a good number of mappings we share with the userspace, that
+includes the main rings, provided buffer rings, upcoming rings for
+zerocopy rx and more. All of them duplicate user argument parsing and
+some internal details as well (page pinnning, huge page optimisations,
+mmap'ing, etc.)
+
+Introduce a notion of regions. For userspace for now it's just a new
+structure called struct io_uring_region_desc which is supposed to
+parameterise all such mapping / queue creations. A region either
+represents a user provided chunk of memory, in which case the user_addr
+field should point to it, or a request for the kernel to allocate the
+memory, in which case the user would need to mmap it after using the
+offset returned in the mmap_offset field. With a uniform userspace API
+we can avoid additional boiler plate code and apply future optimisation
+to all of them at once.
+
+Internally, there is a new structure struct io_mapped_region holding all
+relevant runtime information and some helpers to work with it. This
+patch limits it to user provided regions.
+
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+Link: https://lore.kernel.org/r/0e6fe25818dfbaebd1bd90b870a6cac503fe1a24.1731689588.git.asml.silence@gmail.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ include/linux/io_uring_types.h |  6 +++
+ include/uapi/linux/io_uring.h  | 14 +++++++
+ io_uring/memmap.c              | 67 ++++++++++++++++++++++++++++++++++
+ io_uring/memmap.h              | 14 +++++++
+ 4 files changed, 101 insertions(+)
+
+diff --git a/include/linux/io_uring_types.h b/include/linux/io_uring_types.h
+index 52a5da99a205..1d3a37234ace 100644
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -75,6 +75,12 @@ struct io_hash_table {
+ 	unsigned		hash_bits;
+ };
+ 
++struct io_mapped_region {
++	struct page		**pages;
++	void			*vmap_ptr;
++	size_t			nr_pages;
++};
++
+ /*
+  * Arbitrary limit, can be raised if need be
+  */
+diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+index 132f5db3d4e8..5cbfd330c688 100644
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -647,6 +647,20 @@ struct io_uring_files_update {
+ 	__aligned_u64 /* __s32 * */ fds;
+ };
+ 
++enum {
++	/* initialise with user provided memory pointed by user_addr */
++	IORING_MEM_REGION_TYPE_USER		= 1,
++};
++
++struct io_uring_region_desc {
++	__u64 user_addr;
++	__u64 size;
++	__u32 flags;
++	__u32 id;
++	__u64 mmap_offset;
++	__u64 __resv[4];
++};
++
+ /*
+  * Register a fully sparse file space, rather than pass in an array of all
+  * -1 file descriptors.
+diff --git a/io_uring/memmap.c b/io_uring/memmap.c
+index 6ab59c60dfd0..bbd9569a0120 100644
+--- a/io_uring/memmap.c
++++ b/io_uring/memmap.c
+@@ -12,6 +12,7 @@
+ 
+ #include "memmap.h"
+ #include "kbuf.h"
++#include "rsrc.h"
+ 
+ static void *io_mem_alloc_compound(struct page **pages, int nr_pages,
+ 				   size_t size, gfp_t gfp)
+@@ -194,6 +195,72 @@ void *__io_uaddr_map(struct page ***pages, unsigned short *npages,
+ 	return ERR_PTR(-ENOMEM);
+ }
+ 
++void io_free_region(struct io_ring_ctx *ctx, struct io_mapped_region *mr)
++{
++	if (mr->pages) {
++		unpin_user_pages(mr->pages, mr->nr_pages);
++		kvfree(mr->pages);
++	}
++	if (mr->vmap_ptr)
++		vunmap(mr->vmap_ptr);
++	if (mr->nr_pages && ctx->user)
++		__io_unaccount_mem(ctx->user, mr->nr_pages);
++
++	memset(mr, 0, sizeof(*mr));
++}
++
++int io_create_region(struct io_ring_ctx *ctx, struct io_mapped_region *mr,
++		     struct io_uring_region_desc *reg)
++{
++	int pages_accounted = 0;
++	struct page **pages;
++	int nr_pages, ret;
++	void *vptr;
++	u64 end;
++
++	if (WARN_ON_ONCE(mr->pages || mr->vmap_ptr || mr->nr_pages))
++		return -EFAULT;
++	if (memchr_inv(&reg->__resv, 0, sizeof(reg->__resv)))
++		return -EINVAL;
++	if (reg->flags != IORING_MEM_REGION_TYPE_USER)
++		return -EINVAL;
++	if (!reg->user_addr)
++		return -EFAULT;
++	if (!reg->size || reg->mmap_offset || reg->id)
++		return -EINVAL;
++	if ((reg->size >> PAGE_SHIFT) > INT_MAX)
++		return E2BIG;
++	if ((reg->user_addr | reg->size) & ~PAGE_MASK)
++		return -EINVAL;
++	if (check_add_overflow(reg->user_addr, reg->size, &end))
++		return -EOVERFLOW;
++
++	pages = io_pin_pages(reg->user_addr, reg->size, &nr_pages);
++	if (IS_ERR(pages))
++		return PTR_ERR(pages);
++
++	if (ctx->user) {
++		ret = __io_account_mem(ctx->user, nr_pages);
++		if (ret)
++			goto out_free;
++		pages_accounted = nr_pages;
++	}
++
++	vptr = vmap(pages, nr_pages, VM_MAP, PAGE_KERNEL);
++	if (!vptr)
++		goto out_free;
++
++	mr->pages = pages;
++	mr->vmap_ptr = vptr;
++	mr->nr_pages = nr_pages;
++	return 0;
++out_free:
++	if (pages_accounted)
++		__io_unaccount_mem(ctx->user, pages_accounted);
++	io_pages_free(&pages, nr_pages);
++	return ret;
++}
++
+ static void *io_uring_validate_mmap_request(struct file *file, loff_t pgoff,
+ 					    size_t sz)
+ {
+diff --git a/io_uring/memmap.h b/io_uring/memmap.h
+index 5cec5b7ac49a..f361a635b6c7 100644
+--- a/io_uring/memmap.h
++++ b/io_uring/memmap.h
+@@ -22,4 +22,18 @@ unsigned long io_uring_get_unmapped_area(struct file *file, unsigned long addr,
+ 					 unsigned long flags);
+ int io_uring_mmap(struct file *file, struct vm_area_struct *vma);
+ 
++void io_free_region(struct io_ring_ctx *ctx, struct io_mapped_region *mr);
++int io_create_region(struct io_ring_ctx *ctx, struct io_mapped_region *mr,
++		     struct io_uring_region_desc *reg);
++
++static inline void *io_region_get_ptr(struct io_mapped_region *mr)
++{
++	return mr->vmap_ptr;
++}
++
++static inline bool io_region_is_set(struct io_mapped_region *mr)
++{
++	return !!mr->nr_pages;
++}
++
+ #endif
+-- 
+2.52.0
+

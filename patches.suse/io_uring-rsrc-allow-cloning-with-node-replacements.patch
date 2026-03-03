@@ -1,0 +1,159 @@
+From c1329532d5aabecf79788924941afb8a7b7c1024 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Tue, 29 Oct 2024 07:50:56 -0600
+Subject: [PATCH] io_uring/rsrc: allow cloning with node replacements
+Git-commit: c1329532d5aabecf79788924941afb8a7b7c1024
+Patch-mainline: v6.13-rc1
+References: bsc#1257958
+
+Currently cloning a buffer table will fail if the destination already has
+a table. But it should be possible to use it to replace existing elements.
+Add a IORING_REGISTER_DST_REPLACE cloning flag, which if set, will allow
+the destination to already having a buffer table. If that is the case,
+then entries designated by offset + nr buffers will be replaced if they
+already exist.
+
+Note that it's allowed to use IORING_REGISTER_DST_REPLACE and not have
+an existing table, in which case it'll work just like not having the
+flag set and an empty table - it'll just assign the newly created table
+for that case.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ include/uapi/linux/io_uring.h |  3 +-
+ io_uring/rsrc.c               | 66 +++++++++++++++++++++++++++--------
+ 2 files changed, 54 insertions(+), 15 deletions(-)
+
+diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+index cc8dbe78c126..ce58c4590de6 100644
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -713,7 +713,8 @@ struct io_uring_clock_register {
+ };
+ 
+ enum {
+-	IORING_REGISTER_SRC_REGISTERED = 1,
++	IORING_REGISTER_SRC_REGISTERED	= (1U << 0),
++	IORING_REGISTER_DST_REPLACE	= (1U << 1),
+ };
+ 
+ struct io_uring_clone_buffers {
+diff --git a/io_uring/rsrc.c b/io_uring/rsrc.c
+index 289866315ecf..60fa857985cb 100644
+--- a/io_uring/rsrc.c
++++ b/io_uring/rsrc.c
+@@ -930,8 +930,40 @@ int io_import_fixed(int ddir, struct iov_iter *iter,
+ static int io_clone_buffers(struct io_ring_ctx *ctx, struct io_ring_ctx *src_ctx,
+ 			    struct io_uring_clone_buffers *arg)
+ {
+-	int i, ret, nbufs, off, nr;
+ 	struct io_rsrc_data data;
++	int i, ret, off, nr;
++	unsigned int nbufs;
++
++	/* if offsets are given, must have nr specified too */
++	if (!arg->nr && (arg->dst_off || arg->src_off))
++		return -EINVAL;
++	/* not allowed unless REPLACE is set */
++	if (ctx->buf_table.nr && !(arg->flags & IORING_REGISTER_DST_REPLACE))
++		return -EBUSY;
++
++	nbufs = READ_ONCE(src_ctx->buf_table.nr);
++	if (!arg->nr)
++		arg->nr = nbufs;
++	else if (arg->nr > nbufs)
++		return -EINVAL;
++	else if (arg->nr > IORING_MAX_REG_BUFFERS)
++		return -EINVAL;
++	if (check_add_overflow(arg->nr, arg->dst_off, &nbufs))
++		return -EOVERFLOW;
++
++	ret = io_rsrc_data_alloc(&data, max(nbufs, ctx->buf_table.nr));
++	if (ret)
++		return ret;
++
++	/* Fill entries in data from dst that won't overlap with src */
++	for (i = 0; i < min(arg->dst_off, ctx->buf_table.nr); i++) {
++		struct io_rsrc_node *src_node = ctx->buf_table.nodes[i];
++
++		if (src_node) {
++			data.nodes[i] = src_node;
++			src_node->refs++;
++		}
++	}
+ 
+ 	/*
+ 	 * Drop our own lock here. We'll setup the data we need and reference
+@@ -954,14 +986,6 @@ static int io_clone_buffers(struct io_ring_ctx *ctx, struct io_ring_ctx *src_ctx
+ 		goto out_unlock;
+ 	if (off > nbufs)
+ 		goto out_unlock;
+-	if (check_add_overflow(arg->nr, arg->dst_off, &off))
+-		goto out_unlock;
+-	ret = -EINVAL;
+-	if (off > IORING_MAX_REG_BUFFERS)
+-		goto out_unlock;
+-	ret = io_rsrc_data_alloc(&data, off);
+-	if (ret)
+-		goto out_unlock;
+ 
+ 	off = arg->dst_off;
+ 	i = arg->src_off;
+@@ -989,6 +1013,20 @@ static int io_clone_buffers(struct io_ring_ctx *ctx, struct io_ring_ctx *src_ctx
+ 	/* Have a ref on the bufs now, drop src lock and re-grab our own lock */
+ 	mutex_unlock(&src_ctx->uring_lock);
+ 	mutex_lock(&ctx->uring_lock);
++
++	/*
++	 * If asked for replace, put the old table. data->nodes[] holds both
++	 * old and new nodes at this point.
++	 */
++	if (arg->flags & IORING_REGISTER_DST_REPLACE)
++		io_rsrc_data_free(&ctx->buf_table);
++
++	/*
++	 * ctx->buf_table should be empty now - either the contents are being
++	 * replaced and we just freed the table, or someone raced setting up
++	 * a buffer table while the clone was happening. If not empty, fall
++	 * through to failure handling.
++	 */
+ 	if (!ctx->buf_table.nr) {
+ 		ctx->buf_table = data;
+ 		return 0;
+@@ -998,14 +1036,14 @@ static int io_clone_buffers(struct io_ring_ctx *ctx, struct io_ring_ctx *src_ctx
+ 	mutex_lock(&src_ctx->uring_lock);
+ 	/* someone raced setting up buffers, dump ours */
+ 	ret = -EBUSY;
+-	i = nbufs;
+ out_put_free:
++	i = data.nr;
+ 	while (i--) {
+ 		io_buffer_unmap(src_ctx, data.nodes[i]);
+ 		kfree(data.nodes[i]);
+ 	}
+-	io_rsrc_data_free(&data);
+ out_unlock:
++	io_rsrc_data_free(&data);
+ 	mutex_unlock(&src_ctx->uring_lock);
+ 	mutex_lock(&ctx->uring_lock);
+ 	return ret;
+@@ -1025,12 +1063,12 @@ int io_register_clone_buffers(struct io_ring_ctx *ctx, void __user *arg)
+ 	struct file *file;
+ 	int ret;
+ 
+-	if (ctx->buf_table.nr)
+-		return -EBUSY;
+ 	if (copy_from_user(&buf, arg, sizeof(buf)))
+ 		return -EFAULT;
+-	if (buf.flags & ~IORING_REGISTER_SRC_REGISTERED)
++	if (buf.flags & ~(IORING_REGISTER_SRC_REGISTERED|IORING_REGISTER_DST_REPLACE))
+ 		return -EINVAL;
++	if (!(buf.flags & IORING_REGISTER_DST_REPLACE) && ctx->buf_table.nr)
++		return -EBUSY;
+ 	if (memchr_inv(buf.pad, 0, sizeof(buf.pad)))
+ 		return -EINVAL;
+ 
+-- 
+2.52.0
+

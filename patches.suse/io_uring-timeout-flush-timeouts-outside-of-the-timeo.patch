@@ -1,0 +1,166 @@
+From a9c83a0ab66a5b02e914daed502fb8d3a8d3d619 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 30 Dec 2024 14:15:17 -0700
+Subject: [PATCH] io_uring/timeout: flush timeouts outside of the timeout lock
+Git-commit: a9c83a0ab66a5b02e914daed502fb8d3a8d3d619
+Patch-mainline: v6.13-rc6
+References: bsc#1257958
+
+syzbot reports that a recent fix causes nesting issues between the (now)
+raw timeoutlock and the eventfd locking:
+
+=============================
+[ BUG: Invalid wait context ]
+6.13.0-rc4-00080-g9828a4c0901f #29 Not tainted
+-----------------------------
+kworker/u32:0/68094 is trying to lock:
+ffff000014d7a520 (&ctx->wqh#2){..-.}-{3:3}, at: eventfd_signal_mask+0x64/0x180
+other info that might help us debug this:
+context-{5:5}
+6 locks held by kworker/u32:0/68094:
+ #0: ffff0000c1d98148 ((wq_completion)iou_exit){+.+.}-{0:0}, at: process_one_work+0x4e8/0xfc0
+ #1: ffff80008d927c78 ((work_completion)(&ctx->exit_work)){+.+.}-{0:0}, at: process_one_work+0x53c/0xfc0
+ #2: ffff0000c59bc3d8 (&ctx->completion_lock){+.+.}-{3:3}, at: io_kill_timeouts+0x40/0x180
+ #3: ffff0000c59bc358 (&ctx->timeout_lock){-.-.}-{2:2}, at: io_kill_timeouts+0x48/0x180
+ #4: ffff800085127aa0 (rcu_read_lock){....}-{1:3}, at: rcu_lock_acquire+0x8/0x38
+ #5: ffff800085127aa0 (rcu_read_lock){....}-{1:3}, at: rcu_lock_acquire+0x8/0x38
+stack backtrace:
+CPU: 7 UID: 0 PID: 68094 Comm: kworker/u32:0 Not tainted 6.13.0-rc4-00080-g9828a4c0901f #29
+Hardware name: linux,dummy-virt (DT)
+Workqueue: iou_exit io_ring_exit_work
+Call trace:
+ show_stack+0x1c/0x30 (C)
+ __dump_stack+0x24/0x30
+ dump_stack_lvl+0x60/0x80
+ dump_stack+0x14/0x20
+ __lock_acquire+0x19f8/0x60c8
+ lock_acquire+0x1a4/0x540
+ _raw_spin_lock_irqsave+0x90/0xd0
+ eventfd_signal_mask+0x64/0x180
+ io_eventfd_signal+0x64/0x108
+ io_req_local_work_add+0x294/0x430
+ __io_req_task_work_add+0x1c0/0x270
+ io_kill_timeout+0x1f0/0x288
+ io_kill_timeouts+0xd4/0x180
+ io_uring_try_cancel_requests+0x2e8/0x388
+ io_ring_exit_work+0x150/0x550
+ process_one_work+0x5e8/0xfc0
+ worker_thread+0x7ec/0xc80
+ kthread+0x24c/0x300
+ ret_from_fork+0x10/0x20
+
+because after the preempt-rt fix for the timeout lock nesting inside
+the io-wq lock, we now have the eventfd spinlock nesting inside the
+raw timeout spinlock.
+
+Rather than play whack-a-mole with other nesting on the timeout lock,
+split the deletion and killing of timeouts so queueing the task_work
+for the timeout cancelations can get done outside of the timeout lock.
+
+Reported-by: syzbot+b1fc199a40b65d601b65@syzkaller.appspotmail.com
+Fixes: 020b40f35624 ("io_uring: make ctx->timeout_lock a raw spinlock")
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ io_uring/timeout.c | 45 +++++++++++++++++++++++++++++++--------------
+ 1 file changed, 31 insertions(+), 14 deletions(-)
+
+diff --git a/io_uring/timeout.c b/io_uring/timeout.c
+index bbe58638eca7..362689b17ccc 100644
+--- a/io_uring/timeout.c
++++ b/io_uring/timeout.c
+@@ -85,7 +85,27 @@ static void io_timeout_complete(struct io_kiocb *req, struct io_tw_state *ts)
+ 	io_req_task_complete(req, ts);
+ }
+ 
+-static bool io_kill_timeout(struct io_kiocb *req, int status)
++static __cold bool io_flush_killed_timeouts(struct list_head *list, int err)
++{
++	if (list_empty(list))
++		return false;
++
++	while (!list_empty(list)) {
++		struct io_timeout *timeout;
++		struct io_kiocb *req;
++
++		timeout = list_first_entry(list, struct io_timeout, list);
++		list_del_init(&timeout->list);
++		req = cmd_to_io_kiocb(timeout);
++		if (err)
++			req_set_fail(req);
++		io_req_queue_tw_complete(req, err);
++	}
++
++	return true;
++}
++
++static void io_kill_timeout(struct io_kiocb *req, struct list_head *list)
+ 	__must_hold(&req->ctx->timeout_lock)
+ {
+ 	struct io_timeout_data *io = req->async_data;
+@@ -93,21 +113,17 @@ static bool io_kill_timeout(struct io_kiocb *req, int status)
+ 	if (hrtimer_try_to_cancel(&io->timer) != -1) {
+ 		struct io_timeout *timeout = io_kiocb_to_cmd(req, struct io_timeout);
+ 
+-		if (status)
+-			req_set_fail(req);
+ 		atomic_set(&req->ctx->cq_timeouts,
+ 			atomic_read(&req->ctx->cq_timeouts) + 1);
+-		list_del_init(&timeout->list);
+-		io_req_queue_tw_complete(req, status);
+-		return true;
++		list_move_tail(&timeout->list, list);
+ 	}
+-	return false;
+ }
+ 
+ __cold void io_flush_timeouts(struct io_ring_ctx *ctx)
+ {
+-	u32 seq;
+ 	struct io_timeout *timeout, *tmp;
++	LIST_HEAD(list);
++	u32 seq;
+ 
+ 	raw_spin_lock_irq(&ctx->timeout_lock);
+ 	seq = ctx->cached_cq_tail - atomic_read(&ctx->cq_timeouts);
+@@ -131,10 +147,11 @@ __cold void io_flush_timeouts(struct io_ring_ctx *ctx)
+ 		if (events_got < events_needed)
+ 			break;
+ 
+-		io_kill_timeout(req, 0);
++		io_kill_timeout(req, &list);
+ 	}
+ 	ctx->cq_last_tm_flush = seq;
+ 	raw_spin_unlock_irq(&ctx->timeout_lock);
++	io_flush_killed_timeouts(&list, 0);
+ }
+ 
+ static void io_req_tw_fail_links(struct io_kiocb *link, struct io_tw_state *ts)
+@@ -661,7 +678,7 @@ __cold bool io_kill_timeouts(struct io_ring_ctx *ctx, struct io_uring_task *tctx
+ 			     bool cancel_all)
+ {
+ 	struct io_timeout *timeout, *tmp;
+-	int canceled = 0;
++	LIST_HEAD(list);
+ 
+ 	/*
+ 	 * completion_lock is needed for io_match_task(). Take it before
+@@ -672,11 +689,11 @@ __cold bool io_kill_timeouts(struct io_ring_ctx *ctx, struct io_uring_task *tctx
+ 	list_for_each_entry_safe(timeout, tmp, &ctx->timeout_list, list) {
+ 		struct io_kiocb *req = cmd_to_io_kiocb(timeout);
+ 
+-		if (io_match_task(req, tctx, cancel_all) &&
+-		    io_kill_timeout(req, -ECANCELED))
+-			canceled++;
++		if (io_match_task(req, tctx, cancel_all))
++			io_kill_timeout(req, &list);
+ 	}
+ 	raw_spin_unlock_irq(&ctx->timeout_lock);
+ 	spin_unlock(&ctx->completion_lock);
+-	return canceled != 0;
++
++	return io_flush_killed_timeouts(&list, -ECANCELED);
+ }
+-- 
+2.52.0
+

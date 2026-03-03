@@ -1,0 +1,213 @@
+From 087f997870a948820ec366701d178f402c6a23a3 Mon Sep 17 00:00:00 2001
+From: Pavel Begunkov <asml.silence@gmail.com>
+Date: Fri, 29 Nov 2024 13:34:32 +0000
+Subject: [PATCH] io_uring/memmap: implement mmap for regions
+Git-commit: 087f997870a948820ec366701d178f402c6a23a3
+Patch-mainline: v6.14-rc1
+References: bsc#1257958
+
+The patch implements mmap for the param region and enables the kernel
+allocation mode. Internally it uses a fixed mmap offset, however the
+user has to use the offset returned in
+struct io_uring_region_desc::mmap_offset.
+
+Note, mmap doesn't and can't take ->uring_lock and the region / ring
+lookup is protected by ->mmap_lock, and it's directly peeking at
+ctx->param_region. We can't protect io_create_region() with the
+mmap_lock as it'd deadlock, which is why io_create_region_mmap_safe()
+initialises it for us in a temporary variable and then publishes it
+with the lock taken. It's intentionally decoupled from main region
+helpers, and in the future we might want to have a list of active
+regions, which then could be protected by the ->mmap_lock.
+
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+Link: https://lore.kernel.org/r/0f1212bd6af7fb39b63514b34fae8948014221d1.1732886067.git.asml.silence@gmail.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ io_uring/memmap.c   | 61 +++++++++++++++++++++++++++++++++++++++++----
+ io_uring/memmap.h   | 10 +++++++-
+ io_uring/register.c |  6 ++---
+ 3 files changed, 67 insertions(+), 10 deletions(-)
+
+diff --git a/io_uring/memmap.c b/io_uring/memmap.c
+index 0908a71bf57e..9a182c8a4be1 100644
+--- a/io_uring/memmap.c
++++ b/io_uring/memmap.c
+@@ -275,7 +275,8 @@ static int io_region_pin_pages(struct io_ring_ctx *ctx,
+ 
+ static int io_region_allocate_pages(struct io_ring_ctx *ctx,
+ 				    struct io_mapped_region *mr,
+-				    struct io_uring_region_desc *reg)
++				    struct io_uring_region_desc *reg,
++				    unsigned long mmap_offset)
+ {
+ 	gfp_t gfp = GFP_KERNEL_ACCOUNT | __GFP_ZERO | __GFP_NOWARN;
+ 	unsigned long size = mr->nr_pages << PAGE_SHIFT;
+@@ -290,8 +291,7 @@ static int io_region_allocate_pages(struct io_ring_ctx *ctx,
+ 	p = io_mem_alloc_compound(pages, mr->nr_pages, size, gfp);
+ 	if (!IS_ERR(p)) {
+ 		mr->flags |= IO_REGION_F_SINGLE_REF;
+-		mr->pages = pages;
+-		return 0;
++		goto done;
+ 	}
+ 
+ 	nr_allocated = alloc_pages_bulk_array_node(gfp, NUMA_NO_NODE,
+@@ -302,12 +302,15 @@ static int io_region_allocate_pages(struct io_ring_ctx *ctx,
+ 		kvfree(pages);
+ 		return -ENOMEM;
+ 	}
++done:
++	reg->mmap_offset = mmap_offset;
+ 	mr->pages = pages;
+ 	return 0;
+ }
+ 
+ int io_create_region(struct io_ring_ctx *ctx, struct io_mapped_region *mr,
+-		     struct io_uring_region_desc *reg)
++		     struct io_uring_region_desc *reg,
++		     unsigned long mmap_offset)
+ {
+ 	int nr_pages, ret;
+ 	u64 end;
+@@ -341,7 +344,7 @@ int io_create_region(struct io_ring_ctx *ctx, struct io_mapped_region *mr,
+ 	if (reg->flags & IORING_MEM_REGION_TYPE_USER)
+ 		ret = io_region_pin_pages(ctx, mr, reg);
+ 	else
+-		ret = io_region_allocate_pages(ctx, mr, reg);
++		ret = io_region_allocate_pages(ctx, mr, reg, mmap_offset);
+ 	if (ret)
+ 		goto out_free;
+ 
+@@ -354,6 +357,40 @@ int io_create_region(struct io_ring_ctx *ctx, struct io_mapped_region *mr,
+ 	return ret;
+ }
+ 
++int io_create_region_mmap_safe(struct io_ring_ctx *ctx, struct io_mapped_region *mr,
++				struct io_uring_region_desc *reg,
++				unsigned long mmap_offset)
++{
++	struct io_mapped_region tmp_mr;
++	int ret;
++
++	memcpy(&tmp_mr, mr, sizeof(tmp_mr));
++	ret = io_create_region(ctx, &tmp_mr, reg, mmap_offset);
++	if (ret)
++		return ret;
++
++	/*
++	 * Once published mmap can find it without holding only the ->mmap_lock
++	 * and not ->uring_lock.
++	 */
++	guard(mutex)(&ctx->mmap_lock);
++	memcpy(mr, &tmp_mr, sizeof(tmp_mr));
++	return 0;
++}
++
++static void *io_region_validate_mmap(struct io_ring_ctx *ctx,
++				     struct io_mapped_region *mr)
++{
++	lockdep_assert_held(&ctx->mmap_lock);
++
++	if (!io_region_is_set(mr))
++		return ERR_PTR(-EINVAL);
++	if (mr->flags & IO_REGION_F_USER_PROVIDED)
++		return ERR_PTR(-EINVAL);
++
++	return io_region_get_ptr(mr);
++}
++
+ static void *io_uring_validate_mmap_request(struct file *file, loff_t pgoff,
+ 					    size_t sz)
+ {
+@@ -389,6 +426,8 @@ static void *io_uring_validate_mmap_request(struct file *file, loff_t pgoff,
+ 		io_put_bl(ctx, bl);
+ 		return ptr;
+ 		}
++	case IORING_MAP_OFF_PARAM_REGION:
++		return io_region_validate_mmap(ctx, &ctx->param_region);
+ 	}
+ 
+ 	return ERR_PTR(-EINVAL);
+@@ -405,6 +444,16 @@ int io_uring_mmap_pages(struct io_ring_ctx *ctx, struct vm_area_struct *vma,
+ 
+ #ifdef CONFIG_MMU
+ 
++static int io_region_mmap(struct io_ring_ctx *ctx,
++			  struct io_mapped_region *mr,
++			  struct vm_area_struct *vma)
++{
++	unsigned long nr_pages = mr->nr_pages;
++
++	vm_flags_set(vma, VM_DONTEXPAND);
++	return vm_insert_pages(vma, vma->vm_start, mr->pages, &nr_pages);
++}
++
+ __cold int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
+ {
+ 	struct io_ring_ctx *ctx = file->private_data;
+@@ -429,6 +478,8 @@ __cold int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
+ 						ctx->n_sqe_pages);
+ 	case IORING_OFF_PBUF_RING:
+ 		return io_pbuf_mmap(file, vma);
++	case IORING_MAP_OFF_PARAM_REGION:
++		return io_region_mmap(ctx, &ctx->param_region, vma);
+ 	}
+ 
+ 	return -EINVAL;
+diff --git a/io_uring/memmap.h b/io_uring/memmap.h
+index 2096a8427277..2402bca3d700 100644
+--- a/io_uring/memmap.h
++++ b/io_uring/memmap.h
+@@ -1,6 +1,8 @@
+ #ifndef IO_URING_MEMMAP_H
+ #define IO_URING_MEMMAP_H
+ 
++#define IORING_MAP_OFF_PARAM_REGION		0x20000000ULL
++
+ struct page **io_pin_pages(unsigned long ubuf, unsigned long len, int *npages);
+ void io_pages_free(struct page ***pages, int npages);
+ int io_uring_mmap_pages(struct io_ring_ctx *ctx, struct vm_area_struct *vma,
+@@ -24,7 +26,13 @@ int io_uring_mmap(struct file *file, struct vm_area_struct *vma);
+ 
+ void io_free_region(struct io_ring_ctx *ctx, struct io_mapped_region *mr);
+ int io_create_region(struct io_ring_ctx *ctx, struct io_mapped_region *mr,
+-		     struct io_uring_region_desc *reg);
++		     struct io_uring_region_desc *reg,
++		     unsigned long mmap_offset);
++
++int io_create_region_mmap_safe(struct io_ring_ctx *ctx,
++				struct io_mapped_region *mr,
++				struct io_uring_region_desc *reg,
++				unsigned long mmap_offset);
+ 
+ static inline void *io_region_get_ptr(struct io_mapped_region *mr)
+ {
+diff --git a/io_uring/register.c b/io_uring/register.c
+index 47992bc1ffcb..8c19fbe84808 100644
+--- a/io_uring/register.c
++++ b/io_uring/register.c
+@@ -588,9 +588,6 @@ static int io_register_mem_region(struct io_ring_ctx *ctx, void __user *uarg)
+ 	rd_uptr = u64_to_user_ptr(reg.region_uptr);
+ 	if (copy_from_user(&rd, rd_uptr, sizeof(rd)))
+ 		return -EFAULT;
+-
+-	if (!(rd.flags & IORING_MEM_REGION_TYPE_USER))
+-		return -EINVAL;
+ 	if (memchr_inv(&reg.__resv, 0, sizeof(reg.__resv)))
+ 		return -EINVAL;
+ 	if (reg.flags & ~IORING_MEM_REGION_REG_WAIT_ARG)
+@@ -605,7 +602,8 @@ static int io_register_mem_region(struct io_ring_ctx *ctx, void __user *uarg)
+ 	    !(ctx->flags & IORING_SETUP_R_DISABLED))
+ 		return -EINVAL;
+ 
+-	ret = io_create_region(ctx, &ctx->param_region, &rd);
++	ret = io_create_region_mmap_safe(ctx, &ctx->param_region, &rd,
++					 IORING_MAP_OFF_PARAM_REGION);
+ 	if (ret)
+ 		return ret;
+ 	if (copy_to_user(rd_uptr, &rd, sizeof(rd))) {
+-- 
+2.52.0
+
