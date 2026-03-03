@@ -1,0 +1,245 @@
+From: Alexei Starovoitov <ast@kernel.org>
+Date: Fri, 21 Feb 2025 18:44:23 -0800
+Subject: mm, bpf: Introduce try_alloc_pages() for opportunistic page
+ allocation
+Patch-mainline: v6.15-rc1
+Git-commit: 97769a53f117e2f33864c587d85992ee35194ecf
+References: jsc#PED-14653
+
+Tracing BPF programs execute from tracepoints and kprobes where
+running context is unknown, but they need to request additional
+memory. The prior workarounds were using pre-allocated memory and
+BPF specific freelists to satisfy such allocation requests.
+Instead, introduce gfpflags_allow_spinning() condition that signals
+to the allocator that running context is unknown.
+Then rely on percpu free list of pages to allocate a page.
+try_alloc_pages() -> get_page_from_freelist() -> rmqueue() ->
+rmqueue_pcplist() will spin_trylock to grab the page from percpu
+free list. If it fails (due to re-entrancy or list being empty)
+then rmqueue_bulk()/rmqueue_buddy() will attempt to
+spin_trylock zone->lock and grab the page from there.
+spin_trylock() is not safe in PREEMPT_RT when in NMI or in hard IRQ.
+Bailout early in such case.
+
+The support for gfpflags_allow_spinning() mode for free_page and memcg
+comes in the next patches.
+
+This is a first step towards supporting BPF requirements in SLUB
+and getting rid of bpf_mem_alloc.
+That goal was discussed at LSFMM: https://lwn.net/Articles/974138/
+
+Acked-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Acked-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Reviewed-by: Shakeel Butt <shakeel.butt@linux.dev>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/r/20250222024427.30294-3-alexei.starovoitov@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ include/linux/gfp.h |   22 +++++++++++
+ lib/stackdepot.c    |    5 +-
+ mm/internal.h       |    1 
+ mm/page_alloc.c     |  104 ++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 4 files changed, 127 insertions(+), 5 deletions(-)
+
+--- a/include/linux/gfp.h
++++ b/include/linux/gfp.h
+@@ -39,6 +39,25 @@ static inline bool gfpflags_allow_blocki
+ 	return !!(gfp_flags & __GFP_DIRECT_RECLAIM);
+ }
+ 
++static inline bool gfpflags_allow_spinning(const gfp_t gfp_flags)
++{
++	/*
++	 * !__GFP_DIRECT_RECLAIM -> direct claim is not allowed.
++	 * !__GFP_KSWAPD_RECLAIM -> it's not safe to wake up kswapd.
++	 * All GFP_* flags including GFP_NOWAIT use one or both flags.
++	 * try_alloc_pages() is the only API that doesn't specify either flag.
++	 *
++	 * This is stronger than GFP_NOWAIT or GFP_ATOMIC because
++	 * those are guaranteed to never block on a sleeping lock.
++	 * Here we are enforcing that the allocation doesn't ever spin
++	 * on any locks (i.e. only trylocks). There is no high level
++	 * GFP_$FOO flag for this use in try_alloc_pages() as the
++	 * regular page allocator doesn't fully support this
++	 * allocation mode.
++	 */
++	return !(gfp_flags & __GFP_RECLAIM);
++}
++
+ #ifdef CONFIG_HIGHMEM
+ #define OPT_ZONE_HIGHMEM ZONE_HIGHMEM
+ #else
+@@ -335,6 +354,9 @@ static inline struct page *alloc_page_vm
+ }
+ #define alloc_page_vma(...)			alloc_hooks(alloc_page_vma_noprof(__VA_ARGS__))
+ 
++struct page *try_alloc_pages_noprof(int nid, unsigned int order);
++#define try_alloc_pages(...)			alloc_hooks(try_alloc_pages_noprof(__VA_ARGS__))
++
+ extern unsigned long get_free_pages_noprof(gfp_t gfp_mask, unsigned int order);
+ #define __get_free_pages(...)			alloc_hooks(get_free_pages_noprof(__VA_ARGS__))
+ 
+--- a/lib/stackdepot.c
++++ b/lib/stackdepot.c
+@@ -591,7 +591,8 @@ depot_stack_handle_t stack_depot_save_fl
+ 	depot_stack_handle_t handle = 0;
+ 	struct page *page = NULL;
+ 	void *prealloc = NULL;
+-	bool can_alloc = depot_flags & STACK_DEPOT_FLAG_CAN_ALLOC;
++	bool allow_spin = gfpflags_allow_spinning(alloc_flags);
++	bool can_alloc = (depot_flags & STACK_DEPOT_FLAG_CAN_ALLOC) && allow_spin;
+ 	unsigned long flags;
+ 	u32 hash;
+ 
+@@ -630,7 +631,7 @@ depot_stack_handle_t stack_depot_save_fl
+ 			prealloc = page_address(page);
+ 	}
+ 
+-	if (in_nmi()) {
++	if (in_nmi() || !allow_spin) {
+ 		/* We can never allocate in NMI context. */
+ 		WARN_ON_ONCE(can_alloc);
+ 		/* Best effort; bail if we fail to take the lock. */
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -1185,6 +1185,7 @@ unsigned int reclaim_clean_pages_from_li
+ #define ALLOC_NOFRAGMENT	  0x0
+ #endif
+ #define ALLOC_HIGHATOMIC	0x200 /* Allows access to MIGRATE_HIGHATOMIC */
++#define ALLOC_TRYLOCK		0x400 /* Only use spin_trylock in allocation path */
+ #define ALLOC_KSWAPD		0x800 /* allow waking of kswapd, __GFP_KSWAPD_RECLAIM set */
+ 
+ /* Flags that allow allocations below the min watermark. */
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -2307,7 +2307,11 @@ static int rmqueue_bulk(struct zone *zon
+ 	unsigned long flags;
+ 	int i;
+ 
+-	spin_lock_irqsave(&zone->lock, flags);
++	if (!spin_trylock_irqsave(&zone->lock, flags)) {
++		if (unlikely(alloc_flags & ALLOC_TRYLOCK))
++			return 0;
++		spin_lock_irqsave(&zone->lock, flags);
++	}
+ 	for (i = 0; i < count; ++i) {
+ 		struct page *page = __rmqueue(zone, order, migratetype,
+ 								alloc_flags);
+@@ -2907,7 +2911,11 @@ struct page *rmqueue_buddy(struct zone *
+ 
+ 	do {
+ 		page = NULL;
+-		spin_lock_irqsave(&zone->lock, flags);
++		if (!spin_trylock_irqsave(&zone->lock, flags)) {
++			if (unlikely(alloc_flags & ALLOC_TRYLOCK))
++				return NULL;
++			spin_lock_irqsave(&zone->lock, flags);
++		}
+ 		if (alloc_flags & ALLOC_HIGHATOMIC)
+ 			page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+ 		if (!page) {
+@@ -4512,7 +4520,12 @@ static inline bool prepare_alloc_pages(g
+ 
+ 	might_alloc(gfp_mask);
+ 
+-	if (should_fail_alloc_page(gfp_mask, order))
++	/*
++	 * Don't invoke should_fail logic, since it may call
++	 * get_random_u32() and printk() which need to spin_lock.
++	 */
++	if (!(*alloc_flags & ALLOC_TRYLOCK) &&
++	    should_fail_alloc_page(gfp_mask, order))
+ 		return false;
+ 
+ 	*alloc_flags = gfp_to_alloc_flags_cma(gfp_mask, *alloc_flags);
+@@ -7081,3 +7094,88 @@ static bool __free_unaccepted(struct pag
+ }
+ 
+ #endif /* CONFIG_UNACCEPTED_MEMORY */
++
++/**
++ * try_alloc_pages - opportunistic reentrant allocation from any context
++ * @nid: node to allocate from
++ * @order: allocation order size
++ *
++ * Allocates pages of a given order from the given node. This is safe to
++ * call from any context (from atomic, NMI, and also reentrant
++ * allocator -> tracepoint -> try_alloc_pages_noprof).
++ * Allocation is best effort and to be expected to fail easily so nobody should
++ * rely on the success. Failures are not reported via warn_alloc().
++ * See always fail conditions below.
++ *
++ * Return: allocated page or NULL on failure.
++ */
++struct page *try_alloc_pages_noprof(int nid, unsigned int order)
++{
++	/*
++	 * Do not specify __GFP_DIRECT_RECLAIM, since direct claim is not allowed.
++	 * Do not specify __GFP_KSWAPD_RECLAIM either, since wake up of kswapd
++	 * is not safe in arbitrary context.
++	 *
++	 * These two are the conditions for gfpflags_allow_spinning() being true.
++	 *
++	 * Specify __GFP_NOWARN since failing try_alloc_pages() is not a reason
++	 * to warn. Also warn would trigger printk() which is unsafe from
++	 * various contexts. We cannot use printk_deferred_enter() to mitigate,
++	 * since the running context is unknown.
++	 *
++	 * Specify __GFP_ZERO to make sure that call to kmsan_alloc_page() below
++	 * is safe in any context. Also zeroing the page is mandatory for
++	 * BPF use cases.
++	 *
++	 * Though __GFP_NOMEMALLOC is not checked in the code path below,
++	 * specify it here to highlight that try_alloc_pages()
++	 * doesn't want to deplete reserves.
++	 */
++	gfp_t alloc_gfp = __GFP_NOWARN | __GFP_ZERO | __GFP_NOMEMALLOC;
++	unsigned int alloc_flags = ALLOC_TRYLOCK;
++	struct alloc_context ac = { };
++	struct page *page;
++
++	/*
++	 * In PREEMPT_RT spin_trylock() will call raw_spin_lock() which is
++	 * unsafe in NMI. If spin_trylock() is called from hard IRQ the current
++	 * task may be waiting for one rt_spin_lock, but rt_spin_trylock() will
++	 * mark the task as the owner of another rt_spin_lock which will
++	 * confuse PI logic, so return immediately if called form hard IRQ or
++	 * NMI.
++	 *
++	 * Note, irqs_disabled() case is ok. This function can be called
++	 * from raw_spin_lock_irqsave region.
++	 */
++	if (IS_ENABLED(CONFIG_PREEMPT_RT) && (in_nmi() || in_hardirq()))
++		return NULL;
++	if (!pcp_allowed_order(order))
++		return NULL;
++
++#ifdef CONFIG_UNACCEPTED_MEMORY
++	/* Bailout, since try_to_accept_memory_one() needs to take a lock */
++	if (has_unaccepted_memory())
++		return NULL;
++#endif
++	/* Bailout, since _deferred_grow_zone() needs to take a lock */
++	if (deferred_pages_enabled())
++		return NULL;
++
++	if (nid == NUMA_NO_NODE)
++		nid = numa_node_id();
++
++	prepare_alloc_pages(alloc_gfp, order, nid, NULL, &ac,
++			    &alloc_gfp, &alloc_flags);
++
++	/*
++	 * Best effort allocation from percpu free list.
++	 * If it's empty attempt to spin_trylock zone->lock.
++	 */
++	page = get_page_from_freelist(alloc_gfp, order, alloc_flags, &ac);
++
++	/* Unlike regular alloc_pages() there is no __alloc_pages_slowpath(). */
++
++	trace_mm_page_alloc(page, order, alloc_gfp, ac.migratetype);
++	kmsan_alloc_page(page, order, alloc_gfp);
++	return page;
++}
