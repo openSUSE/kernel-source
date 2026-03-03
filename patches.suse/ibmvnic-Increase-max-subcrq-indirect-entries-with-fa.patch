@@ -1,0 +1,216 @@
+From: Mingming Cao <mmc@linux.ibm.com>
+Date: Thu, 21 Aug 2025 06:02:15 -0700
+Subject: ibmvnic: Increase max subcrq indirect entries with fallback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v6.18-rc1
+Git-commit: 3c14917953a51a22f4fa7e13dfc13a4ec09bf348
+References: jsc#PED-15115
+
+POWER8 support a maximum of 16 subcrq indirect descriptor entries per
+ H_SEND_SUB_CRQ_INDIRECT call, while POWER9 and newer hypervisors
+ support up to 128 entries. Increasing the max number of indirect
+descriptor entries improves batching efficiency and reduces
+hcall overhead, which enhances throughput under large workload on POWER9+.
+
+Currently, ibmvnic driver always uses a fixed number of max indirect
+descriptor entries (16). send_subcrq_indirect() treats all hypervisor
+errors the same:
+ - Cleanup and Drop the entire batch of descriptors.
+ - Return an error to the caller.
+ - Rely on TCP/IP retransmissions to recover.
+ - If the hypervisor returns H_PARAMETER (e.g., because 128
+   entries are not supported on POWER8), the driver will continue
+   to drop batches, resulting in unnecessary packet loss.
+
+In this patch:
+Raise the default maximum indirect entries to 128 to improve ibmvnic
+batching on morden platform. But also gracefully fall back to
+16 entries for Power 8 systems.
+
+Since there is no VIO interface to query the hypervisor’s supported
+limit, vnic handles send_subcrq_indirect() H_PARAMETER errors:
+ - On first H_PARAMETER failure, log the failure context
+ - Reduce max_indirect_entries to 16 and allow the single batch to drop.
+ - Subsequent calls automatically use the correct lower limit,
+    avoiding repeated drops.
+
+The goal is to  optimizes performance on modern systems while handles
+falling back for older POWER8 hypervisors.
+
+Performance shows 40% improvements with MTU (1500) on largework load.
+
+Signed-off-by: Mingming Cao <mmc@linux.ibm.com>
+Reviewed-by: Brian King <bjking1@linux.ibm.com>
+Reviewed-by: Haren Myneni <haren@linux.ibm.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/20250821130215.97960-1-mmc@linux.ibm.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/ibm/ibmvnic.c |   59 ++++++++++++++++++++++++++++++++-----
+ drivers/net/ethernet/ibm/ibmvnic.h |    6 ++-
+ 2 files changed, 56 insertions(+), 9 deletions(-)
+
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@ -756,6 +756,17 @@ static void deactivate_rx_pools(struct i
+ 		adapter->rx_pool[i].active = 0;
+ }
+ 
++static void ibmvnic_set_safe_max_ind_descs(struct ibmvnic_adapter *adapter)
++{
++	if (adapter->cur_max_ind_descs > IBMVNIC_SAFE_IND_DESC) {
++		netdev_info(adapter->netdev,
++			    "set max ind descs from %u to safe limit %u\n",
++			    adapter->cur_max_ind_descs,
++			    IBMVNIC_SAFE_IND_DESC);
++		adapter->cur_max_ind_descs = IBMVNIC_SAFE_IND_DESC;
++	}
++}
++
+ static void replenish_rx_pool(struct ibmvnic_adapter *adapter,
+ 			      struct ibmvnic_rx_pool *pool)
+ {
+@@ -843,7 +854,7 @@ static void replenish_rx_pool(struct ibm
+ 		sub_crq->rx_add.len = cpu_to_be32(pool->buff_size << shift);
+ 
+ 		/* if send_subcrq_indirect queue is full, flush to VIOS */
+-		if (ind_bufp->index == IBMVNIC_MAX_IND_DESCS ||
++		if (ind_bufp->index == adapter->cur_max_ind_descs ||
+ 		    i == count - 1) {
+ 			lpar_rc =
+ 				send_subcrq_indirect(adapter, handle,
+@@ -862,6 +873,14 @@ static void replenish_rx_pool(struct ibm
+ failure:
+ 	if (lpar_rc != H_PARAMETER && lpar_rc != H_CLOSED)
+ 		dev_err_ratelimited(dev, "rx: replenish packet buffer failed\n");
++
++	/* Detect platform limit H_PARAMETER */
++	if (lpar_rc == H_PARAMETER)
++		ibmvnic_set_safe_max_ind_descs(adapter);
++
++	/* For all error case, temporarily drop only this batch
++	 * Rely on TCP/IP retransmissions to retry and recover
++	 */
+ 	for (i = ind_bufp->index - 1; i >= 0; --i) {
+ 		struct ibmvnic_rx_buff *rx_buff;
+ 
+@@ -2381,16 +2400,28 @@ static int ibmvnic_tx_scrq_flush(struct
+ 		rc = send_subcrq_direct(adapter, handle,
+ 					(u64 *)ind_bufp->indir_arr);
+ 
+-	if (rc)
++	if (rc) {
++		dev_err_ratelimited(&adapter->vdev->dev,
++				    "tx_flush failed, rc=%u (%llu entries dma=%pad handle=%llx)\n",
++				    rc, entries, &dma_addr, handle);
++		/* Detect platform limit H_PARAMETER */
++		if (rc == H_PARAMETER)
++			ibmvnic_set_safe_max_ind_descs(adapter);
++
++		/* For all error case, temporarily drop only this batch
++		 * Rely on TCP/IP retransmissions to retry and recover
++		 */
+ 		ibmvnic_tx_scrq_clean_buffer(adapter, tx_scrq);
+-	else
++	} else {
+ 		ind_bufp->index = 0;
++	}
+ 	return rc;
+ }
+ 
+ static netdev_tx_t ibmvnic_xmit(struct sk_buff *skb, struct net_device *netdev)
+ {
+ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++	u32 cur_max_ind_descs = adapter->cur_max_ind_descs;
+ 	int queue_num = skb_get_queue_mapping(skb);
+ 	u8 *hdrs = (u8 *)&adapter->tx_rx_desc_req;
+ 	struct device *dev = &adapter->vdev->dev;
+@@ -2590,7 +2621,7 @@ static netdev_tx_t ibmvnic_xmit(struct s
+ 	tx_crq.v1.n_crq_elem = num_entries;
+ 	tx_buff->num_entries = num_entries;
+ 	/* flush buffer if current entry can not fit */
+-	if (num_entries + ind_bufp->index > IBMVNIC_MAX_IND_DESCS) {
++	if (num_entries + ind_bufp->index > cur_max_ind_descs) {
+ 		lpar_rc = ibmvnic_tx_scrq_flush(adapter, tx_scrq, true);
+ 		if (lpar_rc != H_SUCCESS)
+ 			goto tx_flush_err;
+@@ -2603,7 +2634,7 @@ static netdev_tx_t ibmvnic_xmit(struct s
+ 	ind_bufp->index += num_entries;
+ 	if (__netdev_tx_sent_queue(txq, skb->len,
+ 				   netdev_xmit_more() &&
+-				   ind_bufp->index < IBMVNIC_MAX_IND_DESCS)) {
++				   ind_bufp->index < cur_max_ind_descs)) {
+ 		lpar_rc = ibmvnic_tx_scrq_flush(adapter, tx_scrq, true);
+ 		if (lpar_rc != H_SUCCESS)
+ 			goto tx_err;
+@@ -4006,7 +4037,7 @@ static void release_sub_crq_queue(struct
+ 	}
+ 
+ 	dma_free_coherent(dev,
+-			  IBMVNIC_IND_ARR_SZ,
++			  IBMVNIC_IND_MAX_ARR_SZ,
+ 			  scrq->ind_buf.indir_arr,
+ 			  scrq->ind_buf.indir_dma);
+ 
+@@ -4063,7 +4094,7 @@ static struct ibmvnic_sub_crq_queue *ini
+ 
+ 	scrq->ind_buf.indir_arr =
+ 		dma_alloc_coherent(dev,
+-				   IBMVNIC_IND_ARR_SZ,
++				   IBMVNIC_IND_MAX_ARR_SZ,
+ 				   &scrq->ind_buf.indir_dma,
+ 				   GFP_KERNEL);
+ 
+@@ -6369,6 +6400,19 @@ static int ibmvnic_reset_init(struct ibm
+ 			rc = reset_sub_crq_queues(adapter);
+ 		}
+ 	} else {
++		if (adapter->reset_reason == VNIC_RESET_MOBILITY) {
++			/* After an LPM, reset the max number of indirect
++			 * subcrq descriptors per H_SEND_SUB_CRQ_INDIRECT
++			 * hcall to the default max (e.g POWER8 -> POWER10)
++			 *
++			 * If the new destination platform does not support
++			 * the higher limit max (e.g. POWER10-> POWER8 LPM)
++			 * H_PARAMETER will trigger automatic fallback to the
++			 * safe minimum limit.
++			 */
++			adapter->cur_max_ind_descs = IBMVNIC_MAX_IND_DESCS;
++		}
++
+ 		rc = init_sub_crqs(adapter);
+ 	}
+ 
+@@ -6520,6 +6564,7 @@ static int ibmvnic_probe(struct vio_dev
+ 
+ 	adapter->wait_for_reset = false;
+ 	adapter->last_reset_time = jiffies;
++	adapter->cur_max_ind_descs = IBMVNIC_MAX_IND_DESCS;
+ 
+ 	rc = register_netdev(netdev);
+ 	if (rc) {
+--- a/drivers/net/ethernet/ibm/ibmvnic.h
++++ b/drivers/net/ethernet/ibm/ibmvnic.h
+@@ -29,8 +29,9 @@
+ #define IBMVNIC_BUFFS_PER_POOL	100
+ #define IBMVNIC_MAX_QUEUES	16
+ #define IBMVNIC_MAX_QUEUE_SZ   4096
+-#define IBMVNIC_MAX_IND_DESCS  16
+-#define IBMVNIC_IND_ARR_SZ	(IBMVNIC_MAX_IND_DESCS * 32)
++#define IBMVNIC_MAX_IND_DESCS 128
++#define IBMVNIC_SAFE_IND_DESC 16
++#define IBMVNIC_IND_MAX_ARR_SZ (IBMVNIC_MAX_IND_DESCS * 32)
+ 
+ #define IBMVNIC_TSO_BUF_SZ	65536
+ #define IBMVNIC_TSO_BUFS	64
+@@ -930,6 +931,7 @@ struct ibmvnic_adapter {
+ 	struct ibmvnic_control_ip_offload_buffer ip_offload_ctrl;
+ 	dma_addr_t ip_offload_ctrl_tok;
+ 	u32 msg_enable;
++	u32 cur_max_ind_descs;
+ 
+ 	/* Vital Product Data (VPD) */
+ 	struct ibmvnic_vpd *vpd;
