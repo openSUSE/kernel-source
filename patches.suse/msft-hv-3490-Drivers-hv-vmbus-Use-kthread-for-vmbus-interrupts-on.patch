@@ -1,0 +1,174 @@
+From: Jan Kiszka <jan.kiszka@siemens.com>
+Date: Mon, 16 Feb 2026 17:24:56 +0100
+Patch-mainline: v7.0-rc1
+Subject: Drivers: hv: vmbus: Use kthread for vmbus interrupts on PREEMPT_RT
+Git-commit: f8e6343b7a89c7c649db5a9e309ba7aa20401813
+References: git-fixes
+
+Resolves the following lockdep report when booting PREEMPT_RT on Hyper-V
+with related guest support enabled:
+
+[    1.127941] hv_vmbus: registering driver hyperv_drm
+
+[    1.132518] =============================
+[    1.132519] [ BUG: Invalid wait context ]
+[    1.132521] 6.19.0-rc8+ #9 Not tainted
+[    1.132524] -----------------------------
+[    1.132525] swapper/0/0 is trying to lock:
+[    1.132526] ffff8b9381bb3c90 (&channel->sched_lock){....}-{3:3}, at: vmbus_chan_sched+0xc4/0x2b0
+[    1.132543] other info that might help us debug this:
+[    1.132544] context-{2:2}
+[    1.132545] 1 lock held by swapper/0/0:
+[    1.132547]  #0: ffffffffa010c4c0 (rcu_read_lock){....}-{1:3}, at: vmbus_chan_sched+0x31/0x2b0
+[    1.132557] stack backtrace:
+[    1.132560] CPU: 0 UID: 0 PID: 0 Comm: swapper/0 Not tainted 6.19.0-rc8+ #9 PREEMPT_{RT,(lazy)}
+[    1.132565] Hardware name: Microsoft Corporation Virtual Machine/Virtual Machine, BIOS Hyper-V UEFI Release v4.1 09/25/2025
+[    1.132567] Call Trace:
+[    1.132570]  <IRQ>
+[    1.132573]  dump_stack_lvl+0x6e/0xa0
+[    1.132581]  __lock_acquire+0xee0/0x21b0
+[    1.132592]  lock_acquire+0xd5/0x2d0
+[    1.132598]  ? vmbus_chan_sched+0xc4/0x2b0
+[    1.132606]  ? lock_acquire+0xd5/0x2d0
+[    1.132613]  ? vmbus_chan_sched+0x31/0x2b0
+[    1.132619]  rt_spin_lock+0x3f/0x1f0
+[    1.132623]  ? vmbus_chan_sched+0xc4/0x2b0
+[    1.132629]  ? vmbus_chan_sched+0x31/0x2b0
+[    1.132634]  vmbus_chan_sched+0xc4/0x2b0
+[    1.132641]  vmbus_isr+0x2c/0x150
+[    1.132648]  __sysvec_hyperv_callback+0x5f/0xa0
+[    1.132654]  sysvec_hyperv_callback+0x88/0xb0
+[    1.132658]  </IRQ>
+[    1.132659]  <TASK>
+[    1.132660]  asm_sysvec_hyperv_callback+0x1a/0x20
+
+As code paths that handle vmbus IRQs use sleepy locks under PREEMPT_RT,
+the vmbus_isr execution needs to be moved into thread context. Open-
+coding this allows to skip the IPI that irq_work would additionally
+bring and which we do not need, being an IRQ, never an NMI.
+
+This affects both x86 and arm64, therefore hook into the common driver
+logic.
+
+Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+Reviewed-by: Florian Bezdeka <florian.bezdeka@siemens.com>
+Tested-by: Florian Bezdeka <florian.bezdeka@siemens.com>
+Reviewed-by: Michael Kelley <mhklinux@outlook.com>
+Tested-by: Michael Kelley <mhklinux@outlook.com>
+Signed-off-by: Wei Liu <wei.liu@kernel.org>
+Acked-by: Olaf Hering <ohering@suse.de>
+---
+ drivers/hv/vmbus_drv.c | 66 ++++++++-
+ 1 file changed, 65 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/hv/vmbus_drv.c b/drivers/hv/vmbus_drv.c
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@ -25,6 +25,7 @@
+ #include <linux/cpu.h>
+ #include <linux/sched/isolation.h>
+ #include <linux/sched/task_stack.h>
++#include <linux/smpboot.h>
+ 
+ #include <linux/delay.h>
+ #include <linux/panic_notifier.h>
+@@ -1350,7 +1351,7 @@ static void vmbus_message_sched(struct hv_per_cpu_context *hv_cpu, void *message
+ 	}
+ }
+ 
+-void vmbus_isr(void)
++static void __vmbus_isr(void)
+ {
+ 	struct hv_per_cpu_context *hv_cpu
+ 		= this_cpu_ptr(hv_context.cpu_context);
+@@ -1363,6 +1364,53 @@ void vmbus_isr(void)
+ 
+ 	add_interrupt_randomness(vmbus_interrupt);
+ }
++
++static DEFINE_PER_CPU(bool, vmbus_irq_pending);
++static DEFINE_PER_CPU(struct task_struct *, vmbus_irqd);
++
++static void vmbus_irqd_wake(void)
++{
++	struct task_struct *tsk = __this_cpu_read(vmbus_irqd);
++
++	__this_cpu_write(vmbus_irq_pending, true);
++	wake_up_process(tsk);
++}
++
++static void vmbus_irqd_setup(unsigned int cpu)
++{
++	sched_set_fifo(current);
++}
++
++static int vmbus_irqd_should_run(unsigned int cpu)
++{
++	return __this_cpu_read(vmbus_irq_pending);
++}
++
++static void run_vmbus_irqd(unsigned int cpu)
++{
++	__this_cpu_write(vmbus_irq_pending, false);
++	__vmbus_isr();
++}
++
++static bool vmbus_irq_initialized;
++
++static struct smp_hotplug_thread vmbus_irq_threads = {
++	.store                  = &vmbus_irqd,
++	.setup			= vmbus_irqd_setup,
++	.thread_should_run      = vmbus_irqd_should_run,
++	.thread_fn              = run_vmbus_irqd,
++	.thread_comm            = "vmbus_irq/%u",
++};
++
++void vmbus_isr(void)
++{
++	if (IS_ENABLED(CONFIG_PREEMPT_RT)) {
++		vmbus_irqd_wake();
++	} else {
++		lockdep_hardirq_threaded();
++		__vmbus_isr();
++	}
++}
+ EXPORT_SYMBOL_GPL(vmbus_isr);
+ 
+ static irqreturn_t vmbus_percpu_isr(int irq, void *dev_id)
+@@ -1462,6 +1510,13 @@ static int vmbus_bus_init(void)
+ 	 * the VMbus interrupt handler.
+ 	 */
+ 
++	if (IS_ENABLED(CONFIG_PREEMPT_RT) && !vmbus_irq_initialized) {
++		ret = smpboot_register_percpu_thread(&vmbus_irq_threads);
++		if (ret)
++			goto err_kthread;
++		vmbus_irq_initialized = true;
++	}
++
+ 	if (vmbus_irq == -1) {
+ 		hv_setup_vmbus_handler(vmbus_isr);
+ 	} else {
+@@ -1507,6 +1562,11 @@ err_connect:
+ 		free_percpu(vmbus_evt);
+ 	}
+ err_setup:
++	if (IS_ENABLED(CONFIG_PREEMPT_RT) && vmbus_irq_initialized) {
++		smpboot_unregister_percpu_thread(&vmbus_irq_threads);
++		vmbus_irq_initialized = false;
++	}
++err_kthread:
+ 	bus_unregister(&hv_bus);
+ 	return ret;
+ }
+@@ -2976,6 +3036,10 @@ static void __exit vmbus_exit(void)
+ 		free_percpu_irq(vmbus_irq, vmbus_evt);
+ 		free_percpu(vmbus_evt);
+ 	}
++	if (IS_ENABLED(CONFIG_PREEMPT_RT) && vmbus_irq_initialized) {
++		smpboot_unregister_percpu_thread(&vmbus_irq_threads);
++		vmbus_irq_initialized = false;
++	}
+ 	for_each_online_cpu(cpu) {
+ 		struct hv_per_cpu_context *hv_cpu
+ 			= per_cpu_ptr(hv_context.cpu_context, cpu);
