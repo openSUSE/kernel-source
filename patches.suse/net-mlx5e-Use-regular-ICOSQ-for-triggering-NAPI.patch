@@ -1,0 +1,192 @@
+From: William Tu <witu@nvidia.com>
+Date: Wed, 14 Jan 2026 09:46:38 +0200
+Subject: net/mlx5e: Use regular ICOSQ for triggering NAPI
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v7.0-rc1
+Git-commit: 56aca3e0f7308821b6404730a0a6bfd9f26fa04c
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Before the cited commit, ICOSQ is used to post NOP WQE to trigger
+hardware interrupt and start NAPI, but this mechanism suffers from
+a race condition: mlx5e_alloc_rx_mpwqe may post UMR WQEs to ICOSQ
+_before_ NOP WQE is posted. The cited commit fixes the issue by
+replacing ICOSQ with async ICOSQ, as a new way to post the NOP WQE
+to trigger the hardware interrupt and NAPI.
+
+The patch changes it back by replacing async ICOSQ with regular
+ICOSQ, for the purpose of saving memory in later patches, and solves
+the issue by adding a new SQ state, MLX5E_SQ_STATE_LOCK_NEEDED
+for syncing the start of NAPI.
+
+What it does:
+- Switch trigger path from async ICOSQ to regular ICOSQ to reduce
+  need for async SQ.
+- Introduce MLX5E_SQ_STATE_LOCK_NEEDED and mlx5e_icosq_sync_lock(),
+  unlock() to prevent the race where UMR WQEs could be posted before
+  the NOP WQE used to trigger NAPI.
+- Use synchronize_net() once per trigger cycle to quiesce in-flight
+  softirqs before serializing the NOP WQE and any UMR postings via
+  the ICOSQ lock.
+- Wrap ICOSQ UMR posting in en_rx.c and xsk/rx.c with the new
+  conditional lock.
+
+The conditional locking approach is critical for performance: always
+locking would impose unnecessary overhead. Synchronization is not needed
+between regular NAPI cycles once the channel is activated and running.
+The lock is only required to protect against the race during channel
+activation—specifically, when the very first NOP WQE is posted to trigger
+NAPI. After that initial trigger, normal NAPI polling handles subsequent
+work without contention. The MLX5E_SQ_STATE_LOCK_NEEDED flag ensures we
+pay the synchronization cost only when necessary.
+
+Signed-off-by: William Tu <witu@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1768376800-1607672-3-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en.h             |   21 ++++++++++++++-
+ drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/en/xsk/rx.c      |    3 ++
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c        |   13 ++++++---
+ drivers/net/ethernet/mellanox/mlx5/core/en_rx.c          |    4 ++
+ 5 files changed, 37 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -387,6 +387,7 @@ enum {
+ 	MLX5E_SQ_STATE_DIM,
+ 	MLX5E_SQ_STATE_PENDING_XSK_TX,
+ 	MLX5E_SQ_STATE_PENDING_TLS_RX_RESYNC,
++	MLX5E_SQ_STATE_LOCK_NEEDED,
+ 	MLX5E_NUM_SQ_STATES, /* Must be kept last */
+ };
+ 
+@@ -544,7 +545,10 @@ struct mlx5e_icosq {
+ 	u32                        sqn;
+ 	u16                        reserved_room;
+ 	unsigned long              state;
+-	/* icosq can be accessed from any CPU - the spinlock protects it. */
++	/* icosq can be accessed from any CPU and from different contexts
++	 * (NAPI softirq or process/workqueue). Always use spin_lock_bh for
++	 * simplicity and correctness across all contexts.
++	 */
+ 	spinlock_t                 lock;
+ 	struct mlx5e_ktls_resync_resp *ktls_resync;
+ 
+@@ -800,6 +804,21 @@ struct mlx5e_channel {
+ 	struct dim_cq_moder        tx_cq_moder;
+ };
+ 
++static inline bool mlx5e_icosq_sync_lock(struct mlx5e_icosq *sq)
++{
++	if (likely(!test_bit(MLX5E_SQ_STATE_LOCK_NEEDED, &sq->state)))
++		return false;
++
++	spin_lock_bh(&sq->lock);
++	return true;
++}
++
++static inline void mlx5e_icosq_sync_unlock(struct mlx5e_icosq *sq, bool locked)
++{
++	if (unlikely(locked))
++		spin_unlock_bh(&sq->lock);
++}
++
+ struct mlx5e_ptp;
+ 
+ struct mlx5e_channels {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
+@@ -15,6 +15,7 @@ static const char * const sq_sw_state_ty
+ 	[MLX5E_SQ_STATE_DIM] = "dim",
+ 	[MLX5E_SQ_STATE_PENDING_XSK_TX] = "pending_xsk_tx",
+ 	[MLX5E_SQ_STATE_PENDING_TLS_RX_RESYNC] = "pending_tls_rx_resync",
++	[MLX5E_SQ_STATE_LOCK_NEEDED] = "lock_needed",
+ };
+ 
+ static int mlx5e_wait_for_sq_flush(struct mlx5e_txqsq *sq)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/rx.c
+@@ -23,6 +23,7 @@ int mlx5e_xsk_alloc_rx_mpwqe(struct mlx5
+ 	struct mlx5_wq_cyc *wq = &icosq->wq;
+ 	struct mlx5e_umr_wqe *umr_wqe;
+ 	struct xdp_buff **xsk_buffs;
++	bool sync_locked;
+ 	int batch, i;
+ 	u32 offset; /* 17-bit value with MTT. */
+ 	u16 pi;
+@@ -47,6 +48,7 @@ int mlx5e_xsk_alloc_rx_mpwqe(struct mlx5
+ 			goto err_reuse_batch;
+ 	}
+ 
++	sync_locked = mlx5e_icosq_sync_lock(icosq);
+ 	pi = mlx5e_icosq_get_next_pi(icosq, rq->mpwqe.umr_wqebbs);
+ 	umr_wqe = mlx5_wq_cyc_get_wqe(wq, pi);
+ 	memcpy(umr_wqe, &rq->mpwqe.umr_wqe, sizeof(struct mlx5e_umr_wqe));
+@@ -143,6 +145,7 @@ int mlx5e_xsk_alloc_rx_mpwqe(struct mlx5
+ 	};
+ 
+ 	icosq->pc += rq->mpwqe.umr_wqebbs;
++	mlx5e_icosq_sync_unlock(icosq, sync_locked);
+ 
+ 	icosq->doorbell_cseg = &umr_wqe->hdr.ctrl;
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -2735,11 +2735,16 @@ static int mlx5e_channel_stats_alloc(str
+ 
+ void mlx5e_trigger_napi_icosq(struct mlx5e_channel *c)
+ {
+-	struct mlx5e_icosq *async_icosq = &c->async_icosq;
++	bool locked;
+ 
+-	spin_lock_bh(&async_icosq->lock);
+-	mlx5e_trigger_irq(async_icosq);
+-	spin_unlock_bh(&async_icosq->lock);
++	if (!test_and_set_bit(MLX5E_SQ_STATE_LOCK_NEEDED, &c->icosq.state))
++		synchronize_net();
++
++	locked = mlx5e_icosq_sync_lock(&c->icosq);
++	mlx5e_trigger_irq(&c->icosq);
++	mlx5e_icosq_sync_unlock(&c->icosq, locked);
++
++	clear_bit(MLX5E_SQ_STATE_LOCK_NEEDED, &c->icosq.state);
+ }
+ 
+ void mlx5e_trigger_napi_sched(struct napi_struct *napi)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -775,6 +775,7 @@ static int mlx5e_alloc_rx_mpwqe(struct m
+ 	struct mlx5_wq_cyc *wq = &sq->wq;
+ 	struct mlx5e_umr_wqe *umr_wqe;
+ 	u32 offset; /* 17-bit value with MTT. */
++	bool sync_locked;
+ 	u16 pi;
+ 	int err;
+ 	int i;
+@@ -785,6 +786,7 @@ static int mlx5e_alloc_rx_mpwqe(struct m
+ 			goto err;
+ 	}
+ 
++	sync_locked = mlx5e_icosq_sync_lock(sq);
+ 	pi = mlx5e_icosq_get_next_pi(sq, rq->mpwqe.umr_wqebbs);
+ 	umr_wqe = mlx5_wq_cyc_get_wqe(wq, pi);
+ 	memcpy(umr_wqe, &rq->mpwqe.umr_wqe, sizeof(struct mlx5e_umr_wqe));
+@@ -831,12 +833,14 @@ static int mlx5e_alloc_rx_mpwqe(struct m
+ 	};
+ 
+ 	sq->pc += rq->mpwqe.umr_wqebbs;
++	mlx5e_icosq_sync_unlock(sq, sync_locked);
+ 
+ 	sq->doorbell_cseg = &umr_wqe->hdr.ctrl;
+ 
+ 	return 0;
+ 
+ err_unmap:
++	mlx5e_icosq_sync_unlock(sq, sync_locked);
+ 	while (--i >= 0) {
+ 		frag_page--;
+ 		mlx5e_page_release_fragmented(rq->page_pool, frag_page);
