@@ -1,0 +1,184 @@
+From c32eaba2d760ef0ec5426b207cf0ce750064cf36 Mon Sep 17 00:00:00 2001
+From: Md Haris Iqbal <haris.iqbal@ionos.com>
+Date: Wed, 7 Jan 2026 17:15:13 +0100
+Subject: [PATCH 1/1] RDMA/rtrs-srv: Add check and closure for possible zombie
+ paths
+Git-commit: c32eaba2d760ef0ec5426b207cf0ce750064cf36
+Patch-mainline: v7.0-rc1
+References: jsc#PED-15314
+
+During several network incidents, a number of RTRS paths for a session
+went through disconnect and reconnect phase. However, some of those did
+not auto-reconnect successfully. Instead they failed with the following
+logs,
+
+On client,
+kernel: rtrs_client L1991: <sess-name>: Connect rejected: status 28
+  (consumer defined), rtrs errno -104
+kernel: rtrs_client L2698: <sess-name>: init_conns() failed: err=-104
+  path=gid:<gid1>@gid:<gid2> [mlx4_0:1]
+
+On server, (log a)
+kernel: ibtrs_server L1868: <>: Connection already exists: 0
+
+When the misbehaving path was removed, and add_path was called to re-add
+the path, the log on client side changed to, (log b)
+kernel: rtrs_client L1991: <sess-name>: Connect rejected: status 28
+  (consumer defined), rtrs errno -17
+
+There was no log on the server side for this, which is expected since
+there is no logging in that path,
+if (unlikely(__is_path_w_addr_exists(srv, &cm_id->route.addr))) {
+	err = -EEXIST;
+	goto err;
+
+Because of the following check on server side,
+if (unlikely(sess->state != IBTRS_SRV_CONNECTING)) {
+	ibtrs_err(s, "Session in wrong state: %s\n",
+
+.. we know that the path in (log a) was in CONNECTING state.
+
+The above state of the path persists for as long as we leave the session
+be. This means that the path is in some zombie state, probably waiting
+for the info_req packet to arrive, which never does.
+
+The changes in this commits does 2 things.
+
+1) Add logs at places where we see the errors happening. The logs would
+shed more light at the state and lifetime of such zombie paths.
+
+2) Close such zombie sessions, only if they are in CONNECTING state, and
+after an inactivity period of 30 seconds.
+  i) The state check prevents closure of paths which are CONNECTED.
+Also, from the above logs and code, we already know that the path could
+only be on CONNECTING state, so we play safe and narrow our impact surface
+area by closing only CONNECTING paths.
+  ii) The inactivity period is to allow requests for other cid to finish
+processing, or for any stray packets to arrive/fail.
+
+Signed-off-by: Md Haris Iqbal <haris.iqbal@ionos.com>
+Signed-off-by: Jack Wang <jinpu.wang@ionos.com>
+Signed-off-by: Grzegorz Prajsner <grzegorz.prajsner@ionos.com>
+Link: https://patch.msgid.link/20260107161517.56357-7-haris.iqbal@ionos.com
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/ulp/rtrs/rtrs-srv.c | 45 +++++++++++++++++++++++---
+ drivers/infiniband/ulp/rtrs/rtrs-srv.h |  1 +
+ 2 files changed, 41 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs-srv.c b/drivers/infiniband/ulp/rtrs/rtrs-srv.c
+index 9b8567e5ea38..4e49c15fa970 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs-srv.c
++++ b/drivers/infiniband/ulp/rtrs/rtrs-srv.c
+@@ -905,6 +905,12 @@ static int process_info_req(struct rtrs_srv_con *con,
+ 				      tx_iu->dma_addr,
+ 				      tx_iu->size, DMA_TO_DEVICE);
+ 
++	/*
++	 * Now disable zombie connection closing. Since from the logs and code,
++	 * we know that it can never be in CONNECTED state.
++	 */
++	srv_path->connection_timeout = 0;
++
+ 	/* Send info response */
+ 	err = rtrs_iu_post_send(&con->c, tx_iu, tx_sz, reg_wr);
+ 	if (err) {
+@@ -1531,17 +1537,38 @@ static int sockaddr_cmp(const struct sockaddr *a, const struct sockaddr *b)
+ 	}
+ }
+ 
++/* Let's close connections which have been waiting for more than 30 seconds */
++#define RTRS_MAX_CONN_TIMEOUT 30000
++
++static void rtrs_srv_check_close_path(struct rtrs_srv_path *srv_path)
++{
++	struct rtrs_path *s = &srv_path->s;
++
++	if (srv_path->state == RTRS_SRV_CONNECTING && srv_path->connection_timeout &&
++	   (jiffies_to_msecs(jiffies - srv_path->connection_timeout) > RTRS_MAX_CONN_TIMEOUT)) {
++		rtrs_err(s, "Closing zombie path\n");
++		close_path(srv_path);
++	}
++}
++
+ static bool __is_path_w_addr_exists(struct rtrs_srv_sess *srv,
+ 				    struct rdma_addr *addr)
+ {
+ 	struct rtrs_srv_path *srv_path;
+ 
+-	list_for_each_entry(srv_path, &srv->paths_list, s.entry)
++	list_for_each_entry(srv_path, &srv->paths_list, s.entry) {
+ 		if (!sockaddr_cmp((struct sockaddr *)&srv_path->s.dst_addr,
+ 				  (struct sockaddr *)&addr->dst_addr) &&
+ 		    !sockaddr_cmp((struct sockaddr *)&srv_path->s.src_addr,
+-				  (struct sockaddr *)&addr->src_addr))
++				  (struct sockaddr *)&addr->src_addr)) {
++			rtrs_err((&srv_path->s),
++				 "Path (%s) with same addr exists (lifetime %u)\n",
++				 rtrs_srv_state_str(srv_path->state),
++				 (jiffies_to_msecs(jiffies - srv_path->connection_timeout)));
++			rtrs_srv_check_close_path(srv_path);
+ 			return true;
++		}
++	}
+ 
+ 	return false;
+ }
+@@ -1779,7 +1806,6 @@ static struct rtrs_srv_path *__alloc_path(struct rtrs_srv_sess *srv,
+ 	}
+ 	if (__is_path_w_addr_exists(srv, &cm_id->route.addr)) {
+ 		err = -EEXIST;
+-		pr_err("Path with same addr exists\n");
+ 		goto err;
+ 	}
+ 	srv_path = kzalloc(sizeof(*srv_path), GFP_KERNEL);
+@@ -1826,6 +1852,7 @@ static struct rtrs_srv_path *__alloc_path(struct rtrs_srv_sess *srv,
+ 	spin_lock_init(&srv_path->state_lock);
+ 	INIT_WORK(&srv_path->close_work, rtrs_srv_close_work);
+ 	rtrs_srv_init_hb(srv_path);
++	srv_path->connection_timeout = 0;
+ 
+ 	srv_path->s.dev = rtrs_ib_dev_find_or_add(cm_id->device, &dev_pd);
+ 	if (!srv_path->s.dev) {
+@@ -1931,8 +1958,10 @@ static int rtrs_rdma_connect(struct rdma_cm_id *cm_id,
+ 			goto reject_w_err;
+ 		}
+ 		if (s->con[cid]) {
+-			rtrs_err(s, "Connection already exists: %d\n",
+-				  cid);
++			rtrs_err(s, "Connection (%s) already exists: %d (lifetime %u)\n",
++				 rtrs_srv_state_str(srv_path->state), cid,
++				 (jiffies_to_msecs(jiffies - srv_path->connection_timeout)));
++			rtrs_srv_check_close_path(srv_path);
+ 			mutex_unlock(&srv->paths_mutex);
+ 			goto reject_w_err;
+ 		}
+@@ -1947,6 +1976,12 @@ static int rtrs_rdma_connect(struct rdma_cm_id *cm_id,
+ 			goto reject_w_err;
+ 		}
+ 	}
++
++	/*
++	 * Start of any connection creation resets the timeout for the path.
++	 */
++	srv_path->connection_timeout = jiffies;
++
+ 	err = create_con(srv_path, cm_id, cid);
+ 	if (err) {
+ 		rtrs_err((&srv_path->s), "create_con(), error %pe\n", ERR_PTR(err));
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs-srv.h b/drivers/infiniband/ulp/rtrs/rtrs-srv.h
+index 014f85681f37..3d36876527f5 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs-srv.h
++++ b/drivers/infiniband/ulp/rtrs/rtrs-srv.h
+@@ -89,6 +89,7 @@ struct rtrs_srv_path {
+ 	unsigned int		mem_bits;
+ 	struct kobject		kobj;
+ 	struct rtrs_srv_stats	*stats;
++	unsigned long		connection_timeout;
+ };
+ 
+ static inline struct rtrs_srv_path *to_srv_path(struct rtrs_path *s)
+-- 
+2.52.0
+
