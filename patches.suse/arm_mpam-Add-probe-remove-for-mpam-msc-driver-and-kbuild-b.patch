@@ -1,0 +1,340 @@
+From: James Morse <james.morse@arm.com>
+Date: Wed, 19 Nov 2025 12:22:40 +0000
+Subject: arm_mpam: Add probe/remove for mpam msc driver and kbuild boiler
+ plate
+Git-commit: f04046f2577a5c76167333ca99d3903ee5331ba0
+Patch-mainline: v6.19-rc1
+References: jsc#PED-15480
+
+Probing MPAM is convoluted. MSCs that are integrated with a CPU may
+only be accessible from those CPUs, and they may not be online.
+Touching the hardware early is pointless as MPAM can't be used until
+the system-wide common values for num_partid and num_pmg have been
+discovered.
+
+Start with driver probe/remove and mapping the MSC.
+
+Cc: Carl Worth <carl@os.amperecomputing.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+Reviewed-by: Fenghua Yu <fenghuay@nvidia.com>
+Reviewed-by: Shaopeng Tan <tan.shaopeng@jp.fujitsu.com>
+Tested-by: Fenghua Yu <fenghuay@nvidia.com>
+Tested-by: Shaopeng Tan <tan.shaopeng@jp.fujitsu.com>
+Tested-by: Peter Newman <peternewman@google.com>
+Tested-by: Carl Worth <carl@os.amperecomputing.com>
+Tested-by: Gavin Shan <gshan@redhat.com>
+Tested-by: Zeng Heng <zengheng4@huawei.com>
+Tested-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: James Morse <james.morse@arm.com>
+Signed-off-by: Ben Horgan <ben.horgan@arm.com>
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Acked-by: Stanimir Varbanov <svarbanov@suse.de>
+---
+ arch/arm64/Kconfig              |    1 
+ drivers/Kconfig                 |    2 
+ drivers/Makefile                |    1 
+ drivers/resctrl/Kconfig         |   15 +++
+ drivers/resctrl/Makefile        |    4 
+ drivers/resctrl/mpam_devices.c  |  190 ++++++++++++++++++++++++++++++++++++++++
+ drivers/resctrl/mpam_internal.h |   49 ++++++++++
+ 7 files changed, 262 insertions(+)
+
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -2077,6 +2077,7 @@ config ARM64_TLB_RANGE
+ 
+ config ARM64_MPAM
+ 	bool "Enable support for MPAM"
++	select ARM64_MPAM_DRIVER if EXPERT	# does nothing yet
+ 	select ACPI_MPAM if ACPI
+ 	help
+ 	  Memory System Resource Partitioning and Monitoring (MPAM) is an
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -245,4 +245,6 @@ source "drivers/hte/Kconfig"
+ 
+ source "drivers/cdx/Kconfig"
+ 
++source "drivers/resctrl/Kconfig"
++
+ endmenu
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -193,6 +193,7 @@ obj-$(CONFIG_HTE)		+= hte/
+ obj-$(CONFIG_DRM_ACCEL)		+= accel/
+ obj-$(CONFIG_CDX_BUS)		+= cdx/
+ obj-$(CONFIG_DPLL)		+= dpll/
++obj-y				+= resctrl/
+ 
+ obj-$(CONFIG_DIBS)		+= dibs/
+ obj-$(CONFIG_S390)		+= s390/
+--- /dev/null
++++ b/drivers/resctrl/Kconfig
+@@ -0,0 +1,15 @@
++menuconfig ARM64_MPAM_DRIVER
++	bool "MPAM driver"
++	depends on ARM64 && ARM64_MPAM && EXPERT
++	help
++	  Memory System Resource Partitioning and Monitoring (MPAM) driver for
++	  System IP, e.g. caches and memory controllers.
++
++if ARM64_MPAM_DRIVER
++
++config ARM64_MPAM_DRIVER_DEBUG
++	bool "Enable debug messages from the MPAM driver"
++	help
++	  Say yes here to enable debug messages from the MPAM driver.
++
++endif
+--- /dev/null
++++ b/drivers/resctrl/Makefile
+@@ -0,0 +1,4 @@
++obj-$(CONFIG_ARM64_MPAM_DRIVER)			+= mpam.o
++mpam-y						+= mpam_devices.o
++
++ccflags-$(CONFIG_ARM64_MPAM_DRIVER_DEBUG)	+= -DDEBUG
+--- /dev/null
++++ b/drivers/resctrl/mpam_devices.c
+@@ -0,0 +1,190 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (C) 2025 Arm Ltd.
++
++#define pr_fmt(fmt) "%s:%s: " fmt, KBUILD_MODNAME, __func__
++
++#include <linux/acpi.h>
++#include <linux/arm_mpam.h>
++#include <linux/cacheinfo.h>
++#include <linux/cpumask.h>
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/gfp.h>
++#include <linux/list.h>
++#include <linux/lockdep.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
++#include <linux/printk.h>
++#include <linux/srcu.h>
++#include <linux/types.h>
++
++#include "mpam_internal.h"
++
++/*
++ * mpam_list_lock protects the SRCU lists when writing. Once the
++ * mpam_enabled key is enabled these lists are read-only,
++ * unless the error interrupt disables the driver.
++ */
++static DEFINE_MUTEX(mpam_list_lock);
++static LIST_HEAD(mpam_all_msc);
++
++struct srcu_struct mpam_srcu;
++
++/*
++ * Number of MSCs that have been probed. Once all MSCs have been probed MPAM
++ * can be enabled.
++ */
++static atomic_t mpam_num_msc;
++
++/*
++ * An MSC can control traffic from a set of CPUs, but may only be accessible
++ * from a (hopefully wider) set of CPUs. The common reason for this is power
++ * management. If all the CPUs in a cluster are in PSCI:CPU_SUSPEND, the
++ * corresponding cache may also be powered off. By making accesses from
++ * one of those CPUs, we ensure we don't access a cache that's powered off.
++ */
++static void update_msc_accessibility(struct mpam_msc *msc)
++{
++	u32 affinity_id;
++	int err;
++
++	err = device_property_read_u32(&msc->pdev->dev, "cpu_affinity",
++				       &affinity_id);
++	if (err)
++		cpumask_copy(&msc->accessibility, cpu_possible_mask);
++	else
++		acpi_pptt_get_cpus_from_container(affinity_id, &msc->accessibility);
++}
++
++static void mpam_msc_destroy(struct mpam_msc *msc)
++{
++	struct platform_device *pdev = msc->pdev;
++
++	lockdep_assert_held(&mpam_list_lock);
++
++	list_del_rcu(&msc->all_msc_list);
++	platform_set_drvdata(pdev, NULL);
++}
++
++static void mpam_msc_drv_remove(struct platform_device *pdev)
++{
++	struct mpam_msc *msc = platform_get_drvdata(pdev);
++
++	mutex_lock(&mpam_list_lock);
++	mpam_msc_destroy(msc);
++	mutex_unlock(&mpam_list_lock);
++
++	synchronize_srcu(&mpam_srcu);
++}
++
++static struct mpam_msc *do_mpam_msc_drv_probe(struct platform_device *pdev)
++{
++	int err;
++	u32 tmp;
++	struct mpam_msc *msc;
++	struct resource *msc_res;
++	struct device *dev = &pdev->dev;
++
++	lockdep_assert_held(&mpam_list_lock);
++
++	msc = devm_kzalloc(&pdev->dev, sizeof(*msc), GFP_KERNEL);
++	if (!msc)
++		return ERR_PTR(-ENOMEM);
++
++	err = devm_mutex_init(dev, &msc->probe_lock);
++	if (err)
++		return ERR_PTR(err);
++
++	err = devm_mutex_init(dev, &msc->part_sel_lock);
++	if (err)
++		return ERR_PTR(err);
++
++	msc->id = pdev->id;
++	msc->pdev = pdev;
++	INIT_LIST_HEAD_RCU(&msc->all_msc_list);
++	INIT_LIST_HEAD_RCU(&msc->ris);
++
++	update_msc_accessibility(msc);
++	if (cpumask_empty(&msc->accessibility)) {
++		dev_err_once(dev, "MSC is not accessible from any CPU!");
++		return ERR_PTR(-EINVAL);
++	}
++
++	if (device_property_read_u32(&pdev->dev, "pcc-channel", &tmp))
++		msc->iface = MPAM_IFACE_MMIO;
++	else
++		msc->iface = MPAM_IFACE_PCC;
++
++	if (msc->iface == MPAM_IFACE_MMIO) {
++		void __iomem *io;
++
++		io = devm_platform_get_and_ioremap_resource(pdev, 0,
++							    &msc_res);
++		if (IS_ERR(io)) {
++			dev_err_once(dev, "Failed to map MSC base address\n");
++			return ERR_CAST(io);
++		}
++		msc->mapped_hwpage_sz = msc_res->end - msc_res->start;
++		msc->mapped_hwpage = io;
++	} else {
++		return ERR_PTR(-EINVAL);
++	}
++
++	list_add_rcu(&msc->all_msc_list, &mpam_all_msc);
++	platform_set_drvdata(pdev, msc);
++
++	return msc;
++}
++
++static int fw_num_msc;
++
++static int mpam_msc_drv_probe(struct platform_device *pdev)
++{
++	int err;
++	struct mpam_msc *msc = NULL;
++	void *plat_data = pdev->dev.platform_data;
++
++	mutex_lock(&mpam_list_lock);
++	msc = do_mpam_msc_drv_probe(pdev);
++	mutex_unlock(&mpam_list_lock);
++
++	if (IS_ERR(msc))
++		return PTR_ERR(msc);
++
++	/* Create RIS entries described by firmware */
++	err = acpi_mpam_parse_resources(msc, plat_data);
++	if (err) {
++		mpam_msc_drv_remove(pdev);
++		return err;
++	}
++
++	if (atomic_add_return(1, &mpam_num_msc) == fw_num_msc)
++		pr_info("Discovered all MSCs\n");
++
++	return 0;
++}
++
++static struct platform_driver mpam_msc_driver = {
++	.driver = {
++		.name = "mpam_msc",
++	},
++	.probe = mpam_msc_drv_probe,
++	.remove = mpam_msc_drv_remove,
++};
++
++static int __init mpam_msc_driver_init(void)
++{
++	if (!system_supports_mpam())
++		return -EOPNOTSUPP;
++
++	init_srcu_struct(&mpam_srcu);
++
++	fw_num_msc = acpi_mpam_count_msc();
++	if (fw_num_msc <= 0) {
++		pr_err("No MSC devices found in firmware\n");
++		return -EINVAL;
++	}
++
++	return platform_driver_register(&mpam_msc_driver);
++}
++subsys_initcall(mpam_msc_driver_init);
+--- /dev/null
++++ b/drivers/resctrl/mpam_internal.h
+@@ -0,0 +1,49 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++// Copyright (C) 2025 Arm Ltd.
++
++#ifndef MPAM_INTERNAL_H
++#define MPAM_INTERNAL_H
++
++#include <linux/arm_mpam.h>
++#include <linux/cpumask.h>
++#include <linux/io.h>
++#include <linux/mutex.h>
++#include <linux/types.h>
++
++struct platform_device;
++
++struct mpam_msc {
++	/* member of mpam_all_msc */
++	struct list_head	all_msc_list;
++
++	int			id;
++	struct platform_device	*pdev;
++
++	/* Not modified after mpam_is_enabled() becomes true */
++	enum mpam_msc_iface	iface;
++	u32			nrdy_usec;
++	cpumask_t		accessibility;
++
++	/*
++	 * probe_lock is only taken during discovery. After discovery these
++	 * properties become read-only and the lists are protected by SRCU.
++	 */
++	struct mutex		probe_lock;
++	unsigned long		ris_idxs;
++	u32			ris_max;
++
++	/* mpam_msc_ris of this component */
++	struct list_head	ris;
++
++	/*
++	 * part_sel_lock protects access to the MSC hardware registers that are
++	 * affected by MPAMCFG_PART_SEL. (including the ID registers that vary
++	 * by RIS).
++	 * If needed, take msc->probe_lock first.
++	 */
++	struct mutex		part_sel_lock;
++
++	void __iomem		*mapped_hwpage;
++	size_t			mapped_hwpage_sz;
++};
++#endif /* MPAM_INTERNAL_H */
