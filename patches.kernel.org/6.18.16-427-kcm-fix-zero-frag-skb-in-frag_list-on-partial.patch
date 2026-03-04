@@ -1,0 +1,122 @@
+From: Jiayuan Chen <jiayuan.chen@shopee.com>
+Date: Thu, 19 Feb 2026 09:42:51 +0800
+Subject: [PATCH] kcm: fix zero-frag skb in frag_list on partial sendmsg error
+References: bsc#1258210
+Patch-mainline: 6.18.16
+Git-commit: ca220141fa8ebae09765a242076b2b77338106b0
+
+[ Upstream commit ca220141fa8ebae09765a242076b2b77338106b0 ]
+
+Syzkaller reported a warning in kcm_write_msgs() when processing a
+message with a zero-fragment skb in the frag_list.
+
+When kcm_sendmsg() fills MAX_SKB_FRAGS fragments in the current skb,
+it allocates a new skb (tskb) and links it into the frag_list before
+copying data. If the copy subsequently fails (e.g. -EFAULT from
+user memory), tskb remains in the frag_list with zero fragments:
+
+  head skb (msg being assembled, NOT yet in sk_write_queue)
+  +-----------+
+  | frags[17] |  (MAX_SKB_FRAGS, all filled with data)
+  | frag_list-+--> tskb
+  +-----------+    +----------+
+                   | frags[0] |  (empty! copy failed before filling)
+                   +----------+
+
+For SOCK_SEQPACKET with partial data already copied, the error path
+saves this message via partial_message for later completion. For
+SOCK_SEQPACKET, sock_write_iter() automatically sets MSG_EOR, so a
+subsequent zero-length write(fd, NULL, 0) completes the message and
+queues it to sk_write_queue. kcm_write_msgs() then walks the
+frag_list and hits:
+
+  WARN_ON(!skb_shinfo(skb)->nr_frags)
+
+TCP has a similar pattern where skbs are enqueued before data copy
+and cleaned up on failure via tcp_remove_empty_skb(). KCM was
+missing the equivalent cleanup.
+
+Fix this by tracking the predecessor skb (frag_prev) when allocating
+a new frag_list entry. On error, if the tail skb has zero frags,
+use frag_prev to unlink and free it in O(1) without walking the
+singly-linked frag_list. frag_prev is safe to dereference because
+the entire message chain is only held locally (or in kcm->seq_skb)
+and is not added to sk_write_queue until MSG_EOR, so the send path
+cannot free it underneath us.
+
+Also change the WARN_ON to WARN_ON_ONCE to avoid flooding the log
+if the condition is somehow hit repeatedly.
+
+There are currently no KCM selftests in the kernel tree; a simple
+reproducer is available at [1].
+
+[1] https://gist.github.com/mrpre/a94d431c757e8d6f168f4dd1a3749daa
+
+Reported-by: syzbot+52624bdfbf2746d37d70@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/all/000000000000269a1405a12fdc77@google.com/T/
+Fixes: ab7ac4eb9832 ("kcm: Kernel Connection Multiplexor module")
+Signed-off-by: Jiayuan Chen <jiayuan.chen@shopee.com>
+Link: https://patch.msgid.link/20260219014256.370092-1-jiayuan.chen@linux.dev
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ net/kcm/kcmsock.c | 21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/net/kcm/kcmsock.c b/net/kcm/kcmsock.c
+index b4f01cb07561..f6d44481954c 100644
+--- a/net/kcm/kcmsock.c
++++ b/net/kcm/kcmsock.c
+@@ -628,7 +628,7 @@ static int kcm_write_msgs(struct kcm_sock *kcm)
+ 			skb = txm->frag_skb;
+ 		}
+ 
+-		if (WARN_ON(!skb_shinfo(skb)->nr_frags) ||
++		if (WARN_ON_ONCE(!skb_shinfo(skb)->nr_frags) ||
+ 		    WARN_ON_ONCE(!skb_frag_page(&skb_shinfo(skb)->frags[0]))) {
+ 			ret = -EINVAL;
+ 			goto out;
+@@ -749,7 +749,7 @@ static int kcm_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+ {
+ 	struct sock *sk = sock->sk;
+ 	struct kcm_sock *kcm = kcm_sk(sk);
+-	struct sk_buff *skb = NULL, *head = NULL;
++	struct sk_buff *skb = NULL, *head = NULL, *frag_prev = NULL;
+ 	size_t copy, copied = 0;
+ 	long timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
+ 	int eor = (sock->type == SOCK_DGRAM) ?
+@@ -824,6 +824,7 @@ static int kcm_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+ 				else
+ 					skb->next = tskb;
+ 
++				frag_prev = skb;
+ 				skb = tskb;
+ 				skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 				continue;
+@@ -933,6 +934,22 @@ static int kcm_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+ out_error:
+ 	kcm_push(kcm);
+ 
++	/* When MAX_SKB_FRAGS was reached, a new skb was allocated and
++	 * linked into the frag_list before data copy. If the copy
++	 * subsequently failed, this skb has zero frags. Remove it from
++	 * the frag_list to prevent kcm_write_msgs from later hitting
++	 * WARN_ON(!skb_shinfo(skb)->nr_frags).
++	 */
++	if (frag_prev && !skb_shinfo(skb)->nr_frags) {
++		if (head == frag_prev)
++			skb_shinfo(head)->frag_list = NULL;
++		else
++			frag_prev->next = NULL;
++		kfree_skb(skb);
++		/* Update skb as it may be saved in partial_message via goto */
++		skb = frag_prev;
++	}
++
+ 	if (sock->type == SOCK_SEQPACKET) {
+ 		/* Wrote some bytes before encountering an
+ 		 * error, return partial success.
+-- 
+2.51.0
+

@@ -1,0 +1,154 @@
+From: Sun YangKai <sunk67188@gmail.com>
+Date: Wed, 14 Jan 2026 11:47:02 +0800
+Subject: [PATCH] btrfs: fix periodic reclaim condition
+References: bsc#1258210
+Patch-mainline: 6.18.16
+Git-commit: 19eff93dc738e8afaa59cb374b44bb5a162e6c2d
+
+[ Upstream commit 19eff93dc738e8afaa59cb374b44bb5a162e6c2d ]
+
+Problems with current implementation:
+
+1. reclaimable_bytes is signed while chunk_sz is unsigned, causing
+   negative reclaimable_bytes to trigger reclaim unexpectedly
+
+2. The "space must be freed between scans" assumption breaks the
+   two-scan requirement: first scan marks block groups, second scan
+   reclaims them. Without the second scan, no reclamation occurs.
+
+Instead, track actual reclaim progress: pause reclaim when block groups
+will be reclaimed, and resume only when progress is made. This ensures
+reclaim continues until no further progress can be made. And resume
+periodic reclaim when there's enough free space.
+
+And we take care if reclaim is making any progress now, so it's
+unnecessary to set periodic_reclaim_ready to false when failed to reclaim
+a block group.
+
+Fixes: 813d4c6422516 ("btrfs: prevent pathological periodic reclaim loops")
+CC: stable@vger.kernel.org # 6.12+
+Suggested-by: Boris Burkov <boris@bur.io>
+Reviewed-by: Boris Burkov <boris@bur.io>
+Signed-off-by: Sun YangKai <sunk67188@gmail.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/btrfs/block-group.c |  6 ++++--
+ fs/btrfs/space-info.c  | 21 ++++++++++++---------
+ 2 files changed, 16 insertions(+), 11 deletions(-)
+
+diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+index f7f6d8cb3311..4689ef206d0e 100644
+--- a/fs/btrfs/block-group.c
++++ b/fs/btrfs/block-group.c
+@@ -1877,6 +1877,7 @@ void btrfs_reclaim_bgs_work(struct work_struct *work)
+ 	while (!list_empty(&fs_info->reclaim_bgs)) {
+ 		u64 used;
+ 		u64 reserved;
++		u64 old_total;
+ 		int ret = 0;
+ 
+ 		bg = list_first_entry(&fs_info->reclaim_bgs,
+@@ -1942,6 +1943,7 @@ void btrfs_reclaim_bgs_work(struct work_struct *work)
+ 		}
+ 
+ 		spin_unlock(&bg->lock);
++		old_total = space_info->total_bytes;
+ 		spin_unlock(&space_info->lock);
+ 
+ 		/*
+@@ -1994,14 +1996,14 @@ void btrfs_reclaim_bgs_work(struct work_struct *work)
+ 			reserved = 0;
+ 			spin_lock(&space_info->lock);
+ 			space_info->reclaim_errors++;
+-			if (READ_ONCE(space_info->periodic_reclaim))
+-				space_info->periodic_reclaim_ready = false;
+ 			spin_unlock(&space_info->lock);
+ 		}
+ 		spin_lock(&space_info->lock);
+ 		space_info->reclaim_count++;
+ 		space_info->reclaim_bytes += used;
+ 		space_info->reclaim_bytes += reserved;
++		if (space_info->total_bytes < old_total)
++			btrfs_set_periodic_reclaim_ready(space_info, true);
+ 		spin_unlock(&space_info->lock);
+ 
+ next:
+diff --git a/fs/btrfs/space-info.c b/fs/btrfs/space-info.c
+index 474ed47095ba..6b64691034de 100644
+--- a/fs/btrfs/space-info.c
++++ b/fs/btrfs/space-info.c
+@@ -2074,11 +2074,11 @@ static bool is_reclaim_urgent(struct btrfs_space_info *space_info)
+ 	return unalloc < data_chunk_size;
+ }
+ 
+-static void do_reclaim_sweep(struct btrfs_space_info *space_info, int raid)
++static bool do_reclaim_sweep(struct btrfs_space_info *space_info, int raid)
+ {
+ 	struct btrfs_block_group *bg;
+ 	int thresh_pct;
+-	bool try_again = true;
++	bool will_reclaim = false;
+ 	bool urgent;
+ 
+ 	spin_lock(&space_info->lock);
+@@ -2096,7 +2096,7 @@ static void do_reclaim_sweep(struct btrfs_space_info *space_info, int raid)
+ 		spin_lock(&bg->lock);
+ 		thresh = mult_perc(bg->length, thresh_pct);
+ 		if (bg->used < thresh && bg->reclaim_mark) {
+-			try_again = false;
++			will_reclaim = true;
+ 			reclaim = true;
+ 		}
+ 		bg->reclaim_mark++;
+@@ -2113,12 +2113,13 @@ static void do_reclaim_sweep(struct btrfs_space_info *space_info, int raid)
+ 	 * If we have any staler groups, we don't touch the fresher ones, but if we
+ 	 * really need a block group, do take a fresh one.
+ 	 */
+-	if (try_again && urgent) {
+-		try_again = false;
++	if (!will_reclaim && urgent) {
++		urgent = false;
+ 		goto again;
+ 	}
+ 
+ 	up_read(&space_info->groups_sem);
++	return will_reclaim;
+ }
+ 
+ void btrfs_space_info_update_reclaimable(struct btrfs_space_info *space_info, s64 bytes)
+@@ -2128,7 +2129,8 @@ void btrfs_space_info_update_reclaimable(struct btrfs_space_info *space_info, s6
+ 	lockdep_assert_held(&space_info->lock);
+ 	space_info->reclaimable_bytes += bytes;
+ 
+-	if (space_info->reclaimable_bytes >= chunk_sz)
++	if (space_info->reclaimable_bytes > 0 &&
++	    space_info->reclaimable_bytes >= chunk_sz)
+ 		btrfs_set_periodic_reclaim_ready(space_info, true);
+ }
+ 
+@@ -2155,7 +2157,6 @@ static bool btrfs_should_periodic_reclaim(struct btrfs_space_info *space_info)
+ 
+ 	spin_lock(&space_info->lock);
+ 	ret = space_info->periodic_reclaim_ready;
+-	btrfs_set_periodic_reclaim_ready(space_info, false);
+ 	spin_unlock(&space_info->lock);
+ 
+ 	return ret;
+@@ -2169,8 +2170,10 @@ void btrfs_reclaim_sweep(const struct btrfs_fs_info *fs_info)
+ 	list_for_each_entry(space_info, &fs_info->space_info, list) {
+ 		if (!btrfs_should_periodic_reclaim(space_info))
+ 			continue;
+-		for (raid = 0; raid < BTRFS_NR_RAID_TYPES; raid++)
+-			do_reclaim_sweep(space_info, raid);
++		for (raid = 0; raid < BTRFS_NR_RAID_TYPES; raid++) {
++			if (do_reclaim_sweep(space_info, raid))
++				btrfs_set_periodic_reclaim_ready(space_info, false);
++		}
+ 	}
+ }
+ 
+-- 
+2.51.0
+
