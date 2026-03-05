@@ -1,0 +1,135 @@
+From: Alexander Grest <Alexander.Grest@microsoft.com>
+Date: Mon, 8 Dec 2025 13:28:57 -0800
+Subject: [PATCH] iommu/arm-smmu-v3: Improve CMDQ lock fairness and efficiency
+References: bsc#1012628
+Patch-mainline: 6.19.6
+Git-commit: df180b1a4cc51011c5f8c52c7ec02ad2e42962de
+
+[ Upstream commit df180b1a4cc51011c5f8c52c7ec02ad2e42962de ]
+
+The SMMU CMDQ lock is highly contentious when there are multiple CPUs
+issuing commands and the queue is nearly full.
+
+The lock has the following states:
+ - 0:		Unlocked
+ - >0:		Shared lock held with count
+ - INT_MIN+N:	Exclusive lock held, where N is the # of shared waiters
+ - INT_MIN:	Exclusive lock held, no shared waiters
+
+When multiple CPUs are polling for space in the queue, they attempt to
+grab the exclusive lock to update the cons pointer from the hardware. If
+they fail to get the lock, they will spin until either the cons pointer
+is updated by another CPU.
+
+The current code allows the possibility of shared lock starvation
+if there is a constant stream of CPUs trying to grab the exclusive lock.
+This leads to severe latency issues and soft lockups.
+
+Consider the following scenario where CPU1's attempt to acquire the
+shared lock is starved by CPU2 and CPU0 contending for the exclusive
+lock.
+
+CPU0 (exclusive)  | CPU1 (shared)     | CPU2 (exclusive)    | `cmdq->lock`
+--------------------------------------------------------------------------
+trylock() //takes |                   |                     | 0
+                  | shared_lock()     |                     | INT_MIN
+                  | fetch_inc()       |                     | INT_MIN
+                  | no return         |                     | INT_MIN + 1
+                  | spins // VAL >= 0 |                     | INT_MIN + 1
+unlock()          | spins...          |                     | INT_MIN + 1
+set_release(0)    | spins...          |                     | 0 see[NOTE]
+(done)            | (sees 0)          | trylock() // takes  | 0
+                  | *exits loop*      | cmpxchg(0, INT_MIN) | 0
+                  |                   | *cuts in*           | INT_MIN
+                  | cmpxchg(0, 1)     |                     | INT_MIN
+                  | fails // != 0     |                     | INT_MIN
+                  | spins // VAL >= 0 |                     | INT_MIN
+                  | *starved*         |                     | INT_MIN
+
+[NOTE] The current code resets the exclusive lock to 0 regardless of the
+state of the lock. This causes two problems:
+1. It opens the possibility of back-to-back exclusive locks and the
+   downstream effect of starving shared lock.
+2. The count of shared lock waiters are lost.
+
+To mitigate this, we release the exclusive lock by only clearing the sign
+bit while retaining the shared lock waiter count as a way to avoid
+starving the shared lock waiters.
+
+Also deleted cmpxchg loop while trying to acquire the shared lock as it
+is not needed. The waiters can see the positive lock count and proceed
+immediately after the exclusive lock is released.
+
+Exclusive lock is not starved in that submitters will try exclusive lock
+first when new spaces become available.
+
+Reviewed-by: Mostafa Saleh <smostafa@google.com>
+Reviewed-by: Nicolin Chen <nicolinc@nvidia.com>
+Signed-off-by: Alexander Grest <Alexander.Grest@microsoft.com>
+Signed-off-by: Jacob Pan <jacob.pan@linux.microsoft.com>
+Signed-off-by: Will Deacon <will@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c | 31 ++++++++++++++-------
+ 1 file changed, 21 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+index d16d35c78c06..7a6aea3b61c1 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+@@ -487,20 +487,26 @@ static void arm_smmu_cmdq_skip_err(struct arm_smmu_device *smmu)
+  */
+ static void arm_smmu_cmdq_shared_lock(struct arm_smmu_cmdq *cmdq)
+ {
+-	int val;
+-
+ 	/*
+-	 * We can try to avoid the cmpxchg() loop by simply incrementing the
+-	 * lock counter. When held in exclusive state, the lock counter is set
+-	 * to INT_MIN so these increments won't hurt as the value will remain
+-	 * negative.
++	 * When held in exclusive state, the lock counter is set to INT_MIN
++	 * so these increments won't hurt as the value will remain negative.
++	 * The increment will also signal the exclusive locker that there are
++	 * shared waiters.
+ 	 */
+ 	if (atomic_fetch_inc_relaxed(&cmdq->lock) >= 0)
+ 		return;
+ 
+-	do {
+-		val = atomic_cond_read_relaxed(&cmdq->lock, VAL >= 0);
+-	} while (atomic_cmpxchg_relaxed(&cmdq->lock, val, val + 1) != val);
++	/*
++	 * Someone else is holding the lock in exclusive state, so wait
++	 * for them to finish. Since we already incremented the lock counter,
++	 * no exclusive lock can be acquired until we finish. We don't need
++	 * the return value since we only care that the exclusive lock is
++	 * released (i.e. the lock counter is non-negative).
++	 * Once the exclusive locker releases the lock, the sign bit will
++	 * be cleared and our increment will make the lock counter positive,
++	 * allowing us to proceed.
++	 */
++	atomic_cond_read_relaxed(&cmdq->lock, VAL > 0);
+ }
+ 
+ static void arm_smmu_cmdq_shared_unlock(struct arm_smmu_cmdq *cmdq)
+@@ -527,9 +533,14 @@ static bool arm_smmu_cmdq_shared_tryunlock(struct arm_smmu_cmdq *cmdq)
+ 	__ret;								\
+ })
+ 
++/*
++ * Only clear the sign bit when releasing the exclusive lock this will
++ * allow any shared_lock() waiters to proceed without the possibility
++ * of entering the exclusive lock in a tight loop.
++ */
+ #define arm_smmu_cmdq_exclusive_unlock_irqrestore(cmdq, flags)		\
+ ({									\
+-	atomic_set_release(&cmdq->lock, 0);				\
++	atomic_fetch_andnot_release(INT_MIN, &cmdq->lock);		\
+ 	local_irq_restore(flags);					\
+ })
+ 
+-- 
+2.53.0
+
