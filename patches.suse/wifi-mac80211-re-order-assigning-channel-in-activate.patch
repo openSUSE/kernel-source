@@ -1,0 +1,169 @@
+From 188a1bf894323bf3a90361676da8364c82ce6d32 Mon Sep 17 00:00:00 2001
+From: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Date: Tue, 1 Oct 2024 14:20:34 +0530
+Subject: [PATCH] wifi: mac80211: re-order assigning channel in activate links
+Git-commit: 188a1bf894323bf3a90361676da8364c82ce6d32
+Patch-mainline: v6.13-rc1
+References: jsc#PED-14425
+
+The current flow in _ieee80211_set_active_links() does not align with the
+operational requirements of drivers that groups multiple hardware
+under a single wiphy. These drivers (e.g ath12k) rely on channel
+assignment to determine the appropriate hardware for each link. Without
+this, the drivers cannot correctly establish the link interface.
+
+Currently in _ieee80211_set_active_links(), after calling
+drv_change_vif_links() on the driver, the state of all connected stations
+is updated via drv_change_sta_links(). This is followed by handling keys
+in the links, and finally, assigning the channel to the links.
+Consequently, drv_change_sta_links() prompts drivers to create the station
+entry at their level and within their firmware. However, since channels
+have not yet been assigned to links at this stage, drivers have not
+created the necessary link interface for establishing link stations,
+leading to failures in activating the links.
+
+Therefore, re-order the logic so that after drv_change_vif_links() and
+removing the old links, channels are assigned to newly added links.
+Following this, the flow proceeds to station handling.
+
+Signed-off-by: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Link: https://patch.msgid.link/20241001085034.2745669-1-quic_adisi@quicinc.com
+[johannes: fix iwlwifi to deal with the changes]
+Reviewed-by: Miriam Rachel Korenblit <miriam.rachel.korenblit@intel.com>
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/net/wireless/intel/iwlwifi/mvm/mld-mac80211.c |   32 +++++------
+ drivers/net/wireless/intel/iwlwifi/mvm/mld-sta.c      |    3 +
+ net/mac80211/link.c                                   |   51 ++++++++++--------
+ 3 files changed, 50 insertions(+), 36 deletions(-)
+
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac80211.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac80211.c
+@@ -339,23 +339,18 @@ __iwl_mvm_mld_assign_vif_chanctx(struct
+ 	if (ret)
+ 		goto out;
+ 
+-	/* Initialize rate control for the AP station, since we might be
+-	 * doing a link switch here - we cannot initialize it before since
+-	 * this needs the phy context assigned (and in FW?), and we cannot
+-	 * do it later because it needs to be initialized as soon as we're
+-	 * able to TX on the link, i.e. when active.
++	/*
++	 * if link switching (link not active yet) we'll activate it in
++	 * firmware later on link-info change, which mac80211 guarantees
++	 * for link switch after the stations are set up
+ 	 */
+-	if (mvmvif->ap_sta) {
+-		struct ieee80211_link_sta *link_sta;
+-
+-		rcu_read_lock();
+-		link_sta = rcu_dereference(mvmvif->ap_sta->link[link_id]);
+-
+-		if (!WARN_ON_ONCE(!link_sta))
+-			iwl_mvm_rs_rate_init(mvm, vif, mvmvif->ap_sta,
+-					     link_conf, link_sta,
+-					     phy_ctxt->channel->band);
+-		rcu_read_unlock();
++	if (ieee80211_vif_link_active(vif, link_conf->link_id)) {
++		ret = iwl_mvm_link_changed(mvm, vif, link_conf,
++					   LINK_CONTEXT_MODIFY_ACTIVE |
++					   LINK_CONTEXT_MODIFY_RATES_INFO,
++					   true);
++		if (ret)
++			goto out;
+ 	}
+ 
+ 	/* then activate */
+@@ -783,6 +778,11 @@ iwl_mvm_mld_link_info_changed_station(st
+ 	if (WARN_ON_ONCE(!mvmvif->link[link_conf->link_id]))
+ 		return;
+ 
++	/* not yet marked active in vif means during link switch */
++	if (!ieee80211_vif_link_active(vif, link_conf->link_id) &&
++	    vif->cfg.assoc && mvmvif->link[link_conf->link_id]->phy_ctxt)
++		link_changes |= LINK_CONTEXT_MODIFY_ACTIVE;
++
+ 	has_he = link_conf->he_support && !iwlwifi_mod_params.disable_11ax;
+ 	has_eht = link_conf->eht_support && !iwlwifi_mod_params.disable_11be;
+ 
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mld-sta.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mld-sta.c
+@@ -1182,6 +1182,9 @@ int iwl_mvm_mld_update_sta_links(struct
+ 		link_sta_added_to_fw |= BIT(link_id);
+ 
+ 		iwl_mvm_rs_add_sta_link(mvm, mvm_sta_link);
++
++		iwl_mvm_rs_rate_init(mvm, vif, sta, link_conf, link_sta,
++				     link_conf->chanreq.oper.chan->band);
+ 	}
+ 
+ 	if (sta_mask_added) {
+--- a/net/mac80211/link.c
++++ b/net/mac80211/link.c
+@@ -389,6 +389,37 @@ static int _ieee80211_set_active_links(s
+ 						 jiffies);
+ 	}
+ 
++	for_each_set_bit(link_id, &add, IEEE80211_MLD_MAX_NUM_LINKS) {
++		struct ieee80211_link_data *link;
++
++		link = sdata_dereference(sdata->link[link_id], sdata);
++
++		/*
++		 * This call really should not fail. Unfortunately, it appears
++		 * that this may happen occasionally with some drivers. Should
++		 * it happen, we are stuck in a bad place as going backwards is
++		 * not really feasible.
++		 *
++		 * So lets just tell link_use_channel that it must not fail to
++		 * assign the channel context (from mac80211's perspective) and
++		 * assume the driver is going to trigger a recovery flow if it
++		 * had a failure.
++		 * That really is not great nor guaranteed to work. But at least
++		 * the internal mac80211 state remains consistent and there is
++		 * a chance that we can recover.
++		 */
++		ret = _ieee80211_link_use_channel(link,
++						  &link->conf->chanreq,
++						  IEEE80211_CHANCTX_SHARED,
++						  true);
++		WARN_ON_ONCE(ret);
++
++		/*
++		 * inform about the link info changed parameters after all
++		 * stations are also added
++		 */
++	}
++
+ 	list_for_each_entry(sta, &local->sta_list, list) {
+ 		if (sdata != sta->sdata)
+ 			continue;
+@@ -432,26 +463,6 @@ static int _ieee80211_set_active_links(s
+ 
+ 		link = sdata_dereference(sdata->link[link_id], sdata);
+ 
+-		/*
+-		 * This call really should not fail. Unfortunately, it appears
+-		 * that this may happen occasionally with some drivers. Should
+-		 * it happen, we are stuck in a bad place as going backwards is
+-		 * not really feasible.
+-		 *
+-		 * So lets just tell link_use_channel that it must not fail to
+-		 * assign the channel context (from mac80211's perspective) and
+-		 * assume the driver is going to trigger a recovery flow if it
+-		 * had a failure.
+-		 * That really is not great nor guaranteed to work. But at least
+-		 * the internal mac80211 state remains consistent and there is
+-		 * a chance that we can recover.
+-		 */
+-		ret = _ieee80211_link_use_channel(link,
+-						  &link->conf->chanreq,
+-						  IEEE80211_CHANCTX_SHARED,
+-						  true);
+-		WARN_ON_ONCE(ret);
+-
+ 		ieee80211_mgd_set_link_qos_params(link);
+ 		ieee80211_link_info_change_notify(sdata, link,
+ 						  BSS_CHANGED_ERP_CTS_PROT |
