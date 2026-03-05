@@ -1,0 +1,215 @@
+From: Song Liu <song@kernel.org>
+Date: Wed, 25 Jun 2025 09:40:24 -0700
+Subject: bpf: Add range tracking for BPF_NEG
+Patch-mainline: v6.17-rc1
+Git-commit: aced132599b3c8884c050218d4c48eef203678f6
+References: jsc#PED-14653
+
+Add range tracking for instruction BPF_NEG. Without this logic, a trivial
+program like the following will fail
+
+    volatile bool found_value_b;
+    SEC("lsm.s/socket_connect")
+    int BPF_PROG(test_socket_connect)
+    {
+        if (!found_value_b)
+                return -1;
+        return 0;
+    }
+
+with verifier log:
+
+"At program exit the register R0 has smin=0 smax=4294967295 should have
+been in [-4095, 0]".
+
+This is because range information is lost in BPF_NEG:
+
+0: R1=ctx() R10=fp0
+; if (!found_value_b) @ xxxx.c:24
+0: (18) r1 = 0xffa00000011e7048       ; R1_w=map_value(...)
+2: (71) r0 = *(u8 *)(r1 +0)           ; R0_w=scalar(smin32=0,smax=255)
+3: (a4) w0 ^= 1                       ; R0_w=scalar(smin32=0,smax=255)
+4: (84) w0 = -w0                      ; R0_w=scalar(range info lost)
+
+Note that, the log above is manually modified to highlight relevant bits.
+
+Fix this by maintaining proper range information with BPF_NEG, so that
+the verifier will know:
+
+4: (84) w0 = -w0                      ; R0_w=scalar(smin32=-255,smax=0)
+
+Also updated selftests based on the expected behavior.
+
+Signed-off-by: Song Liu <song@kernel.org>
+Acked-by: Eduard Zingerman <eddyz87@gmail.com>
+Link: https://lore.kernel.org/r/20250625164025.3310203-2-song@kernel.org
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ include/linux/tnum.h                                          |    2 
+ kernel/bpf/tnum.c                                             |    5 ++
+ kernel/bpf/verifier.c                                         |   17 +++++++
+ tools/testing/selftests/bpf/progs/verifier_bounds_deduction.c |   11 +++--
+ tools/testing/selftests/bpf/progs/verifier_value_ptr_arith.c  |   22 +++++++---
+ 5 files changed, 46 insertions(+), 11 deletions(-)
+
+--- a/include/linux/tnum.h
++++ b/include/linux/tnum.h
+@@ -40,6 +40,8 @@ struct tnum tnum_arshift(struct tnum a,
+ struct tnum tnum_add(struct tnum a, struct tnum b);
+ /* Subtract two tnums, return @a - @b */
+ struct tnum tnum_sub(struct tnum a, struct tnum b);
++/* Neg of a tnum, return  0 - @a */
++struct tnum tnum_neg(struct tnum a);
+ /* Bitwise-AND, return @a & @b */
+ struct tnum tnum_and(struct tnum a, struct tnum b);
+ /* Bitwise-OR, return @a | @b */
+--- a/kernel/bpf/tnum.c
++++ b/kernel/bpf/tnum.c
+@@ -83,6 +83,11 @@ struct tnum tnum_sub(struct tnum a, stru
+ 	return TNUM(dv & ~mu, mu);
+ }
+ 
++struct tnum tnum_neg(struct tnum a)
++{
++	return tnum_sub(TNUM(0, 0), a);
++}
++
+ struct tnum tnum_and(struct tnum a, struct tnum b)
+ {
+ 	u64 alpha, beta, v;
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -15186,6 +15186,7 @@ static bool is_safe_to_compute_dst_reg_r
+ 	switch (BPF_OP(insn->code)) {
+ 	case BPF_ADD:
+ 	case BPF_SUB:
++	case BPF_NEG:
+ 	case BPF_AND:
+ 	case BPF_XOR:
+ 	case BPF_OR:
+@@ -15254,6 +15255,13 @@ static int adjust_scalar_min_max_vals(st
+ 		scalar_min_max_sub(dst_reg, &src_reg);
+ 		dst_reg->var_off = tnum_sub(dst_reg->var_off, src_reg.var_off);
+ 		break;
++	case BPF_NEG:
++		env->fake_reg[0] = *dst_reg;
++		__mark_reg_known(dst_reg, 0);
++		scalar32_min_max_sub(dst_reg, &env->fake_reg[0]);
++		scalar_min_max_sub(dst_reg, &env->fake_reg[0]);
++		dst_reg->var_off = tnum_neg(env->fake_reg[0].var_off);
++		break;
+ 	case BPF_MUL:
+ 		dst_reg->var_off = tnum_mul(dst_reg->var_off, src_reg.var_off);
+ 		scalar32_min_max_mul(dst_reg, &src_reg);
+@@ -15477,7 +15485,14 @@ static int check_alu_op(struct bpf_verif
+ 		}
+ 
+ 		/* check dest operand */
+-		err = check_reg_arg(env, insn->dst_reg, DST_OP);
++		if (opcode == BPF_NEG) {
++			err = check_reg_arg(env, insn->dst_reg, DST_OP_NO_MARK);
++			err = err ?: adjust_scalar_min_max_vals(env, insn,
++							 &regs[insn->dst_reg],
++							 regs[insn->dst_reg]);
++		} else {
++			err = check_reg_arg(env, insn->dst_reg, DST_OP);
++		}
+ 		if (err)
+ 			return err;
+ 
+--- a/tools/testing/selftests/bpf/progs/verifier_bounds_deduction.c
++++ b/tools/testing/selftests/bpf/progs/verifier_bounds_deduction.c
+@@ -159,13 +159,16 @@ __failure_unpriv
+ __naked void deducing_bounds_from_const_10(void)
+ {
+ 	asm volatile ("					\
++	r6 = r1;					\
+ 	r0 = 0;						\
+ 	if r0 s<= 0 goto l0_%=;				\
+-l0_%=:	/* Marks reg as unknown. */			\
+-	r0 = -r0;					\
+-	r0 -= r1;					\
++l0_%=: /* Marks r0 as unknown. */			\
++	call %[bpf_get_prandom_u32];			\
++	r0 -= r6;					\
+ 	exit;						\
+-"	::: __clobber_all);
++"	:
++	: __imm(bpf_get_prandom_u32)
++	: __clobber_all);
+ }
+ 
+ char _license[] SEC("license") = "GPL";
+--- a/tools/testing/selftests/bpf/progs/verifier_value_ptr_arith.c
++++ b/tools/testing/selftests/bpf/progs/verifier_value_ptr_arith.c
+@@ -231,6 +231,10 @@ __retval(1)
+ __naked void ptr_unknown_vs_unknown_lt(void)
+ {
+ 	asm volatile ("					\
++	r8 = r1;					\
++	call %[bpf_get_prandom_u32];			\
++	r9 = r0;					\
++	r1 = r8;					\
+ 	r0 = *(u32*)(r1 + %[__sk_buff_len]);		\
+ 	r1 = 0;						\
+ 	*(u64*)(r10 - 8) = r1;				\
+@@ -245,11 +249,11 @@ l1_%=:	call %[bpf_map_lookup_elem];			\
+ 	r4 = *(u8*)(r0 + 0);				\
+ 	if r4 == 1 goto l3_%=;				\
+ 	r1 = 6;						\
+-	r1 = -r1;					\
++	r1 = r9;					\
+ 	r1 &= 0x3;					\
+ 	goto l4_%=;					\
+ l3_%=:	r1 = 6;						\
+-	r1 = -r1;					\
++	r1 = r9;					\
+ 	r1 &= 0x7;					\
+ l4_%=:	r1 += r0;					\
+ 	r0 = *(u8*)(r1 + 0);				\
+@@ -259,7 +263,8 @@ l2_%=:	r0 = 1;						\
+ 	: __imm(bpf_map_lookup_elem),
+ 	  __imm_addr(map_array_48b),
+ 	  __imm_addr(map_hash_16b),
+-	  __imm_const(__sk_buff_len, offsetof(struct __sk_buff, len))
++	  __imm_const(__sk_buff_len, offsetof(struct __sk_buff, len)),
++	  __imm(bpf_get_prandom_u32)
+ 	: __clobber_all);
+ }
+ 
+@@ -271,6 +276,10 @@ __retval(1)
+ __naked void ptr_unknown_vs_unknown_gt(void)
+ {
+ 	asm volatile ("					\
++	r8 = r1;					\
++	call %[bpf_get_prandom_u32];			\
++	r9 = r0;					\
++	r1 = r8;					\
+ 	r0 = *(u32*)(r1 + %[__sk_buff_len]);		\
+ 	r1 = 0;						\
+ 	*(u64*)(r10 - 8) = r1;				\
+@@ -285,11 +294,11 @@ l1_%=:	call %[bpf_map_lookup_elem];			\
+ 	r4 = *(u8*)(r0 + 0);				\
+ 	if r4 == 1 goto l3_%=;				\
+ 	r1 = 6;						\
+-	r1 = -r1;					\
++	r1 = r9;					\
+ 	r1 &= 0x7;					\
+ 	goto l4_%=;					\
+ l3_%=:	r1 = 6;						\
+-	r1 = -r1;					\
++	r1 = r9;					\
+ 	r1 &= 0x3;					\
+ l4_%=:	r1 += r0;					\
+ 	r0 = *(u8*)(r1 + 0);				\
+@@ -299,7 +308,8 @@ l2_%=:	r0 = 1;						\
+ 	: __imm(bpf_map_lookup_elem),
+ 	  __imm_addr(map_array_48b),
+ 	  __imm_addr(map_hash_16b),
+-	  __imm_const(__sk_buff_len, offsetof(struct __sk_buff, len))
++	  __imm_const(__sk_buff_len, offsetof(struct __sk_buff, len)),
++	  __imm(bpf_get_prandom_u32)
+ 	: __clobber_all);
+ }
+ 
