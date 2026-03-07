@@ -1,0 +1,319 @@
+From: Puranjay Mohan <puranjay@kernel.org>
+Date: Thu, 11 Sep 2025 14:58:02 +0000
+Subject: bpf: Report arena faults to BPF stderr
+Patch-mainline: v6.18-rc1
+Git-commit: 5c5240d020615f13331f4e2c559186125eddc7d3
+References: jsc#PED-14653
+
+Begin reporting arena page faults and the faulting address to BPF
+program's stderr, this patch adds support in the arm64 and x86-64 JITs,
+support for other archs can be added later.
+
+The fault handlers receive the 32 bit address in the arena region so
+the upper 32 bits of user_vm_start is added to it before printing the
+address. This is what the user would expect to see as this is what is
+printed by bpf_printk() is you pass it an address returned by
+bpf_arena_alloc_pages();
+
+Signed-off-by: Puranjay Mohan <puranjay@kernel.org>
+Acked-by: Yonghong Song <yonghong.song@linux.dev>
+Link: https://lore.kernel.org/r/20250911145808.58042-4-puranjay@kernel.org
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ arch/arm64/net/bpf_jit_comp.c |   60 +++++++++++++++++++++++++++++
+ arch/x86/net/bpf_jit_comp.c   |   85 +++++++++++++++++++++++++++++++++++++++---
+ include/linux/bpf.h           |    6 ++
+ kernel/bpf/arena.c            |   30 ++++++++++++++
+ 4 files changed, 176 insertions(+), 5 deletions(-)
+
+--- a/arch/arm64/net/bpf_jit_comp.c
++++ b/arch/arm64/net/bpf_jit_comp.c
+@@ -1066,6 +1066,30 @@ static void build_epilogue(struct jit_ct
+ 	emit(A64_RET(A64_LR), ctx);
+ }
+ 
++/*
++ * Metadata encoding for exception handling in JITed code.
++ *
++ * Format of `fixup` field in `struct exception_table_entry`:
++ *
++ * Bit layout of `fixup` (32-bit):
++ *
++ * +-----------+--------+-----------+-----------+----------+
++ * |   31-27   | 26-22  |     21    |   20-16   |   15-0   |
++ * |           |        |           |           |          |
++ * | FIXUP_REG | Unused | ARENA_ACC | ARENA_REG |  OFFSET  |
++ * +-----------+--------+-----------+-----------+----------+
++ *
++ * - OFFSET (16 bits): Offset used to compute address for Load/Store instruction.
++ * - ARENA_REG (5 bits): Register that is used to calculate the address for load/store when
++ *                       accessing the arena region.
++ * - ARENA_ACCESS (1 bit): This bit is set when the faulting instruction accessed the arena region.
++ * - FIXUP_REG (5 bits): Destination register for the load instruction (cleared on fault) or set to
++ *                       DONT_CLEAR if it is a store instruction.
++ */
++
++#define BPF_FIXUP_OFFSET_MASK      GENMASK(15, 0)
++#define BPF_FIXUP_ARENA_REG_MASK   GENMASK(20, 16)
++#define BPF_ARENA_ACCESS           BIT(21)
+ #define BPF_FIXUP_REG_MASK	GENMASK(31, 27)
+ #define DONT_CLEAR 5 /* Unused ARM64 register from BPF's POV */
+ 
+@@ -1073,11 +1097,22 @@ bool ex_handler_bpf(const struct excepti
+ 		    struct pt_regs *regs)
+ {
+ 	int dst_reg = FIELD_GET(BPF_FIXUP_REG_MASK, ex->fixup);
++	s16 off = FIELD_GET(BPF_FIXUP_OFFSET_MASK, ex->fixup);
++	int arena_reg = FIELD_GET(BPF_FIXUP_ARENA_REG_MASK, ex->fixup);
++	bool is_arena = !!(ex->fixup & BPF_ARENA_ACCESS);
++	bool is_write = (dst_reg == DONT_CLEAR);
++	unsigned long addr;
++
++	if (is_arena) {
++		addr = regs->regs[arena_reg] + off;
++		bpf_prog_report_arena_violation(is_write, addr, regs->pc);
++	}
+ 
+ 	if (dst_reg != DONT_CLEAR)
+ 		regs->regs[dst_reg] = 0;
+ 	/* Skip the faulting instruction */
+ 	regs->pc += AARCH64_INSN_SIZE;
++
+ 	return true;
+ }
+ 
+@@ -1087,6 +1122,9 @@ static int add_exception_handler(const s
+ 				 int dst_reg)
+ {
+ 	off_t ins_offset;
++	s16 off = insn->off;
++	bool is_arena;
++	int arena_reg;
+ 	unsigned long pc;
+ 	struct exception_table_entry *ex;
+ 
+@@ -1100,6 +1138,9 @@ static int add_exception_handler(const s
+ 				BPF_MODE(insn->code) != BPF_PROBE_ATOMIC)
+ 		return 0;
+ 
++	is_arena = (BPF_MODE(insn->code) == BPF_PROBE_MEM32) ||
++		   (BPF_MODE(insn->code) == BPF_PROBE_ATOMIC);
++
+ 	if (!ctx->prog->aux->extable ||
+ 	    WARN_ON_ONCE(ctx->exentry_idx >= ctx->prog->aux->num_exentries))
+ 		return -EINVAL;
+@@ -1131,6 +1172,25 @@ static int add_exception_handler(const s
+ 
+ 	ex->fixup = FIELD_PREP(BPF_FIXUP_REG_MASK, dst_reg);
+ 
++	if (is_arena) {
++		ex->fixup |= BPF_ARENA_ACCESS;
++		/*
++		 * insn->src_reg/dst_reg holds the address in the arena region with upper 32-bits
++		 * being zero because of a preceding addr_space_cast(r<n>, 0x0, 0x1) instruction.
++		 * This address is adjusted with the addition of arena_vm_start (see the
++		 * implementation of BPF_PROBE_MEM32 and BPF_PROBE_ATOMIC) before being used for the
++		 * memory access. Pass the reg holding the unmodified 32-bit address to
++		 * ex_handler_bpf.
++		 */
++		if (BPF_CLASS(insn->code) == BPF_LDX)
++			arena_reg = bpf2a64[insn->src_reg];
++		else
++			arena_reg = bpf2a64[insn->dst_reg];
++
++		ex->fixup |=  FIELD_PREP(BPF_FIXUP_OFFSET_MASK, off) |
++			      FIELD_PREP(BPF_FIXUP_ARENA_REG_MASK, arena_reg);
++	}
++
+ 	ex->type = EX_TYPE_BPF;
+ 
+ 	ctx->exentry_idx++;
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -8,6 +8,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/filter.h>
+ #include <linux/if_vlan.h>
++#include <linux/bitfield.h>
+ #include <linux/bpf.h>
+ #include <linux/memory.h>
+ #include <linux/sort.h>
+@@ -1388,16 +1389,67 @@ static int emit_atomic_ld_st_index(u8 **
+ 	return 0;
+ }
+ 
++/*
++ * Metadata encoding for exception handling in JITed code.
++ *
++ * Format of `fixup` and `data` fields in `struct exception_table_entry`:
++ *
++ * Bit layout of `fixup` (32-bit):
++ *
++ * +-----------+--------+-----------+---------+----------+
++ * | 31        | 30-24  |   23-16   |   15-8  |    7-0   |
++ * |           |        |           |         |          |
++ * | ARENA_ACC | Unused | ARENA_REG | DST_REG | INSN_LEN |
++ * +-----------+--------+-----------+---------+----------+
++ *
++ * - INSN_LEN (8 bits): Length of faulting insn (max x86 insn = 15 bytes (fits in 8 bits)).
++ * - DST_REG  (8 bits): Offset of dst_reg from reg2pt_regs[] (max offset = 112 (fits in 8 bits)).
++ *                      This is set to DONT_CLEAR if the insn is a store.
++ * - ARENA_REG (8 bits): Offset of the register that is used to calculate the
++ *                       address for load/store when accessing the arena region.
++ * - ARENA_ACCESS (1 bit): This bit is set when the faulting instruction accessed the arena region.
++ *
++ * Bit layout of `data` (32-bit):
++ *
++ * +--------------+--------+--------------+
++ * |	31-16	  |  15-8  |     7-0      |
++ * |              |	   |              |
++ * | ARENA_OFFSET | Unused |  EX_TYPE_BPF |
++ * +--------------+--------+--------------+
++ *
++ * - ARENA_OFFSET (16 bits): Offset used to calculate the address for load/store when
++ *                           accessing the arena region.
++ */
++
+ #define DONT_CLEAR 1
++#define FIXUP_INSN_LEN_MASK	GENMASK(7, 0)
++#define FIXUP_REG_MASK		GENMASK(15, 8)
++#define FIXUP_ARENA_REG_MASK	GENMASK(23, 16)
++#define FIXUP_ARENA_ACCESS	BIT(31)
++#define DATA_ARENA_OFFSET_MASK	GENMASK(31, 16)
+ 
+ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
+ {
+-	u32 reg = x->fixup >> 8;
++	u32 reg = FIELD_GET(FIXUP_REG_MASK, x->fixup);
++	u32 insn_len = FIELD_GET(FIXUP_INSN_LEN_MASK, x->fixup);
++	bool is_arena = !!(x->fixup & FIXUP_ARENA_ACCESS);
++	bool is_write = (reg == DONT_CLEAR);
++	unsigned long addr;
++	s16 off;
++	u32 arena_reg;
++
++	if (is_arena) {
++		arena_reg = FIELD_GET(FIXUP_ARENA_REG_MASK, x->fixup);
++		off = FIELD_GET(DATA_ARENA_OFFSET_MASK, x->data);
++		addr = *(unsigned long *)((void *)regs + arena_reg) + off;
++		bpf_prog_report_arena_violation(is_write, addr, regs->ip);
++	}
+ 
+ 	/* jump over faulting load and clear dest register */
+ 	if (reg != DONT_CLEAR)
+ 		*(unsigned long *)((void *)regs + reg) = 0;
+-	regs->ip += x->fixup & 0xff;
++	regs->ip += insn_len;
++
+ 	return true;
+ }
+ 
+@@ -2070,6 +2122,7 @@ populate_extable:
+ 			{
+ 				struct exception_table_entry *ex;
+ 				u8 *_insn = image + proglen + (start_of_ldx - temp);
++				u32 arena_reg, fixup_reg;
+ 				s64 delta;
+ 
+ 				if (!bpf_prog->aux->extable)
+@@ -2089,8 +2142,29 @@ populate_extable:
+ 
+ 				ex->data = EX_TYPE_BPF;
+ 
+-				ex->fixup = (prog - start_of_ldx) |
+-					((BPF_CLASS(insn->code) == BPF_LDX ? reg2pt_regs[dst_reg] : DONT_CLEAR) << 8);
++				/*
++				 * src_reg/dst_reg holds the address in the arena region with upper
++				 * 32-bits being zero because of a preceding addr_space_cast(r<n>,
++				 * 0x0, 0x1) instruction. This address is adjusted with the addition
++				 * of arena_vm_start (see the implementation of BPF_PROBE_MEM32 and
++				 * BPF_PROBE_ATOMIC) before being used for the memory access. Pass
++				 * the reg holding the unmodified 32-bit address to
++				 * ex_handler_bpf().
++				 */
++				if (BPF_CLASS(insn->code) == BPF_LDX) {
++					arena_reg = reg2pt_regs[src_reg];
++					fixup_reg = reg2pt_regs[dst_reg];
++				} else {
++					arena_reg = reg2pt_regs[dst_reg];
++					fixup_reg = DONT_CLEAR;
++				}
++
++				ex->fixup = FIELD_PREP(FIXUP_INSN_LEN_MASK, prog - start_of_ldx) |
++					    FIELD_PREP(FIXUP_ARENA_REG_MASK, arena_reg) |
++					    FIELD_PREP(FIXUP_REG_MASK, fixup_reg);
++				ex->fixup |= FIXUP_ARENA_ACCESS;
++
++				ex->data |= FIELD_PREP(DATA_ARENA_OFFSET_MASK, insn->off);
+ 			}
+ 			break;
+ 
+@@ -2208,7 +2282,8 @@ populate_extable:
+ 				 * End result: x86 insn "mov rbx, qword ptr [rax+0x14]"
+ 				 * of 4 bytes will be ignored and rbx will be zero inited.
+ 				 */
+-				ex->fixup = (prog - start_of_ldx) | (reg2pt_regs[dst_reg] << 8);
++				ex->fixup = FIELD_PREP(FIXUP_INSN_LEN_MASK, prog - start_of_ldx) |
++					    FIELD_PREP(FIXUP_REG_MASK, reg2pt_regs[dst_reg]);
+ 			}
+ 			break;
+ 
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -2881,6 +2881,7 @@ void bpf_dynptr_init(struct bpf_dynptr_k
+ 		     enum bpf_dynptr_type type, u32 offset, u32 size);
+ void bpf_dynptr_set_null(struct bpf_dynptr_kern *ptr);
+ void bpf_dynptr_set_rdonly(struct bpf_dynptr_kern *ptr);
++void bpf_prog_report_arena_violation(bool write, unsigned long addr, unsigned long fault_ip);
+ 
+ #else /* !CONFIG_BPF_SYSCALL */
+ static inline struct bpf_prog *bpf_prog_get(u32 ufd)
+@@ -3168,6 +3169,11 @@ static inline void bpf_dynptr_set_null(s
+ static inline void bpf_dynptr_set_rdonly(struct bpf_dynptr_kern *ptr)
+ {
+ }
++
++static inline void bpf_prog_report_arena_violation(bool write, unsigned long addr,
++						   unsigned long fault_ip)
++{
++}
+ #endif /* CONFIG_BPF_SYSCALL */
+ 
+ static __always_inline int
+--- a/kernel/bpf/arena.c
++++ b/kernel/bpf/arena.c
+@@ -633,3 +633,33 @@ static int __init kfunc_init(void)
+ 	return register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC, &common_kfunc_set);
+ }
+ late_initcall(kfunc_init);
++
++void bpf_prog_report_arena_violation(bool write, unsigned long addr, unsigned long fault_ip)
++{
++	struct bpf_stream_stage ss;
++	struct bpf_prog *prog;
++	u64 user_vm_start;
++
++	/*
++	 * The RCU read lock is held to safely traverse the latch tree, but we
++	 * don't need its protection when accessing the prog, since it will not
++	 * disappear while we are handling the fault.
++	 */
++	rcu_read_lock();
++	prog = bpf_prog_ksym_find(fault_ip);
++	rcu_read_unlock();
++	if (!prog)
++		return;
++
++	/* Use main prog for stream access */
++	prog = prog->aux->main_prog_aux->prog;
++
++	user_vm_start = bpf_arena_get_user_vm_start(prog->aux->arena);
++	addr += clear_lo32(user_vm_start);
++
++	bpf_stream_stage(ss, prog, BPF_STDERR, ({
++		bpf_stream_printk(ss, "ERROR: Arena %s access at unmapped address 0x%lx\n",
++				  write ? "WRITE" : "READ", addr);
++		bpf_stream_dump_stack(ss);
++	}));
++}
