@@ -1,0 +1,207 @@
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:26 -0700
+Subject: rqspinlock: Protect waiters in queue from stalls
+Patch-mainline: v6.15-rc1
+Git-commit: 164c246571e97b6f1bdcc7ff5bb68f16da8afedc
+References: jsc#PED-14653
+
+Implement the wait queue cleanup algorithm for rqspinlock. There are
+three forms of waiters in the original queued spin lock algorithm. The
+first is the waiter which acquires the pending bit and spins on the lock
+word without forming a wait queue. The second is the head waiter that is
+the first waiter heading the wait queue. The third form is of all the
+non-head waiters queued behind the head, waiting to be signalled through
+their MCS node to overtake the responsibility of the head.
+
+In this commit, we are concerned with the second and third kind. First,
+we augment the waiting loop of the head of the wait queue with a
+timeout. When this timeout happens, all waiters part of the wait queue
+will abort their lock acquisition attempts. This happens in three steps.
+First, the head breaks out of its loop waiting for pending and locked
+bits to turn to 0, and non-head waiters break out of their MCS node spin
+(more on that later). Next, every waiter (head or non-head) attempts to
+check whether they are also the tail waiter, in such a case they attempt
+to zero out the tail word and allow a new queue to be built up for this
+lock. If they succeed, they have no one to signal next in the queue to
+stop spinning. Otherwise, they signal the MCS node of the next waiter to
+break out of its spin and try resetting the tail word back to 0. This
+goes on until the tail waiter is found. In case of races, the new tail
+will be responsible for performing the same task, as the old tail will
+then fail to reset the tail word and wait for its next pointer to be
+updated before it signals the new tail to do the same.
+
+We terminate the whole wait queue because of two main reasons. Firstly,
+we eschew per-waiter timeouts with one applied at the head of the wait
+queue.  This allows everyone to break out faster once we've seen the
+owner / pending waiter not responding for the timeout duration from the
+head.  Secondly, it avoids complicated synchronization, because when not
+leaving in FIFO order, prev's next pointer needs to be fixed up etc.
+
+Lastly, all of these waiters release the rqnode and return to the
+caller. This patch underscores the point that rqspinlock's timeout does
+not apply to each waiter individually, and cannot be relied upon as an
+upper bound. It is possible for the rqspinlock waiters to return early
+from a failed lock acquisition attempt as soon as stalls are detected.
+
+The head waiter cannot directly WRITE_ONCE the tail to zero, as it may
+race with a concurrent xchg and a non-head waiter linking its MCS node
+to the head's MCS node through 'prev->next' assignment.
+
+One notable thing is that we must use RES_DEF_TIMEOUT * 2 as our maximum
+duration for the waiting loop (for the wait queue head), since we may
+have both the owner and pending bit waiter ahead of us, and in the worst
+case, need to span their maximum permitted critical section lengths.
+
+Reviewed-by: Barret Rhoden <brho@google.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-11-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ kernel/bpf/rqspinlock.c |   57 ++++++++++++++++++++++++++++++++++++++++++++----
+ kernel/bpf/rqspinlock.h |   48 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 101 insertions(+), 4 deletions(-)
+ create mode 100644 kernel/bpf/rqspinlock.h
+
+--- a/kernel/bpf/rqspinlock.c
++++ b/kernel/bpf/rqspinlock.c
+@@ -77,6 +77,8 @@ struct rqspinlock_timeout {
+ 	u16 spin;
+ };
+ 
++#define RES_TIMEOUT_VAL	2
++
+ static noinline int check_timeout(struct rqspinlock_timeout *ts)
+ {
+ 	u64 time = ktime_get_mono_fast_ns();
+@@ -325,12 +327,18 @@ queue:
+ 	 * head of the waitqueue.
+ 	 */
+ 	if (old & _Q_TAIL_MASK) {
++		int val;
++
+ 		prev = decode_tail(old, rqnodes);
+ 
+ 		/* Link @node into the waitqueue. */
+ 		WRITE_ONCE(prev->next, node);
+ 
+-		arch_mcs_spin_lock_contended(&node->locked);
++		val = arch_mcs_spin_lock_contended(&node->locked);
++		if (val == RES_TIMEOUT_VAL) {
++			ret = -EDEADLK;
++			goto waitq_timeout;
++		}
+ 
+ 		/*
+ 		 * While waiting for the MCS lock, the next pointer may have
+@@ -353,8 +361,49 @@ queue:
+ 	 * store-release that clears the locked bit and create lock
+ 	 * sequentiality; this is because the set_locked() function below
+ 	 * does not imply a full barrier.
+-	 */
+-	val = atomic_cond_read_acquire(&lock->val, !(VAL & _Q_LOCKED_PENDING_MASK));
++	 *
++	 * We use RES_DEF_TIMEOUT * 2 as the duration, as RES_DEF_TIMEOUT is
++	 * meant to span maximum allowed time per critical section, and we may
++	 * have both the owner of the lock and the pending bit waiter ahead of
++	 * us.
++	 */
++	RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT * 2);
++	val = res_atomic_cond_read_acquire(&lock->val, !(VAL & _Q_LOCKED_PENDING_MASK) ||
++					   RES_CHECK_TIMEOUT(ts, ret));
++
++waitq_timeout:
++	if (ret) {
++		/*
++		 * If the tail is still pointing to us, then we are the final waiter,
++		 * and are responsible for resetting the tail back to 0. Otherwise, if
++		 * the cmpxchg operation fails, we signal the next waiter to take exit
++		 * and try the same. For a waiter with tail node 'n':
++		 *
++		 * n,*,* -> 0,*,*
++		 *
++		 * When performing cmpxchg for the whole word (NR_CPUS > 16k), it is
++		 * possible locked/pending bits keep changing and we see failures even
++		 * when we remain the head of wait queue. However, eventually,
++		 * pending bit owner will unset the pending bit, and new waiters
++		 * will queue behind us. This will leave the lock owner in
++		 * charge, and it will eventually either set locked bit to 0, or
++		 * leave it as 1, allowing us to make progress.
++		 *
++		 * We terminate the whole wait queue for two reasons. Firstly,
++		 * we eschew per-waiter timeouts with one applied at the head of
++		 * the wait queue.  This allows everyone to break out faster
++		 * once we've seen the owner / pending waiter not responding for
++		 * the timeout duration from the head.  Secondly, it avoids
++		 * complicated synchronization, because when not leaving in FIFO
++		 * order, prev's next pointer needs to be fixed up etc.
++		 */
++		if (!try_cmpxchg_tail(lock, tail, 0)) {
++			next = smp_cond_load_relaxed(&node->next, VAL);
++			WRITE_ONCE(next->locked, RES_TIMEOUT_VAL);
++		}
++		lockevent_inc(rqspinlock_lock_timeout);
++		goto release;
++	}
+ 
+ 	/*
+ 	 * claim the lock:
+@@ -399,6 +448,6 @@ release:
+ 	 * release the node
+ 	 */
+ 	__this_cpu_dec(rqnodes[0].mcs.count);
+-	return 0;
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(resilient_queued_spin_lock_slowpath);
+--- /dev/null
++++ b/kernel/bpf/rqspinlock.h
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Resilient Queued Spin Lock defines
++ *
++ * (C) Copyright 2024-2025 Meta Platforms, Inc. and affiliates.
++ *
++ * Authors: Kumar Kartikeya Dwivedi <memxor@gmail.com>
++ */
++#ifndef __LINUX_RQSPINLOCK_H
++#define __LINUX_RQSPINLOCK_H
++
++#include "../locking/qspinlock.h"
++
++/*
++ * try_cmpxchg_tail - Return result of cmpxchg of tail word with a new value
++ * @lock: Pointer to queued spinlock structure
++ * @tail: The tail to compare against
++ * @new_tail: The new queue tail code word
++ * Return: Bool to indicate whether the cmpxchg operation succeeded
++ *
++ * This is used by the head of the wait queue to clean up the queue.
++ * Provides relaxed ordering, since observers only rely on initialized
++ * state of the node which was made visible through the xchg_tail operation,
++ * i.e. through the smp_wmb preceding xchg_tail.
++ *
++ * We avoid using 16-bit cmpxchg, which is not available on all architectures.
++ */
++static __always_inline bool try_cmpxchg_tail(struct qspinlock *lock, u32 tail, u32 new_tail)
++{
++	u32 old, new;
++
++	old = atomic_read(&lock->val);
++	do {
++		/*
++		 * Is the tail part we compare to already stale? Fail.
++		 */
++		if ((old & _Q_TAIL_MASK) != tail)
++			return false;
++		/*
++		 * Encode latest locked/pending state for new tail.
++		 */
++		new = (old & _Q_LOCKED_PENDING_MASK) | new_tail;
++	} while (!atomic_try_cmpxchg_relaxed(&lock->val, &old, new));
++
++	return true;
++}
++
++#endif /* __LINUX_RQSPINLOCK_H */

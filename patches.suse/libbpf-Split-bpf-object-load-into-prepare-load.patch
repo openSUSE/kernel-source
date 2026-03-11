@@ -1,0 +1,259 @@
+From: Mykyta Yatsenko <yatsenko@meta.com>
+Date: Mon, 3 Mar 2025 13:57:51 +0000
+Subject: libbpf: Split bpf object load into prepare/load
+Patch-mainline: v6.15-rc1
+Git-commit: 1315c28ed8095108f90dfe882e9e1e68a101fc75
+References: jsc#PED-14653
+
+Introduce bpf_object__prepare API: additional intermediate preparation
+step that performs ELF processing, relocations, prepares final state of
+BPF program instructions (accessible with bpf_program__insns()), creates
+and (potentially) pins maps, and stops short of loading BPF programs.
+
+We anticipate few use cases for this API, such as:
+* Use prepare to initialize bpf_token, without loading freplace
+programs, unlocking possibility to lookup BTF of other programs.
+* Execute prepare to obtain finalized BPF program instructions without
+loading programs, enabling tools like veristat to process one program at
+a time, without incurring cost of ELF parsing and processing.
+
+Signed-off-by: Mykyta Yatsenko <yatsenko@meta.com>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20250303135752.158343-4-mykyta.yatsenko5@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/lib/bpf/libbpf.c   |  146 +++++++++++++++++++++++++++++++++--------------
+ tools/lib/bpf/libbpf.h   |   13 ++++
+ tools/lib/bpf/libbpf.map |    1 
+ 3 files changed, 117 insertions(+), 43 deletions(-)
+
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -7903,13 +7903,6 @@ bpf_object__load_progs(struct bpf_object
+ 
+ 	for (i = 0; i < obj->nr_programs; i++) {
+ 		prog = &obj->programs[i];
+-		err = bpf_object__sanitize_prog(obj, prog);
+-		if (err)
+-			return err;
+-	}
+-
+-	for (i = 0; i < obj->nr_programs; i++) {
+-		prog = &obj->programs[i];
+ 		if (prog_is_subprog(obj, prog))
+ 			continue;
+ 		if (!prog->autoload) {
+@@ -7933,6 +7926,21 @@ bpf_object__load_progs(struct bpf_object
+ 	return 0;
+ }
+ 
++static int bpf_object_prepare_progs(struct bpf_object *obj)
++{
++	struct bpf_program *prog;
++	size_t i;
++	int err;
++
++	for (i = 0; i < obj->nr_programs; i++) {
++		prog = &obj->programs[i];
++		err = bpf_object__sanitize_prog(obj, prog);
++		if (err)
++			return err;
++	}
++	return 0;
++}
++
+ static const struct bpf_sec_def *find_sec_def(const char *sec_name);
+ 
+ static int bpf_object_init_progs(struct bpf_object *obj, const struct bpf_object_open_opts *opts)
+@@ -8549,9 +8557,72 @@ static int bpf_object_prepare_struct_ops
+ 	return 0;
+ }
+ 
++static void bpf_object_unpin(struct bpf_object *obj)
++{
++	int i;
++
++	/* unpin any maps that were auto-pinned during load */
++	for (i = 0; i < obj->nr_maps; i++)
++		if (obj->maps[i].pinned && !obj->maps[i].reused)
++			bpf_map__unpin(&obj->maps[i], NULL);
++}
++
++static void bpf_object_post_load_cleanup(struct bpf_object *obj)
++{
++	int i;
++
++	/* clean up fd_array */
++	zfree(&obj->fd_array);
++
++	/* clean up module BTFs */
++	for (i = 0; i < obj->btf_module_cnt; i++) {
++		close(obj->btf_modules[i].fd);
++		btf__free(obj->btf_modules[i].btf);
++		free(obj->btf_modules[i].name);
++	}
++	obj->btf_module_cnt = 0;
++	zfree(&obj->btf_modules);
++
++	/* clean up vmlinux BTF */
++	btf__free(obj->btf_vmlinux);
++	obj->btf_vmlinux = NULL;
++}
++
++static int bpf_object_prepare(struct bpf_object *obj, const char *target_btf_path)
++{
++	int err;
++
++	if (obj->state >= OBJ_PREPARED) {
++		pr_warn("object '%s': prepare loading can't be attempted twice\n", obj->name);
++		return -EINVAL;
++	}
++
++	err = bpf_object_prepare_token(obj);
++	err = err ? : bpf_object__probe_loading(obj);
++	err = err ? : bpf_object__load_vmlinux_btf(obj, false);
++	err = err ? : bpf_object__resolve_externs(obj, obj->kconfig);
++	err = err ? : bpf_object__sanitize_maps(obj);
++	err = err ? : bpf_object__init_kern_struct_ops_maps(obj);
++	err = err ? : bpf_object_adjust_struct_ops_autoload(obj);
++	err = err ? : bpf_object__relocate(obj, obj->btf_custom_path ? : target_btf_path);
++	err = err ? : bpf_object__sanitize_and_load_btf(obj);
++	err = err ? : bpf_object__create_maps(obj);
++	err = err ? : bpf_object_prepare_progs(obj);
++
++	if (err) {
++		bpf_object_unpin(obj);
++		bpf_object_unload(obj);
++		obj->state = OBJ_LOADED;
++		return err;
++	}
++
++	obj->state = OBJ_PREPARED;
++	return 0;
++}
++
+ static int bpf_object_load(struct bpf_object *obj, int extra_log_level, const char *target_btf_path)
+ {
+-	int err, i;
++	int err;
+ 
+ 	if (!obj)
+ 		return libbpf_err(-EINVAL);
+@@ -8571,17 +8642,12 @@ static int bpf_object_load(struct bpf_ob
+ 		return libbpf_err(-LIBBPF_ERRNO__ENDIAN);
+ 	}
+ 
+-	err = bpf_object_prepare_token(obj);
+-	err = err ? : bpf_object__probe_loading(obj);
+-	err = err ? : bpf_object__load_vmlinux_btf(obj, false);
+-	err = err ? : bpf_object__resolve_externs(obj, obj->kconfig);
+-	err = err ? : bpf_object__sanitize_maps(obj);
+-	err = err ? : bpf_object__init_kern_struct_ops_maps(obj);
+-	err = err ? : bpf_object_adjust_struct_ops_autoload(obj);
+-	err = err ? : bpf_object__relocate(obj, obj->btf_custom_path ? : target_btf_path);
+-	err = err ? : bpf_object__sanitize_and_load_btf(obj);
+-	err = err ? : bpf_object__create_maps(obj);
+-	err = err ? : bpf_object__load_progs(obj, extra_log_level);
++	if (obj->state < OBJ_PREPARED) {
++		err = bpf_object_prepare(obj, target_btf_path);
++		if (err)
++			return libbpf_err(err);
++	}
++	err = bpf_object__load_progs(obj, extra_log_level);
+ 	err = err ? : bpf_object_init_prog_arrays(obj);
+ 	err = err ? : bpf_object_prepare_struct_ops(obj);
+ 
+@@ -8593,35 +8659,22 @@ static int bpf_object_load(struct bpf_ob
+ 			err = bpf_gen__finish(obj->gen_loader, obj->nr_programs, obj->nr_maps);
+ 	}
+ 
+-	/* clean up fd_array */
+-	zfree(&obj->fd_array);
++	bpf_object_post_load_cleanup(obj);
++	obj->state = OBJ_LOADED; /* doesn't matter if successfully or not */
+ 
+-	/* clean up module BTFs */
+-	for (i = 0; i < obj->btf_module_cnt; i++) {
+-		close(obj->btf_modules[i].fd);
+-		btf__free(obj->btf_modules[i].btf);
+-		free(obj->btf_modules[i].name);
++	if (err) {
++		bpf_object_unpin(obj);
++		bpf_object_unload(obj);
++		pr_warn("failed to load object '%s'\n", obj->path);
++		return libbpf_err(err);
+ 	}
+-	free(obj->btf_modules);
+-
+-	/* clean up vmlinux BTF */
+-	btf__free(obj->btf_vmlinux);
+-	obj->btf_vmlinux = NULL;
+-
+-	obj->state = OBJ_LOADED; /* doesn't matter if successfully or not */
+-	if (err)
+-		goto out;
+ 
+ 	return 0;
+-out:
+-	/* unpin any maps that were auto-pinned during load */
+-	for (i = 0; i < obj->nr_maps; i++)
+-		if (obj->maps[i].pinned && !obj->maps[i].reused)
+-			bpf_map__unpin(&obj->maps[i], NULL);
++}
+ 
+-	bpf_object_unload(obj);
+-	pr_warn("failed to load object '%s'\n", obj->path);
+-	return libbpf_err(err);
++int bpf_object__prepare(struct bpf_object *obj)
++{
++	return libbpf_err(bpf_object_prepare(obj, NULL));
+ }
+ 
+ int bpf_object__load(struct bpf_object *obj)
+@@ -9069,6 +9122,13 @@ void bpf_object__close(struct bpf_object
+ 	if (IS_ERR_OR_NULL(obj))
+ 		return;
+ 
++	/*
++	 * if user called bpf_object__prepare() without ever getting to
++	 * bpf_object__load(), we need to clean up stuff that is normally
++	 * cleaned up at the end of loading step
++	 */
++	bpf_object_post_load_cleanup(obj);
++
+ 	usdt_manager_free(obj->usdt_man);
+ 	obj->usdt_man = NULL;
+ 
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@ -242,6 +242,19 @@ bpf_object__open_mem(const void *obj_buf
+ 		     const struct bpf_object_open_opts *opts);
+ 
+ /**
++ * @brief **bpf_object__prepare()** prepares BPF object for loading:
++ * performs ELF processing, relocations, prepares final state of BPF program
++ * instructions (accessible with bpf_program__insns()), creates and
++ * (potentially) pins maps. Leaves BPF object in the state ready for program
++ * loading.
++ * @param obj Pointer to a valid BPF object instance returned by
++ * **bpf_object__open*()** API
++ * @return 0, on success; negative error code, otherwise, error code is
++ * stored in errno
++ */
++int bpf_object__prepare(struct bpf_object *obj);
++
++/**
+  * @brief **bpf_object__load()** loads BPF object into kernel.
+  * @param obj Pointer to a valid BPF object instance returned by
+  * **bpf_object__open*()** APIs
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@ -436,6 +436,7 @@ LIBBPF_1.6.0 {
+ 		bpf_linker__add_buf;
+ 		bpf_linker__add_fd;
+ 		bpf_linker__new_fd;
++		bpf_object__prepare;
+ 		btf__add_decl_attr;
+ 		btf__add_type_attr;
+ } LIBBPF_1.5.0;

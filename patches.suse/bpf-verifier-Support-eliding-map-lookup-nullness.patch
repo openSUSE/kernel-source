@@ -1,0 +1,276 @@
+From: Daniel Xu <dxu@dxuuu.xyz>
+Date: Tue, 14 Jan 2025 13:28:45 -0700
+Subject: bpf: verifier: Support eliding map lookup nullness
+Patch-mainline: v6.14-rc1
+Git-commit: d2102f2f5d75a84dbab6ff890359f0bd4a18ca22
+References: jsc#PED-14653
+
+This commit allows progs to elide a null check on statically known map
+lookup keys. In other words, if the verifier can statically prove that
+the lookup will be in-bounds, allow the prog to drop the null check.
+
+This is useful for two reasons:
+
+1. Large numbers of nullness checks (especially when they cannot fail)
+   unnecessarily pushes prog towards BPF_COMPLEXITY_LIMIT_JMP_SEQ.
+2. It forms a tighter contract between programmer and verifier.
+
+For (1), bpftrace is starting to make heavier use of percpu scratch
+maps. As a result, for user scripts with large number of unrolled loops,
+we are starting to hit jump complexity verification errors.  These
+percpu lookups cannot fail anyways, as we only use static key values.
+Eliding nullness probably results in less work for verifier as well.
+
+For (2), percpu scratch maps are often used as a larger stack, as the
+currrent stack is limited to 512 bytes. In these situations, it is
+desirable for the programmer to express: "this lookup should never fail,
+and if it does, it means I messed up the code". By omitting the null
+check, the programmer can "ask" the verifier to double check the logic.
+
+Tests also have to be updated in sync with these changes, as the
+verifier is more efficient with this change. Notable, iters.c tests had
+to be changed to use a map type that still requires null checks, as it's
+exercising verifier tracking logic w.r.t iterators.
+
+Signed-off-by: Daniel Xu <dxu@dxuuu.xyz>
+Link: https://lore.kernel.org/r/68f3ea96ff3809a87e502a11a4bd30177fc5823e.1736886479.git.dxu@dxuuu.xyz
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ kernel/bpf/verifier.c                                   |   92 +++++++++++++++-
+ tools/testing/selftests/bpf/progs/iters.c               |   14 +-
+ tools/testing/selftests/bpf/progs/map_kptr_fail.c       |    2 
+ tools/testing/selftests/bpf/progs/verifier_map_in_map.c |    2 
+ tools/testing/selftests/bpf/verifier/map_kptr.c         |    2 
+ 5 files changed, 99 insertions(+), 13 deletions(-)
+
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -287,6 +287,7 @@ struct bpf_call_arg_meta {
+ 	u32 ret_btf_id;
+ 	u32 subprogno;
+ 	struct btf_field *kptr_field;
++	s64 const_map_key;
+ };
+ 
+ struct bpf_kfunc_call_arg_meta {
+@@ -9148,6 +9149,63 @@ static int check_reg_const_str(struct bp
+ 	return 0;
+ }
+ 
++/* Returns constant key value if possible, else negative error */
++static s64 get_constant_map_key(struct bpf_verifier_env *env,
++				struct bpf_reg_state *key,
++				u32 key_size)
++{
++	struct bpf_func_state *state = func(env, key);
++	struct bpf_reg_state *reg;
++	int slot, spi, off;
++	int spill_size = 0;
++	int zero_size = 0;
++	int stack_off;
++	int i, err;
++	u8 *stype;
++
++	if (!env->bpf_capable)
++		return -EOPNOTSUPP;
++	if (key->type != PTR_TO_STACK)
++		return -EOPNOTSUPP;
++	if (!tnum_is_const(key->var_off))
++		return -EOPNOTSUPP;
++
++	stack_off = key->off + key->var_off.value;
++	slot = -stack_off - 1;
++	spi = slot / BPF_REG_SIZE;
++	off = slot % BPF_REG_SIZE;
++	stype = state->stack[spi].slot_type;
++
++	/* First handle precisely tracked STACK_ZERO */
++	for (i = off; i >= 0 && stype[i] == STACK_ZERO; i--)
++		zero_size++;
++	if (zero_size >= key_size)
++		return 0;
++
++	/* Check that stack contains a scalar spill of expected size */
++	if (!is_spilled_scalar_reg(&state->stack[spi]))
++		return -EOPNOTSUPP;
++	for (i = off; i >= 0 && stype[i] == STACK_SPILL; i--)
++		spill_size++;
++	if (spill_size != key_size)
++		return -EOPNOTSUPP;
++
++	reg = &state->stack[spi].spilled_ptr;
++	if (!tnum_is_const(reg->var_off))
++		/* Stack value not statically known */
++		return -EOPNOTSUPP;
++
++	/* We are relying on a constant value. So mark as precise
++	 * to prevent pruning on it.
++	 */
++	bt_set_frame_slot(&env->bt, key->frameno, spi);
++	err = mark_chain_precision_batch(env);
++	if (err < 0)
++		return err;
++
++	return reg->var_off.value;
++}
++
+ static int check_func_arg(struct bpf_verifier_env *env, u32 arg,
+ 			  struct bpf_call_arg_meta *meta,
+ 			  const struct bpf_func_proto *fn,
+@@ -9158,6 +9216,7 @@ static int check_func_arg(struct bpf_ver
+ 	enum bpf_arg_type arg_type = fn->arg_type[arg];
+ 	enum bpf_reg_type type = reg->type;
+ 	u32 *arg_btf_id = NULL;
++	u32 key_size;
+ 	int err = 0;
+ 
+ 	if (arg_type == ARG_DONTCARE)
+@@ -9291,8 +9350,13 @@ skip_type_check:
+ 			verbose(env, "invalid map_ptr to access map->key\n");
+ 			return -EACCES;
+ 		}
+-		err = check_helper_mem_access(env, regno, meta->map_ptr->key_size,
+-					      BPF_READ, false, NULL);
++		key_size = meta->map_ptr->key_size;
++		err = check_helper_mem_access(env, regno, key_size, BPF_READ, false, NULL);
++		if (err)
++			return err;
++		meta->const_map_key = get_constant_map_key(env, reg, key_size);
++		if (meta->const_map_key < 0 && meta->const_map_key != -EOPNOTSUPP)
++			return meta->const_map_key;
+ 		break;
+ 	case ARG_PTR_TO_MAP_VALUE:
+ 		if (type_may_be_null(arg_type) && register_is_null(reg))
+@@ -10816,6 +10880,21 @@ static void update_loop_inline_state(str
+ 				 state->callback_subprogno == subprogno);
+ }
+ 
++/* Returns whether or not the given map type can potentially elide
++ * lookup return value nullness check. This is possible if the key
++ * is statically known.
++ */
++static bool can_elide_value_nullness(enum bpf_map_type type)
++{
++	switch (type) {
++	case BPF_MAP_TYPE_ARRAY:
++	case BPF_MAP_TYPE_PERCPU_ARRAY:
++		return true;
++	default:
++		return false;
++	}
++}
++
+ static int get_helper_proto(struct bpf_verifier_env *env, int func_id,
+ 			    const struct bpf_func_proto **ptr)
+ {
+@@ -11182,10 +11261,17 @@ static int check_helper_call(struct bpf_
+ 				"kernel subsystem misconfigured verifier\n");
+ 			return -EINVAL;
+ 		}
++
++		if (func_id == BPF_FUNC_map_lookup_elem &&
++		    can_elide_value_nullness(meta.map_ptr->map_type) &&
++		    meta.const_map_key >= 0 &&
++		    meta.const_map_key < meta.map_ptr->max_entries)
++			ret_flag &= ~PTR_MAYBE_NULL;
++
+ 		regs[BPF_REG_0].map_ptr = meta.map_ptr;
+ 		regs[BPF_REG_0].map_uid = meta.map_uid;
+ 		regs[BPF_REG_0].type = PTR_TO_MAP_VALUE | ret_flag;
+-		if (!type_may_be_null(ret_type) &&
++		if (!type_may_be_null(ret_flag) &&
+ 		    btf_record_has_field(meta.map_ptr->record, BPF_SPIN_LOCK)) {
+ 			regs[BPF_REG_0].id = ++env->id_gen;
+ 		}
+--- a/tools/testing/selftests/bpf/progs/iters.c
++++ b/tools/testing/selftests/bpf/progs/iters.c
+@@ -524,11 +524,11 @@ int iter_subprog_iters(const void *ctx)
+ }
+ 
+ struct {
+-	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(type, BPF_MAP_TYPE_HASH);
+ 	__type(key, int);
+ 	__type(value, int);
+ 	__uint(max_entries, 1000);
+-} arr_map SEC(".maps");
++} hash_map SEC(".maps");
+ 
+ SEC("?raw_tp")
+ __failure __msg("invalid mem access 'scalar'")
+@@ -539,7 +539,7 @@ int iter_err_too_permissive1(const void
+ 
+ 	MY_PID_GUARD();
+ 
+-	map_val = bpf_map_lookup_elem(&arr_map, &key);
++	map_val = bpf_map_lookup_elem(&hash_map, &key);
+ 	if (!map_val)
+ 		return 0;
+ 
+@@ -561,12 +561,12 @@ int iter_err_too_permissive2(const void
+ 
+ 	MY_PID_GUARD();
+ 
+-	map_val = bpf_map_lookup_elem(&arr_map, &key);
++	map_val = bpf_map_lookup_elem(&hash_map, &key);
+ 	if (!map_val)
+ 		return 0;
+ 
+ 	bpf_repeat(1000000) {
+-		map_val = bpf_map_lookup_elem(&arr_map, &key);
++		map_val = bpf_map_lookup_elem(&hash_map, &key);
+ 	}
+ 
+ 	*map_val = 123;
+@@ -585,7 +585,7 @@ int iter_err_too_permissive3(const void
+ 	MY_PID_GUARD();
+ 
+ 	bpf_repeat(1000000) {
+-		map_val = bpf_map_lookup_elem(&arr_map, &key);
++		map_val = bpf_map_lookup_elem(&hash_map, &key);
+ 		found = true;
+ 	}
+ 
+@@ -606,7 +606,7 @@ int iter_tricky_but_fine(const void *ctx
+ 	MY_PID_GUARD();
+ 
+ 	bpf_repeat(1000000) {
+-		map_val = bpf_map_lookup_elem(&arr_map, &key);
++		map_val = bpf_map_lookup_elem(&hash_map, &key);
+ 		if (map_val) {
+ 			found = true;
+ 			break;
+--- a/tools/testing/selftests/bpf/progs/map_kptr_fail.c
++++ b/tools/testing/selftests/bpf/progs/map_kptr_fail.c
+@@ -345,7 +345,7 @@ int reject_indirect_global_func_access(s
+ }
+ 
+ SEC("?tc")
+-__failure __msg("Unreleased reference id=5 alloc_insn=")
++__failure __msg("Unreleased reference id=4 alloc_insn=")
+ int kptr_xchg_ref_state(struct __sk_buff *ctx)
+ {
+ 	struct prog_test_ref_kfunc *p;
+--- a/tools/testing/selftests/bpf/progs/verifier_map_in_map.c
++++ b/tools/testing/selftests/bpf/progs/verifier_map_in_map.c
+@@ -47,7 +47,7 @@ l0_%=:	r0 = 0;						\
+ 
+ SEC("xdp")
+ __description("map in map state pruning")
+-__success __msg("processed 26 insns")
++__success __msg("processed 15 insns")
+ __log_level(2) __retval(0) __flag(BPF_F_TEST_STATE_FREQ)
+ __naked void map_in_map_state_pruning(void)
+ {
+--- a/tools/testing/selftests/bpf/verifier/map_kptr.c
++++ b/tools/testing/selftests/bpf/verifier/map_kptr.c
+@@ -373,7 +373,7 @@
+ 	.prog_type = BPF_PROG_TYPE_SCHED_CLS,
+ 	.fixup_map_kptr = { 1 },
+ 	.result = REJECT,
+-	.errstr = "Unreleased reference id=5 alloc_insn=20",
++	.errstr = "Unreleased reference id=4 alloc_insn=20",
+ 	.fixup_kfunc_btf_id = {
+ 		{ "bpf_kfunc_call_test_acquire", 15 },
+ 	}

@@ -1,0 +1,248 @@
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Mon, 3 Mar 2025 16:32:38 -0800
+Subject: bpf: Add verifier support for timed may_goto
+Patch-mainline: v6.15-rc1
+Git-commit: e723608bf428014b15d9904e062f44f5fe473ad6
+References: jsc#PED-14653
+
+Implement support in the verifier for replacing may_goto implementation
+from a counter-based approach to one which samples time on the local CPU
+to have a bigger loop bound.
+
+We implement it by maintaining 16-bytes per-stack frame, and using 8
+bytes for maintaining the count for amortizing time sampling, and 8
+bytes for the starting timestamp. To minimize overhead, we need to avoid
+spilling and filling of registers around this sequence, so we push this
+cost into the time sampling function 'arch_bpf_timed_may_goto'. This is
+a JIT-specific wrapper around bpf_check_timed_may_goto which returns us
+the count to store into the stack through BPF_REG_AX. All caller-saved
+registers (r0-r5) are guaranteed to remain untouched.
+
+The loop can be broken by returning count as 0, otherwise we dispatch
+into the function when the count drops to 0, and the runtime chooses to
+refresh it (by returning count as BPF_MAX_TIMED_LOOPS) or returning 0
+and aborting the loop on next iteration.
+
+Since the check for 0 is done right after loading the count from the
+stack, all subsequent cond_break sequences should immediately break as
+well, of the same loop or subsequent loops in the program.
+
+We pass in the stack_depth of the count (and thus the timestamp, by
+adding 8 to it) to the arch_bpf_timed_may_goto call so that it can be
+passed in to bpf_check_timed_may_goto as an argument after r1 is saved,
+by adding the offset to r10/fp. This adjustment will be arch specific,
+and the next patch will introduce support for x86.
+
+Note that depending on loop complexity, time spent in the loop can be
+more than the current limit (250 ms), but imposing an upper bound on
+program runtime is an orthogonal problem which will be addressed when
+program cancellations are supported.
+
+The current time afforded by cond_break may not be enough for cases
+where BPF programs want to implement locking algorithms inline, and use
+cond_break as a promise to the verifier that they will eventually
+terminate.
+
+Below are some benchmarking numbers on the time taken per-iteration for
+an empty loop that counts the number of iterations until cond_break
+fires. For comparison, we compare it against bpf_for/bpf_repeat which is
+another way to achieve the same number of spins (BPF_MAX_LOOPS).  The
+hardware used for benchmarking was a Sapphire Rapids Intel server with
+performance governor enabled, mitigations were enabled.
+
++-----------------------------+--------------+--------------+------------------+
+| Loop type                   | Iterations   |  Time (ms)   |   Time/iter (ns) |
++-----------------------------|--------------+--------------+------------------+
+| may_goto                    | 8388608      |  3           |   0.36           |
+| timed_may_goto (count=65535)| 589674932    |  250         |   0.42           |
+| bpf_for                     | 8388608      |  10          |   1.19           |
++-----------------------------+--------------+--------------+------------------+
+
+This gives a good approximation at low overhead while staying close to
+the current implementation.
+
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250304003239.2390751-2-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ include/linux/bpf.h    |    1 
+ include/linux/filter.h |    8 +++++
+ kernel/bpf/core.c      |   26 ++++++++++++++++++
+ kernel/bpf/verifier.c  |   69 +++++++++++++++++++++++++++++++++++++++++++------
+ 4 files changed, 96 insertions(+), 8 deletions(-)
+
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1987,6 +1987,7 @@ struct bpf_array {
+  */
+ enum {
+ 	BPF_MAX_LOOPS = 8 * 1024 * 1024,
++	BPF_MAX_TIMED_LOOPS = 0xffff,
+ };
+ 
+ #define BPF_F_ACCESS_MASK	(BPF_F_RDONLY |		\
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -669,6 +669,11 @@ struct bpf_prog_stats {
+ 	struct u64_stats_sync syncp;
+ } __aligned(2 * sizeof(u64));
+ 
++struct bpf_timed_may_goto {
++	u64 count;
++	u64 timestamp;
++};
++
+ struct sk_filter {
+ 	refcount_t	refcnt;
+ 	struct rcu_head	rcu;
+@@ -1130,8 +1135,11 @@ bool bpf_jit_supports_ptr_xchg(void);
+ bool bpf_jit_supports_arena(void);
+ bool bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena);
+ bool bpf_jit_supports_private_stack(void);
++bool bpf_jit_supports_timed_may_goto(void);
+ u64 bpf_arch_uaddress_limit(void);
+ void arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp), void *cookie);
++u64 arch_bpf_timed_may_goto(void);
++u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *);
+ bool bpf_helper_changes_pkt_data(enum bpf_func_id func_id);
+ 
+ static inline bool bpf_dump_raw_ok(const struct cred *cred)
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -3069,6 +3069,32 @@ void __weak arch_bpf_stack_walk(bool (*c
+ {
+ }
+ 
++bool __weak bpf_jit_supports_timed_may_goto(void)
++{
++	return false;
++}
++
++u64 __weak arch_bpf_timed_may_goto(void)
++{
++	return 0;
++}
++
++u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *p)
++{
++	u64 time = ktime_get_mono_fast_ns();
++
++	/* Populate the timestamp for this stack frame, and refresh count. */
++	if (!p->timestamp) {
++		p->timestamp = time;
++		return BPF_MAX_TIMED_LOOPS;
++	}
++	/* Check if we've exhausted our time slice, and zero count. */
++	if (time - p->timestamp >= (NSEC_PER_SEC / 4))
++		return 0;
++	/* Refresh the count for the stack frame. */
++	return BPF_MAX_TIMED_LOOPS;
++}
++
+ /* for configs without MMU or 32-bit */
+ __weak const struct bpf_map_ops arena_map_ops;
+ __weak u64 bpf_arena_get_user_vm_start(struct bpf_arena *arena)
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -21572,7 +21572,50 @@ static int do_misc_fixups(struct bpf_ver
+ 			goto next_insn;
+ 		}
+ 
+-		if (is_may_goto_insn(insn)) {
++		if (is_may_goto_insn(insn) && bpf_jit_supports_timed_may_goto()) {
++			int stack_off_cnt = -stack_depth - 16;
++
++			/*
++			 * Two 8 byte slots, depth-16 stores the count, and
++			 * depth-8 stores the start timestamp of the loop.
++			 *
++			 * The starting value of count is BPF_MAX_TIMED_LOOPS
++			 * (0xffff).  Every iteration loads it and subs it by 1,
++			 * until the value becomes 0 in AX (thus, 1 in stack),
++			 * after which we call arch_bpf_timed_may_goto, which
++			 * either sets AX to 0xffff to keep looping, or to 0
++			 * upon timeout. AX is then stored into the stack. In
++			 * the next iteration, we either see 0 and break out, or
++			 * continue iterating until the next time value is 0
++			 * after subtraction, rinse and repeat.
++			 */
++			stack_depth_extra = 16;
++			insn_buf[0] = BPF_LDX_MEM(BPF_DW, BPF_REG_AX, BPF_REG_10, stack_off_cnt);
++			if (insn->off >= 0)
++				insn_buf[1] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_AX, 0, insn->off + 5);
++			else
++				insn_buf[1] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_AX, 0, insn->off - 1);
++			insn_buf[2] = BPF_ALU64_IMM(BPF_SUB, BPF_REG_AX, 1);
++			insn_buf[3] = BPF_JMP_IMM(BPF_JNE, BPF_REG_AX, 0, 2);
++			/*
++			 * AX is used as an argument to pass in stack_off_cnt
++			 * (to add to r10/fp), and also as the return value of
++			 * the call to arch_bpf_timed_may_goto.
++			 */
++			insn_buf[4] = BPF_MOV64_IMM(BPF_REG_AX, stack_off_cnt);
++			insn_buf[5] = BPF_EMIT_CALL(arch_bpf_timed_may_goto);
++			insn_buf[6] = BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_AX, stack_off_cnt);
++			cnt = 7;
++
++			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
++			if (!new_prog)
++				return -ENOMEM;
++
++			delta += cnt - 1;
++			env->prog = prog = new_prog;
++			insn = new_prog->insnsi + i + delta;
++			goto next_insn;
++		} else if (is_may_goto_insn(insn)) {
+ 			int stack_off = -stack_depth - 8;
+ 
+ 			stack_depth_extra = 8;
+@@ -22113,23 +22156,33 @@ next_insn:
+ 
+ 	env->prog->aux->stack_depth = subprogs[0].stack_depth;
+ 	for (i = 0; i < env->subprog_cnt; i++) {
++		int delta = bpf_jit_supports_timed_may_goto() ? 2 : 1;
+ 		int subprog_start = subprogs[i].start;
+ 		int stack_slots = subprogs[i].stack_extra / 8;
++		int slots = delta, cnt = 0;
+ 
+ 		if (!stack_slots)
+ 			continue;
+-		if (stack_slots > 1) {
++		/* We need two slots in case timed may_goto is supported. */
++		if (stack_slots > slots) {
+ 			verbose(env, "verifier bug: stack_slots supports may_goto only\n");
+ 			return -EFAULT;
+ 		}
+ 
+-		/* Add ST insn to subprog prologue to init extra stack */
+-		insn_buf[0] = BPF_ST_MEM(BPF_DW, BPF_REG_FP,
+-					 -subprogs[i].stack_depth, BPF_MAX_LOOPS);
++		stack_depth = subprogs[i].stack_depth;
++		if (bpf_jit_supports_timed_may_goto()) {
++			insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, -stack_depth,
++						     BPF_MAX_TIMED_LOOPS);
++			insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, -stack_depth + 8, 0);
++		} else {
++			/* Add ST insn to subprog prologue to init extra stack */
++			insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, -stack_depth,
++						     BPF_MAX_LOOPS);
++		}
+ 		/* Copy first actual insn to preserve it */
+-		insn_buf[1] = env->prog->insnsi[subprog_start];
++		insn_buf[cnt++] = env->prog->insnsi[subprog_start];
+ 
+-		new_prog = bpf_patch_insn_data(env, subprog_start, insn_buf, 2);
++		new_prog = bpf_patch_insn_data(env, subprog_start, insn_buf, cnt);
+ 		if (!new_prog)
+ 			return -ENOMEM;
+ 		env->prog = prog = new_prog;
+@@ -22139,7 +22192,7 @@ next_insn:
+ 		 * to insn after BPF_ST that inits may_goto count.
+ 		 * Adjustment will succeed because bpf_patch_insn_data() didn't fail.
+ 		 */
+-		WARN_ON(adjust_jmp_off(env->prog, subprog_start, 1));
++		WARN_ON(adjust_jmp_off(env->prog, subprog_start, delta));
+ 	}
+ 
+ 	/* Since poke tab is now finalized, publish aux to tracker. */

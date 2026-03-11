@@ -1,0 +1,163 @@
+From: Hou Tao <houtao1@huawei.com>
+Date: Tue, 1 Apr 2025 14:22:47 +0800
+Subject: bpf: Support atomic update for htab of maps
+Patch-mainline: v6.16-rc1
+Git-commit: 2c304172e03193bd02363ee8969444261f7b7a57
+References: jsc#PED-14653
+
+As reported by Cody Haas [1], when there is concurrent map lookup and
+map update operation in an existing element for htab of maps, the map
+lookup procedure may return -ENOENT unexpectedly.
+
+The root cause is twofold:
+
+1) the update of existing element involves two separated list operation
+In htab_map_update_elem(), it first inserts the new element at the head
+of list, then it deletes the old element. Therefore, it is possible a
+lookup operation has already iterated to the middle of the list when a
+concurrent update operation begins, and the lookup operation will fail
+to find the target element.
+
+2) the immediate reuse of htab element.
+It is more subtle. Even through the lookup operation finds the old
+element, it is possible that the target element has been removed by a
+concurrent update operation, and the element has been reused immediately
+by other update operation which runs on the same CPU as the previous
+update operation, and the element is inserted into the same bucket list.
+After these steps above, when the lookup operation tries to compare the
+key in the old element with the expected key, the match will fail
+because the key in the old element have been overwritten by other update
+operation.
+
+The two-step update process is relatively straightforward to address.
+The more challenging aspect is the immediate reuse. As Alexei pointed
+out:
+
+ So since 2022 both prealloc and no_prealloc reuse elements.
+ We can consider a new flag for the hash map like F_REUSE_AFTER_RCU_GP
+ that will use _rcu() flavor of freeing into bpf_ma,
+ but it has to have a strong reason.
+
+Given that htab of maps doesn't support special field in value and
+directly stores the inner map pointer in htab_element, just do in-place
+update for htab of maps instead of attempting to address the immediate
+reuse issue.
+
+[1]: https://lore.kernel.org/xdp-newbies/CAH7f-ULFTwKdoH_t2SFc5rWCVYLEg-14d1fBYWH2eekudsnTRg@mail.gmail.com/
+
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Hou Tao <houtao1@huawei.com>
+Link: https://lore.kernel.org/r/20250401062250.543403-4-houtao@huaweicloud.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ kernel/bpf/hashtab.c |   44 +++++++++++++++++++++-----------------------
+ 1 file changed, 21 insertions(+), 23 deletions(-)
+
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@ -1076,10 +1076,9 @@ static long htab_map_update_elem(struct
+ 				 u64 map_flags)
+ {
+ 	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
+-	struct htab_elem *l_new = NULL, *l_old;
++	struct htab_elem *l_new, *l_old;
+ 	struct hlist_nulls_head *head;
+ 	unsigned long flags;
+-	void *old_map_ptr;
+ 	struct bucket *b;
+ 	u32 key_size, hash;
+ 	int ret;
+@@ -1160,24 +1159,14 @@ static long htab_map_update_elem(struct
+ 		hlist_nulls_del_rcu(&l_old->hash_node);
+ 
+ 		/* l_old has already been stashed in htab->extra_elems, free
+-		 * its special fields before it is available for reuse. Also
+-		 * save the old map pointer in htab of maps before unlock
+-		 * and release it after unlock.
++		 * its special fields before it is available for reuse.
+ 		 */
+-		old_map_ptr = NULL;
+-		if (htab_is_prealloc(htab)) {
+-			if (map->ops->map_fd_put_ptr)
+-				old_map_ptr = fd_htab_map_get_ptr(map, l_old);
++		if (htab_is_prealloc(htab))
+ 			check_and_free_fields(htab, l_old);
+-		}
+ 	}
+ 	htab_unlock_bucket(b, flags);
+-	if (l_old) {
+-		if (old_map_ptr)
+-			map->ops->map_fd_put_ptr(map, old_map_ptr, true);
+-		if (!htab_is_prealloc(htab))
+-			free_htab_elem(htab, l_old);
+-	}
++	if (l_old && !htab_is_prealloc(htab))
++		free_htab_elem(htab, l_old);
+ 	return 0;
+ err:
+ 	htab_unlock_bucket(b, flags);
+@@ -1265,6 +1254,7 @@ static long htab_map_update_elem_in_plac
+ 	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
+ 	struct htab_elem *l_new, *l_old;
+ 	struct hlist_nulls_head *head;
++	void *old_map_ptr = NULL;
+ 	unsigned long flags;
+ 	struct bucket *b;
+ 	u32 key_size, hash;
+@@ -1296,8 +1286,15 @@ static long htab_map_update_elem_in_plac
+ 
+ 	if (l_old) {
+ 		/* Update value in-place */
+-		pcpu_copy_value(htab, htab_elem_get_ptr(l_old, key_size),
+-				value, onallcpus);
++		if (percpu) {
++			pcpu_copy_value(htab, htab_elem_get_ptr(l_old, key_size),
++					value, onallcpus);
++		} else {
++			void **inner_map_pptr = htab_elem_value(l_old, key_size);
++
++			old_map_ptr = *inner_map_pptr;
++			WRITE_ONCE(*inner_map_pptr, *(void **)value);
++		}
+ 	} else {
+ 		l_new = alloc_htab_elem(htab, key, value, key_size,
+ 					hash, percpu, onallcpus, NULL);
+@@ -1309,6 +1306,8 @@ static long htab_map_update_elem_in_plac
+ 	}
+ err:
+ 	htab_unlock_bucket(b, flags);
++	if (old_map_ptr)
++		map->ops->map_fd_put_ptr(map, old_map_ptr, true);
+ 	return ret;
+ }
+ 
+@@ -2531,24 +2530,23 @@ int bpf_fd_htab_map_lookup_elem(struct b
+ 	return ret;
+ }
+ 
+-/* only called from syscall */
++/* Only called from syscall */
+ int bpf_fd_htab_map_update_elem(struct bpf_map *map, struct file *map_file,
+ 				void *key, void *value, u64 map_flags)
+ {
+ 	void *ptr;
+ 	int ret;
+-	u32 ufd = *(u32 *)value;
+ 
+-	ptr = map->ops->map_fd_get_ptr(map, map_file, ufd);
++	ptr = map->ops->map_fd_get_ptr(map, map_file, *(int *)value);
+ 	if (IS_ERR(ptr))
+ 		return PTR_ERR(ptr);
+ 
+ 	/* The htab bucket lock is always held during update operations in fd
+ 	 * htab map, and the following rcu_read_lock() is only used to avoid
+-	 * the WARN_ON_ONCE in htab_map_update_elem().
++	 * the WARN_ON_ONCE in htab_map_update_elem_in_place().
+ 	 */
+ 	rcu_read_lock();
+-	ret = htab_map_update_elem(map, key, &ptr, map_flags);
++	ret = htab_map_update_elem_in_place(map, key, &ptr, map_flags, false, false);
+ 	rcu_read_unlock();
+ 	if (ret)
+ 		map->ops->map_fd_put_ptr(map, ptr, false);
