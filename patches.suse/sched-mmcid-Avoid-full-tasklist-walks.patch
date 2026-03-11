@@ -1,0 +1,172 @@
+From: Thomas Gleixner <tglx@kernel.org>
+Date: Tue, 10 Mar 2026 21:29:09 +0100
+Subject: sched/mmcid: Avoid full tasklist walks
+References: bsc#1258936
+Patch-mainline: Submitted 20260310201009.257617049@kernel.org
+
+Chasing vfork()'ed tasks on a CID ownership mode switch requires a full
+task list walk, which is obviously expensive on large systems.
+
+Avoid that by keeping a list of tasks using a mm MMCID entity in mm::mm_cid
+and walk this list instead. This removes the proven to be flaky counting
+logic and avoids a full task list walk in the case of vfork()'ed tasks.
+
+Fixes: fbd0e71dc370 ("sched/mmcid: Provide CID ownership mode fixup functions")
+Signed-off-by: Thomas Gleixner <tglx@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ include/linux/rseq_types.h |    6 ++++-
+ kernel/fork.c              |    1 
+ kernel/sched/core.c        |   54 ++++++++++-----------------------------------
+ 3 files changed, 18 insertions(+), 43 deletions(-)
+
+--- a/include/linux/rseq_types.h
++++ b/include/linux/rseq_types.h
+@@ -103,10 +103,12 @@ struct rseq_data { };
+  * @active:	MM CID is active for the task
+  * @cid:	The CID associated to the task either permanently or
+  *		borrowed from the CPU
++ * @node:	Queued in the per MM MMCID list
+  */
+ struct sched_mm_cid {
+ 	unsigned int		active;
+ 	unsigned int		cid;
++	struct hlist_node	node;
+ };
+ 
+ /**
+@@ -127,6 +129,7 @@ struct mm_cid_pcpu {
+  * @work:		Regular work to handle the affinity mode change case
+  * @lock:		Spinlock to protect against affinity setting which can't take @mutex
+  * @mutex:		Mutex to serialize forks and exits related to this mm
++ * @user_list:		List of the MM CID users of a MM
+  * @nr_cpus_allowed:	The number of CPUs in the per MM allowed CPUs map. The map
+  *			is growth only.
+  * @users:		The number of tasks sharing this MM. Separate from mm::mm_users
+@@ -147,13 +150,14 @@ struct mm_mm_cid {
+ 
+ 	raw_spinlock_t		lock;
+ 	struct mutex		mutex;
++	struct hlist_head	user_list;
+ 
+ 	/* Low frequency modified */
+ 	unsigned int		nr_cpus_allowed;
+ 	unsigned int		users;
+ 	unsigned int		pcpu_thrs;
+ 	unsigned int		update_deferred;
+-}____cacheline_aligned_in_smp;
++} ____cacheline_aligned;
+ #else /* CONFIG_SCHED_MM_CID */
+ struct mm_mm_cid { };
+ struct sched_mm_cid { };
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -999,6 +999,7 @@ static struct task_struct *dup_task_stru
+ #ifdef CONFIG_SCHED_MM_CID
+ 	tsk->mm_cid.cid = MM_CID_UNSET;
+ 	tsk->mm_cid.active = 0;
++	INIT_HLIST_NODE(&tsk->mm_cid.node);
+ #endif
+ 	return tsk;
+ 
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -10569,13 +10569,10 @@ static inline void mm_cid_transit_to_cpu
+ 	}
+ }
+ 
+-static bool mm_cid_fixup_task_to_cpu(struct task_struct *t, struct mm_struct *mm)
++static void mm_cid_fixup_task_to_cpu(struct task_struct *t, struct mm_struct *mm)
+ {
+ 	/* Remote access to mm::mm_cid::pcpu requires rq_lock */
+ 	guard(task_rq_lock)(t);
+-	/* If the task is not active it is not in the users count */
+-	if (!t->mm_cid.active)
+-		return false;
+ 	if (cid_on_task(t->mm_cid.cid)) {
+ 		/* If running on the CPU, put the CID in transit mode, otherwise drop it */
+ 		if (task_rq(t)->curr == t)
+@@ -10583,51 +10580,21 @@ static bool mm_cid_fixup_task_to_cpu(str
+ 		else
+ 			mm_unset_cid_on_task(t);
+ 	}
+-	return true;
+ }
+ 
+-static void mm_cid_do_fixup_tasks_to_cpus(struct mm_struct *mm)
++static void mm_cid_fixup_tasks_to_cpus(void)
+ {
+-	struct task_struct *p, *t;
+-	unsigned int users;
+-
+-	/*
+-	 * This can obviously race with a concurrent affinity change, which
+-	 * increases the number of allowed CPUs for this mm, but that does
+-	 * not affect the mode and only changes the CID constraints. A
+-	 * possible switch back to per task mode happens either in the
+-	 * deferred handler function or in the next fork()/exit().
+-	 *
+-	 * The caller has already transferred so remove it from the users
+-	 * count. The incoming task is already visible and has mm_cid.active,
+-	 * but has task::mm_cid::cid == UNSET. Still it needs to be accounted
+-	 * for. Concurrent fork()s might add more threads, but all of them have
+-	 * task::mm_cid::active = 0, so they don't affect the accounting here.
+-	 */
+-	users = mm->mm_cid.users - 1;
+-
+-	guard(rcu)();
+-	for_other_threads(current, t) {
+-		if (mm_cid_fixup_task_to_cpu(t, mm))
+-			users--;
+-	}
++	struct mm_struct *mm = current->mm;
++	struct task_struct *t;
+ 
+-	if (!users)
+-		return;
++	lockdep_assert_held(&mm->mm_cid.mutex);
+ 
+-	/* Happens only for VM_CLONE processes. */
+-	for_each_process_thread(p, t) {
+-		if (t == current || t->mm != mm)
+-			continue;
+-		mm_cid_fixup_task_to_cpu(t, mm);
++	hlist_for_each_entry(t, &mm->mm_cid.user_list, mm_cid.node) {
++		/* Current has already transferred before invoking the fixup. */
++		if (t != current)
++			mm_cid_fixup_task_to_cpu(t, mm);
+ 	}
+-}
+-
+-static void mm_cid_fixup_tasks_to_cpus(void)
+-{
+-	struct mm_struct *mm = current->mm;
+ 
+-	mm_cid_do_fixup_tasks_to_cpus(mm);
+ 	mm_cid_complete_transit(mm, MM_CID_ONCPU);
+ }
+ 
+@@ -10636,6 +10603,7 @@ static bool sched_mm_cid_add_user(struct
+ 	lockdep_assert_held(&mm->mm_cid.lock);
+ 
+ 	t->mm_cid.active = 1;
++	hlist_add_head(&t->mm_cid.node, &mm->mm_cid.user_list);
+ 	mm->mm_cid.users++;
+ 	return mm_update_max_cids(mm);
+ }
+@@ -10693,6 +10661,7 @@ static bool sched_mm_cid_remove_user(str
+ 	/* Clear the transition bit */
+ 	t->mm_cid.cid = cid_from_transit_cid(t->mm_cid.cid);
+ 	mm_unset_cid_on_task(t);
++	hlist_del_init(&t->mm_cid.node);
+ 	t->mm->mm_cid.users--;
+ 	return mm_update_max_cids(t->mm);
+ }
+@@ -10835,6 +10804,7 @@ void mm_init_cid(struct mm_struct *mm, s
+ 	mutex_init(&mm->mm_cid.mutex);
+ 	mm->mm_cid.irq_work = IRQ_WORK_INIT_HARD(mm_cid_irq_work);
+ 	INIT_WORK(&mm->mm_cid.work, mm_cid_work_fn);
++	INIT_HLIST_HEAD(&mm->mm_cid.user_list);
+ 	cpumask_copy(mm_cpus_allowed(mm), &p->cpus_mask);
+ 	bitmap_zero(mm_cidmask(mm), num_possible_cpus());
+ }
