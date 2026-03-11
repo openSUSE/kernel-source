@@ -1,0 +1,215 @@
+From 4dd986a2d138c039be7771852b55001fa7a2c186 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Sat, 12 Jul 2025 03:33:43 +0000
+Subject: [PATCH] locking/mutex: Rework task_struct::blocked_on
+
+References: bsc#1234634 (Scheduler functional and performance backports SL-16.1)
+Patch-mainline: v6.17-rc1
+Git-commit: 44e4e0297c3c01987399bb9973f4d22a096a62c2
+
+Track the blocked-on relation for mutexes, to allow following this
+relation at schedule time.
+
+   task
+     | blocked-on
+     v
+   mutex
+     | owner
+     v
+   task
+
+This all will be used for tracking blocked-task/mutex chains
+with the prox-execution patch in a similar fashion to how
+priority inheritance is done with rt_mutexes.
+
+For serialization, blocked-on is only set by the task itself
+(current). And both when setting or clearing (potentially by
+others), is done while holding the mutex::wait_lock.
+
+[minor changes while rebasing]
+[jstultz: Fix blocked_on tracking in __mutex_lock_common in error paths]
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Juri Lelli <juri.lelli@redhat.com>
+Signed-off-by: Connor O'Brien <connoro@google.com>
+Signed-off-by: John Stultz <jstultz@google.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Tested-by: K Prateek Nayak <kprateek.nayak@amd.com>
+Link: https://lkml.kernel.org/r/20250712033407.2383110-3-jstultz@google.com
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ include/linux/sched.h        |  5 +----
+ kernel/fork.c                |  3 +--
+ kernel/locking/mutex-debug.c |  9 +++++----
+ kernel/locking/mutex.c       | 22 ++++++++++++++++++++++
+ kernel/locking/ww_mutex.h    | 18 ++++++++++++++++--
+ 5 files changed, 45 insertions(+), 12 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 6bd5eb25738e..22418095ac1b 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1236,10 +1236,7 @@ struct task_struct {
+ 	struct rt_mutex_waiter		*pi_blocked_on;
+ #endif
+ 
+-#ifdef CONFIG_DEBUG_MUTEXES
+-	/* Mutex deadlock detection: */
+-	struct mutex_waiter		*blocked_on;
+-#endif
++	struct mutex			*blocked_on;	/* lock we're blocked on */
+ 
+ #ifdef CONFIG_DEBUG_ATOMIC_SLEEP
+ 	int				non_block_count;
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 27ec4b871eb5..84c9bc20727f 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -2319,9 +2319,8 @@ __latent_entropy struct task_struct *copy_process(
+ 	lockdep_init_task(p);
+ #endif
+ 
+-#ifdef CONFIG_DEBUG_MUTEXES
+ 	p->blocked_on = NULL; /* not blocked yet */
+-#endif
++
+ #ifdef CONFIG_BCACHE
+ 	p->sequential_io	= 0;
+ 	p->sequential_io_avg	= 0;
+diff --git a/kernel/locking/mutex-debug.c b/kernel/locking/mutex-debug.c
+index 6e6f6071cfa2..758b7a6792b0 100644
+--- a/kernel/locking/mutex-debug.c
++++ b/kernel/locking/mutex-debug.c
+@@ -53,17 +53,18 @@ void debug_mutex_add_waiter(struct mutex *lock, struct mutex_waiter *waiter,
+ {
+ 	lockdep_assert_held(&lock->wait_lock);
+ 
+-	/* Mark the current thread as blocked on the lock: */
+-	task->blocked_on = waiter;
++	/* Current thread can't be already blocked (since it's executing!) */
++	DEBUG_LOCKS_WARN_ON(task->blocked_on);
+ }
+ 
+ void debug_mutex_remove_waiter(struct mutex *lock, struct mutex_waiter *waiter,
+ 			 struct task_struct *task)
+ {
++	struct mutex *blocked_on = READ_ONCE(task->blocked_on);
++
+ 	DEBUG_LOCKS_WARN_ON(list_empty(&waiter->list));
+ 	DEBUG_LOCKS_WARN_ON(waiter->task != task);
+-	DEBUG_LOCKS_WARN_ON(task->blocked_on != waiter);
+-	task->blocked_on = NULL;
++	DEBUG_LOCKS_WARN_ON(blocked_on && blocked_on != lock);
+ 
+ 	INIT_LIST_HEAD(&waiter->list);
+ 	waiter->task = NULL;
+diff --git a/kernel/locking/mutex.c b/kernel/locking/mutex.c
+index 5b1744cfb123..2f00bcde8fe1 100644
+--- a/kernel/locking/mutex.c
++++ b/kernel/locking/mutex.c
+@@ -627,6 +627,8 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
+ 			goto err_early_kill;
+ 	}
+ 
++	WARN_ON(current->blocked_on);
++	current->blocked_on = lock;
+ 	set_current_state(state);
+ 	trace_contention_begin(lock, LCB_F_MUTEX);
+ 	for (;;) {
+@@ -663,6 +665,12 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
+ 
+ 		first = __mutex_waiter_is_first(lock, &waiter);
+ 
++		/*
++		 * As we likely have been woken up by task
++		 * that has cleared our blocked_on state, re-set
++		 * it to the lock we are trying to aquire.
++		 */
++		current->blocked_on = lock;
+ 		set_current_state(state);
+ 		/*
+ 		 * Here we order against unlock; we must either see it change
+@@ -674,8 +682,11 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
+ 
+ 		if (first) {
+ 			trace_contention_begin(lock, LCB_F_MUTEX | LCB_F_SPIN);
++			/* clear blocked_on as mutex_optimistic_spin may schedule() */
++			current->blocked_on = NULL;
+ 			if (mutex_optimistic_spin(lock, ww_ctx, &waiter))
+ 				break;
++			current->blocked_on = lock;
+ 			trace_contention_begin(lock, LCB_F_MUTEX);
+ 		}
+ 
+@@ -683,6 +694,7 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
+ 	}
+ 	raw_spin_lock_irqsave(&lock->wait_lock, flags);
+ acquired:
++	current->blocked_on = NULL;
+ 	__set_current_state(TASK_RUNNING);
+ 
+ 	if (ww_ctx) {
+@@ -712,9 +724,11 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
+ 	return 0;
+ 
+ err:
++	current->blocked_on = NULL;
+ 	__set_current_state(TASK_RUNNING);
+ 	__mutex_remove_waiter(lock, &waiter);
+ err_early_kill:
++	WARN_ON(current->blocked_on);
+ 	trace_contention_end(lock, ret);
+ 	raw_spin_unlock_irqrestore_wake(&lock->wait_lock, flags, &wake_q);
+ 	debug_mutex_free_waiter(&waiter);
+@@ -925,6 +939,14 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
+ 		next = waiter->task;
+ 
+ 		debug_mutex_wake_waiter(lock, waiter);
++		/*
++		 * Unlock wakeups can be happening in parallel
++		 * (when optimistic spinners steal and release
++		 * the lock), so blocked_on may already be
++		 * cleared here.
++		 */
++		WARN_ON(next->blocked_on && next->blocked_on != lock);
++		next->blocked_on = NULL;
+ 		wake_q_add(&wake_q, next);
+ 	}
+ 
+diff --git a/kernel/locking/ww_mutex.h b/kernel/locking/ww_mutex.h
+index 37f025a096c9..45fe05e51db1 100644
+--- a/kernel/locking/ww_mutex.h
++++ b/kernel/locking/ww_mutex.h
+@@ -283,7 +283,15 @@ __ww_mutex_die(struct MUTEX *lock, struct MUTEX_WAITER *waiter,
+ 	if (waiter->ww_ctx->acquired > 0 && __ww_ctx_less(waiter->ww_ctx, ww_ctx)) {
+ #ifndef WW_RT
+ 		debug_mutex_wake_waiter(lock, waiter);
++		/*
++		 * When waking up the task to die, be sure to clear the
++		 * blocked_on pointer. Otherwise we can see circular
++		 * blocked_on relationships that can't resolve.
++		 */
++		WARN_ON(waiter->task->blocked_on &&
++			waiter->task->blocked_on != lock);
+ #endif
++		waiter->task->blocked_on = NULL;
+ 		wake_q_add(wake_q, waiter->task);
+ 	}
+ 
+@@ -331,9 +339,15 @@ static bool __ww_mutex_wound(struct MUTEX *lock,
+ 		 * it's wounded in __ww_mutex_check_kill() or has a
+ 		 * wakeup pending to re-read the wounded state.
+ 		 */
+-		if (owner != current)
++		if (owner != current) {
++			/*
++			 * When waking up the task to wound, be sure to clear the
++			 * blocked_on pointer. Otherwise we can see circular
++			 * blocked_on relationships that can't resolve.
++			 */
++			owner->blocked_on = NULL;
+ 			wake_q_add(wake_q, owner);
+-
++		}
+ 		return true;
+ 	}
+ 
