@@ -1,0 +1,198 @@
+From: "Mike Rapoport (Microsoft)" <rppt@kernel.org>
+Date: Wed, 25 Feb 2026 08:55:55 +0200
+Subject: [PATCH] x86/efi: defer freeing of boot services memory
+References: bsc#1012628
+Patch-mainline: 6.19.7
+Git-commit: a4b0bf6a40f3c107c67a24fbc614510ef5719980
+
+commit a4b0bf6a40f3c107c67a24fbc614510ef5719980 upstream.
+
+efi_free_boot_services() frees memory occupied by EFI_BOOT_SERVICES_CODE
+and EFI_BOOT_SERVICES_DATA using memblock_free_late().
+
+There are two issue with that: memblock_free_late() should be used for
+memory allocated with memblock_alloc() while the memory reserved with
+memblock_reserve() should be freed with free_reserved_area().
+
+More acutely, with CONFIG_DEFERRED_STRUCT_PAGE_INIT=y
+efi_free_boot_services() is called before deferred initialization of the
+memory map is complete.
+
+Benjamin Herrenschmidt reports that this causes a leak of ~140MB of
+RAM on EC2 t3a.nano instances which only have 512MB or RAM.
+
+If the freed memory resides in the areas that memory map for them is
+still uninitialized, they won't be actually freed because
+memblock_free_late() calls memblock_free_pages() and the latter skips
+uninitialized pages.
+
+Using free_reserved_area() at this point is also problematic because
+__free_page() accesses the buddy of the freed page and that again might
+end up in uninitialized part of the memory map.
+
+Delaying the entire efi_free_boot_services() could be problematic
+because in addition to freeing boot services memory it updates
+efi.memmap without any synchronization and that's undesirable late in
+boot when there is concurrency.
+
+More robust approach is to only defer freeing of the EFI boot services
+memory.
+
+Split efi_free_boot_services() in two. First efi_unmap_boot_services()
+collects ranges that should be freed into an array then
+efi_free_boot_services() later frees them after deferred init is complete.
+
+Link: https://lore.kernel.org/all/ec2aaef14783869b3be6e3c253b2dcbf67dbc12a.camel@kernel.crashing.org
+Fixes: 916f676f8dc0 ("x86, efi: Retain boot service code until after switching to virtual mode")
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Reviewed-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ arch/x86/include/asm/efi.h          |  2 +-
+ arch/x86/platform/efi/efi.c         |  2 +-
+ arch/x86/platform/efi/quirks.c      | 55 +++++++++++++++++++++++++++--
+ drivers/firmware/efi/mokvar-table.c |  2 +-
+ 4 files changed, 55 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/include/asm/efi.h b/arch/x86/include/asm/efi.h
+index f227a70ac91f..51b4cdbea061 100644
+--- a/arch/x86/include/asm/efi.h
++++ b/arch/x86/include/asm/efi.h
+@@ -138,7 +138,7 @@ extern void __init efi_apply_memmap_quirks(void);
+ extern int __init efi_reuse_config(u64 tables, int nr_tables);
+ extern void efi_delete_dummy_variable(void);
+ extern void efi_crash_gracefully_on_page_fault(unsigned long phys_addr);
+-extern void efi_free_boot_services(void);
++extern void efi_unmap_boot_services(void);
+ 
+ void arch_efi_call_virt_setup(void);
+ void arch_efi_call_virt_teardown(void);
+diff --git a/arch/x86/platform/efi/efi.c b/arch/x86/platform/efi/efi.c
+index 463b784499a8..791c52c8393f 100644
+--- a/arch/x86/platform/efi/efi.c
++++ b/arch/x86/platform/efi/efi.c
+@@ -837,7 +837,7 @@ static void __init __efi_enter_virtual_mode(void)
+ 	}
+ 
+ 	efi_check_for_embedded_firmwares();
+-	efi_free_boot_services();
++	efi_unmap_boot_services();
+ 
+ 	if (!efi_is_mixed())
+ 		efi_native_runtime_setup();
+diff --git a/arch/x86/platform/efi/quirks.c b/arch/x86/platform/efi/quirks.c
+index 553f330198f2..35caa5746115 100644
+--- a/arch/x86/platform/efi/quirks.c
++++ b/arch/x86/platform/efi/quirks.c
+@@ -341,7 +341,7 @@ void __init efi_reserve_boot_services(void)
+ 
+ 		/*
+ 		 * Because the following memblock_reserve() is paired
+-		 * with memblock_free_late() for this region in
++		 * with free_reserved_area() for this region in
+ 		 * efi_free_boot_services(), we must be extremely
+ 		 * careful not to reserve, and subsequently free,
+ 		 * critical regions of memory (like the kernel image) or
+@@ -404,17 +404,33 @@ static void __init efi_unmap_pages(efi_memory_desc_t *md)
+ 		pr_err("Failed to unmap VA mapping for 0x%llx\n", va);
+ }
+ 
+-void __init efi_free_boot_services(void)
++struct efi_freeable_range {
++	u64 start;
++	u64 end;
++};
++
++static struct efi_freeable_range *ranges_to_free;
++
++void __init efi_unmap_boot_services(void)
+ {
+ 	struct efi_memory_map_data data = { 0 };
+ 	efi_memory_desc_t *md;
+ 	int num_entries = 0;
++	int idx = 0;
++	size_t sz;
+ 	void *new, *new_md;
+ 
+ 	/* Keep all regions for /sys/kernel/debug/efi */
+ 	if (efi_enabled(EFI_DBG))
+ 		return;
+ 
++	sz = sizeof(*ranges_to_free) * efi.memmap.nr_map + 1;
++	ranges_to_free = kzalloc(sz, GFP_KERNEL);
++	if (!ranges_to_free) {
++		pr_err("Failed to allocate storage for freeable EFI regions\n");
++		return;
++	}
++
+ 	for_each_efi_memory_desc(md) {
+ 		unsigned long long start = md->phys_addr;
+ 		unsigned long long size = md->num_pages << EFI_PAGE_SHIFT;
+@@ -471,7 +487,15 @@ void __init efi_free_boot_services(void)
+ 			start = SZ_1M;
+ 		}
+ 
+-		memblock_free_late(start, size);
++		/*
++		 * With CONFIG_DEFERRED_STRUCT_PAGE_INIT parts of the memory
++		 * map are still not initialized and we can't reliably free
++		 * memory here.
++		 * Queue the ranges to free at a later point.
++		 */
++		ranges_to_free[idx].start = start;
++		ranges_to_free[idx].end = start + size;
++		idx++;
+ 	}
+ 
+ 	if (!num_entries)
+@@ -512,6 +536,31 @@ void __init efi_free_boot_services(void)
+ 	}
+ }
+ 
++static int __init efi_free_boot_services(void)
++{
++	struct efi_freeable_range *range = ranges_to_free;
++	unsigned long freed = 0;
++
++	if (!ranges_to_free)
++		return 0;
++
++	while (range->start) {
++		void *start = phys_to_virt(range->start);
++		void *end = phys_to_virt(range->end);
++
++		free_reserved_area(start, end, -1, NULL);
++		freed += (end - start);
++		range++;
++	}
++	kfree(ranges_to_free);
++
++	if (freed)
++		pr_info("Freeing EFI boot services memory: %ldK\n", freed / SZ_1K);
++
++	return 0;
++}
++arch_initcall(efi_free_boot_services);
++
+ /*
+  * A number of config table entries get remapped to virtual addresses
+  * after entering EFI virtual mode. However, the kexec kernel requires
+diff --git a/drivers/firmware/efi/mokvar-table.c b/drivers/firmware/efi/mokvar-table.c
+index aedbbd627706..741674a0a70c 100644
+--- a/drivers/firmware/efi/mokvar-table.c
++++ b/drivers/firmware/efi/mokvar-table.c
+@@ -85,7 +85,7 @@ static struct kobject *mokvar_kobj;
+  * as an alternative to ordinary EFI variables, due to platform-dependent
+  * limitations. The memory occupied by this table is marked as reserved.
+  *
+- * This routine must be called before efi_free_boot_services() in order
++ * This routine must be called before efi_unmap_boot_services() in order
+  * to guarantee that it can mark the table as reserved.
+  *
+  * Implicit inputs:
+-- 
+2.53.0
+
