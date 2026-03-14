@@ -232,9 +232,13 @@ def parse_section_header(line):
     head = git_sort.Head(*args)
 
     if head not in git_sort.remotes:
+        prefix = str(head.repo_url)[0:2];
+        common = [ "\t%s" % (remote,) for remote in git_sort.remotes
+                  if str(remote.repo_url).startswith(prefix) ]
         raise exc.KSError(
             "Section comment \"%s\" in series.conf does not match any Head in "
-            "variable \"remotes\". series.conf is invalid." % (line,))
+            "variable \"remotes\". series.conf is invalid.\nHeads with common two letters (perhaps "
+            "you misspelled one of them?):\n%s" % (line, '\n'.join(common)))
     
     return head
 

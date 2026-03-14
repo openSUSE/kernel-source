@@ -11,15 +11,11 @@ import os
 
 
 def json_custom_dump(data):
-    if sys.version_info.major == 3 and sys.version_info.minor < 6:
-        keys = sorted(data.keys())
-    else:
-        keys = data.keys()
     return '{' + (
             '\n  ' + ',\n  '.join([
                 json.dumps(k) + ': [ ' + (','.join([
                     json.dumps(v) for v in data[k]]) if data[k] else '')
-                + ' ]' for k in keys ])
+                + ' ]' for k in sorted(data.keys()) ])
             if data else '' ) +'\n}\n'
 
 
