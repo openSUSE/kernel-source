@@ -1,0 +1,129 @@
+From: Petr Mladek <pmladek@suse.com>
+Date: Fri, 12 Dec 2025 13:45:20 +0100
+Subject: printk/nbcon: Restore IRQ in atomic flush after each emitted record
+Git-commit: 9bd18e1262c0fec6d76ffe6e2eae2b5f6cc08e3e
+Patch-mainline: v6.19-rc6
+References: bsc#1261149
+
+The commit d5d399efff6577 ("printk/nbcon: Release nbcon consoles ownership
+in atomic flush after each emitted record") prevented stall of a CPU
+which lost nbcon console ownership because another CPU entered
+an emergency flush.
+
+But there is still the problem that the CPU doing the emergency flush
+might cause a stall on its own.
+
+Let's go even further and restore IRQ in the atomic flush after
+each emitted record.
+
+It is not a complete solution. The interrupts and/or scheduling might
+still be blocked when the emergency atomic flush was called with
+IRQs and/or scheduling disabled. But it should remove the following
+lockup:
+
+  mlx5_core 0000:03:00.0: Shutdown was called
+  kvm: exiting hardware virtualization
+  arm-smmu-v3 arm-smmu-v3.10.auto: CMD_SYNC timeout at 0x00000103 [hwprod 0x00000104, hwcons 0x00000102]
+  smp: csd: Detected non-responsive CSD lock (#1) on CPU#4, waiting 5000000032 ns for CPU#00 do_nothing (kernel/smp.c:1057)
+  smp:     csd: CSD lock (#1) unresponsive.
+  [...]
+  Call trace:
+  pl011_console_write_atomic (./arch/arm64/include/asm/vdso/processor.h:12 drivers/tty/serial/amba-pl011.c:2540) (P)
+  nbcon_emit_next_record (kernel/printk/nbcon.c:1049)
+  __nbcon_atomic_flush_pending_con (kernel/printk/nbcon.c:1517)
+  __nbcon_atomic_flush_pending.llvm.15488114865160659019 (./arch/arm64/include/asm/alternative-macros.h:254 ./arch/arm64/include/asm/cpufeature.h:808 ./arch/arm64/include/asm/irqflags.h:192 kernel/printk/nbcon.c:1562 kernel/printk/nbcon.c:1612)
+  nbcon_atomic_flush_pending (kernel/printk/nbcon.c:1629)
+  printk_kthreads_shutdown (kernel/printk/printk.c:?)
+  syscore_shutdown (drivers/base/syscore.c:120)
+  kernel_kexec (kernel/kexec_core.c:1045)
+  __arm64_sys_reboot (kernel/reboot.c:794 kernel/reboot.c:722 kernel/reboot.c:722)
+  invoke_syscall (arch/arm64/kernel/syscall.c:50)
+  el0_svc_common.llvm.14158405452757855239 (arch/arm64/kernel/syscall.c:?)
+  do_el0_svc (arch/arm64/kernel/syscall.c:152)
+  el0_svc (./arch/arm64/include/asm/alternative-macros.h:254 ./arch/arm64/include/asm/cpufeature.h:808 ./arch/arm64/include/asm/irqflags.h:73 arch/arm64/kernel/entry-common.c:169 arch/arm64/kernel/entry-common.c:182 arch/arm64/kernel/entry-common.c:749)
+  el0t_64_sync_handler (arch/arm64/kernel/entry-common.c:820)
+  el0t_64_sync (arch/arm64/kernel/entry.S:600)
+
+In this case, nbcon_atomic_flush_pending() is called from
+printk_kthreads_shutdown() with IRQs and scheduling enabled.
+
+Note that __nbcon_atomic_flush_pending_con() is directly called also from
+nbcon_device_release() where the disabled IRQs might break PREEMPT_RT
+guarantees. But the atomic flush is called only in emergency or panic
+situations where the latencies are irrelevant anyway.
+
+An ultimate solution would be a touching of watchdogs. But it would hide
+all problems. Let's do it later when anyone reports a stall which does
+not have a better solution.
+
+Closes: https://lore.kernel.org/r/sqwajvt7utnt463tzxgwu2yctyn5m6bjwrslsnupfexeml6hkd@v6sqmpbu3vvu
+Tested-by: Breno Leitao <leitao@debian.org>
+Reviewed-by: John Ogness <john.ogness@linutronix.de>
+Link: https://patch.msgid.link/20251212124520.244483-1-pmladek@suse.com
+Signed-off-by: Petr Mladek <pmladek@suse.com>
+---
+ kernel/printk/nbcon.c |   38 ++++++++++++++++++--------------------
+ 1 file changed, 18 insertions(+), 20 deletions(-)
+
+--- a/kernel/printk/nbcon.c
++++ b/kernel/printk/nbcon.c
+@@ -1535,18 +1535,27 @@ static int __nbcon_atomic_flush_pending_
+ 	ctxt->allow_unsafe_takeover	= allow_unsafe_takeover;
+ 
+ 	while (nbcon_seq_read(con) < stop_seq) {
+-		if (!nbcon_context_try_acquire(ctxt, false))
+-			return -EPERM;
+-
+ 		/*
+-		 * nbcon_emit_next_record() returns false when the console was
+-		 * handed over or taken over. In both cases the context is no
+-		 * longer valid.
++		 * Atomic flushing does not use console driver synchronization
++		 * (i.e. it does not hold the port lock for uart consoles).
++		 * Therefore IRQs must be disabled to avoid being interrupted
++		 * and then calling into a driver that will deadlock trying
++		 * to acquire console ownership.
+ 		 */
+-		if (!nbcon_emit_next_record(&wctxt, true))
+-			return -EAGAIN;
++		scoped_guard(irqsave) {
++			if (!nbcon_context_try_acquire(ctxt, false))
++				return -EPERM;
++
++			/*
++			 * nbcon_emit_next_record() returns false when
++			 * the console was handed over or taken over.
++			 * In both cases the context is no longer valid.
++			 */
++			if (!nbcon_emit_next_record(&wctxt, true))
++				return -EAGAIN;
+ 
+-		nbcon_context_release(ctxt);
++			nbcon_context_release(ctxt);
++		}
+ 
+ 		if (!ctxt->backlog) {
+ 			/* Are there reserved but not yet finalized records? */
+@@ -1575,22 +1584,11 @@ static void nbcon_atomic_flush_pending_c
+ 					   bool allow_unsafe_takeover)
+ {
+ 	struct console_flush_type ft;
+-	unsigned long flags;
+ 	int err;
+ 
+ again:
+-	/*
+-	 * Atomic flushing does not use console driver synchronization (i.e.
+-	 * it does not hold the port lock for uart consoles). Therefore IRQs
+-	 * must be disabled to avoid being interrupted and then calling into
+-	 * a driver that will deadlock trying to acquire console ownership.
+-	 */
+-	local_irq_save(flags);
+-
+ 	err = __nbcon_atomic_flush_pending_con(con, stop_seq, allow_unsafe_takeover);
+ 
+-	local_irq_restore(flags);
+-
+ 	/*
+ 	 * If there was a new owner (-EPERM, -EAGAIN), that context is
+ 	 * responsible for completing.
