@@ -27,6 +27,13 @@ def _json_custom_dump(data, indent=0):
     else:
         return json.dumps(data)
 
+def get_maintainership(data, package):
+    if maintainership_is_new_format(data):
+        result = data.get('packages', {}).get(package, {}).get('users', [])
+    else:
+        result = data.get(package, [])
+    return result if result else []
+
 def update_maintainership(data, package, maintainers):
     if maintainership_is_new_format(data):
         data.setdefault('packages', {}).setdefault(package, {})['users'] = maintainers

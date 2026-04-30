@@ -1,4 +1,4 @@
-from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership
+from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership, get_maintainership
 from kutil.config import get_package_archs, get_kernel_projects, uniq
 from obsapi.obsapi import OBSAPI, PkgRepo, process_scmsync
 from obsapi.uploader import UploaderBase
@@ -264,7 +264,18 @@ class TestMisc(unittest.TestCase):
         for data, result in testdata:
             self.assertEqual(json_custom_dump(data), result)
 
-    def test_update_maintainersip(self):
+    def test_get_maintainership(self):
+        testdata = [
+                [[{}, 'kernel-source'], []],
+                [[{'header': {}}, 'kernel-source'], []],
+                [[{'header': {}, 'packages': {'kernel-source': {'users': ['maint4', 'maint5']}}}, 'kernel-source'], ['maint4', 'maint5']],
+                [[{'header': {}, 'packages': {'kernel-source': {'users': None}}}, 'kernel-source'], []],
+                [[{'kernel-source': ['maint4', 'maint5']}, 'kernel-source'], ['maint4', 'maint5']],
+                ]
+        for args, result in testdata:
+            self.assertEqual(get_maintainership(*args), result)
+
+    def test_update_maintainership(self):
         testdata = [
                 [[{}, 'kernel-source', ['maint1', 'maint2']], {'kernel-source' : ['maint1', 'maint2']}],
                 [[{'header': {}}, 'kernel-source', ['maint1', 'maint2']], {'header': {}, 'packages': {'kernel-source': {'users': ['maint1', 'maint2']}}}],

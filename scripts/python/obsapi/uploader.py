@@ -1,5 +1,5 @@
 from kutil.config import get_kernel_projects, get_package_archs, get_source_timestamp, read_source_timestamp, get_kernel_project_package, list_files, list_specs
-from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership
+from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership, get_maintainership
 from obsapi.obsapi import OBSAPI, PkgRepo
 import xml.etree.ElementTree as ET
 from obsapi.api import APIError
@@ -323,7 +323,7 @@ Constraint: hardware:disk:size unit=G %i
             data = self.tea.get_file_data(prjrepo.org, prjrepo.repo, prjrepo.branch, maintfile)
             data_decoded = json.loads(data)
             assert json.loads(json_custom_dump(data_decoded)) == data_decoded
-            current_maintainers = json.loads(data).get(self.package, [])
+            current_maintainers = get_maintainership(data_decoded, self.package)
             if (maintainers and maintainers != current_maintainers) or (not maintainers and data != json_custom_dump(data_decoded)):
                 if maintainers:
                     data_decoded = update_maintainership(data_decoded, self.package, maintainers)
