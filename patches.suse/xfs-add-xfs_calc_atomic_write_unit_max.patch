@@ -1,0 +1,344 @@
+From 0c438dcc31504bf4f50b20dc52f8f5ca7fab53e2 Mon Sep 17 00:00:00 2001
+From: John Garry <john.g.garry@oracle.com>
+Date: Wed, 7 May 2025 14:18:32 -0700
+Subject: xfs: add xfs_calc_atomic_write_unit_max()
+Git-commit: 0c438dcc31504bf4f50b20dc52f8f5ca7fab53e2
+Patch-mainline: v6.16-rc1
+References: jsc#PED-15653
+
+Now that CoW-based atomic writes are supported, update the max size of an
+atomic write for the data device.
+
+The limit of a CoW-based atomic write will be the limit of the number of
+logitems which can fit into a single transaction.
+
+In addition, the max atomic write size needs to be aligned to the agsize.
+Limit the size of atomic writes to the greatest power-of-two factor of the
+agsize so that allocations for an atomic write will always be aligned
+compatibly with the alignment requirements of the storage.
+
+Function xfs_atomic_write_logitems() is added to find the limit the number
+of log items which can fit in a single transaction.
+
+Amend the max atomic write computation to create a new transaction
+reservation type, and compute the maximum size of an atomic write
+completion (in fsblocks) based on this new transaction reservation.
+Initially, tr_atomic_write is a clone of tr_itruncate, which provides a
+reasonable level of parallelism.  In the next patch, we'll add a mount
+option so that sysadmins can configure their own limits.
+
+[djwong: use a new reservation type for atomic write ioends, refactor
+group limit calculations]
+
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+[jpg: rounddown power-of-2 always]
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: John Garry <john.g.garry@oracle.com>
+Acked-by: Anthony Iliopoulos <ailiop@suse.com>
+
+---
+ fs/xfs/libxfs/xfs_trans_resv.c |   94 +++++++++++++++++++++++++++++++++++++++++
+ fs/xfs/libxfs/xfs_trans_resv.h |    2 
+ fs/xfs/xfs_mount.c             |   53 +++++++++++++++++++++++
+ fs/xfs/xfs_mount.h             |    5 ++
+ fs/xfs/xfs_reflink.c           |   16 ++++++
+ fs/xfs/xfs_reflink.h           |    2 
+ fs/xfs/xfs_trace.h             |   53 +++++++++++++++++++++++
+ 7 files changed, 225 insertions(+)
+
+--- a/fs/xfs/libxfs/xfs_trans_resv.c
++++ b/fs/xfs/libxfs/xfs_trans_resv.c
+@@ -22,6 +22,12 @@
+ #include "xfs_rtbitmap.h"
+ #include "xfs_attr_item.h"
+ #include "xfs_log.h"
++#include "xfs_defer.h"
++#include "xfs_bmap_item.h"
++#include "xfs_extfree_item.h"
++#include "xfs_rmap_item.h"
++#include "xfs_refcount_item.h"
++#include "xfs_trace.h"
+ 
+ #define _ALLOC	true
+ #define _FREE	false
+@@ -1337,3 +1343,91 @@ xfs_trans_resv_calc(
+ 	 */
+ 	xfs_calc_default_atomic_ioend_reservation(mp, resp);
+ }
++
++/*
++ * Return the per-extent and fixed transaction reservation sizes needed to
++ * complete an atomic write.
++ */
++STATIC unsigned int
++xfs_calc_atomic_write_ioend_geometry(
++	struct xfs_mount	*mp,
++	unsigned int		*step_size)
++{
++	const unsigned int	efi = xfs_efi_log_space(1);
++	const unsigned int	efd = xfs_efd_log_space(1);
++	const unsigned int	rui = xfs_rui_log_space(1);
++	const unsigned int	rud = xfs_rud_log_space();
++	const unsigned int	cui = xfs_cui_log_space(1);
++	const unsigned int	cud = xfs_cud_log_space();
++	const unsigned int	bui = xfs_bui_log_space(1);
++	const unsigned int	bud = xfs_bud_log_space();
++
++	/*
++	 * Maximum overhead to complete an atomic write ioend in software:
++	 * remove data fork extent + remove cow fork extent + map extent into
++	 * data fork.
++	 *
++	 * tx0: Creates a BUI and a CUI and that's all it needs.
++	 *
++	 * tx1: Roll to finish the BUI.  Need space for the BUD, an RUI, and
++	 * enough space to relog the CUI (== CUI + CUD).
++	 *
++	 * tx2: Roll again to finish the RUI.  Need space for the RUD and space
++	 * to relog the CUI.
++	 *
++	 * tx3: Roll again, need space for the CUD and possibly a new EFI.
++	 *
++	 * tx4: Roll again, need space for an EFD.
++	 *
++	 * If the extent referenced by the pair of BUI/CUI items is not the one
++	 * being currently processed, then we need to reserve space to relog
++	 * both items.
++	 */
++	const unsigned int	tx0 = bui + cui;
++	const unsigned int	tx1 = bud + rui + cui + cud;
++	const unsigned int	tx2 = rud + cui + cud;
++	const unsigned int	tx3 = cud + efi;
++	const unsigned int	tx4 = efd;
++	const unsigned int	relog = bui + bud + cui + cud;
++
++	const unsigned int	per_intent = max(max3(tx0, tx1, tx2),
++						 max3(tx3, tx4, relog));
++
++	/* Overhead to finish one step of each intent item type */
++	const unsigned int	f1 = xfs_calc_finish_efi_reservation(mp, 1);
++	const unsigned int	f2 = xfs_calc_finish_rui_reservation(mp, 1);
++	const unsigned int	f3 = xfs_calc_finish_cui_reservation(mp, 1);
++	const unsigned int	f4 = xfs_calc_finish_bui_reservation(mp, 1);
++
++	/* We only finish one item per transaction in a chain */
++	*step_size = max(f4, max3(f1, f2, f3));
++
++	return per_intent;
++}
++
++/*
++ * Compute the maximum size (in fsblocks) of atomic writes that we can complete
++ * given the existing log reservations.
++ */
++xfs_extlen_t
++xfs_calc_max_atomic_write_fsblocks(
++	struct xfs_mount		*mp)
++{
++	const struct xfs_trans_res	*resv = &M_RES(mp)->tr_atomic_ioend;
++	unsigned int			per_intent = 0;
++	unsigned int			step_size = 0;
++	unsigned int			ret = 0;
++
++	if (resv->tr_logres > 0) {
++		per_intent = xfs_calc_atomic_write_ioend_geometry(mp,
++				&step_size);
++
++		if (resv->tr_logres >= step_size)
++			ret = (resv->tr_logres - step_size) / per_intent;
++	}
++
++	trace_xfs_calc_max_atomic_write_fsblocks(mp, per_intent, step_size,
++			resv->tr_logres, ret);
++
++	return ret;
++}
+--- a/fs/xfs/libxfs/xfs_trans_resv.h
++++ b/fs/xfs/libxfs/xfs_trans_resv.h
+@@ -121,4 +121,6 @@ unsigned int xfs_calc_itruncate_reservat
+ unsigned int xfs_calc_write_reservation_minlogsize(struct xfs_mount *mp);
+ unsigned int xfs_calc_qm_dqalloc_reservation_minlogsize(struct xfs_mount *mp);
+ 
++xfs_extlen_t xfs_calc_max_atomic_write_fsblocks(struct xfs_mount *mp);
++
+ #endif	/* __XFS_TRANS_RESV_H__ */
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -632,6 +632,52 @@ xfs_agbtree_compute_maxlevels(
+ 	mp->m_agbtree_maxlevels = max(levels, mp->m_refc_maxlevels);
+ }
+ 
++/* Maximum atomic write IO size that the kernel allows. */
++static inline xfs_extlen_t xfs_calc_atomic_write_max(struct xfs_mount *mp)
++{
++	return rounddown_pow_of_two(XFS_B_TO_FSB(mp, MAX_RW_COUNT));
++}
++
++static inline unsigned int max_pow_of_two_factor(const unsigned int nr)
++{
++	return 1 << (ffs(nr) - 1);
++}
++
++/*
++ * If the data device advertises atomic write support, limit the size of data
++ * device atomic writes to the greatest power-of-two factor of the AG size so
++ * that every atomic write unit aligns with the start of every AG.  This is
++ * required so that the per-AG allocations for an atomic write will always be
++ * aligned compatibly with the alignment requirements of the storage.
++ *
++ * If the data device doesn't advertise atomic writes, then there are no
++ * alignment restrictions and the largest out-of-place write we can do
++ * ourselves is the number of blocks that user files can allocate from any AG.
++ */
++static inline xfs_extlen_t xfs_calc_perag_awu_max(struct xfs_mount *mp)
++{
++	if (mp->m_ddev_targp->bt_bdev_awu_min > 0)
++		return max_pow_of_two_factor(mp->m_sb.sb_agblocks);
++	return rounddown_pow_of_two(mp->m_ag_max_usable);
++}
++
++/* Compute the maximum atomic write unit size for each section. */
++static inline void
++xfs_calc_atomic_write_unit_max(
++	struct xfs_mount	*mp)
++{
++	struct xfs_groups	*ags = &mp->m_groups[XG_TYPE_AG];
++
++	const xfs_extlen_t	max_write = xfs_calc_atomic_write_max(mp);
++	const xfs_extlen_t	max_ioend = xfs_reflink_max_atomic_cow(mp);
++	const xfs_extlen_t	max_agsize = xfs_calc_perag_awu_max(mp);
++
++	ags->awu_max = min3(max_write, max_ioend, max_agsize);
++
++	trace_xfs_calc_atomic_write_unit_max(mp, max_write, max_ioend,
++			max_agsize);
++}
++
+ /*
+  * This function does the following on an initial mount of a file system:
+  *	- reads the superblock from disk and init the mount struct
+@@ -1007,6 +1053,13 @@ xfs_mountfs(
+ 			goto out_agresv;
+ 	}
+ 
++	/*
++	 * Pre-calculate atomic write unit max.  This involves computations
++	 * derived from transaction reservations, so we must do this after the
++	 * log is fully initialized.
++	 */
++	xfs_calc_atomic_write_unit_max(mp);
++
+ 	return 0;
+ 
+  out_agresv:
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -105,6 +105,11 @@ struct xfs_groups {
+ 	 */
+ 	uint64_t		blkmask;
+ 
++	/*
++	 * Maximum length of an atomic write for files stored in this
++	 * collection of allocation groups, in fsblocks.
++	 */
++	xfs_extlen_t		awu_max;
+ };
+ 
+ /*
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@ -952,6 +952,22 @@ out_cancel:
+ 	return error;
+ }
+ 
++/* Compute the largest atomic write that we can complete through software. */
++xfs_extlen_t
++xfs_reflink_max_atomic_cow(
++	struct xfs_mount	*mp)
++{
++	/* We cannot do any atomic writes without out of place writes. */
++	if (!xfs_can_sw_atomic_write(mp))
++		return 0;
++
++	/*
++	 * Atomic write limits must always be a power-of-2, according to
++	 * generic_atomic_write_valid.
++	 */
++	return rounddown_pow_of_two(xfs_calc_max_atomic_write_fsblocks(mp));
++}
++
+ /*
+  * Free all CoW staging blocks that are still referenced by the ondisk refcount
+  * metadata.  The ondisk metadata does not track which inode created the
+--- a/fs/xfs/xfs_reflink.h
++++ b/fs/xfs/xfs_reflink.h
+@@ -66,4 +66,6 @@ extern int xfs_reflink_remap_blocks(stru
+ extern int xfs_reflink_update_dest(struct xfs_inode *dest, xfs_off_t newlen,
+ 		xfs_extlen_t cowextsize, unsigned int remap_flags);
+ 
++xfs_extlen_t xfs_reflink_max_atomic_cow(struct xfs_mount *mp);
++
+ #endif /* __XFS_REFLINK_H */
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -162,6 +162,59 @@ DEFINE_ATTR_LIST_EVENT(xfs_attr_list_not
+ DEFINE_ATTR_LIST_EVENT(xfs_attr_leaf_list);
+ DEFINE_ATTR_LIST_EVENT(xfs_attr_node_list);
+ 
++TRACE_EVENT(xfs_calc_atomic_write_unit_max,
++	TP_PROTO(struct xfs_mount *mp, unsigned int max_write,
++		 unsigned int max_ioend, unsigned int max_agsize),
++	TP_ARGS(mp, max_write, max_ioend, max_agsize),
++	TP_STRUCT__entry(
++		__field(dev_t, dev)
++		__field(unsigned int, max_write)
++		__field(unsigned int, max_ioend)
++		__field(unsigned int, max_agsize)
++		__field(unsigned int, data_awu_max)
++	),
++	TP_fast_assign(
++		__entry->dev = mp->m_super->s_dev;
++		__entry->max_write = max_write;
++		__entry->max_ioend = max_ioend;
++		__entry->max_agsize = max_agsize;
++		__entry->data_awu_max = mp->m_groups[XG_TYPE_AG].awu_max;
++	),
++	TP_printk("dev %d:%d max_write %u max_ioend %u max_agsize %u data_awu_max %u",
++		  MAJOR(__entry->dev), MINOR(__entry->dev),
++		  __entry->max_write,
++		  __entry->max_ioend,
++		  __entry->max_agsize,
++		  __entry->data_awu_max)
++);
++
++TRACE_EVENT(xfs_calc_max_atomic_write_fsblocks,
++	TP_PROTO(struct xfs_mount *mp, unsigned int per_intent,
++		 unsigned int step_size, unsigned int logres,
++		 unsigned int blockcount),
++	TP_ARGS(mp, per_intent, step_size, logres, blockcount),
++	TP_STRUCT__entry(
++		__field(dev_t, dev)
++		__field(unsigned int, per_intent)
++		__field(unsigned int, step_size)
++		__field(unsigned int, logres)
++		__field(unsigned int, blockcount)
++	),
++	TP_fast_assign(
++		__entry->dev = mp->m_super->s_dev;
++		__entry->per_intent = per_intent;
++		__entry->step_size = step_size;
++		__entry->logres = logres;
++		__entry->blockcount = blockcount;
++	),
++	TP_printk("dev %d:%d per_intent %u step_size %u logres %u blockcount %u",
++		  MAJOR(__entry->dev), MINOR(__entry->dev),
++		  __entry->per_intent,
++		  __entry->step_size,
++		  __entry->logres,
++		  __entry->blockcount)
++);
++
+ TRACE_EVENT(xlog_intent_recovery_failed,
+ 	TP_PROTO(struct xfs_mount *mp, const struct xfs_defer_op_type *ops,
+ 		 int error),
