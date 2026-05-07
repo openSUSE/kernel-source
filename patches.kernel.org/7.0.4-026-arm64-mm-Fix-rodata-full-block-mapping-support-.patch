@@ -1,0 +1,188 @@
+From: Ryan Roberts <ryan.roberts@arm.com>
+Date: Mon, 30 Mar 2026 17:17:02 +0100
+Subject: [PATCH] arm64: mm: Fix rodata=full block mapping support for realm
+ guests
+References: bsc#1012628
+Patch-mainline: 7.0.4
+Git-commit: f12b435de2f2bb09ce406467020181ada528844c
+
+commit f12b435de2f2bb09ce406467020181ada528844c upstream.
+
+Commit a166563e7ec37 ("arm64: mm: support large block mapping when
+rodata=full") enabled the linear map to be mapped by block/cont while
+still allowing granular permission changes on BBML2_NOABORT systems by
+lazily splitting the live mappings. This mechanism was intended to be
+usable by realm guests since they need to dynamically share dma buffers
+with the host by "decrypting" them - which for Arm CCA, means marking
+them as shared in the page tables.
+
+However, it turns out that the mechanism was failing for realm guests
+because realms need to share their dma buffers (via
+__set_memory_enc_dec()) much earlier during boot than
+split_kernel_leaf_mapping() was able to handle. The report linked below
+showed that GIC's ITS was one such user. But during the investigation I
+found other callsites that could not meet the
+split_kernel_leaf_mapping() constraints.
+
+The problem is that we block map the linear map based on the boot CPU
+supporting BBML2_NOABORT, then check that all the other CPUs support it
+too when finalizing the caps. If they don't, then we stop_machine() and
+split to ptes. For safety, split_kernel_leaf_mapping() previously
+wouldn't permit splitting until after the caps were finalized. That
+ensured that if any secondary cpus were running that didn't support
+BBML2_NOABORT, we wouldn't risk breaking them.
+
+I've fix this problem by reducing the black-out window where we refuse
+to split; there are now 2 windows. The first is from T0 until the page
+allocator is inititialized. Splitting allocates memory for the page
+allocator so it must be in use. The second covers the period between
+starting to online the secondary cpus until the system caps are
+finalized (this is a very small window).
+
+All of the problematic callers are calling __set_memory_enc_dec() before
+the secondary cpus come online, so this solves the problem. However, one
+of these callers, swiotlb_update_mem_attributes(), was trying to split
+before the page allocator was initialized. So I have moved this call
+from arch_mm_preinit() to mem_init(), which solves the ordering issue.
+
+I've added warnings and return an error if any attempt is made to split
+in the black-out windows.
+
+Note there are other issues which prevent booting all the way to user
+space, which will be fixed in subsequent patches.
+
+Reported-by: Jinjiang Tu <tujinjiang@huawei.com>
+Closes: https://lore.kernel.org/all/0b2a4ae5-fc51-4d77-b177-b2e9db74f11d@huawei.com/
+Fixes: a166563e7ec3 ("arm64: mm: support large block mapping when rodata=full")
+Cc: stable@vger.kernel.org
+Reviewed-by: Kevin Brodsky <kevin.brodsky@arm.com>
+Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
+Reviewed-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+Tested-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ arch/arm64/include/asm/mmu.h |  2 ++
+ arch/arm64/mm/init.c         |  9 +++++++-
+ arch/arm64/mm/mmu.c          | 45 +++++++++++++++++++++++++-----------
+ 3 files changed, 42 insertions(+), 14 deletions(-)
+
+diff --git a/arch/arm64/include/asm/mmu.h b/arch/arm64/include/asm/mmu.h
+index 137a173df1ff..472610433aae 100644
+--- a/arch/arm64/include/asm/mmu.h
++++ b/arch/arm64/include/asm/mmu.h
+@@ -112,5 +112,7 @@ void kpti_install_ng_mappings(void);
+ static inline void kpti_install_ng_mappings(void) {}
+ #endif
+ 
++extern bool page_alloc_available;
++
+ #endif	/* !__ASSEMBLER__ */
+ #endif
+diff --git a/arch/arm64/mm/init.c b/arch/arm64/mm/init.c
+index 96711b8578fd..b9b248d24fd1 100644
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -350,7 +350,6 @@ void __init arch_mm_preinit(void)
+ 	}
+ 
+ 	swiotlb_init(swiotlb, flags);
+-	swiotlb_update_mem_attributes();
+ 
+ 	/*
+ 	 * Check boundaries twice: Some fundamental inconsistencies can be
+@@ -377,6 +376,14 @@ void __init arch_mm_preinit(void)
+ 	}
+ }
+ 
++bool page_alloc_available __ro_after_init;
++
++void __init mem_init(void)
++{
++	page_alloc_available = true;
++	swiotlb_update_mem_attributes();
++}
++
+ void free_initmem(void)
+ {
+ 	void *lm_init_begin = lm_alias(__init_begin);
+diff --git a/arch/arm64/mm/mmu.c b/arch/arm64/mm/mmu.c
+index fb4693a6b563..97270947787f 100644
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@ -772,30 +772,51 @@ static inline bool force_pte_mapping(void)
+ }
+ 
+ static DEFINE_MUTEX(pgtable_split_lock);
++static bool linear_map_requires_bbml2;
+ 
+ int split_kernel_leaf_mapping(unsigned long start, unsigned long end)
+ {
+ 	int ret;
+ 
+-	/*
+-	 * !BBML2_NOABORT systems should not be trying to change permissions on
+-	 * anything that is not pte-mapped in the first place. Just return early
+-	 * and let the permission change code raise a warning if not already
+-	 * pte-mapped.
+-	 */
+-	if (!system_supports_bbml2_noabort())
+-		return 0;
+-
+ 	/*
+ 	 * If the region is within a pte-mapped area, there is no need to try to
+ 	 * split. Additionally, CONFIG_DEBUG_PAGEALLOC and CONFIG_KFENCE may
+ 	 * change permissions from atomic context so for those cases (which are
+ 	 * always pte-mapped), we must not go any further because taking the
+-	 * mutex below may sleep.
++	 * mutex below may sleep. Do not call force_pte_mapping() here because
++	 * it could return a confusing result if called from a secondary cpu
++	 * prior to finalizing caps. Instead, linear_map_requires_bbml2 gives us
++	 * what we need.
+ 	 */
+-	if (force_pte_mapping() || is_kfence_address((void *)start))
++	if (!linear_map_requires_bbml2 || is_kfence_address((void *)start))
+ 		return 0;
+ 
++	if (!system_supports_bbml2_noabort()) {
++		/*
++		 * !BBML2_NOABORT systems should not be trying to change
++		 * permissions on anything that is not pte-mapped in the first
++		 * place. Just return early and let the permission change code
++		 * raise a warning if not already pte-mapped.
++		 */
++		if (system_capabilities_finalized())
++			return 0;
++
++		/*
++		 * Boot-time: split_kernel_leaf_mapping_locked() allocates from
++		 * page allocator. Can't split until it's available.
++		 */
++		if (WARN_ON(!page_alloc_available))
++			return -EBUSY;
++
++		/*
++		 * Boot-time: Started secondary cpus but don't know if they
++		 * support BBML2_NOABORT yet. Can't allow splitting in this
++		 * window in case they don't.
++		 */
++		if (WARN_ON(num_online_cpus() > 1))
++			return -EBUSY;
++	}
++
+ 	/*
+ 	 * Ensure start and end are at least page-aligned since this is the
+ 	 * finest granularity we can split to.
+@@ -895,8 +916,6 @@ static int range_split_to_ptes(unsigned long start, unsigned long end, gfp_t gfp
+ 	return ret;
+ }
+ 
+-static bool linear_map_requires_bbml2 __initdata;
+-
+ u32 idmap_kpti_bbml2_flag;
+ 
+ static void __init init_idmap_kpti_bbml2_flag(void)
+-- 
+2.53.0
+
