@@ -1,0 +1,194 @@
+From: Florian Westphal <fw@strlen.de>
+Date: Tue, 3 Mar 2026 16:31:32 +0100
+Subject: netfilter: nft_set_pipapo: split gc into unlink and reclaim phase
+Git-commit: 9df95785d3d8302f7c066050117b04cd3c2048c2
+Patch-mainline: v6.18 or v6.18-rc8 (next release)
+References: CVE-2026-23351 bsc#1260526
+
+Yiming Qian reports Use-after-free in the pipapo set type:
+  Under a large number of expired elements, commit-time GC can run for a very
+  long time in a non-preemptible context, triggering soft lockup warnings and
+  RCU stall reports (local denial of service).
+
+We must split GC in an unlink and a reclaim phase.
+
+We cannot queue elements for freeing until pointers have been swapped.
+Expired elements are still exposed to both the packet path and userspace
+dumpers via the live copy of the data structure.
+
+call_rcu() does not protect us: dump operations or element lookups starting
+after call_rcu has fired can still observe the free'd element, unless the
+commit phase has made enough progress to swap the clone and live pointers
+before any new reader has picked up the old version.
+
+This a similar approach as done recently for the rbtree backend in commit
+35f83a75529a ("netfilter: nft_set_rbtree: don't gc elements on insert").
+
+Fixes: 3c4287f62044 ("nf_tables: Add set type for arbitrary concatenation of ranges")
+Reported-by: Yiming Qian <yimingqian591@gmail.com>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Acked-by: Fernando Fernandez Mancera <fmancera@suse.de>
+---
+ include/net/netfilter/nf_tables.h |    5 ++++
+ net/netfilter/nf_tables_api.c     |    5 ----
+ net/netfilter/nft_set_pipapo.c    |   47 +++++++++++++++++++++++++++++++-------
+ net/netfilter/nft_set_pipapo.h    |    2 +
+ 4 files changed, 46 insertions(+), 13 deletions(-)
+
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -1641,6 +1641,11 @@ struct nft_trans_gc {
+ 	struct rcu_head		rcu;
+ };
+ 
++static inline int nft_trans_gc_space(const struct nft_trans_gc *trans)
++{
++	return NFT_TRANS_GC_BATCHCOUNT - trans->count;
++}
++
+ struct nft_trans_gc *nft_trans_gc_alloc(struct nft_set *set,
+ 					unsigned int gc_seq, gfp_t gfp);
+ void nft_trans_gc_destroy(struct nft_trans_gc *trans);
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -8694,11 +8694,6 @@ static void nft_trans_gc_queue_work(stru
+ 	schedule_work(&trans_gc_work);
+ }
+ 
+-static int nft_trans_gc_space(struct nft_trans_gc *trans)
+-{
+-	return NFT_TRANS_GC_BATCHCOUNT - trans->count;
+-}
+-
+ struct nft_trans_gc *nft_trans_gc_queue_async(struct nft_trans_gc *gc,
+ 					      unsigned int gc_seq, gfp_t gfp)
+ {
+--- a/net/netfilter/nft_set_pipapo.c
++++ b/net/netfilter/nft_set_pipapo.c
+@@ -1536,11 +1536,11 @@ static void nft_pipapo_gc_deactivate(str
+ }
+ 
+ /**
+- * pipapo_gc() - Drop expired entries from set, destroy start and end elements
++ * pipapo_gc_scan() - Drop expired entries from set and link them to gc list
+  * @_set:	nftables API set representation
+  * @m:		Matching data
+  */
+-static void pipapo_gc(const struct nft_set *_set, struct nft_pipapo_match *m)
++static void pipapo_gc_scan(const struct nft_set *_set, struct nft_pipapo_match *m)
+ {
+ 	struct nft_set *set = (struct nft_set *) _set;
+ 	struct nft_pipapo *priv = nft_set_priv(set);
+@@ -1553,6 +1553,8 @@ static void pipapo_gc(const struct nft_s
+ 	if (!gc)
+ 		return;
+ 
++	list_add(&gc->list, &priv->gc_head);
++
+ 	while ((rules_f0 = pipapo_rules_same_key(m->f, first_rule))) {
+ 		union nft_pipapo_map_bucket rulemap[NFT_PIPAPO_MAX_FIELDS];
+ 		struct nft_pipapo_field *f;
+@@ -1581,10 +1583,13 @@ static void pipapo_gc(const struct nft_s
+ 		 */
+ 		if (nft_set_elem_expired(&e->ext)) {
+ 			priv->dirty = true;
++			if (!nft_trans_gc_space(gc)) {
++				gc = nft_trans_gc_alloc(set, 0, GFP_KERNEL);
++				if (!gc)
++					return;
+ 
+-			gc = nft_trans_gc_queue_sync(gc, GFP_KERNEL);
+-			if (!gc)
+-				break;
++				list_add(&gc->list, &priv->gc_head);
++			}
+ 
+ 			nft_pipapo_gc_deactivate(net, set, e);
+ 			pipapo_drop(m, rulemap);
+@@ -1598,10 +1603,30 @@ static void pipapo_gc(const struct nft_s
+ 		}
+ 	}
+ 
+-	gc = nft_trans_gc_catchall_sync(gc);
++	priv->last_gc = jiffies;
++}
++
++/**
++ * pipapo_gc_queue() - Free expired elements
++ * @set:	nftables API set representation
++ */
++static void pipapo_gc_queue(struct nft_set *set)
++{
++	struct nft_pipapo *priv = nft_set_priv(set);
++	struct nft_trans_gc *gc, *next;
++
++	/* always do a catchall cycle: */
++	gc = nft_trans_gc_alloc(set, 0, GFP_KERNEL);
+ 	if (gc) {
++		gc = nft_trans_gc_catchall_sync(gc);
++		if (gc)
++			nft_trans_gc_queue_sync_done(gc);
++	}
++
++	/* always purge queued gc elements. */
++	list_for_each_entry_safe(gc, next, &priv->gc_head, list) {
++		list_del(&gc->list);
+ 		nft_trans_gc_queue_sync_done(gc);
+-		priv->last_gc = jiffies;
+ 	}
+ }
+ 
+@@ -1654,6 +1679,10 @@ static void pipapo_reclaim_match(struct
+  *
+  * We also need to create a new working copy for subsequent insertions and
+  * deletions.
++ *
++ * After the live copy has been replaced by the clone, we can safely queue
++ * expired elements that have been collected by pipapo_gc_scan() for
++ * memory reclaim.
+  */
+ static void pipapo_commit(const struct nft_set *set)
+ {
+@@ -1661,7 +1690,7 @@ static void pipapo_commit(const struct n
+ 	struct nft_pipapo_match *new_clone, *old;
+ 
+ 	if (time_after_eq(jiffies, priv->last_gc + nft_set_gc_interval(set)))
+-		pipapo_gc(set, priv->clone);
++		pipapo_gc_scan(set, priv->clone);
+ 
+ 	if (!priv->dirty)
+ 		return;
+@@ -1678,6 +1707,7 @@ static void pipapo_commit(const struct n
+ 		call_rcu(&old->rcu, pipapo_reclaim_match);
+ 
+ 	priv->clone = new_clone;
++	pipapo_gc_queue(set);
+ }
+ 
+ /**
+@@ -2129,6 +2159,7 @@ static int nft_pipapo_init(const struct
+ 
+ 	priv->dirty = false;
+ 
++	INIT_LIST_HEAD(&priv->gc_head);
+ 	rcu_assign_pointer(priv->match, m);
+ 
+ 	return 0;
+--- a/net/netfilter/nft_set_pipapo.h
++++ b/net/netfilter/nft_set_pipapo.h
+@@ -157,6 +157,7 @@ struct nft_pipapo_match {
+  * @width:	Total bytes to be matched for one packet, including padding
+  * @dirty:	Working copy has pending insertions or deletions
+  * @last_gc:	Timestamp of last garbage collection run, jiffies
++ * @gc_head:	list of nft_trans_gc to queue up for mem reclaim
+  */
+ struct nft_pipapo {
+ 	struct nft_pipapo_match __rcu *match;
+@@ -164,6 +165,7 @@ struct nft_pipapo {
+ 	int width;
+ 	bool dirty;
+ 	unsigned long last_gc;
++	struct list_head gc_head;
+ };
+ 
+ struct nft_pipapo_elem;
