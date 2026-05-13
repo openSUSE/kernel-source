@@ -1,0 +1,284 @@
+From bd1d2c21d5d2496f01b2d1fce07ec2e0da05dd3e Mon Sep 17 00:00:00 2001
+From: John Garry <john.g.garry@oracle.com>
+Date: Wed, 7 May 2025 14:18:29 -0700
+Subject: xfs: add xfs_atomic_write_cow_iomap_begin()
+Git-commit: bd1d2c21d5d2496f01b2d1fce07ec2e0da05dd3e
+Patch-mainline: v6.16-rc1
+References: jsc#PED-15653
+
+For CoW-based atomic writes, reuse the infrastructure for reflink CoW fork
+support.
+
+Add ->iomap_begin() callback xfs_atomic_write_cow_iomap_begin() to create
+staging mappings in the CoW fork for atomic write updates.
+
+The general steps in the function are as follows:
+- find extent mapping in the CoW fork for the FS block range being written
+	- if part or full extent is found, proceed to process found extent
+	- if no extent found, map in new blocks to the CoW fork
+- convert unwritten blocks in extent if required
+- update iomap extent mapping and return
+
+The bulk of this function is quite similar to the processing in
+xfs_reflink_allocate_cow(), where we try to find an extent mapping; if
+none exists, then allocate a new extent in the CoW fork, convert unwritten
+blocks, and return a mapping.
+
+Performance testing has shown the XFS_ILOCK_EXCL locking to be quite
+a bottleneck, so this is an area which could be optimised in future.
+
+Christoph Hellwig contributed almost all of the code in
+xfs_atomic_write_cow_iomap_begin().
+
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+[djwong: add a new xfs_can_sw_atomic_write to convey intent better]
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: John Garry <john.g.garry@oracle.com>
+Acked-by: Anthony Iliopoulos <ailiop@suse.com>
+
+---
+ fs/xfs/xfs_iomap.c   | 129 +++++++++++++++++++++++++++++++++++++++++++
+ fs/xfs/xfs_iomap.h   |   1 +
+ fs/xfs/xfs_mount.h   |   5 ++
+ fs/xfs/xfs_reflink.c |   2 +-
+ fs/xfs/xfs_reflink.h |   2 +
+ fs/xfs/xfs_trace.h   |  22 ++++++++
+ 6 files changed, 160 insertions(+), 1 deletion(-)
+
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index 59108c0d8ca1..a40ddbc1b09c 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -29,6 +29,7 @@
+ #include "xfs_reflink.h"
+ #include "xfs_health.h"
+ #include "xfs_rtbitmap.h"
++#include "xfs_icache.h"
+ 
+ #define XFS_ALLOC_ALIGN(mp, off) \
+ 	(((off) >> mp->m_allocsize_log) << mp->m_allocsize_log)
+@@ -928,6 +929,134 @@ const struct iomap_ops xfs_direct_write_iomap_ops = {
+ 	.iomap_begin		= xfs_direct_write_iomap_begin,
+ };
+ 
++static int
++xfs_atomic_write_cow_iomap_begin(
++	struct inode		*inode,
++	loff_t			offset,
++	loff_t			length,
++	unsigned		flags,
++	struct iomap		*iomap,
++	struct iomap		*srcmap)
++{
++	struct xfs_inode	*ip = XFS_I(inode);
++	struct xfs_mount	*mp = ip->i_mount;
++	const xfs_fileoff_t		offset_fsb = XFS_B_TO_FSBT(mp, offset);
++	xfs_fileoff_t		end_fsb = xfs_iomap_end_fsb(mp, offset, length);
++	xfs_filblks_t		count_fsb = end_fsb - offset_fsb;
++	int			nmaps = 1;
++	xfs_filblks_t		resaligned;
++	struct xfs_bmbt_irec	cmap;
++	struct xfs_iext_cursor	icur;
++	struct xfs_trans	*tp;
++	unsigned int		dblocks = 0, rblocks = 0;
++	int			error;
++	u64			seq;
++
++	ASSERT(flags & IOMAP_WRITE);
++	ASSERT(flags & IOMAP_DIRECT);
++
++	if (xfs_is_shutdown(mp))
++		return -EIO;
++
++	if (!xfs_can_sw_atomic_write(mp)) {
++		ASSERT(xfs_can_sw_atomic_write(mp));
++		return -EINVAL;
++	}
++
++	/* blocks are always allocated in this path */
++	if (flags & IOMAP_NOWAIT)
++		return -EAGAIN;
++
++	trace_xfs_iomap_atomic_write_cow(ip, offset, length);
++
++	xfs_ilock(ip, XFS_ILOCK_EXCL);
++
++	if (!ip->i_cowfp) {
++		ASSERT(!xfs_is_reflink_inode(ip));
++		xfs_ifork_init_cow(ip);
++	}
++
++	if (!xfs_iext_lookup_extent(ip, ip->i_cowfp, offset_fsb, &icur, &cmap))
++		cmap.br_startoff = end_fsb;
++	if (cmap.br_startoff <= offset_fsb) {
++		xfs_trim_extent(&cmap, offset_fsb, count_fsb);
++		goto found;
++	}
++
++	end_fsb = cmap.br_startoff;
++	count_fsb = end_fsb - offset_fsb;
++
++	resaligned = xfs_aligned_fsb_count(offset_fsb, count_fsb,
++			xfs_get_cowextsz_hint(ip));
++	xfs_iunlock(ip, XFS_ILOCK_EXCL);
++
++	if (XFS_IS_REALTIME_INODE(ip)) {
++		dblocks = XFS_DIOSTRAT_SPACE_RES(mp, 0);
++		rblocks = resaligned;
++	} else {
++		dblocks = XFS_DIOSTRAT_SPACE_RES(mp, resaligned);
++		rblocks = 0;
++	}
++
++	error = xfs_trans_alloc_inode(ip, &M_RES(mp)->tr_write, dblocks,
++			rblocks, false, &tp);
++	if (error)
++		return error;
++
++	/* extent layout could have changed since the unlock, so check again */
++	if (!xfs_iext_lookup_extent(ip, ip->i_cowfp, offset_fsb, &icur, &cmap))
++		cmap.br_startoff = end_fsb;
++	if (cmap.br_startoff <= offset_fsb) {
++		xfs_trim_extent(&cmap, offset_fsb, count_fsb);
++		xfs_trans_cancel(tp);
++		goto found;
++	}
++
++	/*
++	 * Allocate the entire reservation as unwritten blocks.
++	 *
++	 * Use XFS_BMAPI_EXTSZALIGN to hint at aligning new extents according to
++	 * extszhint, such that there will be a greater chance that future
++	 * atomic writes to that same range will be aligned (and don't require
++	 * this COW-based method).
++	 */
++	error = xfs_bmapi_write(tp, ip, offset_fsb, count_fsb,
++			XFS_BMAPI_COWFORK | XFS_BMAPI_PREALLOC |
++			XFS_BMAPI_EXTSZALIGN, 0, &cmap, &nmaps);
++	if (error) {
++		xfs_trans_cancel(tp);
++		goto out_unlock;
++	}
++
++	xfs_inode_set_cowblocks_tag(ip);
++	error = xfs_trans_commit(tp);
++	if (error)
++		goto out_unlock;
++
++found:
++	if (cmap.br_state != XFS_EXT_NORM) {
++		error = xfs_reflink_convert_cow_locked(ip, offset_fsb,
++				count_fsb);
++		if (error)
++			goto out_unlock;
++		cmap.br_state = XFS_EXT_NORM;
++	}
++
++	length = XFS_FSB_TO_B(mp, cmap.br_startoff + cmap.br_blockcount);
++	trace_xfs_iomap_found(ip, offset, length - offset, XFS_COW_FORK, &cmap);
++	seq = xfs_iomap_inode_sequence(ip, IOMAP_F_SHARED);
++	xfs_iunlock(ip, XFS_ILOCK_EXCL);
++	return xfs_bmbt_to_iomap(ip, iomap, &cmap, flags, IOMAP_F_SHARED, seq);
++
++out_unlock:
++	xfs_iunlock(ip, XFS_ILOCK_EXCL);
++	return error;
++}
++
++const struct iomap_ops xfs_atomic_write_cow_iomap_ops = {
++	.iomap_begin		= xfs_atomic_write_cow_iomap_begin,
++};
++
+ static int
+ xfs_dax_write_iomap_end(
+ 	struct inode		*inode,
+diff --git a/fs/xfs/xfs_iomap.h b/fs/xfs/xfs_iomap.h
+index 8347268af727..732f7bc8c8bf 100644
+--- a/fs/xfs/xfs_iomap.h
++++ b/fs/xfs/xfs_iomap.h
+@@ -53,5 +53,6 @@ extern const struct iomap_ops xfs_read_iomap_ops;
+ extern const struct iomap_ops xfs_seek_iomap_ops;
+ extern const struct iomap_ops xfs_xattr_iomap_ops;
+ extern const struct iomap_ops xfs_dax_write_iomap_ops;
++extern const struct iomap_ops xfs_atomic_write_cow_iomap_ops;
+ 
+ #endif /* __XFS_IOMAP_H__*/
+diff --git a/fs/xfs/xfs_mount.h b/fs/xfs/xfs_mount.h
+index 96496f39f551..30f620b4500a 100644
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -354,6 +354,11 @@ __XFS_HAS_FEAT(needsrepair, NEEDSREPAIR)
+ __XFS_HAS_FEAT(large_extent_counts, NREXT64)
+ __XFS_HAS_FEAT(exchange_range, EXCHANGE_RANGE)
+ 
++static inline bool xfs_can_sw_atomic_write(struct xfs_mount *mp)
++{
++	return xfs_has_reflink(mp);
++}
++
+ /*
+  * Some features are always on for v5 file systems, allow the compiler to
+  * eliminiate dead code when building without v4 support.
+diff --git a/fs/xfs/xfs_reflink.c b/fs/xfs/xfs_reflink.c
+index afbaa1a06f40..da0465eae0a2 100644
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@ -242,7 +242,7 @@ xfs_bmap_trim_cow(
+ 	return xfs_reflink_trim_around_shared(ip, imap, shared);
+ }
+ 
+-static int
++int
+ xfs_reflink_convert_cow_locked(
+ 	struct xfs_inode	*ip,
+ 	xfs_fileoff_t		offset_fsb,
+diff --git a/fs/xfs/xfs_reflink.h b/fs/xfs/xfs_reflink.h
+index 4a58e4533671..4fdcec3ab724 100644
+--- a/fs/xfs/xfs_reflink.h
++++ b/fs/xfs/xfs_reflink.h
+@@ -35,6 +35,8 @@ int xfs_reflink_allocate_cow(struct xfs_inode *ip, struct xfs_bmbt_irec *imap,
+ 		bool convert_now);
+ extern int xfs_reflink_convert_cow(struct xfs_inode *ip, xfs_off_t offset,
+ 		xfs_off_t count);
++int xfs_reflink_convert_cow_locked(struct xfs_inode *ip,
++		xfs_fileoff_t offset_fsb, xfs_filblks_t count_fsb);
+ 
+ extern int xfs_reflink_cancel_cow_blocks(struct xfs_inode *ip,
+ 		struct xfs_trans **tpp, xfs_fileoff_t offset_fsb,
+diff --git a/fs/xfs/xfs_trace.h b/fs/xfs/xfs_trace.h
+index 2efb8d93a247..f4a54e0ae331 100644
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -1459,6 +1459,28 @@ DEFINE_RW_EVENT(xfs_file_direct_write);
+ DEFINE_RW_EVENT(xfs_file_dax_write);
+ DEFINE_RW_EVENT(xfs_reflink_bounce_dio_write);
+ 
++TRACE_EVENT(xfs_iomap_atomic_write_cow,
++	TP_PROTO(struct xfs_inode *ip, xfs_off_t offset, ssize_t count),
++	TP_ARGS(ip, offset, count),
++	TP_STRUCT__entry(
++		__field(dev_t, dev)
++		__field(xfs_ino_t, ino)
++		__field(xfs_off_t, offset)
++		__field(ssize_t, count)
++	),
++	TP_fast_assign(
++		__entry->dev = VFS_I(ip)->i_sb->s_dev;
++		__entry->ino = ip->i_ino;
++		__entry->offset = offset;
++		__entry->count = count;
++	),
++	TP_printk("dev %d:%d ino 0x%llx pos 0x%llx bytecount 0x%zx",
++		  MAJOR(__entry->dev), MINOR(__entry->dev),
++		  __entry->ino,
++		  __entry->offset,
++		  __entry->count)
++)
++
+ DECLARE_EVENT_CLASS(xfs_imap_class,
+ 	TP_PROTO(struct xfs_inode *ip, xfs_off_t offset, ssize_t count,
+ 		 int whichfork, struct xfs_bmbt_irec *irec),
+-- 
+2.53.0
+
