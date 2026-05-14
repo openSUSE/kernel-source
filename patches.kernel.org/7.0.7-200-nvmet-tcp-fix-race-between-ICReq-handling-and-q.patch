@@ -1,0 +1,104 @@
+From: Chaitanya Kulkarni <kch@nvidia.com>
+Date: Wed, 8 Apr 2026 00:51:31 -0700
+Subject: [PATCH] nvmet-tcp: fix race between ICReq handling and queue teardown
+References: bsc#1012628
+Patch-mainline: 7.0.7
+Git-commit: 5293a8882c549fab4a878bc76b0b6c951f980a61
+
+commit 5293a8882c549fab4a878bc76b0b6c951f980a61 upstream.
+
+nvmet_tcp_handle_icreq() updates queue->state after sending an
+Initialization Connection Response (ICResp), but it does so without
+serializing against target-side queue teardown.
+
+If an NVMe/TCP host sends an Initialization Connection Request
+(ICReq) and immediately closes the connection, target-side teardown
+may start in softirq context before io_work drains the already
+buffered ICReq. In that case, nvmet_tcp_schedule_release_queue()
+sets queue->state to NVMET_TCP_Q_DISCONNECTING and drops the queue
+reference under state_lock.
+
+If io_work later processes that ICReq, nvmet_tcp_handle_icreq() can
+still overwrite the state back to NVMET_TCP_Q_LIVE. That defeats the
+DISCONNECTING-state guard in nvmet_tcp_schedule_release_queue() and
+allows a later socket state change to re-enter teardown and issue a
+second kref_put() on an already released queue.
+
+The ICResp send failure path has the same problem. If teardown has
+already moved the queue to DISCONNECTING, a send error can still
+overwrite the state with NVMET_TCP_Q_FAILED, again reopening the
+window for a second teardown path to drop the queue reference.
+
+Fix this by serializing both post-send state transitions with
+state_lock and bailing out if teardown has already started.
+
+Use -ESHUTDOWN as an internal sentinel for that bail-out path rather
+than propagating it as a transport error like -ECONNRESET. Keep
+nvmet_tcp_socket_error() setting rcv_state to NVMET_TCP_RECV_ERR before
+honoring that sentinel so receive-side parsing stays quiesced until the
+existing release path completes.
+
+Fixes: c46a6465bac2 ("nvmet-tcp: add NVMe over TCP target driver")
+Cc: stable@vger.kernel.org
+Reported-by: Shivam Kumar <skumar47@syr.edu>
+Tested-by: Shivam Kumar <kumar.shivam43666@gmail.com>
+Signed-off-by: Chaitanya Kulkarni <kch@nvidia.com>
+Signed-off-by: Keith Busch <kbusch@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/nvme/target/tcp.c | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/drivers/nvme/target/tcp.c b/drivers/nvme/target/tcp.c
+index acc71a26733f..255ebd948dfe 100644
+--- a/drivers/nvme/target/tcp.c
++++ b/drivers/nvme/target/tcp.c
+@@ -398,6 +398,19 @@ static void nvmet_tcp_build_pdu_iovec(struct nvmet_tcp_cmd *cmd)
+ 
+ static void nvmet_tcp_fatal_error(struct nvmet_tcp_queue *queue)
+ {
++	/*
++	 * Keep rcv_state at RECV_ERR even for the internal -ESHUTDOWN path.
++	 * nvmet_tcp_handle_icreq() can return -ESHUTDOWN after the ICReq has
++	 * already been consumed and queue teardown has started.
++	 *
++	 * If nvmet_tcp_data_ready() or nvmet_tcp_write_space() queues
++	 * nvmet_tcp_io_work() again before nvmet_tcp_release_queue_work()
++	 * cancels it, the queue must not keep that old receive state.
++	 * Otherwise the next nvmet_tcp_io_work() run can reach
++	 * nvmet_tcp_done_recv_pdu() and try to handle the same ICReq again.
++	 *
++	 * That is why queue->rcv_state needs to be updated before we return.
++	 */
+ 	queue->rcv_state = NVMET_TCP_RECV_ERR;
+ 	if (queue->nvme_sq.ctrl)
+ 		nvmet_ctrl_fatal_error(queue->nvme_sq.ctrl);
+@@ -922,11 +935,24 @@ static int nvmet_tcp_handle_icreq(struct nvmet_tcp_queue *queue)
+ 	iov.iov_len = sizeof(*icresp);
+ 	ret = kernel_sendmsg(queue->sock, &msg, &iov, 1, iov.iov_len);
+ 	if (ret < 0) {
++		spin_lock_bh(&queue->state_lock);
++		if (queue->state == NVMET_TCP_Q_DISCONNECTING) {
++			spin_unlock_bh(&queue->state_lock);
++			return -ESHUTDOWN;
++		}
+ 		queue->state = NVMET_TCP_Q_FAILED;
++		spin_unlock_bh(&queue->state_lock);
+ 		return ret; /* queue removal will cleanup */
+ 	}
+ 
++	spin_lock_bh(&queue->state_lock);
++	if (queue->state == NVMET_TCP_Q_DISCONNECTING) {
++		spin_unlock_bh(&queue->state_lock);
++		/* Tell nvmet_tcp_socket_error() teardown is in progress. */
++		return -ESHUTDOWN;
++	}
+ 	queue->state = NVMET_TCP_Q_LIVE;
++	spin_unlock_bh(&queue->state_lock);
+ 	nvmet_prepare_receive_pdu(queue);
+ 	return 0;
+ }
+-- 
+2.54.0
+
