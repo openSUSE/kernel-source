@@ -32,7 +32,9 @@ def process_scmsync(sync):
     assert sync.scheme == 'https'
     assert sync.netloc in ['src.suse.de', 'src.opensuse.org']
     query = urllib.parse.parse_qs(sync.query)
-    assert list(query.keys()) == ['trackingbranch'] or list(query.keys()) == []
+    if list(query.keys()) != ['trackingbranch'] and list(query.keys()) != []:
+        raise RuntimeError("In %s: expected [] or ['trackingbranch'], got %s" % (
+            repr(scmsync), str(list(query.keys()))))
     if 'trackingbranch' in query:
         branch = query['trackingbranch'][0]
         assert is_git_sha(sync.fragment)
