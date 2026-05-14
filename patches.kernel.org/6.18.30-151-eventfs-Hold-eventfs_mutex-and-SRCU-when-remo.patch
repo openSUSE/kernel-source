@@ -1,0 +1,133 @@
+From: David Carlier <devnexen@gmail.com>
+Date: Sat, 18 Apr 2026 20:17:37 +0100
+Subject: [PATCH] eventfs: Hold eventfs_mutex and SRCU when remount walks
+ events
+References: bsc#1258210
+Patch-mainline: 6.18.30
+Git-commit: 07004a8c4b572171934390148ee48c4175c77eed
+
+commit 07004a8c4b572171934390148ee48c4175c77eed upstream.
+
+Commit 340f0c7067a9 ("eventfs: Update all the eventfs_inodes from the
+events descriptor") had eventfs_set_attrs() recurse through ei->children
+on remount.  The walk only holds the rcu_read_lock() taken by
+tracefs_apply_options() over tracefs_inodes, which is wrong:
+
+  - list_for_each_entry over ei->children races with the list_del_rcu()
+    in eventfs_remove_rec() -- LIST_POISON1 deref, same shape as
+    d2603279c7d6.
+  - eventfs_inodes are freed via call_srcu(&eventfs_srcu, ...).
+    rcu_read_lock() does not extend an SRCU grace period, so ti->private
+    can be reclaimed under the walk.
+  - The writes to ei->attr race with eventfs_set_attr(), which holds
+    eventfs_mutex.
+
+Reproducer:
+
+  while :; do mount -o remount,uid=$((RANDOM%1000)) /sys/kernel/tracing; done &
+  while :; do
+      echo "p:kp submit_bio" > /sys/kernel/tracing/kprobe_events
+      echo > /sys/kernel/tracing/kprobe_events
+  done
+
+Wrap the events portion of tracefs_apply_options() in
+eventfs_remount_lock()/_unlock() that take eventfs_mutex and
+srcu_read_lock(&eventfs_srcu).  eventfs_set_attrs() doesn't sleep so the
+nested rcu_read_lock() is fine; lockdep_assert_held() pins the contract.
+
+Comment in tracefs_drop_inode() said "RCU cycle" -- it is SRCU.
+
+Fixes: 340f0c7067a9 ("eventfs: Update all the eventfs_inodes from the events descriptor")
+Cc: stable@vger.kernel.org
+Link: https://patch.msgid.link/20260418191737.10289-1-devnexen@gmail.com
+Signed-off-by: David Carlier <devnexen@gmail.com>
+Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/tracefs/event_inode.c | 14 ++++++++++++++
+ fs/tracefs/inode.c       |  5 ++++-
+ fs/tracefs/internal.h    |  3 +++
+ 3 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/fs/tracefs/event_inode.c b/fs/tracefs/event_inode.c
+index 93c231601c8e..0d2bc92b760f 100644
+--- a/fs/tracefs/event_inode.c
++++ b/fs/tracefs/event_inode.c
+@@ -250,6 +250,8 @@ static void eventfs_set_attrs(struct eventfs_inode *ei, bool update_uid, kuid_t
+ {
+ 	struct eventfs_inode *ei_child;
+ 
++	lockdep_assert_held(&eventfs_mutex);
++
+ 	/* Update events/<system>/<event> */
+ 	if (WARN_ON_ONCE(level > 3))
+ 		return;
+@@ -912,3 +914,15 @@ void eventfs_remove_events_dir(struct eventfs_inode *ei)
+ 	d_invalidate(dentry);
+ 	dput(dentry);
+ }
++
++int eventfs_remount_lock(void)
++{
++	mutex_lock(&eventfs_mutex);
++	return srcu_read_lock(&eventfs_srcu);
++}
++
++void eventfs_remount_unlock(int srcu_idx)
++{
++	srcu_read_unlock(&eventfs_srcu, srcu_idx);
++	mutex_unlock(&eventfs_mutex);
++}
+diff --git a/fs/tracefs/inode.c b/fs/tracefs/inode.c
+index 35c0cc557fbb..363a5d755411 100644
+--- a/fs/tracefs/inode.c
++++ b/fs/tracefs/inode.c
+@@ -336,6 +336,7 @@ static int tracefs_apply_options(struct super_block *sb, bool remount)
+ 	struct inode *inode = d_inode(sb->s_root);
+ 	struct tracefs_inode *ti;
+ 	bool update_uid, update_gid;
++	int srcu_idx;
+ 	umode_t tmp_mode;
+ 
+ 	/*
+@@ -360,6 +361,7 @@ static int tracefs_apply_options(struct super_block *sb, bool remount)
+ 		update_uid = fsi->opts & BIT(Opt_uid);
+ 		update_gid = fsi->opts & BIT(Opt_gid);
+ 
++		srcu_idx = eventfs_remount_lock();
+ 		rcu_read_lock();
+ 		list_for_each_entry_rcu(ti, &tracefs_inodes, list) {
+ 			if (update_uid) {
+@@ -381,6 +383,7 @@ static int tracefs_apply_options(struct super_block *sb, bool remount)
+ 				eventfs_remount(ti, update_uid, update_gid);
+ 		}
+ 		rcu_read_unlock();
++		eventfs_remount_unlock(srcu_idx);
+ 	}
+ 
+ 	return 0;
+@@ -426,7 +429,7 @@ static int tracefs_drop_inode(struct inode *inode)
+ 	 * This inode is being freed and cannot be used for
+ 	 * eventfs. Clear the flag so that it doesn't call into
+ 	 * eventfs during the remount flag updates. The eventfs_inode
+-	 * gets freed after an RCU cycle, so the content will still
++	 * gets freed after an SRCU cycle, so the content will still
+ 	 * be safe if the iteration is going on now.
+ 	 */
+ 	ti->flags &= ~TRACEFS_EVENT_INODE;
+diff --git a/fs/tracefs/internal.h b/fs/tracefs/internal.h
+index d83c2a25f288..a4a7f8431aff 100644
+--- a/fs/tracefs/internal.h
++++ b/fs/tracefs/internal.h
+@@ -76,4 +76,7 @@ struct inode *tracefs_get_inode(struct super_block *sb);
+ void eventfs_remount(struct tracefs_inode *ti, bool update_uid, bool update_gid);
+ void eventfs_d_release(struct dentry *dentry);
+ 
++int eventfs_remount_lock(void);
++void eventfs_remount_unlock(int srcu_idx);
++
+ #endif /* _TRACEFS_INTERNAL_H */
+-- 
+2.53.0
+
