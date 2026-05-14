@@ -26,10 +26,10 @@ class TestLinuxGit(unittest.TestCase):
             args.append("--bare")
         args.append(self.tmpdir)
 
-        subprocess.check_call(args, env={})
+        subprocess.check_call(args, env={}, cwd=self.tmpdir)
 
         retval = subprocess.check_output([self.lg_path],
-                                         env={"LINUX_GIT" : var})
+                                         env={"LINUX_GIT" : var}, cwd=self.tmpdir)
         self.assertEqual(output, retval.decode())
 
 

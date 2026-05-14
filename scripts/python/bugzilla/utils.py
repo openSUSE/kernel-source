@@ -6,11 +6,8 @@ TIME_FORMAT_XML = '%Y%m%dT%H:%M:%S'
 TIME_FORMAT_REST = '%Y-%m-%dT%H:%M:%SZ'
 
 def handle_email(email):
-    if email == '__empty-env-var__':
+    if '__empty-env-var__' in email:
         print("Please set the environment variable BUGZILLA_ACCOUNT_EMAIL to your bugzilla email or provide it after --email (-e).", file=sys.stderr)
-        sys.exit(1)
-    if len(email) < 9 or "@suse." not in email:
-        print("no valid bz email provided", file=sys.stderr)
         sys.exit(1)
     return email
 
@@ -19,13 +16,25 @@ def get_score(s):
     return m.group(1) if m else ''
 
 def get_bugzilla_api(rest=False):
-    return bugzilla.Bugzilla(DEFAULT_BZ, force_rest=rest)
+    bzapi = bugzilla.Bugzilla(url=None, force_rest=rest)
+    configpath = os.getenv('HOME') + os.sep + '.bugzillarc'
+    user_email = os.environ.get('BUGZILLA_ACCOUNT_EMAIL', None)
+    if user_email and '@' in user_email:
+        name = user_email.split('@')[0]
+        new_configpath = f'{configpath}.{name}'
+        if os.path.exists(new_configpath):
+            configpath = new_configpath
+    if os.path.exists(configpath):
+        bzapi.readconfig(configpath=configpath, overwrite=True)
+    bzapi.connect(DEFAULT_BZ)
+    return bzapi
 
 def check_being_logged_in(bzapi):
     if not bzapi.logged_in:
-        print("You are not logged in the bugzilla!\n\nGo to https://bugzilla.suse.com/, log in via web interace with your credentials.\n"\
+        print("You are not logged in the bugzilla!\n\nGo to https://bugzilla.suse.com/, log in via web interface with your credentials.\n"\
              "Then go to Preferences, click on the tab API KEYS and generate a new api key\nif you don't have one already.  Then store "\
-             "the api_key in a file ~/.bugzillarc\nin the following format...\n\n# ~/.bugzillarc\n[apibugzilla.suse.com]\napi_key = YOUR_API_KEY")
+             "the api_key in a file ~/.bugzillarc\nin the following format...\n\n# ~/.bugzillarc\n[apibugzilla.suse.com]\napi_key = YOUR_API_KEY",
+             file=sys.stderr)
         return False
     return True
 

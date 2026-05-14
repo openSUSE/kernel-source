@@ -138,6 +138,10 @@ class TestIndex(unittest.TestCase):
             parent = [cid]
             self.commits.append(str(cid))
 
+        self.repo.remotes.create("origin",
+                                 "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git")
+        self.repo.references.create("refs/remotes/origin/master", self.commits[-1])
+
         self.index = git_sort.SortIndex(self.repo)
 
 
@@ -150,7 +154,7 @@ class TestIndex(unittest.TestCase):
         self.assertEqual(
             git_sort.get_heads(self.repo),
             collections.OrderedDict([
-                (git_sort.Head(git_sort.RepoURL(None), "HEAD"),
+                (git_sort.Head(git_sort.RepoURL('git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git'), 'master'),
                  self.commits[-1],)])
         )
 
@@ -276,6 +280,10 @@ class TestCache(unittest.TestCase):
             parent = [cid]
             commits.append("%s %s" % (str(cid), subject,))
         self.commits = commits
+
+        self.repo.remotes.create("origin",
+                                 "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git")
+        self.repo.references.create("refs/remotes/origin/master", self.commits[-1].split(' ')[0])
 
 
     def tearDown(self):

@@ -56,6 +56,9 @@ class GSNotFound(GSException):
     pass
 
 
+class GSMissingUpstream(GSException):
+    pass
+
 class RepoURL(object):
     k_org_canon_prefix = "git://git.kernel.org/pub/scm/linux/kernel/git/"
     proto_match = re.compile("(git|https?)://")
@@ -510,6 +513,15 @@ class SortIndex(object):
         except GSError as err:
             print("Error: %s" % (err,), file=sys.stderr)
             sys.exit(1)
+
+        mainline = remotes[0]
+        if mainline not in repo_heads:
+            raise GSMissingUpstream(
+                "Did not find mainline information (ref \"%s\" from the repository "
+                "at \"%s\") in the repository at LINUX_GIT (\"%s\"). For more "
+                "information, please refer to the \"Configuration Requirements\" "
+                "section of \"scripts/git_sort/README.md\"." % (
+                    mainline.rev, mainline.repo_url.url, repo.path,))
 
         if needs_rebuild or list(history.keys()) != list(repo_heads.items()):
             try:
