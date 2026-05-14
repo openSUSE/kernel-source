@@ -34,7 +34,7 @@ def process_scmsync(sync):
     query = urllib.parse.parse_qs(sync.query)
     if list(query.keys()) != ['trackingbranch'] and list(query.keys()) != []:
         raise RuntimeError("In %s: expected [] or ['trackingbranch'], got %s" % (
-            repr(scmsync), str(list(query.keys()))))
+            repr(sync), str(list(query.keys()))))
     if 'trackingbranch' in query:
         branch = query['trackingbranch'][0]
         assert is_git_sha(sync.fragment)
