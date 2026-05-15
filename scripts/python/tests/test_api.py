@@ -304,12 +304,18 @@ class TestMisc(unittest.TestCase):
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit='cafedead' * 8)],
                 [urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=branch#' + 'cafedead' * 5),
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit='cafedead' * 5)],
+                [urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=branch&enforce_bcntsynctag=1#' + 'cafedead' * 5),
+                 PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit='cafedead' * 5)],
+                [urllib.parse.urlparse('https://src.suse.de/org/repo?enforce_bcntsynctag=1#' + 'cafedead' * 5),
+                 PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch=None, commit='cafedead' * 5)],
                 [urllib.parse.urlparse('https://src.suse.de/org/repo#' + 'cafedead' * 8),
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch=None, commit='cafedead' * 8)],
                 [urllib.parse.urlparse('https://src.suse.de/org/repo#' + 'branch'),
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit=None)],
                 ]
         testexcept = [
+                urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=branch&foo=bar#' + 'cafedead' * 8),
+                urllib.parse.urlparse('https://src.suse.de/org/repo?foo=bar#' + 'cafedead' * 8),
                 urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=' + 'branch'),
                 urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=foo#' + 'bar'),
                 urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=branch#' + 'cafedead' * 6),
