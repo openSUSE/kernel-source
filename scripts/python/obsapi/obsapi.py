@@ -229,22 +229,25 @@ class OBSAPI(api.API):
         return sync.text if sync is not None else None
 
     def project_repo(self, project):
-        if self.project_exists(project) and self.project_meta(project).find('scmsync') != None:
+        if self.project_exists(project):
             return process_scmsync(self.project_scmsync(project))
         return None
 
     def package_repo(self, project, package):
-        if self.package_exists(project, package) and self.package_meta(project, package).find('scmsync') != None:
-            return process_scmsync(self.package_scmsync(project, package))
-        if self.url == 'https://api.suse.de':
-            api = 'https://src.suse.de'
-        elif self.url == 'https://api.opensuse.org':
-            api = 'https://src.opensuse.org'
-        elif self.url.startswith('https://127.0.0.1:'):
-            api = self.url  # test environment
-        else:
-            raise APIError('No default Gitea API for %s' % (self.url,))
-        return PkgRepo(api, 'pool', package, None, None)
+        repo = None
+        if self.package_exists(project, package):
+            repo = process_scmsync(self.package_scmsync(project, package))
+        if not repo:
+            if self.url == 'https://api.suse.de':
+                api = 'https://src.suse.de'
+            elif self.url == 'https://api.opensuse.org':
+                api = 'https://src.opensuse.org'
+            elif self.url.startswith('https://127.0.0.1:'):
+                api = self.url  # test environment
+            else:
+                raise APIError('No default Gitea API for %s' % (self.url,))
+            repo = PkgRepo(api, 'pool', package, None, None)
+        return repo
 
     def list_projects(self):
         xml = ET.fromstring(self.check_get('/source').content)
