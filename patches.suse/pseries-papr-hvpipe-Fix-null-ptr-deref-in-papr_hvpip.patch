@@ -1,0 +1,136 @@
+From 1b9f7aafa44f5ce852c00509104d10fd9eb0f402 Mon Sep 17 00:00:00 2001
+From: "Ritesh Harjani (IBM)" <ritesh.list@gmail.com>
+Date: Fri, 1 May 2026 09:41:42 +0530
+Subject: [PATCH] pseries/papr-hvpipe: Fix null ptr deref in
+ papr_hvpipe_dev_create_handle()
+
+References: jsc#PED-14170 git-fixes
+Patch-mainline: v7.1-rc3
+Git-commit: 1b9f7aafa44f5ce852c00509104d10fd9eb0f402
+
+commit 6d3789d347a7 ("papr-hvpipe: convert papr_hvpipe_dev_create_handle() to FD_PREPARE()"),
+changed the create handle to FD_PREPARE(), but it caused kernel
+null-ptr-deref because after call to retain_and_null_ptr(src_info),
+src_info is re-used for adding it to the global list.
+
+Getting the following kernel panic in papr_hvpipe_dev_create_handle()
+when trying to add src_info to the list.
+ Kernel attempted to write user page (0) - exploit attempt? (uid: 0)
+ BUG: Kernel NULL pointer dereference on write at 0x00000000
+ Faulting instruction address: 0xc0000000001b44a0
+ Oops: Kernel access of bad area, sig: 11 [#1]
+ ...
+ Call Trace:
+ papr_hvpipe_dev_ioctl+0x1f4/0x48c (unreliable)
+ sys_ioctl+0x528/0x1064
+ system_call_exception+0x128/0x360
+ system_call_vectored_common+0x15c/0x2ec
+
+Now, the error handling with FD_PREPARE's file cleanup and __free(kfree) auto
+cleanup is getting too convoluted. This is mainly because we need to
+ensure only 1 user get the srcID handle. To simplify this, we allocate
+prepare the src_info in the beginning and add it to the global list
+under a spinlock after checking that no duplicates exist.
+
+This simplify the error handling where if the FD_ADD fails, we can
+simply remove the src_info from the list and consume any pending msg in
+hvpipe to be cleared, after src_info became visible in the global list.
+
+Cc: stable@vger.kernel.org
+Fixes: 6d3789d347a7 ("papr-hvpipe: convert papr_hvpipe_dev_create_handle() to FD_PREPARE()")
+Reported-by: Haren Myneni <haren@linux.ibm.com>
+Signed-off-by: Ritesh Harjani (IBM) <ritesh.list@gmail.com>
+Signed-off-by: Madhavan Srinivasan <maddy@linux.ibm.com>
+Link: https://patch.msgid.link/31ad94bc89d44156ee700c5bd006cb47a748e3cb.1777606826.git.ritesh.list@gmail.com
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ arch/powerpc/platforms/pseries/papr-hvpipe.c | 57 ++++++++++----------
+ 1 file changed, 30 insertions(+), 27 deletions(-)
+
+diff --git a/arch/powerpc/platforms/pseries/papr-hvpipe.c b/arch/powerpc/platforms/pseries/papr-hvpipe.c
+--- a/arch/powerpc/platforms/pseries/papr-hvpipe.c
++++ b/arch/powerpc/platforms/pseries/papr-hvpipe.c
+@@ -480,23 +480,10 @@ static const struct file_operations papr_hvpipe_handle_ops = {
+ 
+ static int papr_hvpipe_dev_create_handle(u32 srcID)
+ {
+-	struct hvpipe_source_info *src_info __free(kfree) = NULL;
++	struct hvpipe_source_info *src_info;
++	int fd;
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&hvpipe_src_list_lock, flags);
+-	/*
+-	 * Do not allow more than one process communicates with
+-	 * each source.
+-	 */
+-	src_info = hvpipe_find_source(srcID);
+-	if (src_info) {
+-		spin_unlock_irqrestore(&hvpipe_src_list_lock, flags);
+-		pr_err("pid(%d) is already using the source(%d)\n",
+-				src_info->tsk->pid, srcID);
+-		return -EALREADY;
+-	}
+-	spin_unlock_irqrestore(&hvpipe_src_list_lock, flags);
+-
+ 	src_info = kzalloc(sizeof(*src_info), GFP_KERNEL_ACCOUNT);
+ 	if (!src_info)
+ 		return -ENOMEM;
+@@ -505,26 +492,42 @@ static int papr_hvpipe_dev_create_handle(u32 srcID)
+ 	src_info->tsk = current;
+ 	init_waitqueue_head(&src_info->recv_wqh);
+ 
+-	FD_PREPARE(fdf, O_RDONLY | O_CLOEXEC,
+-		   anon_inode_getfile("[papr-hvpipe]", &papr_hvpipe_handle_ops,
+-				      (void *)src_info, O_RDWR));
+-	if (fdf.err)
+-		return fdf.err;
+-
+-	retain_and_null_ptr(src_info);
+-	spin_lock_irqsave(&hvpipe_src_list_lock, flags);
+ 	/*
+-	 * If two processes are executing ioctl() for the same
+-	 * source ID concurrently, prevent the second process to
+-	 * acquire FD.
++	 * Do not allow more than one process communicates with
++	 * each source.
+ 	 */
++	spin_lock_irqsave(&hvpipe_src_list_lock, flags);
+ 	if (hvpipe_find_source(srcID)) {
+ 		spin_unlock_irqrestore(&hvpipe_src_list_lock, flags);
++		pr_err("pid(%d) could not get the source(%d)\n",
++				src_info->tsk->pid, srcID);
++		kfree(src_info);
+ 		return -EALREADY;
+ 	}
+ 	list_add(&src_info->list, &hvpipe_src_list);
+ 	spin_unlock_irqrestore(&hvpipe_src_list_lock, flags);
+-	return fd_publish(fdf);
++
++	fd = FD_ADD(O_RDONLY | O_CLOEXEC,
++		   anon_inode_getfile("[papr-hvpipe]", &papr_hvpipe_handle_ops,
++				      (void *)src_info, O_RDWR));
++	if (fd < 0) {
++		spin_lock_irqsave(&hvpipe_src_list_lock, flags);
++		list_del(&src_info->list);
++		spin_unlock_irqrestore(&hvpipe_src_list_lock, flags);
++		/*
++		 * if we fail to add FD, that means no userspace program is
++		 * polling. In that case if there is a msg pending because the
++		 * interrupt was fired after the src_info was added to the
++		 * global list, then let's consume it here, to unblock the
++		 * hvpipe
++		 */
++		if (src_info->hvpipe_status & HVPIPE_MSG_AVAILABLE)
++			hvpipe_rtas_recv_msg(NULL, 0);
++		kfree(src_info);
++		return fd;
++	}
++
++	return fd;
+ }
+ 
+ /*
+-- 
+2.51.0
+
