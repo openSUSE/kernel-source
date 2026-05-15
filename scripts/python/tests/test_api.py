@@ -300,26 +300,26 @@ class TestMisc(unittest.TestCase):
 
     def test_process_scmsync(self):
         testdata = [
-                [urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=branch#' + 'cafedead' * 8),
+                ['https://src.suse.de/org/repo?trackingbranch=branch#' + 'cafedead' * 8,
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit='cafedead' * 8)],
-                [urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=branch#' + 'cafedead' * 5),
+                ['https://src.suse.de/org/repo?trackingbranch=branch#' + 'cafedead' * 5,
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit='cafedead' * 5)],
-                [urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=branch&enforce_bcntsynctag=1#' + 'cafedead' * 5),
+                ['https://src.suse.de/org/repo?trackingbranch=branch&enforce_bcntsynctag=1#' + 'cafedead' * 5,
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit='cafedead' * 5)],
-                [urllib.parse.urlparse('https://src.suse.de/org/repo?enforce_bcntsynctag=1#' + 'cafedead' * 5),
+                ['https://src.suse.de/org/repo?enforce_bcntsynctag=1#' + 'cafedead' * 5,
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch=None, commit='cafedead' * 5)],
-                [urllib.parse.urlparse('https://src.suse.de/org/repo#' + 'cafedead' * 8),
+                ['https://src.suse.de/org/repo#' + 'cafedead' * 8,
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch=None, commit='cafedead' * 8)],
-                [urllib.parse.urlparse('https://src.suse.de/org/repo#' + 'branch'),
+                ['https://src.suse.de/org/repo#' + 'branch',
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit=None)],
                 ]
         testexcept = [
-                urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=branch&foo=bar#' + 'cafedead' * 8),
-                urllib.parse.urlparse('https://src.suse.de/org/repo?foo=bar#' + 'cafedead' * 8),
-                urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=' + 'branch'),
-                urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=foo#' + 'bar'),
-                urllib.parse.urlparse('https://src.suse.de/org/repo?trackingbranch=branch#' + 'cafedead' * 6),
-                urllib.parse.urlparse('https://src.suse.de/org/repo'),
+                'https://src.suse.de/org/repo?trackingbranch=branch&foo=bar#' + 'cafedead' * 8,
+                'https://src.suse.de/org/repo?foo=bar#' + 'cafedead' * 8,
+                'https://src.suse.de/org/repo?trackingbranch=' + 'branch',
+                'https://src.suse.de/org/repo?trackingbranch=foo#' + 'bar',
+                'https://src.suse.de/org/repo?trackingbranch=branch#' + 'cafedead' * 6,
+                'https://src.suse.de/org/repo',
                 ]
         for data, result in testdata:
             self.assertEqual(process_scmsync(data), result)

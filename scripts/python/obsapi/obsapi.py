@@ -28,7 +28,10 @@ def expand_home(path):
 def is_git_sha(txt):
     return (len(txt) == 64 or len(txt) == 40) and re.fullmatch('(?ai)[a-f0-9]*', txt)
 
-def process_scmsync(sync):
+def process_scmsync(sync_text):
+    if sync_text is None:
+        return sync_text
+    sync = urllib.parse.urlparse(sync_text)
     assert sync.scheme == 'https'
     assert sync.netloc in ['src.suse.de', 'src.opensuse.org']
     query = urllib.parse.parse_qs(sync.query)
@@ -219,11 +222,11 @@ class OBSAPI(api.API):
 
     def package_scmsync(self, project, package):
         sync = self.package_meta(project, package).find('scmsync')
-        return urllib.parse.urlparse(sync.text) if sync is not None else None
+        return sync.text if sync is not None else None
 
     def project_scmsync(self, project):
         sync = self.project_meta(project).find('scmsync')
-        return urllib.parse.urlparse(sync.text) if sync is not None else None
+        return sync.text if sync is not None else None
 
     def project_repo(self, project):
         if self.project_exists(project) and self.project_meta(project).find('scmsync') != None:
