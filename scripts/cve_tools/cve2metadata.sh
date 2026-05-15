@@ -12,10 +12,10 @@ then
 	echo "clone from https://git.kernel.org/pub/scm/linux/security/vulns.git" >&2
 	exit 1
 fi
+SCRIPTS_DIR=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/..
+LINUX_GIT=$("$SCRIPTS_DIR"/linux_git.sh) || exit 1
 
-[ -z "$LINUX_GIT" ] && fail "LINUX_GIT environment variable needs to specify an upstream git tree"
-
-. scripts/common-functions
+. $SCRIPTS_DIR/common-functions
 
 while [ $# -gt 0 ]
 do
