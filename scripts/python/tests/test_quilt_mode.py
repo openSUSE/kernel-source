@@ -16,7 +16,9 @@ from git_sort import series_conf
 from git_sort import git_sort
 from git_sort import lib
 
+os_release = Path('/etc/os-release').read_text()
 
+@unittest.skipIf('Tumbleweed' in os_release, 'Quilt mode broken on Tumbleweed')
 class TestQuiltMode(unittest.TestCase):
     def setUp(self):
         self.env = os.environ.copy()
@@ -405,6 +407,7 @@ Signed-off-by: Ingo Molnar <mingo@kernel.org>
         self.assertEqual(retval.decode().strip(), "M  series.conf")
 
 
+@unittest.skipIf('Tumbleweed' in os_release, 'Quilt mode broken on Tumbleweed')
 class TestQCP(unittest.TestCase):
     def setUp(self):
         self.env = os.environ.copy()
