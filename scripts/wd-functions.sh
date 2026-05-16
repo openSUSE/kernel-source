@@ -125,56 +125,6 @@ _get_tarball_from_git()
     git --git-dir="$git" archive --prefix="linux-$version/" "$tag"
 }
 
-get_tarball()
-{
-    local version=$1 suffix=$2 dest=$3 url=$4 tarball compress sig
-
-    tarball=$(_find_tarball "$version" "$suffix")
-    if test -n "$tarball"; then
-        sig="$(get_kernel_sig "$dest/linux-$version.$suffix")"
-        cp -p "$tarball" "$dest/linux-$version.$suffix.part" || exit
-        cp -p "$(get_kernel_sig "$tarball")" "$sig.part" || exit
-        mv "$dest/linux-$version.$suffix.part" "$dest/linux-$version.$suffix"
-        mv "$sig.part" "$sig"
-        cp -p "$scripts_dir/linux.keyring" "$dest"
-        return
-    fi
-    # Reuse the locally generated tarball if already there
-    tarball="$dest/linux-$version.$suffix"
-    if test -e "$tarball"; then
-        echo "Reusing $tarball" >&2
-        sig="$(get_kernel_sig "$tarball")"
-        if [ -e $sig ] ; then
-            echo "Reusing $sig" >&2
-            cp -p "$scripts_dir/linux.keyring" "$dest"
-        fi
-        return
-    fi
-    echo "Warning: could not find linux-$version.$suffix, trying to create it from git" >&2
-    case "$suffix" in
-    tar.bz2)
-        compress="bzip2 -9"
-        ;;
-    tar.xz)
-        compress="xz"
-        if command -v 'pixz' > /dev/null ; then
-            compress='pixz'
-        fi
-        ;;
-    *)
-        echo "Unknown compression format: $suffix" >&2
-        exit 1
-    esac
-    set -o pipefail
-    _get_tarball_from_git "$version" "$url" | $compress \
-        >"$dest/linux-$version.$suffix.part"
-    if test $? -ne 0; then
-        exit 1
-    fi
-    mv "$dest/linux-$version.$suffix.part" "$dest/linux-$version.$suffix"
-    set +o pipefail
-}
-
 unpack_tarball()
 {
     local version=$1 dest=$2 url=$3 tarball
