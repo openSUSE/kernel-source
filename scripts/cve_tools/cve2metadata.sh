@@ -15,6 +15,7 @@ fi
 
 if [ -z "$CVEKERNELTREE" ]
 then
+	[ -z "$LINUX_GIT" ] && fail "LINUX_GIT environment variable needs to specify an upstream git tree"
 	export CVEKERNELTREE=$LINUX_GIT
 fi
 
