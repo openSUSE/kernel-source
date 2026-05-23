@@ -1,0 +1,171 @@
+From: Puranjay Mohan <puranjay@kernel.org>
+Date: Wed, 4 Feb 2026 07:17:37 -0800
+Subject: [PATCH] bpf: Support negative offsets, BPF_SUB, and alu32 for linked
+ register tracking
+References: bsc#1258210
+Patch-mainline: 6.18.33
+Git-commit: 7a433e519364c3c19643e5c857f4fbfaebec441c
+
+[ Upstream commit 7a433e519364c3c19643e5c857f4fbfaebec441c ]
+
+Previously, the verifier only tracked positive constant deltas between
+linked registers using BPF_ADD. This limitation meant patterns like:
+
+  r1 = r0;
+  r1 += -4;
+  if r1 s>= 0 goto l0_%=;   // r1 >= 0 implies r0 >= 4
+  // verifier couldn't propagate bounds back to r0
+  if r0 != 0 goto l0_%=;
+	r0 /= 0; // Verifier thinks this is reachable
+  l0_%=:
+
+Similar limitation exists for 32-bit registers.
+
+With this change, the verifier can now track negative deltas in reg->off
+enabling bound propagation for the above pattern.
+
+For alu32, we make sure the destination register has the upper 32 bits
+as 0s before creating the link. BPF_ADD_CONST is split into
+BPF_ADD_CONST64 and BPF_ADD_CONST32, the latter is used in case of alu32
+and sync_linked_regs uses this to zext the result if known_reg has this
+flag.
+
+Signed-off-by: Puranjay Mohan <puranjay@kernel.org>
+Acked-by: Eduard Zingerman <eddyz87@gmail.com>
+Link: https://lore.kernel.org/r/20260204151741.2678118-2-puranjay@kernel.org
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Stable-dep-of: d7f14173c0d5 ("bpf: Fix linked reg delta tracking when src_reg == dst_reg")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/linux/bpf_verifier.h                  |  6 ++-
+ kernel/bpf/verifier.c                         | 50 +++++++++++++++----
+ .../selftests/bpf/progs/verifier_bounds.c     |  2 +-
+ 3 files changed, 45 insertions(+), 13 deletions(-)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 4c497e839526..4867b0e8b5d9 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -147,8 +147,12 @@ struct bpf_reg_state {
+ 	 * registers. Example:
+ 	 * r1 = r2;    both will have r1->id == r2->id == N
+ 	 * r1 += 10;   r1->id == N | BPF_ADD_CONST and r1->off == 10
++	 * r3 = r2;    both will have r3->id == r2->id == N
++	 * w3 += 10;   r3->id == N | BPF_ADD_CONST32 and r3->off == 10
+ 	 */
+-#define BPF_ADD_CONST (1U << 31)
++#define BPF_ADD_CONST64 (1U << 31)
++#define BPF_ADD_CONST32 (1U << 30)
++#define BPF_ADD_CONST (BPF_ADD_CONST64 | BPF_ADD_CONST32)
+ 	u32 id;
+ 	/* PTR_TO_SOCKET and PTR_TO_TCP_SOCK could be a ptr returned
+ 	 * from a pointer-cast helper, bpf_sk_fullsock() and
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 0d1ec2b5d469..6cf8b13db301 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -15787,6 +15787,13 @@ static int adjust_reg_min_max_vals(struct bpf_verifier_env *env,
+ 		verbose(env, "verifier internal error: no src_reg\n");
+ 		return -EFAULT;
+ 	}
++	/*
++	 * For alu32 linked register tracking, we need to check dst_reg's
++	 * umax_value before the ALU operation. After adjust_scalar_min_max_vals(),
++	 * alu32 ops will have zero-extended the result, making umax_value <= U32_MAX.
++	 */
++	u64 dst_umax = dst_reg->umax_value;
++
+ 	err = adjust_scalar_min_max_vals(env, insn, dst_reg, *src_reg);
+ 	if (err)
+ 		return err;
+@@ -15796,26 +15803,44 @@ static int adjust_reg_min_max_vals(struct bpf_verifier_env *env,
+ 	 * r1 += 0x1
+ 	 * if r2 < 1000 goto ...
+ 	 * use r1 in memory access
+-	 * So for 64-bit alu remember constant delta between r2 and r1 and
+-	 * update r1 after 'if' condition.
++	 * So remember constant delta between r2 and r1 and update r1 after
++	 * 'if' condition.
+ 	 */
+ 	if (env->bpf_capable &&
+-	    BPF_OP(insn->code) == BPF_ADD && !alu32 &&
+-	    dst_reg->id && is_reg_const(src_reg, false)) {
+-		u64 val = reg_const_value(src_reg, false);
++	    (BPF_OP(insn->code) == BPF_ADD || BPF_OP(insn->code) == BPF_SUB) &&
++	    dst_reg->id && is_reg_const(src_reg, alu32)) {
++		u64 val = reg_const_value(src_reg, alu32);
++		s32 off;
++
++		if (!alu32 && ((s64)val < S32_MIN || (s64)val > S32_MAX))
++			goto clear_id;
++
++		if (alu32 && (dst_umax > U32_MAX))
++			goto clear_id;
+ 
+-		if ((dst_reg->id & BPF_ADD_CONST) ||
+-		    /* prevent overflow in sync_linked_regs() later */
+-		    val > (u32)S32_MAX) {
++		off = (s32)val;
++
++		if (BPF_OP(insn->code) == BPF_SUB) {
++			/* Negating S32_MIN would overflow */
++			if (off == S32_MIN)
++				goto clear_id;
++			off = -off;
++		}
++
++		if (dst_reg->id & BPF_ADD_CONST) {
+ 			/*
+ 			 * If the register already went through rX += val
+ 			 * we cannot accumulate another val into rx->off.
+ 			 */
++clear_id:
+ 			dst_reg->off = 0;
+ 			dst_reg->id = 0;
+ 		} else {
+-			dst_reg->id |= BPF_ADD_CONST;
+-			dst_reg->off = val;
++			if (alu32)
++				dst_reg->id |= BPF_ADD_CONST32;
++			else
++				dst_reg->id |= BPF_ADD_CONST64;
++			dst_reg->off = off;
+ 		}
+ 	} else {
+ 		/*
+@@ -16888,7 +16913,7 @@ static void sync_linked_regs(struct bpf_verifier_state *vstate, struct bpf_reg_s
+ 			u32 saved_id = reg->id;
+ 
+ 			fake_reg.type = SCALAR_VALUE;
+-			__mark_reg_known(&fake_reg, (s32)reg->off - (s32)known_reg->off);
++			__mark_reg_known(&fake_reg, (s64)reg->off - (s64)known_reg->off);
+ 
+ 			/* reg = known_reg; reg += delta */
+ 			copy_register_state(reg, known_reg);
+@@ -16903,6 +16928,9 @@ static void sync_linked_regs(struct bpf_verifier_state *vstate, struct bpf_reg_s
+ 			scalar32_min_max_add(reg, &fake_reg);
+ 			scalar_min_max_add(reg, &fake_reg);
+ 			reg->var_off = tnum_add(reg->var_off, fake_reg.var_off);
++			if (known_reg->id & BPF_ADD_CONST32)
++				zext_32_to_64(reg);
++			reg_bounds_sync(reg);
+ 		}
+ 	}
+ }
+diff --git a/tools/testing/selftests/bpf/progs/verifier_bounds.c b/tools/testing/selftests/bpf/progs/verifier_bounds.c
+index e772ae430915..ea5db79da40e 100644
+--- a/tools/testing/selftests/bpf/progs/verifier_bounds.c
++++ b/tools/testing/selftests/bpf/progs/verifier_bounds.c
+@@ -1477,7 +1477,7 @@ __naked void sub64_full_overflow(void)
+ SEC("socket")
+ __description("64-bit subtraction, partial overflow, result in unbounded reg")
+ __success __log_level(2)
+-__msg("3: (1f) r3 -= r2 {{.*}} R3=scalar()")
++__msg("3: (1f) r3 -= r2 {{.*}} R3=scalar(id=1-1)")
+ __retval(0)
+ __naked void sub64_partial_overflow(void)
+ {
+-- 
+2.53.0
+
