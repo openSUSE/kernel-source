@@ -1,0 +1,152 @@
+From: Amir Goldstein <amir73il@gmail.com>
+Date: Mon, 20 Apr 2026 14:58:00 +0200
+Subject: [PATCH] fsnotify: fix inode reference leak in fsnotify_recalc_mask()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1012628
+Patch-mainline: 7.0.10
+Git-commit: 4aca914ac152f5d055ddcb36704d1e539ac08977
+
+[ Upstream commit 4aca914ac152f5d055ddcb36704d1e539ac08977 ]
+
+fsnotify_recalc_mask() fails to handle the return value of
+__fsnotify_recalc_mask(), which may return an inode pointer that needs
+to be released via fsnotify_drop_object() when the connector's HAS_IREF
+flag transitions from set to cleared.
+
+This manifests as a hung task with the following call trace:
+
+  INFO: task umount:1234 blocked for more than 120 seconds.
+  Call Trace:
+   __schedule
+   schedule
+   fsnotify_sb_delete
+   generic_shutdown_super
+   kill_anon_super
+   cleanup_mnt
+   task_work_run
+   do_exit
+   do_group_exit
+
+The race window that triggers the iref leak:
+
+  Thread A (adding mark)              Thread B (removing mark)
+  ──────────────────────              ────────────────────────
+  fsnotify_add_mark_locked():
+    fsnotify_add_mark_list():
+      spin_lock(conn->lock)
+      add mark_B(evictable) to list
+      spin_unlock(conn->lock)
+    return
+
+    /* ---- gap: no lock held ---- */
+
+                                      fsnotify_detach_mark(mark_A):
+                                        spin_lock(mark_A->lock)
+                                        clear ATTACHED flag on mark_A
+                                        spin_unlock(mark_A->lock)
+                                        fsnotify_put_mark(mark_A)
+
+    fsnotify_recalc_mask():
+      spin_lock(conn->lock)
+      __fsnotify_recalc_mask():
+        /* mark_A skipped: ATTACHED cleared */
+        /* only mark_B(evictable) remains */
+        want_iref = false
+        has_iref = true  /* not yet cleared */
+        -> HAS_IREF transitions true -> false
+        -> returns inode pointer
+      spin_unlock(conn->lock)
+      /* BUG: return value discarded!
+       * iput() and fsnotify_put_sb_watched_objects()
+       * are never called */
+
+Fix this by deferring the transition true -> false of HAS_IREF flag from
+fsnotify_recalc_mask() (Thread A) to fsnotify_put_mark() (thread B).
+
+Fixes: c3638b5b1374 ("fsnotify: allow adding an inode mark without pinning inode")
+Signed-off-by: Xin Yin <yinxin.x@bytedance.com>
+Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+Link: https://patch.msgid.link/CAOQ4uxiPsbHb0o5voUKyPFMvBsDkG914FYDcs4C5UpBMNm0Vcg@mail.gmail.com
+Signed-off-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/notify/mark.c | 39 ++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 36 insertions(+), 3 deletions(-)
+
+diff --git a/fs/notify/mark.c b/fs/notify/mark.c
+index 622f05977f86..e256b420100d 100644
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@ -238,7 +238,12 @@ static struct inode *fsnotify_update_iref(struct fsnotify_mark_connector *conn,
+ 	return inode;
+ }
+ 
+-static void *__fsnotify_recalc_mask(struct fsnotify_mark_connector *conn)
++/*
++ * Calculate mask of events for a list of marks.
++ *
++ * Return true if any of the attached marks want to hold an inode reference.
++ */
++static bool __fsnotify_recalc_mask(struct fsnotify_mark_connector *conn)
+ {
+ 	u32 new_mask = 0;
+ 	bool want_iref = false;
+@@ -262,6 +267,34 @@ static void *__fsnotify_recalc_mask(struct fsnotify_mark_connector *conn)
+ 	 */
+ 	WRITE_ONCE(*fsnotify_conn_mask_p(conn), new_mask);
+ 
++	return want_iref;
++}
++
++/*
++ * Calculate mask of events for a list of marks after attach/modify mark
++ * and get an inode reference for the connector if needed.
++ *
++ * A concurrent add of evictable mark and detach of non-evictable mark can
++ * lead to __fsnotify_recalc_mask() returning false want_iref, but in this
++ * case we defer clearing iref to fsnotify_recalc_mask_clear_iref() called
++ * from fsnotify_put_mark().
++ */
++static void fsnotify_recalc_mask_set_iref(struct fsnotify_mark_connector *conn)
++{
++	bool has_iref = conn->flags & FSNOTIFY_CONN_FLAG_HAS_IREF;
++	bool want_iref = __fsnotify_recalc_mask(conn) || has_iref;
++
++	(void) fsnotify_update_iref(conn, want_iref);
++}
++
++/*
++ * Calculate mask of events for a list of marks after detach mark
++ * and return the inode object if its reference is no longer needed.
++ */
++static void *fsnotify_recalc_mask_clear_iref(struct fsnotify_mark_connector *conn)
++{
++	bool want_iref = __fsnotify_recalc_mask(conn);
++
+ 	return fsnotify_update_iref(conn, want_iref);
+ }
+ 
+@@ -298,7 +331,7 @@ void fsnotify_recalc_mask(struct fsnotify_mark_connector *conn)
+ 
+ 	spin_lock(&conn->lock);
+ 	update_children = !fsnotify_conn_watches_children(conn);
+-	__fsnotify_recalc_mask(conn);
++	fsnotify_recalc_mask_set_iref(conn);
+ 	update_children &= fsnotify_conn_watches_children(conn);
+ 	spin_unlock(&conn->lock);
+ 	/*
+@@ -419,7 +452,7 @@ void fsnotify_put_mark(struct fsnotify_mark *mark)
+ 		/* Update watched objects after detaching mark */
+ 		if (sb)
+ 			fsnotify_update_sb_watchers(sb, conn);
+-		objp = __fsnotify_recalc_mask(conn);
++		objp = fsnotify_recalc_mask_clear_iref(conn);
+ 		type = conn->type;
+ 	}
+ 	WRITE_ONCE(mark->connector, NULL);
+-- 
+2.54.0
+
