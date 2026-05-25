@@ -23,7 +23,6 @@ import subprocess
 import operator
 import tempfile
 import pathlib
-import signal
 import shelve
 import shutil
 import sys

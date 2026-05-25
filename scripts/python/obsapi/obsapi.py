@@ -28,11 +28,18 @@ def expand_home(path):
 def is_git_sha(txt):
     return (len(txt) == 64 or len(txt) == 40) and re.fullmatch('(?ai)[a-f0-9]*', txt)
 
-def process_scmsync(sync):
+def process_scmsync(sync_text):
+    if sync_text is None:
+        return sync_text
+    sync = urllib.parse.urlparse(sync_text)
     assert sync.scheme == 'https'
     assert sync.netloc in ['src.suse.de', 'src.opensuse.org']
     query = urllib.parse.parse_qs(sync.query)
-    assert list(query.keys()) == ['trackingbranch'] or list(query.keys()) == []
+    query_keys = list(query.keys())
+    if 'enforce_bcntsynctag' in query_keys: query_keys.remove('enforce_bcntsynctag')  # Ignore irrelevant query option
+    if query_keys != ['trackingbranch'] and query_keys != []:
+        raise RuntimeError("In %s: expected [] or ['trackingbranch'], got %s" % (
+            repr(sync), str(query_keys)))
     if 'trackingbranch' in query:
         branch = query['trackingbranch'][0]
         assert is_git_sha(sync.fragment)
@@ -72,23 +79,22 @@ class OBSAPI(api.API):
         try:
             self.cookiejar.load()
         except FileNotFoundError:
-            None
+            pass
         except Exception as e:
-            sys.stderr.write("Error loading cookies: %s\n" % (repr(e),))
+            raise RuntimeError('Error loading cookies: ' + cookiejar + ': ' + str(e))
         cp = configparser.ConfigParser(delimiters=('=', ':'), interpolation=None)
         try:
             cp.read(self.config)
-        except (FileNotFoundError, PermissionError) as e:
-            sys.stderr.write('Error loading osc configuration file ' + self.config + ' : ' + str(e) + '\n')
-        config_section = self.url
-        if config_section not in cp:
-            config_section += '/'
-        if config_section not in cp:
+        except (FileNotFoundError, PermissionError, UnicodeError, configparser.Error) as e:
+            raise RuntimeError('Error loading osc configuration file ' + self.config + ' : ' + str(e))
+        try:
+            config_section = [sec for sec in cp.sections() if sec.rstrip('/') == self.url][0]
+        except IndexError:
             raise RuntimeError('No configuration for API ' + self.url + ' in ' + self.config)
         config = cp[config_section]
         self.user = config.get('user', None)
         if not self.user:
-            raise RuntimeError('No username found in ' + self.url + ' configuration.')
+            raise RuntimeError('No username found for API ' + self.url + ' in ' + self.config)
         self.sshkey = None
         self.passw = None
         if 'sshkey' in config:
@@ -99,16 +105,16 @@ class OBSAPI(api.API):
                 raise RuntimeError('Key file does not exist ' + self.sshkey)
             return
         passx = None
+        cmc = config.get('credentials_mgr_class', None)
         if 'passx' in config:
             passx = config['passx']
-        elif 'pass' in config and config.get('credentials_mgr_class', None) == 'osc.credentials.ObfuscatedConfigFileCredentialsManager':
+        elif 'pass' in config and cmc == 'osc.credentials.ObfuscatedConfigFileCredentialsManager':
             passx = config['pass']
         if passx:
             passw = bz2.decompress(base64.standard_b64decode(passx)).decode()
         else:
             passw = config.get('pass', None)
         if not passw:
-            cmc = config.get('credentials_mgr_class', None)
             if 'keyring' in config or 'gnome_keyring' in config or cmc == 'osc.credentials.KeyringCredentialsManager:keyring.backends.SecretService.Keyring':
                 assert self.url.startswith('https://')
                 host = self.url[       len('https://'):]
@@ -116,7 +122,7 @@ class OBSAPI(api.API):
                 assert len(passw) > 0
                 passw = passw.decode()
             else:
-                raise RuntimeError('No password found in ' + self.url + ' configuration. Authentication type ' + str(cmc) + ' not supported.')
+                raise RuntimeError('No password found for API ' + self.url + ' in ' + self.config +'. Authentication type ' + str(cmc) + ' not supported.')
         self.passw = passw
 
     def ssh_signature(self, created, user, sshkey, realm):
@@ -124,7 +130,7 @@ class OBSAPI(api.API):
             fn = os.path.join(td, 'data')
             with open(fn, 'w') as f:
                 f.write('(created): ' + str(created))
-            for i in range(0,3):
+            for _ in range(0,3):
                 try:
                     subprocess.check_call(['ssh-keygen', '-Y', 'sign', '-f', sshkey, '-n', realm, '-q', fn])
                     break
@@ -154,7 +160,7 @@ class OBSAPI(api.API):
             if 'realm' not in wwwa:
                 raise RuntimeError('No realm received for basic authentication')
             return {'Authorization' : 'Basic ' + base64.standard_b64encode((self.user + ':' + self.passw).encode()).decode()}
-        raise RuntimeError('Authentication required but no usable authentication found\nRequested authorizarion: ' + str(dict(wwwa)) +
+        raise RuntimeError('Authentication required but no usable credentials found\nRequested authorizarion: ' + str(dict(wwwa)) +
                            '\nAvailable credentials:  password: ' + str(not not self.passw) + '  SSH key: ' + str(not not self.sshkey))
 
     def check_login(self):
@@ -178,7 +184,7 @@ class OBSAPI(api.API):
         self.check_put('/'.join(['/source', project, '_config']), headers={'Content-type': 'text/plain'}, data=conf)
 
     def delete_project(self, project):
-        return self.check_delete('/'.join(['/source', project] + '?force=1'))
+        return self.check_delete('/'.join(['/source', project]) + '?force=1')
 
     def package_exists(self, project, package):
         return self.file_exists(project, package, '_meta')
@@ -216,29 +222,32 @@ class OBSAPI(api.API):
 
     def package_scmsync(self, project, package):
         sync = self.package_meta(project, package).find('scmsync')
-        return urllib.parse.urlparse(sync.text) if sync is not None else None
+        return sync.text if sync is not None else None
 
     def project_scmsync(self, project):
         sync = self.project_meta(project).find('scmsync')
-        return urllib.parse.urlparse(sync.text) if sync is not None else None
+        return sync.text if sync is not None else None
 
     def project_repo(self, project):
-        if self.project_exists(project) and self.project_meta(project).find('scmsync') != None:
+        if self.project_exists(project):
             return process_scmsync(self.project_scmsync(project))
         return None
 
     def package_repo(self, project, package):
-        if self.package_exists(project, package) and self.package_meta(project, package).find('scmsync') != None:
-            return process_scmsync(self.package_scmsync(project, package))
-        if self.url == 'https://api.suse.de':
-            api = 'https://src.suse.de'
-        elif self.url == 'https://api.opensuse.org':
-            api = 'https://src.opensuse.org'
-        elif self.url.startswith('https://127.0.0.1:'):
-            api = self.url  # test environment
-        else:
-            raise APIError('No default Gitea API for %s' % (self.url,))
-        return PkgRepo(api, 'pool', package, None, None)
+        repo = None
+        if self.package_exists(project, package):
+            repo = process_scmsync(self.package_scmsync(project, package))
+        if not repo:
+            if self.url == 'https://api.suse.de':
+                api = 'https://src.suse.de'
+            elif self.url == 'https://api.opensuse.org':
+                api = 'https://src.opensuse.org'
+            elif self.url.startswith('https://127.0.0.1:'):
+                api = self.url  # test environment
+            else:
+                raise APIError('No default Gitea API for %s' % (self.url,))
+            repo = PkgRepo(api, 'pool', package, None, None)
+        return repo
 
     def list_projects(self):
         xml = ET.fromstring(self.check_get('/source').content)

@@ -1,7 +1,7 @@
 from kutil.config import get_kernel_projects, get_package_archs, get_source_timestamp, read_source_timestamp, get_kernel_project_package, list_files, list_specs
+from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership, get_maintainership
+from obsapi.obsapi import OBSAPI, PkgRepo
 import xml.etree.ElementTree as ET
-from obsapi.teaapi import TeaAPI, json_custom_dump
-from obsapi.obsapi import OBSAPI
 from obsapi.api import APIError
 import subprocess
 import tempfile
@@ -254,7 +254,7 @@ Constraint: hardware:disk:size unit=G %i
         ET.indent(pkgmeta)
         return ET.tostring(pkgmeta)
 
-    def create_package(self, limit_packages=None):
+    def create_package(self, limit_packages=None, no_init=False):
         limit_packages = self.filter_limit_packages(limit_packages)
         repo_archs = self.get_project_repo_archs(limit_packages)
         multibuild = '_multibuild' in list_files(self.data)
@@ -266,22 +266,37 @@ Constraint: hardware:disk:size unit=G %i
         self.obs.create_package_meta(self.project, self.package, self.pkgmeta())
         kob = 'kernel-obs-build'
         kob_agg = kob + '.agg'
-        self.log_progress('Aggregating %s/%s...' % (self.project, kob_agg))
-        self.obs.create_package(self.project, kob_agg)
+        if not no_init:
+            if kob in specs:
+                self.aggregate_package(package, kob, kob_agg, list(repo_archs.keys()))
+            else:
+                self.log_progress('Deleting %s/%s...' % (self.project, kob_agg))
+                try:
+                    self.obs.delete_package(self.project, kob_agg)
+                    self.log_progress('ok\n')
+                except APIError as e:
+                    self.log_progress(str(e))
+        self.update_package_links(specs, package, multibuild)
+
+    def aggregate_package(self, package, agg_src, agg_target, repos):
+        self.log_progress('Aggregating %s/%s...' % (self.project, agg_target))
+        self.obs.create_package(self.project, agg_target)
         aggxml = ET.Element('aggregatelist')
         agg = ET.SubElement(aggxml, 'aggregate', project = self.project)
         pkg = ET.SubElement(agg, 'package')
-        pkg.text = kob
+        pkg.text = agg_src
         pkg = ET.SubElement(agg, 'package')
-        pkg.text = package + ':' + kob
-        for r in repo_archs.keys():
+        pkg.text = package + ':' + agg_src
+        for r in repos:
             ET.SubElement(agg, 'repository', target=self.get_qa_repo(r), source=r)
             # default aggregetio is identity, target=source.
             # target with no souce disables aggregation
             ET.SubElement(agg, 'repository', target=r)
         ET.indent(aggxml)
-        self.obs.upload_file(self.project, kob_agg, '_aggregate', ET.tostring(aggxml), 'application/xml')
+        self.obs.upload_file(self.project, agg_target, '_aggregate', ET.tostring(aggxml), 'application/xml')
         self.log_progress('ok\n')
+
+    def update_package_links(self, specs, package, multibuild):
         links = self.obs.list_package_links(self.project, self.package)
         if not multibuild:
             for s in specs:
@@ -308,13 +323,13 @@ Constraint: hardware:disk:size unit=G %i
             data = self.tea.get_file_data(prjrepo.org, prjrepo.repo, prjrepo.branch, maintfile)
             data_decoded = json.loads(data)
             assert json.loads(json_custom_dump(data_decoded)) == data_decoded
-            current_maintainers = json.loads(data).get(self.package, [])
+            current_maintainers = get_maintainership(data_decoded, self.package)
             if (maintainers and maintainers != current_maintainers) or (not maintainers and data != json_custom_dump(data_decoded)):
                 if maintainers:
-                    data_decoded[self.package] = maintainers
+                    data_decoded = update_maintainership(data_decoded, self.package, maintainers)
                 data_massaged = json_custom_dump(data_decoded)
                 sys.stderr.write('\n'.join(difflib.unified_diff(data.splitlines(), data_massaged.splitlines(), lineterm='')))
-                self.fork_repo(prjrepo, True)
+                self.fork_repo(prjrepo, True, True)
                 self.log_progress('Updating %s.\n' % (maintfile,))
                 self.tea.update_file(self.user, prjrepo.repo, self.user_branch, maintfile, data_massaged)
                 commit = self.tea.repo_branches(self.user, prjrepo.repo)[self.user_branch]['commit']['id']
@@ -322,29 +337,34 @@ Constraint: hardware:disk:size unit=G %i
                 self._submit(prjrepo, 'Update ' + self.package + ' maintainer list.' if maintainers else
                 'Normalize ' + maintfile + ' formatting\nThe ' + maintfile + ' formatting is not entirely consistent.\nMake the formatting uniform across the whole file to facilitate automated updates.')
 
-    def fork_repo(self, upstream_repo, reset_branch):
+    def fork_repo(self, upstream_repo, reset_branch, re_fork):
         upstream_info = self.tea.repo_exists(upstream_repo.org, upstream_repo.repo)
         if upstream_info:
             upstream_info = upstream_info.json()
-        downstream_info = self.tea.repo_exists(self.user, upstream_repo.repo)
-        if downstream_info:
-            downstream_info = downstream_info.json()
-        if upstream_info and downstream_info:
-            if not downstream_info['fork'] or downstream_info['parent']['full_name'] != upstream_repo.org + '/' + upstream_repo.repo:
-                raise APIError('Fork of ' + upstream_repo.org + '/' + upstream_repo.repo + ' needed.')
         if upstream_repo.branch:
             assert upstream_repo.branch in self.tea.repo_branches(upstream_repo.org, upstream_repo.repo)
         if upstream_repo.commit:  # Maybe check it's part of the branch as well?
             self.tea.repo_commit_exists(upstream_repo.org, upstream_repo.repo, upstream_repo.commit)  # may be missing because of sync error
+        downstream_repo = PkgRepo(self.tea.url, self.user, upstream_repo.repo, None, None)
+        downstream_info = self.tea.repo_exists(downstream_repo.org, downstream_repo.repo)
+        if downstream_info:
+            downstream_info = downstream_info.json()
+        if upstream_info and downstream_info:
+            if not downstream_info['fork'] or downstream_info['parent']['full_name'] != upstream_repo.org + '/' + upstream_repo.repo:
+                if not re_fork:
+                    raise APIError('Fork of ' + upstream_repo.org + '/' + upstream_repo.repo + ' needed.')
+                else:
+                    self.downstream_info = None
+                    self.tea.check_delete(self.tea.repo_path(downstream_repo.org, downstream_repo.repo))
         if not downstream_info:
             if upstream_info:
-                self.log_progress('Forking repository %s/%s from %s/%s.\n' % (self.user, upstream_repo.repo, upstream_repo.org, upstream_repo.repo))
+                self.log_progress('Forking repository %s/%s from %s/%s.\n' % (downstream_repo.org, downstream_repo.repo, upstream_repo.org, upstream_repo.repo))
             else:
-                self.log_progress('Creating repository %s/%s.\n' % (self.user, upstream_repo.repo))
-            downstream_info = self.tea.fork_repo(upstream_repo.org, self.user, upstream_repo.repo)
+                self.log_progress('Creating repository %s/%s.\n' % (downstream_repo.org, downstream_repo.repo))
+            downstream_info = self.tea.fork_repo(upstream_repo.org, upstream_repo.repo, downstream_repo.org, upstream_repo.repo)
         if upstream_info and upstream_repo.branch:
             self.log_progress('Merging upstream branch %s..' % (upstream_repo.branch,))
-            pull = self.tea.merge_upstream_branch(self.user, upstream_repo.repo, upstream_repo.branch)
+            pull = self.tea.merge_upstream_branch(downstream_repo.org, downstream_repo.repo, upstream_repo.branch)
             if not pull.ok:
                 self.log_progress(' '.join([pull.status_message_pretty, repr(pull.json())]) + '\n')
             else:
@@ -356,11 +376,11 @@ Constraint: hardware:disk:size unit=G %i
                 self.log_progress('Resetting branch %s.\n' % (self.user_branch,))
             else:
                 self.log_progress('Creating branch %s.\n' % (self.user_branch,))
-            self.tea.create_or_reset_branch(self.user, upstream_repo.repo, self.user_branch, upstream_repo.branch, upstream_repo.commit, reset_branch)
+            self.tea.create_or_reset_branch(downstream_repo.org, downstream_repo.repo, self.user_branch, upstream_repo.branch, upstream_repo.commit, reset_branch)
 
 
 class Uploader(UploaderBase):
-    def __init__(self, api, data, user_project, reset_branch=False, logfile=None, progress=True, ignore_kabi=False, upload_all=False):
+    def __init__(self, api, data, user_project, reset_branch=False, re_fork=False, logfile=None, progress=True, ignore_kabi=False, upload_all=False):
         self.progress = sys.stderr if progress else None
         self.data = data
         self.upstream_project, self.package = get_kernel_project_package(self.data)
@@ -376,5 +396,6 @@ class Uploader(UploaderBase):
         self.user_branch = user_project.translate(str.maketrans(':', '/')) if user_project else self.upstream.branch
         self.ignore_kabi_badness = ignore_kabi
         self.reset_branch = reset_branch
+        self.re_fork = re_fork
         self.upload_all = upload_all
-        self.fork_repo(self.upstream, self.reset_branch)
+        self.fork_repo(self.upstream, self.reset_branch, self.re_fork)
