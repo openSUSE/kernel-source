@@ -6,7 +6,7 @@ TIME_FORMAT_XML = '%Y%m%dT%H:%M:%S'
 TIME_FORMAT_REST = '%Y-%m-%dT%H:%M:%SZ'
 
 def handle_email(email):
-    if email == '__empty-env-var__':
+    if '__empty-env-var__' in email:
         print("Please set the environment variable BUGZILLA_ACCOUNT_EMAIL to your bugzilla email or provide it after --email (-e).", file=sys.stderr)
         sys.exit(1)
     return email

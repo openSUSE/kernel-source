@@ -1,0 +1,397 @@
+From a7b9ce39fbe4ae2919fe4f7ac16c293cb6632d30 Mon Sep 17 00:00:00 2001
+From: Ilpo Järvinen <ilpo.jarvinen@linux.intel.com>
+Date: Tue, 3 Feb 2026 19:10:49 +0200
+Subject: [PATCH] serial: 8250_dw: Ensure BUSY is deasserted
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: a7b9ce39fbe4ae2919fe4f7ac16c293cb6632d30
+Patch-mainline: v7.0-rc5
+References: bsc#1262480
+
+DW UART cannot write to LCR, DLL, and DLH while BUSY is asserted.
+Existance of BUSY depends on uart_16550_compatible, if UART HW is
+configured with it those registers can always be written.
+
+There currently is dw8250_force_idle() which attempts to achieve
+non-BUSY state by disabling FIFO, however, the solution is unreliable
+when Rx keeps getting more and more characters.
+
+Create a sequence of operations that ensures UART cannot keep BUSY
+asserted indefinitely. The new sequence relies on enabling loopback mode
+temporarily to prevent incoming Rx characters keeping UART BUSY.
+
+Ensure no Tx in ongoing while the UART is switches into the loopback
+mode (requires exporting serial8250_fifo_wait_for_lsr_thre() and adding
+DMA Tx pause/resume functions).
+
+According to tests performed by Adriana Nicolae <adriana@arista.com>,
+simply disabling FIFO or clearing FIFOs only once does not always
+ensure BUSY is deasserted but up to two tries may be needed. This could
+be related to ongoing Rx of a character (a guess, not known for sure).
+Therefore, retry FIFO clearing a few times (retry limit 4 is arbitrary
+number but using, e.g., p->fifosize seems overly large). Tests
+performed by others did not exhibit similar challenge but it does not
+seem harmful to leave the FIFO clearing loop in place for all DW UARTs
+with BUSY functionality.
+
+Use the new dw8250_idle_enter/exit() to do divisor writes and LCR
+writes. In case of plain LCR writes, opportunistically try to update
+LCR first and only invoke dw8250_idle_enter() if the write did not
+succeed (it has been observed that in practice most LCR writes do
+succeed without complications).
+
+This issue was first reported by qianfan Zhao who put lots of debugging
+effort into understanding the solution space.
+
+Fixes: c49436b657d0 ("serial: 8250_dw: Improve unwritable LCR workaround")
+Fixes: 7d4008ebb1c9 ("tty: add a DesignWare 8250 driver")
+Cc: stable <stable@kernel.org>
+Reported-by: qianfan Zhao <qianfanguijin@163.com>
+Link: https://lore.kernel.org/linux-serial/289bb78a-7509-1c5c-2923-a04ed3b6487d@163.com/
+Reported-by: Adriana Nicolae <adriana@arista.com>
+Link: https://lore.kernel.org/linux-serial/20250819182322.3451959-1-adriana@arista.com/
+Reported-by: Bandal, Shankar <shankar.bandal@intel.com>
+Tested-by: Bandal, Shankar <shankar.bandal@intel.com>
+Tested-by: Murthy, Shanth <shanth.murthy@intel.com>
+Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Signed-off-by: Ilpo Järvinen <ilpo.jarvinen@linux.intel.com>
+Link: https://patch.msgid.link/20260203171049.4353-8-ilpo.jarvinen@linux.intel.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/tty/serial/8250/8250.h      |   25 ++++++
+ drivers/tty/serial/8250/8250_dw.c   |  150 ++++++++++++++++++++++++++++--------
+ drivers/tty/serial/8250/8250_port.c |   28 +++---
+ 3 files changed, 160 insertions(+), 43 deletions(-)
+
+--- a/drivers/tty/serial/8250/8250.h
++++ b/drivers/tty/serial/8250/8250.h
+@@ -164,7 +164,9 @@ static unsigned int __maybe_unused seria
+ 	return value;
+ }
+ 
++void serial8250_clear_fifos(struct uart_8250_port *p);
+ void serial8250_clear_and_reinit_fifos(struct uart_8250_port *p);
++void serial8250_fifo_wait_for_lsr_thre(struct uart_8250_port *up, unsigned int count);
+ 
+ static inline u32 serial_dl_read(struct uart_8250_port *up)
+ {
+@@ -378,6 +380,26 @@ static inline bool serial8250_tx_dma_run
+ 
+ 	return dma && dma->tx_running;
+ }
++
++static inline void serial8250_tx_dma_pause(struct uart_8250_port *p)
++{
++	struct uart_8250_dma *dma = p->dma;
++
++	if (!dma->tx_running)
++		return;
++
++	dmaengine_pause(dma->txchan);
++}
++
++static inline void serial8250_tx_dma_resume(struct uart_8250_port *p)
++{
++	struct uart_8250_dma *dma = p->dma;
++
++	if (!dma->tx_running)
++		return;
++
++	dmaengine_resume(dma->txchan);
++}
+ #else
+ static inline int serial8250_tx_dma(struct uart_8250_port *p)
+ {
+@@ -399,6 +421,9 @@ static inline bool serial8250_tx_dma_run
+ {
+ 	return false;
+ }
++
++static inline void serial8250_tx_dma_pause(struct uart_8250_port *p) { }
++static inline void serial8250_tx_dma_resume(struct uart_8250_port *p) { }
+ #endif
+ 
+ static inline int ns16550a_goto_highspeed(struct uart_8250_port *up)
+--- a/drivers/tty/serial/8250/8250_dw.c
++++ b/drivers/tty/serial/8250/8250_dw.c
+@@ -16,6 +16,7 @@
+ #include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/io.h>
++#include <linux/lockdep.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
+ #include <linux/notifier.h>
+@@ -48,6 +49,8 @@
+ 
+ #define DW_UART_MCR_SIRE		BIT(6)
+ 
++#define DW_UART_USR_BUSY		BIT(0)
++
+ /* Renesas specific register fields */
+ #define RZN1_UART_xDMACR_DMA_EN		BIT(0)
+ #define RZN1_UART_xDMACR_1_WORD_BURST	(0 << 1)
+@@ -90,6 +93,7 @@ struct dw8250_data {
+ 
+ 	unsigned int		skip_autocfg:1;
+ 	unsigned int		uart_16550_compatible:1;
++	unsigned int		in_idle:1;
+ 
+ 	u8			no_int_count;
+ };
+@@ -122,57 +126,142 @@ static inline int dw8250_modify_msr(stru
+ 	return value;
+ }
+ 
+-static void dw8250_force_idle(struct uart_port *p)
++static void dw8250_idle_exit(struct uart_port *p)
+ {
++	struct dw8250_data *d = to_dw8250_data(p->private_data);
+ 	struct uart_8250_port *up = up_to_u8250p(p);
+-	unsigned int lsr;
+ 
+-	serial8250_clear_and_reinit_fifos(up);
++	if (d->uart_16550_compatible)
++		return;
++
++	if (up->capabilities & UART_CAP_FIFO)
++		serial_port_out(p, UART_FCR, up->fcr);
++	serial_port_out(p, UART_MCR, up->mcr);
++	serial_port_out(p, UART_IER, up->ier);
++
++	/* DMA Rx is restarted by IRQ handler as needed. */
++	if (up->dma)
++		serial8250_tx_dma_resume(up);
++
++	d->in_idle = 0;
++}
++
++/*
++ * Ensure BUSY is not asserted. If DW UART is configured with
++ * !uart_16550_compatible, the writes to LCR, DLL, and DLH fail while
++ * BUSY is asserted.
++ *
++ * Context: port's lock must be held
++ */
++static int dw8250_idle_enter(struct uart_port *p)
++{
++	struct dw8250_data *d = to_dw8250_data(p->private_data);
++	unsigned int usr_reg = d->pdata ? d->pdata->usr_reg : DW_UART_USR;
++	struct uart_8250_port *up = up_to_u8250p(p);
++	int retries;
++	u32 lsr;
++
++	lockdep_assert_held_once(&p->lock);
++
++	if (d->uart_16550_compatible)
++		return 0;
++
++	d->in_idle = 1;
++
++	/* Prevent triggering interrupt from RBR filling */
++	serial_port_out(p, UART_IER, 0);
++
++	if (up->dma) {
++		serial8250_rx_dma_flush(up);
++		if (serial8250_tx_dma_running(up))
++			serial8250_tx_dma_pause(up);
++	}
+ 
+ 	/*
+-	 * With PSLVERR_RESP_EN parameter set to 1, the device generates an
+-	 * error response when an attempt to read an empty RBR with FIFO
+-	 * enabled.
++	 * Wait until Tx becomes empty + one extra frame time to ensure all bits
++	 * have been sent on the wire.
++	 *
++	 * FIXME: frame_time delay is too long with very low baudrates.
+ 	 */
+-	if (up->fcr & UART_FCR_ENABLE_FIFO) {
+-		lsr = p->serial_in(p, UART_LSR);
+-		if (!(lsr & UART_LSR_DR))
+-			return;
++	serial8250_fifo_wait_for_lsr_thre(up, p->fifosize);
++	ndelay(p->frame_time);
++
++	serial_port_out(p, UART_MCR, up->mcr | UART_MCR_LOOP);
++
++	retries = 4;	/* Arbitrary limit, 2 was always enough in tests */
++	do {
++		serial8250_clear_fifos(up);
++		if (!(serial_port_in(p, usr_reg) & DW_UART_USR_BUSY))
++			break;
++		/* FIXME: frame_time delay is too long with very low baudrates. */
++		ndelay(p->frame_time);
++	} while (--retries);
++
++	lsr = serial_lsr_in(up);
++	if (lsr & UART_LSR_DR) {
++		serial_port_in(p, UART_RX);
++		up->lsr_saved_flags = 0;
+ 	}
+ 
+-	(void)p->serial_in(p, UART_RX);
++	/* Now guaranteed to have BUSY deasserted? Just sanity check */
++	if (serial_port_in(p, usr_reg) & DW_UART_USR_BUSY) {
++		dw8250_idle_exit(p);
++		return -EBUSY;
++	}
++
++	return 0;
++}
++
++static void dw8250_set_divisor(struct uart_port *p, unsigned int baud,
++			       unsigned int quot, unsigned int quot_frac)
++{
++	struct uart_8250_port *up = up_to_u8250p(p);
++	int ret;
++
++	ret = dw8250_idle_enter(p);
++	if (ret < 0)
++		return;
++
++	serial_port_out(p, UART_LCR, up->lcr | UART_LCR_DLAB);
++	if (!(serial_port_in(p, UART_LCR) & UART_LCR_DLAB))
++		goto idle_failed;
++
++	serial_dl_write(up, quot);
++	serial_port_out(p, UART_LCR, up->lcr);
++
++idle_failed:
++	dw8250_idle_exit(p);
+ }
+ 
+ static void dw8250_check_lcr(struct uart_port *p, int value)
+ {
+-	void __iomem *offset = p->membase + (UART_LCR << p->regshift);
+-	int tries = 1000;
++	struct dw8250_data *d = to_dw8250_data(p->private_data);
++	u32 lcr;
++	int ret;
++
++	lcr = serial_port_in(p, UART_LCR);
+ 
+ 	/* Make sure LCR write wasn't ignored */
+-	while (tries--) {
+-		unsigned int lcr = p->serial_in(p, UART_LCR);
++	if ((value & ~UART_LCR_SPAR) == (lcr & ~UART_LCR_SPAR))
++		return;
+ 
+-		if ((value & ~UART_LCR_SPAR) == (lcr & ~UART_LCR_SPAR))
+-			return;
++	if (d->in_idle)
++		goto write_err;
+ 
+-		dw8250_force_idle(p);
++	ret = dw8250_idle_enter(p);
++	if (ret < 0)
++		goto write_err;
++
++	serial_port_out(p, UART_LCR, value);
++	dw8250_idle_exit(p);
++	return;
+ 
+-#ifdef CONFIG_64BIT
+-		if (p->type == PORT_OCTEON)
+-			__raw_writeq(value & 0xff, offset);
+-		else
+-#endif
+-		if (p->iotype == UPIO_MEM32)
+-			writel(value, offset);
+-		else if (p->iotype == UPIO_MEM32BE)
+-			iowrite32be(value, offset);
+-		else
+-			writeb(value, offset);
+-	}
++write_err:
+ 	/*
+ 	 * FIXME: this deadlocks if port->lock is already held
+ 	 * dev_err(p->dev, "Couldn't set LCR to %d\n", value);
+ 	 */
++	return;		/* Silences "label at the end of compound statement" */
+ }
+ 
+ /*
+@@ -662,6 +751,7 @@ static int dw8250_probe(struct platform_
+ 	p->serial_out	= dw8250_serial_out;
+ 	p->set_ldisc	= dw8250_set_ldisc;
+ 	p->set_termios	= dw8250_set_termios;
++	p->set_divisor	= dw8250_set_divisor;
+ 
+ 	p->membase = devm_ioremap(dev, regs->start, resource_size(regs));
+ 	if (!p->membase)
+--- a/drivers/tty/serial/8250/8250_port.c
++++ b/drivers/tty/serial/8250/8250_port.c
+@@ -489,7 +489,7 @@ serial_port_out_sync(struct uart_port *p
+ /*
+  * FIFO support.
+  */
+-static void serial8250_clear_fifos(struct uart_8250_port *p)
++void serial8250_clear_fifos(struct uart_8250_port *p)
+ {
+ 	if (p->capabilities & UART_CAP_FIFO) {
+ 		serial_out(p, UART_FCR, UART_FCR_ENABLE_FIFO);
+@@ -498,6 +498,7 @@ static void serial8250_clear_fifos(struc
+ 		serial_out(p, UART_FCR, 0);
+ 	}
+ }
++EXPORT_SYMBOL_GPL(serial8250_clear_fifos);
+ 
+ static enum hrtimer_restart serial8250_em485_handle_start_tx(struct hrtimer *t);
+ static enum hrtimer_restart serial8250_em485_handle_stop_tx(struct hrtimer *t);
+@@ -3346,6 +3347,17 @@ void serial8250_set_defaults(struct uart
+ }
+ EXPORT_SYMBOL_GPL(serial8250_set_defaults);
+ 
++void serial8250_fifo_wait_for_lsr_thre(struct uart_8250_port *up, unsigned int count)
++{
++	unsigned int i;
++
++	for (i = 0; i < count; i++) {
++		if (wait_for_lsr(up, UART_LSR_THRE))
++			return;
++	}
++}
++EXPORT_SYMBOL_GPL(serial8250_fifo_wait_for_lsr_thre);
++
+ #ifdef CONFIG_SERIAL_8250_CONSOLE
+ 
+ static void serial8250_console_putchar(struct uart_port *port, unsigned char ch)
+@@ -3382,16 +3394,6 @@ static void serial8250_console_restore(s
+ 	serial8250_out_MCR(up, up->mcr | UART_MCR_DTR | UART_MCR_RTS);
+ }
+ 
+-static void fifo_wait_for_lsr(struct uart_8250_port *up, unsigned int count)
+-{
+-	unsigned int i;
+-
+-	for (i = 0; i < count; i++) {
+-		if (wait_for_lsr(up, UART_LSR_THRE))
+-			return;
+-	}
+-}
+-
+ /*
+  * Print a string to the serial port using the device FIFO
+  *
+@@ -3409,7 +3411,7 @@ static void serial8250_console_fifo_writ
+ 
+ 	while (s != end) {
+ 		/* Allow timeout for each byte of a possibly full FIFO */
+-		fifo_wait_for_lsr(up, fifosize);
++		serial8250_fifo_wait_for_lsr_thre(up, fifosize);
+ 
+ 		for (i = 0; i < fifosize && s != end; ++i) {
+ 			if (*s == '\n' && !cr_sent) {
+@@ -3427,7 +3429,7 @@ static void serial8250_console_fifo_writ
+ 	 * Allow timeout for each byte written since the caller will only wait
+ 	 * for UART_LSR_BOTH_EMPTY using the timeout of a single character
+ 	 */
+-	fifo_wait_for_lsr(up, tx_count);
++	serial8250_fifo_wait_for_lsr_thre(up, tx_count);
+ }
+ 
+ /*
