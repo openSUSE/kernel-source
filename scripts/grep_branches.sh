@@ -8,8 +8,20 @@ grep_branch()
 {
 	local branch=$1
 	shift
+	local params
+	local files
 
-	git --no-pager grep "$@" origin/$branch
+	# Loop through all positional parameters
+	while [[ $# -gt 0 ]]; do
+		if [[ "$1" == "--" ]]; then
+			files=("$@")
+			break
+		fi
+		params+=("$1")
+		shift
+	done
+
+	git --no-pager grep "${params[@]}" origin/$branch "${files[@]}"
 	return 0
 }
 
