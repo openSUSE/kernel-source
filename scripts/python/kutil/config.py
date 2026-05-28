@@ -1,6 +1,45 @@
+#! /usr/bin/env python3
+"""
+Synopsis: determine the current kernel source version from a series of patches
+          as being defined in series.conf
+
+Usage: {appname} [-hVvp]
+       -h, --help           this message
+       -V, --version        print version and exit
+       -v, --verbose        verbose mode (cumulative)
+       -p, --patches dir    base directory, holding rpm/config.sh, series.conf
+                            and patches.*, referenced in series.conf
+
+Description:
+The executable part of this script replaces the old compute-PATCHVERSION.sh
+script. It is expected to be executed in the kernel-source base folder, e.g.:
+
+        ./rpm/compute-PATCHVERSION.py
+
+Otherwise provide the --patches argument with the preferred base directory.
+
+This file is typically a symlink to ../scripts/python/kutil/config.py.
+
+It fetches the kernel source version from ./rpm/config.sh, then parses the
+./series.conf file, collecting all patch files, and tracks for any changes in
+top level Makefiles to the four version defining symbols: VERSION, PATCHLEVEL,
+SUBLEVEL, and EXTRAVERSION. The result should consitute the latest kernel
+patch level.
+
+Version: {version}
+Copyright: (c)2026 by {company}
+Author: {author}
+License: {license}
+"""
+#
+# vim:set et ts=8 sw=4:
+#
+
 import configparser
 import subprocess
 import os
+
+# some commonly used functions
 
 def uniq(lst):
     # fairly slow but does not require any special property of elements nor ordered dictionaries
@@ -149,3 +188,299 @@ def get_package_archs(package_tar_up_dir, limit_packages=None):
                     assert '%' not in l  # will need to do more macro expansion otherwise
                     archs += l.split(' ')
     return sorted(list(set(archs)))
+
+# here starts the new compute-PATCHVERSION.py implementation
+
+if __name__ == "__main__":
+    import os
+    import re
+    import sys
+    import shlex
+    import getopt
+    import signal
+
+    __version__ = '0.1'
+    __company__ = 'SUSE LLC'
+    __author__ = 'Hans-Peter Jansen <hp.jansen@suse.com>'
+    __license__ = 'GNU GPL v2 - see http://www.gnu.org/licenses/gpl2.txt for details'
+
+    class gpar:
+        """Global parameter class"""
+        appdir, appname = os.path.split(sys.argv[0])
+        if appdir == '.':
+            appdir = os.getcwd()
+        if appname.endswith('.py'):
+            appname = appname[:-3]
+        pid = os.getpid()
+        version = __version__
+        company = __company__
+        author = __author__
+        license = __license__
+        loglevel = 0
+        basedir = '.'
+
+
+    stdout = lambda *msg: print(*msg, file = sys.stdout, flush = True)
+    stderr = lambda *msg: print(*msg, file = sys.stderr, flush = True)
+
+
+    def vout(lvl, *msg):
+        """Verbose output"""
+        if lvl <= gpar.loglevel:
+            stderr(*msg)
+
+
+    def exit(ret = 0, msg = None, usage = False):
+        """Terminate process with optional message and usage"""
+        if msg:
+            stderr('{}: {}'.format(gpar.appname, msg))
+        if usage:
+            stderr(__doc__.format(**gpar.__dict__))
+        sys.exit(ret)
+
+
+    def parse_config_sh(config_sh):
+        """Parse config.sh file and return a dict with key value pairs"""
+        config = {}
+        lnnr = 0
+        with open(config_sh, 'r') as f:
+            for line in f:
+                lnnr += 1
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+
+                if '=' in line:
+                    key, raw_value = line.split('=', 1)
+                    key = key.strip()
+                    # shlex removes the outer quotation marks cleanly
+                    parsed_tokens = shlex.split(raw_value)
+                    value = parsed_tokens[0] if parsed_tokens else ""
+                    config[key] = value
+                else:
+                    raise ValueError('line {} malformed in {}: "{}"'.format(lnnr, config_sh, line))
+
+        return config
+
+
+    class SrcVersion:
+        """Class, defining a source code version allows parsing from string, updating single values
+        and returns the resulting version as string repr"""
+        def __init__(self, version_str):
+            self.version = '0'
+            self.patchlevel = '0'
+            self.sublevel = '0'
+            self.extraversion = ''
+            self._partlist = ('version', 'patchlevel', 'sublevel', 'extraversion')
+            pattern = re.compile(r'''
+                ^                           # Start of line
+                (?P<version>\d+)            # Required: version number
+                \.                          # Required: version dot
+                (?P<patchlevel>\d+)         # Required: patchlevel number
+                (?:                         # Start of non-capturing group
+                    \.(?P<sublevel>\d+)     # Optional: sublevel number
+                )?                          # End of group
+                (?P<extraversion>.*)        # Optional: extra version
+                $                           # End of line
+            ''', re.VERBOSE)
+
+            match = re.match(pattern, version_str)
+            if not match:
+                raise ValueError('Invalid version str: "{}". Expecting X[.Y][.Z][-extra]'.format(version_str))
+            for part in self._partlist:
+                value = match.group(part)
+                if value is not None:
+                    self.update(part, value)
+
+        def update(self, part, value):
+            """Update a specific version component to a new value"""
+            if part in self._partlist:
+                setattr(self, part, value)
+
+        def __str__(self):
+            return '{version}.{patchlevel}.{sublevel}{extraversion}'.format(**self.__dict__)
+
+
+    def parse_series_conf(basedir, series_conf):
+        """Parse the series.conf file, taking guards into account, and return a list of patch files"""
+        pattern = re.compile(r'''
+            ^                   # Start of line
+            (?:                 # Start of non-capturing group for sign and symbol
+                (?P<sign>[+-])  # Required if group matches: Matches a single '+' or '-' sign
+                (?P<symbol>[a-zA-Z0-9]+)? # Optional: Matches alphanumeric symbol only after a sign
+            )?                  # End of group: The entire sign+symbol block is optional
+            \s*                 # Optional: Ignores any subsequent whitespace characters
+            (?P<patch>\S+)      # Required: Matches the filename (one or more non-whitespace characters)
+            $                   # End of line
+        ''', re.VERBOSE)
+
+        patches = []
+        lnnr = 0
+        with open(series_conf, 'r') as f:
+            for line in f:
+                lnnr += 1
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+
+                m = re.match(pattern, line)
+                if m:
+                    guard = m['sign']
+                    if guard:
+                        # guarded line
+                        if guard == '+':
+                            vout(2, '{}: patch in line {} flagged: {}'.format(series_conf, lnnr, line))
+                        else:
+                            # guard == '-':
+                            vout(2, '{}: patch in line {} excluded: {}'.format(series_conf, lnnr, line))
+                    patch = os.path.join(basedir, m['patch'])
+                    if not os.access(patch, os.R_OK):
+                        raise ValueError('{}: patch {} in line {} not readable'.format(series_conf, patch, lnnr))
+                    if patch in patches:
+                        raise ValueError('{}: patch {} in line {} named twice'.format(series_conf, patch, lnnr))
+                    patches.append(patch)
+                else:
+                    raise ValueError('{}: line {} malformed: "{}"'.format(series_conf, lnnr, line))
+
+        return patches
+
+
+    def parse_makefiles(diff_text):
+        """Locate changes to the toplevel Makefile in a unified diff file
+        return applied changesets to the linux kernel version variables"""
+        # match top level Makefile
+        makefile_target = re.compile(r'''
+            ^                   # Anchor a start of line
+            (---|\+\+\+)        # Match either +++ or ---
+            \s+                 # Skip blinks
+            (?P<path>[^\/]+/Makefile)   # Extract Makefile with single slash
+            ( |\t|$)            # May end in a blank, tab or end of line
+        ''', re.VERBOSE)
+        # match variable change pattern
+        var_pattern = re.compile(r'''
+            ^                   # Anchor at start of line
+            (?P<action>[-+])    # Required: action is either '+' or '-'
+            \s*                 # Skip optional blanks
+            (?P<key>VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)   # Required: key value is one of these
+            \s*=\s*             # Required: assignment with optional blanks
+            (?P<value>.*)       # Required: any value, even an empty one
+        ''', re.VERBOSE)
+
+        in_makefile = False
+        changes = []
+
+        for line in diff_text.splitlines():
+            if line.startswith(('--- ', '+++ ')):
+                match = makefile_target.match(line)
+                if match:
+                    # we're in a toplevel Makefile diff section now
+                    in_makefile = True
+                    current_file = match.group('path')
+                    vout(4, 'parse_makefiles: {}'.format(current_file))
+                else:
+                    # we're in some other files modification context
+                    in_makefile = False
+
+            if not in_makefile:
+                continue
+
+            # extract version variable changes
+            match = var_pattern.match(line)
+            if match:
+                changes.append(
+                    {
+                        # which Makefile
+                        'file': current_file,
+                        # either + (added) or - (removed)
+                        'action': match.group('action'),
+                        # which variable (and avoid shouting loudly)
+                        'variable': match.group('key').lower(),
+                        # added (new) or removed (old) value
+                        'value': match.group('value').strip(),
+                    }
+                )
+
+        return changes
+
+
+    def compute():
+        """Compute patchversion from config.sh, series.conf and patch files"""
+        ret = 0
+        vout(3, 'started with pid {pid} in {appdir}'.format(**gpar.__dict__))
+        basedir = gpar.basedir
+        if not os.path.isdir(basedir):
+            exit(1, 'patches basedir {} not found'.format(basedir))
+
+        # fetch key value pairs from config.sh
+        config_sh = os.path.join(basedir, 'rpm/config.sh')
+        config = parse_config_sh(config_sh)
+        vout(2, 'config.sh: {}'.format(config))
+
+        # determine kernel base source code version
+        src_version = SrcVersion(config['SRCVERSION'])
+        vout(1, 'base source version is: {}'.format(src_version))
+
+        # fetch patch files from series.conf
+        series_conf = os.path.join(basedir, 'series.conf')
+        patches = parse_series_conf(basedir, series_conf)
+        vout(4, 'patches: {}'.format(patches))
+
+        # collect Makefile changesets from patch files
+        changes = []
+        for pfn in patches:
+            with open(pfn, 'r') as f:
+                changeset = parse_makefiles(f.read())
+                if changeset:
+                    vout(3, 'parse_matches: {}: {}'.format(pfn, changeset))
+                    changes.append(changeset)
+
+        # iterate over all changesets, and apply the additions
+        # TODO: do we need to care about the removals?
+        # e.g. we do not handle removal of extraversion from within a patchset
+        for changeset in changes:
+            for ch in changeset:
+                vout(3, '{}'.format(ch))
+                if ch['action'] == '+':
+                    src_version.update(ch['variable'], ch['value'])
+
+        # provide the result on stdout
+        stdout(src_version)
+
+        return ret
+
+
+    def main(argv = None):
+        """Command line interface and console script entry point."""
+        if argv is None:
+            argv = sys.argv[1:]
+
+        try:
+            optlist, args = getopt.getopt(argv, 'hVvp:',
+                ('help', 'version', 'verbose', 'patches=')
+            )
+        except getopt.error as msg:
+            exit(1, msg, True)
+
+        for opt, par in optlist:
+            if opt in ('-h', '--help'):
+                exit(usage = True)
+            elif opt in ('-V', '--version'):
+                exit(msg = 'version {}'.format(gpar.version))
+            elif opt in ('-v', '--verbose'):
+                gpar.loglevel += 1
+            elif opt in ('-p', '--patches'):
+                gpar.basedir = par
+
+        # ignore broken pipe errors (SIGPIPE)
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+        try:
+            return compute()
+        except (ValueError, IOError) as exc:
+            stderr('Sorry, we hit a snag: {}'.format(exc))
+            return 1
+        except KeyboardInterrupt:
+            return 3    # SIGQUIT
+
+    if __name__ == '__main__':
+        sys.exit(main())
