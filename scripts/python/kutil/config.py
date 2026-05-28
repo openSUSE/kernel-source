@@ -311,6 +311,7 @@ if __name__ == "__main__":
             )?                  # End of group: The entire sign+symbol block is optional
             \s*                 # Optional: Ignores any subsequent whitespace characters
             (?P<patch>\S+)      # Required: Matches the filename (one or more non-whitespace characters)
+            .*?                 # ignore any trailing garbarge
             $                   # End of line
         ''', re.VERBOSE)
 
