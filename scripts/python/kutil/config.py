@@ -39,6 +39,7 @@ License: {license}
 
 import configparser
 import subprocess
+import shlex
 import os
 
 # some commonly used functions
@@ -69,35 +70,6 @@ def list_specs(directory):
     ext = '.spec'
     return [f[0:-len(ext)] for f in list_files(directory) if f.endswith(ext)]
 
-def _unquote(val):
-    # From kbuild2.conf parser.
-    ret = ''
-    inquotes = False
-    idx = 0
-    while idx < len(val):
-        endidx = idx
-        escaped = False
-        while endidx < len(val):
-            if escaped:
-                escaped = False
-            elif val[endidx] in '$"\'':
-                break
-            elif not inquotes and val[endidx] == '\\':
-                escaped = True
-            endidx += 1
-        ret += val[idx:endidx]
-        idx = endidx
-        if idx >= len(val):
-            break
-        if val[idx] == '"':
-            inquotes = not inquotes
-            idx += 1
-        elif not inquotes and val[idx] == "'":
-            endidx = val.index("'", idx + 1)
-            ret += val[idx+1:endidx]
-            idx = endidx + 1
-    return ret
-
 def read_source_timestamp(directory):
     file = os.path.join(directory, 'source-timestamp')
     cp = configparser.ConfigParser(delimiters=(':'), interpolation=None)
@@ -106,21 +78,56 @@ def read_source_timestamp(directory):
     config = cp['section']
     return config
 
+class CaseInsensitiveDict(dict):
+    def __init__(self, *args, **kwargs):
+        self.update(*args, **kwargs)
+
+    def __getitem__(self, key):
+        return super().__getitem__(key.casefold())
+
+    def __setitem__(self, key, value):
+        return super().__setitem__(key.casefold(), value)
+
+    def update(self, *args, **kwargs):
+        for k, v in dict(*args, **kwargs).items():
+            self[k] = v
+
+    def getboolean(self, key):
+        if not key.casefold() in self:
+            return False
+        value = self.get(key)
+        if value.isdigit():
+            if int(value) == 0:
+                return False
+            return True
+        if value.casefold() in ['y', 'yes', 't', 'true']:
+            return True
+        if value.casefold() in ['n', 'no', 'f', 'false']:
+            return False
+        raise ValueError('Do not know how to interpret "%s" as boolean' % (value,))
+
+
 def read_config_sh(package_tar_up_dir):
-    file = os.path.join(package_tar_up_dir, 'config.sh')
-    cp = configparser.ConfigParser(delimiters=('='), interpolation=None)
-    with open(file, 'r') as fd:
-        cp.read_string('[section]\n' + fd.read())
+    """Parse config.sh file and return a dict with key value pairs"""
+    config_sh = os.path.join(package_tar_up_dir, 'config.sh')
+    config = CaseInsensitiveDict()
+    lnnr = 0
+    with open(config_sh, 'r') as f:
+        for line in f:
+            lnnr += 1
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
 
-    config = cp['section']
-
-    options = cp.options('section')
-
-    for o in options:
-        val = config.get(o)
-        unq = _unquote(val)
-        if unq != val:
-            cp.set('section', o, unq)
+            if '=' in line:
+                key, raw_value = line.split('=', 1)
+                key = key.strip()
+                # shlex removes the outer quotation marks cleanly
+                parsed_tokens = shlex.split(raw_value)
+                value = parsed_tokens[0] if parsed_tokens else ""
+                config[key] = value
+            else:
+                raise ValueError('line {} malformed in {}: "{}"'.format(lnnr, config_sh, line))
 
     return config
 
@@ -197,7 +204,6 @@ if __name__ == "__main__":
     import os
     import re
     import sys
-    import shlex
     import getopt
     import signal
 
@@ -239,29 +245,6 @@ if __name__ == "__main__":
             stderr(__doc__.format(**gpar.__dict__))
         sys.exit(ret)
 
-
-    def parse_config_sh(config_sh):
-        """Parse config.sh file and return a dict with key value pairs"""
-        config = {}
-        lnnr = 0
-        with open(config_sh, 'r') as f:
-            for line in f:
-                lnnr += 1
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-
-                if '=' in line:
-                    key, raw_value = line.split('=', 1)
-                    key = key.strip()
-                    # shlex removes the outer quotation marks cleanly
-                    parsed_tokens = shlex.split(raw_value)
-                    value = parsed_tokens[0] if parsed_tokens else ""
-                    config[key] = value
-                else:
-                    raise ValueError('line {} malformed in {}: "{}"'.format(lnnr, config_sh, line))
-
-        return config
 
 
     class SrcVersion:
@@ -408,8 +391,7 @@ if __name__ == "__main__":
             exit(1, 'patch directory {} not found'.format(patchdir))
 
         # fetch key value pairs from config.sh
-        config_sh = os.path.join(bindir, 'config.sh')
-        config = parse_config_sh(config_sh)
+        config = read_config_sh(bindir)
         vout(2, 'config.sh: {}'.format(config))
 
         # determine kernel base source code version

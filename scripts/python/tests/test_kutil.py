@@ -12,6 +12,8 @@ class MiscTests(unittest.TestCase):
         self.assertEqual(config['variant'], '')
         self.assertEqual(config['multibuild'], 'Yes')
         self.assertEqual(config.getboolean('multibuild'), True)
+        self.assertEqual(config.getboolean('build_pdf'), False)
+        self.assertEqual(config.getboolean('foobar'), False)
         self.assertEqual(config['bugzilla_product'], 'openSUSE Tumbleweed')
 
     def test_pkg_name(self):
