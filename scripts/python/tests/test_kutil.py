@@ -1,5 +1,10 @@
 from kutil.config import read_config_sh, get_kernel_project_package, list_files, list_specs, get_kernel_projects, get_package_archs
+from kutil import pathlib_compat
+from pathlib import Path
+import subprocess
+import tempfile
 import unittest
+import shutil
 
 class MiscTests(unittest.TestCase):
     def test_config_sh(self):
@@ -80,3 +85,150 @@ another file
                           ['ppc64le', 'x86_64'])
         self.assertEqual(get_package_archs('tests/kutil/rpm/klp'),
                           ['x86_64'])
+
+class TestComputePatchversion(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmpdir.name)
+        self.rpmdir = self.base / 'rpm'
+        self.rpmdir.mkdir()
+        self.patches_orig = Path(__file__).parent / 'kutil' / 'patchversion'
+        self.patches = self.base / 'patches.suse'
+        self.packagedir = self.base / 'package'
+        self.packagedir.mkdir()
+        self.config_sh = self.rpmdir / 'config.sh'
+        self.config_sh_pkg = self.packagedir / 'config.sh'
+        self.series_conf = self.base / 'series.conf'
+        self.series_conf_pkg = self.packagedir / 'series.conf'
+        self.compute_orig = Path(__file__).parents[2] / 'compute-PATCHVERSION'
+        self.guards_orig = Path(__file__).parents[2] / 'guards'
+        self.compute_rpm = self.rpmdir / 'compute-PATCHVERSION'
+        self.guards_rpm = self.rpmdir / 'guards'
+        self.compute_pkg = self.packagedir / 'compute-PATCHVERSION'
+        self.guards_pkg = self.packagedir / 'guards'
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+        self.tmpdir = None
+
+    def run_pipeline(self, cmd, cwd, expect_error=False):
+        pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
+        out, err = pipe.communicate()
+        if err and not expect_error:
+            print(cmd, err)
+        return pipe, out, err
+
+    def run_test(self, test_fn, expect_error=False):
+        self.compute_rpm.symlink_to(self.compute_orig)
+        self.guards_rpm.symlink_to(self.guards_orig)
+        self.patches.symlink_to(self.patches_orig)
+        test_fn(*self.run_pipeline([self.compute_rpm], self.base, expect_error))
+        shutil.copy(self.compute_orig, self.compute_pkg)
+        shutil.copy(self.guards_orig, self.guards_pkg)
+        try:
+            shutil.copy(self.config_sh, self.config_sh_pkg)
+        except FileNotFoundError:
+            None
+        try:
+            shutil.copy(self.series_conf, self.series_conf_pkg)
+        except FileNotFoundError:
+            None
+        test_fn(*self.run_pipeline([self.compute_pkg, '--patches', self.base], self.packagedir, expect_error))
+
+    def test_empty(self):
+        def test_fn(pipe, out, err):
+            # script retruns 0 and prints .0.0, not a desirable outcome, not tested
+            self.assertTrue(b'config.sh' in err)
+        self.run_test(test_fn, True)
+
+    def test_no_series(self):
+        self.config_sh.write_text('SRCVERSION=1.2')
+
+        def test_fn(pipe, out, err):
+            # script retruns 0 and prints .0.0, not a desirable outcome, not tested
+            self.assertTrue(b'series.conf' in err)
+        self.run_test(test_fn, True)
+
+    def test_nonexistent_patch(self):
+        self.config_sh.write_text('SRCVERSION=1.2-rc3')
+        self.series_conf.write_text('''
+patches.suse/no_such.patch
+''')
+
+        def test_fn(pipe, out, err):
+            self.assertNotEqual(0, pipe.returncode)
+            self.assertEqual(b'', out.strip())
+            self.assertTrue(b'no_such.patch' in err)
+        self.run_test(test_fn, True)
+
+    def test_empty_series(self):
+        self.config_sh.write_text('SRCVERSION=1.2')
+        self.series_conf.write_text('')
+
+        def test_fn(pipe, out, err):
+            self.assertEqual(0, pipe.returncode)
+            self.assertEqual(b'1.2.0', out.strip())
+            self.assertEqual(b'', err)
+        self.run_test(test_fn)
+
+    def test_noextra(self):
+        self.config_sh.write_text('SRCVERSION=1.2-rc3')
+        self.series_conf.write_text('''
+patches.suse/no_extraversion.diff
+''')
+
+        def test_fn(pipe, out, err):
+            self.assertEqual(0, pipe.returncode)
+            self.assertEqual(b'1.2.0', out.strip())
+            self.assertEqual(b'', err)
+        self.run_test(test_fn)
+
+    def test_commented(self):
+        self.config_sh.write_text('SRCVERSION=1.2')
+        self.series_conf.write_text('''
+# patches.suse/sublevel_4
+''')
+
+        def test_fn(pipe, out, err):
+            self.assertEqual(0, pipe.returncode)
+            self.assertEqual(b'1.2.0', out.strip())
+            self.assertEqual(b'', err)
+        self.run_test(test_fn)
+
+    def test_guarded(self):
+        self.config_sh.write_text('SRCVERSION=1.2')
+        self.series_conf.write_text('''
++unused patches.suse/sublevel_4
+''')
+
+        def test_fn(pipe, out, err):
+            self.assertEqual(0, pipe.returncode)
+            self.assertEqual(b'1.2.0', out.strip())
+            self.assertEqual(b'', err)
+        self.run_test(test_fn)
+
+    def test_sublevel(self):
+        self.config_sh.write_text('SRCVERSION=1.2')
+        self.series_conf.write_text('''
+patches.suse/sublevel_4 # change sublevel
+''')
+
+        def test_fn(pipe, out, err):
+            self.assertEqual(0, pipe.returncode)
+            self.assertEqual(b'1.2.4', out.strip())
+            self.assertEqual(b'', err)
+        self.run_test(test_fn)
+
+    def test_not_patches(self):
+        self.config_sh.write_text('SRCVERSION=1.2')
+        self.series_conf.write_text('''
+patches.suse/sublevel_4_before
+patches.suse/sublevel_4_after
+''')
+
+        def test_fn(pipe, out, err):
+            self.assertEqual(0, pipe.returncode)
+            self.assertEqual(b'1.2.0', out.strip())
+            self.assertEqual(b'', err)
+        self.run_test(test_fn)
