@@ -293,52 +293,28 @@ if __name__ == "__main__":
             stderr(__doc__.format(**gpar.__dict__))
         sys.exit(ret)
 
-    def parse_series_conf(series_conf):
+    def parse_series_conf(patchdir, series_conf):
         """Parse the series.conf file, taking guards into account, and return a list of patch files"""
-        pattern = re.compile(r'''
-            ^                   # Start of line
-            (?:                 # Start of non-capturing group for sign and symbol
-                (?P<sign>[+-])  # Required if group matches: Matches a single '+' or '-' sign
-                (?P<symbol>[a-zA-Z0-9]+)? # Optional: Matches alphanumeric symbol only after a sign
-            )?                  # End of group: The entire sign+symbol block is optional
-            \s*                 # Optional: Ignores any subsequent whitespace characters
-            (?P<patch>\S+)      # Required: Matches the filename (one or more non-whitespace characters)
-            .*?                 # Optional: Ignore any trailing garbarge
-            $                   # End of line
-        ''', re.VERBOSE)
-
-        patches = []
-        lnnr = 0
-        with open(series_conf, 'r') as f:
-            for line in f:
-                lnnr += 1
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-
-                # split lines into list of elements
-                e = line.split()
-                if len(e) == 1:
-                    # common case, just a patch
-                    patches.append(e[0])
-                elif e[0].startswith(('+', '-')):
-                    # guarded line
-                    try:
-                        guard, patch = e[:2]
-                    except IndexError as exc:
-                        raise ValueError('{}: guarded patch in line {} malformed: {}'.format(series_conf, lnnr, line)) from exc
-                    if guard[0] == '+':
-                        vout(1, '{}: patch in line {} flagged by {}: {}'.format(series_conf, lnnr, guard, patch))
-                        patches.append(patch)
-                    else:
-                        # guard[0] == '-':
-                        vout(1, '{}: patch in line {} excluded by {}: {}'.format(series_conf, lnnr, guard, patch))
-                    # remove guard element
-                    e.pop(0)
-
-                # check special cases
-                if len(e) > 1:
-                    vout(3, '{}: excess elements in line {}: {}'.format(series_conf, lnnr, e))
+        # Use grep to extract patch file names from series.conf.
+        # In a plain quilt series file the non-whitespace thing at the start of a line that is not a comment is
+        # a patch filename. However, the series.conf in kernel-source may contain 'guards'. While complex semantic
+        # of guards was supported in the past in practice guards are alos comments.
+        # Ignore anything that does not look like a patch filename.
+        pipe = subprocess.Popen(['grep', '-o', '^[ \t]*patches[.][^ \t#]*', series_conf],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        patches, errors = pipe.communicate()
+        if pipe.returncode == 2:
+            raise RuntimeError('%s\n%s' % (pipe.args, errors))
+        vout(4, 'patches: {}'.format(patches))
+        # The resulting patch filenames can be prefixed with whitespace.
+        # However, they are fed to xargs which splits on whitespace conveniently stripping the leading whitespace
+        # from the patch filenames. This alleviates the need to ever touch the buffer from python
+        pipe = subprocess.Popen(['xargs', 'grep', '-lE', '^[+][+][+][^/]+/Makefile'],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=patchdir)
+        output, errors = pipe.communicate(input=patches)
+        if errors:  # The return value from xargs grep is fairly meaningless but stderr should be empty
+            raise RuntimeError('%s\n%s' % (pipe.args, errors))
+        patches = [p.decode() for p in output.splitlines()]
 
         return patches
 
@@ -417,12 +393,13 @@ if __name__ == "__main__":
 
         # fetch patch files from series.conf
         series_conf = os.path.join(rpmdir, 'series.conf')
-        patches = parse_series_conf(series_conf)
+        patches = parse_series_conf(patchdir, series_conf)
         vout(4, 'patches: {}'.format(patches))
 
         # collect top level Makefile changesets from patch files
         changes = []
-        for pfn in patches:
+        for patch in patches:
+            pfn = os.path.join(patchdir, patch)
             with open(pfn, 'r') as f:
                 patch_data = f.read()
                 if 'Makefile' in patch_data:
