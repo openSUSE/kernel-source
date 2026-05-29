@@ -40,6 +40,7 @@ License: {license}
 import configparser
 import subprocess
 import shlex
+import re
 import os
 
 # some commonly used functions
@@ -78,6 +79,48 @@ def read_source_timestamp(directory):
     config = cp['section']
     return config
 
+class SrcVersion:
+    """Class, defining a source code version allows parsing from string, updating single values
+    and returns the resulting version as string repr"""
+    def __init__(self, version_str):
+        self.version = '0'
+        self.patchlevel = '0'
+        self.sublevel = '0'
+        self.extraversion = ''
+        self._partlist = ('version', 'patchlevel', 'sublevel', 'extraversion')
+        pattern = re.compile(r'''
+            ^                           # Start of line
+            (?P<version>\d+)            # Required: version number
+            \.                          # Required: version dot
+            (?P<patchlevel>\d+)         # Required: patchlevel number
+            (?:                         # Start of non-capturing group
+                \.(?P<sublevel>\d+)     # Optional: sublevel number
+            )?                          # End of group
+            (?P<extraversion>.*)        # Optional: extra version
+            $                           # End of line
+        ''', re.VERBOSE)
+
+        match = re.match(pattern, version_str)
+        if not match:
+            raise ValueError('Invalid version str: "{}". Expecting X[.Y][.Z][-extra]'.format(version_str))
+        for part in self._partlist:
+            value = match.group(part)
+            if value is not None:
+                self.update(part, value)
+
+    def update(self, part, value):
+        """Update a specific version component to a new value"""
+        if part in self._partlist:
+            setattr(self, part, value)
+
+    def __str__(self):
+        return '{version}.{patchlevel}.{sublevel}{extraversion}'.format(**self.__dict__)
+
+    def __iter__(self):
+        for index, item in self.__dict__.items():
+            if index in self._partlist:
+                yield index, item
+
 class CaseInsensitiveDict(dict):
     def __init__(self, *args, **kwargs):
         self.update(*args, **kwargs)
@@ -105,6 +148,9 @@ class CaseInsensitiveDict(dict):
         if value.casefold() in ['n', 'no', 'f', 'false']:
             return False
         raise ValueError('Do not know how to interpret "%s" as boolean' % (value,))
+
+    def getversion(self, key):
+        return SrcVersion(self.get(key))
 
 
 def read_config_sh(package_tar_up_dir):
@@ -202,7 +248,6 @@ def get_package_archs(package_tar_up_dir, limit_packages=None):
 
 if __name__ == "__main__":
     import os
-    import re
     import sys
     import getopt
     import signal
@@ -244,45 +289,6 @@ if __name__ == "__main__":
         if usage:
             stderr(__doc__.format(**gpar.__dict__))
         sys.exit(ret)
-
-
-
-    class SrcVersion:
-        """Class, defining a source code version allows parsing from string, updating single values
-        and returns the resulting version as string repr"""
-        def __init__(self, version_str):
-            self.version = '0'
-            self.patchlevel = '0'
-            self.sublevel = '0'
-            self.extraversion = ''
-            self._partlist = ('version', 'patchlevel', 'sublevel', 'extraversion')
-            pattern = re.compile(r'''
-                ^                           # Start of line
-                (?P<version>\d+)            # Required: version number
-                \.                          # Required: version dot
-                (?P<patchlevel>\d+)         # Required: patchlevel number
-                (?:                         # Start of non-capturing group
-                    \.(?P<sublevel>\d+)     # Optional: sublevel number
-                )?                          # End of group
-                (?P<extraversion>.*)        # Optional: extra version
-                $                           # End of line
-            ''', re.VERBOSE)
-
-            match = re.match(pattern, version_str)
-            if not match:
-                raise ValueError('Invalid version str: "{}". Expecting X[.Y][.Z][-extra]'.format(version_str))
-            for part in self._partlist:
-                value = match.group(part)
-                if value is not None:
-                    self.update(part, value)
-
-        def update(self, part, value):
-            """Update a specific version component to a new value"""
-            if part in self._partlist:
-                setattr(self, part, value)
-
-        def __str__(self):
-            return '{version}.{patchlevel}.{sublevel}{extraversion}'.format(**self.__dict__)
 
 
     def parse_series_conf(patchdir, series_conf):

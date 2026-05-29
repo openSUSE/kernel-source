@@ -1,4 +1,4 @@
-from kutil.config import read_config_sh, get_kernel_project_package, list_files, list_specs, get_kernel_projects, get_package_archs
+from kutil.config import read_config_sh, get_kernel_project_package, list_files, list_specs, get_kernel_projects, get_package_archs, SrcVersion
 from kutil import pathlib_compat
 from pathlib import Path
 import subprocess
@@ -87,6 +87,35 @@ another file
                           ['ppc64le', 'x86_64'])
         self.assertEqual(get_package_archs('tests/kutil/rpm/klp'),
                           ['x86_64'])
+
+    def test_srcversion(self):
+        self.assertRaises(Exception, SrcVersion('1.2.4el4'))
+        testdata = [
+        ('1.2.3-rc4', None, {
+            'version': '1',
+            'patchlevel': '2',
+            'sublevel': '3',
+            'extraversion': '-rc4',
+            }),
+        ('1.2-foobar', '1.2.0-foobar', {
+            'version': '1',
+            'patchlevel': '2',
+            'sublevel': '0',
+            'extraversion': '-foobar',
+            }),
+        ('7.0', '7.0.0', {
+            'version': '7',
+            'patchlevel': '0',
+            'sublevel': '0',
+            'extraversion': '',
+            }),
+        ]
+        for inp, outs, outd in testdata:
+            if not outs:
+                outs = inp
+            sv = SrcVersion(inp)
+            self.assertEqual(str(sv), outs)
+            self.assertEqual(dict(sv), outd)
 
 class TestComputePatchversion(unittest.TestCase):
 
