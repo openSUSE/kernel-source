@@ -3,20 +3,20 @@
 Synopsis: determine the current kernel source version from a series of patches
           as being defined in series.conf
 
-Usage: {appname} [-hVvp]
+Usage: {appname} [-hVvb:p:]
        -h, --help           this message
        -V, --version        print version and exit
        -v, --verbose        verbose mode (cumulative)
-       -p, --patches dir    base directory, holding rpm/config.sh, series.conf
-                            and patches.*, referenced in series.conf
+       -b, --basedir dir    base directory, holding rpm/config.sh, series.conf,
+                            default: '{basedir}'
+       -p, --patches dir    directory, where patches.* reside, referenced in
+                            series.conf, default: '{patches}'
 
 Description:
 The executable part of this script replaces the old compute-PATCHVERSION.sh
 script. It is expected to be executed in the kernel-source base folder, e.g.:
 
         ./rpm/compute-PATCHVERSION.py
-
-Otherwise provide the --patches argument with the preferred base directory.
 
 This file is typically a symlink to ../scripts/python/kutil/config.py.
 
@@ -218,6 +218,7 @@ if __name__ == "__main__":
         license = __license__
         loglevel = 0
         basedir = '.'
+        patches = '.'
 
 
     stdout = lambda *msg: print(*msg, file = sys.stdout, flush = True)
@@ -334,8 +335,7 @@ if __name__ == "__main__":
                         else:
                             # guard == '-':
                             vout(2, '{}: patch in line {} excluded: {}'.format(series_conf, lnnr, line))
-                    patch = os.path.join(basedir, m['patch'])
-                    patches.append(patch)
+                    patches.append(m['patch'])
                 else:
                     raise ValueError('{}: line {} malformed: "{}"'.format(series_conf, lnnr, line))
 
@@ -399,11 +399,9 @@ if __name__ == "__main__":
         return changes
 
 
-    def compute():
+    def compute(basedir, patchdir):
         """Compute patchversion from config.sh, series.conf and patch files"""
         ret = 0
-        vout(3, 'started with pid {pid} in {appdir}'.format(**gpar.__dict__))
-        basedir = gpar.basedir
         if not os.path.isdir(basedir):
             exit(1, 'patches basedir {} not found'.format(basedir))
 
@@ -424,6 +422,7 @@ if __name__ == "__main__":
         # collect Makefile changesets from patch files
         changes = []
         for pfn in patches:
+            pfn = os.path.join(patchdir, pfn)
             with open(pfn, 'r') as f:
                 patch_data = f.read()
                 if 'Makefile' in patch_data:
@@ -450,8 +449,8 @@ if __name__ == "__main__":
             argv = sys.argv[1:]
 
         try:
-            optlist, args = getopt.getopt(argv, 'hVvp:',
-                ('help', 'version', 'verbose', 'patches=')
+            optlist, args = getopt.getopt(argv, 'hVvb:p:',
+                ('help', 'version', 'verbose', 'basedir=', 'patches=')
             )
         except getopt.error as msg:
             exit(1, msg, True)
@@ -463,14 +462,17 @@ if __name__ == "__main__":
                 exit(msg = 'version {}'.format(gpar.version))
             elif opt in ('-v', '--verbose'):
                 gpar.loglevel += 1
-            elif opt in ('-p', '--patches'):
+            elif opt in ('-b', '--basedir'):
                 gpar.basedir = par
+            elif opt in ('-p', '--patches'):
+                gpar.patches = par
 
         # ignore broken pipe errors (SIGPIPE)
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
+        vout(3, 'started with pid {pid} in {appdir}'.format(**gpar.__dict__))
         try:
-            return compute()
+            return compute(gpar.basedir, gpar.patches)
         except (ValueError, IOError) as exc:
             stderr('Sorry, we hit a snag: {}'.format(exc))
             return 1
