@@ -311,7 +311,7 @@ if __name__ == "__main__":
             )?                  # End of group: The entire sign+symbol block is optional
             \s*                 # Optional: Ignores any subsequent whitespace characters
             (?P<patch>\S+)      # Required: Matches the filename (one or more non-whitespace characters)
-            .*?                 # ignore any trailing garbarge
+            .*?                 # Optional: Ignore any trailing garbarge
             $                   # End of line
         ''', re.VERBOSE)
 
@@ -335,10 +335,6 @@ if __name__ == "__main__":
                             # guard == '-':
                             vout(2, '{}: patch in line {} excluded: {}'.format(series_conf, lnnr, line))
                     patch = os.path.join(basedir, m['patch'])
-                    if not os.access(patch, os.R_OK):
-                        raise ValueError('{}: patch {} in line {} not readable'.format(series_conf, patch, lnnr))
-                    if patch in patches:
-                        raise ValueError('{}: patch {} in line {} named twice'.format(series_conf, patch, lnnr))
                     patches.append(patch)
                 else:
                     raise ValueError('{}: line {} malformed: "{}"'.format(series_conf, lnnr, line))
@@ -360,7 +356,7 @@ if __name__ == "__main__":
         # match variable change pattern
         var_pattern = re.compile(r'''
             ^                   # Anchor at start of line
-            (?P<action>[-+])    # Required: action is either '+' or '-'
+            \+                  # Required: we care about additions ('+') only
             \s*                 # Skip optional blanks
             (?P<key>VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)   # Required: key value is one of these
             \s*=\s*             # Required: assignment with optional blanks
@@ -385,15 +381,14 @@ if __name__ == "__main__":
             if not in_makefile:
                 continue
 
+            if line.startswith((' ', '@@')):
+                continue
+
             # extract version variable changes
             match = var_pattern.match(line)
             if match:
                 changes.append(
                     {
-                        # which Makefile
-                        'file': current_file,
-                        # either + (added) or - (removed)
-                        'action': match.group('action'),
                         # which variable (and avoid shouting loudly)
                         'variable': match.group('key').lower(),
                         # added (new) or removed (old) value
@@ -430,19 +425,18 @@ if __name__ == "__main__":
         changes = []
         for pfn in patches:
             with open(pfn, 'r') as f:
-                changeset = parse_makefiles(f.read())
-                if changeset:
-                    vout(3, 'parse_matches: {}: {}'.format(pfn, changeset))
-                    changes.append(changeset)
+                patch_data = f.read()
+                if 'Makefile' in patch_data:
+                    changeset = parse_makefiles(patch_data)
+                    if changeset:
+                        vout(3, 'parse_matches: {}: {}'.format(pfn, changeset))
+                        changes.append(changeset)
 
-        # iterate over all changesets, and apply the additions
-        # TODO: do we need to care about the removals?
-        # e.g. we do not handle removal of extraversion from within a patchset
+        # iterate over all changesets, and apply them
         for changeset in changes:
             for ch in changeset:
                 vout(3, '{}'.format(ch))
-                if ch['action'] == '+':
-                    src_version.update(ch['variable'], ch['value'])
+                src_version.update(ch['variable'], ch['value'])
 
         # provide the result on stdout
         stdout(src_version)
