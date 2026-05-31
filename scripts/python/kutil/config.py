@@ -284,7 +284,6 @@ def parse_makefiles(diff_text):
                 # we're in a toplevel Makefile diff section now
                 in_makefile = True
                 current_file = match.group('path')
-                vout(4, 'parse_makefiles: {}'.format(current_file))
             else:
                 # we're in some other files modification context
                 in_makefile = False
@@ -374,7 +373,7 @@ if __name__ == "__main__":
                 e = line.split()
                 if len(e) == 1:
                     # common case, just a patch
-                    patch = e[0]
+                    patches.append(e[0])
                 elif e[0].startswith(('+', '-')):
                     # guarded line
                     try:
@@ -384,14 +383,14 @@ if __name__ == "__main__":
                     else:
                         if guard == '+':
                             vout(2, '{}: patch in line {} flagged by {}: {}'.format(series_conf, lnnr, guard, patch))
+                            patches.append(patch)
                         else:
                             # guard == '-':
                             vout(2, '{}: patch in line {} excluded by {}: {}'.format(series_conf, lnnr, guard, patch))
-                            continue
+
                 # check special cases
                 if len(e) > 1:
                     vout(3, '{}: excess elements in line {}: {}'.format(series_conf, lnnr, e))
-                patches.append(patch)
 
         return patches
 
