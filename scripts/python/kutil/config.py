@@ -1,16 +1,17 @@
 #! /usr/bin/env python3
 """
 Synopsis: determine the current kernel source version from a series of patches
-          as being defined in series.conf
+          as being referenced from series.conf
 
 Usage: {appname} [-hVvb:p:]
        -h, --help           this message
        -V, --version        print version and exit
        -v, --verbose        verbose mode (cumulative)
-       -b, --basedir dir    base directory, holding rpm/config.sh, series.conf,
-                            default: '{basedir}'
+       -b, --basedir dir    base directory, holding rpm/config.sh, series.conf
+                            [default: '{basedir}']
        -p, --patches dir    directory, where patches.* reside, referenced in
-                            series.conf, default: '{patches}'
+                            series.conf [default: '{patches}']
+       --verify             do some consistency tests
 
 Description:
 The executable part of this script replaces the old compute-PATCHVERSION.sh
@@ -21,10 +22,11 @@ script. It is expected to be executed in the kernel-source base folder, e.g.:
 This file is typically a symlink to ../scripts/python/kutil/config.py.
 
 It fetches the kernel source version from ./rpm/config.sh, then parses the
-./series.conf file, collecting all patch files, and tracks for any changes in
-top level Makefiles to the four version defining symbols: VERSION, PATCHLEVEL,
+./series.conf file, collecting all patch files, and tracks for any changes of
+top level Makefiles to the 4 version defining symbols: VERSION, PATCHLEVEL,
 SUBLEVEL, and EXTRAVERSION. The result should consitute the latest kernel
-patch level.
+patch level. Verbose levels up to 4 reveal internal states, that you probably
+don't want to ever know of.
 
 Version: {version}
 Copyright: (c)2026 by {company}
@@ -34,10 +36,15 @@ License: {license}
 #
 # vim:set et ts=8 sw=4:
 #
+# disable some pylint noise
+# pylint: disable=line-too-long, missing-function-docstring, unspecified-encoding
+# pylint: disable=consider-using-f-string, consider-using-sys-exit
 
 import configparser
 import subprocess
+import shlex
 import os
+import re
 
 # some commonly used functions
 
@@ -58,7 +65,7 @@ def list_files(directory):
     if len(directory) > 1:
         directory = directory.rstrip('/')
     result = []
-    for root, dirs, filenames in os.walk(directory):
+    for root, _, filenames in os.walk(directory):
         for f in filenames:
             result.append(os.path.join(root, f)[len(directory)+1:])
     return sorted(result)
@@ -105,6 +112,7 @@ def read_source_timestamp(directory):
     return config
 
 def read_config_sh(package_tar_up_dir):
+    """Returns a dict: usage: read_config_sh('./rpm/config.sh')['srcversion']"""
     file = os.path.join(package_tar_up_dir, 'config.sh')
     cp = configparser.ConfigParser(delimiters=('='), interpolation=None)
     with open(file, 'r') as fd:
@@ -279,14 +287,7 @@ def parse_makefiles(diff_text):
 
     for line in diff_text.splitlines():
         if line.startswith(('--- ', '+++ ')):
-            match = makefile_target.match(line)
-            if match:
-                # we're in a toplevel Makefile diff section now
-                in_makefile = True
-                current_file = match.group('path')
-            else:
-                # we're in some other files modification context
-                in_makefile = False
+            in_makefile = bool(makefile_target.match(line))
 
         if not in_makefile:
             continue
@@ -310,10 +311,7 @@ def parse_makefiles(diff_text):
 
 
 if __name__ == "__main__":
-    import os
-    import re
     import sys
-    import shlex
     import getopt
     import signal
 
@@ -339,16 +337,16 @@ if __name__ == "__main__":
         patches = '.'
         verify = False
 
+    def stdout(*msg):
+        print(*msg, file = sys.stdout, flush = True)
 
-    stdout = lambda *msg: print(*msg, file = sys.stdout, flush = True)
-    stderr = lambda *msg: print(*msg, file = sys.stderr, flush = True)
-
+    def stderr(*msg):
+        print(*msg, file = sys.stderr, flush = True)
 
     def vout(lvl, *msg):
         """Verbose output"""
         if lvl <= gpar.loglevel:
             stderr(*msg)
-
 
     def exit(ret = 0, msg = None, usage = False):
         """Terminate process with optional message and usage"""
@@ -358,8 +356,7 @@ if __name__ == "__main__":
             stderr(__doc__.format(**gpar.__dict__))
         sys.exit(ret)
 
-
-    def parse_series_conf(basedir, series_conf):
+    def parse_series_conf(series_conf):
         """Parse the series.conf file, taking guards into account, and return a list of patch files"""
         patches = []
         lnnr = 0
@@ -379,15 +376,16 @@ if __name__ == "__main__":
                     # guarded line
                     try:
                         guard, patch = e[:2]
-                    except IndexError:
-                        raise ValueError('{}: guarded patch in line {} malformed: {}'.format(series_conf, lnnr, line))
+                    except IndexError as exc:
+                        raise ValueError('{}: guarded patch in line {} malformed: {}'.format(series_conf, lnnr, line)) from exc
+                    if guard[0] == '+':
+                        vout(1, '{}: patch in line {} flagged by {}: {}'.format(series_conf, lnnr, guard, patch))
+                        patches.append(patch)
                     else:
-                        if guard[0] == '+':
-                            vout(1, '{}: patch in line {} flagged by {}: {}'.format(series_conf, lnnr, guard, patch))
-                            patches.append(patch)
-                        else:
-                            # guard[0] == '-':
-                            vout(1, '{}: patch in line {} excluded by {}: {}'.format(series_conf, lnnr, guard, patch))
+                        # guard[0] == '-':
+                        vout(1, '{}: patch in line {} excluded by {}: {}'.format(series_conf, lnnr, guard, patch))
+                    # remove guard element
+                    e.pop(0)
 
                 # check special cases
                 if len(e) > 1:
@@ -395,6 +393,26 @@ if __name__ == "__main__":
 
         return patches
 
+    def verify(patchdir, patches):
+        """apply some consistency tests"""
+        patchdict = {}
+        for patch in patches:
+            patch = os.path.join(patchdir, patch)
+            patchpath, patchfile = os.path.split(patch)
+            patchlist = patchdict.setdefault(patchpath, set())
+            if patchfile in patchlist:
+                vout(1, 'duplicate patch {} in {}'.format(patchfile, patchpath))
+            else:
+                patchlist.add(patchfile)
+        patchdirs = sorted(patchdict.keys())
+        vout(1, 'patchdirs: {}'.format(patchdirs))
+        for patchpath in patchdirs:
+            # fetch all patches in patchpath
+            files = {f for f in list_files(patchpath) if f.endswith('.patch')}
+            # set difference: unused patches
+            unused = files - patchdict[patchpath]
+            if unused:
+                vout(1, '{}: unused: {}'.format(patchpath, sorted(unused)))
 
     def compute(basedir, patchdir):
         """Compute patchversion from config.sh, series.conf and patch files"""
@@ -402,21 +420,21 @@ if __name__ == "__main__":
         if not os.path.isdir(basedir):
             exit(1, 'patches basedir {} not found'.format(basedir))
 
-        # fetch key value pairs from config.sh
+        # fetch key, value pairs from config.sh
         config_sh = os.path.join(basedir, 'rpm/config.sh')
         config = parse_config_sh(config_sh)
         vout(2, 'config.sh: {}'.format(config))
 
         # determine kernel base source code version
         src_version = SrcVersion(config['SRCVERSION'])
-        vout(1, 'base source version is: {}'.format(src_version))
+        vout(1, 'base source version: {}'.format(src_version))
 
         # fetch patch files from series.conf
         series_conf = os.path.join(basedir, 'series.conf')
-        patches = parse_series_conf(basedir, series_conf)
+        patches = parse_series_conf(series_conf)
         vout(4, 'patches: {}'.format(patches))
 
-        # collect Makefile changesets from patch files
+        # collect top level Makefile changesets from patch files
         changes = []
         for patch in patches:
             patch = os.path.join(patchdir, patch)
@@ -425,7 +443,7 @@ if __name__ == "__main__":
                 if 'Makefile' in patch_data:
                     changeset = parse_makefiles(patch_data)
                     if changeset:
-                        vout(3, 'parse_matches: {}: {}'.format(patch, changeset))
+                        vout(2, 'parse_matches: {}: {}'.format(patch, changeset))
                         changes.append(changeset)
 
         # iterate over all changesets, and apply them
@@ -436,29 +454,12 @@ if __name__ == "__main__":
 
         # verify consistency
         if gpar.verify:
-            patchdict = {}
-            for patch in patches:
-                patch = os.path.join(patchdir, patch)
-                patchpath, patchfile = os.path.split(patch)
-                patchlist = patchdict.setdefault(patchpath, set())
-                if patchfile in patchlist:
-                    vout(1, '{}: duplicate patch {} in {}'.format(series_conf, patchfile, patchpath))
-                    #vout(1, '{}: {}'.format(series_conf, patchlist))
-                else:
-                    patchlist.add(patchfile)
-            patchdirs = sorted(patchdict.keys())
-            vout(1, '{}: patchdirs: {}'.format(series_conf, patchdirs))
-            for patchpath in patchdirs:
-                files = set([f for f in list_files(patchpath) if f.endswith('.patch')])
-                unused = files - patchdict[patchpath]
-                if unused:
-                    vout(1, '{}: {}: unused: {}'.format(series_conf, patchpath, sorted(unused)))
+            verify(patchdir, patches)
 
         # provide the result on stdout
         stdout(src_version)
 
         return ret
-
 
     def main(argv = None):
         """Command line interface and console script entry point."""
@@ -466,7 +467,7 @@ if __name__ == "__main__":
             argv = sys.argv[1:]
 
         try:
-            optlist, args = getopt.getopt(argv, 'hVvb:p:',
+            optlist, _ = getopt.getopt(argv, 'hVvb:p:',
                 ('help', 'version', 'verbose', 'basedir=', 'patches=', 'verify')
             )
         except getopt.error as msg:
