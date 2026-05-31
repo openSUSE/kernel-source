@@ -382,12 +382,12 @@ if __name__ == "__main__":
                     except IndexError:
                         raise ValueError('{}: guarded patch in line {} malformed: {}'.format(series_conf, lnnr, line))
                     else:
-                        if guard == '+':
-                            vout(2, '{}: patch in line {} flagged by {}: {}'.format(series_conf, lnnr, guard, patch))
+                        if guard[0] == '+':
+                            vout(1, '{}: patch in line {} flagged by {}: {}'.format(series_conf, lnnr, guard, patch))
                             patches.append(patch)
                         else:
-                            # guard == '-':
-                            vout(2, '{}: patch in line {} excluded by {}: {}'.format(series_conf, lnnr, guard, patch))
+                            # guard[0] == '-':
+                            vout(1, '{}: patch in line {} excluded by {}: {}'.format(series_conf, lnnr, guard, patch))
 
                 # check special cases
                 if len(e) > 1:
