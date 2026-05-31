@@ -191,6 +191,125 @@ def get_package_archs(package_tar_up_dir, limit_packages=None):
 
 # here starts the new compute-PATCHVERSION.py implementation
 
+class SrcVersion:
+    """Class, defining a source code version, allows parsing from string, updating single values
+    and returns the resulting version as string repr"""
+    def __init__(self, version_str):
+        self.version = '0'
+        self.patchlevel = '0'
+        self.sublevel = '0'
+        self.extraversion = ''
+        self._partlist = ('version', 'patchlevel', 'sublevel', 'extraversion')
+        pattern = re.compile(r'''
+            ^                           # Start of line
+            (?P<version>\d+)            # Required: version number
+            \.                          # Required: version dot
+            (?P<patchlevel>\d+)         # Required: patchlevel number
+            (?:                         # Start of non-capturing group
+                \.(?P<sublevel>\d+)     # Optional: sublevel number
+            )?                          # End of group
+            (?P<extraversion>.*)        # Optional: extra version
+            $                           # End of line
+        ''', re.VERBOSE)
+
+        match = re.match(pattern, version_str)
+        if not match:
+            raise ValueError('Invalid version str: "{}". Expecting X[.Y][.Z][-extra]'.format(version_str))
+        for part in self._partlist:
+            value = match.group(part)
+            if value is not None:
+                self.update(part, value)
+
+    def update(self, part, value):
+        """Update a specific version component to a new value"""
+        if part in self._partlist:
+            setattr(self, part, value)
+
+    def __str__(self):
+        return '{version}.{patchlevel}.{sublevel}{extraversion}'.format(**self.__dict__)
+
+
+def parse_config_sh(config_sh):
+    """Parse config.sh file and return a dict with key value pairs"""
+    config = {}
+    lnnr = 0
+    with open(config_sh, 'r') as f:
+        for line in f:
+            lnnr += 1
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            if '=' in line:
+                key, raw_value = line.split('=', 1)
+                key = key.strip()
+                # shlex removes the outer quotation marks cleanly
+                parsed_tokens = shlex.split(raw_value)
+                value = parsed_tokens[0] if parsed_tokens else ""
+                config[key] = value
+            else:
+                raise ValueError('line {} malformed in {}: "{}"'.format(lnnr, config_sh, line))
+
+    return config
+
+
+def parse_makefiles(diff_text):
+    """Locate changes to the toplevel Makefile in a unified diff file
+    return applied changesets to the linux kernel version variables"""
+    # match top level Makefile
+    makefile_target = re.compile(r'''
+        ^                   # Anchor a start of line
+        (---|\+\+\+)        # Match either +++ or ---
+        \s+                 # Skip blinks
+        (?P<path>[^\/]+/Makefile)   # Extract Makefile with single slash
+        ( |\t|$)            # May end in a blank, tab or end of line
+    ''', re.VERBOSE)
+    # match variable change pattern
+    var_pattern = re.compile(r'''
+        ^                   # Anchor at start of line
+        \+                  # Required: we care about additions ('+') only
+        \s*                 # Skip optional blanks
+        (?P<key>VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)   # Required: key value is one of these
+        \s*=\s*             # Required: assignment with optional blanks
+        (?P<value>.*)       # Required: any value, even an empty one
+    ''', re.VERBOSE)
+
+    in_makefile = False
+    changes = []
+
+    for line in diff_text.splitlines():
+        if line.startswith(('--- ', '+++ ')):
+            match = makefile_target.match(line)
+            if match:
+                # we're in a toplevel Makefile diff section now
+                in_makefile = True
+                current_file = match.group('path')
+                vout(4, 'parse_makefiles: {}'.format(current_file))
+            else:
+                # we're in some other files modification context
+                in_makefile = False
+
+        if not in_makefile:
+            continue
+
+        if line.startswith((' ', '@@')):
+            continue
+
+        # extract version variable changes
+        match = var_pattern.match(line)
+        if match:
+            changes.append(
+                {
+                    # which variable (and avoid shouting loudly)
+                    'variable': match.group('key').lower(),
+                    # added (new) or removed (old) value
+                    'value': match.group('value').strip(),
+                }
+            )
+
+    return changes
+
+
 if __name__ == "__main__":
     import os
     import re
@@ -240,68 +359,6 @@ if __name__ == "__main__":
         sys.exit(ret)
 
 
-    def parse_config_sh(config_sh):
-        """Parse config.sh file and return a dict with key value pairs"""
-        config = {}
-        lnnr = 0
-        with open(config_sh, 'r') as f:
-            for line in f:
-                lnnr += 1
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-
-                if '=' in line:
-                    key, raw_value = line.split('=', 1)
-                    key = key.strip()
-                    # shlex removes the outer quotation marks cleanly
-                    parsed_tokens = shlex.split(raw_value)
-                    value = parsed_tokens[0] if parsed_tokens else ""
-                    config[key] = value
-                else:
-                    raise ValueError('line {} malformed in {}: "{}"'.format(lnnr, config_sh, line))
-
-        return config
-
-
-    class SrcVersion:
-        """Class, defining a source code version allows parsing from string, updating single values
-        and returns the resulting version as string repr"""
-        def __init__(self, version_str):
-            self.version = '0'
-            self.patchlevel = '0'
-            self.sublevel = '0'
-            self.extraversion = ''
-            self._partlist = ('version', 'patchlevel', 'sublevel', 'extraversion')
-            pattern = re.compile(r'''
-                ^                           # Start of line
-                (?P<version>\d+)            # Required: version number
-                \.                          # Required: version dot
-                (?P<patchlevel>\d+)         # Required: patchlevel number
-                (?:                         # Start of non-capturing group
-                    \.(?P<sublevel>\d+)     # Optional: sublevel number
-                )?                          # End of group
-                (?P<extraversion>.*)        # Optional: extra version
-                $                           # End of line
-            ''', re.VERBOSE)
-
-            match = re.match(pattern, version_str)
-            if not match:
-                raise ValueError('Invalid version str: "{}". Expecting X[.Y][.Z][-extra]'.format(version_str))
-            for part in self._partlist:
-                value = match.group(part)
-                if value is not None:
-                    self.update(part, value)
-
-        def update(self, part, value):
-            """Update a specific version component to a new value"""
-            if part in self._partlist:
-                setattr(self, part, value)
-
-        def __str__(self):
-            return '{version}.{patchlevel}.{sublevel}{extraversion}'.format(**self.__dict__)
-
-
     def parse_series_conf(basedir, series_conf):
         """Parse the series.conf file, taking guards into account, and return a list of patch files"""
         patches = []
@@ -337,63 +394,6 @@ if __name__ == "__main__":
                 patches.append(patch)
 
         return patches
-
-
-    def parse_makefiles(diff_text):
-        """Locate changes to the toplevel Makefile in a unified diff file
-        return applied changesets to the linux kernel version variables"""
-        # match top level Makefile
-        makefile_target = re.compile(r'''
-            ^                   # Anchor a start of line
-            (---|\+\+\+)        # Match either +++ or ---
-            \s+                 # Skip blinks
-            (?P<path>[^\/]+/Makefile)   # Extract Makefile with single slash
-            ( |\t|$)            # May end in a blank, tab or end of line
-        ''', re.VERBOSE)
-        # match variable change pattern
-        var_pattern = re.compile(r'''
-            ^                   # Anchor at start of line
-            \+                  # Required: we care about additions ('+') only
-            \s*                 # Skip optional blanks
-            (?P<key>VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)   # Required: key value is one of these
-            \s*=\s*             # Required: assignment with optional blanks
-            (?P<value>.*)       # Required: any value, even an empty one
-        ''', re.VERBOSE)
-
-        in_makefile = False
-        changes = []
-
-        for line in diff_text.splitlines():
-            if line.startswith(('--- ', '+++ ')):
-                match = makefile_target.match(line)
-                if match:
-                    # we're in a toplevel Makefile diff section now
-                    in_makefile = True
-                    current_file = match.group('path')
-                    vout(4, 'parse_makefiles: {}'.format(current_file))
-                else:
-                    # we're in some other files modification context
-                    in_makefile = False
-
-            if not in_makefile:
-                continue
-
-            if line.startswith((' ', '@@')):
-                continue
-
-            # extract version variable changes
-            match = var_pattern.match(line)
-            if match:
-                changes.append(
-                    {
-                        # which variable (and avoid shouting loudly)
-                        'variable': match.group('key').lower(),
-                        # added (new) or removed (old) value
-                        'value': match.group('value').strip(),
-                    }
-                )
-
-        return changes
 
 
     def compute(basedir, patchdir):
