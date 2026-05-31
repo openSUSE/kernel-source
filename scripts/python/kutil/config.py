@@ -1,9 +1,9 @@
 #! /usr/bin/env python3
 """
 Synopsis: determine the current kernel source version from a series of patches
-          as being defined in series.conf
+          as being referenced from series.conf
 
-Usage: {appname} [-hVvp]
+Usage: {appname} [-hVvp:]
        -h, --help           this message
        -V, --version        print version and exit
        -v, --verbose        verbose mode (cumulative)
@@ -23,10 +23,11 @@ Otherwise provide the --patches argument with the preferred base directory.
 This file is typically a symlink to ../scripts/python/kutil/config.py.
 
 It fetches the kernel source version from config.sh, then parses the
-./series.conf file, collecting all patch files, and tracks for any changes in
-top level Makefiles to the four version defining symbols: VERSION, PATCHLEVEL,
+./series.conf file, collecting all patch files, and tracks any changes of the
+top level Makefile to the four version defining symbols: VERSION, PATCHLEVEL,
 SUBLEVEL, and EXTRAVERSION. The result should consitute the latest kernel
-patch level.
+patch level. Verbose levels up to 4 reveal internal states, that you probably
+don't want to ever know of.
 
 Version: {version}
 Copyright: (c)2026 by {company}
@@ -36,6 +37,9 @@ License: {license}
 #
 # vim:set et ts=8 sw=4:
 #
+# disable some pylint noise
+# pylint: disable=line-too-long, missing-function-docstring, unspecified-encoding
+# pylint: disable=consider-using-f-string, consider-using-sys-exit
 
 import configparser
 import subprocess
@@ -62,7 +66,7 @@ def list_files(directory):
     if len(directory) > 1:
         directory = directory.rstrip('/')
     result = []
-    for root, dirs, filenames in os.walk(directory):
+    for root, _, filenames in os.walk(directory):
         for f in filenames:
             result.append(os.path.join(root, f)[len(directory)+1:])
     return sorted(result)
@@ -247,7 +251,6 @@ def get_package_archs(package_tar_up_dir, limit_packages=None):
 # here starts the new compute-PATCHVERSION.py implementation
 
 if __name__ == "__main__":
-    import os
     import sys
     import getopt
     import signal
@@ -271,16 +274,16 @@ if __name__ == "__main__":
         rpmdir = '.'
         patchdir = '.'
 
+    def stdout(*msg):
+        print(*msg, file = sys.stdout, flush = True)
 
-    stdout = lambda *msg: print(*msg, file = sys.stdout, flush = True)
-    stderr = lambda *msg: print(*msg, file = sys.stderr, flush = True)
-
+    def stderr(*msg):
+        print(*msg, file = sys.stderr, flush = True)
 
     def vout(lvl, *msg):
         """Verbose output"""
         if lvl <= gpar.loglevel:
             stderr(*msg)
-
 
     def exit(ret = 0, msg = None, usage = False):
         """Terminate process with optional message and usage"""
@@ -290,8 +293,7 @@ if __name__ == "__main__":
             stderr(__doc__.format(**gpar.__dict__))
         sys.exit(ret)
 
-
-    def parse_series_conf(patchdir, series_conf):
+    def parse_series_conf(series_conf):
         """Parse the series.conf file, taking guards into account, and return a list of patch files"""
         pattern = re.compile(r'''
             ^                   # Start of line
@@ -314,20 +316,29 @@ if __name__ == "__main__":
                 if not line or line.startswith('#'):
                     continue
 
-                m = re.match(pattern, line)
-                if m:
-                    guard = m['sign']
-                    if guard:
-                        # guarded line
-                        if guard == '+':
-                            vout(2, '{}: patch in line {} flagged: {}'.format(series_conf, lnnr, line))
-                        else:
-                            # guard == '-':
-                            vout(2, '{}: patch in line {} excluded: {}'.format(series_conf, lnnr, line))
-                    patch = os.path.join(patchdir, m['patch'])
-                    patches.append(patch)
-                else:
-                    raise ValueError('{}: line {} malformed: "{}"'.format(series_conf, lnnr, line))
+                # split lines into list of elements
+                e = line.split()
+                if len(e) == 1:
+                    # common case, just a patch
+                    patches.append(e[0])
+                elif e[0].startswith(('+', '-')):
+                    # guarded line
+                    try:
+                        guard, patch = e[:2]
+                    except IndexError as exc:
+                        raise ValueError('{}: guarded patch in line {} malformed: {}'.format(series_conf, lnnr, line)) from exc
+                    if guard[0] == '+':
+                        vout(1, '{}: patch in line {} flagged by {}: {}'.format(series_conf, lnnr, guard, patch))
+                        patches.append(patch)
+                    else:
+                        # guard[0] == '-':
+                        vout(1, '{}: patch in line {} excluded by {}: {}'.format(series_conf, lnnr, guard, patch))
+                    # remove guard element
+                    e.pop(0)
+
+                # check special cases
+                if len(e) > 1:
+                    vout(3, '{}: excess elements in line {}: {}'.format(series_conf, lnnr, e))
 
         return patches
 
@@ -396,20 +407,20 @@ if __name__ == "__main__":
         if not os.path.isdir(patchdir):
             exit(1, 'patch directory {} not found'.format(patchdir))
 
-        # fetch key value pairs from config.sh
+        # fetch key, value pairs from config.sh
         config = read_config_sh(bindir)
         vout(2, 'config.sh: {}'.format(config))
 
         # determine kernel base source code version
         src_version = config.getversion('srcversion')
-        vout(1, 'base source version is: {}'.format(src_version))
+        vout(1, 'base source version: {}'.format(src_version))
 
         # fetch patch files from series.conf
         series_conf = os.path.join(rpmdir, 'series.conf')
-        patches = parse_series_conf(patchdir, series_conf)
+        patches = parse_series_conf(series_conf)
         vout(4, 'patches: {}'.format(patches))
 
-        # collect Makefile changesets from patch files
+        # collect top level Makefile changesets from patch files
         changes = []
         for pfn in patches:
             with open(pfn, 'r') as f:
@@ -417,7 +428,7 @@ if __name__ == "__main__":
                 if 'Makefile' in patch_data:
                     changeset = parse_makefiles(patch_data)
                     if changeset:
-                        vout(3, 'parse_matches: {}: {}'.format(pfn, changeset))
+                        vout(2, 'parse_matches: {}: {}'.format(pfn, changeset))
                         changes.append(changeset)
 
         # iterate over all changesets, and apply them
@@ -431,14 +442,13 @@ if __name__ == "__main__":
 
         return ret
 
-
     def main(argv = None):
         """Command line interface and console script entry point."""
         if argv is None:
             argv = sys.argv[1:]
 
         try:
-            optlist, args = getopt.getopt(argv, 'hVvp:',
+            optlist, _ = getopt.getopt(argv, 'hVvp:',
                 ('help', 'version', 'verbose', 'patches=')
             )
         except getopt.error as msg:
