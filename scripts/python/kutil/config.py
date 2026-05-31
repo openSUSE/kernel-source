@@ -337,6 +337,7 @@ if __name__ == "__main__":
         loglevel = 0
         basedir = '.'
         patches = '.'
+        verify = False
 
 
     stdout = lambda *msg: print(*msg, file = sys.stdout, flush = True)
@@ -417,14 +418,14 @@ if __name__ == "__main__":
 
         # collect Makefile changesets from patch files
         changes = []
-        for pfn in patches:
-            pfn = os.path.join(patchdir, pfn)
-            with open(pfn, 'r') as f:
+        for patch in patches:
+            patch = os.path.join(patchdir, patch)
+            with open(patch, 'r') as f:
                 patch_data = f.read()
                 if 'Makefile' in patch_data:
                     changeset = parse_makefiles(patch_data)
                     if changeset:
-                        vout(3, 'parse_matches: {}: {}'.format(pfn, changeset))
+                        vout(3, 'parse_matches: {}: {}'.format(patch, changeset))
                         changes.append(changeset)
 
         # iterate over all changesets, and apply them
@@ -432,6 +433,26 @@ if __name__ == "__main__":
             for ch in changeset:
                 vout(3, '{}'.format(ch))
                 src_version.update(ch['variable'], ch['value'])
+
+        # verify consistency
+        if gpar.verify:
+            patchdict = {}
+            for patch in patches:
+                patch = os.path.join(patchdir, patch)
+                patchpath, patchfile = os.path.split(patch)
+                patchlist = patchdict.setdefault(patchpath, set())
+                if patchfile in patchlist:
+                    vout(1, '{}: duplicate patch {} in {}'.format(series_conf, patchfile, patchpath))
+                    #vout(1, '{}: {}'.format(series_conf, patchlist))
+                else:
+                    patchlist.add(patchfile)
+            patchdirs = sorted(patchdict.keys())
+            vout(1, '{}: patchdirs: {}'.format(series_conf, patchdirs))
+            for patchpath in patchdirs:
+                files = set([f for f in list_files(patchpath) if f.endswith('.patch')])
+                unused = files - patchdict[patchpath]
+                if unused:
+                    vout(1, '{}: {}: unused: {}'.format(series_conf, patchpath, sorted(unused)))
 
         # provide the result on stdout
         stdout(src_version)
@@ -446,7 +467,7 @@ if __name__ == "__main__":
 
         try:
             optlist, args = getopt.getopt(argv, 'hVvb:p:',
-                ('help', 'version', 'verbose', 'basedir=', 'patches=')
+                ('help', 'version', 'verbose', 'basedir=', 'patches=', 'verify')
             )
         except getopt.error as msg:
             exit(1, msg, True)
@@ -462,6 +483,11 @@ if __name__ == "__main__":
                 gpar.basedir = par
             elif opt in ('-p', '--patches'):
                 gpar.patches = par
+            elif opt in ('--verify'):
+                gpar.verify = True
+
+        if gpar.verify and gpar.loglevel == 0:
+            gpar.loglevel = 1
 
         # ignore broken pipe errors (SIGPIPE)
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
