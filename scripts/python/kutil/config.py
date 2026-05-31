@@ -304,40 +304,37 @@ if __name__ == "__main__":
 
     def parse_series_conf(basedir, series_conf):
         """Parse the series.conf file, taking guards into account, and return a list of patch files"""
-        pattern = re.compile(r'''
-            ^                   # Start of line
-            (?:                 # Start of non-capturing group for sign and symbol
-                (?P<sign>[+-])  # Required if group matches: Matches a single '+' or '-' sign
-                (?P<symbol>[a-zA-Z0-9]+)? # Optional: Matches alphanumeric symbol only after a sign
-            )?                  # End of group: The entire sign+symbol block is optional
-            \s*                 # Optional: Ignores any subsequent whitespace characters
-            (?P<patch>\S+)      # Required: Matches the filename (one or more non-whitespace characters)
-            .*?                 # Optional: Ignore any trailing garbarge
-            $                   # End of line
-        ''', re.VERBOSE)
-
         patches = []
         lnnr = 0
         with open(series_conf, 'r') as f:
-            for line in f:
+            for line in f.read().splitlines():
                 lnnr += 1
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
 
-                m = re.match(pattern, line)
-                if m:
-                    guard = m['sign']
-                    if guard:
-                        # guarded line
+                # split lines into list of elements
+                e = line.split()
+                if len(e) == 1:
+                    # common case, just a patch
+                    patch = e[0]
+                elif e[0].startswith(('+', '-')):
+                    # guarded line
+                    try:
+                        guard, patch = e[:2]
+                    except IndexError:
+                        raise ValueError('{}: guarded patch in line {} malformed: {}'.format(series_conf, lnnr, line))
+                    else:
                         if guard == '+':
-                            vout(2, '{}: patch in line {} flagged: {}'.format(series_conf, lnnr, line))
+                            vout(2, '{}: patch in line {} flagged by {}: {}'.format(series_conf, lnnr, guard, patch))
                         else:
                             # guard == '-':
-                            vout(2, '{}: patch in line {} excluded: {}'.format(series_conf, lnnr, line))
-                    patches.append(m['patch'])
-                else:
-                    raise ValueError('{}: line {} malformed: "{}"'.format(series_conf, lnnr, line))
+                            vout(2, '{}: patch in line {} excluded by {}: {}'.format(series_conf, lnnr, guard, patch))
+                            continue
+                # check special cases
+                if len(e) > 1:
+                    vout(3, '{}: excess elements in line {}: {}'.format(series_conf, lnnr, e))
+                patches.append(patch)
 
         return patches
 
