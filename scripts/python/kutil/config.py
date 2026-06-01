@@ -369,10 +369,7 @@ if __name__ == "__main__":
 
                 # split lines into list of elements
                 e = line.split()
-                if len(e) == 1:
-                    # common case, just a patch
-                    patches.append(e[0])
-                elif e[0].startswith(('+', '-')):
+                if e[0].startswith(('+', '-')):
                     # guarded line
                     try:
                         guard, patch = e[:2]
@@ -386,6 +383,13 @@ if __name__ == "__main__":
                         vout(1, '{}: patch in line {} excluded by {}: {}'.format(series_conf, lnnr, guard, patch))
                     # remove guard element
                     e.pop(0)
+                else:
+                    # common case, just a patch, propably with trailing garbarge
+                    try:
+                        patch = e[0]
+                    except IndexError as exc:
+                        raise ValueError('{}: patch in line {} malformed: {}'.format(series_conf, lnnr, line)) from exc
+                    patches.append(patch)
 
                 # check special cases
                 if len(e) > 1:
