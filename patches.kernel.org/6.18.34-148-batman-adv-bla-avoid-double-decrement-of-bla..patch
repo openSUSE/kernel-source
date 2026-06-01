@@ -1,0 +1,233 @@
+From: Sven Eckelmann <sven@narfation.org>
+Date: Tue, 12 May 2026 09:13:31 +0200
+Subject: [PATCH] batman-adv: bla: avoid double decrement of bla.num_requests
+References: bsc#1258210
+Patch-mainline: 6.18.34
+Git-commit: 83ab69bd12b80f6ea169c8bea6977701b53a043d
+
+commit 83ab69bd12b80f6ea169c8bea6977701b53a043d upstream.
+
+The bla.num_requests is increased when no request_sent was in progress. And
+it is decremented in various places (announcement was received, backbone is
+purged, periodic work). But the check if the request_sent is actually set
+to a specific state and the atomic_dec/_inc are not safe because they are
+not atomic (TOCTOU) and multiple such code portions can run concurrently.
+
+At the same time, it is necessary to modify request_sent (state) and
+bla.num_requests atomically. Otherwise batadv_bla_send_request() might set
+request_sent to 1 and is interrupted.  batadv_handle_announce() can then
+set request_sent back to 0 and decrement num_requests before
+batadv_bla_send_request() incremented it.
+
+The two operations must therefore be locked. And since state (request_sent)
+and wait_periods are only accessed inside this lock, they can be converted
+to simpler datatypes. And to avoid that the bla.num_requests is touched by
+a parallel running context with a valid backbone_gw reference after
+batadv_bla_purge_backbone_gw() ran, a third state "stopped" is required to
+correctly signal that a backbone_gw is in the state of being cleaned up.
+
+Cc: stable@kernel.org
+Fixes: 23721387c409 ("batman-adv: add basic bridge loop avoidance code")
+Signed-off-by: Sven Eckelmann <sven@narfation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ net/batman-adv/bridge_loop_avoidance.c | 51 ++++++++++++++++++--------
+ net/batman-adv/mesh-interface.c        |  1 +
+ net/batman-adv/types.h                 | 39 ++++++++++++++++----
+ 3 files changed, 67 insertions(+), 24 deletions(-)
+
+diff --git a/net/batman-adv/bridge_loop_avoidance.c b/net/batman-adv/bridge_loop_avoidance.c
+index 33b1275fdf83..42ee7efc3d79 100644
+--- a/net/batman-adv/bridge_loop_avoidance.c
++++ b/net/batman-adv/bridge_loop_avoidance.c
+@@ -515,8 +515,8 @@ batadv_bla_get_backbone_gw(struct batadv_priv *bat_priv, const u8 *orig,
+ 	entry->crc = BATADV_BLA_CRC_INIT;
+ 	entry->bat_priv = bat_priv;
+ 	spin_lock_init(&entry->crc_lock);
+-	atomic_set(&entry->request_sent, 0);
+-	atomic_set(&entry->wait_periods, 0);
++	entry->state = BATADV_BLA_BACKBONE_GW_SYNCED;
++	entry->wait_periods = 0;
+ 	ether_addr_copy(entry->orig, orig);
+ 	INIT_WORK(&entry->report_work, batadv_bla_loopdetect_report);
+ 	kref_init(&entry->refcount);
+@@ -545,9 +545,13 @@ batadv_bla_get_backbone_gw(struct batadv_priv *bat_priv, const u8 *orig,
+ 		batadv_bla_send_announce(bat_priv, entry);
+ 
+ 		/* this will be decreased in the worker thread */
+-		atomic_inc(&entry->request_sent);
+-		atomic_set(&entry->wait_periods, BATADV_BLA_WAIT_PERIODS);
+-		atomic_inc(&bat_priv->bla.num_requests);
++		spin_lock_bh(&bat_priv->bla.num_requests_lock);
++		if (entry->state == BATADV_BLA_BACKBONE_GW_SYNCED) {
++			entry->state = BATADV_BLA_BACKBONE_GW_UNSYNCED;
++			entry->wait_periods = BATADV_BLA_WAIT_PERIODS;
++			atomic_inc(&bat_priv->bla.num_requests);
++		}
++		spin_unlock_bh(&bat_priv->bla.num_requests_lock);
+ 	}
+ 
+ 	return entry;
+@@ -650,10 +654,12 @@ static void batadv_bla_send_request(struct batadv_bla_backbone_gw *backbone_gw)
+ 			      backbone_gw->vid, BATADV_CLAIM_TYPE_REQUEST);
+ 
+ 	/* no local broadcasts should be sent or received, for now. */
+-	if (!atomic_read(&backbone_gw->request_sent)) {
++	spin_lock_bh(&backbone_gw->bat_priv->bla.num_requests_lock);
++	if (backbone_gw->state == BATADV_BLA_BACKBONE_GW_SYNCED) {
++		backbone_gw->state = BATADV_BLA_BACKBONE_GW_UNSYNCED;
+ 		atomic_inc(&backbone_gw->bat_priv->bla.num_requests);
+-		atomic_set(&backbone_gw->request_sent, 1);
+ 	}
++	spin_unlock_bh(&backbone_gw->bat_priv->bla.num_requests_lock);
+ }
+ 
+ /**
+@@ -874,10 +880,12 @@ static bool batadv_handle_announce(struct batadv_priv *bat_priv, u8 *an_addr,
+ 		/* if we have sent a request and the crc was OK,
+ 		 * we can allow traffic again.
+ 		 */
+-		if (atomic_read(&backbone_gw->request_sent)) {
++		spin_lock_bh(&bat_priv->bla.num_requests_lock);
++		if (backbone_gw->state == BATADV_BLA_BACKBONE_GW_UNSYNCED) {
++			backbone_gw->state = BATADV_BLA_BACKBONE_GW_SYNCED;
+ 			atomic_dec(&backbone_gw->bat_priv->bla.num_requests);
+-			atomic_set(&backbone_gw->request_sent, 0);
+ 		}
++		spin_unlock_bh(&bat_priv->bla.num_requests_lock);
+ 	}
+ 
+ 	batadv_backbone_gw_put(backbone_gw);
+@@ -1256,9 +1264,13 @@ static void batadv_bla_purge_backbone_gw(struct batadv_priv *bat_priv, int now)
+ 				purged = true;
+ 
+ 				/* don't wait for the pending request anymore */
+-				if (atomic_read(&backbone_gw->request_sent))
++				spin_lock_bh(&bat_priv->bla.num_requests_lock);
++				if (backbone_gw->state == BATADV_BLA_BACKBONE_GW_UNSYNCED)
+ 					atomic_dec(&bat_priv->bla.num_requests);
+ 
++				backbone_gw->state = BATADV_BLA_BACKBONE_GW_STOPPED;
++				spin_unlock_bh(&bat_priv->bla.num_requests_lock);
++
+ 				batadv_bla_del_backbone_claims(backbone_gw);
+ 
+ 				hlist_del_rcu(&backbone_gw->hash_entry);
+@@ -1509,7 +1521,7 @@ static void batadv_bla_periodic_work(struct work_struct *work)
+ 				batadv_bla_send_loopdetect(bat_priv,
+ 							   backbone_gw);
+ 
+-			/* request_sent is only set after creation to avoid
++			/* state is only set to unsynced after creation to avoid
+ 			 * problems when we are not yet known as backbone gw
+ 			 * in the backbone.
+ 			 *
+@@ -1518,14 +1530,21 @@ static void batadv_bla_periodic_work(struct work_struct *work)
+ 			 * some grace time.
+ 			 */
+ 
+-			if (atomic_read(&backbone_gw->request_sent) == 0)
+-				continue;
++			spin_lock_bh(&bat_priv->bla.num_requests_lock);
++			if (backbone_gw->state != BATADV_BLA_BACKBONE_GW_UNSYNCED)
++				goto unlock_next;
+ 
+-			if (!atomic_dec_and_test(&backbone_gw->wait_periods))
+-				continue;
++			if (backbone_gw->wait_periods > 0)
++				backbone_gw->wait_periods--;
++
++			if (backbone_gw->wait_periods > 0)
++				goto unlock_next;
+ 
++			backbone_gw->state = BATADV_BLA_BACKBONE_GW_SYNCED;
+ 			atomic_dec(&backbone_gw->bat_priv->bla.num_requests);
+-			atomic_set(&backbone_gw->request_sent, 0);
++
++unlock_next:
++			spin_unlock_bh(&bat_priv->bla.num_requests_lock);
+ 		}
+ 		rcu_read_unlock();
+ 	}
+diff --git a/net/batman-adv/mesh-interface.c b/net/batman-adv/mesh-interface.c
+index df7e95811ef5..dcdc82f6af8c 100644
+--- a/net/batman-adv/mesh-interface.c
++++ b/net/batman-adv/mesh-interface.c
+@@ -787,6 +787,7 @@ static int batadv_meshif_init_late(struct net_device *dev)
+ 	atomic_set(&bat_priv->tt.ogm_append_cnt, 0);
+ #ifdef CONFIG_BATMAN_ADV_BLA
+ 	atomic_set(&bat_priv->bla.num_requests, 0);
++	spin_lock_init(&bat_priv->bla.num_requests_lock);
+ #endif
+ 	atomic_set(&bat_priv->tp_num, 0);
+ 
+diff --git a/net/batman-adv/types.h b/net/batman-adv/types.h
+index aca82693ccff..d9518d73c257 100644
+--- a/net/batman-adv/types.h
++++ b/net/batman-adv/types.h
+@@ -1026,6 +1026,12 @@ struct batadv_priv_bla {
+ 	/** @num_requests: number of bla requests in flight */
+ 	atomic_t num_requests;
+ 
++	/**
++	 * @num_requests_lock: locks update num_requests +
++	 * batadv_backbone_gw::state + batadv_backbone_gw::wait_periods update
++	 */
++	spinlock_t num_requests_lock;
++
+ 	/**
+ 	 * @claim_hash: hash table containing mesh nodes this host has claimed
+ 	 */
+@@ -1669,6 +1675,27 @@ struct batadv_priv {
+ 
+ #ifdef CONFIG_BATMAN_ADV_BLA
+ 
++enum batadv_bla_backbone_gw_state {
++	/**
++	 * @BATADV_BLA_BACKBONE_GW_STOPPED: backbone gw is being removed
++	 * and it must not longer work on requests
++	 */
++	BATADV_BLA_BACKBONE_GW_STOPPED,
++
++	/**
++	 * @BATADV_BLA_BACKBONE_GW_UNSYNCED: backbone was detected out
++	 * of sync and a request was send. No traffic is forwarded until the
++	 * situation is resolved
++	 */
++	BATADV_BLA_BACKBONE_GW_UNSYNCED,
++
++	/**
++	 * @BATADV_BLA_BACKBONE_GW_SYNCED: backbone is consider to be in
++	 * sync. traffic can be forwarded
++	 */
++	BATADV_BLA_BACKBONE_GW_SYNCED,
++};
++
+ /**
+  * struct batadv_bla_backbone_gw - batman-adv gateway bridged into the LAN
+  */
+@@ -1694,16 +1721,12 @@ struct batadv_bla_backbone_gw {
+ 	/**
+ 	 * @wait_periods: grace time for bridge forward delays and bla group
+ 	 *  forming at bootup phase - no bcast traffic is formwared until it has
+-	 *  elapsed
++	 *  elapsed. Must only be access with num_requests_lock.
+ 	 */
+-	atomic_t wait_periods;
++	u8 wait_periods;
+ 
+-	/**
+-	 * @request_sent: if this bool is set to true we are out of sync with
+-	 *  this backbone gateway - no bcast traffic is formwared until the
+-	 *  situation was resolved
+-	 */
+-	atomic_t request_sent;
++	/** @state: sync state. Must only be access with num_requests_lock. */
++	enum batadv_bla_backbone_gw_state state;
+ 
+ 	/** @crc: crc16 checksum over all claims */
+ 	u16 crc;
+-- 
+2.53.0
+
