@@ -197,7 +197,8 @@ patches.suse/sublevel_4 # change sublevel
 
     def test_empty(self):
         def test_fn(pipe, out, err):
-            # script retruns 0 and prints .0.0, not a desirable outcome, not tested
+            self.assertNotEqual(0, pipe.returncode)
+            self.assertEqual(b'', out.strip())
             self.assertTrue(b'config.sh' in err)
         self.run_test(test_fn, True)
 
@@ -205,7 +206,8 @@ patches.suse/sublevel_4 # change sublevel
         self.config_sh.write_text('SRCVERSION=1.2')
 
         def test_fn(pipe, out, err):
-            # script retruns 0 and prints .0.0, not a desirable outcome, not tested
+            self.assertNotEqual(0, pipe.returncode)
+            self.assertEqual(b'', out.strip())
             self.assertTrue(b'series.conf' in err)
         self.run_test(test_fn, True)
 
