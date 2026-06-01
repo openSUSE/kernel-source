@@ -1,0 +1,270 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Fri, 13 Feb 2026 17:26:50 -0800
+Subject: KVM: VMX: Unconditionally allocate root VMCSes during boot CPU
+ bringup
+Git-commit: 405b7c27934eaabbcc52ccfbaeb22ef966b6b5f0
+Patch-mainline: v7.1-rc1
+References: git-fixes
+
+Allocate the root VMCS (misleading called "vmxarea" and "kvm_area" in KVM)
+for each possible CPU during early boot CPU bringup, before early TDX
+initialization, so that TDX can eventually do VMXON on-demand (to make
+SEAMCALLs) without needing to load kvm-intel.ko.  Allocate the pages early
+on, e.g. instead of trying to do so on-demand, to avoid having to juggle
+allocation failures at runtime.
+
+Opportunistically rename the per-CPU pointers to better reflect the role
+of the VMCS.  Use Intel's "root VMCS" terminology, e.g. from various VMCS
+patents[1][2] and older SDMs, not the more opaque "VMXON region" used in
+recent versions of the SDM.  While it's possible the VMCS passed to VMXON
+no longer serves as _the_ root VMCS on modern CPUs, it is still in effect
+a "root mode VMCS", as described in the patents.
+
+Link: https://patentimages.storage.googleapis.com/c7/e4/32/d7a7def5580667/WO2013101191A1.pdf [1]
+Link: https://patentimages.storage.googleapis.com/13/f6/8d/1361fab8c33373/US20080163205A1.pdf [2]
+Tested-by: Chao Gao <chao.gao@intel.com>
+Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Tested-by: Sagi Shahar <sagis@google.com>
+Link: https://patch.msgid.link/20260214012702.2368778-5-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/include/asm/virt.h  |   13 +++++++
+ arch/x86/kernel/cpu/common.c |    2 +
+ arch/x86/kvm/vmx/vmx.c       |   58 ++---------------------------------
+ arch/x86/virt/hw.c           |   71 +++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 89 insertions(+), 55 deletions(-)
+
+--- a/arch/x86/include/asm/virt.h
++++ b/arch/x86/include/asm/virt.h
+@@ -2,10 +2,21 @@
+ #ifndef _ASM_X86_VIRT_H
+ #define _ASM_X86_VIRT_H
+ 
+-#include <linux/types.h>
++#include <linux/percpu-defs.h>
++
++#include <asm/reboot.h>
+ 
+ #if IS_ENABLED(CONFIG_KVM_X86)
+ extern bool virt_rebooting;
++
++void __init x86_virt_init(void);
++
++#if IS_ENABLED(CONFIG_KVM_INTEL)
++DECLARE_PER_CPU(struct vmcs *, root_vmcs);
++#endif
++
++#else
++static __always_inline void x86_virt_init(void) {}
+ #endif
+ 
+ #endif /* _ASM_X86_VIRT_H */
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -68,6 +68,7 @@
+ #include <asm/traps.h>
+ #include <asm/sev.h>
+ #include <asm/tdx.h>
++#include <asm/virt.h>
+ #include <asm/posted_intr.h>
+ #include <asm/runtime-const.h>
+ 
+@@ -2061,6 +2062,7 @@ static __init void identify_boot_cpu(voi
+ 	cpu_detect_tlb(&boot_cpu_data);
+ 	setup_cr_pinning();
+ 
++	x86_virt_init();
+ 	tsx_init();
+ 	tdx_init();
+ 	lkgs_init();
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -468,7 +468,6 @@ noinline void invept_error(unsigned long
+ 	vmx_insn_failed("invept failed: ext=0x%lx eptp=%llx\n", ext, eptp);
+ }
+ 
+-static DEFINE_PER_CPU(struct vmcs *, vmxarea);
+ DEFINE_PER_CPU(struct vmcs *, current_vmcs);
+ /*
+  * We maintain a per-CPU linked-list of VMCS loaded on that CPU. This is needed
+@@ -2768,6 +2767,9 @@ static bool __kvm_is_vmx_supported(void)
+ 		return false;
+ 	}
+ 
++	if (!per_cpu(root_vmcs, cpu))
++		return false;
++
+ 	return true;
+ }
+ 
+@@ -2827,7 +2829,7 @@ fault:
+ int vmx_enable_virtualization_cpu(void)
+ {
+ 	int cpu = raw_smp_processor_id();
+-	u64 phys_addr = __pa(per_cpu(vmxarea, cpu));
++	u64 phys_addr = __pa(per_cpu(root_vmcs, cpu));
+ 	int r;
+ 
+ 	if (cr4_read_shadow() & X86_CR4_VMXE)
+@@ -2948,47 +2950,6 @@ out_vmcs:
+ 	return -ENOMEM;
+ }
+ 
+-static void free_kvm_area(void)
+-{
+-	int cpu;
+-
+-	for_each_possible_cpu(cpu) {
+-		free_vmcs(per_cpu(vmxarea, cpu));
+-		per_cpu(vmxarea, cpu) = NULL;
+-	}
+-}
+-
+-static __init int alloc_kvm_area(void)
+-{
+-	int cpu;
+-
+-	for_each_possible_cpu(cpu) {
+-		struct vmcs *vmcs;
+-
+-		vmcs = alloc_vmcs_cpu(false, cpu, GFP_KERNEL);
+-		if (!vmcs) {
+-			free_kvm_area();
+-			return -ENOMEM;
+-		}
+-
+-		/*
+-		 * When eVMCS is enabled, alloc_vmcs_cpu() sets
+-		 * vmcs->revision_id to KVM_EVMCS_VERSION instead of
+-		 * revision_id reported by MSR_IA32_VMX_BASIC.
+-		 *
+-		 * However, even though not explicitly documented by
+-		 * TLFS, VMXArea passed as VMXON argument should
+-		 * still be marked with revision_id reported by
+-		 * physical CPU.
+-		 */
+-		if (kvm_is_using_evmcs())
+-			vmcs->hdr.revision_id = vmx_basic_vmcs_revision_id(vmcs_config.basic);
+-
+-		per_cpu(vmxarea, cpu) = vmcs;
+-	}
+-	return 0;
+-}
+-
+ static void fix_pmode_seg(struct kvm_vcpu *vcpu, int seg,
+ 		struct kvm_segment *save)
+ {
+@@ -8222,8 +8183,6 @@ void vmx_hardware_unsetup(void)
+ 
+ 	if (nested)
+ 		nested_vmx_hardware_unsetup();
+-
+-	free_kvm_area();
+ }
+ 
+ void vmx_vm_destroy(struct kvm *kvm)
+@@ -8522,10 +8481,6 @@ __init int vmx_hardware_setup(void)
+ 			return r;
+ 	}
+ 
+-	r = alloc_kvm_area();
+-	if (r)
+-		goto err_kvm_area;
+-
+ 	kvm_set_posted_intr_wakeup_handler(pi_wakeup_handler);
+ 
+ 	/*
+@@ -8552,11 +8507,6 @@ __init int vmx_hardware_setup(void)
+ 	kvm_caps.inapplicable_quirks &= ~KVM_X86_QUIRK_IGNORE_GUEST_PAT;
+ 
+ 	return 0;
+-
+-err_kvm_area:
+-	if (nested)
+-		nested_vmx_hardware_unsetup();
+-	return r;
+ }
+ 
+ static void vmx_cleanup_l1d_flush(void)
+--- a/arch/x86/virt/hw.c
++++ b/arch/x86/virt/hw.c
+@@ -1,7 +1,78 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++#include <linux/cpu.h>
++#include <linux/cpumask.h>
++#include <linux/errno.h>
+ #include <linux/kvm_types.h>
++#include <linux/list.h>
++#include <linux/percpu.h>
+ 
++#include <asm/perf_event.h>
++#include <asm/processor.h>
+ #include <asm/virt.h>
++#include <asm/vmx.h>
+ 
+ __visible bool virt_rebooting;
+ EXPORT_SYMBOL_FOR_KVM(virt_rebooting);
++
++#if IS_ENABLED(CONFIG_KVM_INTEL)
++DEFINE_PER_CPU(struct vmcs *, root_vmcs);
++EXPORT_PER_CPU_SYMBOL(root_vmcs);
++
++static __init void x86_vmx_exit(void)
++{
++	int cpu;
++
++	for_each_possible_cpu(cpu) {
++		free_page((unsigned long)per_cpu(root_vmcs, cpu));
++		per_cpu(root_vmcs, cpu) = NULL;
++	}
++}
++
++static __init int x86_vmx_init(void)
++{
++	u64 basic_msr;
++	u32 rev_id;
++	int cpu;
++
++	if (!cpu_feature_enabled(X86_FEATURE_VMX))
++		return -EOPNOTSUPP;
++
++	rdmsrq(MSR_IA32_VMX_BASIC, basic_msr);
++
++	/* IA-32 SDM Vol 3B: VMCS size is never greater than 4kB. */
++	if (WARN_ON_ONCE(vmx_basic_vmcs_size(basic_msr) > PAGE_SIZE))
++		return -EIO;
++
++	/*
++	 * Even if eVMCS is enabled (or will be enabled?), and even though not
++	 * explicitly documented by TLFS, the root VMCS  passed to VMXON should
++	 * still be marked with the revision_id reported by the physical CPU.
++	 */
++	rev_id = vmx_basic_vmcs_revision_id(basic_msr);
++
++	for_each_possible_cpu(cpu) {
++		int node = cpu_to_node(cpu);
++		struct page *page;
++		struct vmcs *vmcs;
++
++		page = __alloc_pages_node(node, GFP_KERNEL | __GFP_ZERO, 0);
++		if (!page) {
++			x86_vmx_exit();
++			return -ENOMEM;
++		}
++
++		vmcs = page_address(page);
++		vmcs->hdr.revision_id = rev_id;
++		per_cpu(root_vmcs, cpu) = vmcs;
++	}
++
++	return 0;
++}
++#else
++static __init int x86_vmx_init(void) { return -EOPNOTSUPP; }
++#endif
++
++void __init x86_virt_init(void)
++{
++	x86_vmx_init();
++}
