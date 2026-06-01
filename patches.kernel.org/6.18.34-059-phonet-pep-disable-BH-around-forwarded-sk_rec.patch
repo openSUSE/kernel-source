@@ -1,0 +1,111 @@
+From: Zijing Yin <yzjaurora@gmail.com>
+Date: Tue, 19 May 2026 10:26:33 -0700
+Subject: [PATCH] phonet/pep: disable BH around forwarded sk_receive_skb()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1258210
+Patch-mainline: 6.18.34
+Git-commit: dbc81608e3a653dea6cf403f20cae35468b8ab9c
+
+commit dbc81608e3a653dea6cf403f20cae35468b8ab9c upstream.
+
+The networking receive path is usually run from softirq context, but
+protocols that take the socket lock may have packets stored in the
+backlog and processed later from process context. In that case
+release_sock() -> __release_sock() drops the slock with spin_unlock_bh()
+and then calls sk->sk_backlog_rcv() with bottom halves enabled.
+
+Typical sk_backlog_rcv handlers process the socket whose backlog is
+being drained, so the BH state at entry is irrelevant for the slocks
+they touch. pep_do_rcv() is different: when the inbound skb targets an
+existing PEP pipe, it forwards the skb to a different *child* socket
+via sk_receive_skb(). That helper takes the child slock with
+bh_lock_sock_nested(), which is just spin_lock_nested() and assumes BH
+is already off. The same child slock therefore ends up acquired with
+BH on (process path) and with BH off (softirq path):
+
+  process context                   softirq context
+  ---------------                   ---------------
+  release_sock(listener)            __netif_receive_skb()
+   __release_sock()                  phonet_rcv()
+    spin_unlock_bh()                  __sk_receive_skb(listener)
+    [BH now ENABLED]                  [BH already disabled]
+    sk_backlog_rcv:                   sk_backlog_rcv:
+     pep_do_rcv()                      pep_do_rcv()
+      sk_receive_skb(child)             sk_receive_skb(child)
+       bh_lock_sock_nested(child)        bh_lock_sock_nested(child)
+       => SOFTIRQ-ON-W                   => IN-SOFTIRQ-W
+
+Lockdep flags this as inconsistent lock state, and it can become a real
+self-deadlock if a softirq on the same CPU tries to receive to the same
+child socket while its slock is held in the BH-enabled path:
+
+  WARNING: inconsistent lock state
+  inconsistent {SOFTIRQ-ON-W} -> {IN-SOFTIRQ-W} usage.
+   (slock-AF_PHONET/1){+.?.}-{3:3}, at: __sk_receive_skb+0x1cf/0x900
+    __sk_receive_skb              net/core/sock.c:563
+    sk_receive_skb                include/net/sock.h:2022 [inline]
+    pep_do_rcv                    net/phonet/pep.c:675
+    sk_backlog_rcv                include/net/sock.h:1190
+    __release_sock                net/core/sock.c:3216
+    release_sock                  net/core/sock.c:3815
+    pep_sock_accept               net/phonet/pep.c:879
+
+Wrap the forwarded sk_receive_skb() in local_bh_disable() /
+local_bh_enable() so the child slock is always acquired with BH off.
+local_bh_disable() nests safely on the softirq path.
+
+Discovered via in-house syzkaller fuzzing; the same root cause also
+on the linux-6.1.y syzbot dashboard as extid 44f0626dd6284f02663c.
+Reproduced under KASAN + LOCKDEP + PROVE_LOCKING, reproducer:
+https://pastebin.com/A3t8xzCR
+
+Fixes: 9641458d3ec4 ("Phonet: Pipe End Point for Phonet Pipes protocol")
+Link: https://syzkaller.appspot.com/bug?extid=44f0626dd6284f02663c
+Cc: stable@vger.kernel.org
+Signed-off-by: Zijing Yin <yzjaurora@gmail.com>
+Acked-by: Rémi Denis-Courmont <remi@remlab.net>
+Reported-by: syzbot+9f4a135646b66c509935@syzkaller.appspotmail.com
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Link: https://patch.msgid.link/20260519172635.86304-1-yzjaurora@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ net/phonet/pep.c | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/net/phonet/pep.c b/net/phonet/pep.c
+index 4db564d9d522..058a16c423ae 100644
+--- a/net/phonet/pep.c
++++ b/net/phonet/pep.c
+@@ -671,8 +671,23 @@ static int pep_do_rcv(struct sock *sk, struct sk_buff *skb)
+ 
+ 	/* Look for an existing pipe handle */
+ 	sknode = pep_find_pipe(&pn->hlist, &dst, pipe_handle);
+-	if (sknode)
+-		return sk_receive_skb(sknode, skb, 1);
++	if (sknode) {
++		int rc;
++
++		/* pep_do_rcv() runs from two contexts: from softirq via
++		 * phonet_rcv() -> __sk_receive_skb() with BH disabled,
++		 * and from process context via
++		 * release_sock() -> __release_sock(), which drops
++		 * the listener slock with spin_unlock_bh() before draining
++		 * the backlog.  The child pipe slock is taken below via
++		 * bh_lock_sock_nested(), which does not itself disable BH, so
++		 * disable BH here to keep both acquire contexts consistent.
++		 */
++		local_bh_disable();
++		rc = sk_receive_skb(sknode, skb, 1);
++		local_bh_enable();
++		return rc;
++	}
+ 
+ 	switch (hdr->message_id) {
+ 	case PNS_PEP_CONNECT_REQ:
+-- 
+2.53.0
+
