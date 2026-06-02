@@ -1,0 +1,177 @@
+From: David Howells <dhowells@redhat.com>
+Date: Tue, 12 May 2026 13:33:50 +0100
+Subject: [PATCH] netfs: Fix streaming write being overwritten
+References: bsc#1012628
+Patch-mainline: 7.0.11
+Git-commit: 7b4dcf1b9455a6e52ac7478b4057dbe10359576d
+
+[ Upstream commit 7b4dcf1b9455a6e52ac7478b4057dbe10359576d ]
+
+In order to avoid reading whilst writing, netfslib will allow "streaming
+writes" in which dirty data is stored directly into folios without reading
+them first.  Such folios are marked dirty but may not be marked uptodate.
+If a folio is entirely written by a streaming write, uptodate will be set,
+otherwise it will have a netfs_folio struct attached to ->private recording
+the dirty region.
+
+In the event that a partially written streaming write page is to be
+overwritten entirely by a single write(), netfs_perform_write() will try to
+copy over it, but doesn't discard the netfs_folio if it succeeds; further,
+it doesn't correctly handle a partial copy that overwrites some of the
+dirty data.
+
+Fix this by the following:
+
+ (1) If the folio is successfully overwritten, free the netfs_folio struct
+     before marking the page uptodate.
+
+ (2) If the copy to the folio partially fails, but short of the dirty data,
+     just ignore the copy.
+
+ (3) If the copy partially fails and overwrites some of the dirty data,
+     accept the copy, update the netfs_folio struct to record the new data.
+     If the folio is now filled, free the netfs_folio and set uptodate,
+     otherwise return a partial write.
+
+Found with:
+
+	fsx -q -N 1000000 -p 10000 -o 128000 -l 600000 \
+	  /xfstest.test/junk --replay-ops=junk.fsxops
+
+using the following as junk.fsxops:
+
+	truncate 0x0 0 0x927c0
+	write 0x63fb8 0x53c8 0
+	copy_range 0xb704 0x19b9 0x24429 0x79380
+	write 0x2402b 0x144a2 0x90660 *
+	write 0x204d5 0x140a0 0x927c0 *
+	copy_range 0x1f72c 0x137d0 0x7a906 0x927c0 *
+	read 0x00000 0x20000 0x9157c
+	read 0x20000 0x20000 0x9157c
+	read 0x40000 0x20000 0x9157c
+	read 0x60000 0x20000 0x9157c
+	read 0x7e1a0 0xcfb9 0x9157c
+
+on cifs with the default cache option.
+
+It shows folio 0x24 misbehaving if the FMODE_READ check is commented out in
+netfs_perform_write():
+
+		if (//(file->f_mode & FMODE_READ) ||
+		    netfs_is_cache_enabled(ctx)) {
+
+and no fscache.  This was initially found with the generic/522 xfstest.
+
+Fixes: 8f52de0077ba ("netfs: Reduce number of conditional branches in netfs_perform_write()")
+Signed-off-by: David Howells <dhowells@redhat.com>
+Link: https://patch.msgid.link/20260512123404.719402-14-dhowells@redhat.com
+cc: Paulo Alcantara <pc@manguebit.org>
+cc: Matthew Wilcox <willy@infradead.org>
+cc: netfs@lists.linux.dev
+cc: linux-fsdevel@vger.kernel.org
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/netfs/buffered_write.c    | 47 ++++++++++++++++++++++++++----------
+ include/trace/events/netfs.h |  3 +++
+ 2 files changed, 37 insertions(+), 13 deletions(-)
+
+diff --git a/fs/netfs/buffered_write.c b/fs/netfs/buffered_write.c
+index a695d5168b2f..0ff4c790ae26 100644
+--- a/fs/netfs/buffered_write.c
++++ b/fs/netfs/buffered_write.c
+@@ -247,18 +247,38 @@ ssize_t netfs_perform_write(struct kiocb *iocb, struct iov_iter *iter,
+ 		/* See if we can write a whole folio in one go. */
+ 		if (!maybe_trouble && offset == 0 && part >= flen) {
+ 			copied = copy_folio_from_iter_atomic(folio, offset, part, iter);
+-			if (unlikely(copied == 0))
++			if (likely(copied == part)) {
++				if (finfo) {
++					trace = netfs_whole_folio_modify_filled;
++					goto folio_now_filled;
++				}
++				__netfs_set_group(folio, netfs_group);
++				folio_mark_uptodate(folio);
++				trace = netfs_whole_folio_modify;
++				goto copied;
++			}
++			if (copied == 0)
+ 				goto copy_failed;
+-			if (unlikely(copied < part)) {
++			if (!finfo || copied <= finfo->dirty_offset) {
+ 				maybe_trouble = true;
+ 				iov_iter_revert(iter, copied);
+ 				copied = 0;
+ 				folio_unlock(folio);
+ 				goto retry;
+ 			}
+-			__netfs_set_group(folio, netfs_group);
+-			folio_mark_uptodate(folio);
+-			trace = netfs_whole_folio_modify;
++
++			/* We overwrote some existing dirty data, so we have to
++			 * accept the partial write.
++			 */
++			finfo->dirty_len += finfo->dirty_offset;
++			if (finfo->dirty_len == flen) {
++				trace = netfs_whole_folio_modify_filled_efault;
++				goto folio_now_filled;
++			}
++			if (copied > finfo->dirty_len)
++				finfo->dirty_len = copied;
++			finfo->dirty_offset = 0;
++			trace = netfs_whole_folio_modify_efault;
+ 			goto copied;
+ 		}
+ 
+@@ -328,16 +348,10 @@ ssize_t netfs_perform_write(struct kiocb *iocb, struct iov_iter *iter,
+ 				goto copy_failed;
+ 			finfo->dirty_len += copied;
+ 			if (finfo->dirty_offset == 0 && finfo->dirty_len == flen) {
+-				if (finfo->netfs_group)
+-					folio_change_private(folio, finfo->netfs_group);
+-				else
+-					folio_detach_private(folio);
+-				folio_mark_uptodate(folio);
+-				kfree(finfo);
+ 				trace = netfs_streaming_cont_filled_page;
+-			} else {
+-				trace = netfs_streaming_write_cont;
++				goto folio_now_filled;
+ 			}
++			trace = netfs_streaming_write_cont;
+ 			goto copied;
+ 		}
+ 
+@@ -351,6 +365,13 @@ ssize_t netfs_perform_write(struct kiocb *iocb, struct iov_iter *iter,
+ 			goto out;
+ 		continue;
+ 
++	folio_now_filled:
++		if (finfo->netfs_group)
++			folio_change_private(folio, finfo->netfs_group);
++		else
++			folio_detach_private(folio);
++		folio_mark_uptodate(folio);
++		kfree(finfo);
+ 	copied:
+ 		trace_netfs_folio(folio, trace);
+ 		flush_dcache_folio(folio);
+diff --git a/include/trace/events/netfs.h b/include/trace/events/netfs.h
+index 88d814ba1e69..db045135406c 100644
+--- a/include/trace/events/netfs.h
++++ b/include/trace/events/netfs.h
+@@ -177,6 +177,9 @@
+ 	EM(netfs_folio_is_uptodate,		"mod-uptodate")	\
+ 	EM(netfs_just_prefetch,			"mod-prefetch")	\
+ 	EM(netfs_whole_folio_modify,		"mod-whole-f")	\
++	EM(netfs_whole_folio_modify_efault,	"mod-whole-f!")	\
++	EM(netfs_whole_folio_modify_filled,	"mod-whole-f+")	\
++	EM(netfs_whole_folio_modify_filled_efault, "mod-whole-f+!") \
+ 	EM(netfs_modify_and_clear,		"mod-n-clear")	\
+ 	EM(netfs_streaming_write,		"mod-streamw")	\
+ 	EM(netfs_streaming_write_cont,		"mod-streamw+")	\
+-- 
+2.54.0
+
