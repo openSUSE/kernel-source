@@ -1,0 +1,275 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Fri, 13 Feb 2026 17:26:55 -0800
+Subject: x86/virt: Add refcounting of VMX/SVM usage to support multiple
+ in-kernel users
+Git-commit: 8528a7f9c91d917ad2b3b6a71f1cb7e00b1fb1bf
+Patch-mainline: v7.1-rc1
+References: git-fixes
+
+Implement a per-CPU refcounting scheme so that "users" of hardware
+virtualization, e.g. KVM and the future TDX code, can co-exist without
+pulling the rug out from under each other.  E.g. if KVM were to disable
+VMX on module unload or when the last KVM VM was destroyed, SEAMCALLs from
+the TDX subsystem would #UD and panic the kernel.
+
+Disable preemption in the get/put APIs to ensure virtualization is fully
+enabled/disabled before returning to the caller.  E.g. if the task were
+preempted after a 0=>1 transition, the new task would see a 1=>2 and thus
+return without enabling virtualization.  Explicitly disable preemption
+instead of requiring the caller to do so, because the need to disable
+preemption is an artifact of the implementation.  E.g. from KVM's
+perspective there is no _need_ to disable preemption as KVM guarantees the
+pCPU on which it is running is stable (but preemption is enabled).
+
+Opportunistically abstract away SVM vs. VMX in the public APIs by using
+X86_FEATURE_{SVM,VMX} to communicate what technology the caller wants to
+enable and use.
+
+Cc: Xu Yilun <yilun.xu@linux.intel.com>
+Reviewed-by: Chao Gao <chao.gao@intel.com>
+Tested-by: Chao Gao <chao.gao@intel.com>
+Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Tested-by: Sagi Shahar <sagis@google.com>
+Link: https://patch.msgid.link/20260214012702.2368778-10-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/include/asm/virt.h | 11 ++------
+ arch/x86/kvm/svm/svm.c      |  4 +--
+ arch/x86/kvm/vmx/vmx.c      |  4 +--
+ arch/x86/virt/hw.c          | 64 +++++++++++++++++++++++++++++++++------------
+ 4 files changed, 53 insertions(+), 30 deletions(-)
+
+diff --git a/arch/x86/include/asm/virt.h b/arch/x86/include/asm/virt.h
+index 2c35534437e0..1558a0673d06 100644
+--- a/arch/x86/include/asm/virt.h
++++ b/arch/x86/include/asm/virt.h
+@@ -11,15 +11,8 @@ extern bool virt_rebooting;
+ 
+ void __init x86_virt_init(void);
+ 
+-#if IS_ENABLED(CONFIG_KVM_INTEL)
+-int x86_vmx_enable_virtualization_cpu(void);
+-int x86_vmx_disable_virtualization_cpu(void);
+-#endif
+-
+-#if IS_ENABLED(CONFIG_KVM_AMD)
+-int x86_svm_enable_virtualization_cpu(void);
+-int x86_svm_disable_virtualization_cpu(void);
+-#endif
++int x86_virt_get_ref(int feat);
++void x86_virt_put_ref(int feat);
+ 
+ int x86_virt_emergency_disable_virtualization_cpu(void);
+ 
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index fc08450cb4b7..e4be0caa09b3 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -489,7 +489,7 @@ static void svm_disable_virtualization_cpu(void)
+ 	if (tsc_scaling)
+ 		__svm_write_tsc_multiplier(SVM_TSC_RATIO_DEFAULT);
+ 
+-	x86_svm_disable_virtualization_cpu();
++	x86_virt_put_ref(X86_FEATURE_SVM);
+ 	wrmsrq(MSR_VM_HSAVE_PA, 0);
+ 
+ 	amd_pmu_disable_virt();
+@@ -502,7 +502,7 @@ static int svm_enable_virtualization_cpu(void)
+ 	int me = raw_smp_processor_id();
+ 	int r;
+ 
+-	r = x86_svm_enable_virtualization_cpu();
++	r = x86_virt_get_ref(X86_FEATURE_SVM);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index c02fd7e91809..6200cf4dbd26 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -2963,7 +2963,7 @@ int vmx_enable_virtualization_cpu(void)
+ 	if (kvm_is_using_evmcs() && !hv_get_vp_assist_page(cpu))
+ 		return -EFAULT;
+ 
+-	return x86_vmx_enable_virtualization_cpu();
++	return x86_virt_get_ref(X86_FEATURE_VMX);
+ }
+ 
+ static void vmclear_local_loaded_vmcss(void)
+@@ -2980,7 +2980,7 @@ void vmx_disable_virtualization_cpu(void)
+ {
+ 	vmclear_local_loaded_vmcss();
+ 
+-	x86_vmx_disable_virtualization_cpu();
++	x86_virt_put_ref(X86_FEATURE_VMX);
+ 
+ 	hv_reset_evmcs();
+ }
+diff --git a/arch/x86/virt/hw.c b/arch/x86/virt/hw.c
+index 73c8309ba3fb..c898f16fe612 100644
+--- a/arch/x86/virt/hw.c
++++ b/arch/x86/virt/hw.c
+@@ -13,6 +13,8 @@
+ 
+ struct x86_virt_ops {
+ 	int feature;
++	int (*enable_virtualization_cpu)(void);
++	int (*disable_virtualization_cpu)(void);
+ 	void (*emergency_disable_virtualization_cpu)(void);
+ };
+ static struct x86_virt_ops virt_ops __ro_after_init;
+@@ -20,6 +22,8 @@ static struct x86_virt_ops virt_ops __ro_after_init;
+ __visible bool virt_rebooting;
+ EXPORT_SYMBOL_FOR_KVM(virt_rebooting);
+ 
++static DEFINE_PER_CPU(int, virtualization_nr_users);
++
+ static cpu_emergency_virt_cb __rcu *kvm_emergency_callback;
+ 
+ void x86_virt_register_emergency_callback(cpu_emergency_virt_cb *callback)
+@@ -74,13 +78,10 @@ static int x86_virt_cpu_vmxon(void)
+ 	return -EFAULT;
+ }
+ 
+-int x86_vmx_enable_virtualization_cpu(void)
++static int x86_vmx_enable_virtualization_cpu(void)
+ {
+ 	int r;
+ 
+-	if (virt_ops.feature != X86_FEATURE_VMX)
+-		return -EOPNOTSUPP;
+-
+ 	if (cr4_read_shadow() & X86_CR4_VMXE)
+ 		return -EBUSY;
+ 
+@@ -94,7 +95,6 @@ int x86_vmx_enable_virtualization_cpu(void)
+ 
+ 	return 0;
+ }
+-EXPORT_SYMBOL_FOR_KVM(x86_vmx_enable_virtualization_cpu);
+ 
+ /*
+  * Disable VMX and clear CR4.VMXE (even if VMXOFF faults)
+@@ -105,7 +105,7 @@ EXPORT_SYMBOL_FOR_KVM(x86_vmx_enable_virtualization_cpu);
+  * faults are guaranteed to be due to the !post-VMXON check unless the CPU is
+  * magically in RM, VM86, compat mode, or at CPL>0.
+  */
+-int x86_vmx_disable_virtualization_cpu(void)
++static int x86_vmx_disable_virtualization_cpu(void)
+ {
+ 	int r = -EIO;
+ 
+@@ -119,7 +119,6 @@ int x86_vmx_disable_virtualization_cpu(void)
+ 	intel_pt_handle_vmx(0);
+ 	return r;
+ }
+-EXPORT_SYMBOL_FOR_KVM(x86_vmx_disable_virtualization_cpu);
+ 
+ static void x86_vmx_emergency_disable_virtualization_cpu(void)
+ {
+@@ -154,6 +153,8 @@ static __init int __x86_vmx_init(void)
+ {
+ 	const struct x86_virt_ops vmx_ops = {
+ 		.feature = X86_FEATURE_VMX,
++		.enable_virtualization_cpu = x86_vmx_enable_virtualization_cpu,
++		.disable_virtualization_cpu = x86_vmx_disable_virtualization_cpu,
+ 		.emergency_disable_virtualization_cpu = x86_vmx_emergency_disable_virtualization_cpu,
+ 	};
+ 
+@@ -212,13 +213,10 @@ static __init void x86_vmx_exit(void) { }
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_KVM_AMD)
+-int x86_svm_enable_virtualization_cpu(void)
++static int x86_svm_enable_virtualization_cpu(void)
+ {
+ 	u64 efer;
+ 
+-	if (virt_ops.feature != X86_FEATURE_SVM)
+-		return -EOPNOTSUPP;
+-
+ 	rdmsrq(MSR_EFER, efer);
+ 	if (efer & EFER_SVME)
+ 		return -EBUSY;
+@@ -226,9 +224,8 @@ int x86_svm_enable_virtualization_cpu(void)
+ 	wrmsrq(MSR_EFER, efer | EFER_SVME);
+ 	return 0;
+ }
+-EXPORT_SYMBOL_FOR_KVM(x86_svm_enable_virtualization_cpu);
+ 
+-int x86_svm_disable_virtualization_cpu(void)
++static int x86_svm_disable_virtualization_cpu(void)
+ {
+ 	int r = -EIO;
+ 	u64 efer;
+@@ -247,7 +244,6 @@ int x86_svm_disable_virtualization_cpu(void)
+ 	wrmsrq(MSR_EFER, efer & ~EFER_SVME);
+ 	return r;
+ }
+-EXPORT_SYMBOL_FOR_KVM(x86_svm_disable_virtualization_cpu);
+ 
+ static void x86_svm_emergency_disable_virtualization_cpu(void)
+ {
+@@ -268,6 +264,8 @@ static __init int x86_svm_init(void)
+ {
+ 	const struct x86_virt_ops svm_ops = {
+ 		.feature = X86_FEATURE_SVM,
++		.enable_virtualization_cpu = x86_svm_enable_virtualization_cpu,
++		.disable_virtualization_cpu = x86_svm_disable_virtualization_cpu,
+ 		.emergency_disable_virtualization_cpu = x86_svm_emergency_disable_virtualization_cpu,
+ 	};
+ 
+@@ -281,6 +279,41 @@ static __init int x86_svm_init(void)
+ static __init int x86_svm_init(void) { return -EOPNOTSUPP; }
+ #endif
+ 
++int x86_virt_get_ref(int feat)
++{
++	int r;
++
++	/* Ensure the !feature check can't get false positives. */
++	BUILD_BUG_ON(!X86_FEATURE_SVM || !X86_FEATURE_VMX);
++
++	if (!virt_ops.feature || virt_ops.feature != feat)
++		return -EOPNOTSUPP;
++
++	guard(preempt)();
++
++	if (this_cpu_inc_return(virtualization_nr_users) > 1)
++		return 0;
++
++	r = virt_ops.enable_virtualization_cpu();
++	if (r)
++		WARN_ON_ONCE(this_cpu_dec_return(virtualization_nr_users));
++
++	return r;
++}
++EXPORT_SYMBOL_FOR_KVM(x86_virt_get_ref);
++
++void x86_virt_put_ref(int feat)
++{
++	guard(preempt)();
++
++	if (WARN_ON_ONCE(!this_cpu_read(virtualization_nr_users)) ||
++	    this_cpu_dec_return(virtualization_nr_users))
++		return;
++
++	BUG_ON(virt_ops.disable_virtualization_cpu() && !virt_rebooting);
++}
++EXPORT_SYMBOL_FOR_KVM(x86_virt_put_ref);
++
+ /*
+  * Disable virtualization, i.e. VMX or SVM, to ensure INIT is recognized during
+  * reboot.  VMX blocks INIT if the CPU is post-VMXON, and SVM blocks INIT if
+@@ -288,9 +321,6 @@ static __init int x86_svm_init(void) { return -EOPNOTSUPP; }
+  */
+ int x86_virt_emergency_disable_virtualization_cpu(void)
+ {
+-	/* Ensure the !feature check can't get false positives. */
+-	BUILD_BUG_ON(!X86_FEATURE_SVM || !X86_FEATURE_VMX);
+-
+ 	if (!virt_ops.feature)
+ 		return -EOPNOTSUPP;
+ 
+

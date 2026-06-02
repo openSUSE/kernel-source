@@ -1,0 +1,509 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Fri, 13 Feb 2026 17:26:54 -0800
+Subject: KVM: x86: Move bulk of emergency virtualizaton logic to virt
+ subsystem
+Git-commit: 428afac5a8ea9c55bb8408e02dc92b8f85bf5f30
+Patch-mainline: v7.1-rc1
+References: git-fixes
+
+Move the majority of the code related to disabling hardware virtualization
+in emergency from KVM into the virt subsystem so that virt can take full
+ownership of the state of SVM/VMX.  This will allow refcounting usage of
+SVM/VMX so that KVM and the TDX subsystem can enable VMX without stomping
+on each other.
+
+To route the emergency callback to the "right" vendor code, add to avoid
+mixing vendor and generic code, implement a x86_virt_ops structure to
+track the emergency callback, along with the SVM vs. VMX (vs. "none")
+feature that is active.
+
+To avoid having to choose between SVM and VMX, simply refuse to enable
+either if both are somehow supported.  No known CPU supports both SVM and
+VMX, and it's comically unlikely such a CPU will ever exist.
+
+Leave KVM's clearing of loaded VMCSes and MSR_VM_HSAVE_PA in KVM, via a
+callback explicitly scoped to KVM.  Loading VMCSes and saving/restoring
+host state are firmly tied to running VMs, and thus are (a) KVM's
+responsibility and (b) operations that are still exclusively reserved for
+KVM (as far as in-tree code is concerned).  I.e. the contract being
+established is that non-KVM subsystems can utilize virtualization, but for
+all intents and purposes cannot act as full-blown hypervisors.
+
+Reviewed-by: Chao Gao <chao.gao@intel.com>
+Tested-by: Chao Gao <chao.gao@intel.com>
+Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Tested-by: Sagi Shahar <sagis@google.com>
+Link: https://patch.msgid.link/20260214012702.2368778-9-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |    3 
+ arch/x86/include/asm/reboot.h   |   11 ---
+ arch/x86/include/asm/virt.h     |    9 ++
+ arch/x86/kernel/crash.c         |    3 
+ arch/x86/kernel/reboot.c        |   63 ++------------------
+ arch/x86/kernel/smp.c           |    5 -
+ arch/x86/kvm/vmx/vmx.c          |   11 ---
+ arch/x86/kvm/x86.c              |    4 -
+ arch/x86/virt/hw.c              |  123 +++++++++++++++++++++++++++++++++++++---
+ 9 files changed, 138 insertions(+), 94 deletions(-)
+
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -38,7 +38,8 @@
+ #include <asm/asm.h>
+ #include <asm/kvm_page_track.h>
+ #include <asm/kvm_vcpu_regs.h>
+-#include <asm/reboot.h>
++#include <asm/virt.h>
++
+ #include <hyperv/hvhdk.h>
+ 
+ #define __KVM_HAVE_ARCH_VCPU_DEBUGFS
+--- a/arch/x86/include/asm/reboot.h
++++ b/arch/x86/include/asm/reboot.h
+@@ -25,17 +25,6 @@ void __noreturn machine_real_restart(uns
+ #define MRR_BIOS	0
+ #define MRR_APM		1
+ 
+-typedef void (cpu_emergency_virt_cb)(void);
+-#if IS_ENABLED(CONFIG_KVM_X86)
+-void cpu_emergency_register_virt_callback(cpu_emergency_virt_cb *callback);
+-void cpu_emergency_unregister_virt_callback(cpu_emergency_virt_cb *callback);
+-void cpu_emergency_disable_virtualization(void);
+-#else
+-static inline void cpu_emergency_register_virt_callback(cpu_emergency_virt_cb *callback) {}
+-static inline void cpu_emergency_unregister_virt_callback(cpu_emergency_virt_cb *callback) {}
+-static inline void cpu_emergency_disable_virtualization(void) {}
+-#endif /* CONFIG_KVM_X86 */
+-
+ typedef void (*nmi_shootdown_cb)(int, struct pt_regs*);
+ void nmi_shootdown_cpus(nmi_shootdown_cb callback);
+ void run_crash_ipi_callback(struct pt_regs *regs);
+--- a/arch/x86/include/asm/virt.h
++++ b/arch/x86/include/asm/virt.h
+@@ -4,6 +4,8 @@
+ 
+ #include <asm/reboot.h>
+ 
++typedef void (cpu_emergency_virt_cb)(void);
++
+ #if IS_ENABLED(CONFIG_KVM_X86)
+ extern bool virt_rebooting;
+ 
+@@ -12,17 +14,20 @@ void __init x86_virt_init(void);
+ #if IS_ENABLED(CONFIG_KVM_INTEL)
+ int x86_vmx_enable_virtualization_cpu(void);
+ int x86_vmx_disable_virtualization_cpu(void);
+-void x86_vmx_emergency_disable_virtualization_cpu(void);
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_KVM_AMD)
+ int x86_svm_enable_virtualization_cpu(void);
+ int x86_svm_disable_virtualization_cpu(void);
+-void x86_svm_emergency_disable_virtualization_cpu(void);
+ #endif
+ 
++int x86_virt_emergency_disable_virtualization_cpu(void);
++
++void x86_virt_register_emergency_callback(cpu_emergency_virt_cb *callback);
++void x86_virt_unregister_emergency_callback(cpu_emergency_virt_cb *callback);
+ #else
+ static __always_inline void x86_virt_init(void) {}
++static inline int x86_virt_emergency_disable_virtualization_cpu(void) { return -ENOENT; }
+ #endif
+ 
+ #endif /* _ASM_X86_VIRT_H */
+--- a/arch/x86/kernel/crash.c
++++ b/arch/x86/kernel/crash.c
+@@ -42,6 +42,7 @@
+ #include <asm/crash.h>
+ #include <asm/cmdline.h>
+ #include <asm/sev.h>
++#include <asm/virt.h>
+ 
+ /* Used while preparing memory map entries for second kernel */
+ struct crash_memmap_data {
+@@ -111,7 +112,7 @@ void native_machine_crash_shutdown(struc
+ 
+ 	crash_smp_send_stop();
+ 
+-	cpu_emergency_disable_virtualization();
++	x86_virt_emergency_disable_virtualization_cpu();
+ 
+ 	/*
+ 	 * Disable Intel PT to stop its logging
+--- a/arch/x86/kernel/reboot.c
++++ b/arch/x86/kernel/reboot.c
+@@ -27,6 +27,7 @@
+ #include <asm/cpu.h>
+ #include <asm/nmi.h>
+ #include <asm/smp.h>
++#include <asm/virt.h>
+ 
+ #include <linux/ctype.h>
+ #include <linux/mc146818rtc.h>
+@@ -532,51 +533,6 @@ static inline void kb_wait(void)
+ static inline void nmi_shootdown_cpus_on_restart(void);
+ 
+ #if IS_ENABLED(CONFIG_KVM_X86)
+-/* RCU-protected callback to disable virtualization prior to reboot. */
+-static cpu_emergency_virt_cb __rcu *cpu_emergency_virt_callback;
+-
+-void cpu_emergency_register_virt_callback(cpu_emergency_virt_cb *callback)
+-{
+-	if (WARN_ON_ONCE(rcu_access_pointer(cpu_emergency_virt_callback)))
+-		return;
+-
+-	rcu_assign_pointer(cpu_emergency_virt_callback, callback);
+-}
+-EXPORT_SYMBOL_FOR_KVM(cpu_emergency_register_virt_callback);
+-
+-void cpu_emergency_unregister_virt_callback(cpu_emergency_virt_cb *callback)
+-{
+-	if (WARN_ON_ONCE(rcu_access_pointer(cpu_emergency_virt_callback) != callback))
+-		return;
+-
+-	rcu_assign_pointer(cpu_emergency_virt_callback, NULL);
+-	synchronize_rcu();
+-}
+-EXPORT_SYMBOL_FOR_KVM(cpu_emergency_unregister_virt_callback);
+-
+-/*
+- * Disable virtualization, i.e. VMX or SVM, to ensure INIT is recognized during
+- * reboot.  VMX blocks INIT if the CPU is post-VMXON, and SVM blocks INIT if
+- * GIF=0, i.e. if the crash occurred between CLGI and STGI.
+- */
+-void cpu_emergency_disable_virtualization(void)
+-{
+-	cpu_emergency_virt_cb *callback;
+-
+-	/*
+-	 * IRQs must be disabled as KVM enables virtualization in hardware via
+-	 * function call IPIs, i.e. IRQs need to be disabled to guarantee
+-	 * virtualization stays disabled.
+-	 */
+-	lockdep_assert_irqs_disabled();
+-
+-	rcu_read_lock();
+-	callback = rcu_dereference(cpu_emergency_virt_callback);
+-	if (callback)
+-		callback();
+-	rcu_read_unlock();
+-}
+-
+ static void emergency_reboot_disable_virtualization(void)
+ {
+ 	local_irq_disable();
+@@ -588,16 +544,11 @@ static void emergency_reboot_disable_vir
+ 	 * We can't take any locks and we may be on an inconsistent state, so
+ 	 * use NMIs as IPIs to tell the other CPUs to disable VMX/SVM and halt.
+ 	 *
+-	 * Do the NMI shootdown even if virtualization is off on _this_ CPU, as
+-	 * other CPUs may have virtualization enabled.
++	 * Safely force _this_ CPU out of VMX/SVM operation, and if necessary,
++	 * blast NMIs to force other CPUs out of VMX/SVM as well.k
+ 	 */
+-	if (rcu_access_pointer(cpu_emergency_virt_callback)) {
+-		/* Safely force _this_ CPU out of VMX/SVM operation. */
+-		cpu_emergency_disable_virtualization();
+-
+-		/* Disable VMX/SVM and halt on other CPUs. */
++	if (!x86_virt_emergency_disable_virtualization_cpu())
+ 		nmi_shootdown_cpus_on_restart();
+-	}
+ }
+ #else
+ static void emergency_reboot_disable_virtualization(void) { }
+@@ -875,10 +826,10 @@ static int crash_nmi_callback(unsigned i
+ 		shootdown_callback(cpu, regs);
+ 
+ 	/*
+-	 * Prepare the CPU for reboot _after_ invoking the callback so that the
+-	 * callback can safely use virtualization instructions, e.g. VMCLEAR.
++	 * Disable virtualization, as both VMX and SVM can block INIT and thus
++	 * prevent AP bringup, e.g. in a kdump kernel or in firmware.
+ 	 */
+-	cpu_emergency_disable_virtualization();
++	x86_virt_emergency_disable_virtualization_cpu();
+ 
+ 	atomic_dec(&waiting_for_crash_ipi);
+ 
+--- a/arch/x86/kernel/smp.c
++++ b/arch/x86/kernel/smp.c
+@@ -35,6 +35,7 @@
+ #include <asm/trace/irq_vectors.h>
+ #include <asm/kexec.h>
+ #include <asm/reboot.h>
++#include <asm/virt.h>
+ 
+ /*
+  *	Some notes on x86 processor bugs affecting SMP operation:
+@@ -124,7 +125,7 @@ static int smp_stop_nmi_callback(unsigne
+ 	if (raw_smp_processor_id() == atomic_read(&stopping_cpu))
+ 		return NMI_HANDLED;
+ 
+-	cpu_emergency_disable_virtualization();
++	x86_virt_emergency_disable_virtualization_cpu();
+ 	stop_this_cpu(NULL);
+ 
+ 	return NMI_HANDLED;
+@@ -136,7 +137,7 @@ static int smp_stop_nmi_callback(unsigne
+ DEFINE_IDTENTRY_SYSVEC(sysvec_reboot)
+ {
+ 	apic_eoi();
+-	cpu_emergency_disable_virtualization();
++	x86_virt_emergency_disable_virtualization_cpu();
+ 	stop_this_cpu(NULL);
+ }
+ 
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -679,23 +679,12 @@ void vmx_emergency_disable_virtualizatio
+ 	int cpu = raw_smp_processor_id();
+ 	struct loaded_vmcs *v;
+ 
+-	/*
+-	 * Note, CR4.VMXE can be _cleared_ in NMI context, but it can only be
+-	 * set in task context.  If this races with _another_ emergency call
+-	 * from NMI context, VMCLEAR may #UD, but KVM will eat those faults due
+-	 * to virt_rebooting being set by the interrupting NMI callback.
+-	 */
+-	if (!(__read_cr4() & X86_CR4_VMXE))
+-		return;
+-
+ 	list_for_each_entry(v, &per_cpu(loaded_vmcss_on_cpu, cpu),
+ 			    loaded_vmcss_on_cpu_link) {
+ 		vmcs_clear(v->vmcs);
+ 		if (v->shadow_vmcs)
+ 			vmcs_clear(v->shadow_vmcs);
+ 	}
+-
+-	x86_vmx_emergency_disable_virtualization_cpu();
+ }
+ 
+ static void __loaded_vmcs_clear(void *arg)
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -13010,12 +13010,12 @@ EXPORT_SYMBOL_GPL(kvm_vcpu_deliver_sipi_
+ 
+ void kvm_arch_enable_virtualization(void)
+ {
+-	cpu_emergency_register_virt_callback(kvm_x86_ops.emergency_disable_virtualization_cpu);
++	x86_virt_register_emergency_callback(kvm_x86_ops.emergency_disable_virtualization_cpu);
+ }
+ 
+ void kvm_arch_disable_virtualization(void)
+ {
+-	cpu_emergency_unregister_virt_callback(kvm_x86_ops.emergency_disable_virtualization_cpu);
++	x86_virt_unregister_emergency_callback(kvm_x86_ops.emergency_disable_virtualization_cpu);
+ }
+ 
+ int kvm_arch_enable_virtualization_cpu(void)
+--- a/arch/x86/virt/hw.c
++++ b/arch/x86/virt/hw.c
+@@ -11,9 +11,45 @@
+ #include <asm/virt.h>
+ #include <asm/vmx.h>
+ 
++struct x86_virt_ops {
++	int feature;
++	void (*emergency_disable_virtualization_cpu)(void);
++};
++static struct x86_virt_ops virt_ops __ro_after_init;
++
+ __visible bool virt_rebooting;
+ EXPORT_SYMBOL_FOR_KVM(virt_rebooting);
+ 
++static cpu_emergency_virt_cb __rcu *kvm_emergency_callback;
++
++void x86_virt_register_emergency_callback(cpu_emergency_virt_cb *callback)
++{
++	if (WARN_ON_ONCE(rcu_access_pointer(kvm_emergency_callback)))
++		return;
++
++	rcu_assign_pointer(kvm_emergency_callback, callback);
++}
++EXPORT_SYMBOL_FOR_KVM(x86_virt_register_emergency_callback);
++
++void x86_virt_unregister_emergency_callback(cpu_emergency_virt_cb *callback)
++{
++	if (WARN_ON_ONCE(rcu_access_pointer(kvm_emergency_callback) != callback))
++		return;
++
++	rcu_assign_pointer(kvm_emergency_callback, NULL);
++	synchronize_rcu();
++}
++EXPORT_SYMBOL_FOR_KVM(x86_virt_unregister_emergency_callback);
++
++static void x86_virt_invoke_kvm_emergency_callback(void)
++{
++	cpu_emergency_virt_cb *kvm_callback;
++
++	kvm_callback = rcu_dereference(kvm_emergency_callback);
++	if (kvm_callback)
++		kvm_callback();
++}
++
+ #if IS_ENABLED(CONFIG_KVM_INTEL)
+ static DEFINE_PER_CPU(struct vmcs *, root_vmcs);
+ 
+@@ -42,6 +78,9 @@ int x86_vmx_enable_virtualization_cpu(vo
+ {
+ 	int r;
+ 
++	if (virt_ops.feature != X86_FEATURE_VMX)
++		return -EOPNOTSUPP;
++
+ 	if (cr4_read_shadow() & X86_CR4_VMXE)
+ 		return -EBUSY;
+ 
+@@ -82,22 +121,24 @@ fault:
+ }
+ EXPORT_SYMBOL_FOR_KVM(x86_vmx_disable_virtualization_cpu);
+ 
+-void x86_vmx_emergency_disable_virtualization_cpu(void)
++static void x86_vmx_emergency_disable_virtualization_cpu(void)
+ {
+ 	virt_rebooting = true;
+ 
+ 	/*
+ 	 * Note, CR4.VMXE can be _cleared_ in NMI context, but it can only be
+ 	 * set in task context.  If this races with _another_ emergency call
+-	 * from NMI context, VMXOFF may #UD, but kernel will eat those faults
+-	 * due to virt_rebooting being set by the interrupting NMI callback.
++	 * from NMI context, VMCLEAR (in KVM) and VMXOFF may #UD, but KVM and
++	 * the kernel will eat those faults due to virt_rebooting being set by
++	 * the interrupting NMI callback.
+ 	 */
+ 	if (!(__read_cr4() & X86_CR4_VMXE))
+ 		return;
+ 
++	x86_virt_invoke_kvm_emergency_callback();
++
+ 	x86_vmx_disable_virtualization_cpu();
+ }
+-EXPORT_SYMBOL_FOR_KVM(x86_vmx_emergency_disable_virtualization_cpu);
+ 
+ static __init void x86_vmx_exit(void)
+ {
+@@ -111,6 +152,11 @@ static __init void x86_vmx_exit(void)
+ 
+ static __init int __x86_vmx_init(void)
+ {
++	const struct x86_virt_ops vmx_ops = {
++		.feature = X86_FEATURE_VMX,
++		.emergency_disable_virtualization_cpu = x86_vmx_emergency_disable_virtualization_cpu,
++	};
++
+ 	u64 basic_msr;
+ 	u32 rev_id;
+ 	int cpu;
+@@ -147,6 +193,7 @@ static __init int __x86_vmx_init(void)
+ 		per_cpu(root_vmcs, cpu) = vmcs;
+ 	}
+ 
++	memcpy(&virt_ops, &vmx_ops, sizeof(virt_ops));
+ 	return 0;
+ }
+ 
+@@ -161,6 +208,7 @@ static __init int x86_vmx_init(void)
+ }
+ #else
+ static __init int x86_vmx_init(void) { return -EOPNOTSUPP; }
++static __init void x86_vmx_exit(void) { }
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_KVM_AMD)
+@@ -168,7 +216,7 @@ int x86_svm_enable_virtualization_cpu(vo
+ {
+ 	u64 efer;
+ 
+-	if (!cpu_feature_enabled(X86_FEATURE_SVM))
++	if (virt_ops.feature != X86_FEATURE_SVM)
+ 		return -EOPNOTSUPP;
+ 
+ 	rdmsrq(MSR_EFER, efer);
+@@ -201,7 +249,7 @@ fault:
+ }
+ EXPORT_SYMBOL_FOR_KVM(x86_svm_disable_virtualization_cpu);
+ 
+-void x86_svm_emergency_disable_virtualization_cpu(void)
++static void x86_svm_emergency_disable_virtualization_cpu(void)
+ {
+ 	u64 efer;
+ 
+@@ -211,12 +259,71 @@ void x86_svm_emergency_disable_virtualiz
+ 	if (!(efer & EFER_SVME))
+ 		return;
+ 
++	x86_virt_invoke_kvm_emergency_callback();
++
+ 	x86_svm_disable_virtualization_cpu();
+ }
+-EXPORT_SYMBOL_FOR_KVM(x86_svm_emergency_disable_virtualization_cpu);
++
++static __init int x86_svm_init(void)
++{
++	const struct x86_virt_ops svm_ops = {
++		.feature = X86_FEATURE_SVM,
++		.emergency_disable_virtualization_cpu = x86_svm_emergency_disable_virtualization_cpu,
++	};
++
++	if (!cpu_feature_enabled(X86_FEATURE_SVM))
++		return -EOPNOTSUPP;
++
++	memcpy(&virt_ops, &svm_ops, sizeof(virt_ops));
++	return 0;
++}
++#else
++static __init int x86_svm_init(void) { return -EOPNOTSUPP; }
+ #endif
+ 
++/*
++ * Disable virtualization, i.e. VMX or SVM, to ensure INIT is recognized during
++ * reboot.  VMX blocks INIT if the CPU is post-VMXON, and SVM blocks INIT if
++ * GIF=0, i.e. if the crash occurred between CLGI and STGI.
++ */
++int x86_virt_emergency_disable_virtualization_cpu(void)
++{
++	/* Ensure the !feature check can't get false positives. */
++	BUILD_BUG_ON(!X86_FEATURE_SVM || !X86_FEATURE_VMX);
++
++	if (!virt_ops.feature)
++		return -EOPNOTSUPP;
++
++	/*
++	 * IRQs must be disabled as virtualization is enabled in hardware via
++	 * function call IPIs, i.e. IRQs need to be disabled to guarantee
++	 * virtualization stays disabled.
++	 */
++	lockdep_assert_irqs_disabled();
++
++	/*
++	 * Do the NMI shootdown even if virtualization is off on _this_ CPU, as
++	 * other CPUs may have virtualization enabled.
++	 *
++	 * TODO: Track whether or not virtualization might be enabled on other
++	 *	 CPUs?  May not be worth avoiding the NMI shootdown...
++	 */
++	virt_ops.emergency_disable_virtualization_cpu();
++	return 0;
++}
++
+ void __init x86_virt_init(void)
+ {
+-	x86_vmx_init();
++	/*
++	 * Attempt to initialize both SVM and VMX, and simply use whichever one
++	 * is present.  Rsefuse to enable/use SVM or VMX if both are somehow
++	 * supported.  No known CPU supports both SVM and VMX.
++	 */
++	bool has_vmx = !x86_vmx_init();
++	bool has_svm = !x86_svm_init();
++
++	if (WARN_ON_ONCE(has_vmx && has_svm)) {
++		x86_vmx_exit();
++		memset(&virt_ops, 0, sizeof(virt_ops));
++	}
+ }
