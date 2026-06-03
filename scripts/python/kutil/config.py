@@ -84,7 +84,7 @@ def read_source_timestamp(directory):
     return config
 
 class SrcVersion:
-    """Class, defining a source code version allows parsing from string, updating single values
+    """Class, defining a source code version, allows parsing from string, updating single values
     and returns the resulting version as string repr"""
     def __init__(self, version_str):
         self.version = '0'
@@ -318,7 +318,6 @@ if __name__ == "__main__":
 
         return patches
 
-
     def parse_makefiles(diff_text):
         """Locate changes to the toplevel Makefile in a unified diff file
         return applied changesets to the linux kernel version variables"""
@@ -345,15 +344,7 @@ if __name__ == "__main__":
 
         for line in diff_text.splitlines():
             if line.startswith(('--- ', '+++ ')):
-                match = makefile_target.match(line)
-                if match:
-                    # we're in a toplevel Makefile diff section now
-                    in_makefile = True
-                    current_file = match.group('path')
-                    vout(4, 'parse_makefiles: {}'.format(current_file))
-                else:
-                    # we're in some other files modification context
-                    in_makefile = False
+                in_makefile = bool(makefile_target.match(line))
 
             if not in_makefile:
                 continue
@@ -374,7 +365,6 @@ if __name__ == "__main__":
                 )
 
         return changes
-
 
     def compute(bindir, rpmdir, patchdir):
         """Compute patchversion from config.sh, series.conf and patch files"""
@@ -399,14 +389,13 @@ if __name__ == "__main__":
         # collect top level Makefile changesets from patch files
         changes = []
         for patch in patches:
-            pfn = os.path.join(patchdir, patch)
-            with open(pfn, 'r') as f:
+            patch = os.path.join(patchdir, patch)
+            with open(patch, 'r') as f:
                 patch_data = f.read()
-                if 'Makefile' in patch_data:
-                    changeset = parse_makefiles(patch_data)
-                    if changeset:
-                        vout(2, 'parse_matches: {}: {}'.format(pfn, changeset))
-                        changes.append(changeset)
+                changeset = parse_makefiles(patch_data)
+                if changeset:
+                    vout(2, 'parse_matches: {}: {}'.format(patch, changeset))
+                    changes.append(changeset)
 
         # iterate over all changesets, and apply them
         for changeset in changes:
