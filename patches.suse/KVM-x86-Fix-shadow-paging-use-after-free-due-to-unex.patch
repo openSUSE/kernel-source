@@ -1,0 +1,133 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Wed, 15 Apr 2026 00:52:34 +0000
+Subject: KVM: x86: Fix shadow paging use-after-free due to unexpected GFN
+Patch-mainline: v7.1-rc3
+Git-commit: 0cb2af2ea66ad8ff195c156ea690f11216285bdf
+References: CVE-2026-46113 bsc#1266969
+
+The shadow MMU computes GFNs for direct shadow pages using sp->gfn plus
+the SPTE index. This assumption breaks for shadow paging if the guest
+page tables are modified between VM entries (similar to commit
+aad885e77496, "KVM: x86/mmu: Drop/zap existing present SPTE even
+when creating an MMIO SPTE", 2026-03-27).  The flow is as follows:
+
+- a PDE is installed for a 2MB mapping, and a page in that area is
+  accessed.  KVM creates a kvm_mmu_page consisting of 512 4KB pages;
+  the kvm_mmu_page is marked by FNAME(fetch) as direct-mapped because
+  the guest's mapping is a huge page (and thus contiguous).
+
+- the PDE mapping is changed from outside the guest.
+
+- the guest accesses another page in the same 2MB area.  KVM installs
+  a new leaf SPTE and rmap entry; the SPTE uses the "correct" GFN
+  (i.e. based on the new mapping, as changed in the previous step) but
+  that GFN is outside of the [sp->gfn, sp->gfn + 511] range; therefore
+  the rmap entry cannot be found and removed when the kvm_mmu_page
+  is zapped.
+
+- the memslot that covers the first 2MB mapping is deleted, and the
+  kvm_mmu_page for the now-invalid GPA is zapped.  However, rmap_remove()
+  only looks at the [sp->gfn, sp->gfn + 511] range established in step 1,
+  and fails to find the rmap entry that was recorded by step 3.
+
+- any operation that causes an rmap walk for the same page accessed
+  by step 3 then walks a stale rmap and dereferences a freed kvm_mmu_page.
+  This includes dirty logging or MMU notifier invalidations (e.g., from
+  MADV_DONTNEED).
+
+The underlying issue is that KVM's walking of shadow PTEs assumes that
+if a SPTE is present when KVM wants to install a non-leaf SPTE, then the
+existing kvm_mmu_page must be for the correct gfn.  Because the only way
+for the gfn to be wrong is if KVM messed up and failed to zap a SPTE...
+which shouldn't happen, but *actually* only happens in response to a
+guest write.
+
+That bug dates back literally forever, as even the first version of KVM
+assumes that the GFN matches and walks into the "wrong" shadow page.
+However, that was only an imprecision until 2032a93d66fa ("KVM: MMU:
+Don't allocate gfns page for direct mmu pages") came along.
+
+Fix it by checking for a target gfn mismatch and zapping the existing
+SPTE.  That way the old SP and rmap entries are gone, KVM installs
+the rmap in the right location, and everyone is happy.
+
+Fixes: 2032a93d66fa ("KVM: MMU: Don't allocate gfns page for direct mmu pages")
+Fixes: 6aa8b732ca01 ("kvm: userspace interface")
+Reported-by: Alexander Bulekov <bkov@amazon.com>
+Reported-by: Fred Griffoul <fgriffo@amazon.co.uk>
+Cc: stable@vger.kernel.org
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Link: https://patch.msgid.link/20260503201029.106481-1-pbonzini@redhat.com/
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/kvm/mmu.c         |   13 +++++++++++++
+ arch/x86/kvm/paging_tmpl.h |   28 ++++++++++++++++++++++++++++
+ 2 files changed, 41 insertions(+)
+
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -2377,6 +2377,19 @@ static int __direct_map(struct kvm_vcpu
+ 			break;
+ 
+ 		drop_large_spte(vcpu, it.sptep);
++		if (is_shadow_present_pte(*it.sptep)) {
++			struct kvm_mmu_page *child = page_header(*it.sptep & PT64_BASE_ADDR_MASK);
++			struct kvm_mmu_page *parent_sp;
++
++			if (!child || child->gfn != base_gfn) {
++				parent_sp = page_header(__pa(it.sptep));
++				WARN_ON_ONCE(parent_sp->role.level == PT_PAGE_TABLE_LEVEL);
++
++				mmu_page_remove_parent_pte(child, it.sptep);
++				__set_spte(it.sptep, shadow_trap_nonpresent_pte);
++				kvm_flush_remote_tlbs(vcpu->kvm);
++			}
++		}
+ 		if (*it.sptep == shadow_trap_nonpresent_pte) {
+ 			sp = kvm_mmu_get_page(vcpu, base_gfn, it.addr,
+ 					      it.level - 1, 1, ACC_ALL, it.sptep);
+--- a/arch/x86/kvm/paging_tmpl.h
++++ b/arch/x86/kvm/paging_tmpl.h
+@@ -514,6 +514,20 @@ static u64 *FNAME(fetch)(struct kvm_vcpu
+ 
+ 		drop_large_spte(vcpu, it.sptep);
+ 
++		if (is_shadow_present_pte(*it.sptep)) {
++			struct kvm_mmu_page *child = page_header(*it.sptep & PT64_BASE_ADDR_MASK);
++			struct kvm_mmu_page *parent_sp;
++
++			if (!child || child->gfn != gw->table_gfn[it.level - 2]) {
++				parent_sp = page_header(__pa(it.sptep));
++				WARN_ON_ONCE(parent_sp->role.level == PT_PAGE_TABLE_LEVEL);
++
++				mmu_page_remove_parent_pte(child, it.sptep);
++				__set_spte(it.sptep, shadow_trap_nonpresent_pte);
++				kvm_flush_remote_tlbs(vcpu->kvm);
++			}
++		}
++
+ 		sp = NULL;
+ 		if (!is_shadow_present_pte(*it.sptep)) {
+ 			table_gfn = gw->table_gfn[it.level - 2];
+@@ -555,6 +569,20 @@ static u64 *FNAME(fetch)(struct kvm_vcpu
+ 
+ 		drop_large_spte(vcpu, it.sptep);
+ 
++		if (is_shadow_present_pte(*it.sptep)) {
++			struct kvm_mmu_page *child = page_header(*it.sptep & PT64_BASE_ADDR_MASK);
++			struct kvm_mmu_page *parent_sp;
++
++			if (!child || child->gfn != base_gfn) {
++				parent_sp = page_header(__pa(it.sptep));
++				WARN_ON_ONCE(parent_sp->role.level == PT_PAGE_TABLE_LEVEL);
++
++				mmu_page_remove_parent_pte(child, it.sptep);
++				__set_spte(it.sptep, shadow_trap_nonpresent_pte);
++				kvm_flush_remote_tlbs(vcpu->kvm);
++			}
++		}
++
+ 		if (!is_shadow_present_pte(*it.sptep)) {
+ 			sp = kvm_mmu_get_page(vcpu, base_gfn, addr, it.level-1,
+ 					      true, direct_access, it.sptep);
