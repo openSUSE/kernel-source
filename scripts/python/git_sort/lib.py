@@ -25,7 +25,7 @@ import sys
 import os
 import re
 
-from . import pygit2_wrapper as pygit2
+from kutil import pygit2_wrapper as pygit2
 from kutil import pathlib_compat
 from . import series_conf
 from . import git_sort
