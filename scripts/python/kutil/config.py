@@ -3,10 +3,9 @@
 Synopsis: determine the current kernel source version from a series of patches
           as being referenced from series.conf
 
-Usage: {appname} [-hVvp:]
+Usage: {appname} [-hVp:]
        -h, --help           this message
        -V, --version        print version and exit
-       -v, --verbose        verbose mode (cumulative)
        -p, --patches dir    directory, where patches.* reside, referenced in
                             series.conf [default: '{patchdir}']
                             series.conf is read from . and config.sh from
@@ -26,8 +25,7 @@ It fetches the kernel source version from config.sh, then parses the
 ./series.conf file, collecting all patch files, and tracks any changes of the
 top level Makefile to the four version defining symbols: VERSION, PATCHLEVEL,
 SUBLEVEL, and EXTRAVERSION. The result should consitute the latest kernel
-patch level. Verbose levels up to 4 reveal internal states, that you probably
-don't want to ever know of.
+patch level.
 
 Version: {version}
 Copyright: (c)2026 by {company}
@@ -250,6 +248,111 @@ def get_package_archs(package_tar_up_dir, limit_packages=None):
 
 # here starts the new compute-PATCHVERSION.py implementation
 
+def parse_series_conf(patchdir, series_conf):
+    """Parse the series.conf file, taking guards into account, and return a list of patch files"""
+    # Use grep to extract patch file names from series.conf.
+    # In a plain quilt series file the non-whitespace thing at the start of a line that is not a comment is
+    # a patch filename. However, the series.conf in kernel-source may contain 'guards'. While complex semantic
+    # of guards was supported in the past in practice guards are alos comments.
+    # Ignore anything that does not look like a patch filename.
+    pipe = subprocess.Popen(['grep', '-o', '^[ \t]*patches[.][^ \t#]*', series_conf],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    patches, errors = pipe.communicate()
+    if pipe.returncode == 2:
+        raise RuntimeError('%s\n%s' % (pipe.args, errors))
+    # The resulting patch filenames can be prefixed with whitespace.
+    # However, they are fed to xargs which splits on whitespace conveniently stripping the leading whitespace
+    # from the patch filenames. This alleviates the need to ever touch the buffer from python
+    pipe = subprocess.Popen(['xargs', 'grep', '-lE', '^[+][+][+][^/]+/Makefile'],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=patchdir)
+    output, errors = pipe.communicate(input=patches)
+    if errors:  # The return value from xargs grep is fairly meaningless but stderr should be empty
+        raise RuntimeError('%s\n%s' % (pipe.args, errors))
+    patches = [p.decode() for p in output.splitlines()]
+
+    return patches
+
+def parse_makefiles(diff_text):
+    """Locate changes to the toplevel Makefile in a unified diff file
+    return applied changesets to the linux kernel version variables"""
+    # match top level Makefile
+    makefile_target = re.compile(r'''
+        ^                   # Anchor a start of line
+        (---|\+\+\+)        # Match either +++ or ---
+        \s+                 # Skip blinks
+        (?P<path>[^\/]+/Makefile)   # Extract Makefile with single slash
+        ( |\t|$)            # May end in a blank, tab or end of line
+    ''', re.VERBOSE)
+    # match variable change pattern
+    var_pattern = re.compile(r'''
+        ^                   # Anchor at start of line
+        \+                  # Required: we care about additions ('+') only
+        \s*                 # Skip optional blanks
+        (?P<key>VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)   # Required: key value is one of these
+        \s*=\s*             # Required: assignment with optional blanks
+        (?P<value>.*)       # Required: any value, even an empty one
+    ''', re.VERBOSE)
+
+    in_makefile = False
+    changes = []
+
+    for line in diff_text.splitlines():
+        if line.startswith(('--- ', '+++ ')):
+            in_makefile = bool(makefile_target.match(line))
+
+        if not in_makefile:
+            continue
+
+        if line.startswith((' ', '@@')):
+            continue
+
+        # extract version variable changes
+        match = var_pattern.match(line)
+        if match:
+            changes.append(
+                {
+                    # which variable (and avoid shouting loudly)
+                    'variable': match.group('key').lower(),
+                    # added (new) or removed (old) value
+                    'value': match.group('value').strip(),
+                }
+            )
+
+    return changes
+
+def compute_patchversion(bindir, rpmdir, patchdir):
+    """Compute patchversion from config.sh, series.conf and patch files"""
+    patchdir = str(patchdir)
+    if not os.path.isdir(patchdir):
+        raise FileNotFoundError('patch directory {} not found'.format(patchdir))
+
+    # fetch key, value pairs from config.sh
+    config = read_config_sh(str(bindir))
+
+    # determine kernel base source code version
+    src_version = config.getversion('srcversion')
+
+    # fetch patch files from series.conf
+    series_conf = os.path.join(str(rpmdir), 'series.conf')
+    patches = parse_series_conf(patchdir, series_conf)
+
+    # collect top level Makefile changesets from patch files
+    changes = []
+    for patch in patches:
+        patch = os.path.join(patchdir, patch)
+        with open(patch, 'r') as f:
+            patch_data = f.read()
+            changeset = parse_makefiles(patch_data)
+            if changeset:
+                changes.append(changeset)
+
+    # iterate over all changesets, and apply them
+    for changeset in changes:
+        for ch in changeset:
+            src_version.update(ch['variable'], ch['value'])
+
+    return src_version
+
 if __name__ == "__main__":
     import sys
     import getopt
@@ -270,7 +373,6 @@ if __name__ == "__main__":
         company = __company__
         author = __author__
         license = __license__
-        loglevel = 0
         rpmdir = '.'
         patchdir = '.'
 
@@ -280,11 +382,6 @@ if __name__ == "__main__":
     def stderr(*msg):
         print(*msg, file = sys.stderr, flush = True)
 
-    def vout(lvl, *msg):
-        """Verbose output"""
-        if lvl <= gpar.loglevel:
-            stderr(*msg)
-
     def exit(ret = 0, msg = None, usage = False):
         """Terminate process with optional message and usage"""
         if msg:
@@ -292,121 +389,6 @@ if __name__ == "__main__":
         if usage:
             stderr(__doc__.format(**gpar.__dict__))
         sys.exit(ret)
-
-    def parse_series_conf(patchdir, series_conf):
-        """Parse the series.conf file, taking guards into account, and return a list of patch files"""
-        # Use grep to extract patch file names from series.conf.
-        # In a plain quilt series file the non-whitespace thing at the start of a line that is not a comment is
-        # a patch filename. However, the series.conf in kernel-source may contain 'guards'. While complex semantic
-        # of guards was supported in the past in practice guards are alos comments.
-        # Ignore anything that does not look like a patch filename.
-        pipe = subprocess.Popen(['grep', '-o', '^[ \t]*patches[.][^ \t#]*', series_conf],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        patches, errors = pipe.communicate()
-        if pipe.returncode == 2:
-            raise RuntimeError('%s\n%s' % (pipe.args, errors))
-        vout(4, 'patches: {}'.format(patches))
-        # The resulting patch filenames can be prefixed with whitespace.
-        # However, they are fed to xargs which splits on whitespace conveniently stripping the leading whitespace
-        # from the patch filenames. This alleviates the need to ever touch the buffer from python
-        pipe = subprocess.Popen(['xargs', 'grep', '-lE', '^[+][+][+][^/]+/Makefile'],
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=patchdir)
-        output, errors = pipe.communicate(input=patches)
-        if errors:  # The return value from xargs grep is fairly meaningless but stderr should be empty
-            raise RuntimeError('%s\n%s' % (pipe.args, errors))
-        patches = [p.decode() for p in output.splitlines()]
-
-        return patches
-
-    def parse_makefiles(diff_text):
-        """Locate changes to the toplevel Makefile in a unified diff file
-        return applied changesets to the linux kernel version variables"""
-        # match top level Makefile
-        makefile_target = re.compile(r'''
-            ^                   # Anchor a start of line
-            (---|\+\+\+)        # Match either +++ or ---
-            \s+                 # Skip blinks
-            (?P<path>[^\/]+/Makefile)   # Extract Makefile with single slash
-            ( |\t|$)            # May end in a blank, tab or end of line
-        ''', re.VERBOSE)
-        # match variable change pattern
-        var_pattern = re.compile(r'''
-            ^                   # Anchor at start of line
-            \+                  # Required: we care about additions ('+') only
-            \s*                 # Skip optional blanks
-            (?P<key>VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)   # Required: key value is one of these
-            \s*=\s*             # Required: assignment with optional blanks
-            (?P<value>.*)       # Required: any value, even an empty one
-        ''', re.VERBOSE)
-
-        in_makefile = False
-        changes = []
-
-        for line in diff_text.splitlines():
-            if line.startswith(('--- ', '+++ ')):
-                in_makefile = bool(makefile_target.match(line))
-
-            if not in_makefile:
-                continue
-
-            if line.startswith((' ', '@@')):
-                continue
-
-            # extract version variable changes
-            match = var_pattern.match(line)
-            if match:
-                changes.append(
-                    {
-                        # which variable (and avoid shouting loudly)
-                        'variable': match.group('key').lower(),
-                        # added (new) or removed (old) value
-                        'value': match.group('value').strip(),
-                    }
-                )
-
-        return changes
-
-    def compute(bindir, rpmdir, patchdir):
-        """Compute patchversion from config.sh, series.conf and patch files"""
-        ret = 0
-        vout(3, 'started with pid {pid} in {appdir}'.format(**gpar.__dict__))
-        if not os.path.isdir(patchdir):
-            exit(1, 'patch directory {} not found'.format(patchdir))
-
-        # fetch key, value pairs from config.sh
-        config = read_config_sh(bindir)
-        vout(2, 'config.sh: {}'.format(config))
-
-        # determine kernel base source code version
-        src_version = config.getversion('srcversion')
-        vout(1, 'base source version: {}'.format(src_version))
-
-        # fetch patch files from series.conf
-        series_conf = os.path.join(rpmdir, 'series.conf')
-        patches = parse_series_conf(patchdir, series_conf)
-        vout(4, 'patches: {}'.format(patches))
-
-        # collect top level Makefile changesets from patch files
-        changes = []
-        for patch in patches:
-            patch = os.path.join(patchdir, patch)
-            with open(patch, 'r') as f:
-                patch_data = f.read()
-                changeset = parse_makefiles(patch_data)
-                if changeset:
-                    vout(2, 'parse_matches: {}: {}'.format(patch, changeset))
-                    changes.append(changeset)
-
-        # iterate over all changesets, and apply them
-        for changeset in changes:
-            for ch in changeset:
-                vout(3, '{}'.format(ch))
-                src_version.update(ch['variable'], ch['value'])
-
-        # provide the result on stdout
-        stdout(src_version)
-
-        return ret
 
     def main(argv = None):
         """Command line interface and console script entry point."""
@@ -425,8 +407,6 @@ if __name__ == "__main__":
                 exit(usage = True)
             elif opt in ('-V', '--version'):
                 exit(msg = 'version {}'.format(gpar.version))
-            elif opt in ('-v', '--verbose'):
-                gpar.loglevel += 1
             elif opt in ('-p', '--patches'):
                 gpar.patchdir = par
 
@@ -434,12 +414,12 @@ if __name__ == "__main__":
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
         try:
-            return compute(gpar.appdir, gpar.rpmdir, gpar.patchdir)
-        except (ValueError, IOError) as exc:
+            stdout(str(compute_patchversion(gpar.appdir, gpar.rpmdir, gpar.patchdir)))
+            return 0
+        except (ValueError, IOError, OSError, RuntimeError) as exc:
             stderr('Sorry, we hit a snag: {}'.format(exc))
             return 1
         except KeyboardInterrupt:
             return 3    # SIGQUIT
 
-    if __name__ == '__main__':
-        sys.exit(main())
+    sys.exit(main())

@@ -1,4 +1,4 @@
-from kutil.config import read_config_sh, get_kernel_project_package, list_files, list_specs, get_kernel_projects, get_package_archs, SrcVersion
+from kutil.config import read_config_sh, get_kernel_project_package, list_files, list_specs, get_kernel_projects, get_package_archs, SrcVersion, compute_patchversion
 from kutil import pathlib_compat
 from pathlib import Path
 import subprocess
@@ -126,6 +126,7 @@ class TestComputePatchversion(unittest.TestCase):
         self.rpmdir.mkdir()
         self.patches_orig = Path(__file__).parent / 'kutil' / 'patchversion'
         self.patches = self.base / 'patches.suse'
+        self.patches.symlink_to(self.patches_orig)
         self.packagedir = self.base / 'package'
         self.packagedir.mkdir()
         self.config_sh = self.rpmdir / 'config.sh'
@@ -153,7 +154,6 @@ class TestComputePatchversion(unittest.TestCase):
     def run_test(self, test_fn, expect_error=False):
         self.compute_rpm.symlink_to(self.compute_orig)
         self.guards_rpm.symlink_to(self.guards_orig)
-        self.patches.symlink_to(self.patches_orig)
         test_fn(*self.run_pipeline([self.compute_rpm], self.base, expect_error))
         shutil.copy(self.compute_orig, self.compute_pkg)
         shutil.copy(self.guards_orig, self.guards_pkg)
@@ -166,6 +166,34 @@ class TestComputePatchversion(unittest.TestCase):
         except FileNotFoundError:
             None
         test_fn(*self.run_pipeline([self.compute_pkg, '--patches', self.base], self.packagedir, expect_error))
+
+    def test_compute_fn_no_config(self):
+        self.series_conf.write_text('''
+patches.suse/sublevel_4 # change sublevel
+''')
+        with self.assertRaisesRegex(FileNotFoundError, 'config[.]sh'):
+            ver = compute_patchversion(self.rpmdir, self.base, self.base)
+
+    def test_compute_fn_no_series(self):
+        self.config_sh.write_text('SRCVERSION=1.2')
+        with self.assertRaisesRegex(RuntimeError, 'series[.]conf'):
+            ver = compute_patchversion(self.rpmdir, self.base, self.base)
+
+    def test_compute_fn_missing_patch(self):
+        self.config_sh.write_text('SRCVERSION=1.2')
+        self.series_conf.write_text('''
+patches.suse/no_such.patch
+''')
+        with self.assertRaisesRegex(RuntimeError, 'no_such[.]patch'):
+            ver = compute_patchversion(self.rpmdir, self.base, self.base)
+
+    def test_compute_fn(self):
+        self.config_sh.write_text('SRCVERSION=1.2')
+        self.series_conf.write_text('''
+patches.suse/sublevel_4 # change sublevel
+''')
+        ver = compute_patchversion(self.rpmdir, self.base, self.base)
+        self.assertEqual('1.2.4', str(ver))
 
     def test_empty(self):
         def test_fn(pipe, out, err):
