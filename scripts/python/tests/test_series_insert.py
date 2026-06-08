@@ -10,7 +10,7 @@ import sys
 import os
 
 import tests.support  # before git_sort
-from git_sort import pygit2_wrapper as pygit2
+from kutil import pygit2_wrapper as pygit2
 from git_sort import git_sort
 from git_sort import lib
 
