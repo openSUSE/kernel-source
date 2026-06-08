@@ -7,8 +7,10 @@ Usage: {appname} [-hVvp]
        -h, --help           this message
        -V, --version        print version and exit
        -v, --verbose        verbose mode (cumulative)
-       -p, --patches dir    base directory, holding rpm/config.sh, series.conf
-                            and patches.*, referenced in series.conf
+       -p, --patches dir    directory, where patches.* reside, referenced in
+                            series.conf [default: '{patchdir}']
+                            series.conf is read from . and config.sh from
+                            the directory from which {appname} is executed
 
 Description:
 The executable part of this script replaces the old compute-PATCHVERSION.sh
@@ -20,7 +22,7 @@ Otherwise provide the --patches argument with the preferred base directory.
 
 This file is typically a symlink to ../scripts/python/kutil/config.py.
 
-It fetches the kernel source version from ./rpm/config.sh, then parses the
+It fetches the kernel source version from config.sh, then parses the
 ./series.conf file, collecting all patch files, and tracks for any changes in
 top level Makefiles to the four version defining symbols: VERSION, PATCHLEVEL,
 SUBLEVEL, and EXTRAVERSION. The result should consitute the latest kernel
@@ -209,15 +211,14 @@ if __name__ == "__main__":
         appdir, appname = os.path.split(sys.argv[0])
         if appdir == '.':
             appdir = os.getcwd()
-        if appname.endswith('.py'):
-            appname = appname[:-3]
         pid = os.getpid()
         version = __version__
         company = __company__
         author = __author__
         license = __license__
         loglevel = 0
-        basedir = '.'
+        rpmdir = '.'
+        patchdir = '.'
 
 
     stdout = lambda *msg: print(*msg, file = sys.stdout, flush = True)
@@ -301,7 +302,7 @@ if __name__ == "__main__":
             return '{version}.{patchlevel}.{sublevel}{extraversion}'.format(**self.__dict__)
 
 
-    def parse_series_conf(basedir, series_conf):
+    def parse_series_conf(patchdir, series_conf):
         """Parse the series.conf file, taking guards into account, and return a list of patch files"""
         pattern = re.compile(r'''
             ^                   # Start of line
@@ -334,7 +335,7 @@ if __name__ == "__main__":
                         else:
                             # guard == '-':
                             vout(2, '{}: patch in line {} excluded: {}'.format(series_conf, lnnr, line))
-                    patch = os.path.join(basedir, m['patch'])
+                    patch = os.path.join(patchdir, m['patch'])
                     patches.append(patch)
                 else:
                     raise ValueError('{}: line {} malformed: "{}"'.format(series_conf, lnnr, line))
@@ -399,26 +400,25 @@ if __name__ == "__main__":
         return changes
 
 
-    def compute():
+    def compute(bindir, rpmdir, patchdir):
         """Compute patchversion from config.sh, series.conf and patch files"""
         ret = 0
         vout(3, 'started with pid {pid} in {appdir}'.format(**gpar.__dict__))
-        basedir = gpar.basedir
-        if not os.path.isdir(basedir):
-            exit(1, 'patches basedir {} not found'.format(basedir))
+        if not os.path.isdir(patchdir):
+            exit(1, 'patch directory {} not found'.format(patchdir))
 
         # fetch key value pairs from config.sh
-        config_sh = os.path.join(basedir, 'rpm/config.sh')
+        config_sh = os.path.join(bindir, 'config.sh')
         config = parse_config_sh(config_sh)
         vout(2, 'config.sh: {}'.format(config))
 
         # determine kernel base source code version
-        src_version = SrcVersion(config['SRCVERSION'])
+        src_version = config.getversion('srcversion')
         vout(1, 'base source version is: {}'.format(src_version))
 
         # fetch patch files from series.conf
-        series_conf = os.path.join(basedir, 'series.conf')
-        patches = parse_series_conf(basedir, series_conf)
+        series_conf = os.path.join(rpmdir, 'series.conf')
+        patches = parse_series_conf(patchdir, series_conf)
         vout(4, 'patches: {}'.format(patches))
 
         # collect Makefile changesets from patch files
@@ -464,13 +464,13 @@ if __name__ == "__main__":
             elif opt in ('-v', '--verbose'):
                 gpar.loglevel += 1
             elif opt in ('-p', '--patches'):
-                gpar.basedir = par
+                gpar.patchdir = par
 
         # ignore broken pipe errors (SIGPIPE)
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
         try:
-            return compute()
+            return compute(gpar.appdir, gpar.rpmdir, gpar.patchdir)
         except (ValueError, IOError) as exc:
             stderr('Sorry, we hit a snag: {}'.format(exc))
             return 1
