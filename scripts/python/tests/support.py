@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-from git_sort import pygit2_wrapper as pygit2
+from kutil import pygit2_wrapper as pygit2
 from pathlib import Path
 import datetime
 import re
