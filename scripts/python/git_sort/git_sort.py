@@ -28,7 +28,7 @@ import shelve
 import subprocess
 import sys
 from pathlib import Path
-from . import pygit2_wrapper as pygit2
+from kutil import pygit2_wrapper as pygit2
 
 try:
     import yaml
