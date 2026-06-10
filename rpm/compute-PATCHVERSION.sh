@@ -68,7 +68,7 @@ eval "$(
     <"$series" xargs awk '
     /^--- |^\+\+\+ / \
 	{ M = match($2, /^[^\/]+\/Makefile( \t|$)/) }
-    M && /^+(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)/ \
+    M && /^\+(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)/ \
 	{ print }
     ' \
     | sed -e 's,^+,,' -e 's, *= *\(.*\),="\1",'
