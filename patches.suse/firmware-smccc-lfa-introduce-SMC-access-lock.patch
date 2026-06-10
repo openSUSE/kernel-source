@@ -1,0 +1,189 @@
+From 66e850370d9ff50652bce5875590d4b41aac6904 Mon Sep 17 00:00:00 2001
+From: Andre Przywara <andre.przywara@arm.com>
+Date: Tue, 17 Mar 2026 11:33:34 +0100
+Subject: [PATCH 7/9] firmware: smccc: lfa: introduce SMC access lock
+
+References: LFA
+Patch-mainline: submitted https://lore.kernel.org/all/20260317103336.1273582-1-andre.przywara@arm.com/
+BugLink: https://bugs.launchpad.net/bugs/2150652
+
+After a successful live activation, the list of firmware images might
+change, which also affects the sequence IDs. We store the sequence
+ID in a data structure and connect it to its GUID, which is the
+identifier used to access certain image properties from userland.
+When an activation is happening, the sequence ID associations might
+change at any point, so we must be sure to not use any previously
+learned sequence ID during this time.
+
+Protect the association between a sequence ID and a firmware image
+(its GUID, really) by a reader/writer lock. In this case it's a R/W
+semaphore, so it can sleep and we can hold it for longer, also
+concurrent SMC calls are not blocked on each other, it's just an
+activation that blocks calls.
+
+Signed-off-by: Andre Przywara <andre.przywara@arm.com>
+(backported from https://lore.kernel.org/all/20260317103336.1273582-1-andre.przywara@arm.com/)
+Signed-off-by: Nirmoy Das <nirmoyd@nvidia.com>
+Acked-by: Carol L Soto <csoto@nvidia.com>
+Acked-by: Jamie Nguyen <jamien@nvidia.com>
+Signed-off-by: Jamie Nguyen <jamien@nvidia.com>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ drivers/firmware/smccc/lfa_fw.c | 38 +++++++++++++++++++++++++++++++--
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/firmware/smccc/lfa_fw.c b/drivers/firmware/smccc/lfa_fw.c
+index ecd056901b8d8..663ba79f07135 100644
+--- a/drivers/firmware/smccc/lfa_fw.c
++++ b/drivers/firmware/smccc/lfa_fw.c
+@@ -19,6 +19,7 @@
+ #include <linux/of.h>
+ #include <linux/of_irq.h>
+ #include <linux/psci.h>
++#include <linux/rwsem.h>
+ #include <linux/stop_machine.h>
+ #include <linux/string.h>
+ #include <linux/sysfs.h>
+@@ -157,6 +158,16 @@ static struct workqueue_struct *fw_images_update_wq;
+ static struct work_struct fw_images_update_work;
+ static struct attribute *image_default_attrs[LFA_ATTR_NR_IMAGES + 1];
+ 
++/*
++ * A successful image activation might change the number of available images,
++ * leading to a re-order and thus re-assignment of the sequence IDs.
++ * The lock protects the connection between a firmware image (through its
++ * user visible UUID) and the sequence IDs. Anyone doing an SMC call with
++ * a sequence ID needs to take the readers lock. Doing an activation requires
++ * the writer lock, as that process might change the assocications.
++ */
++struct rw_semaphore smc_lock;
++
+ static const struct attribute_group image_attr_group = {
+ 	.attrs = image_default_attrs,
+ };
+@@ -253,6 +264,7 @@ static unsigned long get_nr_lfa_components(void)
+ 	reg.a0 = LFA_1_0_FN_GET_INFO;
+ 	reg.a1 = 0; /* lfa_info_selector = 0 */
+ 
++	/* No need for the smc_lock, since no sequence IDs are involved. */
+ 	arm_smccc_1_2_invoke(&reg, &reg);
+ 	if (reg.a0 != LFA_SUCCESS)
+ 		return reg.a0;
+@@ -265,9 +277,11 @@ static int lfa_cancel(void *data)
+ 	struct fw_image *image = data;
+ 	struct arm_smccc_1_2_regs reg = { 0 };
+ 
++	down_read(&smc_lock);
+ 	reg.a0 = LFA_1_0_FN_CANCEL;
+ 	reg.a1 = image->fw_seq_id;
+ 	arm_smccc_1_2_invoke(&reg, &reg);
++	up_read(&smc_lock);
+ 
+ 	/*
+ 	 * When firmware activation is called with "skip_cpu_rendezvous=1",
+@@ -332,6 +346,7 @@ static int activate_fw_image(struct fw_image *image)
+ 	int ret;
+ 
+ retry:
++	down_write(&smc_lock);
+ 	if (image->cpu_rendezvous_forced || image->cpu_rendezvous)
+ 		ret = stop_machine(call_lfa_activate, image, cpu_online_mask);
+ 	else
+@@ -339,10 +354,13 @@ static int activate_fw_image(struct fw_image *image)
+ 
+ 	if (!ret) {
+ 		update_fw_images_tree();
++		up_write(&smc_lock);
+ 
+ 		return 0;
+ 	}
+ 
++	up_write(&smc_lock);
++
+ 	if (ret == -LFA_CALL_AGAIN) {
+ 		/* SMC returned with call_again flag set */
+ 		if (ktime_before(ktime_get(), end)) {
+@@ -383,8 +401,11 @@ static int prime_fw_image(struct fw_image *image)
+ 	 * be called again.
+ 	 * reg.a1 will become 0 once the prime process completes.
+ 	 */
++	down_read(&smc_lock);
+ 	reg.a1 = image->fw_seq_id;
+ 	arm_smccc_1_2_invoke(&reg, &res);
++	up_read(&smc_lock);
++
+ 	if ((long)res.a0 < 0) {
+ 		pr_err("LFA_PRIME for image %s failed: %s\n",
+ 		       get_image_name(image),
+@@ -429,7 +450,7 @@ static ssize_t activation_capable_show(struct kobject *kobj,
+ 	return sysfs_emit(buf, "%d\n", image->activation_capable);
+ }
+ 
+-static void update_fw_image_pending(struct fw_image *image)
++static void _update_fw_image_pending(struct fw_image *image)
+ {
+ 	struct arm_smccc_1_2_regs reg = { 0 };
+ 
+@@ -441,6 +462,13 @@ static void update_fw_image_pending(struct fw_image *image)
+ 		image->activation_pending = !!(reg.a3 & BIT(1));
+ }
+ 
++static void update_fw_image_pending(struct fw_image *image)
++{
++	down_read(&smc_lock);
++	_update_fw_image_pending(image);
++	up_read(&smc_lock);
++}
++
+ static ssize_t activation_pending_show(struct kobject *kobj,
+ 				       struct kobj_attribute *attr, char *buf)
+ {
+@@ -515,9 +543,11 @@ static ssize_t pending_version_show(struct kobject *kobj,
+ 	 * Similar to activation pending, this value can change following an
+ 	 * update, we need to retrieve fresh info instead of stale information.
+ 	 */
++	down_read(&smc_lock);
+ 	reg.a0 = LFA_1_0_FN_GET_INVENTORY;
+ 	reg.a1 = image->fw_seq_id;
+ 	arm_smccc_1_2_invoke(&reg, &reg);
++	up_read(&smc_lock);
+ 	if (reg.a0 == LFA_SUCCESS) {
+ 		if (reg.a5 != 0 && image->activation_pending) {
+ 			u32 maj, min;
+@@ -749,6 +779,7 @@ static int activate_pending_image(void)
+ 	struct fw_image *image;
+ 	int ret;
+ 
++	down_read(&smc_lock);
+ 	spin_lock(&lfa_kset->list_lock);
+ 	list_for_each_entry(kobj, &lfa_kset->list, entry) {
+ 		image = kobj_to_fw_image(kobj);
+@@ -756,7 +787,7 @@ static int activate_pending_image(void)
+ 		if (image->fw_seq_id == -1)
+ 			continue; /* Invalid FW component */
+ 
+-		update_fw_image_pending(image);
++		_update_fw_image_pending(image);
+ 		if (image->activation_capable && image->activation_pending &&
+ 		    image->auto_activate) {
+ 			found_pending = true;
+@@ -764,6 +795,7 @@ static int activate_pending_image(void)
+ 		}
+ 	}
+ 	spin_unlock(&lfa_kset->list_lock);
++	up_read(&smc_lock);
+ 
+ 	if (!found_pending)
+ 		return -ENOENT;
+@@ -950,6 +982,8 @@ static int __init lfa_init(void)
+ 	 */
+ 	lfa_dev = faux_device_create("arm-lfa", NULL, &lfa_device_ops);
+ 
++	init_rwsem(&smc_lock);
++
+ 	err = update_fw_images_tree();
+ 	if (err != 0) {
+ 		kset_unregister(lfa_kset);
+-- 
+2.51.0
+
