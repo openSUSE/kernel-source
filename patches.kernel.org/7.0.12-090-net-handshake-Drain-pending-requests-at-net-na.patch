@@ -1,0 +1,113 @@
+From: Chuck Lever <chuck.lever@oracle.com>
+Date: Mon, 25 May 2026 12:51:22 -0400
+Subject: [PATCH] net/handshake: Drain pending requests at net namespace exit
+References: bsc#1012628
+Patch-mainline: 7.0.12
+Git-commit: ea5fe6a73ca57e5150b8a38b341aef2636eb72f0
+
+[ Upstream commit ea5fe6a73ca57e5150b8a38b341aef2636eb72f0 ]
+
+The arguments to list_splice_init() in handshake_net_exit() are
+reversed. The call moves the local empty "requests" list onto
+hn->hn_requests, leaving the local list empty, so the subsequent
+drain loop runs zero iterations. Pending handshake requests that
+had not yet been accepted are not torn down when the net namespace
+is destroyed; each one keeps a reference on a socket file and on
+the handshake_req allocation.
+
+Pass the source and destination in the documented order
+(list_splice_init(list, head) moves list onto head) so the pending
+list is transferred to the local scratch list and drained through
+handshake_complete().
+
+Fixing the splice direction exposes a list-corruption race. After
+the splice each req->hr_list still has non-empty link pointers,
+threading the stack-local scratch list rather than hn_requests.
+A concurrent handshake_req_cancel() -- for example, from sunrpc's
+TLS timeout on a kernel socket whose netns reference was not
+taken -- finds the request through the rhashtable, calls
+remove_pending(), and sees !list_empty(&req->hr_list).
+__remove_pending_locked() then list_del_init()s an entry off the
+scratch list while the drain iterates, corrupting it. The same
+call arriving after the drain loop has run list_del() on an
+entry hits LIST_POISON instead.
+
+Have remove_pending() check HANDSHAKE_F_NET_DRAINING under
+hn_lock and report not-found when drain is in progress. The
+drain has already taken ownership; handshake_complete()'s existing
+test_and_set on HANDSHAKE_F_REQ_COMPLETED still arbitrates
+between drain and cancel for who calls the consumer's hp_done. Use
+list_del_init() rather than list_del() in the drain so req->hr_list
+does not carry LIST_POISON after drain releases the entry.
+
+The DRAINING guard in remove_pending() makes cancel return false,
+but cancel still falls through to test_and_set_bit on
+HANDSHAKE_F_REQ_COMPLETED and drops the request's hr_file reference.
+Without another pin, if that is the last reference, sk_destruct frees
+the request while it is still linked on the drain loop's local list.
+Pin each request's hr_file under hn_lock before releasing the list,
+and drop that drain pin after the loop finishes with the request.
+
+Fixes: 3b3009ea8abb ("net/handshake: Create a NETLINK service for handling handshake requests")
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Reviewed-by: Hannes Reinecke <hare@kernel.org>
+Link: https://patch.msgid.link/20260525-handshake-file-pin-v3-8-66c616906ead@oracle.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ net/handshake/netlink.c | 10 ++++++++--
+ net/handshake/request.c |  5 ++++-
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/net/handshake/netlink.c b/net/handshake/netlink.c
+index 21d6cbd52fcd..3fd4fef9bab1 100644
+--- a/net/handshake/netlink.c
++++ b/net/handshake/netlink.c
+@@ -201,13 +201,19 @@ static void __net_exit handshake_net_exit(struct net *net)
+ 	 */
+ 	spin_lock_bh(&hn->hn_lock);
+ 	set_bit(HANDSHAKE_F_NET_DRAINING, &hn->hn_flags);
+-	list_splice_init(&requests, &hn->hn_requests);
++	list_splice_init(&hn->hn_requests, &requests);
++	list_for_each_entry(req, &requests, hr_list)
++		get_file(req->hr_file);
+ 	spin_unlock_bh(&hn->hn_lock);
+ 
+ 	while (!list_empty(&requests)) {
++		struct file *file;
++
+ 		req = list_first_entry(&requests, struct handshake_req, hr_list);
+-		list_del(&req->hr_list);
++		file = req->hr_file;
++		list_del_init(&req->hr_list);
+ 		handshake_complete(req, -ETIMEDOUT, NULL);
++		fput(file);
+ 	}
+ }
+ 
+diff --git a/net/handshake/request.c b/net/handshake/request.c
+index e2d7ee7ce6e0..2f1ab6eb9538 100644
+--- a/net/handshake/request.c
++++ b/net/handshake/request.c
+@@ -163,13 +163,16 @@ static void __remove_pending_locked(struct handshake_net *hn,
+  * otherwise %false.
+  *
+  * If @req was on a pending list, it has not yet been accepted.
++ * Returns %false when the net namespace is draining; the drain
++ * loop has taken ownership of the pending list.
+  */
+ static bool remove_pending(struct handshake_net *hn, struct handshake_req *req)
+ {
+ 	bool ret = false;
+ 
+ 	spin_lock_bh(&hn->hn_lock);
+-	if (!list_empty(&req->hr_list)) {
++	if (!test_bit(HANDSHAKE_F_NET_DRAINING, &hn->hn_flags) &&
++	    !list_empty(&req->hr_list)) {
+ 		__remove_pending_locked(hn, req);
+ 		ret = true;
+ 	}
+-- 
+2.54.0
+
