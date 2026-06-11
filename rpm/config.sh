@@ -1,5 +1,5 @@
 # The version of the main tarball to use
-SRCVERSION=7.1-rc7-56-gacb7500801e9
+SRCVERSION=7.1-rc7-65-g9716c086c8e8
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=-vanilla
 # Set to 1 to use the variant kernel for kernel-obs-build
