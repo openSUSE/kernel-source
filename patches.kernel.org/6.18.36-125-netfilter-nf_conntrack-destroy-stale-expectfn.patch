@@ -1,0 +1,151 @@
+From: Weiming Shi <bestswngs@gmail.com>
+Date: Wed, 3 Jun 2026 00:38:17 -0700
+Subject: [PATCH] netfilter: nf_conntrack: destroy stale expectfn expectations
+ on unregister
+References: bsc#1258210
+Patch-mainline: 6.18.36
+Git-commit: c3009418f9fa1dcb3eb86f4d8c92583537b5faa3
+
+[ Upstream commit c3009418f9fa1dcb3eb86f4d8c92583537b5faa3 ]
+
+NAT helpers such as nf_nat_h323 store a raw pointer to module text in
+exp->expectfn (e.g. ip_nat_q931_expect). nf_ct_helper_expectfn_unregister()
+only unlinks the callback descriptor and never walks the expectation table,
+so an expectation pending at module removal survives with a dangling
+exp->expectfn into freed module text.
+
+When the expected connection arrives, init_conntrack() invokes
+exp->expectfn(), now a stale pointer into the unloaded module. Reproduced
+on a KASAN build by loading the H.323 helpers, creating a Q.931
+expectation, unloading nf_nat_h323, then connecting to the expected port:
+
+ Oops: int3: 0000 [#1] SMP KASAN NOPTI
+ RIP: 0010:0xffffffffa06102d1
+  init_conntrack.isra.0 (net/netfilter/nf_conntrack_core.c:1862)
+  nf_conntrack_in (net/netfilter/nf_conntrack_core.c:2049)
+  ipv4_conntrack_local (net/netfilter/nf_conntrack_proto.c:223)
+  nf_hook_slow (net/netfilter/core.c:619)
+  __ip_local_out (net/ipv4/ip_output.c:120)
+  __tcp_transmit_skb (net/ipv4/tcp_output.c:1715)
+  tcp_connect (net/ipv4/tcp_output.c:4374)
+  tcp_v4_connect (net/ipv4/tcp_ipv4.c:345)
+  __sys_connect (net/socket.c:2167)
+ Modules linked in: nf_conntrack_h323 [last unloaded: nf_nat_h323]
+
+Reaching the dangling state requires CAP_SYS_MODULE in the initial user
+namespace to remove a NAT helper that still has live expectations, so this
+is a robustness fix; leaving an expectation pointing at freed text is wrong
+regardless.
+
+Add nf_ct_helper_expectfn_destroy(), which walks the expectation table and
+drops every expectation whose ->expectfn matches the descriptor being torn
+down. Call it from each NAT helper's exit path after the existing RCU grace
+period, so no expectation outlives the code it points at and no extra
+synchronize_rcu() is introduced. With the fix, the same reproducer runs to
+completion without the Oops.
+
+Fixes: f587de0e2feb ("[NETFILTER]: nf_conntrack/nf_nat: add H.323 helper port")
+Reported-by: Xiang Mei <xmei5@asu.edu>
+Assisted-by: Claude:claude-opus-4-8
+Signed-off-by: Weiming Shi <bestswngs@gmail.com>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/net/netfilter/nf_conntrack_helper.h |  1 +
+ net/ipv4/netfilter/nf_nat_h323.c            |  2 ++
+ net/netfilter/nf_conntrack_helper.c         | 19 +++++++++++++++++++
+ net/netfilter/nf_nat_core.c                 |  2 ++
+ net/netfilter/nf_nat_sip.c                  |  1 +
+ 5 files changed, 25 insertions(+)
+
+diff --git a/include/net/netfilter/nf_conntrack_helper.h b/include/net/netfilter/nf_conntrack_helper.h
+index de2f956abf34..24cf3d2d9745 100644
+--- a/include/net/netfilter/nf_conntrack_helper.h
++++ b/include/net/netfilter/nf_conntrack_helper.h
+@@ -155,6 +155,7 @@ void nf_ct_helper_log(struct sk_buff *skb, const struct nf_conn *ct,
+ 
+ void nf_ct_helper_expectfn_register(struct nf_ct_helper_expectfn *n);
+ void nf_ct_helper_expectfn_unregister(struct nf_ct_helper_expectfn *n);
++void nf_ct_helper_expectfn_destroy(const struct nf_ct_helper_expectfn *n);
+ struct nf_ct_helper_expectfn *
+ nf_ct_helper_expectfn_find_by_name(const char *name);
+ struct nf_ct_helper_expectfn *
+diff --git a/net/ipv4/netfilter/nf_nat_h323.c b/net/ipv4/netfilter/nf_nat_h323.c
+index faee20af4856..10e1b0837731 100644
+--- a/net/ipv4/netfilter/nf_nat_h323.c
++++ b/net/ipv4/netfilter/nf_nat_h323.c
+@@ -555,6 +555,8 @@ static void __exit nf_nat_h323_fini(void)
+ 	nf_ct_helper_expectfn_unregister(&q931_nat);
+ 	nf_ct_helper_expectfn_unregister(&callforwarding_nat);
+ 	synchronize_rcu();
++	nf_ct_helper_expectfn_destroy(&q931_nat);
++	nf_ct_helper_expectfn_destroy(&callforwarding_nat);
+ }
+ 
+ /****************************************************************************/
+diff --git a/net/netfilter/nf_conntrack_helper.c b/net/netfilter/nf_conntrack_helper.c
+index a715304a53d8..9150bcfd7ca8 100644
+--- a/net/netfilter/nf_conntrack_helper.c
++++ b/net/netfilter/nf_conntrack_helper.c
+@@ -283,6 +283,25 @@ void nf_ct_helper_expectfn_unregister(struct nf_ct_helper_expectfn *n)
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_helper_expectfn_unregister);
+ 
++static bool expect_iter_expectfn(struct nf_conntrack_expect *exp, void *data)
++{
++	const struct nf_ct_helper_expectfn *n = data;
++
++	/* Relies on registered expectfn descriptors having unique ->expectfn
++	 * pointers, which holds for the in-tree NAT helpers.
++	 */
++	return exp->expectfn == n->expectfn;
++}
++
++/* Destroy expectations still pointing at @n->expectfn; call after the
++ * caller's RCU grace period so none outlives the (often modular) callback.
++ */
++void nf_ct_helper_expectfn_destroy(const struct nf_ct_helper_expectfn *n)
++{
++	nf_ct_expect_iterate_destroy(expect_iter_expectfn, (void *)n);
++}
++EXPORT_SYMBOL_GPL(nf_ct_helper_expectfn_destroy);
++
+ /* Caller should hold the rcu lock */
+ struct nf_ct_helper_expectfn *
+ nf_ct_helper_expectfn_find_by_name(const char *name)
+diff --git a/net/netfilter/nf_nat_core.c b/net/netfilter/nf_nat_core.c
+index 8e36b4e3e5c4..d3e158ecf729 100644
+--- a/net/netfilter/nf_nat_core.c
++++ b/net/netfilter/nf_nat_core.c
+@@ -1347,6 +1347,7 @@ static int __init nf_nat_init(void)
+ 		RCU_INIT_POINTER(nf_nat_hook, NULL);
+ 		nf_ct_helper_expectfn_unregister(&follow_master_nat);
+ 		synchronize_net();
++		nf_ct_helper_expectfn_destroy(&follow_master_nat);
+ 		unregister_pernet_subsys(&nat_net_ops);
+ 		kvfree(nf_nat_bysource);
+ 	}
+@@ -1364,6 +1365,7 @@ static void __exit nf_nat_cleanup(void)
+ 	RCU_INIT_POINTER(nf_nat_hook, NULL);
+ 
+ 	synchronize_net();
++	nf_ct_helper_expectfn_destroy(&follow_master_nat);
+ 	kvfree(nf_nat_bysource);
+ 	unregister_pernet_subsys(&nat_net_ops);
+ }
+diff --git a/net/netfilter/nf_nat_sip.c b/net/netfilter/nf_nat_sip.c
+index 9fbfc6bff0c2..00838c0cc5bb 100644
+--- a/net/netfilter/nf_nat_sip.c
++++ b/net/netfilter/nf_nat_sip.c
+@@ -655,6 +655,7 @@ static void __exit nf_nat_sip_fini(void)
+ 	RCU_INIT_POINTER(nf_nat_sip_hooks, NULL);
+ 	nf_ct_helper_expectfn_unregister(&sip_nat);
+ 	synchronize_rcu();
++	nf_ct_helper_expectfn_destroy(&sip_nat);
+ }
+ 
+ static const struct nf_nat_sip_hooks sip_hooks = {
+-- 
+2.53.0
+
