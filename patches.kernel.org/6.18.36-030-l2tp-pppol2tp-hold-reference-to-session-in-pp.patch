@@ -1,0 +1,177 @@
+From: Lee Jones <lee@kernel.org>
+Date: Wed, 27 May 2026 13:36:29 +0000
+Subject: [PATCH] l2tp: pppol2tp: hold reference to session in pppol2tp_ioctl()
+References: bsc#1258210
+Patch-mainline: 6.18.36
+Git-commit: a213a8950414c684999dcf03edeea6c46ede172e
+
+[ Upstream commit a213a8950414c684999dcf03edeea6c46ede172e ]
+
+pppol2tp_ioctl() read sock->sk->sk_user_data directly without any
+locks or reference counting.  If a controllable sleep was induced during
+copy_from_user() (e.g. via a userfaultfd page fault sleep), a concurrent
+socket close could trigger pppol2tp_session_close() asynchronously.  This
+frees the l2tp_session structure via the l2tp_session_del_work workqueue.
+Upon resuming, the ioctl thread dereferences the stale session pointer,
+resulting in a Use-After-Free (UAF).
+
+Fix this by securely fetching the session reference using the RCU-safe,
+refcounted helper pppol2tp_sock_to_session(sk) on entry.  This locks the
+session's refcount across the sleep.  We structured the function to exit
+via standard err breaks, guaranteeing that l2tp_session_put() is cleanly
+called on all return paths to drop the reference.
+
+To preserve existing behavior we validate the session and its magic
+signature only for the specific L2TP commands that require it.  This
+ensures that generic/unknown ioctls called on an unconnected socket
+still return -ENOIOCTLCMD and correctly fall back to generic handlers
+(e.g. in sock_do_ioctl()).
+
+Signed-off-by: Lee Jones <lee@kernel.org>
+Fixes: fd558d186df2 ("l2tp: Split pppol2tp patch into separate l2tp and ppp parts")
+Link: https://patch.msgid.link/20260527133630.2120612-1-lee@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ net/l2tp/l2tp_ppp.c | 82 +++++++++++++++++++++++++++------------------
+ 1 file changed, 50 insertions(+), 32 deletions(-)
+
+diff --git a/net/l2tp/l2tp_ppp.c b/net/l2tp/l2tp_ppp.c
+index 5e12e7ce17d8..f388bf9abf37 100644
+--- a/net/l2tp/l2tp_ppp.c
++++ b/net/l2tp/l2tp_ppp.c
+@@ -1044,64 +1044,76 @@ static int pppol2tp_ioctl(struct socket *sock, unsigned int cmd,
+ {
+ 	struct pppol2tp_ioc_stats stats;
+ 	struct l2tp_session *session;
++	int err = 0;
++
++	session = pppol2tp_sock_to_session(sock->sk);
+ 
++	/* Validate session presence and magic integrity ONLY for commands
++	 * that belong to L2TP and require a valid session.
++	 */
+ 	switch (cmd) {
+ 	case PPPIOCGMRU:
+ 	case PPPIOCGFLAGS:
+-		session = sock->sk->sk_user_data;
++	case PPPIOCSMRU:
++	case PPPIOCSFLAGS:
++	case PPPIOCGL2TPSTATS:
+ 		if (!session)
+ 			return -ENOTCONN;
+ 
+-		if (WARN_ON(session->magic != L2TP_SESSION_MAGIC))
++		if (session->magic != L2TP_SESSION_MAGIC) {
++			l2tp_session_put(session);
+ 			return -EBADF;
++		}
++		break;
++	default:
++		break;
++	}
+ 
++	switch (cmd) {
++	case PPPIOCGMRU:
++	case PPPIOCGFLAGS:
+ 		/* Not defined for tunnels */
+-		if (!session->session_id && !session->peer_session_id)
+-			return -ENOSYS;
++		if (!session->session_id && !session->peer_session_id) {
++			err = -ENOSYS;
++			break;
++		}
+ 
+-		if (put_user(0, (int __user *)arg))
+-			return -EFAULT;
++		if (put_user(0, (int __user *)arg)) {
++			err = -EFAULT;
++			break;
++		}
+ 		break;
+ 
+ 	case PPPIOCSMRU:
+ 	case PPPIOCSFLAGS:
+-		session = sock->sk->sk_user_data;
+-		if (!session)
+-			return -ENOTCONN;
+-
+-		if (WARN_ON(session->magic != L2TP_SESSION_MAGIC))
+-			return -EBADF;
+-
+ 		/* Not defined for tunnels */
+-		if (!session->session_id && !session->peer_session_id)
+-			return -ENOSYS;
++		if (!session->session_id && !session->peer_session_id) {
++			err = -ENOSYS;
++			break;
++		}
+ 
+-		if (!access_ok((int __user *)arg, sizeof(int)))
+-			return -EFAULT;
++		if (!access_ok((int __user *)arg, sizeof(int))) {
++			err = -EFAULT;
++			break;
++		}
+ 		break;
+ 
+ 	case PPPIOCGL2TPSTATS:
+-		session = sock->sk->sk_user_data;
+-		if (!session)
+-			return -ENOTCONN;
+-
+-		if (WARN_ON(session->magic != L2TP_SESSION_MAGIC))
+-			return -EBADF;
+-
+ 		/* Session 0 represents the parent tunnel */
+ 		if (!session->session_id && !session->peer_session_id) {
+ 			u32 session_id;
+-			int err;
+ 
+ 			if (copy_from_user(&stats, (void __user *)arg,
+-					   sizeof(stats)))
+-				return -EFAULT;
++					   sizeof(stats))) {
++				err = -EFAULT;
++				break;
++			}
+ 
+ 			session_id = stats.session_id;
+ 			err = pppol2tp_tunnel_copy_stats(&stats,
+ 							 session->tunnel);
+ 			if (err < 0)
+-				return err;
++				break;
+ 
+ 			stats.session_id = session_id;
+ 		} else {
+@@ -1111,15 +1123,21 @@ static int pppol2tp_ioctl(struct socket *sock, unsigned int cmd,
+ 		stats.tunnel_id = session->tunnel->tunnel_id;
+ 		stats.using_ipsec = l2tp_tunnel_uses_xfrm(session->tunnel);
+ 
+-		if (copy_to_user((void __user *)arg, &stats, sizeof(stats)))
+-			return -EFAULT;
++		if (copy_to_user((void __user *)arg, &stats, sizeof(stats))) {
++			err = -EFAULT;
++			break;
++		}
+ 		break;
+ 
+ 	default:
+-		return -ENOIOCTLCMD;
++		err = -ENOIOCTLCMD;
++		break;
+ 	}
+ 
+-	return 0;
++	if (session)
++		l2tp_session_put(session);
++
++	return err;
+ }
+ 
+ /*****************************************************************************
+-- 
+2.53.0
+
