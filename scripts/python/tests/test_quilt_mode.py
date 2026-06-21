@@ -599,6 +599,53 @@ class TestQfmakeExec(unittest.TestCase):
         self._qfmake_fail("qfmake --exec ./post_build; POST_FAIL=1 qfmake all")
 
 
+class TestViConflicts(unittest.TestCase):
+    def setUp(self):
+        self.ks_dir = Path(tempfile.mkdtemp(prefix="gs_ks"))
+        self.current = self.ks_dir / "tmp/current"
+        self.current.mkdir(parents=True)
+        (self.current / "file1.c").touch()
+        (self.current / "file2.c").touch()
+
+
+    def tearDown(self):
+        shutil.rmtree(self.ks_dir)
+
+
+    def _write_pc_file(self, patch, name):
+        pc_file = self.current / ".pc" / patch / name
+        pc_file.parent.mkdir(parents=True)
+        pc_file.touch()
+
+
+    def _vi_conflicts(self, top_patch=None):
+        quilt = ["return 1", "echo '%s'" % top_patch][bool(top_patch)]
+        command = ("quilt() { %s; };"
+                   "vi() { printf '%%s\\n' \"$@\"; };"
+                   ". %s; vi-conflicts" % (quilt, lib.qm_path))
+        output = subprocess.check_output(command, shell=True, cwd=self.current,
+                                         stderr=subprocess.DEVNULL, executable="/bin/bash")
+        args = output.decode().splitlines()
+        self.assertEqual(args[0], "-p")
+        return args[1:]
+
+
+    def test_without_top_patch(self):
+        (self.current / "file1.c.rej").touch()
+        self.assertEqual(self._vi_conflicts(), ["./file1.c", "./file1.c.rej"])
+
+
+    def test_with_top_patch(self):
+        prev_patch = "patches/0001-conflict.patch"
+        top_patch = "patches/0002-conflict.patch"
+        (self.current / "file1.c.rej").touch()
+        (self.current / "file2.c.rej").touch()
+        self._write_pc_file(prev_patch, "file1.c")
+        self._write_pc_file(top_patch, "file2.c")
+
+        self.assertEqual(self._vi_conflicts(top_patch), ["./file2.c", "./file2.c.rej"])
+
+
 if __name__ == '__main__':
     # Run a single testcase
     suite = unittest.TestLoader().loadTestsFromTestCase(TestQCP)

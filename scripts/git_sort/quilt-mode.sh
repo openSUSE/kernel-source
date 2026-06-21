@@ -158,6 +158,25 @@ qgoto () {
 }
 
 
+vi-conflicts () {
+	local file orig top_patch
+	local args
+
+	top_patch=$(quilt --quiltrc - top 2>/dev/null) || top_patch=
+	while read file; do
+		orig=${file%.rej}
+		if [ -e "$orig" ] &&
+		   { [ -z "$top_patch" ] || [ -e ".pc/$top_patch/$orig" ]; }; then
+			args+=("$orig" "$file")
+		fi
+	done <<< "$(find ./ -name "*.rej")"
+
+	if [ ${#args[@]} -gt 0 ]; then
+		vi -p "${args[@]}"
+	fi
+}
+
+
 qdupcheck () {
 	"$_libdir"/qdupcheck "$@"
 }
