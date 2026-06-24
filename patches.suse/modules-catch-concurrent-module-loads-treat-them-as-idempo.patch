@@ -1,0 +1,173 @@
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Mon, 29 May 2023 21:39:51 -0400
+Subject: modules: catch concurrent module loads, treat them as idempotent
+Git-commit: 9b9879fc03275ffe0da328cf5b864d9e694167c8
+Patch-mainline: v6.5-rc1
+References: jsc#PED-16303
+
+This is the new-and-improved attempt at avoiding huge memory load spikes
+when the user space boot sequence tries to load hundreds (or even
+thousands) of redundant duplicate modules in parallel.
+
+See commit 9828ed3f695a ("module: error out early on concurrent load of
+the same module file") for background and an earlier failed attempt that
+was reverted.
+
+That earlier attempt just said "concurrently loading the same module is
+silly, just open the module file exclusively and return -ETXTBSY if
+somebody else is already loading it".
+
+While it is true that concurrent module loads of the same module is
+silly, the reason that earlier attempt then failed was that the
+concurrently loaded module would often be a prerequisite for another
+module.
+
+Thus failing to load the prerequisite would then cause cascading
+failures of the other modules, rather than just short-circuiting that
+one unnecessary module load.
+
+At the same time, we still really don't want to load the contents of the
+same module file hundreds of times, only to then wait for an eventually
+successful load, and have everybody else return -EEXIST.
+
+As a result, this takes another approach, and treats concurrent module
+loads from the same file as "idempotent" in the inode.  So if one module
+load is ongoing, we don't start a new one, but instead just wait for the
+first one to complete and return the same return value as it did.
+
+So unlike the first attempt, this does not return early: the intent is
+not to speed up the boot, but to avoid a thundering herd problem in
+allocating memory (both physical and virtual) for a module more than
+once.
+
+Also note that this does change behavior: it used to be that when you
+had concurrent loads, you'd have one "winner" that would return success,
+and everybody else would return -EEXIST.
+
+In contrast, this idempotent logic goes all Oprah on the problem, and
+says "You are a winner! And you are a winner! We are ALL winners".  But
+since there's no possible actual real semantic difference between "you
+loaded the module" and "somebody else already loaded the module", this
+is more of a feel-good change than an actual honest-to-goodness semantic
+change.
+
+Of course, any true Johnny-come-latelies that don't get caught in the
+concurrency filter will still return -EEXIST.  It's no different from
+not even getting a seat at an Oprah taping.  That's life.
+
+See the long thread on the kernel mailing list about this all, which
+includes some numbers for memory use before and after the patch.
+
+Link: https://lore.kernel.org/lkml/20230524213620.3509138-1-mcgrof@kernel.org/
+Reviewed-by: Johan Hovold <johan@kernel.org>
+Tested-by: Johan Hovold <johan@kernel.org>
+Tested-by: Luis Chamberlain <mcgrof@kernel.org>
+Tested-by: Dan Williams <dan.j.williams@intel.com>
+Tested-by: Rudi Heitbaum <rudi@heitbaum..com>
+Tested-by: David Hildenbrand <david@redhat.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Acked-by: Petr Pavlu <petr.pavlu@suse.com>
+---
+ kernel/module/main.c | 73 ++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 71 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/module/main.c b/kernel/module/main.c
+index 23abfe3e2674..d6de66a6a1ac 100644
+--- a/kernel/module/main.c
++++ b/kernel/module/main.c
+@@ -3057,15 +3057,82 @@ SYSCALL_DEFINE3(init_module, void __user *, umod,
+ 	return load_module(&info, uargs, 0);
+ }
+ 
++struct idempotent {
++	const void *cookie;
++	struct hlist_node entry;
++	struct completion complete;
++	int ret;
++};
++
++#define IDEM_HASH_BITS 8
++static struct hlist_head idem_hash[1 << IDEM_HASH_BITS];
++static DEFINE_SPINLOCK(idem_lock);
++
++static bool idempotent(struct idempotent *u, const void *cookie)
++{
++	int hash = hash_ptr(cookie, IDEM_HASH_BITS);
++	struct hlist_head *head = idem_hash + hash;
++	struct idempotent *existing;
++	bool first;
++
++	u->ret = 0;
++	u->cookie = cookie;
++	init_completion(&u->complete);
++
++	spin_lock(&idem_lock);
++	first = true;
++	hlist_for_each_entry(existing, head, entry) {
++		if (existing->cookie != cookie)
++			continue;
++		first = false;
++		break;
++	}
++	hlist_add_head(&u->entry, idem_hash + hash);
++	spin_unlock(&idem_lock);
++
++	return !first;
++}
++
++/*
++ * We were the first one with 'cookie' on the list, and we ended
++ * up completing the operation. We now need to walk the list,
++ * remove everybody - which includes ourselves - fill in the return
++ * value, and then complete the operation.
++ */
++static void idempotent_complete(struct idempotent *u, int ret)
++{
++	const void *cookie = u->cookie;
++	int hash = hash_ptr(cookie, IDEM_HASH_BITS);
++	struct hlist_head *head = idem_hash + hash;
++	struct hlist_node *next;
++	struct idempotent *pos;
++
++	spin_lock(&idem_lock);
++	hlist_for_each_entry_safe(pos, next, head, entry) {
++		if (pos->cookie != cookie)
++			continue;
++		hlist_del(&pos->entry);
++		pos->ret = ret;
++		complete(&pos->complete);
++	}
++	spin_unlock(&idem_lock);
++}
++
+ static int init_module_from_file(struct file *f, const char __user * uargs, int flags)
+ {
++	struct idempotent idem;
+ 	struct load_info info = { };
+ 	void *buf = NULL;
+-	int len;
++	int len, ret;
+ 
+ 	if (!f || !(f->f_mode & FMODE_READ))
+ 		return -EBADF;
+ 
++	if (idempotent(&idem, file_inode(f))) {
++		wait_for_completion(&idem.complete);
++		return idem.ret;
++	}
++
+ 	len = kernel_read_file(f, 0, &buf, INT_MAX, NULL, READING_MODULE);
+ 	if (len < 0) {
+ 		mod_stat_inc(&failed_kreads);
+@@ -3086,7 +3153,9 @@ static int init_module_from_file(struct file *f, const char __user * uargs, int
+ 		info.len = len;
+ 	}
+ 
+-	return load_module(&info, uargs, flags);
++	ret = load_module(&info, uargs, flags);
++	idempotent_complete(&idem, ret);
++	return ret;
+ }
+ 
+ SYSCALL_DEFINE3(finit_module, int, fd, const char __user *, uargs, int, flags)
+
