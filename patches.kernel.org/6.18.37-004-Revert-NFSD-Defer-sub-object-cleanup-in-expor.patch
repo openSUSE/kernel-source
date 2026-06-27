@@ -1,0 +1,256 @@
+From: Yang Erkun <yangerkun@huawei.com>
+Date: Wed, 13 May 2026 10:42:52 +0800
+Subject: [PATCH] Revert "NFSD: Defer sub-object cleanup in export put
+ callbacks"
+References: bsc#1258210
+Patch-mainline: 6.18.37
+Git-commit: 516403d4d85607fdef3ca41d4a56b54e5566fa9a
+
+commit 516403d4d85607fdef3ca41d4a56b54e5566fa9a upstream.
+
+This reverts commit 48db892356d6cb80f6942885545de4a6dd8d2a29.
+
+Commit 48db892356d6 ("NFSD: Defer sub-object cleanup in export
+put callbacks") moved path_put() and auth_domain_put() out of
+svc_export_put() and expkey_put() and behind queue_rcu_work() to
+close a claimed use-after-free in e_show() and c_show() against
+ex_path and ex_client->name. Discussion in [1] shows neither
+the diagnosis nor the remedy survives review.
+
+The downstream teardown of both sub-objects is already RCU-deferred.
+auth_domain_put() reaches svcauth_unix_domain_release(), which frees
+the unix_domain and its ->name through call_rcu(). path_put()
+reaches dentry_free(), which frees the dentry through call_rcu(),
+and prepend_path() is already structured to tolerate concurrent
+dentry teardown. A reader in cache_seq_start_rcu() therefore
+observes both sub-objects through the next grace period regardless
+of whether svc_export_put() runs synchronously, so the synchronous
+form was never unsafe.
+
+The crash signature in the report cited by commit 48db892356d6
+("NFSD: Defer sub-object cleanup in export put callbacks") has a
+different root cause: a /proc/net/rpc cache file held open across
+network-namespace exit lets cache_destroy_net() free cd->hash_table
+while a reader is still walking it. The correct fix pins cd->net for
+the open fd's lifetime and does not require any deferral inside
+svc_export_put().
+
+Meanwhile, deferring path_put() out of svc_export_put() reintroduces
+the regression that commit 69d803c40ede ("nfsd: Revert "nfsd:
+release svc_expkey/svc_export with rcu_work"") repaired: after
+"exportfs -r" drops the last cache reference, the mount reference
+held through ex_path lingers in the workqueue, so a subsequent
+umount fails with EBUSY.
+
+Restore the synchronous path_put() and auth_domain_put() in
+svc_export_put() and expkey_put() and the call_rcu()/kfree_rcu()
+free of the containing structures. The unrelated fix for
+ex_uuid/ex_stats from commit 2530766492ec ("nfsd: fix UAF when
+access ex_uuid or ex_stats") is preserved.
+
+Link: https://lore.kernel.org/all/10019b42-4589-4f9f-8d5b-d8197db1ce3c@huawei.com/ [1]
+Fixes: 48db892356d6 ("NFSD: Defer sub-object cleanup in export put callbacks")
+Cc: stable@vger.kernel.org
+Reviewed-by: Jeff Layton <jlayton@kernel.org>
+Tested-by: Alexandr Alexandrov <alexandr.alexandrov@oracle.com>
+Signed-off-by: Yang Erkun <yangerkun@huawei.com>
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/nfsd/export.c | 63 +++++++-----------------------------------------
+ fs/nfsd/export.h |  7 ++----
+ fs/nfsd/nfsctl.c |  8 +-----
+ 3 files changed, 12 insertions(+), 66 deletions(-)
+
+diff --git a/fs/nfsd/export.c b/fs/nfsd/export.c
+index 18933ca407be..2a1499f2ad19 100644
+--- a/fs/nfsd/export.c
++++ b/fs/nfsd/export.c
+@@ -36,30 +36,19 @@
+  * second map contains a reference to the entry in the first map.
+  */
+ 
+-static struct workqueue_struct *nfsd_export_wq;
+-
+ #define	EXPKEY_HASHBITS		8
+ #define	EXPKEY_HASHMAX		(1 << EXPKEY_HASHBITS)
+ #define	EXPKEY_HASHMASK		(EXPKEY_HASHMAX -1)
+ 
+-static void expkey_release(struct work_struct *work)
++static void expkey_put(struct kref *ref)
+ {
+-	struct svc_expkey *key = container_of(to_rcu_work(work),
+-					      struct svc_expkey, ek_rwork);
++	struct svc_expkey *key = container_of(ref, struct svc_expkey, h.ref);
+ 
+ 	if (test_bit(CACHE_VALID, &key->h.flags) &&
+ 	    !test_bit(CACHE_NEGATIVE, &key->h.flags))
+ 		path_put(&key->ek_path);
+ 	auth_domain_put(key->ek_client);
+-	kfree(key);
+-}
+-
+-static void expkey_put(struct kref *ref)
+-{
+-	struct svc_expkey *key = container_of(ref, struct svc_expkey, h.ref);
+-
+-	INIT_RCU_WORK(&key->ek_rwork, expkey_release);
+-	queue_rcu_work(nfsd_export_wq, &key->ek_rwork);
++	kfree_rcu(key, ek_rcu);
+ }
+ 
+ static int expkey_upcall(struct cache_detail *cd, struct cache_head *h)
+@@ -364,13 +353,11 @@ static void export_stats_destroy(struct export_stats *stats)
+ 					    EXP_STATS_COUNTERS_NUM);
+ }
+ 
+-static void svc_export_release(struct work_struct *work)
++static void svc_export_release(struct rcu_head *rcu_head)
+ {
+-	struct svc_export *exp = container_of(to_rcu_work(work),
+-					      struct svc_export, ex_rwork);
++	struct svc_export *exp = container_of(rcu_head, struct svc_export,
++			ex_rcu);
+ 
+-	path_put(&exp->ex_path);
+-	auth_domain_put(exp->ex_client);
+ 	nfsd4_fslocs_free(&exp->ex_fslocs);
+ 	export_stats_destroy(exp->ex_stats);
+ 	kfree(exp->ex_stats);
+@@ -382,8 +369,9 @@ static void svc_export_put(struct kref *ref)
+ {
+ 	struct svc_export *exp = container_of(ref, struct svc_export, h.ref);
+ 
+-	INIT_RCU_WORK(&exp->ex_rwork, svc_export_release);
+-	queue_rcu_work(nfsd_export_wq, &exp->ex_rwork);
++	path_put(&exp->ex_path);
++	auth_domain_put(exp->ex_client);
++	call_rcu(&exp->ex_rcu, svc_export_release);
+ }
+ 
+ static int svc_export_upcall(struct cache_detail *cd, struct cache_head *h)
+@@ -1490,36 +1478,6 @@ const struct seq_operations nfs_exports_op = {
+ 	.show	= e_show,
+ };
+ 
+-/**
+- * nfsd_export_wq_init - allocate the export release workqueue
+- *
+- * Called once at module load. The workqueue runs deferred svc_export and
+- * svc_expkey release work scheduled by queue_rcu_work() in the cache put
+- * callbacks.
+- *
+- * Return values:
+- *   %0: workqueue allocated
+- *   %-ENOMEM: allocation failed
+- */
+-int nfsd_export_wq_init(void)
+-{
+-	nfsd_export_wq = alloc_workqueue("nfsd_export", WQ_UNBOUND, 0);
+-	if (!nfsd_export_wq)
+-		return -ENOMEM;
+-	return 0;
+-}
+-
+-/**
+- * nfsd_export_wq_shutdown - drain and free the export release workqueue
+- *
+- * Called once at module unload. Per-namespace teardown in
+- * nfsd_export_shutdown() has already drained all deferred work.
+- */
+-void nfsd_export_wq_shutdown(void)
+-{
+-	destroy_workqueue(nfsd_export_wq);
+-}
+-
+ /*
+  * Initialize the exports module.
+  */
+@@ -1581,9 +1539,6 @@ nfsd_export_shutdown(struct net *net)
+ 
+ 	cache_unregister_net(nn->svc_expkey_cache, net);
+ 	cache_unregister_net(nn->svc_export_cache, net);
+-	/* Drain deferred export and expkey release work. */
+-	rcu_barrier();
+-	flush_workqueue(nfsd_export_wq);
+ 	cache_destroy_net(nn->svc_expkey_cache, net);
+ 	cache_destroy_net(nn->svc_export_cache, net);
+ 	svcauth_unix_purge(net);
+diff --git a/fs/nfsd/export.h b/fs/nfsd/export.h
+index b05399374574..d2b09cd76145 100644
+--- a/fs/nfsd/export.h
++++ b/fs/nfsd/export.h
+@@ -7,7 +7,6 @@
+ 
+ #include <linux/sunrpc/cache.h>
+ #include <linux/percpu_counter.h>
+-#include <linux/workqueue.h>
+ #include <uapi/linux/nfsd/export.h>
+ #include <linux/nfs4.h>
+ 
+@@ -76,7 +75,7 @@ struct svc_export {
+ 	u32			ex_layout_types;
+ 	struct nfsd4_deviceid_map *ex_devid_map;
+ 	struct cache_detail	*cd;
+-	struct rcu_work		ex_rwork;
++	struct rcu_head		ex_rcu;
+ 	unsigned long		ex_xprtsec_modes;
+ 	struct export_stats	*ex_stats;
+ };
+@@ -93,7 +92,7 @@ struct svc_expkey {
+ 	u32			ek_fsid[6];
+ 
+ 	struct path		ek_path;
+-	struct rcu_work		ek_rwork;
++	struct rcu_head		ek_rcu;
+ };
+ 
+ #define EX_ISSYNC(exp)		(!((exp)->ex_flags & NFSEXP_ASYNC))
+@@ -111,8 +110,6 @@ __be32 check_nfsd_access(struct svc_export *exp, struct svc_rqst *rqstp,
+ /*
+  * Function declarations
+  */
+-int			nfsd_export_wq_init(void);
+-void			nfsd_export_wq_shutdown(void);
+ int			nfsd_export_init(struct net *);
+ void			nfsd_export_shutdown(struct net *);
+ void			nfsd_export_flush(struct net *);
+diff --git a/fs/nfsd/nfsctl.c b/fs/nfsd/nfsctl.c
+index 4ed19d81577b..1da5c40d6722 100644
+--- a/fs/nfsd/nfsctl.c
++++ b/fs/nfsd/nfsctl.c
+@@ -2262,12 +2262,9 @@ static int __init init_nfsd(void)
+ 	if (retval)
+ 		goto out_free_pnfs;
+ 	nfsd_lockd_init();	/* lockd->nfsd callbacks */
+-	retval = nfsd_export_wq_init();
+-	if (retval)
+-		goto out_free_lockd;
+ 	retval = register_pernet_subsys(&nfsd_net_ops);
+ 	if (retval < 0)
+-		goto out_free_export_wq;
++		goto out_free_lockd;
+ 	retval = register_cld_notifier();
+ 	if (retval)
+ 		goto out_free_subsys;
+@@ -2296,8 +2293,6 @@ static int __init init_nfsd(void)
+ 	unregister_cld_notifier();
+ out_free_subsys:
+ 	unregister_pernet_subsys(&nfsd_net_ops);
+-out_free_export_wq:
+-	nfsd_export_wq_shutdown();
+ out_free_lockd:
+ 	nfsd_lockd_shutdown();
+ 	nfsd_drc_slab_free();
+@@ -2318,7 +2313,6 @@ static void __exit exit_nfsd(void)
+ 	nfsd4_destroy_laundry_wq();
+ 	unregister_cld_notifier();
+ 	unregister_pernet_subsys(&nfsd_net_ops);
+-	nfsd_export_wq_shutdown();
+ 	nfsd_drc_slab_free();
+ 	nfsd_lockd_shutdown();
+ 	nfsd4_free_slabs();
+-- 
+2.53.0
+
