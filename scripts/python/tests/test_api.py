@@ -312,6 +312,8 @@ class TestMisc(unittest.TestCase):
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch=None, commit='cafedead' * 8)],
                 ['https://src.suse.de/org/repo#' + 'branch',
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit=None)],
+                ['https://src.opensuse.org/kernel/kernel-default-base?trackingbranch=main',
+                 PkgRepo(api='https://src.opensuse.org', org='kernel', repo='kernel-default-base', branch='main', commit=None)],
                 ]
         testexcept = [
                 'https://src.suse.de/org/repo?trackingbranch=branch&foo=bar#' + 'cafedead' * 8,
