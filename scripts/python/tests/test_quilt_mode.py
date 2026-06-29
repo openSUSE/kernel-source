@@ -557,6 +557,48 @@ Signed-off-by: Maintainer One <maintainer@example.com>
         self.assertEqual(retval.decode().strip(), name)
 
 
+class TestQfmakeExec(unittest.TestCase):
+    def setUp(self):
+        self.ks_dir = Path(tempfile.mkdtemp(prefix="gs_ks"))
+        self.current = self.ks_dir / "tmp/current"
+        self.current.mkdir(parents=True)
+        self.post_build = self.current / "post_build"
+        self.post_build.write_text("#!/bin/sh\n"
+                                   "printf 'post_build:%s\\n' \"$*\"\n"
+                                   "exit ${POST_FAIL:-0}\n")
+        self.post_build.chmod(0o755)
+
+
+    def tearDown(self):
+        shutil.rmtree(self.ks_dir)
+
+
+    def _qfmake_cmd(self, script):
+        return ("quilt() { return 0; };"
+                "make() { return ${MAKE_FAIL:-0}; };"
+                ". %s; %s" % (lib.qm_path, script))
+
+
+    def _qfmake_pass(self, script, expected):
+        retval = subprocess.check_output(self._qfmake_cmd(script), shell=True, cwd=self.current,
+                                         stderr=subprocess.DEVNULL, executable="/bin/bash")
+        output = retval.decode().splitlines()
+        self.assertEqual(output, expected)
+
+
+    def _qfmake_fail(self, script):
+        rc = subprocess.call(self._qfmake_cmd(script), shell=True, cwd=self.current,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, executable="/bin/bash")
+        self.assertEqual(rc, 1)
+
+
+    def test_exec(self):
+        self._qfmake_pass("qfmake --exec ./post_build; qfmake all", ["post_build:all"])
+        self._qfmake_pass("qfmake --exec ./post_build; qfmake --exec; qfmake all", [])
+        self._qfmake_fail("qfmake --exec ./post_build; MAKE_FAIL=1 qfmake all")
+        self._qfmake_fail("qfmake --exec ./post_build; POST_FAIL=1 qfmake all")
+
+
 if __name__ == '__main__':
     # Run a single testcase
     suite = unittest.TestLoader().loadTestsFromTestCase(TestQCP)
