@@ -42,8 +42,11 @@ def process_scmsync(sync_text):
             repr(sync), str(query_keys)))
     if 'trackingbranch' in query:
         branch = query['trackingbranch'][0]
-        assert is_git_sha(sync.fragment)
-        commit = sync.fragment
+        if sync.fragment:
+            assert is_git_sha(sync.fragment)
+            commit = sync.fragment
+        else:
+            commit = None
     else:
         if is_git_sha(sync.fragment):
             branch = None
