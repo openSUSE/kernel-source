@@ -32,6 +32,8 @@ def cookies_to_dict(cookies):
     return res
 
 class TestRequest(http.server.BaseHTTPRequestHandler):
+    __test__ = False  # not a unit test class
+
     def do_GET(self):
         self.do_request()
     def do_PUT(self):
@@ -143,6 +145,8 @@ class TestRequest(http.server.BaseHTTPRequestHandler):
 
 
 class TestServer(http.server.HTTPServer):
+    __test__ = False  # not a unit test class
+
     def __init__(self, address, requast, data):
         self.index = 0
         with open(data, 'rb') as f:
