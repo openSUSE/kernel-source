@@ -233,6 +233,8 @@ def list_moved_patches(base_lines, remote_lines):
 
     return result
 
+class PatchNotFound(exc.KSError):
+    pass
 
 class InputEntry(object):
     """
@@ -249,6 +251,12 @@ class InputEntry(object):
         self.value = value
 
 
+    def from_source_git(self, index, repo, sha, name, current_head, move_upstream):
+        tree = repo[sha].peel(pygit2.Tree)
+        blob = tree[name]
+        bfile = pygit2.BlobIO(blob)
+        self._from_file(index, bfile, name, current_head, move_upstream)
+
     def from_patch(self, index, name, current_head, move_upstream):
         """
         This is where we decide a patch line's fate in the sorted series.conf
@@ -260,11 +268,15 @@ class InputEntry(object):
         * patch's tag is good ("Git-repo:" == current_head.url)
         * patches may be moved upstream between subsystem sections
         """
-        self.name = name
         if not os.path.exists(name):
-            raise exc.KSError("Could not find patch \"%s\"" % (name,))
+            raise PatchNotFound("Could not find patch \"%s\"" % (name,))
 
-        with Patch(open(name, mode="rb")) as patch:
+        self._from_file(index, open(name, mode="rb"), name, current_head, move_upstream)
+
+    def _from_file(self, index, file, name, current_head, move_upstream):
+        self.name = name
+
+        with Patch(file) as patch:
             mainline_tags = patch.get("Patch-mainline")
             commit_tags = patch.get("Git-commit")
             repo_tags = patch.get("Git-repo")
