@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
+from io import UnsupportedOperation
 from pathlib import Path
 import subprocess
 import tempfile
@@ -24,10 +25,15 @@ class TestSpliceSeries(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if cls.kcov and os.isatty(sys.stdin.fileno()):
-            print("Coverage report in %s Press enter when done with it." %
-                  (cls.covdir,))
-            sys.stdin.readline()
+        if cls.kcov:
+            try:
+                is_tty = os.isatty(sys.stdin.fileno())
+            except UnsupportedOperation:
+                is_tty = False
+            if is_tty:
+                print("Coverage report in %s Press enter when done with it." %
+                      (cls.covdir,))
+                sys.stdin.readline()
         shutil.rmtree(cls.covdir)
 
 
