@@ -48,8 +48,9 @@ qfmake () {
 				echo "Options:"
 				echo "    -x, --exclude <target|dir>     Exclude target or targets under directory from automatic building."
 				echo "    -X, --no-exclude <target|dir>  Remove previously set exclusion."
+				echo "    --exec [<script>]              Run script after build success, omit to clear."
 				echo "    -r, --reset                    Reset exclusion list."
-				echo "    -s, --show                     Show exclusion list."
+				echo "    -s, --show                     Show exclusion list and exec command."
 				echo "    -h, --help                     Print this help"
 				return
 				;;
@@ -70,6 +71,14 @@ qfmake () {
 				shift
 				doit=
 				;;
+			--exec)
+				unset qfm_exec
+				if [ $# -gt 1 ]; then
+					qfm_exec=$2
+					shift
+				fi
+				doit=
+				;;
 			-r|--reset)
 				qfm_excludes=()
 				return
@@ -77,6 +86,9 @@ qfmake () {
 			-s|--show)
 				if [ "${#qfm_excludes[@]}" -gt 0 ]; then
 					printf "%s\n" "${qfm_excludes[@]}"
+				fi
+				if [ "${qfm_exec-}" ]; then
+					printf "exec: %s\n" "$qfm_exec"
 				fi
 				return
 				;;
@@ -126,7 +138,10 @@ qfmake () {
 	done
 
 	if [ ${#targets[@]} -gt 0 ]; then
-		make "${targets[@]}"
+		make "${targets[@]}" || return
+		if [ "${qfm_exec-}" ]; then
+			"$qfm_exec" "${targets[@]}"
+		fi
 	fi
 }
 
@@ -139,6 +154,25 @@ qf1 () {
 qgoto () {
 	if command=$("$_libdir"/qgoto "$@") && [ "$command" ]; then
 		quilt $command
+	fi
+}
+
+
+vi-conflicts () {
+	local file orig top_patch
+	local args
+
+	top_patch=$(quilt --quiltrc - top 2>/dev/null) || top_patch=
+	while read file; do
+		orig=${file%.rej}
+		if [ -e "$orig" ] &&
+		   { [ -z "$top_patch" ] || [ -e ".pc/$top_patch/$orig" ]; }; then
+			args+=("$orig" "$file")
+		fi
+	done <<< "$(find ./ -name "*.rej")"
+
+	if [ ${#args[@]} -gt 0 ]; then
+		vi -p "${args[@]}"
 	fi
 }
 
