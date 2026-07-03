@@ -1,0 +1,170 @@
+From e31408734332b8cc611342cdaaab6ba492180156 Mon Sep 17 00:00:00 2001
+From: Runyu Xiao <runyu.xiao@seu.edu.cn>
+Date: Fri, 19 Jun 2026 09:59:38 +0800
+Subject: [PATCH] hwmon: (occ) unregister sysfs devices outside occ lock
+Git-commit: e31408734332b8cc611342cdaaab6ba492180156
+Patch-mainline: v7.2-rc2
+References: git-fixes
+
+occ_active(false) and occ_shutdown() unregister sysfs-backed devices while
+occ->lock is held.  hwmon_device_unregister() and sysfs_remove_group() can
+wait for active sysfs callbacks to drain, and those callbacks can enter the
+OCC update path and try to take occ->lock again.  That gives the unregister
+paths the lock ordering occ->lock -> sysfs callback drain, while a callback
+has the opposite edge sysfs callback -> occ->lock.
+
+This issue was found by our static analysis tool and then manually
+reviewed against the current tree.
+
+The grounded PoC kept the real unregister and callback carrier:
+
+  occ_shutdown()
+  hwmon_device_unregister()
+  occ_show_temp_1()
+  occ_update_response()
+
+Lockdep reported the circular dependency with occ_shutdown() already
+holding the OCC mutex and hwmon_device_unregister() waiting on the sysfs
+Side: 
+
+  WARNING: possible circular locking dependency detected
+  ... (sysfs_lock) ... at: hwmon_device_unregister+0x12/0x30 [vuln_msv]
+  ... (&test_occ.lock) ... at: occ_shutdown.constprop.0+0xe/0x40 [vuln_msv]
+  occ_update_response.isra.0+0xb/0x20 [vuln_msv]
+  occ_show_temp_1.constprop.0.isra.0+0x23/0x40 [vuln_msv]
+  *** DEADLOCK ***
+
+Serialize hwmon registration and removal with a separate hwmon_lock.
+Under that lock, detach occ->hwmon and update occ->active while occ->lock
+is held so concurrent OCC state changes still see a stable state, then
+drop occ->lock before calling hwmon_device_unregister().  Remove the
+driver sysfs group before taking occ->lock in occ_shutdown(), so draining
+the driver attributes cannot wait while the OCC mutex is held.  Also make
+OCC update callbacks return -ENODEV after deactivation, so callbacks that
+already passed sysfs active protection do not poll the hardware after
+teardown has detached the hwmon device.
+
+Fixes: 849b0156d996 ("hwmon: (occ) Delay hwmon registration until user request")
+Fixes: ac6888ac5a11 ("hwmon: (occ) Lock mutex in shutdown to prevent race with occ_active")
+Cc: stable@vger.kernel.org
+Signed-off-by: Runyu Xiao <runyu.xiao@seu.edu.cn>
+Link: https://lore.kernel.org/r/20260619015938.494464-1-runyu.xiao@seu.edu.cn
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/hwmon/occ/common.c | 34 ++++++++++++++++++++++++++++------
+ drivers/hwmon/occ/common.h |  1 +
+ 2 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/hwmon/occ/common.c b/drivers/hwmon/occ/common.c
+index 42cc6068bb08..e18e80e832fd 100644
+--- a/drivers/hwmon/occ/common.c
++++ b/drivers/hwmon/occ/common.c
+@@ -214,6 +214,11 @@ int occ_update_response(struct occ *occ)
+ 	if (rc)
+ 		return rc;
+ 
++	if (!occ->active) {
++		rc = -ENODEV;
++		goto unlock;
++	}
++
+ 	/* limit the maximum rate of polling the OCC */
+ 	if (time_after(jiffies, occ->next_update)) {
+ 		rc = occ_poll(occ);
+@@ -222,6 +227,7 @@ int occ_update_response(struct occ *occ)
+ 		rc = occ->last_error;
+ 	}
+ 
++unlock:
+ 	mutex_unlock(&occ->lock);
+ 	return rc;
+ }
+@@ -1105,11 +1111,16 @@ static void occ_parse_poll_response(struct occ *occ)
+ 
+ int occ_active(struct occ *occ, bool active)
+ {
+-	int rc = mutex_lock_interruptible(&occ->lock);
++	struct device *hwmon = NULL;
++	int rc = mutex_lock_interruptible(&occ->hwmon_lock);
+ 
+ 	if (rc)
+ 		return rc;
+ 
++	rc = mutex_lock_interruptible(&occ->lock);
++	if (rc)
++		goto unlock_hwmon;
++
+ 	if (active) {
+ 		if (occ->active) {
+ 			rc = -EALREADY;
+@@ -1154,14 +1165,17 @@ int occ_active(struct occ *occ, bool active)
+ 			goto unlock;
+ 		}
+ 
+-		if (occ->hwmon)
+-			hwmon_device_unregister(occ->hwmon);
++		hwmon = occ->hwmon;
+ 		occ->active = false;
+ 		occ->hwmon = NULL;
+ 	}
+ 
+ unlock:
+ 	mutex_unlock(&occ->lock);
++	if (hwmon)
++		hwmon_device_unregister(hwmon);
++unlock_hwmon:
++	mutex_unlock(&occ->hwmon_lock);
+ 	return rc;
+ }
+ 
+@@ -1170,6 +1184,7 @@ int occ_setup(struct occ *occ)
+ 	int rc;
+ 
+ 	mutex_init(&occ->lock);
++	mutex_init(&occ->hwmon_lock);
+ 	occ->groups[0] = &occ->group;
+ 
+ 	rc = occ_setup_sysfs(occ);
+@@ -1190,15 +1205,22 @@ EXPORT_SYMBOL_GPL(occ_setup);
+ 
+ void occ_shutdown(struct occ *occ)
+ {
+-	mutex_lock(&occ->lock);
++	struct device *hwmon;
+ 
+ 	occ_shutdown_sysfs(occ);
+ 
+-	if (occ->hwmon)
+-		hwmon_device_unregister(occ->hwmon);
++	mutex_lock(&occ->hwmon_lock);
++	mutex_lock(&occ->lock);
++
++	hwmon = occ->hwmon;
++	occ->active = false;
+ 	occ->hwmon = NULL;
+ 
+ 	mutex_unlock(&occ->lock);
++
++	if (hwmon)
++		hwmon_device_unregister(hwmon);
++	mutex_unlock(&occ->hwmon_lock);
+ }
+ EXPORT_SYMBOL_GPL(occ_shutdown);
+ 
+diff --git a/drivers/hwmon/occ/common.h b/drivers/hwmon/occ/common.h
+index 7ac4b2febce6..82f600093c7f 100644
+--- a/drivers/hwmon/occ/common.h
++++ b/drivers/hwmon/occ/common.h
+@@ -101,6 +101,7 @@ struct occ {
+ 
+ 	unsigned long next_update;
+ 	struct mutex lock;		/* lock OCC access */
++	struct mutex hwmon_lock;		/* serialize hwmon registration/removal */
+ 
+ 	struct device *hwmon;
+ 	struct occ_attribute *attrs;
+-- 
+2.54.0
+
