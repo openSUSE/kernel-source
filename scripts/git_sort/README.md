@@ -229,6 +229,8 @@ For each commit in the list, this command will
 * build test the result using `qfmake`. This calls make with the options
   specified to `qdoit` plus the .o targets corresponding to the .c files
   changed by the topmost patch.
+* optionally run additional checks configured with `qfmake --exec <script>`
+  after a successful build.
 
 The process will stop automatically in case of error. At that time the user
 must address the situation and then call `qdoit` again when ready.
