@@ -57,7 +57,7 @@ class Patch(object):
     break_matcher = re.compile(rb"(---|\*\*\*|Index:)[ \t][^ \t]|^diff -")
 
     def __init__(self, f):
-        assert(f.tell() == 0)
+        assert(not f.seekable() or f.tell() == 0)
         assert(isinstance(f, io.BufferedIOBase)) # binary (bytes) io object
 
         self.modified = False

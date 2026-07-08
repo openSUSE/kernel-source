@@ -32,6 +32,8 @@ def cookies_to_dict(cookies):
     return res
 
 class TestRequest(http.server.BaseHTTPRequestHandler):
+    __test__ = False  # not a unit test class
+
     def do_GET(self):
         self.do_request()
     def do_PUT(self):
@@ -143,6 +145,8 @@ class TestRequest(http.server.BaseHTTPRequestHandler):
 
 
 class TestServer(http.server.HTTPServer):
+    __test__ = False  # not a unit test class
+
     def __init__(self, address, requast, data):
         self.index = 0
         with open(data, 'rb') as f:
@@ -312,6 +316,8 @@ class TestMisc(unittest.TestCase):
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch=None, commit='cafedead' * 8)],
                 ['https://src.suse.de/org/repo#' + 'branch',
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit=None)],
+                ['https://src.opensuse.org/kernel/kernel-default-base?trackingbranch=main',
+                 PkgRepo(api='https://src.opensuse.org', org='kernel', repo='kernel-default-base', branch='main', commit=None)],
                 ]
         testexcept = [
                 'https://src.suse.de/org/repo?trackingbranch=branch&foo=bar#' + 'cafedead' * 8,
