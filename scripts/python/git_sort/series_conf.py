@@ -34,7 +34,7 @@ start_text = "sorted patches"
 end_text = "end of sorted patches"
 
 
-def split(series):
+def split(series, needed=True):
     before = []
     inside = []
     after = []
@@ -77,7 +77,7 @@ def split(series):
         current.extend(whitespace)
         whitespace = []
 
-    if current is before:
+    if current is before and needed:
         raise exc.KSNotFound("Sorted subseries not found.")
 
     current.extend(comments)
