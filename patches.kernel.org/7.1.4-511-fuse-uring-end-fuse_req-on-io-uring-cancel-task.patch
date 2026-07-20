@@ -1,0 +1,91 @@
+From: Chris Mason <clm@meta.com>
+Date: Mon, 8 Jun 2026 17:28:55 -0700
+Subject: [PATCH] fuse-uring: end fuse_req on io-uring cancel task work
+References: bsc#1012628
+Patch-mainline: 7.1.4
+Git-commit: bea4fe98204b6ce7eb8e29f7bf867dd7619b3ddd
+
+commit bea4fe98204b6ce7eb8e29f7bf867dd7619b3ddd upstream.
+
+When io_uring delivers task work with tw.cancel set (PF_EXITING,
+PF_KTHREAD fallback, or percpu_ref_is_dying on the ring context),
+fuse_uring_send_in_task() takes the cancel branch, assigns
+-ECANCELED, and falls through to fuse_uring_send(). That path only
+flips the entry to FRRS_USERSPACE and completes the io_uring cmd;
+it never discharges the ring entry's owning reference to the
+fuse_req that fuse_uring_add_req_to_ring_ent() handed it at
+dispatch time.
+
+    fuse_uring_send_in_task()
+      tw.cancel == true
+        err = -ECANCELED
+      fuse_uring_send(ent, cmd, err, issue_flags)
+        ent->state = FRRS_USERSPACE
+        list_move(&ent->list, &queue->ent_in_userspace)
+        ent->cmd = NULL
+        io_uring_cmd_done(-ECANCELED)
+        /* ent->fuse_req still set, req still hashed */
+
+The fuse_req stays linked on fpq->processing[hash] and
+fuse_request_end() is never invoked. The originating syscall
+thread blocks in D-state in request_wait_answer() until
+fuse_abort_conn() runs, which can be the entire connection
+lifetime. For FR_BACKGROUND requests fc->num_background is never
+decremented either, so repeated cancels inflate the counter until
+max_background is hit and all later background ops stall. tw.cancel does
+not imply a connection abort (e.g. a single io_uring worker thread exits
+while the fuse connection stays up), so this cannot be left for
+fuse_abort_conn() to clean up.
+
+Ending the req but still routing the entry through fuse_uring_send()
+is not enough: that leaves a req-less entry on ent_in_userspace, and
+ent_list_request_expired() dereferences ent->fuse_req unconditionally
+on the head of that list, which would then NULL-deref.
+
+Fix the cancel branch to release the entry directly. Remove it from the
+queue, complete the io_uring cmd, end the fuse_req, free the entry, and
+drop its queue_refs (waking the teardown waiter if it was the last).
+
+Fixes: c2c9af9a0b13 ("fuse: Allow to queue fg requests through io-uring")
+Cc: stable@vger.kernel.org
+Reviewed-by: Joanne Koong <joannelkoong@gmail.com>
+Assisted-by: kres (claude-opus-4-7)
+Signed-off-by: Chris Mason <clm@meta.com>
+Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/fuse/dev_uring.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index 05c3c07bc487..4ecb1d0ae59f 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -1225,11 +1225,21 @@ static void fuse_uring_send_in_task(struct io_tw_req tw_req, io_tw_token_t tw)
+ 			fuse_uring_next_fuse_req(ent, queue, issue_flags);
+ 			return;
+ 		}
++		fuse_uring_send(ent, cmd, err, issue_flags);
+ 	} else {
+ 		err = -ECANCELED;
+-	}
+ 
+-	fuse_uring_send(ent, cmd, err, issue_flags);
++		spin_lock(&queue->lock);
++		list_del_init(&ent->list);
++		spin_unlock(&queue->lock);
++
++		io_uring_cmd_done(cmd, err, issue_flags);
++
++		fuse_uring_req_end(ent, ent->fuse_req, err);
++		kfree(ent);
++		if (atomic_dec_and_test(&queue->ring->queue_refs))
++			wake_up_all(&queue->ring->stop_waitq);
++	}
+ }
+ 
+ static struct fuse_ring_queue *fuse_uring_task_to_queue(struct fuse_ring *ring)
+-- 
+2.55.0
+
