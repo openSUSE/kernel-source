@@ -1,0 +1,147 @@
+From: "Kiryl Shutsemau (Meta)" <kas@kernel.org>
+Date: Fri, 29 May 2026 18:23:27 +0100
+Subject: [PATCH] fs/proc/task_mmu: fix hugetlb self-deadlock in
+ pagemap_scan_pte_hole()
+References: bsc#1258210
+Patch-mainline: 6.18.40
+Git-commit: e92d92bbafb264dc0518d52b846a3c07ed8d523f
+
+commit e92d92bbafb264dc0518d52b846a3c07ed8d523f upstream.
+
+A PAGEMAP_SCAN ioctl requesting PM_SCAN_WP_MATCHING on a hugetlb VMA hangs
+the calling thread, unkillably, as soon as the scan reaches an unpopulated
+part of the range:
+
+  do_pagemap_scan()
+    walk_page_range()
+      walk_hugetlb_range()
+        hugetlb_vma_lock_read()           # take the vma lock for read ...
+        pagemap_scan_pte_hole()           # ... ->pte_hole() for a hole
+          uffd_wp_range()
+            change_protection()
+              hugetlb_change_protection()
+                hugetlb_vma_lock_write()  # ... and block taking it for write
+
+walk_hugetlb_range() holds the hugetlb vma lock for read across the whole
+walk.  A present entry goes to ->hugetlb_entry(); an unpopulated one goes
+to ->pte_hole(), i.e.  pagemap_scan_pte_hole().  To write-protect the hole
+that handler calls uffd_wp_range(), which on a hugetlb VMA reaches
+hugetlb_change_protection() and takes the same vma lock for write.  The
+thread then blocks in down_write() waiting for the read lock it is itself
+holding.
+
+The populated path avoids this: pagemap_scan_hugetlb_entry()
+write-protects the entry inline under the page-table lock and never enters
+hugetlb_change_protection().
+
+Do the same for holes.  Fault in the page table and install the uffd-wp
+marker directly with make_uffd_wp_huge_pte() under the page-table lock,
+rather than routing through uffd_wp_range().  That is the same sequence
+hugetlb_change_protection() runs for an unpopulated entry, minus the vma
+write lock -- which is safe to skip because PMD sharing is disabled on
+uffd-wp VMAs (hugetlb_unshare_all_pmds() runs at registration), leaving
+nothing for that lock to serialise against.
+
+Link: https://lore.kernel.org/20260529172331.356655-4-kas@kernel.org
+Fixes: 52526ca7fdb9 ("fs/proc/task_mmu: implement IOCTL to get and optionally clear info about PTEs")
+Signed-off-by: Kiryl Shutsemau <kas@kernel.org>
+Reported-by: Sashiko AI review <sashiko-bot@kernel.org>
+Assisted-by: Claude:claude-opus-4-8
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Balbir Singh <balbirs@nvidia.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/proc/task_mmu.c | 59 +++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 4c5adfd4fc1f..7e7fd3a5e68b 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -2851,8 +2851,62 @@ static int pagemap_scan_hugetlb_entry(pte_t *ptep, unsigned long hmask,
+ 
+ 	return ret;
+ }
++
++/*
++ * Write-protect the unpopulated hugetlb entries covering [addr, end) by
++ * installing uffd-wp markers inline, exactly as pagemap_scan_hugetlb_entry()
++ * does for populated entries.
++ *
++ * walk_hugetlb_range() currently calls ->pte_hole() once per huge page, so the
++ * loop normally runs a single iteration; it is written to cover the full range
++ * in case the walker ever coalesces adjacent holes.
++ *
++ * The obvious route -- uffd_wp_range() -> hugetlb_change_protection() --
++ * cannot be used here: it takes hugetlb_vma_lock_write(), but the page-table
++ * walker (walk_hugetlb_range()) already holds hugetlb_vma_lock_read() on the
++ * same VMA, so the scanning thread would deadlock against itself. PMD sharing
++ * is disabled on uffd-wp VMAs (hugetlb_unshare_all_pmds() at registration), so
++ * the vma lock guards nothing that matters for these entries anyway.
++ */
++static int pagemap_scan_hugetlb_hole_wp(struct vm_area_struct *vma,
++					unsigned long addr, unsigned long end)
++{
++	struct hstate *h = hstate_vma(vma);
++	unsigned long psize = huge_page_size(h);
++	struct mm_struct *mm = vma->vm_mm;
++	spinlock_t *ptl;
++	pte_t *ptep;
++	pte_t pte;
++
++	for (addr = ALIGN_DOWN(addr, psize); addr < end; addr += psize) {
++		ptep = huge_pte_alloc(mm, vma, addr, psize);
++		if (!ptep)
++			return -ENOMEM;
++
++		i_mmap_lock_write(vma->vm_file->f_mapping);
++		ptl = huge_pte_lock(h, mm, ptep);
++		pte = huge_ptep_get(mm, addr, ptep);
++		make_uffd_wp_huge_pte(vma, addr, ptep, pte);
++		/*
++		 * A none entry has no cached translation, so installing the
++		 * marker needs no TLB flush. Flush only if a fault populated
++		 * the entry between huge_pte_alloc() and the page table lock.
++		 */
++		if (!huge_pte_none(pte))
++			flush_hugetlb_tlb_range(vma, addr, addr + psize);
++		spin_unlock(ptl);
++		i_mmap_unlock_write(vma->vm_file->f_mapping);
++	}
++
++	return 0;
++}
+ #else
+ #define pagemap_scan_hugetlb_entry NULL
++static int pagemap_scan_hugetlb_hole_wp(struct vm_area_struct *vma,
++					unsigned long addr, unsigned long end)
++{
++	return 0;
++}
+ #endif
+ 
+ static int pagemap_scan_pte_hole(unsigned long addr, unsigned long end,
+@@ -2872,7 +2926,10 @@ static int pagemap_scan_pte_hole(unsigned long addr, unsigned long end,
+ 	if (~p->arg.flags & PM_SCAN_WP_MATCHING)
+ 		return ret;
+ 
+-	err = uffd_wp_range(vma, addr, end - addr, true);
++	if (is_vm_hugetlb_page(vma))
++		err = pagemap_scan_hugetlb_hole_wp(vma, addr, end);
++	else
++		err = uffd_wp_range(vma, addr, end - addr, true);
+ 	if (err < 0)
+ 		ret = err;
+ 
+-- 
+2.53.0
+

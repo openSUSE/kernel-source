@@ -1,0 +1,228 @@
+From: "Rafael J. Wysocki" <rafael.j.wysocki@intel.com>
+Date: Fri, 10 Jul 2026 11:47:10 -0400
+Subject: [PATCH] ACPI: NFIT: core: Fix possible deadlock and missing
+ notifications
+References: bsc#1258210
+Patch-mainline: 6.18.40
+Git-commit: 18a00ed0e718473f5c3fcfa49df46c944575e60c
+
+[ Upstream commit 18a00ed0e718473f5c3fcfa49df46c944575e60c ]
+
+After commit 9b311b7313d6 ("ACPI: NFIT: Install Notify() handler before
+getting NFIT table"), ACPI NFIT driver removal may deadlock if an ACPI
+notify on the NFIT device is triggered concurrently.  A similar deadlock
+may occur if an ACPI notify on the NFIT device is triggered during a
+failing driver probe.
+
+The deadlock is possible because acpi_dev_remove_notify_handler() calls
+acpi_os_wait_events_complete() after removing the notify handler and the
+driver core invokes it under the NFIT platform device lock which is also
+acquired by acpi_nfit_notify().  Thus acpi_os_wait_events_complete() may
+be waiting for acpi_nfit_notify() to complete, but the latter may not be
+able to acquire the device lock which is being held by the driver core
+while the former is being executed.
+
+Moreover, after commit 03667e146f81 ("ACPI: NFIT: core: Convert the
+driver to a platform one"), there are no sysfs notifications regarding
+NVDIMM devices because __acpi_nvdimm_notify() always bails out after
+checking the driver data pointer of the device's parent.  That parent
+is the ACPI companion of the platform device used for driver binding,
+so its driver data pointer is always NULL after the commit in question
+which was overlooked by it.
+
+A remedy for the deadlock is to use a special separate lock for ACPI
+notify synchronization with driver probe and removal instead of the
+device lock of the NFIT device, while a remedy for the second issue
+is to populate the driver data pointer of the NFIT device's ACPI
+companion when the driver is ready to operate, so do both these things.
+However, since the new lock is not held across the entire teardown and
+acpi_nfit_notify() should do nothing when teardown is in progress, make
+it check the driver data pointer of the NFIT device's ACPI companion, in
+analogy with the existing check in __acpi_nvdimm_notify(), and bail out
+if that pointer is NULL.
+
+Fixes: 9b311b7313d6 ("ACPI: NFIT: Install Notify() handler before getting NFIT table")
+Fixes: 03667e146f81 ("ACPI: NFIT: core: Convert the driver to a platform one")
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Cc: All applicable <stable@vger.kernel.org> # 9995e4404ea4: ACPI: NFIT: core: Eliminate redundant local variable
+Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://patch.msgid.link/3420096.aeNJFYEL58@rafael.j.wysocki
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/acpi/bus.c       |  6 +++-
+ drivers/acpi/nfit/core.c | 62 +++++++++++++++++++++++++++++++---------
+ 2 files changed, 54 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/acpi/bus.c b/drivers/acpi/bus.c
+index c2ea10e6a266..222a6bc61644 100644
+--- a/drivers/acpi/bus.c
++++ b/drivers/acpi/bus.c
+@@ -623,6 +623,7 @@ void acpi_dev_remove_notify_handler(struct acpi_device *adev,
+ EXPORT_SYMBOL_GPL(acpi_dev_remove_notify_handler);
+ 
+ struct acpi_notify_handler_devres {
++	struct acpi_device *adev;
+ 	acpi_notify_handler handler;
+ 	u32 handler_type;
+ };
+@@ -631,7 +632,7 @@ static void devm_acpi_notify_handler_release(struct device *dev, void *res)
+ {
+ 	struct acpi_notify_handler_devres *dr = res;
+ 
+-	acpi_dev_remove_notify_handler(ACPI_COMPANION(dev), dr->handler_type,
++	acpi_dev_remove_notify_handler(dr->adev, dr->handler_type,
+ 				       dr->handler);
+ }
+ 
+@@ -667,6 +668,8 @@ int devm_acpi_install_notify_handler(struct device *dev, u32 handler_type,
+ 	int ret;
+ 
+ 	adev = ACPI_COMPANION(dev);
++	if (!adev && dev->bus == &acpi_bus_type)
++		adev = to_acpi_device(dev);
+ 	if (!adev)
+ 		return dev_err_probe(dev, -ENODEV, "No ACPI companion in %s()\n", __func__);
+ 
+@@ -680,6 +683,7 @@ int devm_acpi_install_notify_handler(struct device *dev, u32 handler_type,
+ 		return dev_err_probe(dev, ret, "Failed to install an ACPI notify handler\n");
+ 	}
+ 
++	dr->adev = adev;
+ 	dr->handler = handler;
+ 	dr->handler_type = handler_type;
+ 	devres_add(dev, dr);
+diff --git a/drivers/acpi/nfit/core.c b/drivers/acpi/nfit/core.c
+index 0a43b6cfa12a..633eb625f037 100644
+--- a/drivers/acpi/nfit/core.c
++++ b/drivers/acpi/nfit/core.c
+@@ -55,6 +55,8 @@ MODULE_PARM_DESC(force_labels, "Opt-in to labels despite missing methods");
+ LIST_HEAD(acpi_descs);
+ DEFINE_MUTEX(acpi_desc_lock);
+ 
++DEFINE_MUTEX(acpi_notify_lock);
++
+ static struct workqueue_struct *nfit_wq;
+ 
+ struct nfit_table_prev {
+@@ -1702,9 +1704,15 @@ static void acpi_nvdimm_notify(acpi_handle handle, u32 event, void *data)
+ 	struct acpi_device *adev = data;
+ 	struct device *dev = &adev->dev;
+ 
+-	device_lock(dev->parent);
+-	__acpi_nvdimm_notify(dev, event);
+-	device_unlock(dev->parent);
++	/*
++	 * Locking is needed here for synchronization with driver probe and
++	 * removal and the parent NFIT device's ACPI driver data pointer is
++	 * NULL when teardown is in progress.
++	 */
++	guard(mutex)(&acpi_notify_lock);
++
++	if (acpi_driver_data(to_acpi_device(dev->parent)))
++		__acpi_nvdimm_notify(dev, event);
+ }
+ 
+ static bool acpi_nvdimm_has_method(struct acpi_device *adev, char *method)
+@@ -3150,11 +3158,10 @@ EXPORT_SYMBOL_GPL(acpi_nfit_init);
+ static int acpi_nfit_flush_probe(struct nvdimm_bus_descriptor *nd_desc)
+ {
+ 	struct acpi_nfit_desc *acpi_desc = to_acpi_desc(nd_desc);
+-	struct device *dev = acpi_desc->dev;
+ 
+-	/* Bounce the device lock to flush acpi_nfit_add / acpi_nfit_notify */
+-	device_lock(dev);
+-	device_unlock(dev);
++	/* Bounce the notify lock to flush acpi_nfit_add / acpi_nfit_notify */
++	mutex_lock(&acpi_notify_lock);
++	mutex_unlock(&acpi_notify_lock);
+ 
+ 	/* Bounce the init_mutex to complete initial registration */
+ 	mutex_lock(&acpi_desc->init_mutex);
+@@ -3286,10 +3293,17 @@ static void acpi_nfit_put_table(void *table)
+ static void acpi_nfit_notify(acpi_handle handle, u32 event, void *data)
+ {
+ 	struct device *dev = data;
++	struct acpi_device *adev = to_acpi_device(dev);
+ 
+-	device_lock(dev);
+-	__acpi_nfit_notify(dev, handle, event);
+-	device_unlock(dev);
++	/*
++	 * Locking is needed here for synchronization with driver probe and
++	 * removal and the ACPI driver data pointer is NULL when teardown
++	 * is in progress.
++	 */
++	guard(mutex)(&acpi_notify_lock);
++
++	if (acpi_driver_data(adev))
++		__acpi_nfit_notify(dev, handle, event);
+ }
+ 
+ void acpi_nfit_shutdown(void *data)
+@@ -3336,6 +3350,12 @@ static int acpi_nfit_add(struct acpi_device *adev)
+ 	acpi_size sz;
+ 	int rc = 0;
+ 
++	/*
++	 * Prevent acpi_nfit_notify() from progressing until the probe is
++	 * complete in case there is a concurrent event to process.
++	 */
++	guard(mutex)(&acpi_notify_lock);
++
+ 	rc = devm_acpi_install_notify_handler(dev, ACPI_DEVICE_NOTIFY,
+ 					      acpi_nfit_notify, dev);
+ 	if (rc)
+@@ -3351,6 +3371,11 @@ static int acpi_nfit_add(struct acpi_device *adev)
+ 		 * data in the format of a series of NFIT Structures.
+ 		 */
+ 		dev_dbg(dev, "failed to find NFIT at startup\n");
++		/*
++		 * Let acpi_nfit_update_notify() run in case it will need to
++		 * allocate the acpi_desc object.
++		 */
++		adev->driver_data = dev;
+ 		return 0;
+ 	}
+ 
+@@ -3368,7 +3393,7 @@ static int acpi_nfit_add(struct acpi_device *adev)
+ 	acpi_desc->acpi_header = *tbl;
+ 
+ 	/* Evaluate _FIT and override with that if present */
+-	status = acpi_evaluate_object(ACPI_HANDLE(dev), "_FIT", NULL, &buf);
++	status = acpi_evaluate_object(adev->handle, "_FIT", NULL, &buf);
+ 	if (ACPI_SUCCESS(status) && buf.length > 0) {
+ 		union acpi_object *obj = buf.pointer;
+ 
+@@ -3385,14 +3410,25 @@ static int acpi_nfit_add(struct acpi_device *adev)
+ 				+ sizeof(struct acpi_table_nfit),
+ 				sz - sizeof(struct acpi_table_nfit));
+ 
+-	if (rc)
++	if (rc) {
+ 		acpi_nfit_shutdown(acpi_desc);
++		return rc;
++	}
+ 
+-	return rc;
++	/*
++	 * Let notify handlers operate (the actual value of the ACPI driver
++	 * data pointer does not matter here so long as it is not NULL).
++	 */
++	adev->driver_data = dev;
++	return 0;
+ }
+ 
+ static void acpi_nfit_remove(struct acpi_device *adev)
+ {
++	guard(mutex)(&acpi_notify_lock);
++
++	/* Make notify handlers bail out early going forward. */
++	adev->driver_data = NULL;
+ 	acpi_nfit_shutdown(dev_get_drvdata(&adev->dev));
+ }
+ 
+-- 
+2.53.0
+
