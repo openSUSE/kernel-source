@@ -1,7 +1,7 @@
 import itertools
 import unittest
 
-import www_authenticate
+from www_authenticate import www_authenticate
 
 challenges = (
     ('Negotiate',
