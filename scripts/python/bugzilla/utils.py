@@ -1,6 +1,7 @@
 import bugzilla, os, re, sys
 import xmlrpc.client
 from bugzilla._cli import DEFAULT_BZ
+from datetime import datetime, timedelta
 
 CVSS_PATTERN = re.compile(r"CVSSv3.1:SUSE:CVE-[0-9]{4}-[0-9]{4,}:([0-9].[0-9])")
 
@@ -13,6 +14,24 @@ def handle_email(email):
 def get_score(s):
     m = re.search(CVSS_PATTERN, s)
     return m.group(1) if m else ''
+
+def calculate_deadline(reported: datetime, cvss):
+    base_cvss = int(cvss.split('.', maxsplit=1)[0])
+    if base_cvss >= 9:
+        sla = timedelta(days=30)
+    elif base_cvss >= 7:
+        sla = timedelta(days=30)
+        # make sure there is some head room before the submission and spill
+        # over to another submission if we are too close
+        if reported.day > 20:
+            sla = timedelta(days=50)
+    elif base_cvss >= 4:
+        sla = timedelta(days=90)
+    else:
+        sla = timedelta(days=120)
+
+    deadline = (reported + sla).date().replace(day=1)
+    return deadline
 
 def get_bugzilla_api(rest=False):
     bzapi = bugzilla.Bugzilla(url=None, force_rest=rest)

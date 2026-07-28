@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-from datetime import datetime
+from xmlrpc.client import DateTime
 import tempfile
 import unittest
 import sys
@@ -45,15 +45,28 @@ class BZMock:
 class TestDispatchCves(unittest.TestCase):
     def setUp(self):
         self.bzapi = BZMock()
-        self.file = tempfile.NamedTemporaryFile('w', encoding='utf-8')
-        self.file.write("""
+
+        inputs = ["""
 Security fix for CVE-2026-53035 bsc#1269190 with CVSS 5.5
 ASSIGNEE: mkoutny@suse.com
 CC: mkoutny@suse.com
 
 NO ACTION NEEDED
-""".lstrip())
-        self.file.flush()
+""",
+                  """
+Security fix for CVE-2026-53035 bsc#1269190 with CVSS 7.0
+ASSIGNEE: mkoutny@suse.com
+CC: mkoutny@suse.com
+
+NO ACTION NEEDED
+""",
+                  ]
+        self.mockfiles = []
+        for i in inputs:
+            file = tempfile.NamedTemporaryFile('w', encoding='utf-8')
+            file.write(i.lstrip())
+            file.flush()
+            self.mockfiles.append(file)
 
         self.bzapi.mockbugs.append(DictObj({
             'id': 1269190,
@@ -62,11 +75,13 @@ NO ACTION NEEDED
             'cc': [],
             'flags': [],
             'product': 'SUSE Security Incidents',
+            'creation_time': DateTime('20260625T15:30:48'),
             }))
 
 
     def tearDown(self):
-        self.file.close()
+        for f in self.mockfiles:
+            f.close()
 
 
     def test_single_dispatch(self):
@@ -76,7 +91,7 @@ NO ACTION NEEDED
 
         ret = dispatch_cves.single_dispatch(
                 self.bzapi,
-                self.file.name,
+                self.mockfiles[0].name,
                 False,
                 True, # yes
                 False,
@@ -90,3 +105,29 @@ NO ACTION NEEDED
         self.assertEqual(self.bzapi.updates[1269190]['assigned_to'],
                          'kernel-security-sentinel@lists.suse.com') # because no force
         self.assertIn('mkoutny@suse.com', self.bzapi.updates[1269190]['cc_add'])
+
+    def test_single_dispatch_deadline(self):
+        for creation, exp_deadline, file_idx in [
+                ('20260625T15:30:48', '2026-09-01', 0),
+                ('20260625T15:30:48', '2026-08-01', 1),
+                ]:
+            with self.subTest("Interval {}-{}".format(creation, exp_deadline)):
+                self.bzapi.mockbugs[0].update({
+                    'assigned_to': 'kernel-bugs@suse.de',
+                    'creation_time': DateTime(creation),
+                })
+
+                ret = dispatch_cves.single_dispatch(
+                        self.bzapi,
+                        self.mockfiles[file_idx].name,
+                        False,
+                        True, # yes
+                        False,
+                        None,
+                        False
+                        )
+                self.assertEqual(ret, None)
+                self.assertIn(1269190, self.bzapi.updates)
+                self.assertIn('deadline', self.bzapi.updates[1269190])
+                self.assertEqual(self.bzapi.updates[1269190]['deadline'],
+                                 exp_deadline)

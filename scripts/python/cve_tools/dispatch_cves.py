@@ -3,12 +3,13 @@ import re
 import sys
 import argparse
 import textwrap
-from bugzilla.utils import make_url, make_unique
+from bugzilla.utils import make_url, make_unique, calculate_deadline, format_time
 
 # dispatch-cves script - is based on python-bugzilla (our in-tree patched copy) and requests libraries
 # for now this script should be kept Python 3.6 compatible (SLE15-SP7)
 
 BSC_PATTERN = re.compile(r'\sbsc#([0-9][0-9]*)\s')
+CVSS_PATTERN = re.compile(r'\swith\s+CVSS\s*([0-9]?[0-9](\.[0-9]*)?)\s')
 MAINTAINERS_PATTERN = re.compile(r'\s(\S+\@suse.\S+\s\([0-9]+\))')
 EMAIL_PATTERN = re.compile(r'[\s,:](\S+\@suse.\S+)')
 CC_PATTERN = re.compile(r'^\s*CC[\s:]\s*(\S+\@suse.\S+[,\s]*)+$')
@@ -23,12 +24,13 @@ COMMENT_BANLIST = [ 'swamp@suse.de', 'bwiedemann+obsbugzillabot@suse.com', 'main
 MIN_COMMENTS = 2
 
 class BugUpdate:
-    def __init__(self, path_to_remove, bug, comment_lines, to_append, email, action, cc_list=None, needinfo_list=None):
+    def __init__(self, path_to_remove, bug, cvss, comment_lines, to_append, email, action, cc_list=None, needinfo_list=None):
         self.path_to_remove = path_to_remove
         self.comment = "".join(comment_lines) + to_append
         self.email = email
         self.original_email = '<unknown>'
         self.bug = bug
+        self.in_cvss = cvss
         self.action = action
         self.already_dispatched = False
         self.unknown_state = False
@@ -38,13 +40,21 @@ class BugUpdate:
         self.needinfo_list = needinfo_list if needinfo_list else []
         self.cc_add = []
         self.cve = ''
+        self.deadline = None
         self.any_flags = False
         self.bz_comments = []
         self.human_comments = []
 
     def __str__(self):
-        return f"{make_url(self.bug)} {self.cve:<14} {self.action:<9} ({self.original_email} -> {self.email}"\
-        f"{', CC: ' + ', '.join(self.cc_add) if self.cc_add else ''}{', NEEDINFO: ' + ', '.join(self.needinfo_list) if self.needinfo_list else ''})"
+        return "{} {:<14} {:<9} ({} -> {}{}{}{})".format(
+                make_url(self.bug),
+                self.cve,
+                self.action,
+                self.original_email, self.email,
+                ', CC: ' + ', '.join(self.cc_add) if self.cc_add else '',
+                ', NEEDINFO: ' + ', '.join(self.needinfo_list) if self.needinfo_list else '',
+                ', DEADLINE: ' + str(self.deadline) if self.deadline else '',
+                )
 
     def dispatch_to_bugzilla(self, bzapi, force, allow_same_assignee):
         if self.self_assign and not force and not allow_same_assignee:
@@ -58,6 +68,9 @@ class BugUpdate:
             bargs['cc_add'] = self.cc_add
         if self.needinfo_list and not self.any_flags:
             bargs['flags'] = [ { 'name': 'needinfo', 'requestee': rmail, 'status': '?', 'type_id': 4 } for rmail in self.needinfo_list ]
+        if self.deadline is not None:
+            bargs['deadline'] = self.deadline.strftime('%Y-%m-%d')
+
         vals = bzapi.build_update(**bargs)
         if self.any_flags:
             print(f'Warning: bsc#{self.bug} has already flags set, skipping needinfo update!', file=sys.stderr)
@@ -108,7 +121,8 @@ def ask_user(bzapi, todo, yes, force, allow_same_assignee):
 def update_bug_metadata(bzapi, todo):
     bugs, comments = None, None
     try:
-        bugs = bzapi.getbugs([ b.bug for b in todo ], include_fields=["id", "assigned_to", "alias", "cc", "flags", "product"])
+        bugs = bzapi.getbugs([ b.bug for b in todo ], include_fields=[
+            "id", "assigned_to", "alias", "cc", "flags", "product", "deadline", "creation_time"])
         comments = bzapi.get_comments([ b.bug for b in todo ])
     except Exception as e:
         print(f"Couldn't query bugzilla: {e}", file=sys.stderr)
@@ -125,6 +139,8 @@ def update_bug_metadata(bzapi, todo):
         b.original_email = bugmap[b.bug].assigned_to    if b.bug in bugmap else '<unknown>'
         b.any_flags = bool(bugmap[b.bug].flags)         if b.bug in bugmap else False
         b.product = bugmap[b.bug].product               if b.bug in bugmap else ''
+        b.deadline = calculate_deadline(format_time(bugmap[b.bug].creation_time), b.in_cvss) \
+                                                        if b.bug in bugmap else None
 
         if b.bug in bugmap:
             b.cc_add = list(set(b.cc_list) - set(bugmap[b.bug].cc))
@@ -139,6 +155,7 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
     with open(path, 'r') as f:
         decided = False
         bug = 0
+        cvss = None
         comment_lines = []
         candidates = []
         candidate_emails = []
@@ -152,6 +169,9 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
                 m = re.search(BSC_PATTERN, l)
                 if m:
                     bug = int(m.group(1))
+                m = re.search(CVSS_PATTERN, l)
+                if m:
+                    cvss = m.group(1)
             if l.startswith('NO CODESTREAM AFFECTED') or l.startswith('NO ACTION NEEDED'):
                 candidate_emails = [ SECURITY_EMAIL ]
                 decided = True
@@ -226,7 +246,7 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
                 email = candidate_emails[answer - 1]
             break
         to_add = ''
-        to_dispatch.append(BugUpdate(path if remove_file else None, bug, comment_lines, to_add, email, 'developer', cc_list, needinfo_list))
+        to_dispatch.append(BugUpdate(path if remove_file else None, bug, cvss, comment_lines, to_add, email, 'developer', cc_list, needinfo_list))
 
 def single_dispatch(bzapi, path, remove_file, yes, force, cc_us, allow_same_assignee):
     to_dispatch = []
