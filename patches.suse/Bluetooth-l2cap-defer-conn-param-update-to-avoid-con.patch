@@ -1,0 +1,218 @@
+From 91b5a598b5285da794b72619f31777b62dd336f8 Mon Sep 17 00:00:00 2001
+From: Mikhail Gavrilov <mikhail.v.gavrilov@gmail.com>
+Date: Wed, 15 Apr 2026 02:52:37 +0500
+Subject: Bluetooth: l2cap: defer conn param update to avoid conn->lock/hdev->lock inversion
+Git-commit: 91b5a598b5285da794b72619f31777b62dd336f8
+Patch-mainline: v7.1-rc3
+References: git-fixes
+
+[ backport note: replaced kzalloc_obj() with open code ]
+
+When a BLE peripheral sends an L2CAP Connection Parameter Update Request
+the processing path is:
+
+  process_pending_rx()          [takes conn->lock]
+    l2cap_le_sig_channel()
+      l2cap_conn_param_update_req()
+        hci_le_conn_update()    [takes hdev->lock]
+
+Meanwhile other code paths take the locks in the opposite order:
+
+  l2cap_chan_connect()          [takes hdev->lock]
+    ...
+      mutex_lock(&conn->lock)
+
+  l2cap_conn_ready()            [hdev->lock via hci_cb_list_lock]
+    ...
+      mutex_lock(&conn->lock)
+
+This is a classic AB/BA deadlock which lockdep reports as a circular
+locking dependency when connecting a BLE MIDI keyboard (Carry-On FC-49).
+
+Fix this by making hci_le_conn_update() defer the HCI command through
+hci_cmd_sync_queue() so it no longer needs to take hdev->lock in the
+caller context.  The sync callback uses __hci_cmd_sync_status_sk() to
+wait for the HCI_EV_LE_CONN_UPDATE_COMPLETE event, then updates the
+stored connection parameters (hci_conn_params) and notifies userspace
+(mgmt_new_conn_param) only after the controller has confirmed the update.
+
+A reference on hci_conn is held via hci_conn_get()/hci_conn_put() for
+the lifetime of the queued work to prevent use-after-free, and
+hci_conn_valid() is checked before proceeding in case the connection was
+removed while the work was pending.  The hci_dev_lock is held across
+hci_conn_valid() and all conn field accesses to prevent a concurrent
+disconnect from invalidating the connection mid-use.
+
+Fixes: f044eb0524a0 ("Bluetooth: Store latency and supervision timeout in connection params")
+Signed-off-by: Mikhail Gavrilov <mikhail.v.gavrilov@gmail.com>
+Reviewed-by: Paul Menzel <pmenzel@molgen.mpg.de>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ include/net/bluetooth/hci_core.h |    2 
+ net/bluetooth/hci_conn.c         |  105 +++++++++++++++++++++++++++++++--------
+ net/bluetooth/l2cap_core.c       |   12 ----
+ 3 files changed, 89 insertions(+), 30 deletions(-)
+
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -2463,7 +2463,7 @@ void mgmt_adv_monitor_device_lost(struct
+ 				  bdaddr_t *bdaddr, u8 addr_type);
+ 
+ int hci_abort_conn(struct hci_conn *conn, u8 reason);
+-u8 hci_le_conn_update(struct hci_conn *conn, u16 min, u16 max, u16 latency,
++void hci_le_conn_update(struct hci_conn *conn, u16 min, u16 max, u16 latency,
+ 		      u16 to_multiplier);
+ void hci_le_start_enc(struct hci_conn *conn, __le16 ediv, __le64 rand,
+ 		      __u8 ltk[16], __u8 key_size);
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@ -480,40 +480,107 @@ bool hci_setup_sync(struct hci_conn *con
+ 	return hci_setup_sync_conn(conn, handle);
+ }
+ 
+-u8 hci_le_conn_update(struct hci_conn *conn, u16 min, u16 max, u16 latency,
+-		      u16 to_multiplier)
++struct le_conn_update_data {
++	struct hci_conn *conn;
++	u16	min;
++	u16	max;
++	u16	latency;
++	u16	to_multiplier;
++};
++
++static int le_conn_update_sync(struct hci_dev *hdev, void *data)
+ {
+-	struct hci_dev *hdev = conn->hdev;
++	struct le_conn_update_data *d = data;
++	struct hci_conn *conn = d->conn;
+ 	struct hci_conn_params *params;
+ 	struct hci_cp_le_conn_update cp;
++	u16 timeout;
++	u8 store_hint;
++	int err;
++
++	/* Verify connection is still alive and read conn fields under
++	 * the same lock to prevent a concurrent disconnect from freeing
++	 * or reusing the connection while we build the HCI command.
++	 */
++	hci_dev_lock(hdev);
++
++	if (!hci_conn_valid(hdev, conn)) {
++		hci_dev_unlock(hdev);
++		return -ECANCELED;
++	}
++
++	memset(&cp, 0, sizeof(cp));
++	cp.handle		= cpu_to_le16(conn->handle);
++	cp.conn_interval_min	= cpu_to_le16(d->min);
++	cp.conn_interval_max	= cpu_to_le16(d->max);
++	cp.conn_latency		= cpu_to_le16(d->latency);
++	cp.supervision_timeout	= cpu_to_le16(d->to_multiplier);
++	cp.min_ce_len		= cpu_to_le16(0x0000);
++	cp.max_ce_len		= cpu_to_le16(0x0000);
++	timeout			= conn->conn_timeout;
++
++	hci_dev_unlock(hdev);
+ 
++	err = __hci_cmd_sync_status_sk(hdev, HCI_OP_LE_CONN_UPDATE,
++				       sizeof(cp), &cp,
++				       HCI_EV_LE_CONN_UPDATE_COMPLETE,
++				       timeout, NULL);
++	if (err)
++		return err;
++
++	/* Update stored connection parameters after the controller has
++	 * confirmed the update via the LE Connection Update Complete event.
++	 */
+ 	hci_dev_lock(hdev);
+ 
+ 	params = hci_conn_params_lookup(hdev, &conn->dst, conn->dst_type);
+ 	if (params) {
+-		params->conn_min_interval = min;
+-		params->conn_max_interval = max;
+-		params->conn_latency = latency;
+-		params->supervision_timeout = to_multiplier;
++		params->conn_min_interval = d->min;
++		params->conn_max_interval = d->max;
++		params->conn_latency = d->latency;
++		params->supervision_timeout = d->to_multiplier;
++		store_hint = 0x01;
++	} else {
++		store_hint = 0x00;
+ 	}
+ 
+ 	hci_dev_unlock(hdev);
+ 
+-	memset(&cp, 0, sizeof(cp));
+-	cp.handle		= cpu_to_le16(conn->handle);
+-	cp.conn_interval_min	= cpu_to_le16(min);
+-	cp.conn_interval_max	= cpu_to_le16(max);
+-	cp.conn_latency		= cpu_to_le16(latency);
+-	cp.supervision_timeout	= cpu_to_le16(to_multiplier);
+-	cp.min_ce_len		= cpu_to_le16(0x0000);
+-	cp.max_ce_len		= cpu_to_le16(0x0000);
++	mgmt_new_conn_param(hdev, &conn->dst, conn->dst_type, store_hint,
++			    d->min, d->max, d->latency, d->to_multiplier);
+ 
+-	hci_send_cmd(hdev, HCI_OP_LE_CONN_UPDATE, sizeof(cp), &cp);
++	return 0;
++}
+ 
+-	if (params)
+-		return 0x01;
++static void le_conn_update_complete(struct hci_dev *hdev, void *data, int err)
++{
++	struct le_conn_update_data *d = data;
+ 
+-	return 0x00;
++	hci_conn_put(d->conn);
++	kfree(d);
++}
++
++void hci_le_conn_update(struct hci_conn *conn, u16 min, u16 max, u16 latency,
++			u16 to_multiplier)
++{
++	struct le_conn_update_data *d;
++
++	d = kzalloc(sizeof(*d), GFP_KERNEL);
++	if (!d)
++		return;
++
++	hci_conn_get(conn);
++	d->conn = conn;
++	d->min = min;
++	d->max = max;
++	d->latency = latency;
++	d->to_multiplier = to_multiplier;
++
++	if (hci_cmd_sync_queue(conn->hdev, le_conn_update_sync, d,
++			       le_conn_update_complete) < 0) {
++		hci_conn_put(conn);
++		kfree(d);
++	}
+ }
+ 
+ void hci_le_start_enc(struct hci_conn *conn, __le16 ediv, __le64 rand,
+--- a/net/bluetooth/l2cap_core.c
++++ b/net/bluetooth/l2cap_core.c
+@@ -4711,16 +4711,8 @@ static inline int l2cap_conn_param_updat
+ 	l2cap_send_cmd(conn, cmd->ident, L2CAP_CONN_PARAM_UPDATE_RSP,
+ 		       sizeof(rsp), &rsp);
+ 
+-	if (!err) {
+-		u8 store_hint;
+-
+-		store_hint = hci_le_conn_update(hcon, min, max, latency,
+-						to_multiplier);
+-		mgmt_new_conn_param(hcon->hdev, &hcon->dst, hcon->dst_type,
+-				    store_hint, min, max, latency,
+-				    to_multiplier);
+-
+-	}
++	if (!err)
++		hci_le_conn_update(hcon, min, max, latency, to_multiplier);
+ 
+ 	return 0;
+ }
