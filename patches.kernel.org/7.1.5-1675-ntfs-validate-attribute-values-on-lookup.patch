@@ -1,0 +1,293 @@
+From: DaeMyung Kang <charsyam@gmail.com>
+Date: Sat, 30 May 2026 23:35:09 +0900
+Subject: [PATCH] ntfs: validate attribute values on lookup
+References: bsc#1012628
+Patch-mainline: 7.1.5
+Git-commit: d5803e3345dae9c6470bb61869885236276b9a35
+
+commit d5803e3345dae9c6470bb61869885236276b9a35 upstream.
+
+ntfs_attr_find() and ntfs_external_attr_find() check that generic
+resident attribute values fit in their attribute records and that
+fixed-size resident values are large enough. For variable-length resident
+formats, however, the fixed part is not enough: embedded length fields
+can still point callers past the resident value.
+
+A crafted image can set a small resident $FILE_NAME value_length while
+leaving file_name_length large. Callers then trust file_name_length and
+read past the resident value when converting or comparing the name. This
+was reproduced with a crafted image under KASAN as a slab-out-of-bounds
+read from the kmalloc-1k MFT record copy. The stack included
+ntfs_lookup(), ntfs_iget(), ntfs_read_locked_inode(), ntfs_attr_name_get(),
+ntfs_ucstonls(), and utf16s_to_utf8s().
+
+Add a shared attribute value validator and use it before a lookup path
+can return an attribute, including the AT_UNUSED enumeration case where
+callers inspect returned attributes directly. The helper validates
+resident value bounds, minimum resident value sizes, variable-length
+$FILE_NAME fields, and non-resident mapping-pairs metadata that was
+previously checked separately in both lookup paths.
+
+This also preserves the intended resident @val matching semantics in the
+external attribute lookup path. The old duplicated validation block
+overwrote the actual resident value length with the type-specific minimum
+length before comparing @val, so variable-length resident values could
+fail to match even when the bytes were identical. Keep the comparison on
+the actual value length, and make ntfs_attrlist_entry_add() compare
+resident attributes with lowest_vcn zero instead of reading the
+non-resident union member after a successful resident match.
+
+Reject non-resident $FILE_NAME records too: the format requires
+$FILE_NAME to be resident and callers treat returned records as resident.
+
+Cc: stable@vger.kernel.org # v7.1
+Fixes: 6ceb4cc81ef3 ("ntfs: add bound checking to ntfs_attr_find")
+Signed-off-by: DaeMyung Kang <charsyam@gmail.com>
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/ntfs/attrib.c   | 160 ++++++++++++++++++++++++++++-----------------
+ fs/ntfs/attrlist.c |  11 +++-
+ 2 files changed, 107 insertions(+), 64 deletions(-)
+
+diff --git a/fs/ntfs/attrib.c b/fs/ntfs/attrib.c
+index e8dc4b07bd97..114c965d1094 100644
+--- a/fs/ntfs/attrib.c
++++ b/fs/ntfs/attrib.c
+@@ -595,6 +595,97 @@ static u32 ntfs_resident_attr_min_value_length(const __le32 type)
+ 	}
+ }
+ 
++static bool ntfs_file_name_attr_value_is_valid(const u8 *value, const u32 value_length)
++{
++	const struct file_name_attr *fn;
++	u32 file_name_size;
++
++	fn = (const struct file_name_attr *)value;
++	file_name_size = fn->file_name_length * sizeof(__le16);
++
++	return file_name_size <=
++			value_length - offsetof(struct file_name_attr, file_name);
++}
++
++struct ntfs_resident_attr_value {
++	const u8 *data;
++	u32 len;
++};
++
++static bool ntfs_resident_attr_value_get(const struct attr_record *a,
++					 struct ntfs_resident_attr_value *value)
++{
++	u32 attr_len;
++	u16 value_offset;
++
++	attr_len = le32_to_cpu(a->length);
++	if (attr_len < offsetof(struct attr_record, data.resident.reserved) +
++			sizeof(a->data.resident.reserved))
++		return false;
++
++	value->len = le32_to_cpu(a->data.resident.value_length);
++	value_offset = le16_to_cpu(a->data.resident.value_offset);
++
++	if (value->len > attr_len || value_offset > attr_len - value->len)
++		return false;
++
++	value->data = (const u8 *)a + value_offset;
++	return true;
++}
++
++static bool ntfs_non_resident_attr_value_is_valid(const struct attr_record *a)
++{
++	u32 attr_len;
++	u32 min_len;
++	u16 mp_offset;
++
++	attr_len = le32_to_cpu(a->length);
++	min_len = offsetof(struct attr_record, data.non_resident.initialized_size) +
++		  sizeof(a->data.non_resident.initialized_size);
++	if (attr_len < min_len)
++		return false;
++
++	mp_offset = le16_to_cpu(a->data.non_resident.mapping_pairs_offset);
++	return mp_offset >= min_len && mp_offset <= attr_len;
++}
++
++static bool ntfs_attr_value_is_valid(struct ntfs_volume *vol,
++				     const struct attr_record *a,
++				     const u64 mft_no)
++{
++	struct ntfs_resident_attr_value value;
++	u32 min_len;
++
++	if (a->non_resident) {
++		if (a->type == AT_FILE_NAME)
++			goto corrupt;
++		if (!ntfs_non_resident_attr_value_is_valid(a))
++			goto corrupt;
++		return true;
++	}
++
++	if (!ntfs_resident_attr_value_get(a, &value))
++		goto corrupt;
++
++	min_len = ntfs_resident_attr_min_value_length(a->type);
++	if (min_len && value.len < min_len)
++		goto corrupt;
++
++	switch (a->type) {
++	case AT_FILE_NAME:
++		if (!ntfs_file_name_attr_value_is_valid(value.data, value.len))
++			goto corrupt;
++		break;
++	}
++	return true;
++
++corrupt:
++	ntfs_error(vol->sb,
++		   "Corrupt %#x attribute in MFT record %llu\n",
++		   le32_to_cpu(a->type), mft_no);
++	return false;
++}
++
+ /*
+  * ntfs_attr_find - find (next) attribute in mft record
+  * @type:	attribute type to find
+@@ -705,8 +796,11 @@ static int ntfs_attr_find(const __le32 type, const __le16 *name,
+ 			}
+ 		}
+ 
+-		if (type == AT_UNUSED)
++		if (type == AT_UNUSED) {
++			if (!ntfs_attr_value_is_valid(vol, a, ctx->ntfs_ino->mft_no))
++				break;
+ 			return 0;
++		}
+ 		if (a->type != type)
+ 			continue;
+ 		/*
+@@ -747,37 +841,8 @@ static int ntfs_attr_find(const __le32 type, const __le16 *name,
+ 			}
+ 		}
+ 
+-		 /* Validate attribute's value offset/length */
+-		if (!a->non_resident) {
+-			u32 min_len;
+-			u32 value_length = le32_to_cpu(a->data.resident.value_length);
+-			u16 value_offset = le16_to_cpu(a->data.resident.value_offset);
+-
+-			if (value_length > le32_to_cpu(a->length) ||
+-			    value_offset > le32_to_cpu(a->length) - value_length)
+-				break;
+-
+-			min_len = ntfs_resident_attr_min_value_length(a->type);
+-			if (min_len && value_length < min_len) {
+-				ntfs_error(vol->sb,
+-					   "Too small %#x resident attribute value in MFT record %lld\n",
+-					   le32_to_cpu(a->type), (long long)ctx->ntfs_ino->mft_no);
+-				break;
+-			}
+-		} else {
+-			u32 min_len;
+-			u16 mp_offset;
+-
+-			min_len = offsetof(struct attr_record, data.non_resident.initialized_size) +
+-				  sizeof(a->data.non_resident.initialized_size);
+-			if (le32_to_cpu(a->length) < min_len)
+-				break;
+-
+-			mp_offset = le16_to_cpu(a->data.non_resident.mapping_pairs_offset);
+-			if (mp_offset < min_len ||
+-			    mp_offset > le32_to_cpu(a->length))
+-				break;
+-		}
++		if (!ntfs_attr_value_is_valid(vol, a, ctx->ntfs_ino->mft_no))
++			break;
+ 
+ 		/*
+ 		 * The names match or @name not present and attribute is
+@@ -1299,22 +1364,8 @@ static int ntfs_external_attr_find(const __le32 type,
+ 
+ 		ctx->attr = a;
+ 
+-		if (a->non_resident) {
+-			u32 min_len;
+-			u16 mp_offset;
+-
+-			min_len = offsetof(struct attr_record,
+-					   data.non_resident.initialized_size) +
+-				  sizeof(a->data.non_resident.initialized_size);
+-
+-			if (le32_to_cpu(a->length) < min_len)
+-				break;
+-
+-			mp_offset =
+-				le16_to_cpu(a->data.non_resident.mapping_pairs_offset);
+-			if (mp_offset < min_len || mp_offset > attr_len)
+-				break;
+-		}
++		if (!ntfs_attr_value_is_valid(vol, a, ctx->ntfs_ino->mft_no))
++			break;
+ 
+ 		/*
+ 		 * If no @val specified or @val specified and it matches, we
+@@ -1326,19 +1377,6 @@ static int ntfs_external_attr_find(const __le32 type,
+ 			u32 value_length = le32_to_cpu(a->data.resident.value_length);
+ 			u16 value_offset = le16_to_cpu(a->data.resident.value_offset);
+ 
+-			if (attr_len < offsetof(struct attr_record, data.resident.reserved) +
+-					sizeof(a->data.resident.reserved))
+-				break;
+-			if (value_length > attr_len || value_offset > attr_len - value_length)
+-				break;
+-
+-			value_length = ntfs_resident_attr_min_value_length(a->type);
+-			if (value_length && le32_to_cpu(a->data.resident.value_length) <
+-			    value_length) {
+-				pr_err("Too small resident attribute value in MFT record %lld, type %#x\n",
+-				       (long long)ctx->ntfs_ino->mft_no, a->type);
+-				break;
+-			}
+ 			if (value_length == val_len &&
+ 			    !memcmp((u8 *)a + value_offset, val, val_len)) {
+ attr_found:
+diff --git a/fs/ntfs/attrlist.c b/fs/ntfs/attrlist.c
+index c2594d4c83b0..afb13038ba42 100644
+--- a/fs/ntfs/attrlist.c
++++ b/fs/ntfs/attrlist.c
+@@ -118,6 +118,7 @@ int ntfs_attrlist_entry_add(struct ntfs_inode *ni, struct attr_record *attr)
+ 	int entry_len, entry_offset, err;
+ 	struct mft_record *ni_mrec;
+ 	u8 *old_al;
++	__le64 lowest_vcn;
+ 
+ 	if (!ni || !attr) {
+ 		ntfs_debug("Invalid arguments.\n");
+@@ -158,17 +159,21 @@ int ntfs_attrlist_entry_add(struct ntfs_inode *ni, struct attr_record *attr)
+ 		ntfs_error(ni->vol->sb, "Failed to get search context");
+ 		goto err_out;
+ 	}
++	if (attr->non_resident)
++		lowest_vcn = attr->data.non_resident.lowest_vcn;
++	else
++		lowest_vcn = 0;
+ 
+ 	err = ntfs_attr_lookup(attr->type, (attr->name_length) ? (__le16 *)
+ 			((u8 *)attr + le16_to_cpu(attr->name_offset)) :
+ 			AT_UNNAMED, attr->name_length, CASE_SENSITIVE,
+-			(attr->non_resident) ? le64_to_cpu(attr->data.non_resident.lowest_vcn) :
+-			0, (attr->non_resident) ? NULL : ((u8 *)attr +
++			le64_to_cpu(lowest_vcn),
++			(attr->non_resident) ? NULL : ((u8 *)attr +
+ 			le16_to_cpu(attr->data.resident.value_offset)), (attr->non_resident) ?
+ 			0 : le32_to_cpu(attr->data.resident.value_length), ctx);
+ 	if (!err) {
+ 		/* Found some extent, check it to be before new extent. */
+-		if (ctx->al_entry->lowest_vcn == attr->data.non_resident.lowest_vcn) {
++		if (ctx->al_entry->lowest_vcn == lowest_vcn) {
+ 			err = -EEXIST;
+ 			ntfs_debug("Such attribute already present in the attribute list.\n");
+ 			ntfs_attr_put_search_ctx(ctx);
+-- 
+2.55.0
+
