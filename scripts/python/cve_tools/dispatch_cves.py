@@ -116,22 +116,18 @@ def update_bug_metadata(bzapi, todo):
     if not bugs:
         print(f"Couldn't find any of the following bugs: {[ b.bug for b in todo ]}", file=sys.stderr)
         sys.exit(5)
-    emails = { b.id: b.assigned_to for b in bugs }
-    cves = { b.id: make_unique(b.alias) for b in bugs }
-    ccs = { b.id: b.cc for b in bugs }
-    any_flags = { b.id: bool(b.flags) for b in bugs }
-    products = { b.id: b.product for b in bugs }
+    bugmap = { b.id: b for b in bugs }
 
     for b in todo:
         b.bz_comments = comments['bugs'][str(b.bug)]['comments']
         b.human_comments = [ c for c in b.bz_comments if c['creator'] not in COMMENT_BANLIST ]
-        b.cve = cves.get(b.bug, '')
-        b.original_email = emails.get(b.bug, '<unknown>')
-        b.any_flags = any_flags.get(b.bug, False)
-        b.product = products.get(b.bug, '')
+        b.cve = make_unique(bugmap[b.bug].alias)        if b.bug in bugmap else ''
+        b.original_email = bugmap[b.bug].assigned_to    if b.bug in bugmap else '<unknown>'
+        b.any_flags = bool(bugmap[b.bug].flags)         if b.bug in bugmap else False
+        b.product = bugmap[b.bug].product               if b.bug in bugmap else ''
 
-        if b.bug in ccs:
-            b.cc_add = list(set(b.cc_list) - set(ccs.get(b.bug)))
+        if b.bug in bugmap:
+            b.cc_add = list(set(b.cc_list) - set(bugmap[b.bug].cc))
         if b.original_email == '<unknown>':
             b.unknown_state = True
         elif b.original_email == b.email:
