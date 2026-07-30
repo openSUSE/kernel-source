@@ -1,9 +1,8 @@
 import bugzilla, os, re, sys
+import xmlrpc.client
 from bugzilla._cli import DEFAULT_BZ
 
 CVSS_PATTERN = re.compile(r"CVSSv3.1:SUSE:CVE-[0-9]{4}-[0-9]{4,}:([0-9].[0-9])")
-TIME_FORMAT_XML = '%Y%m%dT%H:%M:%S'
-TIME_FORMAT_REST = '%Y-%m-%dT%H:%M:%SZ'
 
 def handle_email(email):
     if '__empty-env-var__' in email:
@@ -46,6 +45,13 @@ def make_unique(alist):
 
 def make_url(bug_id):
     return f'https://bugzilla.suse.com/show_bug.cgi?id={bug_id}'
+
+TIME_FORMAT_XML = '%Y%m%dT%H:%M:%S'
+TIME_FORMAT_REST = '%Y-%m-%dT%H:%M:%SZ'
+# module parameter to allow switching
+time_format = TIME_FORMAT_XML
+def format_time(t: xmlrpc.client.DateTime):
+    return datetime.strptime(str(t), time_format)
 
 def get_exportpatch_string(references, h, patch_dir):
     return f'exportpatch -w -s -d {patch_dir} {" ".join(f"-F {r}" for r in references)} {h}'
