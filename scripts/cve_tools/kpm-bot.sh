@@ -287,8 +287,8 @@ do_branch_cleanup()
 		echo "Checking $branch"
 		fix_merged origin/$base_branch $cve || continue
 		echo "Fix for $cve merged into origin/$base_branch. Removing $branch"
-		#git push origin :$branch
-		#git branch -D $branch
+		git push origin :$branch
+		git branch -D $branch
 	done 
 }
 
