@@ -121,6 +121,7 @@ check_incoming_queue()
 			then
 				git reset --hard
 				rm $patch_files
+				echo $target_branch >> $PROCESS_DIR/${cve}.failed
 				git checkout $FALLBACK_BRANCH >/dev/null 2>&1
 				git branch -D $user_branch
 				continue
