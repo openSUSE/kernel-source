@@ -1,0 +1,221 @@
+From: "Chia-Lin Kao (AceLan)" <acelan.kao@canonical.com>
+Date: Mon, 13 Jul 2026 16:43:21 +0800
+Subject: [PATCH] usb: typec: ucsi: Detect and skip duplicate altmodes from
+ buggy firmware
+References: bsc#1258210
+Patch-mainline: 6.18.42
+Git-commit: 67c92c6419ea6dbc5b1f3e9691aecea956e3e81c
+
+commit 67c92c6419ea6dbc5b1f3e9691aecea956e3e81c upstream.
+
+Some firmware implementations incorrectly return the same altmode
+multiple times at different offsets when queried via
+UCSI_GET_ALTERNATE_MODES.  This causes sysfs duplicate filename errors
+and kernel call traces when the driver attempts to register the same
+altmode twice:
+
+  sysfs: cannot create duplicate filename '/devices/.../typec/port0/port0.0/partner'
+  typec-thunderbolt port0-partner.1: failed to create symlinks
+  typec-thunderbolt port0-partner.1: probe with driver typec-thunderbolt failed with error -17
+
+The matching rules differ by recipient:
+
+  - UCSI_RECIPIENT_CON (port) and UCSI_RECIPIENT_SOP_P (plug):
+    Two altmodes with identical SVID and VDO are byte-for-byte
+    duplicates and the second has no observable function, so drop it.
+
+  - UCSI_RECIPIENT_SOP (partner):
+    The typec class binds each partner altmode to a port altmode of
+    the same SVID via altmode_match()/device_find_child(), which
+    returns the first port altmode with a matching SVID.  If the
+    partner advertises more altmodes for SVID X than the port
+    advertises, the surplus partner altmode(s) collapse onto an
+    already-paired port altmode and trigger the
+    "duplicate filename .../partner" sysfs error during
+    typec_altmode_create_links().  Use the port-side altmode count for
+    SVID X as the authoritative cap and reject any partner altmode
+    that would exceed it.  This preserves legitimate multi-Mode
+    partner altmodes (vendor SVIDs that the port really does
+    advertise more than once) while filtering the firmware-generated
+    duplicates that have no port counterpart, and is therefore
+    stricter than a plain SVID+VDO comparison (which still admits the
+    Thunderbolt case where firmware reports the same SVID twice with
+    different VDOs) without being over-broad like a plain SVID match
+    (which would falsely drop legitimate vendor multi-Mode entries).
+
+If a duplicate is detected, skip it and emit a clean warning instead
+of generating a kernel call trace:
+
+  ucsi_acpi USBC000:00: con2: Firmware bug: duplicate partner altmode SVID 0x8087 at offset 1, ignoring.
+  ucsi_acpi USBC000:00: con2: VDO mismatch: 0x8087a043 vs 0x00000001
+
+The duplicate detection logic lives in a reusable helper
+ucsi_altmode_is_duplicate() and is invoked from
+ucsi_register_altmodes().  It applies to all three recipient types:
+partner (SOP), port (CON), and plug (SOP_P) altmodes.
+
+Fixes: a79f16efcd00 ("usb: typec: ucsi: Add support for the partner USB Modes")
+Cc: stable <stable@kernel.org>
+Signed-off-by: Chia-Lin Kao (AceLan) <acelan.kao@canonical.com>
+unchanged: still SVID+VDO exact-dup match.
+Reviewed-by: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+Link: https://patch.msgid.link/20260713084323.287516-1-acelan.kao@canonical.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/usb/typec/ucsi/ucsi.c | 132 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 132 insertions(+)
+
+diff --git a/drivers/usb/typec/ucsi/ucsi.c b/drivers/usb/typec/ucsi/ucsi.c
+index b4b0c46d2fa4..fc41f00acfdf 100644
+--- a/drivers/usb/typec/ucsi/ucsi.c
++++ b/drivers/usb/typec/ucsi/ucsi.c
+@@ -487,6 +487,129 @@ static int ucsi_register_altmode(struct ucsi_connector *con,
+ 	return ret;
+ }
+ 
++static void ucsi_dump_duplicate_altmode(struct ucsi_connector *con,
++					u8 recipient, u16 svid,
++					u32 existing_vdo, u32 new_vdo,
++					int offset)
++{
++	static const char * const recipient_names[] = {
++		[UCSI_RECIPIENT_CON]    = "port",
++		[UCSI_RECIPIENT_SOP]    = "partner",
++		[UCSI_RECIPIENT_SOP_P]  = "plug",
++		[UCSI_RECIPIENT_SOP_PP] = "cable plug prime",
++	};
++
++	dev_warn(con->ucsi->dev,
++		 "con%d: Firmware bug: duplicate %s altmode SVID 0x%04x at offset %d, ignoring but please contact the BIOS vendor to fix this issue.\n",
++		 con->num, recipient_names[recipient], svid, offset);
++
++	if (existing_vdo != new_vdo)
++		dev_warn(con->ucsi->dev,
++			 "con%d: VDO mismatch: 0x%08x vs 0x%08x\n",
++			 con->num, existing_vdo, new_vdo);
++}
++
++/* Count altmodes in @altmodes that advertise @svid. */
++static int ucsi_altmode_count_svid(struct typec_altmode **altmodes, u16 svid)
++{
++	int count = 0;
++	int k;
++
++	for (k = 0; k < UCSI_MAX_ALTMODES; k++) {
++		if (!altmodes[k])
++			break;
++		if (altmodes[k]->svid == svid)
++			count++;
++	}
++
++	return count;
++}
++
++/*
++ * Check if an altmode is a duplicate. Some firmware implementations
++ * incorrectly return the same altmode multiple times, causing sysfs errors.
++ * Returns true if the altmode should be skipped.
++ *
++ * The matching rules differ by recipient:
++ *
++ *   - UCSI_RECIPIENT_CON (port) and UCSI_RECIPIENT_SOP_P (plug):
++ *     Two altmodes with identical SVID and VDO are byte-for-byte duplicates
++ *     and the second has no observable function. Drop them.
++ *
++ *   - UCSI_RECIPIENT_SOP (partner):
++ *     The typec class binds each partner altmode to a port altmode of the
++ *     same SVID via altmode_match()/device_find_child(), which returns the
++ *     first port altmode with a matching SVID. If the partner advertises
++ *     more altmodes for SVID X than the port advertises, the surplus
++ *     partner altmode(s) collapse onto an already-paired port altmode and
++ *     trigger a "duplicate filename .../partner" sysfs error during
++ *     typec_altmode_create_links(). Use the port-side altmode count for
++ *     SVID X as the authoritative cap and reject any partner altmode that
++ *     would exceed it. This preserves legitimate multi-Mode partner
++ *     altmodes (e.g. vendor SVIDs that the port really does advertise
++ *     twice) while filtering the firmware-generated duplicates that have
++ *     no port counterpart.
++ */
++static bool ucsi_altmode_is_duplicate(struct ucsi_connector *con, u8 recipient,
++				      const struct ucsi_altmode *alt_batch, int batch_idx,
++				      u16 svid, u32 vdo, int offset)
++{
++	struct typec_altmode **altmodes;
++	int port_count, partner_count;
++	int k;
++
++	/* Check for duplicates within the current batch first */
++	for (k = 0; k < batch_idx; k++) {
++		if (alt_batch[k].svid == svid && alt_batch[k].mid == vdo) {
++			ucsi_dump_duplicate_altmode(con, recipient, svid,
++						    vdo, vdo, offset);
++			return true;
++		}
++	}
++
++	switch (recipient) {
++	case UCSI_RECIPIENT_SOP:
++		/*
++		 * Cap partner altmodes per SVID by the port-side count:
++		 * any further partner altmode for that SVID would alias an
++		 * already-paired port altmode and break typec sysfs.
++		 */
++		port_count = ucsi_altmode_count_svid(con->port_altmode, svid);
++		partner_count = ucsi_altmode_count_svid(con->partner_altmode,
++							svid);
++		if (port_count && partner_count >= port_count) {
++			ucsi_dump_duplicate_altmode(con, recipient, svid,
++						    con->partner_altmode[partner_count - 1]->vdo,
++						    vdo, offset);
++			return true;
++		}
++		return false;
++	case UCSI_RECIPIENT_CON:
++		altmodes = con->port_altmode;
++		break;
++	case UCSI_RECIPIENT_SOP_P:
++		altmodes = con->plug_altmode;
++		break;
++	default:
++		return false;
++	}
++
++	/* CON and SOP_P: drop only exact SVID+VDO duplicates. */
++	for (k = 0; k < UCSI_MAX_ALTMODES; k++) {
++		if (!altmodes[k])
++			break;
++
++		if (altmodes[k]->svid != svid || altmodes[k]->vdo != vdo)
++			continue;
++
++		ucsi_dump_duplicate_altmode(con, recipient, svid,
++					    altmodes[k]->vdo, vdo, offset);
++		return true;
++	}
++
++	return false;
++}
++
+ static int
+ ucsi_register_altmodes_nvidia(struct ucsi_connector *con, u8 recipient)
+ {
+@@ -611,6 +734,15 @@ static int ucsi_register_altmodes(struct ucsi_connector *con, u8 recipient)
+ 			if (!alt[j].svid)
+ 				return 0;
+ 
++			/*
++			 * Check for duplicates in current batch and already
++			 * registered altmodes. Skip if duplicate found.
++			 */
++			if (ucsi_altmode_is_duplicate(con, recipient, alt, j,
++						      alt[j].svid, alt[j].mid,
++						      i - num + j))
++				continue;
++
+ 			memset(&desc, 0, sizeof(desc));
+ 			desc.vdo = alt[j].mid;
+ 			desc.svid = alt[j].svid;
+-- 
+2.53.0
+
