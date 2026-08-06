@@ -10,9 +10,6 @@ repository.
 https://build.opensuse.org/package/show/Kernel:tools/python-pygit2
 ```
 
-series_merge_tool depends on `merge` from the rcs package, available in
-standard repositories.
-
 The functions in `quilt-mode.sh` are meant to be used with a modified `quilt`
 that can use kernel-source.git's series.conf directly instead of a shadow
 copy.
