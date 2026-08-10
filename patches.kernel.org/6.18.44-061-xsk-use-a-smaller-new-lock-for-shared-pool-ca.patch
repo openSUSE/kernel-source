@@ -1,0 +1,141 @@
+From: Jason Xing <kernelxing@tencent.com>
+Date: Thu, 30 Oct 2025 08:06:46 +0800
+Subject: [PATCH] xsk: use a smaller new lock for shared pool case
+References: bsc#1258210
+Patch-mainline: 6.18.44
+Git-commit: 30ed05adca4a05c50594384cff18910858dd1d35
+
+[ Upstream commit 30ed05adca4a05c50594384cff18910858dd1d35 ]
+
+- Split cq_lock into two smaller locks: cq_prod_lock and
+  cq_cached_prod_lock
+- Avoid disabling/enabling interrupts in the hot xmit path
+
+In either xsk_cq_cancel_locked() or xsk_cq_reserve_locked() function,
+the race condition is only between multiple xsks sharing the same
+pool. They are all in the process context rather than interrupt context,
+so now the small lock named cq_cached_prod_lock can be used without
+handling interrupts.
+
+While cq_cached_prod_lock ensures the exclusive modification of
+@cached_prod, cq_prod_lock in xsk_cq_submit_addr_locked() only cares
+about @producer and corresponding @desc. Both of them don't necessarily
+be consistent with @cached_prod protected by cq_cached_prod_lock.
+That's the reason why the previous big lock can be split into two
+smaller ones. Please note that SPSC rule is all about the global state
+of producer and consumer that can affect both layers instead of local
+or cached ones.
+
+Frequently disabling and enabling interrupt are very time consuming
+in some cases, especially in a per-descriptor granularity, which now
+can be avoided after this optimization, even when the pool is shared by
+multiple xsks.
+
+With this patch, the performance number[1] could go from 1,872,565 pps
+to 1,961,009 pps. It's a minor rise of around 5%.
+
+[1]: taskset -c 1 ./xdpsock -i enp2s0f1 -q 0 -t -S -s 64
+
+Signed-off-by: Jason Xing <kernelxing@tencent.com>
+Acked-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+Link: https://patch.msgid.link/20251030000646.18859-3-kerneljasonxing@gmail.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Stable-dep-of: bd44a6dcd424 ("xsk: drain continuation descs after overflow in xsk_build_skb()")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/net/xsk_buff_pool.h | 13 +++++++++----
+ net/xdp/xsk.c               | 15 ++++++---------
+ net/xdp/xsk_buff_pool.c     |  3 ++-
+ 3 files changed, 17 insertions(+), 14 deletions(-)
+
+diff --git a/include/net/xsk_buff_pool.h b/include/net/xsk_buff_pool.h
+index cac56e6b0869..92a2358c6ce3 100644
+--- a/include/net/xsk_buff_pool.h
++++ b/include/net/xsk_buff_pool.h
+@@ -85,11 +85,16 @@ struct xsk_buff_pool {
+ 	bool unaligned;
+ 	bool tx_sw_csum;
+ 	void *addrs;
+-	/* Mutual exclusion of the completion ring in the SKB mode. Two cases to protect:
+-	 * NAPI TX thread and sendmsg error paths in the SKB destructor callback and when
+-	 * sockets share a single cq when the same netdev and queue id is shared.
++	/* Mutual exclusion of the completion ring in the SKB mode.
++	 * Protect: NAPI TX thread and sendmsg error paths in the SKB
++	 * destructor callback.
+ 	 */
+-	spinlock_t cq_lock;
++	spinlock_t cq_prod_lock;
++	/* Mutual exclusion of the completion ring in the SKB mode.
++	 * Protect: when sockets share a single cq when the same netdev
++	 * and queue id is shared.
++	 */
++	spinlock_t cq_cached_prod_lock;
+ 	struct xdp_buff_xsk *free_heads[];
+ };
+ 
+diff --git a/net/xdp/xsk.c b/net/xdp/xsk.c
+index 024e23c08b8d..72d83b671f84 100644
+--- a/net/xdp/xsk.c
++++ b/net/xdp/xsk.c
+@@ -547,12 +547,11 @@ static int xsk_wakeup(struct xdp_sock *xs, u8 flags)
+ 
+ static int xsk_cq_reserve_locked(struct xsk_buff_pool *pool)
+ {
+-	unsigned long flags;
+ 	int ret;
+ 
+-	spin_lock_irqsave(&pool->cq_lock, flags);
++	spin_lock(&pool->cq_cached_prod_lock);
+ 	ret = xskq_prod_reserve(pool->cq);
+-	spin_unlock_irqrestore(&pool->cq_lock, flags);
++	spin_unlock(&pool->cq_cached_prod_lock);
+ 
+ 	return ret;
+ }
+@@ -603,7 +602,7 @@ static void xsk_cq_submit_addr_locked(struct xsk_buff_pool *pool,
+ 	unsigned long flags;
+ 	u32 idx, i;
+ 
+-	spin_lock_irqsave(&pool->cq_lock, flags);
++	spin_lock_irqsave(&pool->cq_prod_lock, flags);
+ 	idx = xskq_get_prod(pool->cq);
+ 
+ 	if (unlikely(num_descs > 1)) {
+@@ -621,16 +620,14 @@ static void xsk_cq_submit_addr_locked(struct xsk_buff_pool *pool,
+ 		descs_processed++;
+ 	}
+ 	xskq_prod_submit_n(pool->cq, descs_processed);
+-	spin_unlock_irqrestore(&pool->cq_lock, flags);
++	spin_unlock_irqrestore(&pool->cq_prod_lock, flags);
+ }
+ 
+ static void xsk_cq_cancel_locked(struct xsk_buff_pool *pool, u32 n)
+ {
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&pool->cq_lock, flags);
++	spin_lock(&pool->cq_cached_prod_lock);
+ 	xskq_prod_cancel_n(pool->cq, n);
+-	spin_unlock_irqrestore(&pool->cq_lock, flags);
++	spin_unlock(&pool->cq_cached_prod_lock);
+ }
+ 
+ static void xsk_destruct_skb(struct sk_buff *skb)
+diff --git a/net/xdp/xsk_buff_pool.c b/net/xdp/xsk_buff_pool.c
+index a129ce6f1c25..c9688735b643 100644
+--- a/net/xdp/xsk_buff_pool.c
++++ b/net/xdp/xsk_buff_pool.c
+@@ -96,7 +96,8 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
+ 	INIT_LIST_HEAD(&pool->xskb_list);
+ 	INIT_LIST_HEAD(&pool->xsk_tx_list);
+ 	spin_lock_init(&pool->xsk_tx_list_lock);
+-	spin_lock_init(&pool->cq_lock);
++	spin_lock_init(&pool->cq_prod_lock);
++	spin_lock_init(&pool->cq_cached_prod_lock);
+ 	refcount_set(&pool->users, 1);
+ 
+ 	pool->fq = xs->fq_tmp;
+-- 
+2.53.0
+
