@@ -1,0 +1,172 @@
+From: "Jose Fernandez (Anthropic)" <jose.fernandez@linux.dev>
+Date: Thu, 30 Jul 2026 22:32:47 +0000
+Subject: [PATCH] bpf: tcp: Fix use-after-free in
+ bpf_iter_tcp_established_batch()
+References: bsc#1258210
+Patch-mainline: 6.18.45
+Git-commit: e5fd3f514e27db1f05fbd72ba615d74941e23c51
+
+[ Upstream commit e5fd3f514e27db1f05fbd72ba615d74941e23c51 ]
+
+reqsk_queue_hash_req() publishes a TCP_NEW_SYN_RECV request_sock onto
+the ehash chain, drops the bucket lock, and only afterwards sets
+rsk_refcnt to 3.
+
+Lockless readers such as __inet_lookup_established() handle this with
+refcount_inc_not_zero(), but bpf_iter_tcp_established_batch() uses plain
+sock_hold() while holding the bucket lock, on the assumption that the
+lock guarantees sk_refcnt > 0. That assumption does not hold for
+request_sock:
+
+  CPU 0                                CPU 1
+  -----                                -----
+  tcp_conn_request()
+   reqsk_queue_hash_req()
+    inet_ehash_insert(req)
+     spin_lock(bucket)
+     __sk_nulls_add_node_rcu(req)      // rsk_refcnt == 0
+     spin_unlock(bucket)
+                                       bpf_iter_tcp_established_batch()
+                                        spin_lock(bucket)
+                                        sock_hold(req)   <-- addition on 0
+                                        spin_unlock(bucket)
+    refcount_set(&req->rsk_refcnt, 3)  // clobbers saturated value
+
+which surfaces as:
+
+  refcount_t: addition on 0; use-after-free.
+  WARNING: lib/refcount.c:25 at refcount_warn_saturate+0x48/0x90, CPU#1
+  Call Trace:
+   bpf_iter_tcp_established_batch+0x14e/0x170
+   bpf_iter_tcp_batch+0x53/0x200
+   bpf_iter_tcp_seq_next+0x27/0x70
+   bpf_seq_read+0x107/0x410
+   vfs_read+0xb9/0x380
+
+The iterator's stolen reference is lost when the publishing CPU's
+refcount_set() overwrites the count, leaving the socket one reference
+short. When the last legitimate owner drops its reference the reqsk is
+freed while still reachable, leading to use-after-free.
+
+This reproduces in seconds with tcp_syncookies=0, a handful of threads
+doing connect()/close() to a local listener while others read an
+iter/tcp link in a tight loop.
+
+Use refcount_inc_not_zero() and skip the socket on failure. A skipped
+socket is still part of the bucket, so keep counting it in expected.
+The reallocations are sized from expected, and a request sock whose
+refcount gets published while the lock is held across the last realloc
+must already have room.
+
+A skipped socket is counted in expected but never batched, so end_sk
+can be short of expected on a batch that is actually complete. Decide
+completeness by whether the walk left any socket behind instead. The
+WARN after the locked realloc checks the same, replacing an
+end_sk == expected check that could not hold on that path since
+commit cdec67a489d4 ("bpf: tcp: Make sure iter->batch always
+contains a full bucket snapshot").
+
+If every matching socket in a bucket is mid-init (refcount 0), end_sk
+stays 0. Advance to the next bucket rather than returning a batch entry
+that was never filled this round.
+
+Fixes: 04c7820b776f ("bpf: tcp: Bpf iter batching and lock_sock")
+Assisted-by: Claude:unspecified
+Signed-off-by: Jose Fernandez (Anthropic) <jose.fernandez@linux.dev>
+Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://lore.kernel.org/bpf/20260730-bpf-iter-tcp-refcnt-v3-1-754b9c8a6717@linux.dev
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ net/ipv4/tcp_ipv4.c | 43 ++++++++++++++++++++++++-------------------
+ 1 file changed, 24 insertions(+), 19 deletions(-)
+
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index 3463e5b964a9..708b69cc2f56 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -3219,24 +3219,24 @@ static unsigned int bpf_iter_tcp_established_batch(struct seq_file *seq,
+ {
+ 	struct bpf_tcp_iter_state *iter = seq->private;
+ 	struct hlist_nulls_node *node;
+-	unsigned int expected = 1;
+-	struct sock *sk;
+-
+-	sock_hold(*start_sk);
+-	iter->batch[iter->end_sk++].sk = *start_sk;
++	struct sock *sk = *start_sk;
++	unsigned int expected = 0;
+ 
+-	sk = sk_nulls_next(*start_sk);
+ 	*start_sk = NULL;
+ 	sk_nulls_for_each_from(sk, node) {
+-		if (seq_sk_match(seq, sk)) {
+-			if (iter->end_sk < iter->max_sk) {
+-				sock_hold(sk);
+-				iter->batch[iter->end_sk++].sk = sk;
+-			} else if (!*start_sk) {
+-				/* Remember where we left off. */
+-				*start_sk = sk;
+-			}
+-			expected++;
++		if (!seq_sk_match(seq, sk))
++			continue;
++		expected++;
++		if (iter->end_sk < iter->max_sk) {
++			/* reqsk_queue_hash_req() inserts with sk_refcnt == 0
++			 * and refcount_set()s it after the bucket lock drops.
++			 */
++			if (unlikely(!refcount_inc_not_zero(&sk->sk_refcnt)))
++				continue;
++			iter->batch[iter->end_sk++].sk = sk;
++		} else if (!*start_sk) {
++			/* Remember where we left off. */
++			*start_sk = sk;
+ 		}
+ 	}
+ 
+@@ -3274,12 +3274,13 @@ static struct sock *bpf_iter_tcp_batch(struct seq_file *seq)
+ 	struct sock *sk;
+ 	int err;
+ 
++again:
+ 	sk = bpf_iter_tcp_resume(seq);
+ 	if (!sk)
+ 		return NULL; /* Done */
+ 
+ 	expected = bpf_iter_fill_batch(seq, &sk);
+-	if (likely(iter->end_sk == expected))
++	if (likely(!sk))
+ 		goto done;
+ 
+ 	/* Batch size was too small. */
+@@ -3298,7 +3299,7 @@ static struct sock *bpf_iter_tcp_batch(struct seq_file *seq)
+ 		return NULL; /* Done */
+ 
+ 	expected = bpf_iter_fill_batch(seq, &sk);
+-	if (likely(iter->end_sk == expected))
++	if (likely(!sk))
+ 		goto done;
+ 
+ 	/* Batch size was still too small. Hold onto the lock while we try
+@@ -3311,10 +3312,14 @@ static struct sock *bpf_iter_tcp_batch(struct seq_file *seq)
+ 		return ERR_PTR(err);
+ 	}
+ 
+-	expected = bpf_iter_fill_batch(seq, &sk);
+-	WARN_ON_ONCE(iter->end_sk != expected);
++	bpf_iter_fill_batch(seq, &sk);
++	WARN_ON_ONCE(sk);
+ done:
+ 	bpf_iter_tcp_unlock_bucket(seq);
++	if (unlikely(!iter->end_sk)) {
++		++iter->state.bucket;
++		goto again;
++	}
+ 	return iter->batch[0].sk;
+ }
+ 
+-- 
+2.53.0
+
