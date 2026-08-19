@@ -1,0 +1,143 @@
+From: Antonio Quartulli <antonio@openvpn.net>
+Date: Tue, 28 Jul 2026 13:48:47 +0200
+Subject: [PATCH] ovpn: skip rehash for peers already removed from by_id
+References: bsc#1258210
+Patch-mainline: 6.18.45
+Git-commit: 33ec10567fe14456063daf549fdf1a4f53448e4c
+
+[ Upstream commit 33ec10567fe14456063daf549fdf1a4f53448e4c ]
+
+ovpn_nl_peer_set_doit() resolves the target peer via
+ovpn_peer_get_by_id() before taking ovpn->lock. In the window between
+the lookup (which only takes a refcount) and the subsequent
+spin_lock_bh(&ovpn->lock), a concurrent OVPN_CMD_PEER_DEL, keepalive
+expiry, or socket teardown can take ovpn->lock first, run
+ovpn_peer_remove() to unhash the peer from all four tables (by_id,
+by_vpn_addr4/6, by_transp_addr) and release the lock. set_doit then
+acquires ovpn->lock and calls ovpn_peer_hash_vpn_ip(), which
+re-inserts the now-removed peer back into the rehashing tables.
+
+The same race affects the float path: ovpn_peer_endpoints_update()
+holds only a refcount and acquires ovpn->lock very late (after async
+AEAD decrypt and a netlink notification), then rehashes the peer
+in the by_transp_addr table.
+
+The resurrected peer becomes reachable again from the RX lookup
+(ovpn_peer_get_by_transp_addr) and the TX VPN-IP lookup, even though
+userspace believes it is gone. Once the data-path refcount drops the
+peer is freed via call_rcu while the hash entries embedded in it
+remain linked, opening a UAF window.
+
+Bail out of the rehash when hash_entry_id is unhashed, mirroring
+the sentinel already used by ovpn_peer_remove() to detect the
+already-removed state. The check is safe under ovpn->lock, which
+serializes every mutation of hash_entry_id, and is a no-op for the
+add path because ovpn_peer_add_mp() inserts hash_entry_id before
+calling ovpn_peer_hash_vpn_ip().
+
+Fixes: 1d36a36f6d53 ("ovpn: implement peer add/get/dump/delete via netlink")
+Signed-off-by: Antonio Quartulli <antonio@openvpn.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/net/ovpn/peer.c | 73 ++++++++++++++++++++++++-----------------
+ 1 file changed, 43 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/net/ovpn/peer.c b/drivers/net/ovpn/peer.c
+index 85fa9bd475f4..6b7e368f63f3 100644
+--- a/drivers/net/ovpn/peer.c
++++ b/drivers/net/ovpn/peer.c
+@@ -291,40 +291,46 @@ void ovpn_peer_endpoints_update(struct ovpn_peer *peer, struct sk_buff *skb)
+ 	/* rehashing is required only in MP mode as P2P has one peer
+ 	 * only and thus there is no hashtable
+ 	 */
+-	if (peer->ovpn->mode == OVPN_MODE_MP) {
+-		spin_lock_bh(&peer->ovpn->lock);
+-		spin_lock_bh(&peer->lock);
+-		bind = rcu_dereference_protected(peer->bind,
+-						 lockdep_is_held(&peer->lock));
+-		if (unlikely(!bind)) {
+-			spin_unlock_bh(&peer->lock);
+-			spin_unlock_bh(&peer->ovpn->lock);
+-			return;
+-		}
++	if (peer->ovpn->mode != OVPN_MODE_MP)
++		return;
+ 
+-		/* This function may be invoked concurrently, therefore another
+-		 * float may have happened in parallel: perform rehashing
+-		 * using the peer->bind->remote directly as key
+-		 */
++	spin_lock_bh(&peer->ovpn->lock);
++	spin_lock_bh(&peer->lock);
++	bind = rcu_dereference_protected(peer->bind,
++					 lockdep_is_held(&peer->lock));
++	if (unlikely(!bind))
++		goto unlock2;
+ 
+-		switch (bind->remote.in4.sin_family) {
+-		case AF_INET:
+-			salen = sizeof(*sa);
+-			break;
+-		case AF_INET6:
+-			salen = sizeof(*sa6);
+-			break;
+-		}
++	/* peer may have been concurrently removed between the caller's
++	 * initial lookup and our acquisition of ovpn->lock; skip the
++	 * rehash so we don't re-insert a removed peer
++	 */
++	if (unlikely(hlist_unhashed(&peer->hash_entry_id)))
++		goto unlock2;
+ 
+-		/* remove old hashing */
+-		hlist_nulls_del_init_rcu(&peer->hash_entry_transp_addr);
+-		/* re-add with new transport address */
+-		nhead = ovpn_get_hash_head(peer->ovpn->peers->by_transp_addr,
+-					   &bind->remote, salen);
+-		hlist_nulls_add_head_rcu(&peer->hash_entry_transp_addr, nhead);
+-		spin_unlock_bh(&peer->lock);
+-		spin_unlock_bh(&peer->ovpn->lock);
++	/* This function may be invoked concurrently, therefore another
++	 * float may have happened in parallel: perform rehashing
++	 * using the peer->bind->remote directly as key
++	 */
++
++	switch (bind->remote.in4.sin_family) {
++	case AF_INET:
++		salen = sizeof(*sa);
++		break;
++	case AF_INET6:
++		salen = sizeof(*sa6);
++		break;
+ 	}
++
++	/* remove old hashing */
++	hlist_nulls_del_init_rcu(&peer->hash_entry_transp_addr);
++	/* re-add with new transport address */
++	nhead = ovpn_get_hash_head(peer->ovpn->peers->by_transp_addr,
++				   &bind->remote, salen);
++	hlist_nulls_add_head_rcu(&peer->hash_entry_transp_addr, nhead);
++unlock2:
++	spin_unlock_bh(&peer->lock);
++	spin_unlock_bh(&peer->ovpn->lock);
+ 	return;
+ unlock:
+ 	spin_unlock_bh(&peer->lock);
+@@ -901,6 +907,13 @@ void ovpn_peer_hash_vpn_ip(struct ovpn_peer *peer)
+ 	if (peer->ovpn->mode != OVPN_MODE_MP)
+ 		return;
+ 
++	/* peer may have been concurrently removed between the caller's
++	 * initial lookup and our acquisition of ovpn->lock; skip the
++	 * rehash so we don't re-insert a removed peer
++	 */
++	if (hlist_unhashed(&peer->hash_entry_id))
++		return;
++
+ 	if (peer->vpn_addrs.ipv4.s_addr != htonl(INADDR_ANY)) {
+ 		/* remove potential old hashing */
+ 		hlist_nulls_del_init_rcu(&peer->hash_entry_addr4);
+-- 
+2.53.0
+
