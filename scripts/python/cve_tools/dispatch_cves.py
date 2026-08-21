@@ -11,10 +11,10 @@ from bugzilla.utils import make_url, make_unique, calculate_deadline, format_tim
 BSC_PATTERN = re.compile(r'\sbsc#([0-9][0-9]*)\s')
 CVSS_PATTERN = re.compile(r'\swith\s+CVSS\s*([0-9]?[0-9](\.[0-9]*)?)\s')
 MAINTAINERS_PATTERN = re.compile(r'\s(\S+\@suse.\S+\s\([0-9]+\))')
-EMAIL_PATTERN = re.compile(r'[\s,:](\S+\@suse.\S+)')
-CC_PATTERN = re.compile(r'^\s*CC[\s:]\s*(\S+\@suse.\S+[,\s]*)+$')
-NEEDINFO_PATTERN = re.compile(r'^\s*NEEDINFO[\s:]\s*(\S+\@suse.\S+[,\s]*)+$')
-ASSIGNEE_PATTERN = re.compile(r'^\s*ASSIGNEE[\s:]\s*\S+\@suse.\S+\s*$')
+EMAIL_PATTERN = re.compile(r'[\s,:](\S+@suse\.[^\s,:]+)')
+CC_PATTERN = re.compile(r'^\s*CC[\s:]\s*\S')
+NEEDINFO_PATTERN = re.compile(r'^\s*NEEDINFO[\s:]\s*\S')
+ASSIGNEE_PATTERN = re.compile(r'^\s*ASSIGNEE[\s:]\s*\S')
 CLOSING_COMMENT = 'Switching back to the security team.'
 SECURITY_EMAIL = 'kernel-security-sentinel@lists.suse.com'
 MONKEY_EMAIL = 'cve-kpm@suse.de'
@@ -182,18 +182,18 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
             elif re.search(ASSIGNEE_PATTERN, l):
                 mm = re.findall(EMAIL_PATTERN, l)
                 if mm and len(mm) == 1:
-                    candidate_emails = [ mm[0].strip(", ") ]
+                    candidate_emails = mm
                     decided = True
                 should_go_out = False
             elif re.search(CC_PATTERN, l):
                 mm = re.findall(EMAIL_PATTERN, l)
                 if mm:
-                   cc_list.extend([ cc_entry.strip(", ") for cc_entry in mm ])
+                   cc_list.extend(mm)
                 should_go_out = False
             elif re.search(NEEDINFO_PATTERN, l):
                 mm = re.findall(EMAIL_PATTERN, l)
                 if mm:
-                   needinfo_list.extend([ needinfo_entry.strip(", ") for needinfo_entry in mm ])
+                   needinfo_list.extend(mm)
                 should_go_out = False
             elif l.startswith('Experts candidates:'):
                 mm = re.findall(MAINTAINERS_PATTERN, l)
