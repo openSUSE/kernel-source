@@ -67,6 +67,12 @@ CC: mkoutny@suse.com, mkoutny2@suse.com, mkoutny3@suse.com
 
 NO ACTION NEEDED
 """,
+                  """
+Security fix for CVE-2026-53035 bsc#1269190 with CVSS 7.0
+ASSIGNEE: kernel-security-sentinel@lists.suse.com
+
+NO ACTION NEEDED
+""",
                   ]
         self.mockfiles = []
         for i in inputs:
@@ -159,3 +165,20 @@ NO ACTION NEEDED
         self.assertIn('mkoutny2@suse.com', self.bzapi.updates[1269190]['cc_add'])
         self.assertIn('mkoutny3@suse.com', self.bzapi.updates[1269190]['cc_add'])
         self.assertNotIn('not.mkoutny@suse.com', self.bzapi.updates[1269190]['cc_add'])
+
+    def test_single_dispatch_nonsuse_mail(self):
+        ret = dispatch_cves.single_dispatch(
+                self.bzapi,
+                self.mockfiles[3].name,
+                False,
+                True, # yes
+                True, # force
+                None,
+                False
+                )
+        self.assertEqual(ret, None)
+        self.assertIn(1269190, self.bzapi.updates)
+        self.assertEqual(self.bzapi.updates[1269190]['comment'],
+                         'Security fix for CVE-2026-53035 bsc#1269190 with CVSS 7.0\n\nNO ACTION NEEDED\n')
+        self.assertEqual(self.bzapi.updates[1269190]['assigned_to'],
+                         'kernel-security-sentinel@lists.suse.com')

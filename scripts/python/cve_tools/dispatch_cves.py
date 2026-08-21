@@ -11,7 +11,7 @@ from bugzilla.utils import make_url, make_unique, calculate_deadline, format_tim
 BSC_PATTERN = re.compile(r'\sbsc#([0-9][0-9]*)\s')
 CVSS_PATTERN = re.compile(r'\swith\s+CVSS\s*([0-9]?[0-9](\.[0-9]*)?)\s')
 MAINTAINERS_PATTERN = re.compile(r'\s(\S+\@suse.\S+\s\([0-9]+\))')
-EMAIL_PATTERN = re.compile(r'[\s,:](\S+@suse\.[^\s,:]+)')
+EMAIL_PATTERN = re.compile(r'[\s,:](\S+@\S*suse\.[^\s,:]+)')
 CC_PATTERN = re.compile(r'^\s*CC[\s:]\s*\S')
 NEEDINFO_PATTERN = re.compile(r'^\s*NEEDINFO[\s:]\s*\S')
 ASSIGNEE_PATTERN = re.compile(r'^\s*ASSIGNEE[\s:]\s*\S')
