@@ -1,0 +1,328 @@
+From c279e83953d937470f8a6e69b69f62608714f13f Mon Sep 17 00:00:00 2001
+From: Nicolin Chen <nicolinc@nvidia.com>
+Date: Mon, 15 Dec 2025 13:42:19 -0800
+Subject: [PATCH] iommu: Introduce pci_dev_reset_iommu_prepare/done()
+
+References: bsc#1272627 jsc#NVIDIA-77
+Patch-mainline: v7.0-rc1
+Git-commit: c279e83953d937470f8a6e69b69f62608714f13f
+
+PCIe permits a device to ignore ATS invalidation TLPs while processing a
+reset. This creates a problem visible to the OS where an ATS invalidation
+command will time out. E.g. an SVA domain will have no coordination with a
+reset event and can racily issue ATS invalidations to a resetting device.
+
+The OS should do something to mitigate this as we do not want production
+systems to be reporting critical ATS failures, especially in a hypervisor
+environment. Broadly, OS could arrange to ignore the timeouts, block page
+table mutations to prevent invalidations, or disable and block ATS.
+
+The PCIe r6.0, sec 10.3.1 IMPLEMENTATION NOTE recommends SW to disable and
+block ATS before initiating a Function Level Reset. It also mentions that
+other reset methods could have the same vulnerability as well.
+
+Provide a callback from the PCI subsystem that will enclose the reset and
+have the iommu core temporarily change all the attached RID/PASID domains
+group->blocking_domain so that the IOMMU hardware would fence any incoming
+ATS queries. And IOMMU drivers should also synchronously stop issuing new
+ATS invalidations and wait for all ATS invalidations to complete. This can
+avoid any ATS invaliation timeouts.
+
+However, if there is a domain attachment/replacement happening during an
+ongoing reset, ATS routines may be re-activated between the two function
+calls. So, introduce a new resetting_domain in the iommu_group structure
+to reject any concurrent attach_dev/set_dev_pasid call during a reset for
+a concern of compatibility failure. Since this changes the behavior of an
+attach operation, update the uAPI accordingly.
+
+Note that there are two corner cases:
+ 1. Devices in the same iommu_group
+    Since an attachment is always per iommu_group, this means that any
+    sibling devices in the iommu_group cannot change domain, to prevent
+    race conditions.
+ 2. An SR-IOV PF that is being reset while its VF is not
+    In such case, the VF itself is already broken. So, there is no point
+    in preventing PF from going through the iommu reset.
+
+Reviewed-by: Lu Baolu <baolu.lu@linux.intel.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Tested-by: Dheeraj Kumar Srivastava <dheerajkumar.srivastava@amd.com>
+Signed-off-by: Nicolin Chen <nicolinc@nvidia.com>
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ drivers/iommu/iommu.c     | 173 ++++++++++++++++++++++++++++++++++++++
+ include/linux/iommu.h     |  13 +++
+ include/uapi/linux/vfio.h |   4 +
+ 3 files changed, 190 insertions(+)
+
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -61,6 +61,11 @@ struct iommu_group {
+ 	int id;
+ 	struct iommu_domain *default_domain;
+ 	struct iommu_domain *blocking_domain;
++	/*
++	 * During a group device reset, @resetting_domain points to the physical
++	 * domain, while @domain points to the attached domain before the reset.
++	 */
++	struct iommu_domain *resetting_domain;
+ 	struct iommu_domain *domain;
+ 	struct list_head entry;
+ 	unsigned int owner_cnt;
+@@ -2195,6 +2200,15 @@ int iommu_deferred_attach(struct device *dev, struct iommu_domain *domain)
+ 
+ 	guard(mutex)(&dev->iommu_group->mutex);
+ 
++	/*
++	 * This is a concurrent attach during a device reset. Reject it until
++	 * pci_dev_reset_iommu_done() attaches the device to group->domain.
++	 *
++	 * Note that this might fail the iommu_dma_map(). But there's nothing
++	 * more we can do here.
++	 */
++	if (dev->iommu_group->resetting_domain)
++		return -EBUSY;
+ 	return __iommu_attach_device(domain, dev, NULL);
+ }
+ 
+@@ -2253,6 +2267,17 @@ struct iommu_domain *iommu_driver_get_domain_for_dev(struct device *dev)
+ 
+ 	lockdep_assert_held(&group->mutex);
+ 
++	/*
++	 * Driver handles the low-level __iommu_attach_device(), including the
++	 * one invoked by pci_dev_reset_iommu_done() re-attaching the device to
++	 * the cached group->domain. In this case, the driver must get the old
++	 * domain from group->resetting_domain rather than group->domain. This
++	 * prevents it from re-attaching the device from group->domain (old) to
++	 * group->domain (new).
++	 */
++	if (group->resetting_domain)
++		return group->resetting_domain;
++
+ 	return group->domain;
+ }
+ EXPORT_SYMBOL_GPL(iommu_driver_get_domain_for_dev);
+@@ -2409,6 +2434,13 @@ static int __iommu_group_set_domain_internal(struct iommu_group *group,
+ 	if (WARN_ON(!new_domain))
+ 		return -EINVAL;
+ 
++	/*
++	 * This is a concurrent attach during a device reset. Reject it until
++	 * pci_dev_reset_iommu_done() attaches the device to group->domain.
++	 */
++	if (group->resetting_domain)
++		return -EBUSY;
++
+ 	/*
+ 	 * Changing the domain is done by calling attach_dev() on the new
+ 	 * domain. This switch does not have to be atomic and DMA can be
+@@ -3527,6 +3559,16 @@ int iommu_attach_device_pasid(struct iommu_domain *domain,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&group->mutex);
++
++	/*
++	 * This is a concurrent attach during a device reset. Reject it until
++	 * pci_dev_reset_iommu_done() attaches the device to group->domain.
++	 */
++	if (group->resetting_domain) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++
+ 	for_each_group_device(group, device) {
+ 		/*
+ 		 * Skip PASID validation for devices without PASID support
+@@ -3610,6 +3652,16 @@ int iommu_replace_device_pasid(struct iommu_domain *domain,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&group->mutex);
++
++	/*
++	 * This is a concurrent attach during a device reset. Reject it until
++	 * pci_dev_reset_iommu_done() attaches the device to group->domain.
++	 */
++	if (group->resetting_domain) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++
+ 	entry = iommu_make_pasid_array_entry(domain, handle);
+ 	curr = xa_cmpxchg(&group->pasid_array, pasid, NULL,
+ 			  XA_ZERO_ENTRY, GFP_KERNEL);
+@@ -3867,3 +3919,124 @@ int iommu_replace_group_handle(struct iommu_group *group,
+ 	return ret;
+ }
+ EXPORT_SYMBOL_NS_GPL(iommu_replace_group_handle, IOMMUFD_INTERNAL);
++
++/**
++ * pci_dev_reset_iommu_prepare() - Block IOMMU to prepare for a PCI device reset
++ * @pdev: PCI device that is going to enter a reset routine
++ *
++ * The PCIe r6.0, sec 10.3.1 IMPLEMENTATION NOTE recommends to disable and block
++ * ATS before initiating a reset. This means that a PCIe device during the reset
++ * routine wants to block any IOMMU activity: translation and ATS invalidation.
++ *
++ * This function attaches the device's RID/PASID(s) the group->blocking_domain,
++ * setting the group->resetting_domain. This allows the IOMMU driver pausing any
++ * IOMMU activity while leaving the group->domain pointer intact. Later when the
++ * reset is finished, pci_dev_reset_iommu_done() can restore everything.
++ *
++ * Caller must use pci_dev_reset_iommu_prepare() with pci_dev_reset_iommu_done()
++ * before/after the core-level reset routine, to unset the resetting_domain.
++ *
++ * Return: 0 on success or negative error code if the preparation failed.
++ *
++ * These two functions are designed to be used by PCI reset functions that would
++ * not invoke any racy iommu_release_device(), since PCI sysfs node gets removed
++ * before it notifies with a BUS_NOTIFY_REMOVED_DEVICE. When using them in other
++ * case, callers must ensure there will be no racy iommu_release_device() call,
++ * which otherwise would UAF the dev->iommu_group pointer.
++ */
++int pci_dev_reset_iommu_prepare(struct pci_dev *pdev)
++{
++	struct iommu_group *group = pdev->dev.iommu_group;
++	unsigned long pasid;
++	void *entry;
++	int ret;
++
++	if (!pci_ats_supported(pdev) || !dev_has_iommu(&pdev->dev))
++		return 0;
++
++	guard(mutex)(&group->mutex);
++
++	/* Re-entry is not allowed */
++	if (WARN_ON(group->resetting_domain))
++		return -EBUSY;
++
++	ret = __iommu_group_alloc_blocking_domain(group);
++	if (ret)
++		return ret;
++
++	/* Stage RID domain at blocking_domain while retaining group->domain */
++	if (group->domain != group->blocking_domain) {
++		ret = __iommu_attach_device(group->blocking_domain, &pdev->dev,
++					    group->domain);
++		if (ret)
++			return ret;
++	}
++
++	/*
++	 * Stage PASID domains at blocking_domain while retaining pasid_array.
++	 *
++	 * The pasid_array is mostly fenced by group->mutex, except one reader
++	 * in iommu_attach_handle_get(), so it's safe to read without xa_lock.
++	 */
++	xa_for_each_start(&group->pasid_array, pasid, entry, 1)
++		iommu_remove_dev_pasid(&pdev->dev, pasid,
++				       pasid_array_entry_to_domain(entry));
++
++	group->resetting_domain = group->blocking_domain;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(pci_dev_reset_iommu_prepare);
++
++/**
++ * pci_dev_reset_iommu_done() - Restore IOMMU after a PCI device reset is done
++ * @pdev: PCI device that has finished a reset routine
++ *
++ * After a PCIe device finishes a reset routine, it wants to restore its IOMMU
++ * IOMMU activity, including new translation as well as cache invalidation, by
++ * re-attaching all RID/PASID of the device's back to the domains retained in
++ * the core-level structure.
++ *
++ * Caller must pair it with a successful pci_dev_reset_iommu_prepare().
++ *
++ * Note that, although unlikely, there is a risk that re-attaching domains might
++ * fail due to some unexpected happening like OOM.
++ */
++void pci_dev_reset_iommu_done(struct pci_dev *pdev)
++{
++	struct iommu_group *group = pdev->dev.iommu_group;
++	unsigned long pasid;
++	void *entry;
++
++	if (!pci_ats_supported(pdev) || !dev_has_iommu(&pdev->dev))
++		return;
++
++	guard(mutex)(&group->mutex);
++
++	/* pci_dev_reset_iommu_prepare() was bypassed for the device */
++	if (!group->resetting_domain)
++		return;
++
++	/* pci_dev_reset_iommu_prepare() was not successfully called */
++	if (WARN_ON(!group->blocking_domain))
++		return;
++
++	/* Re-attach RID domain back to group->domain */
++	if (group->domain != group->blocking_domain) {
++		WARN_ON(__iommu_attach_device(group->domain, &pdev->dev,
++					      group->blocking_domain));
++	}
++
++	/*
++	 * Re-attach PASID domains back to the domains retained in pasid_array.
++	 *
++	 * The pasid_array is mostly fenced by group->mutex, except one reader
++	 * in iommu_attach_handle_get(), so it's safe to read without xa_lock.
++	 */
++	xa_for_each_start(&group->pasid_array, pasid, entry, 1)
++		WARN_ON(__iommu_set_group_pasid(
++			pasid_array_entry_to_domain(entry), group, pasid,
++			group->blocking_domain));
++
++	group->resetting_domain = NULL;
++}
++EXPORT_SYMBOL_GPL(pci_dev_reset_iommu_done);
+diff --git a/include/linux/iommu.h b/include/linux/iommu.h
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -1188,6 +1188,10 @@ void iommu_detach_device_pasid(struct iommu_domain *domain,
+ 			       struct device *dev, ioasid_t pasid);
+ ioasid_t iommu_alloc_global_pasid(struct device *dev);
+ void iommu_free_global_pasid(ioasid_t pasid);
++
++/* PCI device reset functions */
++int pci_dev_reset_iommu_prepare(struct pci_dev *pdev);
++void pci_dev_reset_iommu_done(struct pci_dev *pdev);
+ #else /* CONFIG_IOMMU_API */
+ 
+ struct iommu_ops {};
+@@ -1511,6 +1515,15 @@ static inline ioasid_t iommu_alloc_global_pasid(struct device *dev)
+ }
+ 
+ static inline void iommu_free_global_pasid(ioasid_t pasid) {}
++
++static inline int pci_dev_reset_iommu_prepare(struct pci_dev *pdev)
++{
++	return 0;
++}
++
++static inline void pci_dev_reset_iommu_done(struct pci_dev *pdev)
++{
++}
+ #endif /* CONFIG_IOMMU_API */
+ 
+ #if IS_ENABLED(CONFIG_LOCKDEP) && IS_ENABLED(CONFIG_IOMMU_API)
+diff --git a/include/uapi/linux/vfio.h b/include/uapi/linux/vfio.h
+--- a/include/uapi/linux/vfio.h
++++ b/include/uapi/linux/vfio.h
+@@ -964,6 +964,10 @@ struct vfio_device_bind_iommufd {
+  * hw_pagetable with a new hw_pagetable corresponding to the given pt_id.
+  *
+  * Return: 0 on success, -errno on failure.
++ *
++ * When a device is resetting, -EBUSY will be returned to reject any concurrent
++ * attachment to the resetting device itself or any sibling device in the IOMMU
++ * group having the resetting device.
+  */
+ struct vfio_device_attach_iommufd_pt {
+ 	__u32	argsz;
+-- 
+2.51.0
+
