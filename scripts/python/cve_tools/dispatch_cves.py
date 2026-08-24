@@ -1,6 +1,9 @@
-#!/usr/bin/python3
-import os, sys, re, argparse, textwrap
-from bugzilla.utils import get_bugzilla_api, check_being_logged_in, make_url, make_unique
+import os
+import re
+import sys
+import argparse
+import textwrap
+from bugzilla.utils import make_url, make_unique
 
 # dispatch-cves script - is based on python-bugzilla (our in-tree patched copy) and requests libraries
 # for now this script should be kept Python 3.6 compatible (SLE15-SP7)
@@ -298,29 +301,3 @@ The bugzilla comment will always contain copy of the ./scripts/check-kernel-fix 
         QUEUE_EMAIL = args.override_source_assignee
 
     return args
-
-if __name__ == "__main__":
-    try:
-        args = parse_args()
-
-        cc_us = None
-        if not args.no_cc_self:
-            cc_us = os.environ.get('BUGZILLA_ACCOUNT_EMAIL', None)
-            if not cc_us:
-                print("WARNING: The BUGZILLA_ACCOUNT_EMAIL is not set, the autoCCing will not work!", file=sys.stderr)
-
-        bzapi = get_bugzilla_api(args.rest)
-        check_being_logged_in(bzapi)
-
-        if args.file and os.path.isfile(args.file):
-            single_dispatch(bzapi, args.file, args.remove_file, args.yes, args.force, cc_us, args.allow_same_assignee)
-            sys.exit(0)
-
-        if args.dir and os.path.isdir(args.dir):
-            multiple_dispatch(bzapi, args.dir, args.remove_file, args.yes, args.force, cc_us, args.allow_same_assignee)
-            sys.exit(0)
-
-        print(f"{args.file or args.dir} must be either regular file or a directory", file=sys.stderr)
-        sys.exit(1)
-    except KeyboardInterrupt:
-        sys.exit(1)
