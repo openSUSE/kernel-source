@@ -202,6 +202,8 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
                 should_go_out = False
                 if is_interactive:
                     print(l)
+            elif l.startswith('COMMENT:'):
+                should_go_out = False
             if should_go_out:
                 comment_lines.append(l)
         if not bug:
