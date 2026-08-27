@@ -14,8 +14,8 @@ LIVEPATCH=livepatch
 # Enable livepatching related packages on -rt variant
 LIVEPATCH_RT=1
 # buildservice projects to build the kernel against
-OBS_PROJECT=SUSE:SLFO:Main
-IBS_PROJECT=SUSE:SLFO:Main
+OBS_PROJECT=SUSE:SLFO:1.3
+IBS_PROJECT=SUSE:SLFO:1.3
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
 BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 16.1"
