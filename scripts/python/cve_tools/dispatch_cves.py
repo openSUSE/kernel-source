@@ -15,7 +15,6 @@ EMAIL_PATTERN = re.compile(r'[\s,:](\S+@\S*suse\.[^\s,:]+)')
 CC_PATTERN = re.compile(r'^\s*CC[\s:]\s*\S')
 NEEDINFO_PATTERN = re.compile(r'^\s*NEEDINFO[\s:]\s*\S')
 ASSIGNEE_PATTERN = re.compile(r'^\s*ASSIGNEE[\s:]\s*\S')
-CLOSING_COMMENT = 'Switching back to the security team.'
 SECURITY_EMAIL = 'kernel-security-sentinel@lists.suse.com'
 MONKEY_EMAIL = 'cve-kpm@suse.de'
 QUEUE_EMAIL = 'kernel-bugs@suse.de'
