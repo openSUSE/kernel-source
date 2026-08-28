@@ -83,7 +83,7 @@ NO ACTION NEEDED
 
         self.bzapi.mockbugs.append(DictObj({
             'id': 1269190,
-            'alias': 'CVE-2026-53035',
+            'alias': ['CVE-2026-53035'],
             'assigned_to': 'not.mkoutny@suse.com',
             'cc': [],
             'flags': [],
