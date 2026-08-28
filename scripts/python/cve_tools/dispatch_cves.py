@@ -55,7 +55,11 @@ class BugUpdate:
                 ', DEADLINE: ' + str(self.deadline) if self.deadline else '',
                 )
 
+    # Keep the checks in sync with the ones ask_user() reports about, otherwise
+    # a bug announced as 'nothing to do' would be updated anyway.
     def dispatch_to_bugzilla(self, bzapi, force, allow_same_assignee):
+        if self.product != SECURITY_PRODUCT and not force:
+            return
         if self.self_assign and not force and not allow_same_assignee:
             return
         if self.unknown_state and not force:
