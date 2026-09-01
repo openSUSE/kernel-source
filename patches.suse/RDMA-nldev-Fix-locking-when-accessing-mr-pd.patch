@@ -1,0 +1,138 @@
+From 50d5c02ab8e62325548bd3a6e6b758a9dcd6e7c3 Mon Sep 17 00:00:00 2001
+From: Jason Gunthorpe <jgg@nvidia.com>
+Date: Wed, 3 Jun 2026 22:27:43 -0300
+Subject: [PATCH 1/1] RDMA/nldev: Fix locking when accessing mr->pd
+Git-commit: 50d5c02ab8e62325548bd3a6e6b758a9dcd6e7c3
+Patch-mainline: v7.2-rc1
+References:  CVE-2026-74334 bsc#1277095
+
+Sashiko points out that, due to rereg_mr, the PD is actually variable and
+all the touches in nldev are racy.
+
+Use mr->device instead of mr->pd->device.
+
+Getting the PD restrack ID is more tricky. To avoid disturbing all the
+happy paths, add an rdma_restrack_sync() operation which is sort of like
+flush_workqueue() or synchronize_irq(): after it returns, all the old
+nldev touches to the mr are gone and everything sees the new PD. This
+makes it safe to reach into the PD pointer.
+
+Fixes: da5c85078215 ("RDMA/nldev: add driver-specific resource tracking")
+Link: https://patch.msgid.link/r/4-v1-29ebd2c229b5+fd5-ib_mr_pd_jgg@nvidia.com
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/core/nldev.c      |  2 +-
+ drivers/infiniband/core/restrack.c   | 43 ++++++++++++++++++++++++++++
+ drivers/infiniband/core/uverbs_cmd.c |  4 ++-
+ include/rdma/ib_verbs.h              |  5 ++++
+ 4 files changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/infiniband/core/nldev.c b/drivers/infiniband/core/nldev.c
+index 0d10854a7ff7..ea4e021ffa4b 100644
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@ -524,7 +524,7 @@ static int fill_res_mr_entry(struct sk_buff *msg, struct netlink_callback *cb,
+ 			     struct rdma_restrack_entry *res, uint32_t port)
+ {
+ 	struct ib_mr *mr = container_of(res, struct ib_mr, res);
+-	struct rdma_restrack_root *resroot = &mr->pd->device->res;
++	struct rdma_restrack_root *resroot = &mr->device->res;
+ 	struct nlattr *entry_attr;
+ 
+ 	entry_attr = nla_nest_start(msg, RDMA_NLDEV_ATTR_RES_MR_ENTRY);
+diff --git a/drivers/infiniband/core/restrack.c b/drivers/infiniband/core/restrack.c
+index 06d8657ce583..71d3f40337d4 100644
+--- a/drivers/infiniband/core/restrack.c
++++ b/drivers/infiniband/core/restrack.c
+@@ -218,6 +218,49 @@ int rdma_restrack_put(struct rdma_restrack_entry *res)
+ }
+ EXPORT_SYMBOL(rdma_restrack_put);
+ 
++/**
++ * rdma_restrack_sync() - Fence concurrent netlink dumps on an entry
++ * @res:  resource entry
++ *
++ * After this returns any concurrent netlink dump threads will see the current
++ * value of the object. This is useful if the object has to be changed and there
++ * is not locking to protect the nl side. Eg for mr->pd. This effectively
++ * destroys the object from a kref/xarray perspective and then immediately
++ * restores it. The kref is acting like a lock to barrier concurrent nl threads.
++ * Callers must ensure rdma_restrack_del() is not concurrently called.
++ */
++void rdma_restrack_sync(struct rdma_restrack_entry *res)
++{
++	struct task_struct *task;
++	struct ib_device *dev;
++
++	if (!res->valid)
++		return;
++
++	dev = res_to_dev(res);
++	if (WARN_ON(!dev))
++		return;
++
++	down_write(&dev->res.rwsem);
++	hash_del(&res->node);
++	up_write(&dev->res.rwsem);
++
++	task = res->task;
++	if (task)
++		get_task_struct(task);
++	rdma_restrack_put(res);
++	wait_for_completion(&res->comp);
++	reinit_completion(&res->comp);
++	if (task)
++		res->task = task;
++	kref_init(&res->kref);
++
++	down_write(&dev->res.rwsem);
++	hash_add(dev->res.hash, &res->node, res->type);
++	up_write(&dev->res.rwsem);
++}
++EXPORT_SYMBOL(rdma_restrack_sync);
++
+ void rdma_restrack_del(struct rdma_restrack_entry *res)
+ {
+ 	struct ib_device *dev;
+diff --git a/drivers/infiniband/core/uverbs_cmd.c b/drivers/infiniband/core/uverbs_cmd.c
+index 09909068186b..09b45753eb79 100644
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -745,6 +745,7 @@ ssize_t ib_uverbs_reg_mr(struct ib_uverbs_file *file,
+ 	return ret;
+ }
+ 
++void rdma_restrack_sync(struct rdma_restrack_entry *res);
+ ssize_t ib_uverbs_rereg_mr(struct ib_uverbs_file *file,
+ 			   const char __user *buf, int in_len,
+ 			   int out_len)
+@@ -812,7 +813,8 @@ ssize_t ib_uverbs_rereg_mr(struct ib_uverbs_file *file,
+ 	if (!ret) {
+ 		if (cmd.flags & IB_MR_REREG_PD) {
+ 			atomic_inc(&pd->usecnt);
+-			mr->pd = pd;
++			WRITE_ONCE(mr->pd, pd);
++			rdma_restrack_sync(&mr->res);
+ 			atomic_dec(&old_pd->usecnt);
+ 		}
+ 	} else {
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index d8a4bf9787d4..9d74fa9b9570 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -1791,6 +1791,11 @@ struct ib_dm {
+ 
+ struct ib_mr {
+ 	struct ib_device  *device;
++	/*
++	 * Due to IB_MR_REREG_PD pd is not a fixed pointer and can change. For a
++	 * user MR, this value should only be read from a system call that holds
++	 * the uobject lock, or the driver should disable in-place REREG_PD.
++	 */
+ 	struct ib_pd	  *pd;
+ 	u32		   lkey;
+ 	u32		   rkey;
+-- 
+2.54.0
+
