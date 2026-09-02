@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import argparse
+import subprocess
 import textwrap
 from bugzilla.utils import make_url, make_unique, calculate_deadline, format_time
 
@@ -15,16 +16,29 @@ EMAIL_PATTERN = re.compile(r'[\s,:](\S+@\S*suse\.[^\s,:]+)')
 CC_PATTERN = re.compile(r'^\s*CC[\s:]\s*\S')
 NEEDINFO_PATTERN = re.compile(r'^\s*NEEDINFO[\s:]\s*\S')
 ASSIGNEE_PATTERN = re.compile(r'^\s*ASSIGNEE[\s:]\s*\S')
-CLOSING_COMMENT = 'Switching back to the security team.'
+BLACKLIST_PATTERN = re.compile(r'^\s*BLACKLIST[\s:]\s*(\S.*?)\s*$')
+ACTION_PATTERN = re.compile(r'^(\S+):\s+MANUAL:\s')
+BLACKLIST_ALL = '*'
 SECURITY_EMAIL = 'kernel-security-sentinel@lists.suse.com'
 MONKEY_EMAIL = 'cve-kpm@suse.de'
 QUEUE_EMAIL = 'kernel-bugs@suse.de'
 SECURITY_PRODUCT = 'SUSE Security Incidents'
 COMMENT_BANLIST = [ 'swamp@suse.de', 'bwiedemann+obsbugzillabot@suse.com', 'maint-coord+maintenance-robot@suse.de', 'smash_bz@suse.de' ]
 MIN_COMMENTS = 2
+# ../../cve_tools/blacklist-cve
+BLACKLIST_CVE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                             'cve_tools', 'blacklist-cve')
+
+def parse_blacklist(spec):
+    branches = spec.split(maxsplit=1)[0].split(',')
+    if BLACKLIST_ALL not in branches:
+        return branches
+    # the wildcard already covers everything, mixing is most likely a typo
+    return BLACKLIST_ALL if len(branches) == 1 else None
 
 class BugUpdate:
-    def __init__(self, path_to_remove, bug, cvss, comment_lines, to_append, email, action, cc_list=None, needinfo_list=None):
+    def __init__(self, path_to_remove, bug, cvss, comment_lines, to_append, email, action, cc_list=None, needinfo_list=None,
+                 blacklist_branches=[]):
         self.path_to_remove = path_to_remove
         self.comment = "".join(comment_lines) + to_append
         self.email = email
@@ -38,6 +52,7 @@ class BugUpdate:
         self.product = ''
         self.cc_list = cc_list if cc_list else []
         self.needinfo_list = needinfo_list if needinfo_list else []
+        self.blacklist_branches = blacklist_branches
         self.cc_add = []
         self.cve = ''
         self.deadline = None
@@ -46,7 +61,7 @@ class BugUpdate:
         self.human_comments = []
 
     def __str__(self):
-        return "{} {:<14} {:<9} ({} -> {}{}{}{})".format(
+        return "{} {:<14} {:<9} ({} -> {}{}{}{}{})".format(
                 make_url(self.bug),
                 self.cve,
                 self.action,
@@ -54,9 +69,35 @@ class BugUpdate:
                 ', CC: ' + ', '.join(self.cc_add) if self.cc_add else '',
                 ', NEEDINFO: ' + ', '.join(self.needinfo_list) if self.needinfo_list else '',
                 ', DEADLINE: ' + str(self.deadline) if self.deadline else '',
+                ', BLACKLIST: ' + ','.join(self.blacklist_branches) if self.blacklist_branches else '',
                 )
 
+    # The comment we are about to add is appended at the end, so it gets the
+    # number of the already existing ones.
+    def comment_ref(self):
+        return '{}#c{}'.format(make_url(self.bug), len(self.bz_comments))
+
+    def blacklist_cmd(self):
+        cmd = [ BLACKLIST_CVE, 'add', self.cve, ','.join(self.blacklist_branches), self.comment_ref() ]
+        return cmd
+
+    def request_blacklist(self):
+        if not self.blacklist_branches:
+            return False
+        cmd = self.blacklist_cmd()
+        print('Running: {}'.format(' '.join(cmd)))
+        try:
+            subprocess.run(cmd, check=True)
+        except Exception as e:
+            print(f"Failed to request blacklisting of {self.cve} referencing {self.comment_ref()}: {e}", file=sys.stderr)
+            return False
+        return True
+
+    # Keep the checks in sync with the ones ask_user() reports about, otherwise
+    # a bug announced as 'nothing to do' would be updated anyway.
     def dispatch_to_bugzilla(self, bzapi, force, allow_same_assignee):
+        if self.product != SECURITY_PRODUCT and not force:
+            return
         if self.self_assign and not force and not allow_same_assignee:
             return
         if self.unknown_state and not force:
@@ -76,12 +117,16 @@ class BugUpdate:
             print(f'Warning: bsc#{self.bug} has already flags set, skipping needinfo update!', file=sys.stderr)
         try:
             bzapi.update_bugs([self.bug], vals)
-            if self.path_to_remove:
-                os.remove(self.path_to_remove)
         except Exception as e:
             print(f"Failed to update bsc#{self.bug}: {e}", file=sys.stderr)
-        else:
-            print(f'OK: {make_url(self.bug)}#c{len(self.bz_comments)}')
+            return
+        print(f'OK: {self.comment_ref()}')
+        # The blacklist request refers to the comment added above, hence it can
+        # only be submitted once the bugzilla update went through.
+        if self.blacklist_branches and not self.request_blacklist():
+            return
+        if self.path_to_remove:
+            os.remove(self.path_to_remove)
 
 def ask_user(bzapi, todo, yes, force, allow_same_assignee):
     print("\n*** ACTIONS ***")
@@ -163,8 +208,14 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
         if cc_us:
             cc_list.append(cc_us)
         needinfo_list = []
+        blacklist_branches = []
+        action_branches = []
         for l in f:
             should_go_out = True
+            blacklist_m = re.match(BLACKLIST_PATTERN, l)
+            action_m = re.match(ACTION_PATTERN, l)
+            if action_m:
+                action_branches.append(action_m.group(1))
             if l.startswith('Security fix for CVE-'):
                 m = re.search(BSC_PATTERN, l)
                 if m:
@@ -195,6 +246,13 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
                 if mm:
                    needinfo_list.extend(mm)
                 should_go_out = False
+            elif blacklist_m:
+                blacklist_branches = parse_blacklist(blacklist_m.group(1))
+                if not blacklist_branches:
+                    print(f"'{path}' has a malformed BLACKLIST stanza ('{blacklist_m.group(1)}'), "\
+                          f"expected '<branch1>,<branch2>,... ' or '{BLACKLIST_ALL}', skipping.", file=sys.stderr)
+                    return
+                should_go_out = False
             elif l.startswith('Experts candidates:'):
                 mm = re.findall(MAINTAINERS_PATTERN, l)
                 if mm:
@@ -209,6 +267,18 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
         if not bug:
             print(f"'{path}' doesn't seem to contain any bug number, skipping.  Be sure to regenerate c-k-f output with all the repos up-to-date.", file=sys.stderr)
             return
+        if blacklist_branches is BLACKLIST_ALL:
+            blacklist_branches = action_branches
+        # Blacklisting all the branches that need an action is a final verdict,
+        # so the bug goes back to the security team unless an explicit ASSIGNEE
+        if not decided and blacklist_branches:
+            undecided_b = [ b for b in action_branches if b not in blacklist_branches ]
+            if undecided_b:
+                print(f"'{path}' (bsc#{bug}) is not decided by the blacklisting, "\
+                      f"{','.join(undecided_b)} still needs an action.", file=sys.stderr)
+            else:
+                candidate_emails = [ SECURITY_EMAIL ]
+                decided = True
         if not decided and candidates:
             candidates.append(MONKEY_EMAIL)
             candidate_emails = [ e.split(" ")[0] for e in candidates ]
@@ -248,7 +318,9 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
                 email = candidate_emails[answer - 1]
             break
         to_add = ''
-        to_dispatch.append(BugUpdate(path if remove_file else None, bug, cvss, comment_lines, to_add, email, 'developer', cc_list, needinfo_list))
+        if blacklist_branches:
+            to_add = '\nRequesting to blacklist the CVE for: {}\n'.format(','.join(blacklist_branches))
+        to_dispatch.append(BugUpdate(path if remove_file else None, bug, cvss, comment_lines, to_add, email, 'developer', cc_list, needinfo_list, blacklist_branches))
 
 def single_dispatch(bzapi, path, remove_file, yes, force, cc_us, allow_same_assignee):
     to_dispatch = []
@@ -281,11 +353,19 @@ ASSIGNEE <email1>
 CC <email1> <email2> ...
 NEEDINFO <email1> <email2> ...
 TRIVIAL_BACKPORT
+BLACKLIST <branch1>,<branch2>,...
+BLACKLIST *
 
 2/ Directory mode (multiple dispatch) is like File mode, but it goes through all the files in a directory
 and processes only those that do not need an input, skipping the rest.
 
 The bugzilla comment will always contain copy of the ./scripts/check-kernel-fix output taken from the file.
+BLACKLIST takes the same branch list as ./scripts/cve_tools/blacklist-cve, '*' is a shortcut
+for all the branches that the c-k-f output reports as needing an action ('<branch>: MANUAL: ...').
+The request is submitted only after the bugzilla comment it refers to has been added.  When the
+blacklisted branches cover all the branches that need an action, the CVE is considered decided
+and the bug is handed over to the security team (unless an explicit ASSIGNEE says otherwise),
+a partial blacklisting is dispatched like any other bug.
     '''))
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-f", "--file", help="path to a regular file containing ./scripts/check-kernel-fix output", default=None, type=str)
