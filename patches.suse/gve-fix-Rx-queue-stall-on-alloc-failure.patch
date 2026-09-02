@@ -1,0 +1,149 @@
+From: Eddie Phillips <eddiephillips@google.com>
+Date: Thu, 9 Jul 2026 21:19:06 +0000
+Subject: gve: fix Rx queue stall on alloc failure
+Patch-mainline: v7.2-rc5
+Git-commit: b65352a1bac64442ad95e64f385b40ccb9f1b0db
+References: CVE-2026-68129 bsc#1275517
+
+When the system is under extreme memory pressure, page allocations can
+fail during the Rx buffer refill loop. If the number of buffers posted
+to hardware falls below a critical low threshold and the refill loop
+exits due to allocation failures, the queue can stall:
+
+1. The device drops incoming packets because there are no descriptors.
+2. Since no packets are processed, no Rx completions are generated.
+3. Because no completions occur, NAPI is never scheduled, preventing
+   the refill loop from running again even after memory is freed.
+
+This results in a permanent queue stall.
+
+Resolve this by introducing a starvation recovery timer for each Rx queue.
+If the number of buffers posted to hardware falls below a critical low
+threshold, start a timer to periodically reschedule NAPI. Once NAPI runs
+and successfully refills the queue above the threshold, the timer is
+not rescheduled.
+
+The threshold is set to 32 because a single maximum-sized Receive Segment
+Coalescing (RSC) packet can consume up to 19 descriptors in the Rx path.
+Lower thresholds (such as 8 or 16) would be insufficient to process a
+complete maximum-sized RSC packet, risking packet drops or unexpected
+hardware behavior under memory pressure. Setting the threshold to 32
+guarantees a safe margin to handle at least one full RSC packet.
+
+Cc: stable@vger.kernel.org
+Fixes: 9b8dd5e5ea48 ("gve: DQO: Add RX path")
+Reviewed-by: Jordan Rhee <jordanrhee@google.com>
+Signed-off-by: Eddie Phillips <eddiephillips@google.com>
+Signed-off-by: Harshitha Ramamurthy <hramamurthy@google.com>
+Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+Link: https://patch.msgid.link/20260709211906.3322883-1-hramamurthy@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/google/gve/gve.h        |    3 +++
+ drivers/net/ethernet/google/gve/gve_main.c   |   13 +++++++++++++
+ drivers/net/ethernet/google/gve/gve_rx_dqo.c |   21 +++++++++++++++++++++
+ 3 files changed, 37 insertions(+)
+
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@ -11,6 +11,7 @@
+ #include <linux/dmapool.h>
+ #include <linux/netdevice.h>
+ #include <linux/pci.h>
++#include <linux/timer.h>
+ #include <linux/u64_stats_sync.h>
+ #include <net/xdp.h>
+ 
+@@ -37,6 +38,7 @@
+ 
+ /* Interval to schedule a stats report update, 20000ms. */
+ #define GVE_STATS_REPORT_TIMER_PERIOD	20000
++#define GVE_RX_NAPI_RESCHED_MS 20 /* msecs */
+ 
+ /* Numbers of NIC tx/rx stats in stats report. */
+ #define NIC_TX_STATS_REPORT_NUM	0
+@@ -286,6 +288,7 @@ struct gve_rx_ring {
+ 	struct xdp_rxq_info xsk_rxq;
+ 	struct xsk_buff_pool *xsk_pool;
+ 	struct page_frag_cache page_cache; /* Page cache to allocate XDP frames */
++	struct timer_list starvation_timer; /* for queue starvation recovery */
+ };
+ 
+ /* A TX desc ring entry */
+--- a/drivers/net/ethernet/google/gve/gve_main.c
++++ b/drivers/net/ethernet/google/gve/gve_main.c
+@@ -776,6 +776,16 @@ static int gve_create_rings(struct gve_p
+ 	return 0;
+ }
+ 
++static void gve_rx_starvation_timer(struct timer_list *t)
++{
++	struct gve_rx_ring *rx = from_timer(rx, t, starvation_timer);
++	struct gve_priv *priv = rx->gve;
++	struct gve_notify_block *block;
++
++	block = &priv->ntfy_blocks[rx->ntfy_id];
++	napi_schedule(&block->napi);
++}
++
+ static void add_napi_init_xdp_sync_stats(struct gve_priv *priv,
+ 					 int (*napi_poll)(struct napi_struct *napi,
+ 							  int budget))
+@@ -810,9 +820,11 @@ static void add_napi_init_sync_stats(str
+ 	/* Add rx napi  & init sync stats*/
+ 	for (i = 0; i < priv->rx_cfg.num_queues; i++) {
+ 		int ntfy_idx = gve_rx_idx_to_ntfy(priv, i);
++		struct gve_rx_ring *rx = &priv->rx[i];
+ 
+ 		u64_stats_init(&priv->rx[i].statss);
+ 		priv->rx[i].ntfy_id = ntfy_idx;
++		timer_setup(&rx->starvation_timer, gve_rx_starvation_timer, 0);
+ 		gve_add_napi(priv, ntfy_idx, napi_poll);
+ 	}
+ }
+@@ -978,6 +990,7 @@ static void gve_free_rings(struct gve_pr
+ 	if (priv->rx) {
+ 		for (i = 0; i < priv->rx_cfg.num_queues; i++) {
+ 			ntfy_idx = gve_rx_idx_to_ntfy(priv, i);
++			timer_shutdown_sync(&priv->rx[i].starvation_timer);
+ 			gve_remove_napi(priv, ntfy_idx);
+ 		}
+ 		gve_rx_free_rings(priv);
+--- a/drivers/net/ethernet/google/gve/gve_rx_dqo.c
++++ b/drivers/net/ethernet/google/gve/gve_rx_dqo.c
+@@ -374,6 +374,7 @@ void gve_rx_post_buffers_dqo(struct gve_
+ 	struct gve_rx_compl_queue_dqo *complq = &rx->dqo.complq;
+ 	struct gve_rx_buf_queue_dqo *bufq = &rx->dqo.bufq;
+ 	struct gve_priv *priv = rx->gve;
++	u32 num_bufs_avail_to_hw;
+ 	u32 num_avail_slots;
+ 	u32 num_full_slots;
+ 	u32 num_posted = 0;
+@@ -414,6 +415,26 @@ void gve_rx_post_buffers_dqo(struct gve_
+ 	}
+ 
+ 	rx->fill_cnt += num_posted;
++
++	/* If the queue has fewer than GVE_RX_BUF_THRESH_DQO descriptors
++	 * visible to the hardware, the hardware is in danger of starving
++	 * and cannot trigger interrupts.
++	 *
++	 * We use a threshold of 32 because a single maximum-sized RSC
++	 * packet can consume up to 19 descriptors in the Rx path. Lower
++	 * thresholds (e.g., 8 or 16) would be unsafe as they could cause
++	 * the device to drop/stall on a maximum-sized RSC packet.
++	 *
++	 * Start the timer to periodically reschedule NAPI and recover.
++	 */
++	num_bufs_avail_to_hw =
++		((bufq->tail & ~(GVE_RX_BUF_THRESH_DQO - 1)) -
++		 bufq->head) & bufq->mask;
++
++	if (num_bufs_avail_to_hw < GVE_RX_BUF_THRESH_DQO) {
++		mod_timer(&rx->starvation_timer,
++			  jiffies + msecs_to_jiffies(GVE_RX_NAPI_RESCHED_MS));
++	}
+ }
+ 
+ static void gve_try_recycle_buf(struct gve_priv *priv, struct gve_rx_ring *rx,
