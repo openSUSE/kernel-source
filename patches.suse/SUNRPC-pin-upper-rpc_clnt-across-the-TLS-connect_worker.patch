@@ -1,0 +1,127 @@
+From: Chuck Lever <chuck.lever@oracle.com>
+Date: Mon, 4 May 2026 06:28:19 -0400
+Subject: SUNRPC: pin upper rpc_clnt across the TLS connect_worker
+Git-commit: 46bc86c833956219bbfd246c1ffd832a479c5199
+Patch-mainline: v7.2-rc3
+References: CVE-2026-72317 bsc#1275925
+
+The TLS connect path has a use-after-free: nothing pins the
+upper rpc_clnt across the delayed connect_worker. xs_connect()
+stores task->tk_client in sock_xprt::clnt as a raw pointer
+and queues the worker; for TLS-secured transports that worker
+is xs_tcp_tls_setup_socket(), which reads several fields out
+of the saved pointer (cl_timeout, cl_program, cl_prog,
+cl_vers, cl_cred, cl_stats) to construct the args for the
+inner handshake rpc_clnt.
+
+The xprt does not reference the rpc_clnt; the rpc_clnt
+references the xprt. xs_destroy() does cancel the
+connect_worker, but it runs only when the xprt's refcount
+drops to zero, which cannot happen until the rpc_clnt
+releases its cl_xprt reference in rpc_free_client_work().
+When a TLS handshake fails fatally (for example, an mTLS
+mount whose client cert does not match the server), the
+connecting task is woken with -EACCES and exits, the mount
+caller invokes rpc_shutdown_client(), and the upper rpc_clnt
+is freed before the queued connect_worker fires.
+xs_tcp_tls_setup_socket() then dereferences the freed clnt,
+producing the refcount_t underflow Michael Nemanov reported.
+
+Take a reference on the upper rpc_clnt in xs_connect() for
+TLS transports via a new rpc_hold_client() helper, and drop
+it in the connect_worker's exit path with rpc_release_client().
+The xprt_lock_connect() / xprt_unlock_connect() pairing
+already serialises xs_connect() with xs_tcp_tls_setup_socket(),
+so the take and release are balanced one-for-one.
+
+The non-TLS connect worker (xs_tcp_setup_socket) never reads
+sock_xprt::clnt, so leave that path alone and avoid the
+clnt-holds-xprt-holds-clnt cycle that would otherwise prevent
+xprt destruction.
+
+Reported-by: Michael Nemanov <michael.nemanov@vastdata.com>
+Closes: https://lore.kernel.org/linux-nfs/40e3d522-dfcf-4fc1-9c55-b5e81f1536d5@vastdata.com/
+Fixes: 75eb6af7acdf ("SUNRPC: Add a TCP-with-TLS RPC transport class")
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Tested-by: Michael Nemanov <michael.nemanov@vastdata.com>
+Reviewed-by: Michael Nemanov <michael.nemanov@vastdata.com>
+Signed-off-by: Anna Schumaker <anna.schumaker@hammerspace.com>
+Acked-by: Anthony Iliopoulos <ailiop@suse.com>
+---
+ include/linux/sunrpc/clnt.h |  1 +
+ net/sunrpc/clnt.c           | 19 +++++++++++++++++--
+ net/sunrpc/xprtsock.c       | 11 ++++++++++-
+ 3 files changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/sunrpc/clnt.h b/include/linux/sunrpc/clnt.h
+index f8b406b0a1af..3c2b8c355ab3 100644
+--- a/include/linux/sunrpc/clnt.h
++++ b/include/linux/sunrpc/clnt.h
+@@ -190,6 +190,7 @@ int		rpc_switch_client_transport(struct rpc_clnt *,
+ 				const struct rpc_timeout *);
+ 
+ void		rpc_shutdown_client(struct rpc_clnt *);
++void		rpc_hold_client(struct rpc_clnt *);
+ void		rpc_release_client(struct rpc_clnt *);
+ void		rpc_task_release_transport(struct rpc_task *);
+ void		rpc_task_release_client(struct rpc_task *);
+diff --git a/net/sunrpc/clnt.c b/net/sunrpc/clnt.c
+index bc8ca470718b..efa26899bc7d 100644
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@ -1026,8 +1026,23 @@ rpc_free_auth(struct rpc_clnt *clnt)
+ 	return NULL;
+ }
+ 
+-/*
+- * Release reference to the RPC client
++/**
++ * rpc_hold_client - acquire a reference on an rpc_clnt
++ * @clnt: rpc_clnt to pin
++ *
++ * Pairs with rpc_release_client().
++ */
++void rpc_hold_client(struct rpc_clnt *clnt)
++{
++	refcount_inc(&clnt->cl_count);
++}
++
++/**
++ * rpc_release_client - release a reference on an rpc_clnt
++ * @clnt: rpc_clnt to release
++ *
++ * Pairs with rpc_hold_client(). The rpc_clnt's resources are
++ * freed once its reference count drops to zero.
+  */
+ void
+ rpc_release_client(struct rpc_clnt *clnt)
+diff --git a/net/sunrpc/xprtsock.c b/net/sunrpc/xprtsock.c
+index 3eccd4923e6c..359407aae03e 100644
+--- a/net/sunrpc/xprtsock.c
++++ b/net/sunrpc/xprtsock.c
+@@ -2761,6 +2761,7 @@ static void xs_tcp_tls_setup_socket(struct work_struct *work)
+ out_unlock:
+ 	current_restore_flags(pflags, PF_MEMALLOC);
+ 	upper_transport->clnt = NULL;
++	rpc_release_client(upper_clnt);
+ 	xprt_unlock_connect(upper_xprt, upper_transport);
+ 	return;
+ 
+@@ -2808,7 +2809,15 @@ static void xs_connect(struct rpc_xprt *xprt, struct rpc_task *task)
+ 	} else
+ 		dprintk("RPC:       xs_connect scheduled xprt %p\n", xprt);
+ 
+-	transport->clnt = task->tk_client;
++	/*
++	 * Only the TLS connect_worker reads transport->clnt; pinning
++	 * the upper rpc_clnt unconditionally would form a cycle with
++	 * cl_xprt and prevent xprt destruction.
++	 */
++	if (xprt->xprtsec.policy != RPC_XPRTSEC_NONE) {
++		rpc_hold_client(task->tk_client);
++		transport->clnt = task->tk_client;
++	}
+ 	queue_delayed_work(xprtiod_workqueue,
+ 			&transport->connect_worker,
+ 			delay);
+
