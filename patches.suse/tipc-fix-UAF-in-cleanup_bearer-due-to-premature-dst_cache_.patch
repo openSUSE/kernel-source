@@ -1,0 +1,121 @@
+From: Eric Dumazet <edumazet@google.com>
+Date: Tue, 23 Jun 2026 17:30:29 +0000
+Subject: tipc: fix UAF in cleanup_bearer() due to premature
+ dst_cache_destroy()
+Git-commit: 7116764ca53ff529335d7ab7c364a69f094b23a5
+References: CVE-2026-72404 bsc#1278031
+Patch-mainline: v7.2-rc1
+
+TIPC UDP media bearer teardown calls dst_cache_destroy() on its
+replicast caches before calling synchronize_net() to wait for
+concurrent RCU readers (transmitters) to finish:
+
+static void cleanup_bearer(struct work_struct *work)
+{
+...
+	list_for_each_entry_safe(rcast, tmp, &ub->rcast.list, list) {
+		dst_cache_destroy(&rcast->dst_cache);
+		list_del_rcu(&rcast->list);
+		kfree_rcu(rcast, rcu);
+	}
+...
+	dst_cache_destroy(&ub->rcast.dst_cache);
+	udp_tunnel_sock_release(ub->sk);
+	synchronize_net();
+...
+}
+
+This is highly buggy because dst_cache_destroy() immediately frees the
+per-CPU cache memory (free_percpu()) and releases the cached dst
+entries without any synchronization.
+
+If a concurrent transmitter (e.g., tipc_udp_xmit()) is running on another
+CPU under RCU protection, it can call dst_cache_get() concurrently,
+leading to:
+1. Use-After-Free on the per-CPU cache pointer itself (crash).
+2. "rcuref - imbalanced put()" warning if it attempts to release a
+   dst that was concurrently released by dst_cache_destroy().
+
+Furthermore, calling kfree(ub) immediately after synchronize_net() without
+closing the socket first (or waiting after closing it) leaves a window
+where a concurrent receiver (tipc_udp_recv()) could start after
+synchronize_net(), access ub, and suffer a UAF when kfree(ub) runs.
+
+To fix this, we must defer dst_cache_destroy() and kfree(ub) until after
+we have ensured that no more readers can see the bearer/socket and all
+existing readers have finished:
+
+1. Defer rcast entry destruction (both dst_cache_destroy() and kfree())
+   to an RCU callback using call_rcu_hurry().
+   Using call_rcu_hurry() ensures the dst entries are released quickly.
+
+2. Release the bearer socket using udp_tunnel_sock_release() (stops
+   new receive readers).
+
+3. Call synchronize_net() to wait for all outstanding RCU readers
+   (both transmit and receive) to finish.
+
+4. Now that it is safe, call dst_cache_destroy() on the main bearer
+   cache, and free ub.
+
+Note: 3) and 4) can be changed later in net-next to also use
+call_rcu_hurry() and get rid of the synchronize_net() latency.
+
+Fixes: e9c1a793210f ("tipc: add dst_cache support for udp media")
+Reported-by: syzbot+e14bc5d4942756023b77@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/netdev/6a396a66.52ae72c2.136ac7.0003.GAE@google.com/T/#u
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Cc: Jon Maloy <jmaloy@redhat.com>
+Cc: tipc-discussion@lists.sourceforge.net
+Reviewed-by: Xin Long <lucien.xin@gmail.com>
+Link: https://patch.msgid.link/20260623173030.2925059-2-edumazet@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Steffen Jaeckel <sjaeckel@suse.de>
+---
+ net/tipc/udp_media.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/net/tipc/udp_media.c b/net/tipc/udp_media.c
+index 6b3f814ed3d5..f38022d080b2 100644
+--- a/net/tipc/udp_media.c
++++ b/net/tipc/udp_media.c
+@@ -806,6 +806,14 @@ static int tipc_udp_enable(struct net *net, struct tipc_bearer *b,
+ 	return err;
+ }
+ 
++static void rcast_free_rcu(struct rcu_head *rcu)
++{
++	struct udp_replicast *rcast = container_of(rcu, struct udp_replicast, rcu);
++
++	dst_cache_destroy(&rcast->dst_cache);
++	kfree(rcast);
++}
++
+ /* cleanup_bearer - break the socket/bearer association */
+ static void cleanup_bearer(struct work_struct *work)
+ {
+@@ -814,18 +822,17 @@ static void cleanup_bearer(struct work_struct *work)
+ 	struct tipc_net *tn;
+ 
+ 	list_for_each_entry_safe(rcast, tmp, &ub->rcast.list, list) {
+-		dst_cache_destroy(&rcast->dst_cache);
+ 		list_del_rcu(&rcast->list);
+-		kfree_rcu(rcast, rcu);
++		call_rcu_hurry(&rcast->rcu, rcast_free_rcu);
+ 	}
+ 
+ 	tn = tipc_net(sock_net(ub->ubsock->sk));
+ 
+-	dst_cache_destroy(&ub->rcast.dst_cache);
+ 	udp_tunnel_sock_release(ub->ubsock);
+ 
+-	/* Note: could use a call_rcu() to avoid another synchronize_net() */
+ 	synchronize_net();
++
++	dst_cache_destroy(&ub->rcast.dst_cache);
+ 	atomic_dec(&tn->wq_count);
+ 	kfree(ub);
+ }
+-- 
+2.54.0
+
