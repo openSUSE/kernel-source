@@ -1,0 +1,128 @@
+From 4390f019ad7866c3791c3d768d2ff185d89e8ebe Mon Sep 17 00:00:00 2001
+From: Brian Foster <bfoster@redhat.com>
+Date: Fri, 6 Sep 2024 07:40:51 -0400
+Subject: xfs: don't free cowblocks from under dirty pagecache on unshare
+Git-commit: 4390f019ad7866c3791c3d768d2ff185d89e8ebe
+Patch-mainline: v6.12-rc3
+References: bsc#1278709
+
+fallocate unshare mode explicitly breaks extent sharing. When a
+command completes, it checks the data fork for any remaining shared
+extents to determine whether the reflink inode flag and COW fork
+preallocation can be removed. This logic doesn't consider in-core
+pagecache and I/O state, however, which means we can unsafely remove
+COW fork blocks that are still needed under certain conditions.
+
+For example, consider the following command sequence:
+
+xfs_io -fc "pwrite 0 1k" -c "reflink <file> 0 256k 1k" \
+	-c "pwrite 0 32k" -c "funshare 0 1k" <file>
+
+This allocates a data block at offset 0, shares it, and then
+overwrites it with a larger buffered write. The overwrite triggers
+COW fork preallocation, 32 blocks by default, which maps the entire
+32k write to delalloc in the COW fork. All but the shared block at
+offset 0 remains hole mapped in the data fork. The unshare command
+redirties and flushes the folio at offset 0, removing the only
+shared extent from the inode. Since the inode no longer maps shared
+extents, unshare purges the COW fork before the remaining 28k may
+have written back.
+
+This leaves dirty pagecache backed by holes, which writeback quietly
+skips, thus leaving clean, non-zeroed pagecache over holes in the
+file. To verify, fiemap shows holes in the first 32k of the file and
+reads return different data across a remount:
+
+$ xfs_io -c "fiemap -v" <file>
+<file>: EXT: FILE-OFFSET      BLOCK-RANGE      TOTAL FLAGS
+   ...
+   1: [8..511]:        hole               504
+   ...
+$ xfs_io -c "pread -v 4k 8" <file>
+00001000: cd cd cd cd cd cd cd cd  ........
+$ umount <mnt>; mount <dev> <mnt>
+$ xfs_io -c "pread -v 4k 8" <file>
+00001000: 00 00 00 00 00 00 00 00  ........
+
+To avoid this problem, make unshare follow the same rules used for
+background cowblock scanning and never purge the COW fork for inodes
+with dirty pagecache or in-flight I/O.
+
+Fixes: 46afb0628b86347 ("xfs: only flush the unshared range in xfs_reflink_unshare")
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Carlos Maiolino <cem@kernel.org>
+Acked-by: Anthony Iliopoulos <ailiop@suse.com>
+
+---
+ fs/xfs/xfs_icache.c  |  8 +-------
+ fs/xfs/xfs_reflink.c |  3 +++
+ fs/xfs/xfs_reflink.h | 19 +++++++++++++++++++
+ 3 files changed, 23 insertions(+), 7 deletions(-)
+
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index 025fc251095c..c4b783293de1 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -1294,13 +1294,7 @@ xfs_prep_free_cowblocks(
+ 	 * If the mapping is dirty or under writeback we cannot touch the
+ 	 * CoW fork.  Leave it alone if we're in the midst of a directio.
+ 	 */
+-	if ((VFS_I(ip)->i_state & I_DIRTY_PAGES) ||
+-	    mapping_tagged(VFS_I(ip)->i_mapping, PAGECACHE_TAG_DIRTY) ||
+-	    mapping_tagged(VFS_I(ip)->i_mapping, PAGECACHE_TAG_WRITEBACK) ||
+-	    atomic_read(&VFS_I(ip)->i_dio_count))
+-		return false;
+-
+-	return true;
++	return xfs_can_free_cowblocks(ip);
+ }
+ 
+ /*
+diff --git a/fs/xfs/xfs_reflink.c b/fs/xfs/xfs_reflink.c
+index 74a6176aa3b8..8facf9a0eae7 100644
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@ -1651,6 +1651,9 @@ xfs_reflink_clear_inode_flag(
+ 
+ 	ASSERT(xfs_is_reflink_inode(ip));
+ 
++	if (!xfs_can_free_cowblocks(ip))
++		return 0;
++
+ 	error = xfs_reflink_inode_has_shared_extents(*tpp, ip, &needs_flag);
+ 	if (error || needs_flag)
+ 		return error;
+diff --git a/fs/xfs/xfs_reflink.h b/fs/xfs/xfs_reflink.h
+index 65c5dfe17ecf..67a335b247b1 100644
+--- a/fs/xfs/xfs_reflink.h
++++ b/fs/xfs/xfs_reflink.h
+@@ -16,6 +16,25 @@ static inline bool xfs_is_cow_inode(struct xfs_inode *ip)
+ 	return xfs_is_reflink_inode(ip) || xfs_is_always_cow_inode(ip);
+ }
+ 
++/*
++ * Check whether it is safe to free COW fork blocks from an inode. It is unsafe
++ * to do so when an inode has dirty cache or I/O in-flight, even if no shared
++ * extents exist in the data fork, because outstanding I/O may target blocks
++ * that were speculatively allocated to the COW fork.
++ */
++static inline bool
++xfs_can_free_cowblocks(struct xfs_inode *ip)
++{
++	struct inode *inode = VFS_I(ip);
++
++	if ((inode->i_state & I_DIRTY_PAGES) ||
++	    mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
++	    mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK) ||
++	    atomic_read(&inode->i_dio_count))
++		return false;
++	return true;
++}
++
+ extern int xfs_reflink_trim_around_shared(struct xfs_inode *ip,
+ 		struct xfs_bmbt_irec *irec, bool *shared);
+ int xfs_bmap_trim_cow(struct xfs_inode *ip, struct xfs_bmbt_irec *imap,
+-- 
+2.55.0
+
