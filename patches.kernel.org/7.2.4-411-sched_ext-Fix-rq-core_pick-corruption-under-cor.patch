@@ -1,0 +1,191 @@
+From: Tejun Heo <tj@kernel.org>
+Date: Fri, 7 Aug 2026 11:02:21 -1000
+Subject: [PATCH] sched_ext: Fix rq->core_pick corruption under core scheduling
+References: bsc#1012628
+Patch-mainline: 7.2.4
+Git-commit: d954004205c1a1d3f59ce8482b559266c15600fa
+
+commit d954004205c1a1d3f59ce8482b559266c15600fa upstream.
+
+Core scheduling's pick_next_task() picks what to run on every SMT sibling of
+the core in a single pass under the shared core-wide rq lock. The selection
+state is consistent only while the lock is held continuously, so
+->pick_task() originally could not release it. However, since 4c95380701f5
+("sched/ext: Fold balance_scx() into pick_task_scx()"), sched_ext runs
+dispatch from inside the pick and dispatching can drop the rq lock. To
+support this, pick_next_task() has been updated to restart the whole
+selection when a pick returns RETRY_TASK after releasing the lock.
+
+When selections on the same core interleave through the dropped lock, they
+corrupt each other's state: one clears the other's rq->core_pick leading to
+a NULL deref, or invalidates its keep-the-previous-task decision leaving a
+dequeued task running, which deadlocks the next wakeup and matches the
+reported hard hangs. A cookied ping-pong load on an SMT machine makes the
+interleavings frequent and kills the kernel within seconds.
+
+Fix it by making the pick return RETRY_TASK whenever dispatch released the
+rq lock, so that a selection only ever commits picks made under a
+continuously held lock. The previous patch's rq->scx.lock_drop_seq counts
+the releases. A dispatch that touched nothing never releases the lock and
+its verdict, including "nothing to run", stands: retries are bounded, each
+following a dispatch that actually did something, and an idle CPU does not
+loop.
+
+If another dispatch is already in flight on the rq, skip dispatching and
+pick from what is already queued locally - the in-flight dispatch has
+released the lock, so its own selection will retry and re-pick this rq,
+while returning RETRY_TASK here would only spin on the lock that dispatch
+needs to finish.
+
+Balance callbacks must run in the context that queued them, so they can only
+be queued on the CPU's own rq. When dispatching for another rq, run the
+deferred work directly instead - that rq may consume all its picks through
+the core-sched fast path and never queue the callback itself.
+
+The put_prev_task_scx() warning about a runnable task being left behind
+assumed that dispatch ran as part of the very pick that is switching away.
+That now only holds on the non-core path, so gate it and drop the
+cookie-match test, which is always true without core scheduling, from its
+condition.
+
+Fixes: 4c95380701f5 ("sched/ext: Fold balance_scx() into pick_task_scx()")
+Cc: stable@vger.kernel.org # v6.19+
+Reported-by: ElXreno <elxreno@gmail.com>
+Link: https://github.com/sched-ext/scx/issues/3715
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ kernel/sched/ext/ext.c | 86 ++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 78 insertions(+), 8 deletions(-)
+
+diff --git a/kernel/sched/ext/ext.c b/kernel/sched/ext/ext.c
+index 84ec71d28b61..4f62f9bf2edb 100644
+--- a/kernel/sched/ext/ext.c
++++ b/kernel/sched/ext/ext.c
+@@ -2779,6 +2779,7 @@ enum scx_dsp_verdict {
+ 	SCX_DSP_NONE,		/* nothing to run */
+ 	SCX_DSP_LOCAL,		/* local DSQ has tasks */
+ 	SCX_DSP_PREV,		/* keep running @prev */
++	SCX_DSP_RETRY,		/* pick helpers only: restart the pick */
+ };
+ 
+ /*
+@@ -3124,12 +3125,12 @@ static void put_prev_task_scx(struct rq *rq, struct task_struct *p,
+ 		 * ops.enqueue() that @p is the only one available for this cpu,
+ 		 * which should trigger an explicit follow-up scheduling event.
+ 		 *
+-		 * Core scheduling can force this CPU idle while @p stays
+-		 * runnable. @p's cookie then won't match the core's, so skip
+-		 * the warning in that case.
++		 * Under core scheduling, a pick dispatches only when nothing is
++		 * locally runnable and can legitimately go idle with @p still
++		 * runnable (see do_pick_task_scx()).
+ 		 */
+ 		if (next && sched_class_above(&ext_sched_class, next->sched_class)) {
+-			WARN_ON_ONCE(sched_cpu_cookie_match(rq, p) &&
++			WARN_ON_ONCE(!sched_core_enabled(rq) &&
+ 				     !(sch->ops.flags & SCX_OPS_ENQ_LAST));
+ 			do_enqueue_task(rq, p, SCX_ENQ_LAST, -1);
+ 		} else {
+@@ -3222,6 +3223,70 @@ static enum scx_dsp_verdict dispatch_pick(struct rq *rq, struct rq_flags *rf,
+ 	return verdict;
+ }
+ 
++#ifdef CONFIG_SCHED_CORE
++/*
++ * Dispatch for a pick when core scheduling is enabled. The selection picks for
++ * all SMT siblings and the rq_i->core_pick state it builds must stay atomic
++ * throughout. If the dispatch released the rq lock, anything can have happened
++ * in between - return %SCX_DSP_RETRY to restart the selection against current
++ * state.
++ */
++static enum scx_dsp_verdict dispatch_core_pick(struct rq *rq, struct rq_flags *rf,
++					       struct task_struct *prev)
++{
++	enum scx_dsp_verdict verdict;
++	u32 seq = rq->scx.lock_drop_seq;
++
++	/* another dispatch is in flight on @rq, let that handle it */
++	if (rq->scx.flags & SCX_RQ_IN_BALANCE)
++		return SCX_DSP_NONE;
++
++	rq_unpin_lock(rq, rf);
++
++	verdict = balance_one(rq, prev);
++
++	if (cpu_of(rq) == smp_processor_id()) {
++		maybe_queue_balance_callback(rq);
++
++		/* see dispatch_pick() */
++		if (unlikely(rq->scx.kick_sync_pending)) {
++			rq->scx.kick_sync_pending = false;
++			queue_balance_callback(rq, &rq->scx.kick_sync_bal_cb,
++					       kick_sync_wait_bal_cb);
++		}
++	} else if (unlikely(rq->scx.flags & SCX_RQ_BAL_CB_PENDING)) {
++		/*
++		 * Balance callbacks must run in the context that queued them,
++		 * so they can't be queued on another CPU's rq. Run the deferred
++		 * work directly instead.
++		 */
++		rq->scx.flags &= ~SCX_RQ_BAL_CB_PENDING;
++		run_deferred(rq);
++	}
++
++	rq_repin_lock(rq, rf);
++
++	/* if balance_one() released the rq lock, restart the selection */
++	if (rq->scx.lock_drop_seq != seq)
++		return SCX_DSP_RETRY;
++
++	/* see dispatch_pick() */
++	if (unlikely(verdict == SCX_DSP_PREV &&
++		     prev->sched_class != &ext_sched_class)) {
++		WARN_ON_ONCE(scx_enable_state() == SCX_ENABLED);
++		verdict = SCX_DSP_LOCAL;
++	}
++
++	return verdict;
++}
++#else	/* CONFIG_SCHED_CORE */
++static enum scx_dsp_verdict dispatch_core_pick(struct rq *rq, struct rq_flags *rf,
++					       struct task_struct *prev)
++{
++	return SCX_DSP_NONE;
++}
++#endif	/* CONFIG_SCHED_CORE */
++
+ static struct task_struct *
+ do_pick_task_scx(struct rq *rq, struct rq_flags *rf, bool force_scx)
+ {
+@@ -3234,7 +3299,13 @@ do_pick_task_scx(struct rq *rq, struct rq_flags *rf, bool force_scx)
+ 
+ 	rq_modified_begin(rq, &ext_sched_class);
+ 
+-	verdict = dispatch_pick(rq, rf, prev);
++	if (sched_core_enabled(rq))
++		verdict = dispatch_core_pick(rq, rf, prev);
++	else
++		verdict = dispatch_pick(rq, rf, prev);
++
++	if (verdict == SCX_DSP_RETRY)
++		return RETRY_TASK;
+ 
+ 	/*
+ 	 * If any higher-priority sched class enqueued a runnable task on this
+@@ -3248,9 +3319,8 @@ do_pick_task_scx(struct rq *rq, struct rq_flags *rf, bool force_scx)
+ 		return RETRY_TASK;
+ 
+ 	/*
+-	 * If balance_one() is telling us to keep running @prev, replenish slice
+-	 * if necessary and keep running @prev. Otherwise, pop the first one
+-	 * from the local DSQ.
++	 * If we're keeping @prev, replenish slice if necessary and keep running
++	 * @prev. Otherwise, pop the first one from the local DSQ.
+ 	 */
+ 	if (verdict == SCX_DSP_PREV) {
+ 		p = prev;
+-- 
+2.55.0
+
