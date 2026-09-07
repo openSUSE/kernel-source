@@ -1,0 +1,159 @@
+From: Chuck Lever <chuck.lever@oracle.com>
+Date: Thu, 28 May 2026 15:32:13 -0400
+Subject: [PATCH] SUNRPC: close backchannel before destroying callback service
+References: bsc#1012628
+Patch-mainline: 7.2.4
+Git-commit: 3674f780f47d2906b5a0f7199b66973067bdfeca
+
+commit 3674f780f47d2906b5a0f7199b66973067bdfeca upstream.
+
+A backchannel receive can complete a request while the NFS callback
+service is being torn down.  xprt_complete_bc_request() removes the
+request from bc_pa_list, drops bc_alloc_count, marks the request in use,
+and then asks xprt_enqueue_bc_request() to hand it to the callback
+service.
+
+If teardown has already cleared xprt->bc_serv, xprt_enqueue_bc_request()
+currently returns without enqueueing or freeing the committed request.
+The xprt_get() taken on entry is leaked as well.  If the producer wins
+the race before bc_serv is cleared, it can also enqueue onto sv_cb_list
+after nfs_callback_down() has stopped the callback threads, leaving the
+request linked to a svc_serv that is about to be freed.
+
+Close the producer side before callback threads are stopped.  Add
+xprt_svc_shutdown_bc() to clear xprt->bc_serv under bc_pa_lock, and call
+it on callback shutdown and callback-start failure before stopping the
+service threads.  Requests that lose the NULL transition in
+xprt_enqueue_bc_request() are released through the normal backchannel
+free path after balancing bc_slot_count.  Finally, drain any remaining
+sv_cb_list requests after the callback threads have stopped and before
+svc_destroy() frees the service.
+
+Fixes: 441244d4273a ("SUNRPC: cleanup common code in backchannel request")
+Fixes: 9e9fdd0ad0fb ("NFSv4.1: protect destroying and nullifying bc_serv structure")
+Cc: stable@vger.kernel.org
+Signed-off-by: Chris Mason <clm@meta.com>
+Reviewed-by: Jeff Layton <jlayton@kernel.org>
+Link: https://patch.msgid.link/20260528-tier2-v1-6-d026a1415e0b@oracle.com
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/nfs/callback.c              |  4 +++-
+ include/linux/sunrpc/bc_xprt.h |  5 +++++
+ net/sunrpc/backchannel_rqst.c  | 38 +++++++++++++++++++++++++++-------
+ 3 files changed, 39 insertions(+), 8 deletions(-)
+
+diff --git a/fs/nfs/callback.c b/fs/nfs/callback.c
+index ff4e9fd38e83..bc282b744f34 100644
+--- a/fs/nfs/callback.c
++++ b/fs/nfs/callback.c
+@@ -231,8 +231,9 @@ int nfs_callback_up(u32 minorversion, struct rpc_xprt *xprt)
+ 	cb_info->users++;
+ err_net:
+ 	if (!cb_info->users) {
++		xprt_svc_shutdown_bc(xprt);
+ 		svc_set_num_threads(cb_info->serv, 0, 0);
+-		svc_destroy(&cb_info->serv);
++		xprt_svc_destroy_nullify_bc(xprt, &cb_info->serv);
+ 	}
+ err_create:
+ 	mutex_unlock(&nfs_callback_mutex);
+@@ -254,6 +255,7 @@ void nfs_callback_down(int minorversion, struct net *net, struct rpc_xprt *xprt)
+ 
+ 	mutex_lock(&nfs_callback_mutex);
+ 	serv = cb_info->serv;
++	xprt_svc_shutdown_bc(xprt);
+ 	nfs_callback_down_net(minorversion, serv, net);
+ 	cb_info->users--;
+ 	if (cb_info->users == 0) {
+diff --git a/include/linux/sunrpc/bc_xprt.h b/include/linux/sunrpc/bc_xprt.h
+index 98939cb664cf..59d0cc889beb 100644
+--- a/include/linux/sunrpc/bc_xprt.h
++++ b/include/linux/sunrpc/bc_xprt.h
+@@ -32,6 +32,7 @@ int xprt_setup_bc(struct rpc_xprt *xprt, unsigned int min_reqs);
+ void xprt_destroy_bc(struct rpc_xprt *xprt, unsigned int max_reqs);
+ void xprt_free_bc_rqst(struct rpc_rqst *req);
+ unsigned int xprt_bc_max_slots(struct rpc_xprt *xprt);
++void xprt_svc_shutdown_bc(struct rpc_xprt *xprt);
+ void xprt_svc_destroy_nullify_bc(struct rpc_xprt *xprt, struct svc_serv **serv);
+ 
+ /*
+@@ -71,6 +72,10 @@ static inline void xprt_free_bc_request(struct rpc_rqst *req)
+ {
+ }
+ 
++static inline void xprt_svc_shutdown_bc(struct rpc_xprt *xprt)
++{
++}
++
+ static inline void xprt_svc_destroy_nullify_bc(struct rpc_xprt *xprt, struct svc_serv **serv)
+ {
+ 	svc_destroy(serv);
+diff --git a/net/sunrpc/backchannel_rqst.c b/net/sunrpc/backchannel_rqst.c
+index 0ffa4d01a938..1482b06e0f38 100644
+--- a/net/sunrpc/backchannel_rqst.c
++++ b/net/sunrpc/backchannel_rqst.c
+@@ -25,20 +25,39 @@ unsigned int xprt_bc_max_slots(struct rpc_xprt *xprt)
+ }
+ 
+ /*
+- * Helper function to nullify backchannel server pointer in transport.
+- * We need to synchronize setting the pointer to NULL (done so after
+- * the backchannel server is shutdown) with the usage of that pointer
+- * by the backchannel request processing routines
+- * xprt_complete_bc_request() and rpcrdma_bc_receive_call().
++ * Close the backchannel producer side, drain any requests still
++ * queued on sv_cb_list, then destroy the callback service.
+  */
+ void xprt_svc_destroy_nullify_bc(struct rpc_xprt *xprt, struct svc_serv **serv)
+ {
+-	spin_lock(&xprt->bc_pa_lock);
++	struct svc_serv *bc_serv = *serv;
++	struct rpc_rqst *req;
++
++	xprt_svc_shutdown_bc(xprt);
++	while ((req = lwq_dequeue(&bc_serv->sv_cb_list, struct rpc_rqst,
++				  rq_bc_list)) != NULL) {
++		atomic_dec(&req->rq_xprt->bc_slot_count);
++		xprt_free_bc_request(req);
++	}
+ 	svc_destroy(serv);
++}
++EXPORT_SYMBOL_GPL(xprt_svc_destroy_nullify_bc);
++
++/*
++ * Clear the backchannel server pointer in the transport.  The NULL
++ * store is serialized under bc_pa_lock against readers of
++ * xprt->bc_serv in xprt_complete_bc_request() and
++ * rpcrdma_bc_receive_call().  Clearing it before the callback service
++ * is stopped prevents a producer from enqueueing onto a service that
++ * is being torn down.
++ */
++void xprt_svc_shutdown_bc(struct rpc_xprt *xprt)
++{
++	spin_lock(&xprt->bc_pa_lock);
+ 	xprt->bc_serv = NULL;
+ 	spin_unlock(&xprt->bc_pa_lock);
+ }
+-EXPORT_SYMBOL_GPL(xprt_svc_destroy_nullify_bc);
++EXPORT_SYMBOL_GPL(xprt_svc_shutdown_bc);
+ 
+ /*
+  * Helper routines that track the number of preallocation elements
+@@ -393,7 +412,12 @@ void xprt_enqueue_bc_request(struct rpc_rqst *req)
+ 	if (bc_serv) {
+ 		lwq_enqueue(&req->rq_bc_list, &bc_serv->sv_cb_list);
+ 		svc_pool_wake_idle_thread(&bc_serv->sv_pools[0]);
++		spin_unlock(&xprt->bc_pa_lock);
++		return;
+ 	}
+ 	spin_unlock(&xprt->bc_pa_lock);
++
++	atomic_dec(&xprt->bc_slot_count);
++	xprt_free_bc_request(req);
+ }
+ EXPORT_SYMBOL_GPL(xprt_enqueue_bc_request);
+-- 
+2.55.0
+
