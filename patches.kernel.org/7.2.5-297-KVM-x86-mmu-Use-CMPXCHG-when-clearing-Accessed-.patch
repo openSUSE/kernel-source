@@ -1,0 +1,114 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Mon, 27 Jul 2026 17:22:35 -0700
+Subject: [PATCH] KVM: x86/mmu: Use CMPXCHG when clearing Accessed bit in TDP
+ MMU
+References: bsc#1012628
+Patch-mainline: 7.2.5
+Git-commit: 3d679b7cb31f74bf2303123ce4ee3266eeee999a
+
+commit 3d679b7cb31f74bf2303123ce4ee3266eeee999a upstream.
+
+Use LOCK CMPXCHG instead of LOCK AND to clear the Accessed bit when aging
+SPTEs in the TDP MMU, as doing a LOCK AND can corrupt a FROZEN SPTE and
+allow a third CPU to effectively overwrite the FROZEN SPTE.  As pointed
+out by AI of some kind, because the magic FROZEN_SPTE value is a "full"
+SPTE, not a single bit, and includes the Accessed bit, clearing the
+Accessed bit in a FROZEN SPTE will result in is_frozen_spte() getting a
+false negative.
+
+E.g. if CPU0 freezes an SPTE, and CPU1 clears the Accessed bit in the
+frozen SPTE, then CPU2 could come along and overwrite the frozen SPTE with
+a shadow-present SPTE.
+
+Thankfully, the false negative is largely benign, because outside of TDX,
+which doesn't support aging, KVM only freezes leaf SPTEs when removing an
+upper level shadow page.  So while KVM could clobber a frozen SPTE back to
+a shadow-present SPTE, and could even use the new SPTE, the subsequent TLB
+flush will make the orphaned, shadow-present SPTE unreachable.  Failure to
+ever zap the orphaned leaf SPTE would show up in KVM's stats, but otherwise
+is benign (because KVM no longer keeps an elevated refcount for leaf SPTEs).
+
+Opportunistically add a comment to warn future developers away from using
+kvm_tdp_mmu_write_spte_atomic() and tdp_mmu_clear_spte_bits_atomic(), as
+they are generally unsafe.  Keep the helpers, e.g. instead of open-coding
+the atomic64_fetch_and() in tdp_mmu_clear_spte_bits(), as scary warnings
+usually are more effective deterrent against recidivism than removal of the
+dangerous code.
+
+Alternatively, KVM could use different bits for the magic FROZEN_SPTE value,
+e.g. setting the Dirty bits (with effective IPAT and Global aliases) would
+likely be "ok", as IPAT/Global are extremely unlikely to be cleared without
+doing a full SPTE write, and KVM's clearing of Dirty bits shares logic with
+Write-Protection, which must do a full SPTE write (via cmpxchg64() in the
+TDP MMU) to ensure KVM isn't clobbering state.  But there is zero reason to
+carry that risk (beyond stubbornness in wanting to preserve a "cute" idea),
+as the cost of LOCK CMPXCHG and LOCK AND are within 1-2 uops of each other
+on modern hardware.
+
+Fixes: b146a9b34aed ("KVM: x86/mmu: Age TDP MMU SPTEs without holding mmu_lock")
+Cc: stable@vger.kernel.org
+Reviewed-by: Kai Huang <kai.huang@intel.com>
+Reviewed-by: James Houghton <jthoughton@google.com>
+Link: https://patch.msgid.link/20260728002236.869865-2-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ arch/x86/kvm/mmu/tdp_iter.h |  7 +++++++
+ arch/x86/kvm/mmu/tdp_mmu.c  | 20 +++++++++-----------
+ 2 files changed, 16 insertions(+), 11 deletions(-)
+
+diff --git a/arch/x86/kvm/mmu/tdp_iter.h b/arch/x86/kvm/mmu/tdp_iter.h
+index 364c5da6c499..f898d8d0d93c 100644
+--- a/arch/x86/kvm/mmu/tdp_iter.h
++++ b/arch/x86/kvm/mmu/tdp_iter.h
+@@ -19,6 +19,13 @@ static inline u64 kvm_tdp_mmu_read_spte(tdp_ptep_t sptep)
+ 	return READ_ONCE(*rcu_dereference(sptep));
+ }
+ 
++/*
++ * WARNING!  mmu_lock must be held for write when using the "write atomic" or
++ * "clear bits atomic" APIs, otherwise KVM could overwrite the "wrong" old SPTE
++ * value, i.e. clobber an update from a different CPU.  The only exception is
++ * when KVM is freezing a leaf SPTE for removal, in which case KVM doesn't care
++ * about the exact old SPTE value (KVM will react to the actual old value).
++ */
+ static inline u64 kvm_tdp_mmu_write_spte_atomic(tdp_ptep_t sptep, u64 new_spte)
+ {
+ 	KVM_MMU_WARN_ON(is_ept_ve_possible(new_spte));
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index c1cbae65d239..d95af13d922a 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -1334,19 +1334,17 @@ static void kvm_tdp_mmu_age_spte(struct kvm *kvm, struct tdp_iter *iter)
+ 	if (WARN_ON_ONCE(is_mirror_sptep(iter->sptep)))
+ 		return;
+ 
+-	if (spte_ad_enabled(iter->old_spte)) {
+-		iter->old_spte = tdp_mmu_clear_spte_bits_atomic(iter->sptep,
+-								shadow_accessed_mask);
++	if (spte_ad_enabled(iter->old_spte))
+ 		new_spte = iter->old_spte & ~shadow_accessed_mask;
+-	} else {
++	else
+ 		new_spte = mark_spte_for_access_track(iter->old_spte);
+-		/*
+-		 * It is safe for the following cmpxchg to fail. Leave the
+-		 * Accessed bit set, as the spte is most likely young anyway.
+-		 */
+-		if (__tdp_mmu_set_spte_atomic(kvm, iter, new_spte))
+-			return;
+-	}
++
++	/*
++	 * Don't bother retrying if another CPU modified the SPTE, the SPTE is
++	 * either being zapped or is likely still in-use, i.e. is still young.
++	 */
++	if (__tdp_mmu_set_spte_atomic(kvm, iter, new_spte))
++		return;
+ 
+ 	trace_kvm_tdp_mmu_spte_changed(iter->as_id, iter->gfn, iter->level,
+ 				       iter->old_spte, new_spte);
+-- 
+2.55.0
+
