@@ -1,0 +1,106 @@
+From: Shen Yongchao <grayhat@foxmail.com>
+Date: Mon, 3 Aug 2026 22:31:57 +0800
+Subject: [PATCH] HID: bpf: serialize device reference release in struct_ops
+ destroy path
+References: bsc#1012628
+Patch-mainline: 7.2.5
+Git-commit: 9cdc7e6dc7a99ad7311ad5e7c145f2b9ce4e24b0
+
+commit 9cdc7e6dc7a99ad7311ad5e7c145f2b9ce4e24b0 upstream.
+
+__hid_bpf_ops_destroy_device() and hid_bpf_unreg() can race on the
+same registration reference, double-putting struct hid_device and
+freeing it while hid_destroy_device() still uses it.  Serialize the
+remove/NULL decision under hdev->bpf.prog_list_lock so exactly one
+path releases each registration reference: unreg re-checks ops->hdev
+under the lock and returns without putting when the destroy path
+already cleared it; all put_device() calls happen after the lock is
+dropped, which is safe because a concurrent unreg then observes
+ops->hdev == NULL under the lock.
+
+Background: each successful attach (hid_bpf_ops_reg) acquires one
+device reference (hid_get_device()).  Two paths can release it:
+
+- device destruction: hid_destroy_device() -> hid_bpf_destroy_device()
+  -> __hid_bpf_ops_destroy_device(), which walks hdev->bpf.prog_list
+  under rcu_read_lock() and drops one reference per attached program;
+- BPF link release: bpf map delete (no BPF_F_LINK) synchronously calls
+  st_ops->unreg() -> hid_bpf_unreg(), which drops the reference for
+  its own registration.
+
+The coordination handshake (e->hdev = NULL on the destroy side vs
+"if (!hdev) return" on the unreg side) is a TOCTOU check: the two
+paths run under different lock domains (rcu_read_lock vs
+prog_list_lock), so a concurrent unreg can read ops->hdev as
+non-NULL, block on prog_list_lock, and then proceed while the
+destroy traversal executes - both paths then drop the same
+reference.  The refcount reaches zero legitimately (each decrement
+is individually valid), so no refcount_t saturation fires: the
+device is simply freed while the transport is still inside
+hid_destroy_device(), and subsequent teardown touches freed memory.
+
+The fix serializes the remove/NULL decision under prog_list_lock on
+both sides and moves the destroy-side puts outside the lock.  With
+the lock held, plain reads/writes of ops->hdev are sufficient; no
+READ_ONCE/WRITE_ONCE are added, keeping the patch minimal.
+
+Unlocked-read safety: the unlocked read of ops->hdev at the top of
+hid_bpf_unreg() cannot touch a freed device, because the unreg path
+itself still holds this registration's reference (released only by
+its own hid_put_device() after the lock is dropped), and a destroy
+traversal that already cleared ops->hdev makes the lock-internal
+re-check return early without any put.  At most one of the two
+paths releases each registration reference.
+
+Fixes: ebc0d8093e8c ("HID: bpf: implement HID-BPF through bpf_struct_ops")
+Cc: stable@vger.kernel.org
+Signed-off-by: Shen Yongchao <grayhat@foxmail.com>
+Assisted-by: Hermes:kimi-k3
+Signed-off-by: Benjamin Tissoires <bentiss@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/hid/bpf/hid_bpf_struct_ops.c | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/hid/bpf/hid_bpf_struct_ops.c b/drivers/hid/bpf/hid_bpf_struct_ops.c
+index 702c22fae136..049df0647761 100644
+--- a/drivers/hid/bpf/hid_bpf_struct_ops.c
++++ b/drivers/hid/bpf/hid_bpf_struct_ops.c
+@@ -250,6 +250,11 @@ static void hid_bpf_unreg(void *kdata, struct bpf_link *link)
+ 
+ 	mutex_lock(&hdev->bpf.prog_list_lock);
+ 
++	if (!ops->hdev) {
++		mutex_unlock(&hdev->bpf.prog_list_lock);
++		return;
++	}
++
+ 	list_del_rcu(&ops->list);
+ 	synchronize_srcu(&hdev->bpf.srcu);
+ 	ops->hdev = NULL;
+@@ -310,13 +315,17 @@ static struct bpf_struct_ops bpf_hid_bpf_ops = {
+ void __hid_bpf_ops_destroy_device(struct hid_device *hdev)
+ {
+ 	struct hid_bpf_ops *e;
++	int count = 0;
+ 
+-	rcu_read_lock();
+-	list_for_each_entry_rcu(e, &hdev->bpf.prog_list, list) {
+-		hid_put_device(hdev);
++	mutex_lock(&hdev->bpf.prog_list_lock);
++	list_for_each_entry(e, &hdev->bpf.prog_list, list) {
+ 		e->hdev = NULL;
++		count++;
+ 	}
+-	rcu_read_unlock();
++	mutex_unlock(&hdev->bpf.prog_list_lock);
++
++	while (count--)
++		hid_put_device(hdev);
+ }
+ 
+ static int __init hid_bpf_struct_ops_init(void)
+-- 
+2.55.0
+
