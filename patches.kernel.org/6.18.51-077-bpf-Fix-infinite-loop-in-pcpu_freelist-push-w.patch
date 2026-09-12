@@ -1,0 +1,148 @@
+From: Hui Su <sh_def@163.com>
+Date: Fri, 7 Aug 2026 01:56:00 +0800
+Subject: [PATCH] bpf: Fix infinite loop in pcpu_freelist push with one
+ possible CPU
+References: bsc#1258210
+Patch-mainline: 6.18.51
+Git-commit: efebf6496685c93150df5bb0794363ae70c5f58a
+
+commit efebf6496685c93150df5bb0794363ae70c5f58a upstream.
+
+__pcpu_freelist_push() can loop forever when only one CPU is possible
+and an NMI re-enters pcpu_freelist_push() while the interrupted context
+holds that CPU's freelist lock.
+
+After the current-CPU fast path fails, the fallback loop walks
+cpu_possible_mask while skipping the current CPU. With CONFIG_SMP=n, or
+when an SMP kernel is limited to one possible CPU with nr_cpus=1 or
+possible_cpus=1, there are no other possible CPUs to examine. The loop
+therefore makes no lock acquisition attempt and can never make progress.
+
+The following stack was observed on a UP system:
+
+  NMI context:
+    pcpu_freelist_push
+    free_htab_elem
+    htab_map_delete_elem
+    [perf-event BPF program]
+    __perf_event_overflow
+    perf_event_nmi_handler
+    exc_nmi
+
+  Interrupted context:
+    __pcpu_freelist_push
+    pcpu_freelist_push
+    free_htab_elem
+    htab_map_delete_elem
+    [raw_tp/sys_enter BPF program]
+    __bpf_trace_sys_enter
+    do_syscall_64
+
+raw_res_spin_lock() detects the same-CPU recursive acquisition and
+returns -EDEADLK, but the subsequent fallback loop has no candidate head
+on a system with one possible CPU.
+
+Restore the extra fallback head that existed before the rqspinlock
+conversion. Keep the current-CPU fast path, then try the other possible
+CPUs and finally the extra head. The additional head lets a push, which
+cannot fail without losing a preallocated element, make progress when the
+only per-CPU head is held by the interrupted context.
+
+Also check the extra head from the pop path so that nodes placed there
+can be reused.
+
+Fixes: f2ac0e5d1c4d ("bpf: Convert percpu_freelist.c to rqspinlock")
+Signed-off-by: Hui Su <sh_def@163.com>
+Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/bpf/20260806175600.1993595-1-sh_def@163.com
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ kernel/bpf/percpu_freelist.c | 35 +++++++++++++++++++++++++++--------
+ kernel/bpf/percpu_freelist.h |  1 +
+ 2 files changed, 28 insertions(+), 8 deletions(-)
+
+diff --git a/kernel/bpf/percpu_freelist.c b/kernel/bpf/percpu_freelist.c
+index 632762b57299..06ce588d13a3 100644
+--- a/kernel/bpf/percpu_freelist.c
++++ b/kernel/bpf/percpu_freelist.c
+@@ -17,6 +17,8 @@ int pcpu_freelist_init(struct pcpu_freelist *s)
+ 		raw_res_spin_lock_init(&head->lock);
+ 		head->first = NULL;
+ 	}
++	raw_res_spin_lock_init(&s->extralist.lock);
++	s->extralist.first = NULL;
+ 	return 0;
+ }
+ 
+@@ -46,22 +48,28 @@ void __pcpu_freelist_push(struct pcpu_freelist *s,
+ 			struct pcpu_freelist_node *node)
+ {
+ 	struct pcpu_freelist_head *head;
+-	int cpu;
++	int cpu, this_cpu;
+ 
+ 	if (___pcpu_freelist_push(this_cpu_ptr(s->freelist), node))
+ 		return;
+ 
++	this_cpu = raw_smp_processor_id();
+ 	while (true) {
+-		for_each_cpu_wrap(cpu, cpu_possible_mask, raw_smp_processor_id()) {
+-			if (cpu == raw_smp_processor_id())
++		for_each_cpu_wrap(cpu, cpu_possible_mask, this_cpu) {
++			if (cpu == this_cpu)
+ 				continue;
++
+ 			head = per_cpu_ptr(s->freelist, cpu);
+-			if (raw_res_spin_lock(&head->lock))
+-				continue;
+-			pcpu_freelist_push_node(head, node);
+-			raw_res_spin_unlock(&head->lock);
+-			return;
++			if (___pcpu_freelist_push(head, node))
++				return;
+ 		}
++
++		/*
++		 * Push cannot fail. Use the extra list when none of the
++		 * per-CPU freelists can accept the node.
++		 */
++		if (___pcpu_freelist_push(&s->extralist, node))
++			return;
+ 	}
+ }
+ 
+@@ -117,6 +125,17 @@ static struct pcpu_freelist_node *___pcpu_freelist_pop(struct pcpu_freelist *s)
+ 		}
+ 		raw_res_spin_unlock(&head->lock);
+ 	}
++
++	/* Per-CPU lists are empty or unavailable, try the extra list. */
++	head = &s->extralist;
++	if (!READ_ONCE(head->first))
++		return NULL;
++	if (raw_res_spin_lock(&head->lock))
++		return NULL;
++	node = head->first;
++	if (node)
++		WRITE_ONCE(head->first, node->next);
++	raw_res_spin_unlock(&head->lock);
+ 	return node;
+ }
+ 
+diff --git a/kernel/bpf/percpu_freelist.h b/kernel/bpf/percpu_freelist.h
+index 914798b74967..980cf2884fd2 100644
+--- a/kernel/bpf/percpu_freelist.h
++++ b/kernel/bpf/percpu_freelist.h
+@@ -14,6 +14,7 @@ struct pcpu_freelist_head {
+ 
+ struct pcpu_freelist {
+ 	struct pcpu_freelist_head __percpu *freelist;
++	struct pcpu_freelist_head extralist;
+ };
+ 
+ struct pcpu_freelist_node {
+-- 
+2.53.0
+
