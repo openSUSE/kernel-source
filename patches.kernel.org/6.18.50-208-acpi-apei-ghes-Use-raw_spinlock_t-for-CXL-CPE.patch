@@ -1,0 +1,205 @@
+From: Terry Bowman <terry.bowman@amd.com>
+Date: Mon, 3 Aug 2026 17:17:59 -0500
+Subject: [PATCH] acpi/apei/ghes: Use raw_spinlock_t for CXL CPER work locks
+References: bsc#1258210
+Patch-mainline: 6.18.50
+Git-commit: 6625ca499c3131ef63be3215f8f942d7a097ea3a
+
+commit 6625ca499c3131ef63be3215f8f942d7a097ea3a upstream.
+
+The CXL CPER work registration and unregistration helpers acquire
+cxl_cper_work_lock and cxl_cper_prot_err_work_lock with a spinlock
+guard(), which leaves local interrupts enabled. The corresponding post
+paths (cxl_cper_post_event(), cxl_cper_post_prot_err()) execute in hard
+IRQ context (they are called from the GHES error notification path) and
+acquire the same locks with an irqsave guard().
+
+If a CPU is holding one of these locks via a spinlock guard() when a GHES
+interrupt arrives on the same CPU, the IRQ handler spins on the held lock
+waiting for it to release, while the lock holder is preempted by the IRQ.
+The result is a deadlock.
+
+Convert both locks from spinlock_t to raw_spinlock_t and use guard() at
+all call sites. On PREEMPT_RT kernels spinlock_t is backed by rt_mutex and
+sleeping from hard IRQ context is not permitted; raw_spinlock_t is safe in
+both contexts.
+
+Add WARN_ONCE to both register functions to surface double-registration
+bugs at runtime.
+
+Restructure both unregister functions to clear the global work pointer
+under the lock before calling cancel_work_sync(), closing the window
+where a CPER interrupt could schedule work on a pointer about to be
+freed. Add kfifo_reset() after cancel_work_sync() so stale entries
+are not replayed on next module load.
+
+Both kfifos are single-consumer: only one work_struct is registered at
+a time, enforced by the WARN_ONCE guard in the register functions.
+kfifo_reset() is safe outside the lock because cancel_work_sync() has
+already quiesced the consumer, and no new consumer can register until
+the current module exit completes and a fresh module init runs.
+
+Remove the redundant cancel_work_sync() call from cxl_ras_exit() and
+cxl_pci_driver_exit(). The CPER unregister functions now quiesce
+the work internally.
+
+Reported-by: Sashiko <sashiko@linuxfoundation.org>
+Signed-off-by: Terry Bowman <terry.bowman@amd.com>
+Fixes: 5e4a264bf8b5 ("acpi/ghes: Process CXL Component Events")
+Fixes: 36f257e3b0ba ("acpi/ghes, cxl/pci: Process CXL CPER Protocol Errors")
+Cc: stable@vger.kernel.org
+Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@oss.qualcomm.com>
+Reviewed-by: Tony Luck <tony.luck@intel.com>
+Link: https://patch.msgid.link/20260803221810.3685703-4-terry.bowman@amd.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/acpi/apei/ghes.c | 50 ++++++++++++++++++++++++++--------------
+ drivers/cxl/core/ras.c   |  1 -
+ drivers/cxl/pci.c        |  1 -
+ 3 files changed, 33 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/acpi/apei/ghes.c b/drivers/acpi/apei/ghes.c
+index fc96a5e234f0..bdd0253cf034 100644
+--- a/drivers/acpi/apei/ghes.c
++++ b/drivers/acpi/apei/ghes.c
+@@ -736,7 +736,7 @@ static DEFINE_KFIFO(cxl_cper_prot_err_fifo, struct cxl_cper_prot_err_work_data,
+ 		    CXL_CPER_PROT_ERR_FIFO_DEPTH);
+ 
+ /* Synchronize schedule_work() with cxl_cper_prot_err_work changes */
+-static DEFINE_SPINLOCK(cxl_cper_prot_err_work_lock);
++static DEFINE_RAW_SPINLOCK(cxl_cper_prot_err_work_lock);
+ struct work_struct *cxl_cper_prot_err_work;
+ 
+ static void cxl_cper_post_prot_err(struct cxl_cper_sec_prot_err *prot_err,
+@@ -749,7 +749,7 @@ static void cxl_cper_post_prot_err(struct cxl_cper_sec_prot_err *prot_err,
+ 	if (cxl_cper_sec_prot_err_valid(prot_err))
+ 		return;
+ 
+-	guard(spinlock_irqsave)(&cxl_cper_prot_err_work_lock);
++	guard(raw_spinlock_irqsave)(&cxl_cper_prot_err_work_lock);
+ 
+ 	if (!cxl_cper_prot_err_work)
+ 		return;
+@@ -787,10 +787,11 @@ static void cxl_cper_post_prot_err(struct cxl_cper_sec_prot_err *prot_err,
+ 
+ int cxl_cper_register_prot_err_work(struct work_struct *work)
+ {
+-	if (cxl_cper_prot_err_work)
+-		return -EINVAL;
++	guard(raw_spinlock_irqsave)(&cxl_cper_prot_err_work_lock);
+ 
+-	guard(spinlock)(&cxl_cper_prot_err_work_lock);
++	if (WARN_ONCE(cxl_cper_prot_err_work,
++		      "CPER-CXL kfifo consumer already registered\n"))
++		return -EINVAL;
+ 	cxl_cper_prot_err_work = work;
+ 	return 0;
+ }
+@@ -798,11 +799,18 @@ EXPORT_SYMBOL_NS_GPL(cxl_cper_register_prot_err_work, "CXL");
+ 
+ int cxl_cper_unregister_prot_err_work(struct work_struct *work)
+ {
+-	if (cxl_cper_prot_err_work != work)
+-		return -EINVAL;
++	scoped_guard(raw_spinlock_irqsave, &cxl_cper_prot_err_work_lock) {
++		if (WARN_ONCE(cxl_cper_prot_err_work != work,
++			      "CPER-CXL kfifo consumer mismatch on unregister\n"))
++			return -EINVAL;
++		cxl_cper_prot_err_work = NULL;
++	}
++
++	cancel_work_sync(work);
++
++	/* Discard stale entries so they are not replayed on next module load */
++	kfifo_reset(&cxl_cper_prot_err_fifo);
+ 
+-	guard(spinlock)(&cxl_cper_prot_err_work_lock);
+-	cxl_cper_prot_err_work = NULL;
+ 	return 0;
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_cper_unregister_prot_err_work, "CXL");
+@@ -818,7 +826,7 @@ EXPORT_SYMBOL_NS_GPL(cxl_cper_prot_err_kfifo_get, "CXL");
+ DEFINE_KFIFO(cxl_cper_fifo, struct cxl_cper_work_data, CXL_CPER_FIFO_DEPTH);
+ 
+ /* Synchronize schedule_work() with cxl_cper_work changes */
+-static DEFINE_SPINLOCK(cxl_cper_work_lock);
++static DEFINE_RAW_SPINLOCK(cxl_cper_work_lock);
+ struct work_struct *cxl_cper_work;
+ 
+ static void cxl_cper_post_event(enum cxl_event_type event_type,
+@@ -838,7 +846,7 @@ static void cxl_cper_post_event(enum cxl_event_type event_type,
+ 		return;
+ 	}
+ 
+-	guard(spinlock_irqsave)(&cxl_cper_work_lock);
++	guard(raw_spinlock_irqsave)(&cxl_cper_work_lock);
+ 
+ 	if (!cxl_cper_work)
+ 		return;
+@@ -856,10 +864,11 @@ static void cxl_cper_post_event(enum cxl_event_type event_type,
+ 
+ int cxl_cper_register_work(struct work_struct *work)
+ {
+-	if (cxl_cper_work)
++	guard(raw_spinlock_irqsave)(&cxl_cper_work_lock);
++	if (WARN_ONCE(cxl_cper_work,
++		      "CXL CPER kfifo consumer already registered\n"))
+ 		return -EINVAL;
+ 
+-	guard(spinlock)(&cxl_cper_work_lock);
+ 	cxl_cper_work = work;
+ 	return 0;
+ }
+@@ -867,11 +876,18 @@ EXPORT_SYMBOL_NS_GPL(cxl_cper_register_work, "CXL");
+ 
+ int cxl_cper_unregister_work(struct work_struct *work)
+ {
+-	if (cxl_cper_work != work)
+-		return -EINVAL;
++	scoped_guard(raw_spinlock_irqsave, &cxl_cper_work_lock) {
++		if (WARN_ONCE(cxl_cper_work != work,
++			      "CXL CPER kfifo consumer mismatch on unregister\n"))
++			return -EINVAL;
++		cxl_cper_work = NULL;
++	}
++
++	cancel_work_sync(work);
++
++	/* Discard stale entries so they are not replayed on next module load */
++	kfifo_reset(&cxl_cper_fifo);
+ 
+-	guard(spinlock)(&cxl_cper_work_lock);
+-	cxl_cper_work = NULL;
+ 	return 0;
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_cper_unregister_work, "CXL");
+diff --git a/drivers/cxl/core/ras.c b/drivers/cxl/core/ras.c
+index 7056a79bff4d..f2d99865c6df 100644
+--- a/drivers/cxl/core/ras.c
++++ b/drivers/cxl/core/ras.c
+@@ -136,7 +136,6 @@ int cxl_ras_init(void)
+ void cxl_ras_exit(void)
+ {
+ 	cxl_cper_unregister_prot_err_work(&cxl_cper_prot_err_work);
+-	cancel_work_sync(&cxl_cper_prot_err_work);
+ }
+ 
+ static void cxl_dport_map_ras(struct cxl_dport *dport)
+diff --git a/drivers/cxl/pci.c b/drivers/cxl/pci.c
+index c78d7d88744b..2c42ab75e56a 100644
+--- a/drivers/cxl/pci.c
++++ b/drivers/cxl/pci.c
+@@ -1198,7 +1198,6 @@ static int __init cxl_pci_driver_init(void)
+ static void __exit cxl_pci_driver_exit(void)
+ {
+ 	cxl_cper_unregister_work(&cxl_cper_work);
+-	cancel_work_sync(&cxl_cper_work);
+ 	pci_unregister_driver(&cxl_pci_driver);
+ }
+ 
+-- 
+2.53.0
+
