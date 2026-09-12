@@ -1,0 +1,117 @@
+From: Kairui Song <kasong@tencent.com>
+Date: Thu, 3 Sep 2026 13:31:51 -0400
+Subject: [PATCH] mm/mglru: fix and remove redundant unevictable folio handling
+References: bsc#1258210
+Patch-mainline: 6.18.51
+Git-commit: f7e698e326b239a91ea15844817551921209e826
+
+[ Upstream commit f7e698e326b239a91ea15844817551921209e826 ]
+
+sort_folio() has a shortcut for moving folios that are no longer evictable
+but are still sitting on a generation list.  However, this shortcut is
+buggy.  It does not follow the PG_lru usage convention, and it has a more
+serious issue.
+
+Unevictable folios are not threaded on lists[LRU_UNEVICTABLE], so that
+folio->lru can be reused to hold folio->mlock_count (see the comment in
+lruvec_init()).  Hence lruvec_add_folio() skips the list_add() for them,
+and every other place that turns a folio unevictable initialises
+mlock_count explicitly: lru_add() sets it to 0, __mlock_folio() and
+__mlock_new_folio() set it to !!folio_test_mlocked(folio).  sort_folio()
+sets nothing, and the lru_gen_del_folio() right above it may have already
+poisoned folio->lru via list_del(), so mlock_count ends up aliasing
+LIST_POISON2, which reads as 0x122, i.e.  290.  The result is user
+visible.  On munlock, __munlock_folio() decrements that bogus count, finds
+it still non-zero and bails out before clearing PG_mlocked, so the folio
+remains unevictable and the Mlocked accounting stays inflated until the
+folio is freed.
+
+The shortcut also touches the LRU flags in the wrong order.  It calls
+lru_gen_del_folio() while PG_lru is still set, so a concurrent
+folio_test_clear_lru() (e.g.  compaction, folio_isolate_lru()) can succeed
+on a folio that has already been taken off the generation list, which may
+lead to unexpected behavior.
+
+So fix it by isolating them as common folios and letting the generic
+shrink path cull them.  This matches the classical LRU behavior, and there
+should be no visible effect on the generic eviction or isolation behavior.
+
+There is no performance concern either, such a folio goes through this
+once, and then it is off the generation lists for good.
+
+Link: https://lore.kernel.org/20260812-mglru-mlock-fix-v2-1-a3fec5853c08@tencent.com
+Fixes: ac35a4902374 ("mm: multi-gen LRU: minimal implementation")
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Reviewed-by: Barry Song <baohua@kernel.org>
+Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Brian Geffon <bgeffon@google.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Jan Alexander Steffens (heftig) <heftig@archlinux.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Oleksandr Natalenko <oleksandr@natalenko.name>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Steven Barrett <steven@liquorix.net>
+Cc: Suleiman Souhlal <suleiman@google.com>
+Cc: Wei Xu <weixugc@google.com>
+Cc: Yuanchu Xie <yuanchu@google.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ mm/vmscan.c | 19 +++++--------------
+ 1 file changed, 5 insertions(+), 14 deletions(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index bf2648f9cb91..7b2b85a70830 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -4468,7 +4468,6 @@ void lru_gen_soft_reclaim(struct mem_cgroup *memcg, int nid)
+ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_control *sc,
+ 		       int tier_idx)
+ {
+-	bool success;
+ 	int gen = folio_lru_gen(folio);
+ 	int type = folio_is_file_lru(folio);
+ 	int zone = folio_zonenum(folio);
+@@ -4480,15 +4479,9 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
+ 
+ 	VM_WARN_ON_ONCE_FOLIO(gen >= MAX_NR_GENS, folio);
+ 
+-	/* unevictable */
+-	if (!folio_evictable(folio)) {
+-		success = lru_gen_del_folio(lruvec, folio, true);
+-		VM_WARN_ON_ONCE_FOLIO(!success, folio);
+-		folio_set_unevictable(folio);
+-		lruvec_add_folio(lruvec, folio);
+-		__count_vm_events(UNEVICTABLE_PGCULLED, delta);
+-		return true;
+-	}
++	/* unevictable: let it through and the generic path will cull it */
++	if (!folio_evictable(folio))
++		return false;
+ 
+ 	/* promoted */
+ 	if (gen != lru_gen_from_seq(lrugen->min_seq[type])) {
+@@ -4738,11 +4731,9 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 	list_for_each_entry_safe_reverse(folio, next, &list, lru) {
+ 		DEFINE_MIN_SEQ(lruvec);
+ 
+-		if (!folio_evictable(folio)) {
+-			list_del(&folio->lru);
+-			folio_putback_lru(folio);
++		/* move_folios_to_lru() culls unevictable folios via folio_putback_lru() */
++		if (!folio_evictable(folio))
+ 			continue;
+-		}
+ 
+ 		/* retry folios that may have missed folio_rotate_reclaimable() */
+ 		if (!skip_retry && !folio_test_active(folio) && !folio_mapped(folio) &&
+-- 
+2.53.0
+
