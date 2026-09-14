@@ -1,0 +1,258 @@
+From: Qu Wenruo <wqu@suse.com>
+Date: Tue, 11 Nov 2025 09:11:59 +1030
+Subject: [PATCH] btrfs: make btrfs_repair_io_failure() handle bs > ps cases
+ without large folios
+References: bsc#1258210
+Patch-mainline: 6.18.52
+Git-commit: 2574e9011018a1d6d3da8d03d0bfc4e2675dee2a
+
+[ Upstream commit 2574e9011018a1d6d3da8d03d0bfc4e2675dee2a ]
+
+Currently btrfs_repair_io_failure() only accept a single @paddr
+parameter, and for bs > ps cases it's required that @paddr is backed by
+a large folio.
+
+That assumption has quite some limitations, preventing us from utilizing
+true zero-copy direct-io and encoded read/writes.
+
+To address the problem, enhance btrfs_repair_io_failure() by:
+
+- Accept an array of paddrs, up to 64K / PAGE_SIZE entries
+  This kind of acts like a bio_vec, but with very limited entries, as the
+  function is only utilized to repair one fs data block, or a tree block.
+
+  Both have an upper size limit (BTRFS_MAX_BLOCK_SIZE, i.e. 64K), so we
+  don't need the full bio_vec thing to handle it.
+
+- Allocate a bio with multiple slots
+  Previously even for bs > ps cases, we only passed in a contiguous
+  physical address range, thus a single slot will be enough.
+
+  But not anymore, so we have to allocate a bio structure, other than
+  using the on-stack one.
+
+- Use on-stack memory to allocate @paddrs array
+  It's at most 16 pages (4K page size, 64K block size), will take up at
+  most 128 bytes.
+  I think the on-stack cost is still acceptable.
+
+- Add one extra check to make sure the repair bio is exactly one block
+
+- Utilize btrfs_repair_io_failure() to submit a single bio for metadata
+  This should improve the read-repair performance for metadata, as now
+  we submit a node sized bio then wait, other than submit each block of
+  the metadata and wait for each submitted block.
+
+- Add one extra parameter indicating the step
+  This is due to the fact that metadata step can be as large as
+  nodesize, instead of sectorsize.
+  So we need a way to distinguish metadata and data repair.
+
+- Reduce the width of @length parameter of btrfs_repair_io_failure()
+  Since we only call btrfs_repair_io_failure() on a single data or
+  metadata block, u64 is overkilled.
+  Use u32 instead and add one extra ASSERT()s to make sure the length
+  never exceed BTRFS_MAX_BLOCK_SIZE.
+
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Stable-dep-of: ec78575dde99 ("btrfs: always wait for ordered extents to avoid OE races")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/btrfs/bio.c     | 68 ++++++++++++++++++++++++++++++++++++----------
+ fs/btrfs/bio.h     |  5 ++--
+ fs/btrfs/disk-io.c | 31 +++++++++++++--------
+ 3 files changed, 76 insertions(+), 28 deletions(-)
+
+diff --git a/fs/btrfs/bio.c b/fs/btrfs/bio.c
+index 7d8aaa019c8c..afe022a3b8fc 100644
+--- a/fs/btrfs/bio.c
++++ b/fs/btrfs/bio.c
+@@ -172,7 +172,21 @@ static void btrfs_end_repair_bio(struct btrfs_bio *repair_bbio,
+ 	struct btrfs_inode *inode = repair_bbio->inode;
+ 	struct btrfs_fs_info *fs_info = inode->root->fs_info;
+ 	struct bio_vec *bv = bio_first_bvec_all(&repair_bbio->bio);
++	/*
++	 * We can not move forward the saved_iter, as it will be later
++	 * utilized by repair_bbio again.
++	 */
++	struct bvec_iter saved_iter = repair_bbio->saved_iter;
++	const u32 step = min(fs_info->sectorsize, PAGE_SIZE);
++	const u64 logical = repair_bbio->saved_iter.bi_sector << SECTOR_SHIFT;
++	const u32 nr_steps = repair_bbio->saved_iter.bi_size / step;
+ 	int mirror = repair_bbio->mirror_num;
++	phys_addr_t paddrs[BTRFS_MAX_BLOCKSIZE / PAGE_SIZE];
++	phys_addr_t paddr;
++	unsigned int slot = 0;
++
++	/* Repair bbio should be eaxctly one block sized. */
++	ASSERT(repair_bbio->saved_iter.bi_size == fs_info->sectorsize);
+ 
+ 	if (repair_bbio->bio.bi_status ||
+ 	    !btrfs_data_csum_ok(repair_bbio, dev, 0, bvec_phys(bv))) {
+@@ -190,12 +204,17 @@ static void btrfs_end_repair_bio(struct btrfs_bio *repair_bbio,
+ 		return;
+ 	}
+ 
++	btrfs_bio_for_each_block(paddr, &repair_bbio->bio, &saved_iter, step) {
++		ASSERT(slot < nr_steps);
++		paddrs[slot] = paddr;
++		slot++;
++	}
++
+ 	do {
+ 		mirror = prev_repair_mirror(fbio, mirror);
+ 		btrfs_repair_io_failure(fs_info, btrfs_ino(inode),
+ 				  repair_bbio->file_offset, fs_info->sectorsize,
+-				  repair_bbio->saved_iter.bi_sector << SECTOR_SHIFT,
+-				  bvec_phys(bv), mirror);
++				  logical, paddrs, step, mirror);
+ 	} while (mirror != fbio->bbio->mirror_num);
+ 
+ done:
+@@ -865,18 +884,36 @@ void btrfs_submit_bbio(struct btrfs_bio *bbio, int mirror_num)
+  *
+  * The I/O is issued synchronously to block the repair read completion from
+  * freeing the bio.
++ *
++ * @ino:	Offending inode number
++ * @fileoff:	File offset inside the inode
++ * @length:	Length of the repair write
++ * @logical:	Logical address of the range
++ * @paddrs:	Physical address array of the content
++ * @step:	Length of for each paddrs
++ * @mirror_num: Mirror number to write to. Must not be zero
+  */
+-int btrfs_repair_io_failure(struct btrfs_fs_info *fs_info, u64 ino, u64 start,
+-			    u64 length, u64 logical, phys_addr_t paddr, int mirror_num)
++int btrfs_repair_io_failure(struct btrfs_fs_info *fs_info, u64 ino, u64 fileoff,
++			    u32 length, u64 logical, const phys_addr_t paddrs[],
++			    unsigned int step, int mirror_num)
+ {
++	const u32 nr_steps = DIV_ROUND_UP_POW2(length, step);
+ 	struct btrfs_io_stripe smap = { 0 };
+-	struct bio_vec bvec;
+-	struct bio bio;
++	struct bio *bio = NULL;
+ 	int ret = 0;
+ 
+ 	ASSERT(!(fs_info->sb->s_flags & SB_RDONLY));
+ 	BUG_ON(!mirror_num);
+ 
++	/* Basic alignment checks. */
++	ASSERT(IS_ALIGNED(logical, fs_info->sectorsize));
++	ASSERT(IS_ALIGNED(length, fs_info->sectorsize));
++	ASSERT(IS_ALIGNED(fileoff, fs_info->sectorsize));
++	/* Either it's a single data or metadata block. */
++	ASSERT(length <= BTRFS_MAX_BLOCKSIZE);
++	ASSERT(step <= length);
++	ASSERT(is_power_of_2(step));
++
+ 	if (btrfs_repair_one_zone(fs_info, logical))
+ 		return 0;
+ 
+@@ -896,24 +933,27 @@ int btrfs_repair_io_failure(struct btrfs_fs_info *fs_info, u64 ino, u64 start,
+ 		goto out_counter_dec;
+ 	}
+ 
+-	bio_init(&bio, smap.dev->bdev, &bvec, 1, REQ_OP_WRITE | REQ_SYNC);
+-	bio.bi_iter.bi_sector = smap.physical >> SECTOR_SHIFT;
+-	__bio_add_page(&bio, phys_to_page(paddr), length, offset_in_page(paddr));
+-	ret = submit_bio_wait(&bio);
++	bio = bio_alloc(smap.dev->bdev, nr_steps, REQ_OP_WRITE | REQ_SYNC, GFP_NOFS);
++	bio->bi_iter.bi_sector = smap.physical >> SECTOR_SHIFT;
++	for (int i = 0; i < nr_steps; i++) {
++		ret = bio_add_page(bio, phys_to_page(paddrs[i]), step, offset_in_page(paddrs[i]));
++		/* We should have allocated enough slots to contain all the different pages. */
++		ASSERT(ret == step);
++	}
++	ret = submit_bio_wait(bio);
++	bio_put(bio);
+ 	if (ret) {
+ 		/* try to remap that extent elsewhere? */
+ 		btrfs_dev_stat_inc_and_print(smap.dev, BTRFS_DEV_STAT_WRITE_ERRS);
+-		goto out_bio_uninit;
++		goto out_counter_dec;
+ 	}
+ 
+ 	btrfs_info_rl(fs_info,
+ 		"read error corrected: ino %llu off %llu (dev %s sector %llu)",
+-			     ino, start, btrfs_dev_name(smap.dev),
++			     ino, fileoff, btrfs_dev_name(smap.dev),
+ 			     smap.physical >> SECTOR_SHIFT);
+ 	ret = 0;
+ 
+-out_bio_uninit:
+-	bio_uninit(&bio);
+ out_counter_dec:
+ 	btrfs_bio_counter_dec(fs_info);
+ 	return ret;
+diff --git a/fs/btrfs/bio.h b/fs/btrfs/bio.h
+index 69fe54f564fc..fd09b6501c96 100644
+--- a/fs/btrfs/bio.h
++++ b/fs/btrfs/bio.h
+@@ -127,7 +127,8 @@ void btrfs_bio_end_io(struct btrfs_bio *bbio, blk_status_t status);
+ 
+ void btrfs_submit_bbio(struct btrfs_bio *bbio, int mirror_num);
+ void btrfs_submit_repair_write(struct btrfs_bio *bbio, int mirror_num, bool dev_replace);
+-int btrfs_repair_io_failure(struct btrfs_fs_info *fs_info, u64 ino, u64 start,
+-			    u64 length, u64 logical, phys_addr_t paddr, int mirror_num);
++int btrfs_repair_io_failure(struct btrfs_fs_info *fs_info, u64 ino, u64 fileoff,
++			    u32 length, u64 logical, const phys_addr_t paddrs[],
++			    unsigned int step, int mirror_num);
+ 
+ #endif
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index 655eed981078..4e849ed98b18 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -183,26 +183,33 @@ static int btrfs_repair_eb_io_failure(const struct extent_buffer *eb,
+ 				      int mirror_num)
+ {
+ 	struct btrfs_fs_info *fs_info = eb->fs_info;
++	const u32 step = min(fs_info->nodesize, PAGE_SIZE);
++	const u32 nr_steps = eb->len / step;
++	phys_addr_t paddrs[BTRFS_MAX_BLOCKSIZE / PAGE_SIZE];
+ 	int ret = 0;
+ 
+ 	if (sb_rdonly(fs_info->sb))
+ 		return -EROFS;
+ 
+-	for (int i = 0; i < num_extent_folios(eb); i++) {
++	for (int i = 0; i < num_extent_pages(eb); i++) {
+ 		struct folio *folio = eb->folios[i];
+-		u64 start = max_t(u64, eb->start, folio_pos(folio));
+-		u64 end = min_t(u64, eb->start + eb->len,
+-				folio_pos(folio) + eb->folio_size);
+-		u32 len = end - start;
+-		phys_addr_t paddr = PFN_PHYS(folio_pfn(folio)) +
+-				    offset_in_folio(folio, start);
+-
+-		ret = btrfs_repair_io_failure(fs_info, 0, start, len, start,
+-					      paddr, mirror_num);
+-		if (ret)
+-			break;
++
++		/* No large folio support yet. */
++		ASSERT(folio_order(folio) == 0);
++		ASSERT(i < nr_steps);
++
++		/*
++		 * For nodesize < page size, there is just one paddr, with some
++		 * offset inside the page.
++		 *
++		 * For nodesize >= page size, it's one or more paddrs, and eb->start
++		 * must be aligned to page boundary.
++		 */
++		paddrs[i] = page_to_phys(&folio->page) + offset_in_page(eb->start);
+ 	}
+ 
++	ret = btrfs_repair_io_failure(fs_info, 0, eb->start, eb->len, eb->start,
++				      paddrs, step, mirror_num);
+ 	return ret;
+ }
+ 
+-- 
+2.53.0
+
