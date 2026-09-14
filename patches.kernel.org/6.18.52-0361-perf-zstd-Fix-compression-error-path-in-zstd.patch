@@ -1,0 +1,167 @@
+From: Arnaldo Carvalho de Melo <acme@redhat.com>
+Date: Mon, 4 May 2026 18:26:07 -0300
+Subject: [PATCH] perf zstd: Fix compression error path in
+ zstd_compress_stream_to_records()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1258210
+Patch-mainline: 6.18.52
+Git-commit: a18908b5056b8fdb2c44505f0c57ff05865740a3
+
+[ Upstream commit a18908b5056b8fdb2c44505f0c57ff05865740a3 ]
+
+The error fallback does memcpy(dst, src, src_size) intending to store
+uncompressed data when compression fails, but this has three bugs:
+
+1. dst has been advanced past the record header (and potentially
+   past earlier compressed records), so the copy writes to the
+   wrong offset in the output buffer.
+
+2. src still points to the start of the input, not to the
+   remaining uncompressed data at src + input.pos.  On a second
+   or later iteration, previously compressed data would be
+   duplicated.
+
+3. No check that dst_size >= src_size — if the remaining output
+   space is smaller, this is an out-of-bounds write.
+
+Replace with return -1 after resetting the ZSTD compression
+context via ZSTD_initCStream().  The -1 propagates through
+zstd_compress() -> record__pushfn() -> perf_mmap__push() to the
+recording loop, which breaks out and terminates recording.
+
+Add an out_child_no_flush label in __cmd_record() so the
+mmap-read failure path skips the final record__mmap_read_all()
+flush — retrying the same read that just failed would just fail
+again, and the flush is only useful when the mmap data is intact
+but the control path (auxtrace, switch_output) had an error.
+
+Consolidate all error paths through a single 'reset' label to
+ensure the compression context is always reset on failure —
+including the output-buffer-full path, where a bare return
+without resetting would leave stale stream state that corrupts
+output if the caller retries.
+
+Also guard against process_header() writing the event header
+before the buffer-full check: add a sizeof(perf_event_header)
+pre-check so the callback never writes past the output buffer.
+
+Guard against ZSTD making no progress: if output.pos is zero
+after ZSTD_compressStream(), calling process_header(record, 0)
+would re-trigger header initialization, double-subtracting the
+header size from dst_size and underflowing the unsigned counter.
+
+Also fix two pre-existing issues in the same function:
+
+- Add a dst_size guard before subtracting the record header
+  size: if the output buffer is nearly full, the unsigned
+  dst_size -= size underflows to a huge value, causing
+  ZSTD_compressStream to write past the buffer boundary.
+
+- Check the ZSTD_initCStream() return value and log an error
+  if the context reset itself fails.
+
+Reported-by: sashiko-bot@kernel.org # Running on a local machine
+Reviewed-by: Ian Rogers <irogers@google.com>
+Cc: Jiri Olsa <jolsa@kernel.org>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Assisted-by: Claude:claude-opus-4.6-1m
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Stable-dep-of: ad40a000ea59 ("perf record: Fix multiple PERF_RECORD_COMPRESSED2 records per push")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ tools/perf/builtin-record.c |  6 +++++-
+ tools/perf/util/zstd.c      | 27 +++++++++++++++++++++++++--
+ 2 files changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/tools/perf/builtin-record.c b/tools/perf/builtin-record.c
+index c82b9720c929..79603329b889 100644
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@ -2702,7 +2702,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
+ 			trigger_error(&auxtrace_snapshot_trigger);
+ 			trigger_error(&switch_output_trigger);
+ 			err = -1;
+-			goto out_child;
++			goto out_child_no_flush;
+ 		}
+ 
+ 		if (auxtrace_record__snapshot_started) {
+@@ -2849,6 +2849,10 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
+ out_child:
+ 	record__stop_threads(rec);
+ 	record__mmap_read_all(rec, true);
++	goto out_free_threads;
++out_child_no_flush:
++	/* mmap read already failed — retrying would just fail again */
++	record__stop_threads(rec);
+ out_free_threads:
+ 	record__free_thread_data(rec);
+ 	evlist__finalize_ctlfd(rec->evlist);
+diff --git a/tools/perf/util/zstd.c b/tools/perf/util/zstd.c
+index 57027e0ac7b6..ecda9deb53b7 100644
+--- a/tools/perf/util/zstd.c
++++ b/tools/perf/util/zstd.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+ #include <string.h>
++#include <linux/perf_event.h>
+ 
+ #include "util/compress.h"
+ #include "util/debug.h"
+@@ -54,7 +55,13 @@ ssize_t zstd_compress_stream_to_records(struct zstd_data *data, void *dst, size_
+ 
+ 	while (input.pos < input.size) {
+ 		record = dst;
++		/* process_header writes the event header into record */
++		if (dst_size < sizeof(struct perf_event_header))
++			goto reset;
+ 		size = process_header(record, 0);
++		/* Output buffer full — cannot fit even the record header */
++		if (size > dst_size)
++			goto reset;
+ 		compressed += size;
+ 		dst += size;
+ 		dst_size -= size;
+@@ -65,10 +72,18 @@ ssize_t zstd_compress_stream_to_records(struct zstd_data *data, void *dst, size_
+ 		if (ZSTD_isError(ret)) {
+ 			pr_err("failed to compress %ld bytes: %s\n",
+ 				(long)src_size, ZSTD_getErrorName(ret));
+-			memcpy(dst, src, src_size);
+-			return src_size;
++			goto reset;
+ 		}
+ 		size = output.pos;
++		/*
++		 * No progress: ZSTD couldn't emit any bytes into the
++		 * remaining output buffer.  Calling process_header
++		 * with size=0 would re-trigger header initialization,
++		 * double-subtracting the header size from dst_size and
++		 * underflowing the unsigned counter.
++		 */
++		if (size == 0)
++			goto reset;
+ 		size = process_header(record, size);
+ 		compressed += size;
+ 		dst += size;
+@@ -76,6 +91,14 @@ ssize_t zstd_compress_stream_to_records(struct zstd_data *data, void *dst, size_
+ 	}
+ 
+ 	return compressed;
++
++reset:
++	/* Reset so the context is usable if the caller retries */
++	ret = ZSTD_initCStream(data->cstream, data->comp_level);
++	if (ZSTD_isError(ret))
++		pr_err("failed to reset compression context: %s\n",
++			ZSTD_getErrorName(ret));
++	return -1;
+ }
+ 
+ size_t zstd_decompress_stream(struct zstd_data *data, void *src, size_t src_size,
+-- 
+2.53.0
+
