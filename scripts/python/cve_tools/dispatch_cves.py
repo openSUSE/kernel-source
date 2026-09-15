@@ -4,7 +4,7 @@ import sys
 import argparse
 import subprocess
 import textwrap
-from bugzilla.utils import make_url, make_unique, calculate_deadline, format_time
+from bugzilla.utils import make_url, make_unique, calculate_deadline, format_time, BOT_ACCOUNTS
 
 # dispatch-cves script - is based on python-bugzilla (our in-tree patched copy) and requests libraries
 # for now this script should be kept Python 3.6 compatible (SLE15-SP7)
@@ -23,7 +23,6 @@ SECURITY_EMAIL = 'kernel-security-sentinel@lists.suse.com'
 MONKEY_EMAIL = 'cve-kpm@suse.de'
 QUEUE_EMAIL = 'kernel-bugs@suse.de'
 SECURITY_PRODUCT = 'SUSE Security Incidents'
-COMMENT_BANLIST = [ 'swamp@suse.de', 'bwiedemann+obsbugzillabot@suse.com', 'maint-coord+maintenance-robot@suse.de', 'smash_bz@suse.de' ]
 MIN_COMMENTS = 2
 # ../../cve_tools/blacklist-cve
 BLACKLIST_CVE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -179,7 +178,7 @@ def update_bug_metadata(bzapi, todo):
 
     for b in todo:
         b.bz_comments = comments['bugs'][str(b.bug)]['comments']
-        b.human_comments = [ c for c in b.bz_comments if c['creator'] not in COMMENT_BANLIST ]
+        b.human_comments = [ c for c in b.bz_comments if c['creator'] not in BOT_ACCOUNTS ]
         b.cve = make_unique(bugmap[b.bug].alias)        if b.bug in bugmap else ''
         b.original_email = bugmap[b.bug].assigned_to    if b.bug in bugmap else '<unknown>'
         b.any_flags = bool(bugmap[b.bug].flags)         if b.bug in bugmap else False
