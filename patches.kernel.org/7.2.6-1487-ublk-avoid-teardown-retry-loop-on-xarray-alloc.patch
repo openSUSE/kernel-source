@@ -1,0 +1,152 @@
+From: Yao Sang <sangyao@kylinos.cn>
+Date: Tue, 4 Aug 2026 20:57:36 +0800
+Subject: [PATCH] ublk: avoid teardown retry loop on xarray allocation failure
+References: bsc#1012628
+Patch-mainline: 7.2.6
+Git-commit: 4fd66a7f829f3f38f92a79081f0f2688aed644f0
+
+[ Upstream commit 4fd66a7f829f3f38f92a79081f0f2688aed644f0 ]
+
+__ublk_shmem_remove_ranges() removes matching maple tree ranges in
+batches, but first stores each range into a temporary xarray so that the
+pages can be unpinned after dropping the maple tree lock.
+
+That temporary xarray is filled under the maple tree lock with
+xa_store(..., GFP_ATOMIC). If the store fails before mas_erase(), the
+current range is left in the tree and the helper returns false. The
+outer ublk_shmem_remove_ranges() loop then immediately retries the same
+range. While the atomic allocation keeps failing, the teardown path has
+no forward progress.
+
+The issue can be reproduced with radix_tree_node failslab injection after
+a SHMEM_ZC buffer has already been registered:
+
+  # Kernel config:
+  #   CONFIG_BLK_DEV_UBLK=y
+  #   CONFIG_DEBUG_FS=y
+  #   CONFIG_FAULT_INJECTION=y
+  #   CONFIG_FAULT_INJECTION_DEBUG_FS=y
+  #   CONFIG_FAILSLAB=y
+
+  echo 10 > /proc/sys/vm/nr_hugepages
+  mkdir -p /tmp/htlb
+  mount -t hugetlbfs none /tmp/htlb
+  fallocate -l 4M /tmp/htlb/ublk_buf
+
+  dev_id=$(kublk add -t null --shmem_zc \
+		--htlb /tmp/htlb/ublk_buf |
+	   awk -F '[ :]' '/dev id/ {print $3}')
+
+  echo 1 > /sys/kernel/slab/radix_tree_node/failslab
+  echo Y > /sys/kernel/debug/failslab/cache-filter
+  echo Y > /sys/kernel/debug/failslab/ignore-gfp-wait
+  echo 1 > /sys/kernel/debug/failslab/interval
+  echo -1 > /sys/kernel/debug/failslab/times
+  echo 100 > /sys/kernel/debug/failslab/probability
+
+  kublk del -n "$dev_id"
+
+On the unfixed kernel the delete command was still running after 3
+seconds. Disabling failslab made it return. The fault-injection stack
+showed:
+
+  should_failslab
+  kmem_cache_alloc_lru_noprof
+  __xas_nomem
+  __xa_store
+  xa_store
+  __ublk_shmem_remove_ranges
+  ublk_cdev_rel
+  ublk_ctrl_del_dev
+
+Remove the allocation from the teardown loop. Keep the existing batch
+limit, but collect {base_pfn, nr_pages} pairs in a fixed-size stack array.
+Once a matching range is found, the range is erased from the maple tree
+before dropping the lock, so each successful scan makes progress without
+depending on any GFP_ATOMIC allocation.
+
+With the same failslab settings, the fixed kernel completed
+"kublk del -n $dev_id" successfully in about 45 ms.
+
+Fixes: 309e02dccf64 ("ublk: avoid unpinning pages under maple tree spinlock")
+Signed-off-by: Yao Sang <sangyao@kylinos.cn>
+Reviewed-by: Ming Lei <tom.leiming@gmail.com>
+Link: https://patch.msgid.link/20260804125736.2011774-1-sangyao@kylinos.cn
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/block/ublk_drv.c | 31 ++++++++++++++-----------------
+ 1 file changed, 14 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/block/ublk_drv.c b/drivers/block/ublk_drv.c
+index 0bbf1d5a4fbc..b71283588ea7 100644
+--- a/drivers/block/ublk_drv.c
++++ b/drivers/block/ublk_drv.c
+@@ -5522,39 +5522,36 @@ static void ublk_unpin_range_pages(unsigned long base_pfn,
+ 
+ /*
+  * Inner loop: erase up to UBLK_REMOVE_BATCH matching ranges under
+- * mas_lock, collecting them into an xarray. Then drop the lock and
+- * unpin pages + free ranges outside spinlock context.
++ * mas_lock, collecting the page ranges in a fixed-size array. Then
++ * drop the lock and unpin pages + free ranges outside spinlock context.
+  *
+  * Returns true if the tree walk completed, false if more ranges remain.
+- * Xarray key is the base PFN, value encodes nr_pages via xa_mk_value().
+  */
+ #define UBLK_REMOVE_BATCH	64
+ 
++struct ublk_unpin_range {
++	unsigned long base_pfn;
++	unsigned long nr_pages;
++};
++
+ static bool __ublk_shmem_remove_ranges(struct ublk_device *ub,
+ 					int buf_index, int *ret)
+ {
+ 	MA_STATE(mas, &ub->buf_tree, 0, ULONG_MAX);
+ 	struct ublk_buf_range *range;
+-	struct xarray to_unpin;
+-	unsigned long idx;
++	struct ublk_unpin_range to_unpin[UBLK_REMOVE_BATCH];
+ 	unsigned int count = 0;
++	unsigned int i;
+ 	bool done = false;
+-	void *entry;
+-
+-	xa_init(&to_unpin);
+ 
+ 	mas_lock(&mas);
+ 	mas_for_each(&mas, range, ULONG_MAX) {
+-		unsigned long nr;
+-
+ 		if (buf_index >= 0 && range->buf_index != buf_index)
+ 			continue;
+ 
+ 		*ret = 0;
+-		nr = mas.last - mas.index + 1;
+-		if (xa_err(xa_store(&to_unpin, mas.index,
+-				    xa_mk_value(nr), GFP_ATOMIC)))
+-			goto unlock;
++		to_unpin[count].base_pfn = mas.index;
++		to_unpin[count].nr_pages = mas.last - mas.index + 1;
+ 		mas_erase(&mas);
+ 		kfree(range);
+ 		if (++count >= UBLK_REMOVE_BATCH)
+@@ -5564,9 +5561,9 @@ static bool __ublk_shmem_remove_ranges(struct ublk_device *ub,
+ unlock:
+ 	mas_unlock(&mas);
+ 
+-	xa_for_each(&to_unpin, idx, entry)
+-		ublk_unpin_range_pages(idx, xa_to_value(entry));
+-	xa_destroy(&to_unpin);
++	for (i = 0; i < count; i++)
++		ublk_unpin_range_pages(to_unpin[i].base_pfn,
++				       to_unpin[i].nr_pages);
+ 
+ 	return done;
+ }
+-- 
+2.55.0
+
