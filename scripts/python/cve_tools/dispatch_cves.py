@@ -26,6 +26,7 @@ ACTION_PATTERN = re.compile(r'^(\S+):\s+MANUAL:\s')
 BLACKLIST_ALL = '*'
 SECURITY_EMAIL = 'kernel-security-sentinel@lists.suse.com'
 MONKEY_EMAIL = 'cve-kpm@suse.de'
+KEEP_ASSIGNEE = 'KEEP_ASSIGNEE'  # leave the bug's current assignee untouched
 QUEUE_EMAIL = 'kernel-bugs@suse.de'
 SECURITY_PRODUCT = 'SUSE Security Incidents'
 MIN_COMMENTS = 2
@@ -64,7 +65,7 @@ def parse_blacklist(spec):
 
 class BugUpdate:
     def __init__(self, path_to_remove, bug, cvss, comment_lines, to_append, email, action, cc_list=None, needinfo_list=None,
-                 blacklist_branches=[]):
+                 blacklist_branches=[], keep_assignee=False):
         self.path_to_remove = path_to_remove
         self.comment = "".join(comment_lines) + to_append
         self.email = email
@@ -75,6 +76,7 @@ class BugUpdate:
         self.already_dispatched = False
         self.unknown_state = False
         self.self_assign = False
+        self.keep_assignee = keep_assignee
         self.product = ''
         self.cc_list = cc_list if cc_list else []
         self.needinfo_list = needinfo_list if needinfo_list else []
@@ -91,7 +93,7 @@ class BugUpdate:
                 make_url(self.bug),
                 self.cve,
                 self.action,
-                self.original_email, self.email,
+                self.original_email, 'unchanged' if self.keep_assignee else self.email,
                 ', CC: ' + ', '.join(self.cc_add) if self.cc_add else '',
                 ', NEEDINFO: ' + ', '.join(self.needinfo_list) if self.needinfo_list else '',
                 ', DEADLINE: ' + str(self.deadline) if self.deadline else '',
@@ -130,7 +132,9 @@ class BugUpdate:
             return
         if self.already_dispatched and not force:
             return
-        bargs = { 'comment': self.comment, 'comment_private': True, 'assigned_to': self.email }
+        bargs = { 'comment': self.comment, 'comment_private': True }
+        if not self.keep_assignee:
+            bargs['assigned_to'] = self.email
         if self.cc_add:
             bargs['cc_add'] = self.cc_add
         if self.needinfo_list and not self.any_flags:
@@ -227,6 +231,9 @@ def update_bug_metadata(bzapi, todo):
             b.cc_add = list(set(b.cc_list) - set(bugmap[b.bug].cc))
         if b.original_email == '<unknown>':
             b.unknown_state = True
+        # KEEP_ASSIGNEE has no target email, so there is nothing to compare
+        elif b.keep_assignee:
+            pass
         elif b.original_email == b.email:
             b.self_assign = True
         elif QUEUE_EMAIL != 'ANY' and b.original_email != QUEUE_EMAIL:
@@ -246,6 +253,7 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
         needinfo_list = []
         blacklist_branches = []
         action_branches = []
+        keep_assignee = False
         for l in f:
             should_go_out = True
             blacklist_m = re.match(BLACKLIST_PATTERN, l)
@@ -264,6 +272,10 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
                 decided = True
             elif 'TRIVIAL_BACKPORT' in l:
                 candidate_emails = [ MONKEY_EMAIL ]
+                decided = True
+                should_go_out = False
+            elif l.strip() == KEEP_ASSIGNEE:
+                keep_assignee = True
                 decided = True
                 should_go_out = False
             elif re.search(ASSIGNEE_PATTERN, l):
@@ -319,7 +331,7 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
             candidates.append(MONKEY_EMAIL)
             candidate_emails = [ e.split(" ")[0] for e in candidates ]
 
-        if not candidate_emails:
+        if not candidate_emails and not keep_assignee:
             print(f"{path} doesn't have any viable assignees.", file=sys.stderr)
             if is_interactive:
                 sys.exit(1)
@@ -329,14 +341,17 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
         if is_interactive:
             for cl in comment_lines:
                 print(cl, end='')
-        email = None if len(candidate_emails) != 1 else candidate_emails[0]
-        if not email:
-            print(f'Skipping {path} (bsc#{bug}) due to missing ASSIGNEE!', file=sys.stderr)
-            return
+        email = None
+        if not keep_assignee:
+            email = None if len(candidate_emails) != 1 else candidate_emails[0]
+            if not email:
+                print(f'Skipping {path} (bsc#{bug}) due to missing ASSIGNEE!', file=sys.stderr)
+                return
         to_add = ''
         if blacklist_branches:
             to_add = '\nRequesting to blacklist the CVE for: {}\n'.format(','.join(blacklist_branches))
-        to_dispatch.append(BugUpdate(path if remove_file else None, bug, cvss, comment_lines, to_add, email, 'developer', cc_list, needinfo_list, blacklist_branches))
+        to_dispatch.append(BugUpdate(path if remove_file else None, bug, cvss, comment_lines, to_add, email, 'developer', cc_list, needinfo_list,
+                                      blacklist_branches, keep_assignee=keep_assignee))
 
 def single_dispatch(bzapi, path, remove_file, yes, force, cc_us, allow_same_assignee):
     to_dispatch = []
@@ -369,6 +384,7 @@ ASSIGNEE <email1>
 CC <email1> <email2> ...
 NEEDINFO <email1> <email2> ...
 TRIVIAL_BACKPORT
+KEEP_ASSIGNEE
 BLACKLIST <branch1>,<branch2>,...
 BLACKLIST *
 
@@ -382,6 +398,8 @@ The request is submitted only after the bugzilla comment it refers to has been a
 blacklisted branches cover all the branches that need an action, the CVE is considered decided
 and the bug is handed over to the security team (unless an explicit ASSIGNEE says otherwise),
 a partial blacklisting is dispatched like any other bug.
+KEEP_ASSIGNEE dispatches the bug (comment/CC/NEEDINFO/BLACKLIST) without touching its assignee,
+regardless of who it currently is.
     '''))
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-f", "--file", help="path to a regular file containing ./scripts/check-kernel-fix output", default=None, type=str)
