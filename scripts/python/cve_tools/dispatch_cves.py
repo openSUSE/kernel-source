@@ -294,28 +294,8 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
                 print(cl, end='')
         email = None if len(candidate_emails) != 1 else candidate_emails[0]
         if not email:
-            if not is_interactive:
-                print(f'Skipping {path} (bsc#{bug}) due to missing ASSIGNEE!', file=sys.stderr)
-                return
-            for n, c in enumerate(candidates, 1):
-                print("\t{:>3}: {}".format(n, c))
-        while not email:
-            answer = input('(select a number, type q for abort or enter a custom email)> ')
-            if answer == 'q':
-                print("...aborting...", file=sys.stderr)
-                sys.exit(0)
-            if "@suse." in answer and ' ' not in answer:
-                email = answer
-            else:
-                try:
-                    answer = int(answer)
-                    if answer < 1 or answer > len(candidates):
-                        raise Exception()
-                except:
-                    print("{} is not a number between 1 and {}.".format(answer, len(candidates)))
-                    continue
-                email = candidate_emails[answer - 1]
-            break
+            print(f'Skipping {path} (bsc#{bug}) due to missing ASSIGNEE!', file=sys.stderr)
+            return
         to_add = ''
         if blacklist_branches:
             to_add = '\nRequesting to blacklist the CVE for: {}\n'.format(','.join(blacklist_branches))
