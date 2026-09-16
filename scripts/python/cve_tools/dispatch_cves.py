@@ -1,9 +1,14 @@
 import os
 import re
 import sys
+import time
 import argparse
 import subprocess
 import textwrap
+from http import HTTPStatus
+from xmlrpc.client import ProtocolError
+from requests import HTTPError
+from requests import ConnectionError as RequestsConnectionError
 from bugzilla.utils import make_url, make_unique, calculate_deadline, format_time, BOT_ACCOUNTS
 
 # dispatch-cves script - is based on python-bugzilla (our in-tree patched copy) and requests libraries
@@ -24,9 +29,31 @@ MONKEY_EMAIL = 'cve-kpm@suse.de'
 QUEUE_EMAIL = 'kernel-bugs@suse.de'
 SECURITY_PRODUCT = 'SUSE Security Incidents'
 MIN_COMMENTS = 2
+RETRY_DELAYS = (20, 30, 40)  # seconds to wait after a retryable bugzilla error
 # ../../cve_tools/blacklist-cve
 BLACKLIST_CVE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                              'cve_tools', 'blacklist-cve')
+
+def is_rate_limited(exc):
+    """True if exc is an HTTP 429 (Too Many Requests) response from BZ."""
+    if isinstance(exc, ProtocolError):
+        return exc.errcode == HTTPStatus.TOO_MANY_REQUESTS
+    if isinstance(exc, HTTPError):
+        if exc.response is not None:
+            return exc.response.status_code == HTTPStatus.TOO_MANY_REQUESTS
+        # bugzilla's _session.request() rebuilds the exception as type(e)(message) to
+        # scrub the API key out of it, which drops the original response object.  Fall
+        # back to the status code requests always puts at the start of the message.
+        return str(exc).startswith(f'{HTTPStatus.TOO_MANY_REQUESTS.value} ')
+    return False
+
+def is_connection_error(exc):
+    """True if exc is a dropped/aborted connection to BZ, e.g. RemoteDisconnected."""
+    return isinstance(exc, RequestsConnectionError)
+
+def is_retryable(exc):
+    """True if exc is a transient bugzilla error worth retrying."""
+    return is_rate_limited(exc) or is_connection_error(exc)
 
 def parse_blacklist(spec):
     branches = spec.split(maxsplit=1)[0].split(',')
@@ -115,7 +142,17 @@ class BugUpdate:
         if self.any_flags:
             print(f'Warning: bsc#{self.bug} has already flags set, skipping needinfo update!', file=sys.stderr)
         try:
-            bzapi.update_bugs([self.bug], vals)
+            for attempt in range(len(RETRY_DELAYS) + 1):
+                try:
+                    bzapi.update_bugs([self.bug], vals)
+                    break
+                except Exception as e:
+                    if attempt == len(RETRY_DELAYS) or not is_retryable(e):
+                        raise
+                    delay = RETRY_DELAYS[attempt]
+                    print(f"bsc#{self.bug}: retryable bugzilla error ({e}), "
+                          f"retry {attempt + 1}/{len(RETRY_DELAYS)} in {delay}s...", file=sys.stderr)
+                    time.sleep(delay)
         except Exception as e:
             print(f"Failed to update bsc#{self.bug}: {e}", file=sys.stderr)
             return
