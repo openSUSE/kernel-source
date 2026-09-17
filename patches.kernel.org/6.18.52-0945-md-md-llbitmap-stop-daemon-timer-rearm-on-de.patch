@@ -1,0 +1,125 @@
+From: Yu Kuai <yukuai@fygo.io>
+Date: Mon, 3 Aug 2026 03:50:18 +0800
+Subject: [PATCH] md/md-llbitmap: stop daemon timer rearm on destroy
+References: bsc#1258210
+Patch-mainline: 6.18.52
+Git-commit: 5553d64e01d9a995be6c3de38501c6dd4ceede3b
+
+[ Upstream commit 5553d64e01d9a995be6c3de38501c6dd4ceede3b ]
+
+llbitmap_destroy() deletes pending_timer before flushing
+md_llbitmap_io_wq. However, daemon_work can still be queued or running
+after the timer has been deleted, and the daemon path can arm
+pending_timer again when it finds dirty chunks that are not ready to
+flush yet.
+
+If that happens during teardown, pending_timer can remain armed after
+llbitmap is freed and later dereference freed memory.
+
+Add a BITMAP_SHUTDOWN bit to llbitmap->flags, set it before deleting
+the timer, and make the timer and daemon paths stop queueing or rearming
+work once teardown starts. Cancel daemon_work before flushing the shared
+workqueue so no already queued daemon instance can race with the free.
+Use timer_shutdown_sync() so a daemon instance that passed the shutdown
+check before teardown cannot rearm the timer afterward.
+
+BITMAP_SHUTDOWN is a runtime-only state. Mask it out when reading and
+updating the llbitmap superblock so the shutdown state is never loaded
+from disk or persisted to disk.
+
+Fixes: 5ab829f1971d ("md/md-llbitmap: introduce new lockless bitmap")
+Tested-by: Mykola Marzhan <mykola@meshstor.io>
+Link: https://patch.msgid.link/20260802195038.164272-10-yukuai@kernel.org
+Signed-off-by: Yu Kuai <yukuai@fygo.io>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/md/md-bitmap.h   |  1 +
+ drivers/md/md-llbitmap.c | 17 +++++++++++++----
+ 2 files changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/md/md-bitmap.h b/drivers/md/md-bitmap.h
+index f46674bdfeb9..7535742982fc 100644
+--- a/drivers/md/md-bitmap.h
++++ b/drivers/md/md-bitmap.h
+@@ -29,6 +29,7 @@ enum bitmap_state {
+ 	BITMAP_FIRST_USE   = 3, /* llbitmap is just created */
+ 	BITMAP_CLEAN       = 4, /* llbitmap is created with assume_clean */
+ 	BITMAP_DAEMON_BUSY = 5, /* llbitmap daemon is not finished after daemon_sleep */
++	BITMAP_SHUTDOWN    = 6, /* llbitmap is being destroyed */
+ 	BITMAP_HOSTENDIAN  =15,
+ };
+ 
+diff --git a/drivers/md/md-llbitmap.c b/drivers/md/md-llbitmap.c
+index b4738fe6e246..5c60b26ad246 100644
+--- a/drivers/md/md-llbitmap.c
++++ b/drivers/md/md-llbitmap.c
+@@ -662,6 +662,7 @@ static enum llbitmap_state llbitmap_state_machine(struct llbitmap *llbitmap,
+ 		if (state == BitNeedSync)
+ 			need_resync = !mddev->degraded;
+ 		else if (state == BitDirty &&
++			 !test_bit(BITMAP_SHUTDOWN, &llbitmap->flags) &&
+ 			 !timer_pending(&llbitmap->pending_timer))
+ 			mod_timer(&llbitmap->pending_timer,
+ 				  jiffies + mddev->bitmap_info.daemon_sleep * HZ);
+@@ -854,7 +855,7 @@ static int llbitmap_read_sb(struct llbitmap *llbitmap)
+ 		else
+ 			mddev->bitmap_info.space = mddev->bitmap_info.default_space;
+ 	}
+-	llbitmap->flags = le32_to_cpu(sb->state);
++	llbitmap->flags = le32_to_cpu(sb->state) & ~BIT(BITMAP_SHUTDOWN);
+ 	if (test_and_clear_bit(BITMAP_FIRST_USE, &llbitmap->flags)) {
+ 		ret = llbitmap_init(llbitmap);
+ 		goto out_put_page;
+@@ -910,6 +911,9 @@ static void llbitmap_pending_timer_fn(struct timer_list *pending_timer)
+ 	struct llbitmap *llbitmap =
+ 		container_of(pending_timer, struct llbitmap, pending_timer);
+ 
++	if (test_bit(BITMAP_SHUTDOWN, &llbitmap->flags))
++		return;
++
+ 	if (work_busy(&llbitmap->daemon_work)) {
+ 		pr_warn("md/llbitmap: %s daemon_work not finished in %lu seconds\n",
+ 			mdname(llbitmap->mddev),
+@@ -930,6 +934,9 @@ static void md_llbitmap_daemon_fn(struct work_struct *work)
+ 	bool restart;
+ 	int idx;
+ 
++	if (test_bit(BITMAP_SHUTDOWN, &llbitmap->flags))
++		return;
++
+ 	if (llbitmap->mddev->degraded)
+ 		return;
+ retry:
+@@ -969,7 +976,7 @@ static void md_llbitmap_daemon_fn(struct work_struct *work)
+ 		goto retry;
+ 
+ 	/* If some page is dirty but not expired, setup timer again */
+-	if (restart)
++	if (restart && !test_bit(BITMAP_SHUTDOWN, &llbitmap->flags))
+ 		mod_timer(&llbitmap->pending_timer,
+ 			  jiffies + llbitmap->mddev->bitmap_info.daemon_sleep * HZ);
+ }
+@@ -1052,7 +1059,9 @@ static void llbitmap_destroy(struct mddev *mddev)
+ 
+ 	mutex_lock(&mddev->bitmap_info.mutex);
+ 
+-	timer_delete_sync(&llbitmap->pending_timer);
++	set_bit(BITMAP_SHUTDOWN, &llbitmap->flags);
++	timer_shutdown_sync(&llbitmap->pending_timer);
++	cancel_work_sync(&llbitmap->daemon_work);
+ 	flush_workqueue(md_llbitmap_io_wq);
+ 	flush_workqueue(md_llbitmap_unplug_wq);
+ 
+@@ -1376,7 +1385,7 @@ static void llbitmap_update_sb(void *data)
+ 
+ 	sb = kmap_local_page(sb_page);
+ 	sb->events = cpu_to_le64(mddev->events);
+-	sb->state = cpu_to_le32(llbitmap->flags);
++	sb->state = cpu_to_le32(llbitmap->flags & ~BIT(BITMAP_SHUTDOWN));
+ 	sb->chunksize = cpu_to_le32(llbitmap->chunksize);
+ 	sb->sync_size = cpu_to_le64(mddev->resync_max_sectors);
+ 	sb->events_cleared = cpu_to_le64(llbitmap->events_cleared);
+-- 
+2.53.0
+
