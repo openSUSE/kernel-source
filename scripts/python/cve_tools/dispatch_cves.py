@@ -1,10 +1,15 @@
 import os
 import re
 import sys
+import time
 import argparse
 import subprocess
 import textwrap
-from bugzilla.utils import make_url, make_unique, calculate_deadline, format_time
+from http import HTTPStatus
+from xmlrpc.client import ProtocolError
+from requests import HTTPError
+from requests import ConnectionError as RequestsConnectionError
+from bugzilla.utils import make_url, make_unique, calculate_deadline, format_time, BOT_ACCOUNTS
 
 # dispatch-cves script - is based on python-bugzilla (our in-tree patched copy) and requests libraries
 # for now this script should be kept Python 3.6 compatible (SLE15-SP7)
@@ -21,13 +26,35 @@ ACTION_PATTERN = re.compile(r'^(\S+):\s+MANUAL:\s')
 BLACKLIST_ALL = '*'
 SECURITY_EMAIL = 'kernel-security-sentinel@lists.suse.com'
 MONKEY_EMAIL = 'cve-kpm@suse.de'
+KEEP_ASSIGNEE = 'KEEP_ASSIGNEE'  # leave the bug's current assignee untouched
 QUEUE_EMAIL = 'kernel-bugs@suse.de'
 SECURITY_PRODUCT = 'SUSE Security Incidents'
-COMMENT_BANLIST = [ 'swamp@suse.de', 'bwiedemann+obsbugzillabot@suse.com', 'maint-coord+maintenance-robot@suse.de', 'smash_bz@suse.de' ]
 MIN_COMMENTS = 2
+RETRY_DELAYS = (20, 30, 40)  # seconds to wait after a retryable bugzilla error
 # ../../cve_tools/blacklist-cve
 BLACKLIST_CVE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                              'cve_tools', 'blacklist-cve')
+
+def is_rate_limited(exc):
+    """True if exc is an HTTP 429 (Too Many Requests) response from BZ."""
+    if isinstance(exc, ProtocolError):
+        return exc.errcode == HTTPStatus.TOO_MANY_REQUESTS
+    if isinstance(exc, HTTPError):
+        if exc.response is not None:
+            return exc.response.status_code == HTTPStatus.TOO_MANY_REQUESTS
+        # bugzilla's _session.request() rebuilds the exception as type(e)(message) to
+        # scrub the API key out of it, which drops the original response object.  Fall
+        # back to the status code requests always puts at the start of the message.
+        return str(exc).startswith(f'{HTTPStatus.TOO_MANY_REQUESTS.value} ')
+    return False
+
+def is_connection_error(exc):
+    """True if exc is a dropped/aborted connection to BZ, e.g. RemoteDisconnected."""
+    return isinstance(exc, RequestsConnectionError)
+
+def is_retryable(exc):
+    """True if exc is a transient bugzilla error worth retrying."""
+    return is_rate_limited(exc) or is_connection_error(exc)
 
 def parse_blacklist(spec):
     branches = spec.split(maxsplit=1)[0].split(',')
@@ -38,7 +65,7 @@ def parse_blacklist(spec):
 
 class BugUpdate:
     def __init__(self, path_to_remove, bug, cvss, comment_lines, to_append, email, action, cc_list=None, needinfo_list=None,
-                 blacklist_branches=[]):
+                 blacklist_branches=[], keep_assignee=False):
         self.path_to_remove = path_to_remove
         self.comment = "".join(comment_lines) + to_append
         self.email = email
@@ -49,6 +76,7 @@ class BugUpdate:
         self.already_dispatched = False
         self.unknown_state = False
         self.self_assign = False
+        self.keep_assignee = keep_assignee
         self.product = ''
         self.cc_list = cc_list if cc_list else []
         self.needinfo_list = needinfo_list if needinfo_list else []
@@ -65,7 +93,7 @@ class BugUpdate:
                 make_url(self.bug),
                 self.cve,
                 self.action,
-                self.original_email, self.email,
+                self.original_email, 'unchanged' if self.keep_assignee else self.email,
                 ', CC: ' + ', '.join(self.cc_add) if self.cc_add else '',
                 ', NEEDINFO: ' + ', '.join(self.needinfo_list) if self.needinfo_list else '',
                 ', DEADLINE: ' + str(self.deadline) if self.deadline else '',
@@ -104,7 +132,9 @@ class BugUpdate:
             return
         if self.already_dispatched and not force:
             return
-        bargs = { 'comment': self.comment, 'comment_private': True, 'assigned_to': self.email }
+        bargs = { 'comment': self.comment, 'comment_private': True }
+        if not self.keep_assignee:
+            bargs['assigned_to'] = self.email
         if self.cc_add:
             bargs['cc_add'] = self.cc_add
         if self.needinfo_list and not self.any_flags:
@@ -116,7 +146,17 @@ class BugUpdate:
         if self.any_flags:
             print(f'Warning: bsc#{self.bug} has already flags set, skipping needinfo update!', file=sys.stderr)
         try:
-            bzapi.update_bugs([self.bug], vals)
+            for attempt in range(len(RETRY_DELAYS) + 1):
+                try:
+                    bzapi.update_bugs([self.bug], vals)
+                    break
+                except Exception as e:
+                    if attempt == len(RETRY_DELAYS) or not is_retryable(e):
+                        raise
+                    delay = RETRY_DELAYS[attempt]
+                    print(f"bsc#{self.bug}: retryable bugzilla error ({e}), "
+                          f"retry {attempt + 1}/{len(RETRY_DELAYS)} in {delay}s...", file=sys.stderr)
+                    time.sleep(delay)
         except Exception as e:
             print(f"Failed to update bsc#{self.bug}: {e}", file=sys.stderr)
             return
@@ -179,7 +219,7 @@ def update_bug_metadata(bzapi, todo):
 
     for b in todo:
         b.bz_comments = comments['bugs'][str(b.bug)]['comments']
-        b.human_comments = [ c for c in b.bz_comments if c['creator'] not in COMMENT_BANLIST ]
+        b.human_comments = [ c for c in b.bz_comments if c['creator'] not in BOT_ACCOUNTS ]
         b.cve = make_unique(bugmap[b.bug].alias)        if b.bug in bugmap else ''
         b.original_email = bugmap[b.bug].assigned_to    if b.bug in bugmap else '<unknown>'
         b.any_flags = bool(bugmap[b.bug].flags)         if b.bug in bugmap else False
@@ -191,6 +231,9 @@ def update_bug_metadata(bzapi, todo):
             b.cc_add = list(set(b.cc_list) - set(bugmap[b.bug].cc))
         if b.original_email == '<unknown>':
             b.unknown_state = True
+        # KEEP_ASSIGNEE has no target email, so there is nothing to compare
+        elif b.keep_assignee:
+            pass
         elif b.original_email == b.email:
             b.self_assign = True
         elif QUEUE_EMAIL != 'ANY' and b.original_email != QUEUE_EMAIL:
@@ -210,6 +253,7 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
         needinfo_list = []
         blacklist_branches = []
         action_branches = []
+        keep_assignee = False
         for l in f:
             should_go_out = True
             blacklist_m = re.match(BLACKLIST_PATTERN, l)
@@ -228,6 +272,10 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
                 decided = True
             elif 'TRIVIAL_BACKPORT' in l:
                 candidate_emails = [ MONKEY_EMAIL ]
+                decided = True
+                should_go_out = False
+            elif l.strip() == KEEP_ASSIGNEE:
+                keep_assignee = True
                 decided = True
                 should_go_out = False
             elif re.search(ASSIGNEE_PATTERN, l):
@@ -283,7 +331,7 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
             candidates.append(MONKEY_EMAIL)
             candidate_emails = [ e.split(" ")[0] for e in candidates ]
 
-        if not candidate_emails:
+        if not candidate_emails and not keep_assignee:
             print(f"{path} doesn't have any viable assignees.", file=sys.stderr)
             if is_interactive:
                 sys.exit(1)
@@ -293,34 +341,17 @@ def handle_file(bzapi, path, to_dispatch, remove_file, is_interactive=True, cc_u
         if is_interactive:
             for cl in comment_lines:
                 print(cl, end='')
-        email = None if len(candidate_emails) != 1 else candidate_emails[0]
-        if not email:
-            if not is_interactive:
+        email = None
+        if not keep_assignee:
+            email = None if len(candidate_emails) != 1 else candidate_emails[0]
+            if not email:
                 print(f'Skipping {path} (bsc#{bug}) due to missing ASSIGNEE!', file=sys.stderr)
                 return
-            for n, c in enumerate(candidates, 1):
-                print("\t{:>3}: {}".format(n, c))
-        while not email:
-            answer = input('(select a number, type q for abort or enter a custom email)> ')
-            if answer == 'q':
-                print("...aborting...", file=sys.stderr)
-                sys.exit(0)
-            if "@suse." in answer and ' ' not in answer:
-                email = answer
-            else:
-                try:
-                    answer = int(answer)
-                    if answer < 1 or answer > len(candidates):
-                        raise Exception()
-                except:
-                    print("{} is not a number between 1 and {}.".format(answer, len(candidates)))
-                    continue
-                email = candidate_emails[answer - 1]
-            break
         to_add = ''
         if blacklist_branches:
             to_add = '\nRequesting to blacklist the CVE for: {}\n'.format(','.join(blacklist_branches))
-        to_dispatch.append(BugUpdate(path if remove_file else None, bug, cvss, comment_lines, to_add, email, 'developer', cc_list, needinfo_list, blacklist_branches))
+        to_dispatch.append(BugUpdate(path if remove_file else None, bug, cvss, comment_lines, to_add, email, 'developer', cc_list, needinfo_list,
+                                      blacklist_branches, keep_assignee=keep_assignee))
 
 def single_dispatch(bzapi, path, remove_file, yes, force, cc_us, allow_same_assignee):
     to_dispatch = []
@@ -353,6 +384,7 @@ ASSIGNEE <email1>
 CC <email1> <email2> ...
 NEEDINFO <email1> <email2> ...
 TRIVIAL_BACKPORT
+KEEP_ASSIGNEE
 BLACKLIST <branch1>,<branch2>,...
 BLACKLIST *
 
@@ -366,6 +398,8 @@ The request is submitted only after the bugzilla comment it refers to has been a
 blacklisted branches cover all the branches that need an action, the CVE is considered decided
 and the bug is handed over to the security team (unless an explicit ASSIGNEE says otherwise),
 a partial blacklisting is dispatched like any other bug.
+KEEP_ASSIGNEE dispatches the bug (comment/CC/NEEDINFO/BLACKLIST) without touching its assignee,
+regardless of who it currently is.
     '''))
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-f", "--file", help="path to a regular file containing ./scripts/check-kernel-fix output", default=None, type=str)
