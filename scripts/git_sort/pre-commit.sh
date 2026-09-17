@@ -51,13 +51,12 @@ sorted_section_changed () {
 }
 
 sorted_patches_changed () {
+	# $1: sorted output of the names of patches in the current (staged)
+	# sorted section, one per line (i.e. "$current_names").
 	common=$(comm -12 <(
 		git diff-index --cached --name-only --diff-filter=AMD HEAD | sort
-		) <(
-		git cat-file blob :series.conf |
-			"$_libdir"/series_conf --name-only | sort
-		) | wc -l)
-	
+		) <(echo "$1") | wc -l)
+
 	if ! [ "$common" -eq "$common" ] 2>/dev/stderr; then
 		# not an integer
 		echo "Error detecting changes in series.conf sorted patches." \
@@ -72,7 +71,12 @@ sorted_patches_changed () {
 	fi
 }
 
-if sorted_section_changed || sorted_patches_changed; then
+# Computed once and reused below, instead of every caller re-running
+# "series_conf" over the whole (possibly very large) sorted section.
+current_names=$(git cat-file blob :series.conf |
+	"$_libdir"/series_conf --name-only | sort)
+
+if sorted_section_changed || sorted_patches_changed "$current_names"; then
 	# series_sort should examine the patches in the index, not the
 	# working tree. Check them out.
 	#
@@ -88,9 +92,6 @@ if sorted_section_changed || sorted_patches_changed; then
 	checkout_dir="$(git rev-parse --git-dir)/git-sort/pre-commit-checkout"
 	manifest="$checkout_dir.manifest"
 	mkdir -p "$checkout_dir"
-
-	current_names=$(git cat-file blob :series.conf |
-		"$_libdir"/series_conf --name-only | sort)
 
 	# Patches whose staged content actually changed in this commit...
 	changed_names=$(comm -12 <(
