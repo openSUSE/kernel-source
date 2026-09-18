@@ -132,6 +132,12 @@ class Head(object):
     def __init__(self, repo_url, rev="master"):
         self.repo_url = repo_url
         self.rev = rev
+        # Populated lazily by _get_index(). A large sorted series.conf
+        # compares the same small set of Head instances (one per remote,
+        # plus "out-of-tree") tens of thousands of times, so caching this
+        # avoids redoing the dict lookup (and its hashing/equality cost)
+        # on every comparison.
+        self._index = None
 
 
     def _is_valid_operand(self, other):
@@ -143,10 +149,12 @@ class Head(object):
         A head with no url is considered out of tree. Any other head with a
         url is upstream of it.
         """
-        if self.repo_url == RepoURL(None):
-            return len(remotes)
-        else:
-            return remote_index[self]
+        if self._index is None:
+            if self.repo_url == RepoURL(None):
+                self._index = len(remotes)
+            else:
+                self._index = remote_index[self]
+        return self._index
 
 
     def __eq__(self, other):
@@ -159,6 +167,15 @@ class Head(object):
         if not self._is_valid_operand(other):
             return NotImplemented
         return self._get_index() < other._get_index()
+
+
+    def __gt__(self, other):
+        # Defined explicitly (rather than left to functools.total_ordering,
+        # which would synthesize it from __lt__ plus a __ne__ call) since
+        # this comparison is done for every patch in the sorted section.
+        if not self._is_valid_operand(other):
+            return NotImplemented
+        return self._get_index() > other._get_index()
 
 
     def __hash__(self):
