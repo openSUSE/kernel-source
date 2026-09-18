@@ -93,11 +93,13 @@ if sorted_section_changed || sorted_patches_changed "$current_names"; then
 			sort "$manifest" 2> /dev/null
 			) | awk '{print $1}')
 
-	echo "$changed_names" |
-		git checkout-index --quiet --force --prefix="$checkout_dir/" --stdin
-	if [ $? -ne 0 ]; then
-		echo "Error refreshing $checkout_dir." > /dev/stderr
-		exit 1
+	if [ -n "$changed_names" ]; then
+		echo "$changed_names" |
+			git checkout-index --quiet --force --prefix="$checkout_dir/" --stdin
+		if [ $? -ne 0 ]; then
+			echo "Error refreshing $checkout_dir." > /dev/stderr
+			exit 1
+		fi
 	fi
 
 	echo "$staged_shas" > "$manifest"
