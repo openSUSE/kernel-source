@@ -51,13 +51,12 @@ sorted_section_changed () {
 }
 
 sorted_patches_changed () {
+	# $1: sorted output of the names of patches in the current (staged)
+	# sorted section, one per line (i.e. "$current_names").
 	common=$(comm -12 <(
 		git diff-index --cached --name-only --diff-filter=AMD HEAD | sort
-		) <(
-		git cat-file blob :series.conf |
-			"$_libdir"/series_conf --name-only | sort
-		) | wc -l)
-	
+		) <(echo "$1") | wc -l)
+
 	if ! [ "$common" -eq "$common" ] 2>/dev/stderr; then
 		# not an integer
 		echo "Error detecting changes in series.conf sorted patches." \
@@ -72,23 +71,42 @@ sorted_patches_changed () {
 	fi
 }
 
-if sorted_section_changed || sorted_patches_changed; then
-	trap '[ -n "$tmpdir" -a -d "$tmpdir" ] && rm -r "$tmpdir"' EXIT
-	tmpdir=$(mktemp --directory --tmpdir gs_pc.XXXXXXXXXX)
+current_names=$(git cat-file blob :series.conf |
+	"$_libdir"/series_conf --name-only | sort)
 
+if sorted_section_changed || sorted_patches_changed "$current_names"; then
 	# series_sort should examine the patches in the index, not the
 	# working tree. Check them out.
-	git cat-file blob :series.conf |
-		"$_libdir"/series_conf --name-only |
-		git checkout-index --quiet --prefix="$tmpdir/" --stdin
+	checkout_dir="$(git rev-parse --git-dir)/git-sort/pre-commit-checkout"
+	manifest="$checkout_dir.manifest"
+	mkdir -p "$checkout_dir"
+
+	# "<name> <staged blob sha>" pairs for every patch in the current
+	# sorted section
+	staged_shas=$(echo "$current_names" | awk '{print ":" $0, $0}' |
+		git cat-file --batch-check='%(rest) %(objectname)' | sort)
+
+	# Patches whose (name, staged sha) pair isn't already recorded in the
+	# manifest: new to the sorted section, or changed since the manifest
+	# was last written -- on this branch or any other.
+	changed_names=$(comm -23 <(echo "$staged_shas") <(
+			sort "$manifest" 2> /dev/null
+			) | awk '{print $1}')
+
+	if [ -n "$changed_names" ]; then
+		echo "$changed_names" |
+			git checkout-index --quiet --force --prefix="$checkout_dir/" --stdin
+		if [ $? -ne 0 ]; then
+			echo "Error refreshing $checkout_dir." > /dev/stderr
+			exit 1
+		fi
+	fi
+
+	echo "$staged_shas" > "$manifest"
 
 	git cat-file blob :series.conf |
-		"$_libdir"/series_sort --check --prefix="$tmpdir"
+		"$_libdir"/series_sort --check --prefix="$checkout_dir"
 	retval=$?
-
-	rm -r "$tmpdir"
-	unset tmpdir
-	trap - EXIT
 
 	if [ $retval -ne 0 ]; then
 		echo "\"sorted patches\" section of series.conf failed check. Please read \"scripts/git_sort/README.md\", in particular the section \"Refreshing the order of patches in series.conf\"."
