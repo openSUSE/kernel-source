@@ -1,0 +1,137 @@
+From: "Harry Yoo (Meta)" <harry@kernel.org>
+Date: Thu, 3 Sep 2026 15:32:26 +0100
+Subject: [PATCH] mm/slab: take n->list_lock in __slab_try_return_freelist() to
+ avoid race
+References: bsc#1012628
+Patch-mainline: 7.2.7
+Git-commit: 4a724bcf5d703e18957397914d79156fa2cf1174
+
+commit 4a724bcf5d703e18957397914d79156fa2cf1174 upstream.
+
+Commit ba7425312607 ("mm, slab: add an optimistic
+__slab_try_return_freelist()") incorrectly assumed that nobody has freed
+an object to the slab as long as slab->freelist is NULL and cmpxchg
+succeeds.
+
+However, as reported by Hyunwoo Kim [1], other CPUs might have freed
+an object to the slab, insert the slab to the partial list, then
+allocated an object from the slab, and be in the middle of removing
+the slab from the list under n->list_lock.
+
+Since __refill_objects_node() puts the slab back on pc.slabs
+outside n->list_lock, it might insert the slab into that list while
+the slab is concurrently being removed from n->partial.
+This led to a list corruption [1]:
+
+  list_add corruption. next->prev should be prev
+  (ffff888100000248), but was dead000000000122.
+  (next=ffffea000416e410).
+  kernel BUG at lib/list_debug.c:29!
+  Oops: invalid opcode: 0000 [#1] SMP NOPTI
+  CPU: 1 UID: 65534 PID: 144 Comm: poc Not tainted
+  7.2.0-16172-gcf72cbb39da8-dirty #1 PREEMPT(lazy)
+  RIP: 0010:__list_add_valid_or_report+0x80/0xd0
+  ...
+  Call Trace:
+   alloc_from_new_slab+0x183/0x300
+   ___slab_alloc+0x31c/0x890
+   __kmalloc_noprof+0x3d4/0x800
+   lsm_blob_alloc+0x2d/0x50
+   security_msg_msg_alloc+0x26/0x90
+   load_msg+0x1aa/0x210
+   do_msgsnd+0x91/0x800
+   do_syscall_64+0x109/0x5d0
+   entry_SYSCALL_64_after_hwframe+0x77/0x7f
+  ...
+  Kernel panic - not syncing: Fatal exception
+
+This is a classic ABA problem where cmpxchg succeeds but the state has
+changed since __refill_objects_node() took the freelist from the slab.
+
+As Vlastimil Babka mentioned [2], it should be rare to return more than
+one slab (due to the racy read of slab->counters in
+get_partial_node_bulk()). Therefore, instead of introducing additional
+complexity, acquire and release n->list_lock twice in the worst case.
+
+Return the slab directly to the partial list and hold n->list_lock
+across the cmpxchg and add_partial(). This is similar to the initial
+version of commit ba7425312607 [3]. This is enough to avoid the race as
+the list manipulation is serialized by n->list_lock. While at it,
+bring back unlikely() hint now that the condition is unlikely.
+
+Reported-by: Hyunwoo Kim <imv4bel@gmail.com>
+Closes: https://lore.kernel.org/linux-mm/apPa-cGLcyt90l-E@v4bel [1]
+Link: https://lore.kernel.org/linux-mm/ae25c193-b95f-40c1-83b6-1c2546467e41@kernel.org [2]
+Link: https://lore.kernel.org/all/20260421-b4-refill-optimistic-return-v1-1-24f0bfc1acff@kernel.org [3]
+Fixes: ba7425312607 ("mm, slab: add an optimistic __slab_try_return_freelist()")
+Cc: stable@vger.kernel.org
+Signed-off-by: Harry Yoo (Meta) <harry@kernel.org>
+Link: https://patch.msgid.link/20260903-slab-fix-aba-v3-1-b44cb6badd54@kernel.org
+Reviewed-by: Hao Li <hao.li@linux.dev>
+Signed-off-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ mm/slub.c | 20 +++++++++++++-------
+ 1 file changed, 13 insertions(+), 7 deletions(-)
+
+diff --git a/mm/slub.c b/mm/slub.c
+index 5e88c520522b..3791d69ba6f9 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -5612,10 +5612,12 @@ static noinline void free_to_partial_list(
+  *
+  * Fail if the slab isn't full anymore due to a concurrent free.
+  */
+-static bool __slab_try_return_freelist(struct kmem_cache *s, struct slab *slab,
+-				       void *head, int cnt)
++static bool __slab_try_return_freelist(struct kmem_cache *s,
++				       struct kmem_cache_node *n,
++				       struct slab *slab, void *head, int cnt)
+ {
+ 	struct freelist_counters old, new;
++	unsigned long flags;
+ 
+ 	old.freelist = slab->freelist;
+ 	old.counters = slab->counters;
+@@ -5627,9 +5629,15 @@ static bool __slab_try_return_freelist(struct kmem_cache *s, struct slab *slab,
+ 	new.counters = old.counters;
+ 	new.inuse -= cnt;
+ 
+-	if (!slab_update_freelist(s, slab, &old, &new, "__slab_try_return_freelist"))
++	spin_lock_irqsave(&n->list_lock, flags);
++
++	if (!slab_update_freelist(s, slab, &old, &new, "__slab_try_return_freelist")) {
++		spin_unlock_irqrestore(&n->list_lock, flags);
+ 		return false;
++	}
+ 
++	add_partial(n, slab, ADD_TO_TAIL);
++	spin_unlock_irqrestore(&n->list_lock, flags);
+ 	return true;
+ }
+ 
+@@ -7202,10 +7210,8 @@ __refill_objects_node(struct kmem_cache *s, void **p, gfp_t gfp, unsigned int mi
+ 			void *head = object;
+ 			void *tail;
+ 
+-			if (__slab_try_return_freelist(s, slab, head, count)) {
+-				list_add(&slab->slab_list, &pc.slabs);
++			if (__slab_try_return_freelist(s, n, slab, head, count))
+ 				break;
+-			}
+ 
+ 			do {
+ 				tail = object;
+@@ -7218,7 +7224,7 @@ __refill_objects_node(struct kmem_cache *s, void **p, gfp_t gfp, unsigned int mi
+ 			break;
+ 	}
+ 
+-	if (!list_empty(&pc.slabs)) {
++	if (unlikely(!list_empty(&pc.slabs))) {
+ 		spin_lock_irqsave(&n->list_lock, flags);
+ 
+ 		list_for_each_entry(slab, &pc.slabs, slab_list)
+-- 
+2.55.0
+
