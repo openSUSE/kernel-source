@@ -1,0 +1,166 @@
+From: Yu Zhang <yuz08559@gmail.com>
+Date: Fri, 7 Aug 2026 20:00:25 +1000
+Subject: [PATCH] vhost-vdpa: protect config_ctx from being freed under the
+ config callback
+References: bsc#1258210
+Patch-mainline: 6.18.53
+Git-commit: 62be4e3e5f5f947fbf765b914cebdc478f715d12
+
+[ Upstream commit 62be4e3e5f5f947fbf765b914cebdc478f715d12 ]
+
+vhost_vdpa_config_cb() loads v->config_ctx and signals it without taking
+a reference and without holding any lock:
+
+	struct eventfd_ctx *config_ctx = v->config_ctx;
+
+	if (config_ctx)
+		eventfd_signal(config_ctx);
+
+VHOST_VDPA_SET_CONFIG_CALL replaces that field and drops what is normally
+the last reference to the old context:
+
+	swap(ctx, v->config_ctx);
+
+	if (ctx)
+		eventfd_ctx_put(ctx);
+
+eventfd_ctx_put() drops the last kref and frees the context immediately,
+with no RCU grace period, so a callback that has already loaded the
+pointer goes on to dereference freed memory.  The two sides share no
+lock: the ioctl runs under vhost_dev.mutex, while the parent invokes the
+callback from its own interrupt or workqueue context.
+
+This is not the reopen refcount underflow fixed by commit f6bbf0010ba0
+("vhost-vdpa: fix use-after-free of v->config_ctx"), which was about
+vhost_vdpa_config_put() leaving a stale pointer behind.  Here the pointer
+is maintained correctly and it is the read side that is unprotected.
+
+With VDUSE as the parent this is reachable from userspace with access to
+/dev/vduse (root by default).  VDUSE_DEV_INJECT_CONFIG_IRQ queues
+dev->inject, and vduse_dev_irq_inject() runs the callback under VDUSE's
+own dev->irq_lock, which vhost does not hold.  vduse_dev_reset() does
+flush_work(&dev->inject), but VHOST_VDPA_SET_CONFIG_CALL never goes
+through reset, so an inject already in flight is not waited for.  A
+process that injects config interrupts on the VDUSE fd while another
+thread swaps the call fd on the vhost-vdpa fd hits it in seconds:
+
+  BUG: KASAN: slab-use-after-free in native_queued_spin_lock_slowpath
+  Read of size 4 at addr ffff888107d21808 by task kworker/u17:1/2993
+  Workqueue: vduse-irq vduse_dev_irq_inject
+  Call Trace:
+   native_queued_spin_lock_slowpath+0x97/0x5b0
+   _raw_spin_lock_irqsave+0xd4/0xe0
+   eventfd_signal_mask+0x69/0x120
+   vhost_vdpa_config_cb+0x34/0x50
+   vduse_dev_irq_inject+0x46/0x60
+   process_one_work+0x468/0x950
+
+  Allocated by task 2992:
+   do_eventfd+0x50/0x200
+   __x64_sys_eventfd2+0x2e/0x40
+
+  Freed by task 2992:
+   eventfd_ctx_put+0xb9/0xc0
+   vhost_vdpa_unlocked_ioctl+0x116c/0x2190
+
+Add a spinlock covering every access to config_ctx, so the callback
+either signals a context that is still alive or observes NULL, and the
+put happens only once no callback can reach the old value.
+
+Clearing the parent's callback before the put would not be enough: of the
+in-tree set_config_cb() implementations only VDUSE takes a lock, the rest
+store the pointer unlocked, so that would not order against an in-flight
+invocation.
+
+Fixes: 776f395004d8 ("vhost_vdpa: Support config interrupt in vdpa")
+Signed-off-by: Yu Zhang <yuz08559@gmail.com>
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Message-ID: <20260807100025.19750-3-yuz08559@gmail.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/vhost/vdpa.c | 32 +++++++++++++++++++++++++-------
+ 1 file changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/vhost/vdpa.c b/drivers/vhost/vdpa.c
+index 0d0206862cce..2dd2a5ccd09e 100644
+--- a/drivers/vhost/vdpa.c
++++ b/drivers/vhost/vdpa.c
+@@ -57,6 +57,8 @@ struct vhost_vdpa {
+ 	int virtio_id;
+ 	int minor;
+ 	struct eventfd_ctx *config_ctx;
++	/* Serialises vhost_vdpa_config_cb() against config_ctx being replaced. */
++	spinlock_t config_lock;
+ 	int in_batch;
+ 	struct vdpa_iova_range range;
+ 	u32 batch_asid;
+@@ -188,10 +190,12 @@ static irqreturn_t vhost_vdpa_virtqueue_cb(void *private)
+ static irqreturn_t vhost_vdpa_config_cb(void *private)
+ {
+ 	struct vhost_vdpa *v = private;
+-	struct eventfd_ctx *config_ctx = v->config_ctx;
++	unsigned long flags;
+ 
+-	if (config_ctx)
+-		eventfd_signal(config_ctx);
++	spin_lock_irqsave(&v->config_lock, flags);
++	if (v->config_ctx)
++		eventfd_signal(v->config_ctx);
++	spin_unlock_irqrestore(&v->config_lock, flags);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -521,15 +525,22 @@ static long vhost_vdpa_get_vring_num(struct vhost_vdpa *v, u16 __user *argp)
+ 
+ static void vhost_vdpa_config_put(struct vhost_vdpa *v)
+ {
+-	if (v->config_ctx) {
+-		eventfd_ctx_put(v->config_ctx);
+-		v->config_ctx = NULL;
+-	}
++	struct eventfd_ctx *ctx;
++	unsigned long flags;
++
++	spin_lock_irqsave(&v->config_lock, flags);
++	ctx = v->config_ctx;
++	v->config_ctx = NULL;
++	spin_unlock_irqrestore(&v->config_lock, flags);
++
++	if (ctx)
++		eventfd_ctx_put(ctx);
+ }
+ 
+ static long vhost_vdpa_set_config_call(struct vhost_vdpa *v, u32 __user *argp)
+ {
+ 	struct vdpa_callback cb;
++	unsigned long flags;
+ 	int fd;
+ 	struct eventfd_ctx *ctx;
+ 
+@@ -542,8 +553,14 @@ static long vhost_vdpa_set_config_call(struct vhost_vdpa *v, u32 __user *argp)
+ 	if (IS_ERR(ctx))
+ 		return PTR_ERR(ctx);
+ 
++	spin_lock_irqsave(&v->config_lock, flags);
+ 	swap(ctx, v->config_ctx);
++	spin_unlock_irqrestore(&v->config_lock, flags);
+ 
++	/*
++	 * The callback can no longer reach the old context, so this is the
++	 * last reference to it.
++	 */
+ 	if (ctx)
+ 		eventfd_ctx_put(ctx);
+ 
+@@ -1630,6 +1647,7 @@ static int vhost_vdpa_probe(struct vdpa_device *vdpa)
+ 	}
+ 
+ 	atomic_set(&v->opened, 0);
++	spin_lock_init(&v->config_lock);
+ 	v->minor = minor;
+ 	v->vdpa = vdpa;
+ 	v->nvqs = vdpa->nvqs;
+-- 
+2.53.0
+
