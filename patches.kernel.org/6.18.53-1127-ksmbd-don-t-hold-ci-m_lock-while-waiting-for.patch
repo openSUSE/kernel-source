@@ -1,0 +1,184 @@
+From: Namjae Jeon <linkinjeon@kernel.org>
+Date: Tue, 15 Sep 2026 22:56:59 +0300
+Subject: [PATCH] ksmbd: don't hold ci->m_lock while waiting for a lease break
+ ack
+References: bsc#1258210
+Patch-mainline: 6.18.53
+Git-commit: 27a9bc968d4ae809a3f5ca2f2b136856ee613cb4
+
+commit 27a9bc968d4ae809a3f5ca2f2b136856ee613cb4 upstream.
+
+When a cifs.ko client caches a read-handle (RH) lease via deferred close
+and a conflicting open arrives, ksmbd breaks the lease and waits for the
+acknowledgment in wait_for_break_ack() for up to OPLOCK_WAIT_TIME (35s).
+__smb_break_all_levII_oplock() runs that wait while holding ci->m_lock
+for read.
+
+cifs.ko reacts to a handle-lease break by closing the deferred handle
+rather than sending a lease break acknowledgment. That close path
+(close_id_del_oplock() -> opinfo_del()) takes ci->m_lock for write and
+is exactly what would wake the waiter, but it blocks on the read lock
+held by the waiting thread. The break is then resolved only by the 35s
+timeout, so xfstests generic/001 takes ~78s with leases enabled versus
+~4s with oplocks only.
+
+Collect the target opinfos (each pinned with a reference) while holding
+ci->m_lock, then break them after releasing it, matching how
+smb_grant_oplock() already breaks a conflicting lease using only a
+reference.  The reference keeps the opinfo (and its conn and lease)
+alive across the unlocked window, and a close racing the break is
+handled by the existing OPLOCK_CLOSING state check. Apply the same fix
+to the parent lease break paths.
+
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+
+[ This tree predates the deferred break machinery.  The 6.18.y
+backport of the oplock break UAF fix (applied here as c8279ae8df68)
+calls oplock_break() directly while holding ci->m_lock, and its
+smb2_oplock_break_conn_get() takes down_read(ci->m_lock) internally,
+so the three walks self-nest the read lock and deadlock for up to
+OPLOCK_WAIT_TIME (35s) once a writer queues on the inode.  Port the
+machinery above so the walks collect the breaks and drain them after
+releasing ci->m_lock, matching the 7.2.y shape of the fix. ]
+
+Acked-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Abdifatah Suruur <suruurism@gmail.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/smb/server/oplock.c | 63 ++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 58 insertions(+), 5 deletions(-)
+
+diff --git a/fs/smb/server/oplock.c b/fs/smb/server/oplock.c
+index 6fafcbd9aceb..6183bd52ca9d 100644
+--- a/fs/smb/server/oplock.c
++++ b/fs/smb/server/oplock.c
+@@ -1033,6 +1033,43 @@ static int oplock_break(struct oplock_info *brk_opinfo, struct ksmbd_inode *ci,
+ 	return err;
+ }
+ 
++struct oplock_break_entry {
++	struct list_head	list;
++	struct oplock_info	*opinfo;
++};
++
++/*
++ * Collect an oplock for a deferred break.  oplock_break() may block for
++ * the client's break acknowledgment, and the close that wakes that wait
++ * needs ci->m_lock for write, so the walks that hold ci->m_lock defer the
++ * break until the lock is released.
++ */
++static int oplock_break_add(struct list_head *head, struct oplock_info *opinfo)
++{
++	struct oplock_break_entry *ent;
++
++	ent = kmalloc_obj(struct oplock_break_entry, KSMBD_DEFAULT_GFP);
++	if (!ent)
++		return -ENOMEM;
++
++	ent->opinfo = opinfo;
++	list_add_tail(&ent->list, head);
++	return 0;
++}
++
++static void oplock_break_drain_none(struct list_head *head,
++				    struct ksmbd_inode *ci)
++{
++	struct oplock_break_entry *ent, *tmp;
++
++	list_for_each_entry_safe(ent, tmp, head, list) {
++		oplock_break(ent->opinfo, ci, SMB2_OPLOCK_LEVEL_NONE, NULL);
++		list_del(&ent->list);
++		opinfo_put(ent->opinfo);
++		kfree(ent);
++	}
++}
++
+ void destroy_lease_table(struct ksmbd_conn *conn)
+ {
+ 	struct lease_table *lb, *lbtmp;
+@@ -1179,6 +1216,7 @@ void smb_send_parent_lease_break_noti(struct ksmbd_file *fp,
+ {
+ 	struct oplock_info *opinfo;
+ 	struct ksmbd_inode *p_ci = NULL;
++	LIST_HEAD(brk_list);
+ 
+ 	if (lctx->version != 2)
+ 		return;
+@@ -1204,12 +1242,14 @@ void smb_send_parent_lease_break_noti(struct ksmbd_file *fp,
+ 				continue;
+ 			}
+ 
+-			oplock_break(opinfo, p_ci, SMB2_OPLOCK_LEVEL_NONE, NULL);
+-			opinfo_put(opinfo);
++			if (oplock_break_add(&brk_list, opinfo))
++				opinfo_put(opinfo);
+ 		}
+ 	}
+ 	up_read(&p_ci->m_lock);
+ 
++	oplock_break_drain_none(&brk_list, p_ci);
++
+ 	ksmbd_inode_put(p_ci);
+ }
+ 
+@@ -1217,6 +1257,7 @@ void smb_lazy_parent_lease_break_close(struct ksmbd_file *fp)
+ {
+ 	struct oplock_info *opinfo;
+ 	struct ksmbd_inode *p_ci = NULL;
++	LIST_HEAD(brk_list);
+ 
+ 	rcu_read_lock();
+ 	opinfo = rcu_dereference(fp->f_opinfo);
+@@ -1245,12 +1286,14 @@ void smb_lazy_parent_lease_break_close(struct ksmbd_file *fp)
+ 				continue;
+ 			}
+ 
+-			oplock_break(opinfo, p_ci, SMB2_OPLOCK_LEVEL_NONE, NULL);
+-			opinfo_put(opinfo);
++			if (oplock_break_add(&brk_list, opinfo))
++				opinfo_put(opinfo);
+ 		}
+ 	}
+ 	up_read(&p_ci->m_lock);
+ 
++	oplock_break_drain_none(&brk_list, p_ci);
++
+ 	ksmbd_inode_put(p_ci);
+ }
+ 
+@@ -1461,6 +1504,7 @@ void smb_break_all_levII_oplock(struct ksmbd_work *work, struct ksmbd_file *fp,
+ 	struct oplock_info *op, *brk_op;
+ 	struct ksmbd_inode *ci;
+ 	struct ksmbd_conn *conn = work->conn;
++	LIST_HEAD(brk_list);
+ 
+ 	if (!test_share_config_flag(work->tcon->share_conf,
+ 				    KSMBD_SHARE_FLAG_OPLOCKS))
+@@ -1502,12 +1546,21 @@ void smb_break_all_levII_oplock(struct ksmbd_work *work, struct ksmbd_file *fp,
+ 			    SMB2_LEASE_KEY_SIZE))
+ 			goto next;
+ 		brk_op->open_trunc = is_trunc;
+-		oplock_break(brk_op, ci, SMB2_OPLOCK_LEVEL_NONE, NULL);
++
++		/*
++		 * Defer the break until ci->m_lock is released: oplock_break()
++		 * may block waiting for the break acknowledgment, and the
++		 * close that wakes that wait needs ci->m_lock for write.
++		 */
++		if (!oplock_break_add(&brk_list, brk_op))
++			continue;
+ next:
+ 		opinfo_put(brk_op);
+ 	}
+ 	up_read(&ci->m_lock);
+ 
++	oplock_break_drain_none(&brk_list, ci);
++
+ 	if (op)
+ 		opinfo_put(op);
+ }
+-- 
+2.53.0
+
