@@ -144,6 +144,7 @@ path it looked for.
 | `--use-busybox-initrd` | Fast mode only: swap the default dracut initrd for a minimal busybox one. **No SSH in this mode** - console only. |
 | `--extra-qemu "..."` | Raw extra arguments appended to the QEMU invocation. |
 | `--refresh-cache` | Ignore cached kernel/RPM/initrd artifacts and rebuild from scratch. |
+| `--jobs N` / `-j N` | Override the auto-calculated number of parallel `make -jN` build jobs. `build` phase only - ignored (with a warning) for `image`/`boot`. |
 | `--ssh` | Auto-connect via SSH right after boot (this is the default behavior already in `--mode rpm`). |
 | `--qcow2 PATH` | Use this local `.qcow2` as the RPM-mode base image instead of resolving one from IBS/OBS. |
 | `--rpm-build-root PATH` | Build root passed to `osc build --root=` in `--mode rpm` (default: `/var/tmp/build-root`). |
@@ -160,10 +161,16 @@ This is the default mode. It compiles the kernel in a container, packs a dracut
 initrd, and boots QEMU in a few minutes.
 
 > **CPU usage note.** `sequence-patch --rapid` (rapidquilt) threads across every
-> online CPU, and the containerized `make` step also builds with `-j$(nproc
-> --all)` - both intentionally use 100% of every core. On a higher-end lab/build
-> machine this is barely noticeable, but on a developer laptop expect occasional
-> screen freezing/UI slowness during these two windows - it is expected.
+> online CPU - this intentionally uses 100% of every core. On a higher-end
+> lab/build machine this is barely noticeable, but on a developer laptop expect
+> occasional screen freezing/UI slowness during this window - it is expected.
+>
+> **Build jobs.** The containerized `make -jN` step picks `N` automatically
+> from available host RAM (not just core count), to avoid OOM-ing the kernel
+> link stage on mem-constrained machines. If you want to override that
+> calculation - fewer jobs to keep your laptop usable, or more because you know
+> the box can take it - pass `--jobs N` / `-j N`. It only applies to the
+> `build` phase; `image`/`boot` ignore it with a warning if you pass it there.
 
 ```bash
 # Compile and boot a specific commit for the "default|rt|azure|kvmsmall" flavor
