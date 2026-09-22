@@ -17,6 +17,7 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
 # USA.
 
+import subprocess
 import sys
 
 try:
@@ -35,6 +36,25 @@ try:
             args = [str(a) if isinstance(a, pathlib.PurePath) else a for a in args]
             return _old_init_repository(*args, **kwargs)
         init_repository = _fix_init_repository
+
+    # implement faster fetch with git
+    _orig_remote_fetch = Remote.fetch
+
+    def _simple_cli_fetch(self, *args, **kwargs):
+        # pass anything complex to python impl
+        if args or kwargs:
+            return _orig_remote_fetch(self, *args, **kwargs)
+
+        repo_dir = getattr(self._repo, 'workdir', None) or getattr(self._repo, 'path', None)
+        return subprocess.run(
+            ["git", "fetch", self.name],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+    Remote.fetch = _simple_cli_fetch
 except ImportError as err:
     print("Error: %s" % (err,), file=sys.stderr)
     print("Please install the \"pygit2\" python3 module. For more details, "

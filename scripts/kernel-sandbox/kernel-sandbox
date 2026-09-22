@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""
+kernel-sandbox - SUSE Kernel Testing Suite
+
+An orchestrator for building, imaging, and booting
+custom kernel builds in QEMU VMs.
+
+Invocation modes:
+  ./scripts/kernel-sandbox/kernel-sandbox [options]            - Full pipeline orchestrator
+  ./scripts/kernel-sandbox/kernel-sandbox build [options]      - Build phase only
+  ./scripts/kernel-sandbox/kernel-sandbox image [options]      - Image prep phase only
+  ./scripts/kernel-sandbox/kernel-sandbox boot [options]       - Boot phase only
+"""
+
+import argparse
+import functools
+import os
+import re
+import shutil
+import signal
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from libs.cache_metadata import discover_cached_builds
+from libs.config_manager import ConfigManager, ConfigurationError, get_host_arch
+from libs.kernel_source_git import Repository
+from libs.storage_manager import ImageFinder, ImageNotFoundError, Qcow2Manager
+from libs.image_customizer import DependencyError
+from libs.console import get_logger, print_phase_header
+from libs.pipeline_context import FastModeContext, RpmModeContext
+from libs.lock import LockTimeoutError, file_lock
+from libs.errors import KernelSandboxError
+from pipeline_engines import BootEngine, BuildEngine, ImagePreparer
+
+logger = get_logger(__name__)
+
+
+EXCLUDE_QCOW2_PATTERNS = ["openstack", "encrypt", "sap", "cloud"]
+DEFAULT_RPM_BUILD_ROOT = "/var/tmp/build-root"
+
+
+def handle_signals(signum, frame):
+    """Translate any OS signals into SystemExit to make sure we go through context manager teardown."""
+    logger.warning(f"Received fatal signal {signum}. Initiating graceful teardown...")
+    sys.exit(128 + signum)
+
+
+def validate_cli_args(args):
+    """validate some mutually exclusive or invalid cli-args combinations."""
+    if args.mode == "rpm":
+        if args.use_busybox_initrd:
+            logger.error("The --use-busybox-initrd flag is invalid when running in --mode rpm.")
+            sys.exit(1)
+
+    if args.command in ["image", "boot"] and args.refresh_cache:
+        logger.warning(f"--refresh-cache is not applicable for the '{args.command}' phase and will be ignored.")
+        args.refresh_cache = False
+
+
+def verify_host_requirements(args):
+    """Verify phase-specific dependencies build, boot, specific requirements"""
+    # Verify if we are in a kernel source repository
+    scripts_dir = Path.cwd() / "scripts" / "kernel-sandbox"
+
+    if not scripts_dir.exists():
+        logger.error("Not in a kernel-source repository root")
+        logger.error(
+            "Please run kernel-sandbox(as ./scripts/kernel-sandbox/kernel-sandbox) from kernel-source git repository root")
+        sys.exit(1)
+
+    missing = []
+    run_build = args.command in (None, "build")
+    run_image = args.command in (None, "image")
+    run_boot = args.command in (None, "boot")
+
+    if run_build:
+        if not shutil.which("git"):
+            missing.append("git")
+        if args.mode == "fast" and not shutil.which("podman"):
+            missing.append("podman")
+
+    if run_image:
+        if args.mode == "rpm" and not shutil.which("virt-customize"):
+            missing.append("virt-customize")
+            missing.append("guestfish")
+        if args.mode == "fast" and not shutil.which("cpio"):
+            missing.append("cpio")
+
+    if run_boot:
+        config_manager = ConfigManager(yaml_path=get_yaml_config_path())
+        qemu_bin = config_manager.get_qemu_profile(args.arch)["qemu_bin"]
+        if not shutil.which(qemu_bin):
+            missing.append(qemu_bin)
+        if args.mode == "rpm" and not shutil.which("qemu-img"):
+            missing.append("qemu-img")
+
+    if missing:
+        dep_str = "\n  - ".join(set(missing))
+        raise DependencyError(
+            f"Missing required host dependencies for requested phase(s):\n  - {dep_str}\n\n"
+            f"Install with: zypper in libguestfs podman qemu-img qemu-linux-user qemu-tools guestfs-tools"
+        )
+
+
+def get_yaml_config_path():
+    return Path(__file__).resolve().parent / "kernel_sandbox_profiles.yaml"
+
+
+def get_cache_dir():
+    """cache directory from SCRATCH_AREA or fallback to ./tmp/.kernel-sandbox-cache"""
+    scratch_area = os.environ.get("SCRATCH_AREA")
+    if scratch_area:
+        cache_dir = Path(scratch_area) / ".kernel-sandbox-cache"
+    else:
+        cache_dir = Path.cwd() / "tmp" / ".kernel-sandbox-cache"
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _format_age(updated_at_iso):
+    """Formats an ISO timestamp as a short relative age string (ex: '2h ago')."""
+    try:
+        updated_at = datetime.fromisoformat(updated_at_iso)
+    except (TypeError, ValueError):
+        return "unknown age"
+
+    now = datetime.now(timezone.utc)
+    elapsed_seconds = (now - updated_at).total_seconds()
+    if elapsed_seconds < 60:
+        return "just now"
+    if elapsed_seconds < 3600:
+        return f"{int(elapsed_seconds // 60)}m ago"
+    if elapsed_seconds < 86400:
+        return f"{int(elapsed_seconds // 3600)}h ago"
+    return f"{int(elapsed_seconds // 86400)}d ago"
+
+
+def print_cache_listing(cache_dir):
+    """Prints every cached (commit, arch, config) build, boot-readiness, and the exact command to boot it"""
+    entries = discover_cached_builds(cache_dir)
+    if not entries:
+        logger.info(f"No cached builds found under {cache_dir}")
+        return
+
+    for index, entry in enumerate(entries):
+        commit_short = entry.get("commit_hash", "")[:7]
+        status = "ready" if entry["boot_ready"] else "incomplete"
+        print(
+            f"[{index}] {commit_short}  {entry.get('arch')}  {entry.get('config_flavor')}  "
+            f"{entry.get('mode')}  {status}  {_format_age(entry.get('updated_at'))}"
+        )
+        print(
+            f"    ./scripts/kernel-sandbox/kernel-sandbox --commit {commit_short} --arch {entry.get('arch')} "
+            f"--config {entry.get('config_flavor')} --mode {entry.get('mode')} boot"
+        )
+
+
+def parse_sles_version(bugzilla_prod):
+    """Extract SLES target version strings from Bugzilla metadata profiles."""
+    if "16." in bugzilla_prod:
+        match = re.search(r"(16\.\d+)", bugzilla_prod)
+        if match:
+            return match.group(1)
+    elif any(sp in bugzilla_prod for sp in ["15 SP", "12 SP"]):
+        match = re.search(r"(12|15) SP(\d+)", bugzilla_prod)
+        if match:
+            return f"{match.group(1)}-SP{match.group(2)}"
+
+    raise ImageNotFoundError(
+        f"Could not parse a target SLES version from BUGZILLA_PRODUCT '{bugzilla_prod}' in rpm/config.sh"
+    )
+
+
+class SandboxContext:
+    """
+    Maintains the immutable state of the sandbox.
+    Passed between differnt phases.
+    """
+    def __init__(self, args, host_arch=None, cache_dir=None):
+        self.args = args
+        self.host_arch = host_arch
+        self.cache_dir = cache_dir
+        self.workspace = None
+        self.commit_hash = ""
+        self.cow_image = None
+        self.cleanup_needed = getattr(args, "clean_workspace", False)
+        self.repo = Repository(Path.cwd())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Teardown"""
+        if self.cleanup_needed and self.workspace:
+            self.repo.cleanup_worktree(self.workspace)
+
+
+def worktree_lock_path(cache_dir, commit_hash):
+    """Lock path guarding exclusive use of a commit's shared worktree
+    for the lifetime of one kernel-sandbox invocation"""
+    return Path(cache_dir) / "workspaces" / f".{commit_hash}.inuse.lock"
+
+
+def provision_workspace(ctx):
+    # workspace and cache
+    ref = ctx.args.tag or ctx.args.commit or "HEAD"
+
+    ctx.workspace = ctx.repo.create_worktree(ref, ctx.cache_dir)
+    ctx.commit_hash = ctx.repo.resolve_ref(ref)
+    ctx.cleanup_needed = True if getattr(ctx.args, "clean_workspace", False) else False
+
+    scratch_env = os.environ.get("SCRATCH_AREA")
+    if scratch_env:
+        ctx.build_root = Path(scratch_env)
+    else:
+        ctx.build_root = ctx.workspace / "tmp"
+    ctx.build_root.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Workspace: {ctx.workspace}")
+    logger.info(f"Cache directory: {ctx.cache_dir}")
+    logger.info(f"Mode: {ctx.args.mode}")
+
+
+def qcow2_download(arch, cache_dir, bugzilla_prod, jeos_download_map, explicit_qcow2=None):
+    """
+    Handles CoW backing disk for RPM targets.
+    """
+    if explicit_qcow2:
+        if not explicit_qcow2.exists():
+            raise ImageNotFoundError(f"Explicit base image not found at {explicit_qcow2}")
+        logger.info(f"Using explicit base image override: {explicit_qcow2.resolve()}")
+        base_jeos = explicit_qcow2.resolve()
+    else:
+        products_dir = Path("/mounts/dist/ibs/SUSE/Products/")
+
+        target_version = parse_sles_version(bugzilla_prod)
+        mapping_entry = jeos_download_map.get(bugzilla_prod)
+
+        if not mapping_entry:
+            raise ImageNotFoundError(f"No template mapping found for BUGZILLA_PRODUCT '{bugzilla_prod}'")
+
+        finder = ImageFinder(exclude_patterns=EXCLUDE_QCOW2_PATTERNS)
+        fallback_hint = (
+            "You can manually provide a base image to avoid this error using:\n"
+            "        ./scripts/kernel-sandbox/kernel-sandbox --mode rpm --qcow2 /path/to/your-image.qcow2"
+        )
+        base_jeos = finder.find_image(
+            arch=arch,
+            target_version=target_version,
+            cache_dir=cache_dir,
+            local_search_path=products_dir,
+            mapping_entry=mapping_entry,
+            include_filters=["jeos", "minimal-vm"],
+            qcow_match_pattern="kvm",
+            fallback_hint=fallback_hint
+        )
+    return base_jeos
+
+
+class PhaseSkip(Exception):
+    """Exception raised when a phase's prerequisites are not met, requiring a graceful skip."""
+    def __init__(self, reason):
+        self.reason = reason
+
+
+def run_pipeline_phase(phase_name, target_phase, prereq_checker, executor):
+    """
+    Executes a pipeline phase with strict prerequisite validation and clear state logging.
+    """
+    print_phase_header(f"Phase: {phase_name.capitalize()}")
+
+    if target_phase and target_phase not in [phase_name, "all"]:
+        logger.info(f"Phase skipped (CLI execution flag requested '{target_phase}')")
+        return
+
+    try:
+        prereq_checker()
+    except PhaseSkip as skip:
+        if target_phase == phase_name:
+            logger.exception(f"Cannot execute requested phase '{phase_name}': {skip.reason}")
+            sys.exit(1)
+        else:
+            logger.warning(f"Phase skipped: {skip.reason}")
+            return
+    except Exception as e:
+        logger.exception(f"Prerequisite check failed unexpectedly: {str(e)}")
+        sys.exit(1)
+
+    executor()
+
+
+def build_pipeline_context(ctx, config_manager):
+    """
+    Assembles the mode-specific, pipeline context passed to
+    BuildEngine/ImagePreparer/BootEngine.
+    """
+    qemu_profile = config_manager.get_qemu_profile(ctx.args.arch)
+
+    common_fields = dict(
+        workspace=ctx.workspace,
+        build_root=ctx.build_root,
+        cache_dir=ctx.cache_dir,
+        commit_hash=ctx.commit_hash,
+        arch=ctx.args.arch,
+        config_flavor=ctx.args.config,
+        mode=ctx.args.mode,
+        refresh_cache=ctx.args.refresh_cache,
+        use_busybox_initrd=ctx.args.use_busybox_initrd,
+        qemu_bin=qemu_profile["qemu_bin"],
+        extra_qemu=ctx.args.extra_qemu,
+        host_arch=ctx.host_arch,
+        ssh_enabled=ctx.args.ssh,
+        qemu_profile=qemu_profile,
+    )
+
+    arch_profile = config_manager.get_arch_profile(ctx.args.arch)
+
+    if ctx.args.mode == "fast":
+        cc, cross_compile, host_cc = config_manager.get_compiler_env(ctx.args.arch)
+        enable_configs, disable_configs = config_manager.get_kernel_config_patches()
+
+        pipeline_ctx = FastModeContext(
+            **common_fields,
+            kernel_image_name=arch_profile["kernel_image_name"],
+            build_image_name=arch_profile["build_image_name"],
+            linux_arch=arch_profile["linux_arch"],
+            boot_arch=arch_profile["boot_arch"],
+            cross_compile=cross_compile,
+            target_arch_platform=config_manager.get_container_platform(ctx.args.arch),
+            host_arch_platform=config_manager.get_container_platform(ctx.host_arch),
+            container_image=config_manager.get_container_image(),
+            cc=cc,
+            host_cc=host_cc,
+            enable_configs=enable_configs,
+            disable_configs=disable_configs,
+        )
+    else:
+        ibs_api_url, obs_api_url = config_manager.get_osc_api_urls()
+        pipeline_ctx = RpmModeContext(
+            **common_fields,
+            ibs_project=config_manager.parsed_vars.get("IBS_PROJECT"),
+            obs_project=config_manager.parsed_vars.get("OBS_PROJECT"),
+            ibs_api_url=ibs_api_url,
+            obs_api_url=obs_api_url,
+            rpm_arch=arch_profile["rpm_arch"],
+            rpm_build_root=Path(ctx.args.rpm_build_root),
+        )
+        pipeline_ctx.cow_image = (
+            Path(pipeline_ctx.cache_dir)
+            / "base-images"
+            / f"temp-sandbox-g{pipeline_ctx.commit_hash[:7]}-{pipeline_ctx.config_flavor}.{arch_profile['rpm_arch']}.qcow2"
+        )
+
+    logger.info(f"Successfully loaded profile metadata for architecture: {ctx.args.arch}")
+    return pipeline_ctx
+
+
+def run_orchestration_pipeline(ctx):
+    print_phase_header("Phase: Configuration")
+    yaml_config_path = Path(__file__).resolve().parent / "kernel_sandbox_profiles.yaml"
+    config_manager = ConfigManager(yaml_config_path, ctx.workspace)
+    srcversion = config_manager.parsed_vars.get("SRCVERSION")
+    logger.info(f"SRCVERSION: {srcversion}")
+
+    try:
+        pipeline_ctx = build_pipeline_context(ctx, config_manager)
+    except ConfigurationError as e:
+        logger.exception(f"Configuration Missing: {e}")
+        sys.exit(1)
+
+    print_phase_header(
+        "Pipeline execution context",
+        details=[f"{k}: {v}" for k, v in vars(pipeline_ctx).items()]
+    )
+
+    @functools.lru_cache(maxsize=None)
+    def _resolve_base_jeos():
+        return qcow2_download(
+            arch=pipeline_ctx.rpm_arch,
+            cache_dir=pipeline_ctx.cache_dir,
+            bugzilla_prod=config_manager.parsed_vars.get("BUGZILLA_PRODUCT", ""),
+            jeos_download_map=config_manager.yaml_data.get("jeos_download_map", {}),
+            explicit_qcow2=getattr(ctx.args, "qcow2", None)
+        )
+
+    def check_build_prereqs():
+        if pipeline_ctx.mode == "rpm" and target is None:
+            try:
+                _resolve_base_jeos()
+            except ImageNotFoundError as e:
+                raise ImageNotFoundError(
+                    f"{e}\n"
+                    "Refusing to start the RPM build without a resolvable base image. "
+                    "If you only need the compiled RPMs, request the 'build' phase explicitly "
+                    "(... build) instead of running the full pipeline."
+                )
+
+    def execute_build():
+        BuildEngine().execute(pipeline_ctx)
+
+    def check_image_prereqs():
+        pass  # Downloading evaluates during execution to support graceful aborts on network error
+
+    def execute_image():
+        if pipeline_ctx.mode == "rpm":
+            try:
+                Qcow2Manager.create_cow_image(_resolve_base_jeos(), pipeline_ctx.cow_image)
+            except ImageNotFoundError as e:
+                logger.warning(f"Phase aborted: Base image find failed: {e}")
+                logger.warning("The sandbox cannot be provisioned without a base image.")
+                return
+
+        ImagePreparer().execute(pipeline_ctx)
+
+    def check_boot_prereqs():
+        if pipeline_ctx.mode == "rpm" and not getattr(pipeline_ctx, "cow_image", None):
+            raise PhaseSkip("Cannot boot VM: QCOW2 base image is undefined.")
+        if pipeline_ctx.mode == "rpm" and not pipeline_ctx.cow_image.exists():
+            raise PhaseSkip(
+                f"Cannot boot VM: Required QCOW2 base image "
+                f"'{pipeline_ctx.cow_image.name}' is missing. "
+                f"Did the image phase fail?"
+            )
+
+    def execute_boot():
+        BootEngine().execute(pipeline_ctx)
+
+    target = ctx.args.command
+
+    try:
+        run_pipeline_phase("build", target, check_build_prereqs, execute_build)
+        run_pipeline_phase("image", target, check_image_prereqs, execute_image)
+        run_pipeline_phase("boot", target, check_boot_prereqs, execute_boot)
+    except KernelSandboxError as e:
+        logger.exception(f"Pipeline Execution Failed: {e}")
+        sys.exit(1)
+
+
+# setup Trap
+signal.signal(signal.SIGTERM, handle_signals)
+signal.signal(signal.SIGINT, handle_signals)
+parser = argparse.ArgumentParser(
+    description="kernel-sandbox - SUSE Kernel Testing Environment",
+    formatter_class=argparse.RawTextHelpFormatter
+)
+
+host_arch = get_host_arch()
+
+# commit or tag (mutually exclusive)
+git_group = parser.add_mutually_exclusive_group()
+git_group.add_argument(
+    "--tag",
+    metavar="TAG",
+    help="Build and test a specific git tag in isolated worktree"
+)
+git_group.add_argument(
+    "--commit",
+    metavar="HASH",
+    help="Build and test a specific commit in isolated worktree"
+)
+
+parser.add_argument(
+    "--arch",
+    default=host_arch,
+    choices=["x86_64", "arm64", "ppc64le", "s390x"],
+    help=f"Target architecture (default: {host_arch})"
+)
+parser.add_argument(
+    "--config",
+    default="default",
+    help="Configuration target flavor (default: default)"
+)
+parser.add_argument(
+    "--mode",
+    default="fast",
+    choices=["fast", "rpm"],
+    help=(
+        "Execution strategy: 'fast' (direct bzImage boot) or 'rpm' (full package creation and injection) (default: fast).\n\n"
+    )
+)
+initrd_ssh_group = parser.add_mutually_exclusive_group()
+initrd_ssh_group.add_argument(
+    "--use-busybox-initrd",
+    default=False,
+    action="store_true",
+    help=(
+        "Build a lightweight busybox-based initrd instead of Dracut (fast mode default). "
+        "Not allowed with --ssh - there is no sshd in this initrd."
+    )
+)
+parser.add_argument(
+    "--extra-qemu",
+    default="",
+    help="String block of raw arguments passed straight into the native hypervisor execution layer"
+)
+parser.add_argument(
+    "--refresh-cache",
+    action="store_true",
+    help="Force clean build, ignoring any cached RPMs"
+)
+initrd_ssh_group.add_argument(
+    "--ssh",
+    action="store_true",
+    help="Auto-connect via SSH after boot (default in RPM mode). Not allowed with --use-busybox-initrd."
+)
+
+parser.add_argument(
+    "--qcow2",
+    metavar="PATH",
+    type=Path,
+    help=(
+        "Explicitly use this local .qcow2 file as the base image (overrides IBS/OBS resolution)\n\n"
+        "ex: ./scripts/kernel-sandbox/kernel-sandbox --config \"default\" --mode rpm \\\n"
+        "    --qcow2 /mounts/dist/ibs/SUSE/Products/SLE-Product-Minimal/16.1/x86_64/"
+        "SLES-16.1-Minimal-VM.x86_64-kvm-and-xen-010-OpenBeta.qcow2"
+    )
+)
+parser.add_argument(
+    "--rpm-build-root",
+    metavar="PATH",
+    default=DEFAULT_RPM_BUILD_ROOT,
+    help=(
+        f"Build root passed to 'osc build --root=' in --mode rpm (default: {DEFAULT_RPM_BUILD_ROOT}"
+    )
+)
+parser.add_argument(
+    "--clean-workspace",
+    action="store_true",
+    help="Forcefully cleanup the active workspace upon execution completion"
+)
+
+parser.add_argument(
+    "command",
+    nargs="?",
+    choices=["build", "image", "boot", "list-cache"],
+    help=(
+        "Optional phase isolation (build, image, boot). If omitted, runs the full pipeline.\n"
+        "'list-cache' prints every cached build and the exact command to boot it, then exits."
+    )
+)
+
+args = parser.parse_args()
+
+if args.command == "list-cache":
+    print_cache_listing(get_cache_dir())
+    sys.exit(0)
+
+validate_cli_args(args)
+
+try:
+    verify_host_requirements(args)
+except KernelSandboxError as e:
+    logger.exception(str(e))
+    sys.exit(1)
+
+print_phase_header("kernel-sandbox - SUSE Kernel Testing Environment")
+with SandboxContext(args=args, host_arch=host_arch, cache_dir=get_cache_dir()) as ctx:
+    provision_workspace(ctx)
+    try:
+        with file_lock(
+                worktree_lock_path(ctx.cache_dir, ctx.commit_hash),
+                description=f"worktree for commit {ctx.commit_hash[:7]} (build/image/boot)",
+                timeout=0):
+            run_orchestration_pipeline(ctx)
+    except LockTimeoutError as e:
+        logger.exception(
+            f"This commit's worktree is already in use by another kernel-sandbox invocation: {e}")
+        sys.exit(1)
+
+logger.info(f"{Path(sys.argv[0]).name} execution completed")
