@@ -523,6 +523,20 @@ An unresolvable git reference fails with `[ERROR] Could not resolve requested
 git reference: ...`
 - double check the ref exists in the kernel-source repo.
 
+### ctrl+C doesn't stop an in-progress container build
+The containerized `make` step runs podman with `-t` (a pty, for readable/live
+output) but not `-i` (no stdin attached to the container) - this is
+intentional. A side effect is that your keyboard's ctrl+C is never turned into
+a signal at all while that build is running. A real signal sent directly still
+works and triggers a clean teardown (container + worktree cleanup) as
+expected, ex: from another terminal:
+```bash
+kill -INT <kernel-sandbox pid>   # or -TERM
+```
+Switching to `-i` would let ctrl+C work directly at the keyboard, but the
+cleanup path under that combination hasn't been verified yet, so it isn't the
+default today, will revisit later.
+
 ### Reproducing `--mode rpm`'s image-customization step by hand
 If `libs/image_customizer.py`'s `install_rpms_to_image()` (the `virt-customize`
 step that installs your built RPMs into the base qcow2) fails and the wrapped
