@@ -336,11 +336,31 @@ class Cache(object):
              history[commit hash represented as string of 40 characters]
                 index (as described in get_history())
              ,)
+         patch file path
+            (mtime_ns, size, tags)
+            See lib.InputEntry._parse_tags() for the contents of "tags". This
+            entry lets series_sort avoid reopening and reparsing a patch file
+            when it did not change since the last time it was looked at.
+
+            Each patch is stored under its own key, so that a run which only
+            looks up or caches a handful of patches only reads or writes
+            those few keys. series.conf lists tens of thousands of patches;
+            reserializing all of them on every save() previously dominated
+            the running time of any git_sort invocation that changed even
+            one patch's cache entry, since shelve/dbm has no way to know
+            only part of a stored value changed.
+
+            Keyed by absolute path rather than the relative name passed by
+            callers, since mtime/size identify one specific file, and the
+            same logical patch can exist at more than one path with
+            different mtimes (e.g. a worktree copy and the pre-commit
+            hook's persistent checkout-directory copy): collapsing those
+            onto one relative-path key made them invalidate each other's
+            entry on every switch between the two.
 
     The cache is stored using basic types.
     """
-    version = 3
-
+    version = 4
 
     def __init__(self, write_enable=False):
         self.write_enable = write_enable
@@ -411,6 +431,9 @@ class Cache(object):
                 int
             "history"
                 OrderedDict((Head, sha1) : history)
+
+        Individual patch entries are not accessed through this generic
+        interface; see get_patch()/set_patch().
         """
         if self.closed:
             raise ValueError
@@ -472,6 +495,29 @@ class Cache(object):
             raise KeyError
 
 
+    def get_patch(self, path):
+        """
+        Return the (mtime_ns, size, tags) tuple previously stored for the
+        patch file identified by "path" via set_patch(). Raise KeyError if
+        there is none.
+        """
+        if self.closed:
+            raise ValueError
+
+        return self.cache[path]
+
+
+    def set_patch(self, path, value):
+        """
+        Store the (mtime_ns, size, tags) tuple "value" for the patch file
+        identified by "path".
+        """
+        if self.closed or not self.write_enable:
+            raise ValueError
+
+        self.cache[path] = value
+
+
 @functools.total_ordering
 class IndexedCommit(object):
     def __init__(self, head, index):
@@ -512,6 +558,9 @@ class SortIndex(object):
 
     def __init__(self, repo):
         self.repo = repo
+        self.patch_cache = {}
+        self.patch_cache_dirty = set()
+        self._patch_ondisk_cache = None
         needs_rebuild = False
         try:
             with Cache() as cache:
@@ -562,6 +611,8 @@ class SortIndex(object):
         self.version_indexes = None
         self.repo_heads = repo_heads
 
+    def __del__(self):
+        self.save()
 
     def lookup(self, commit):
         for head, log in self.history.items():
@@ -574,6 +625,114 @@ class SortIndex(object):
 
         raise GSKeyError
 
+    def _read_patch_entry(self, path):
+        """
+        Look up the on-disk cache entry for "path", opening a read-only
+        handle to the cache the first time this is called and reusing it
+        for the rest of this SortIndex's lifetime. Entries are fetched one
+        at a time (see Cache.get_patch()) rather than by loading the whole
+        on-disk patch cache up front, since series.conf can list tens of
+        thousands of patches and any single run typically only needs to
+        look up a handful of them.
+        """
+        if self._patch_ondisk_cache is None:
+            try:
+                self._patch_ondisk_cache = Cache()
+            except CException:
+                return None
+
+        try:
+            return self._patch_ondisk_cache.get_patch(path)
+        except (KeyError, CException):
+            return None
+
+
+    def lookup_patch(self, path):
+        """
+        Return the tags previously cached for the patch file at "path" (see
+        lib.InputEntry._parse_tags()), or None if there is no cache entry for
+        it or the file's size or mtime changed since it was cached, meaning
+        the cache entry can no longer be trusted.
+
+        The cache is keyed by os.path.abspath(path), not "path" as given,
+        even though callers generally pass the patch's series.conf-relative
+        name. mtime/size only identify a specific file at a specific
+        location, not a "logical" patch independent of where it is read
+        from: the pre-commit hook reads patches out of a persistent
+        checkout directory distinct from the worktree series_insert/
+        series_sort operate on directly, and those two copies of the same
+        patch, despite having identical content, do not share an mtime.
+        Keying by relative path alone made both locations collide on one
+        cache entry, so every tool invocation that read patches from a
+        different location than the previous one invalidated and
+        overwrote the whole entry -- e.g. running series_insert right
+        before committing would flip every entry to the worktree's mtimes,
+        then the pre-commit hook's series_sort --check would immediately
+        flip them all back, both at the cost of reparsing every patch.
+        Keying by absolute path gives the worktree and the checkout
+        directory independent, stable entries instead.
+        """
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+
+        key = os.path.abspath(path)
+        try:
+            entry = self.patch_cache[key]
+        except KeyError:
+            entry = self._read_patch_entry(key)
+            if entry is None:
+                return None
+            self.patch_cache[key] = entry
+
+        mtime_ns, size, tags = entry
+        if mtime_ns != st.st_mtime_ns or size != st.st_size:
+            return None
+
+        return tags
+
+
+    def cache_patch(self, path, tags):
+        """
+        Remember "tags", as extracted from the patch file at "path", along
+        with the file's current size and mtime, so that a later call to
+        lookup_patch() can skip reopening and reparsing the file, as long as
+        it did not change in the meantime.
+
+        See lookup_patch() for why the cache is keyed by
+        os.path.abspath(path) rather than "path" as given.
+        """
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
+
+        key = os.path.abspath(path)
+        self.patch_cache[key] = (st.st_mtime_ns, st.st_size, tags)
+        self.patch_cache_dirty.add(key)
+
+
+    def save(self):
+        """
+        Persist newly cached patch tags, if any, to disk.
+        """
+        if self._patch_ondisk_cache:
+            self._patch_ondisk_cache.close()
+            self._patch_ondisk_cache = None
+
+        if not self.patch_cache_dirty:
+            return
+
+        try:
+            with Cache(write_enable=True) as cache:
+                for path in self.patch_cache_dirty:
+                    cache.set_patch(path, self.patch_cache[path])
+        except CError as err:
+            print("Error: %s" % (err,), file=sys.stderr)
+            return
+
+        self.patch_cache_dirty = set()
 
     def describe(self, index):
         """
