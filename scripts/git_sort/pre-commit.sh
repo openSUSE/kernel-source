@@ -75,6 +75,10 @@ current_names=$(git cat-file blob :series.conf |
 	"$_libdir"/series_conf --name-only | sort)
 
 if sorted_section_changed || sorted_patches_changed "$current_names"; then
+	if [ -z "$current_names" ]; then
+		exit 0
+	fi
+
 	# series_sort should examine the patches in the index, not the
 	# working tree. Check them out.
 	checkout_dir="$(git rev-parse --git-dir)/git-sort/pre-commit-checkout"
