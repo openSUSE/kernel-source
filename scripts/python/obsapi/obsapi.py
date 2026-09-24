@@ -1,3 +1,4 @@
+from kutil.config import get_kernel_projects, get_package_archs
 import xml.etree.ElementTree as ET
 from obsapi.api import APIError
 from obsapi import api
@@ -288,3 +289,72 @@ class OBSAPI(api.API):
                 remote += 1
         assert len(xml) == len(result) + remote
         return result
+
+    def get_kernel_projects(self, data):
+        projects = get_kernel_projects(data)
+        if self.url == 'https://api.suse.de':
+            return projects['IBS']
+        elif self.url == 'https://api.opensuse.org':
+            return projects['OBS']
+        else:
+            raise APIError('Getting build repositories not supported for %s' % (self.url,))
+
+    def get_project_repo_archs(self, data, limit_packages=None):
+        architectures = get_package_archs(data, limit_packages)
+        projects = self.get_kernel_projects(data)
+        projects_meta = {}
+        for k in projects.keys():
+            p = projects[k]
+            meta = self.project_exists(p)
+            projects_meta[k] = (p, meta.content if meta else meta)
+        results = {}
+        for k in projects_meta.keys():
+            prj = projects_meta[k][0]
+            meta = projects_meta[k][1]
+            if meta:
+                xml = ET.fromstring(meta)
+                assert prj == xml.get('name')
+                # The previous implementation iterates repositories sorted by name
+                # That's fairly arbitrary other than it puts pool before standard
+                # OBS sorts repositories in reverse-alphabetical order, use that to
+                # iterate in the same order as before
+                for r in reversed(list(xml.iter('repository'))):
+                    name = r.get('name')
+                    if not ( name in ['pool', 'standard'] or
+                            # ports repository is only relevant for old style projects
+                            # Newer projects may have such repository bu it's not usable
+                            ( name == 'ports' and not re.compile(r'\b(openSUSE:Factory|ALP|SLFO)\b').search(prj)) or
+                            # livepatch builds for SLE 15 are against maintenance projects
+                            ( re.compile('^SUSE_.*_Update$').match(name) and re.compile('^SUSE:Maintenance:').match(prj))):
+                        continue
+                    archs = []
+                    for a in r.iter('arch'):
+                        a = a.text.strip()
+                        assert '%' not in a  # will need to do macro expansion otherwise
+                        if prj in ['openSUSE:Factory', 'openSUSE.org:openSUSE:Factory'] and a == 'i586': # i586 build disabled in Factory
+                            continue
+                        if a in architectures:
+                            architectures.remove(a)
+                            archs.append(a)
+                    if len(archs) > 0:
+                        if k == '':
+                            k = name
+                        if not results.get(k, None):
+                            results[k] = {}
+                        if not results[k].get(prj, None):
+                            results[k][prj] = {}
+                        results[k][prj][name] = archs
+            else:
+                raise APIError('Could not retrieve metadata for project %s' % (prj,))
+        return results
+
+    def get_repo_archs(self, data):
+        repo_archs = self.get_project_repo_archs(data)
+        result = {}
+        for repo in repo_archs:
+            for upstream_project in repo_archs[repo]:
+                for upstream_repo in repo_archs[repo][upstream_project]:
+                    for a in repo_archs[repo][upstream_project][upstream_repo]:
+                        result.setdefault(repo, []).append(a)
+        return result
+
