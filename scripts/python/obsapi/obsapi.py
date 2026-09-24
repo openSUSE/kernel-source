@@ -347,3 +347,14 @@ class OBSAPI(api.API):
             else:
                 raise APIError('Could not retrieve metadata for project %s' % (prj,))
         return results
+
+    def get_repo_archs(self, data):
+        repo_archs = self.get_project_repo_archs(data)
+        result = {}
+        for repo in repo_archs:
+            for upstream_project in repo_archs[repo]:
+                for upstream_repo in repo_archs[repo][upstream_project]:
+                    for a in repo_archs[repo][upstream_project][upstream_repo]:
+                        result.setdefault(repo, []).append(a)
+        return result
+
