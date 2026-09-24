@@ -1,3 +1,4 @@
+from kutil.config import get_kernel_projects
 import xml.etree.ElementTree as ET
 from obsapi.api import APIError
 from obsapi import api
@@ -288,3 +289,12 @@ class OBSAPI(api.API):
                 remote += 1
         assert len(xml) == len(result) + remote
         return result
+
+    def get_kernel_projects(self, data):
+        projects = get_kernel_projects(data)
+        if self.url == 'https://api.suse.de':
+            return projects['IBS']
+        elif self.url == 'https://api.opensuse.org':
+            return projects['OBS']
+        else:
+            raise APIError('Getting build repositories not supported for %s' % (self.url,))

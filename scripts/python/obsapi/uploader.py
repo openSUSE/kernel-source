@@ -1,4 +1,4 @@
-from kutil.config import get_kernel_projects, get_package_archs, get_source_timestamp, read_source_timestamp, get_kernel_project_package, list_files, list_specs
+from kutil.config import get_package_archs, get_source_timestamp, read_source_timestamp, get_kernel_project_package, list_files, list_specs
 from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership, get_maintainership
 from obsapi.obsapi import OBSAPI, PkgRepo
 import xml.etree.ElementTree as ET
@@ -62,20 +62,11 @@ class UploaderBase:
     def get_qa_repo(self, r):
         return 'QA_' + r if r not in ['standard', 'pool'] else 'QA'
 
-    def get_kernel_projects(self):
-        projects = get_kernel_projects(self.data)
-        if self.obs.url == 'https://api.suse.de':
-            return projects['IBS']
-        elif self.obs.url == 'https://api.opensuse.org':
-            return projects['OBS']
-        else:
-            raise APIError('Getting build repositories not supported for %s' % (self.obs.url,))
-
     def get_project_repo_archs(self, limit_packages=None):
         if hasattr(self, 'repo_archs'):
             return self.repo_archs
         architectures = get_package_archs(self.data, limit_packages)
-        projects = self.get_kernel_projects()
+        projects = self.obs.get_kernel_projects(self.data)
         projects_meta = {}
         for k in projects.keys():
             p = projects[k]
