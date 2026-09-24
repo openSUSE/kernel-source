@@ -1,4 +1,4 @@
-from kutil.config import get_kernel_projects, get_package_archs, get_source_timestamp, read_source_timestamp, get_kernel_project_package, list_files, list_specs
+from kutil.config import get_source_timestamp, read_source_timestamp, get_kernel_project_package, list_files, list_specs
 from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership, get_maintainership
 from obsapi.obsapi import OBSAPI, PkgRepo
 import xml.etree.ElementTree as ET
@@ -62,66 +62,10 @@ class UploaderBase:
     def get_qa_repo(self, r):
         return 'QA_' + r if r not in ['standard', 'pool'] else 'QA'
 
-    def get_kernel_projects(self):
-        projects = get_kernel_projects(self.data)
-        if self.obs.url == 'https://api.suse.de':
-            return projects['IBS']
-        elif self.obs.url == 'https://api.opensuse.org':
-            return projects['OBS']
-        else:
-            raise APIError('Getting build repositories not supported for %s' % (self.obs.url,))
-
     def get_project_repo_archs(self, limit_packages=None):
-        if hasattr(self, 'repo_archs'):
-            return self.repo_archs
-        architectures = get_package_archs(self.data, limit_packages)
-        projects = self.get_kernel_projects()
-        projects_meta = {}
-        for k in projects.keys():
-            p = projects[k]
-            meta = self.obs.project_exists(p)
-            projects_meta[k] = (p, meta.content if meta else meta)
-        results = {}
-        for k in projects_meta.keys():
-            prj = projects_meta[k][0]
-            meta = projects_meta[k][1]
-            if meta:
-                xml = ET.fromstring(meta)
-                assert prj == xml.get('name')
-                # The previous implementation iterates repositories sorted by name
-                # That's fairly arbitrary other than it puts pool before standard
-                # OBS sorts repositories in reverse-alphabetical order, use that to
-                # iterate in the same order as before
-                for r in reversed(list(xml.iter('repository'))):
-                    name = r.get('name')
-                    if not ( name in ['pool', 'standard'] or
-                            # ports repository is only relevant for old style projects
-                            # Newer projects may have such repository bu it's not usable
-                            ( name == 'ports' and not re.compile(r'\b(openSUSE:Factory|ALP|SLFO)\b').search(prj)) or
-                            # livepatch builds for SLE 15 are against maintenance projects
-                            ( re.compile('^SUSE_.*_Update$').match(name) and re.compile('^SUSE:Maintenance:').match(prj))):
-                        continue
-                    archs = []
-                    for a in r.iter('arch'):
-                        a = a.text.strip()
-                        assert '%' not in a  # will need to do macro expansion otherwise
-                        if prj in ['openSUSE:Factory', 'openSUSE.org:openSUSE:Factory'] and a == 'i586': # i586 build disabled in Factory
-                            continue
-                        if a in architectures:
-                            architectures.remove(a)
-                            archs.append(a)
-                    if len(archs) > 0:
-                        if k == '':
-                            k = name
-                        if not results.get(k, None):
-                            results[k] = {}
-                        if not results[k].get(prj, None):
-                            results[k][prj] = {}
-                        results[k][prj][name] = archs
-            else:
-                raise APIError('Could not retrieve metadata for project %s' % (prj,))
-        self.repo_archs = results
-        return results
+        if not hasattr(self, 'repo_archs'):
+            self.repo_archs = self.obs.get_project_repo_archs(self.data, limit_packages)
+        return self.repo_archs
 
     def prjmeta(self, limit_packages=None, rebuild=False, debuginfo=False, maintainers=[]):
         repo_archs = self.get_project_repo_archs(limit_packages)
