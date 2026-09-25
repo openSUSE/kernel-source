@@ -1,0 +1,135 @@
+From: Mike Lothian <mike@fireburn.co.uk>
+Date: Sat, 12 Sep 2026 00:29:08 +0100
+Subject: [PATCH] drm/amdgpu: hold a runtime PM reference for P2P dma-buf
+ attachments
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1012628
+Patch-mainline: 7.2.8
+Git-commit: 636139603b99d2e3a18a46cf3f8d39313ce8042e
+
+commit 636139603b99d2e3a18a46cf3f8d39313ce8042e upstream.
+
+amdgpu_dma_buf_map() adds VRAM to the allowed domains for a peer2peer
+attachment.  GTT is only a fallback placement when VRAM is preferred, so
+ttm_bo_validate() migrates the buffer from GTT into VRAM.  While the
+exporting device is runtime suspended its SDMA rings are down and the
+move fails:
+
+  amdgpu: Move buffer fallback to memcpy unavailable
+
+An importer on a second GPU reaches this holding no runtime PM
+reference on the exporter, e.g. a compositor on the APU submitting a
+frame that references a buffer exported by an idle dGPU:
+
+  amdgpu_cs_ioctl -> amdgpu_cs_parser_bos -> amdgpu_cs_bo_validate
+    -> ttm_bo_validate -> amdgpu_bo_move -> dma_buf_map_attachment
+      -> amdgpu_dma_buf_map -> ttm_bo_validate -> amdgpu_bo_move
+
+Pinning a dma-buf into VRAM has the same requirement, which
+commit 030631e97b20 ("drm/amdgpu: revert "take runtime pm reference
+when we attach a buffer" v2") called out as the one case that would
+need the reference back.
+
+Take it in attach and drop it in detach.  pm_runtime_get_if_active()
+never resumes the device, so it cannot deadlock against the reservation
+taken during resume, which is why the old pm_runtime_get_sync() had to
+go.  If the device is not active, clear peer2peer instead: the buffer
+then stays in GTT, which remains accessible while the GPU is powered
+down.  If runtime PM is disabled, take a plain reference so the put in
+detach stays balanced.
+
+Fixes: 030631e97b20 ("drm/amdgpu: revert "take runtime pm reference when we attach a buffer" v2")
+Suggested-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Mike Lothian <mike@fireburn.co.uk>
+Assisted-by: Claude:Opus-5 [Claude Code]
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 062ff15e30a48d14fb7d7558eba84f8dc97197f0)
+Cc: stable@vger.kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c | 43 ++++++++++++++++++++-
+ 1 file changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+index b33c300e26e2..9adf3eed8822 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+@@ -43,6 +43,7 @@
+ #include <linux/dma-buf.h>
+ #include <linux/dma-fence-array.h>
+ #include <linux/pci-p2pdma.h>
++#include <linux/pm_runtime.h>
+ 
+ static const struct dma_buf_attach_ops amdgpu_dma_buf_attach_ops;
+ 
+@@ -100,15 +101,54 @@ static int amdgpu_dma_buf_attach(struct dma_buf *dmabuf,
+ 	    pci_p2pdma_distance(adev->pdev, attach->dev, false) < 0)
+ 		attach->peer2peer = false;
+ 
++	/*
++	 * Only allow P2P while the exporter is active, and keep it active
++	 * until detach.  With runtime PM disabled take a plain reference so
++	 * the put in detach stays balanced.
++	 */
++	if (attach->peer2peer) {
++		struct device *dev = adev_to_drm(adev)->dev;
++		int ret = pm_runtime_get_if_active(dev);
++
++		if (!ret)
++			attach->peer2peer = false;
++		else if (ret < 0)
++			pm_runtime_get_noresume(dev);
++	}
++
+ 	r = dma_resv_lock(bo->tbo.base.resv, NULL);
+ 	if (r)
+-		return r;
++		goto err_pm_put;
+ 
+ 	amdgpu_vm_bo_update_shared(bo);
+ 
+ 	dma_resv_unlock(bo->tbo.base.resv);
+ 
+ 	return 0;
++
++err_pm_put:
++	if (attach->peer2peer)
++		pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
++	return r;
++}
++
++/**
++ * amdgpu_dma_buf_detach - &dma_buf_ops.detach implementation
++ *
++ * @dmabuf: DMA-buf where we remove the attachment from
++ * @attach: the attachment to remove
++ *
++ * Drop the runtime PM reference taken in amdgpu_dma_buf_attach().
++ */
++static void amdgpu_dma_buf_detach(struct dma_buf *dmabuf,
++				  struct dma_buf_attachment *attach)
++{
++	struct drm_gem_object *obj = dmabuf->priv;
++	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
++	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
++
++	if (attach->peer2peer)
++		pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
+ }
+ 
+ /**
+@@ -350,6 +390,7 @@ static void amdgpu_dma_buf_vunmap(struct dma_buf *dma_buf, struct iosys_map *map
+ 
+ const struct dma_buf_ops amdgpu_dmabuf_ops = {
+ 	.attach = amdgpu_dma_buf_attach,
++	.detach = amdgpu_dma_buf_detach,
+ 	.pin = amdgpu_dma_buf_pin,
+ 	.unpin = amdgpu_dma_buf_unpin,
+ 	.map_dma_buf = amdgpu_dma_buf_map,
+-- 
+2.55.0
+

@@ -1,0 +1,193 @@
+From: Weiming Shi <bestswngs@gmail.com>
+Date: Sun, 6 Sep 2026 23:43:32 +0800
+Subject: [PATCH] Bluetooth: coredump: Quiesce dump work on unregister
+References: bsc#1012628
+Patch-mainline: 7.2.8
+Git-commit: d236517c264e41dc09833c708ef23bccb7a91219
+
+[ Upstream commit d236517c264e41dc09833c708ef23bccb7a91219 ]
+
+hci_devcd_handle_pkt_init() arms dump_timeout and coredump producers
+queue dump_rx without holding an hdev reference. Unregister leaves both
+works live, so disconnecting during an active dump lets them access hdev
+after hci_release_dev() frees it.
+
+Shut down coredump processing during unregister. Close the producer gate
+under dump_q.lock before disabling both works, then free the active buffer
+and queued packets under hci_dev_lock. Serializing the gate with enqueue
+prevents controller-specific workers from adding packets after the final
+purge.
+
+Fixes: 9695ef876fd1 ("Bluetooth: Add support for hci devcoredump")
+Reported-by: syzbot+b170dbf55520ebf5969a@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=b170dbf55520ebf5969a
+Reported-by: Aby Sam Ross <abysamross@gmail.com>
+Link: https://lore.kernel.org/r/20260322210849.68743-1-abysamross@gmail.com
+Suggested-by: Aby Sam Ross <abysamross@gmail.com>
+Reported-by: Tristan Madani <tristan@talencesecurity.com>
+Link: https://lore.kernel.org/r/20260814231248.3096377-1-tristmd@gmail.com
+Reported-by: Xiang Mei <xmei5@asu.edu>
+Assisted-by: OpenAI Codex:gpt-5
+Signed-off-by: Weiming Shi <bestswngs@gmail.com>
+Reported-by: Xiang Mei <xmei5@asu.edu>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ include/net/bluetooth/coredump.h |  2 +
+ net/bluetooth/coredump.c         | 65 +++++++++++++++++++++-----------
+ net/bluetooth/hci_core.c         |  1 +
+ 3 files changed, 47 insertions(+), 21 deletions(-)
+
+diff --git a/include/net/bluetooth/coredump.h b/include/net/bluetooth/coredump.h
+index 72f51b587a04..00c12c7ac042 100644
+--- a/include/net/bluetooth/coredump.h
++++ b/include/net/bluetooth/coredump.h
+@@ -61,6 +61,7 @@ struct hci_devcoredump {
+ #ifdef CONFIG_DEV_COREDUMP
+ 
+ void hci_devcd_reset(struct hci_dev *hdev);
++void hci_devcd_shutdown(struct hci_dev *hdev);
+ void hci_devcd_rx(struct work_struct *work);
+ void hci_devcd_timeout(struct work_struct *work);
+ 
+@@ -75,6 +76,7 @@ int hci_devcd_abort(struct hci_dev *hdev);
+ #else
+ 
+ static inline void hci_devcd_reset(struct hci_dev *hdev) {}
++static inline void hci_devcd_shutdown(struct hci_dev *hdev) {}
+ static inline void hci_devcd_rx(struct work_struct *work) {}
+ static inline void hci_devcd_timeout(struct work_struct *work) {}
+ 
+diff --git a/net/bluetooth/coredump.c b/net/bluetooth/coredump.c
+index 720cb79adf96..b15971ad78a8 100644
+--- a/net/bluetooth/coredump.c
++++ b/net/bluetooth/coredump.c
+@@ -105,6 +105,22 @@ static void hci_devcd_free(struct hci_dev *hdev)
+ 	hci_devcd_reset(hdev);
+ }
+ 
++void hci_devcd_shutdown(struct hci_dev *hdev)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&hdev->dump.dump_q.lock, flags);
++	hdev->dump.supported = false;
++	spin_unlock_irqrestore(&hdev->dump.dump_q.lock, flags);
++
++	disable_work_sync(&hdev->dump.dump_rx);
++	disable_delayed_work_sync(&hdev->dump.dump_timeout);
++
++	hci_dev_lock(hdev);
++	hci_devcd_free(hdev);
++	hci_dev_unlock(hdev);
++}
++
+ /* Call with hci_dev_lock only. */
+ static int hci_devcd_alloc(struct hci_dev *hdev, u32 size)
+ {
+@@ -444,7 +460,29 @@ EXPORT_SYMBOL(hci_devcd_register);
+ 
+ static inline bool hci_devcd_enabled(struct hci_dev *hdev)
+ {
+-	return hdev->dump.supported;
++	return READ_ONCE(hdev->dump.supported);
++}
++
++static int hci_devcd_queue(struct hci_dev *hdev, struct sk_buff *skb)
++{
++	unsigned long flags;
++	int err = 0;
++
++	spin_lock_irqsave(&hdev->dump.dump_q.lock, flags);
++	if (!hdev->dump.supported)
++		err = -EOPNOTSUPP;
++	else
++		__skb_queue_tail(&hdev->dump.dump_q, skb);
++	spin_unlock_irqrestore(&hdev->dump.dump_q.lock, flags);
++
++	if (err) {
++		kfree_skb(skb);
++		return err;
++	}
++
++	queue_work(hdev->workqueue, &hdev->dump.dump_rx);
++
++	return 0;
+ }
+ 
+ int hci_devcd_init(struct hci_dev *hdev, u32 dump_size)
+@@ -461,10 +499,7 @@ int hci_devcd_init(struct hci_dev *hdev, u32 dump_size)
+ 	hci_dmp_cb(skb)->pkt_type = HCI_DEVCOREDUMP_PKT_INIT;
+ 	put_unaligned_le32(dump_size, skb_put(skb, 4));
+ 
+-	skb_queue_tail(&hdev->dump.dump_q, skb);
+-	queue_work(hdev->workqueue, &hdev->dump.dump_rx);
+-
+-	return 0;
++	return hci_devcd_queue(hdev, skb);
+ }
+ EXPORT_SYMBOL(hci_devcd_init);
+ 
+@@ -480,10 +515,7 @@ int hci_devcd_append(struct hci_dev *hdev, struct sk_buff *skb)
+ 
+ 	hci_dmp_cb(skb)->pkt_type = HCI_DEVCOREDUMP_PKT_SKB;
+ 
+-	skb_queue_tail(&hdev->dump.dump_q, skb);
+-	queue_work(hdev->workqueue, &hdev->dump.dump_rx);
+-
+-	return 0;
++	return hci_devcd_queue(hdev, skb);
+ }
+ EXPORT_SYMBOL(hci_devcd_append);
+ 
+@@ -505,10 +537,7 @@ int hci_devcd_append_pattern(struct hci_dev *hdev, u8 pattern, u32 len)
+ 	hci_dmp_cb(skb)->pkt_type = HCI_DEVCOREDUMP_PKT_PATTERN;
+ 	skb_put_data(skb, &p, sizeof(p));
+ 
+-	skb_queue_tail(&hdev->dump.dump_q, skb);
+-	queue_work(hdev->workqueue, &hdev->dump.dump_rx);
+-
+-	return 0;
++	return hci_devcd_queue(hdev, skb);
+ }
+ EXPORT_SYMBOL(hci_devcd_append_pattern);
+ 
+@@ -525,10 +554,7 @@ int hci_devcd_complete(struct hci_dev *hdev)
+ 
+ 	hci_dmp_cb(skb)->pkt_type = HCI_DEVCOREDUMP_PKT_COMPLETE;
+ 
+-	skb_queue_tail(&hdev->dump.dump_q, skb);
+-	queue_work(hdev->workqueue, &hdev->dump.dump_rx);
+-
+-	return 0;
++	return hci_devcd_queue(hdev, skb);
+ }
+ EXPORT_SYMBOL(hci_devcd_complete);
+ 
+@@ -545,9 +571,6 @@ int hci_devcd_abort(struct hci_dev *hdev)
+ 
+ 	hci_dmp_cb(skb)->pkt_type = HCI_DEVCOREDUMP_PKT_ABORT;
+ 
+-	skb_queue_tail(&hdev->dump.dump_q, skb);
+-	queue_work(hdev->workqueue, &hdev->dump.dump_rx);
+-
+-	return 0;
++	return hci_devcd_queue(hdev, skb);
+ }
+ EXPORT_SYMBOL(hci_devcd_abort);
+diff --git a/net/bluetooth/hci_core.c b/net/bluetooth/hci_core.c
+index 86a9677ed702..3ea5ea7267d9 100644
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@ -2670,6 +2670,7 @@ void hci_unregister_dev(struct hci_dev *hdev)
+ 	disable_work_sync(&hdev->error_reset);
+ 	disable_delayed_work_sync(&hdev->cmd_timer);
+ 	disable_delayed_work_sync(&hdev->ncmd_timer);
++	hci_devcd_shutdown(hdev);
+ 
+ 	hci_cmd_sync_clear(hdev);
+ 
+-- 
+2.55.0
+

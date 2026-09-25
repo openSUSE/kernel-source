@@ -1,0 +1,561 @@
+From: Namjae Jeon <linkinjeon@kernel.org>
+Date: Thu, 3 Sep 2026 14:06:02 +0900
+Subject: [PATCH] ksmbd: follow SMB2 session expiration semantics
+References: bsc#1012628
+Patch-mainline: 7.2.8
+Git-commit: d7fd1f98607f2cd358e583f9548bdf0173090a86
+
+[ Upstream commit d7fd1f98607f2cd358e583f9548bdf0173090a86 ]
+
+ksmbd_session_register() destroys valid sessions after ten seconds of
+inactivity whenever a client starts another SessionSetup exchange. This
+confuses Session.IdleTime with Session.ExpirationTime. Windows can create
+additional authenticated sessions on an existing connection, so deleting
+the older session invalidates its tree connects and makes mapped drives
+fail with STATUS_NETWORK_NAME_DELETED.
+
+The session expiration rules require the server to change a valid session
+to expired only after its credential expiration time passes. A valid or
+expired session otherwise keeps its connection from being scavenged.
+Connections that have not negotiated a dialect, have no sessions, or have
+only InProgress sessions are disconnected after an implementation-specific
+timeout. Use the Windows-compatible 45 second value and run the expiration
+check periodically for both TCP and SMB Direct.
+
+Keep zero as an infinite credential expiration time, and count each
+Valid-to-Expired transition. Set expired sessions to InProgress when they
+reauthenticate. If authentication fails, remove the session from the
+global and per-connection tables immediately, including SMB3 multichannel
+connections.
+
+Retain protection against abandoned SessionId-zero exchanges by allowing
+only one InProgress authentication per connection. Additional exchanges
+fail with STATUS_INSUFFICIENT_RESOURCES, and stale InProgress sessions are
+reaped after the same 45 second setup timeout. This bounds the original
+unauthenticated memory-exhaustion path without evicting established
+sessions.
+
+Fixes: ea174a918939 ("ksmbd: destroy expired sessions")
+Reported-by: Mobin Aydinfar <mobin@mobintestserver.ir>
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/smb/server/connection.c        |  72 +++++++++++++++++
+ fs/smb/server/connection.h        |   3 +
+ fs/smb/server/mgmt/user_session.c | 124 ++++++++++++++++++++++++++++--
+ fs/smb/server/mgmt/user_session.h |   8 +-
+ fs/smb/server/proc.c              |   2 +
+ fs/smb/server/server.c            |   2 +-
+ fs/smb/server/smb2pdu.c           |  37 ++++++---
+ fs/smb/server/smb2pdu.h           |   2 -
+ fs/smb/server/stats.h             |   1 +
+ 9 files changed, 227 insertions(+), 24 deletions(-)
+
+diff --git a/fs/smb/server/connection.c b/fs/smb/server/connection.c
+index cef279b8fd27..4f042a8a2fdb 100644
+--- a/fs/smb/server/connection.c
++++ b/fs/smb/server/connection.c
+@@ -22,6 +22,8 @@
+ static DEFINE_MUTEX(init_lock);
+ 
+ static struct ksmbd_conn_ops default_conn_ops;
++static struct delayed_work session_expiration_work;
++static bool stopping_session_expiration_work;
+ 
+ DEFINE_HASHTABLE(conn_list, CONN_HASH_BITS);
+ DECLARE_RWSEM(conn_list_lock);
+@@ -84,18 +86,28 @@ static void delete_proc_clients(void) {}
+ 
+ static struct workqueue_struct *ksmbd_conn_wq;
+ 
++static void ksmbd_session_expiration_worker(struct work_struct *work);
++
+ int ksmbd_conn_wq_init(void)
+ {
+ 	ksmbd_conn_wq = alloc_workqueue("ksmbd-conn-release",
+ 					WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+ 	if (!ksmbd_conn_wq)
+ 		return -ENOMEM;
++
++	WRITE_ONCE(stopping_session_expiration_work, false);
++	INIT_DELAYED_WORK(&session_expiration_work,
++			  ksmbd_session_expiration_worker);
++	queue_delayed_work(ksmbd_conn_wq, &session_expiration_work,
++			   KSMBD_SESSION_EXPIRATION_INTERVAL);
+ 	return 0;
+ }
+ 
+ void ksmbd_conn_wq_destroy(void)
+ {
+ 	if (ksmbd_conn_wq) {
++		WRITE_ONCE(stopping_session_expiration_work, true);
++		cancel_delayed_work_sync(&session_expiration_work);
+ 		destroy_workqueue(ksmbd_conn_wq);
+ 		ksmbd_conn_wq = NULL;
+ 	}
+@@ -205,6 +217,7 @@ struct ksmbd_conn *ksmbd_conn_alloc(void)
+ 		return NULL;
+ 
+ 	conn->need_neg = true;
++	conn->creation_time = jiffies;
+ 	ksmbd_conn_set_new(conn);
+ 	conn->local_nls = load_nls("utf8");
+ 	if (!conn->local_nls)
+@@ -487,6 +500,20 @@ bool ksmbd_conn_alive(struct ksmbd_conn *conn)
+ 	if (kthread_should_stop())
+ 		return false;
+ 
++	/*
++	 * Stale connections that have not completed NEGOTIATE and SESSION_SETUP
++	 * must be disconnected. Do not race a request that is currently
++	 * completing authentication.
++	 */
++	if (!atomic_read(&conn->req_running) &&
++	    time_after(jiffies, conn->creation_time +
++		       KSMBD_UNAUTHENTICATED_CONN_TIMEOUT) &&
++	    (READ_ONCE(conn->need_neg) ||
++	     !ksmbd_conn_has_valid_or_expired_session(conn))) {
++		ksmbd_debug(CONN, "Connection setup timed out\n");
++		return false;
++	}
++
+ 	if (atomic_read(&conn->stats.open_files_count) > 0)
+ 		return true;
+ 
+@@ -504,6 +531,51 @@ bool ksmbd_conn_alive(struct ksmbd_conn *conn)
+ 	return true;
+ }
+ 
++static void ksmbd_session_expiration_worker(struct work_struct *work)
++{
++	struct ksmbd_conn *conn, *target;
++	int bkt;
++
++	if (!ksmbd_server_running())
++		goto reschedule;
++
++	ksmbd_expire_sessions();
++
++	/*
++	 * An old connection without a Valid or Expired session must be
++	 * disconnected. Process one connection at a time without holding
++	 * conn_list_lock across transport shutdown.
++	 */
++again:
++	target = NULL;
++	down_read(&conn_list_lock);
++	hash_for_each(conn_list, bkt, conn, hlist) {
++		if (ksmbd_conn_exiting(conn) || ksmbd_conn_releasing(conn) ||
++		    atomic_read(&conn->req_running) ||
++		    time_before_eq(jiffies, conn->creation_time +
++				   KSMBD_UNAUTHENTICATED_CONN_TIMEOUT) ||
++		    (!READ_ONCE(conn->need_neg) &&
++		     ksmbd_conn_has_valid_or_expired_session(conn)))
++			continue;
++
++		target = ksmbd_conn_get(conn);
++		break;
++	}
++	up_read(&conn_list_lock);
++
++	if (target) {
++		ksmbd_debug(CONN, "Connection setup timed out\n");
++		ksmbd_conn_abort(target);
++		ksmbd_conn_put(target);
++		goto again;
++	}
++
++reschedule:
++	if (!READ_ONCE(stopping_session_expiration_work))
++		queue_delayed_work(ksmbd_conn_wq, &session_expiration_work,
++				   KSMBD_SESSION_EXPIRATION_INTERVAL);
++}
++
+ /* "+2" for BCC field (ByteCount, 2 bytes) */
+ #define SMB1_MIN_SUPPORTED_PDU_SIZE (sizeof(struct smb_hdr) + 2)
+ #define SMB2_MIN_SUPPORTED_PDU_SIZE (sizeof(struct smb2_pdu))
+diff --git a/fs/smb/server/connection.h b/fs/smb/server/connection.h
+index 242a9757eb0d..909f73c6e3c1 100644
+--- a/fs/smb/server/connection.h
++++ b/fs/smb/server/connection.h
+@@ -67,6 +67,7 @@ struct ksmbd_conn {
+ 	struct rw_semaphore		session_lock;
+ 	/* smb session 1 per user */
+ 	struct xarray			sessions;
++	unsigned long			creation_time;
+ 	unsigned long			last_active;
+ 	/* How many request are running currently */
+ 	atomic_t			req_running;
+@@ -160,6 +161,8 @@ struct ksmbd_transport {
+ 
+ #define KSMBD_TCP_RECV_TIMEOUT	(7 * HZ)
+ #define KSMBD_TCP_SEND_TIMEOUT	(5 * HZ)
++#define KSMBD_SESSION_EXPIRATION_INTERVAL	(5 * HZ)
++#define KSMBD_UNAUTHENTICATED_CONN_TIMEOUT	(45 * HZ)
+ #define KSMBD_TCP_PEER_SOCKADDR(c)	((struct sockaddr *)&((c)->peer_addr))
+ 
+ #define CONN_HASH_BITS	12
+diff --git a/fs/smb/server/mgmt/user_session.c b/fs/smb/server/mgmt/user_session.c
+index 37ebfc914b6d..c3c0557dcc19 100644
+--- a/fs/smb/server/mgmt/user_session.c
++++ b/fs/smb/server/mgmt/user_session.c
+@@ -22,6 +22,7 @@
+ static DEFINE_IDA(session_ida);
+ 
+ #define SESSION_HASH_BITS		12
++#define KSMBD_MAX_PENDING_SESSIONS	1
+ static DEFINE_HASHTABLE(sessions_table, SESSION_HASH_BITS);
+ static DECLARE_RWSEM(sessions_table_lock);
+ 
+@@ -401,26 +402,31 @@ struct ksmbd_session *__session_lookup(unsigned long long id)
+ 	return NULL;
+ }
+ 
+-static void ksmbd_expire_session(struct ksmbd_conn *conn)
++static bool ksmbd_too_many_session_setups(struct ksmbd_conn *conn)
+ {
+ 	unsigned long id;
+ 	struct ksmbd_session *sess;
++	unsigned int pending = 0;
+ 
+ 	down_write(&sessions_table_lock);
+ 	down_write(&conn->session_lock);
+ 	xa_for_each(&conn->sessions, id, sess) {
++		if (READ_ONCE(sess->state) != SMB2_SESSION_IN_PROGRESS)
++			continue;
++
+ 		if (atomic_read(&sess->refcnt) <= 1 &&
+-		    (sess->state != SMB2_SESSION_VALID ||
+-		     time_after(jiffies,
+-			       sess->last_active + SMB2_SESSION_TIMEOUT))) {
++		    time_after(jiffies, sess->last_active +
++			       KSMBD_UNAUTHENTICATED_CONN_TIMEOUT)) {
+ 			xa_erase(&conn->sessions, sess->id);
+ 			ksmbd_session_remove_from_table(sess);
+ 			ksmbd_session_destroy(sess);
+ 			continue;
+ 		}
++		pending++;
+ 	}
+ 	up_write(&conn->session_lock);
+ 	up_write(&sessions_table_lock);
++	return pending >= KSMBD_MAX_PENDING_SESSIONS;
+ }
+ 
+ int ksmbd_session_register(struct ksmbd_conn *conn,
+@@ -430,9 +436,12 @@ int ksmbd_session_register(struct ksmbd_conn *conn,
+ 
+ 	sess->dialect = conn->dialect;
+ 	memcpy(sess->ClientGUID, conn->ClientGUID, SMB2_CLIENT_GUID_SIZE);
+-	ksmbd_expire_session(conn);
+-	ret = xa_err(xa_store(&conn->sessions, sess->id, sess,
+-			      KSMBD_DEFAULT_GFP));
++	/* Bound abandoned SessionId-zero authentication exchanges. */
++	if (ksmbd_too_many_session_setups(conn))
++		ret = -ENOSPC;
++	else
++		ret = xa_err(xa_store(&conn->sessions, sess->id, sess,
++				      KSMBD_DEFAULT_GFP));
+ 	if (ret) {
+ 		down_write(&sessions_table_lock);
+ 		ksmbd_session_remove_from_table(sess);
+@@ -443,6 +452,105 @@ int ksmbd_session_register(struct ksmbd_conn *conn,
+ 	return ret;
+ }
+ 
++void ksmbd_session_unregister(struct ksmbd_conn *conn,
++			      struct ksmbd_session *sess)
++{
++	struct ksmbd_conn *session_conns[KSMBD_MAX_CHANNELS];
++	struct channel *chann;
++	unsigned long index;
++	unsigned int nr_conns = 0, i;
++	bool removed = false;
++
++	down_write(&sessions_table_lock);
++	if (!hlist_unhashed(&sess->hlist)) {
++		/* Keep each channel connection stable under sessions_table_lock. */
++		down_read(&sess->chann_lock);
++		xa_for_each(&sess->ksmbd_chann_list, index, chann) {
++			if (nr_conns == ARRAY_SIZE(session_conns))
++				break;
++			session_conns[nr_conns++] = chann->conn;
++		}
++		up_read(&sess->chann_lock);
++
++		ksmbd_session_remove_from_table(sess);
++		removed = true;
++	}
++
++	down_write(&conn->session_lock);
++	if (xa_load(&conn->sessions, sess->id) == sess)
++		xa_erase(&conn->sessions, sess->id);
++	up_write(&conn->session_lock);
++	for (i = 0; i < nr_conns; i++) {
++		if (session_conns[i] == conn)
++			continue;
++		down_write(&session_conns[i]->session_lock);
++		if (xa_load(&session_conns[i]->sessions, sess->id) == sess)
++			xa_erase(&session_conns[i]->sessions, sess->id);
++		up_write(&session_conns[i]->session_lock);
++	}
++	up_write(&sessions_table_lock);
++
++	if (removed)
++		ksmbd_user_session_put(sess);
++}
++
++bool ksmbd_conn_has_valid_or_expired_session(struct ksmbd_conn *conn)
++{
++	struct ksmbd_session *sess;
++	unsigned long id;
++	int state, bkt;
++	bool found = false;
++
++	down_read(&conn->session_lock);
++	xa_for_each(&conn->sessions, id, sess) {
++		state = READ_ONCE(sess->state);
++		if (state == SMB2_SESSION_VALID ||
++		    state == SMB2_SESSION_EXPIRED) {
++			found = true;
++			break;
++		}
++	}
++	up_read(&conn->session_lock);
++	if (found)
++		return true;
++
++	/* A session bound through SMB3 multichannel is not in conn->sessions. */
++	down_read(&sessions_table_lock);
++	hash_for_each(sessions_table, bkt, sess, hlist) {
++		state = READ_ONCE(sess->state);
++		if (state != SMB2_SESSION_VALID &&
++		    state != SMB2_SESSION_EXPIRED)
++			continue;
++
++		down_read(&sess->chann_lock);
++		found = xa_load(&sess->ksmbd_chann_list, (long)conn);
++		up_read(&sess->chann_lock);
++		if (found)
++			break;
++	}
++	up_read(&sessions_table_lock);
++	return found;
++}
++
++void ksmbd_expire_sessions(void)
++{
++	struct ksmbd_session *sess;
++	u64 now = ktime_get_real_seconds();
++	int bkt;
++
++	down_read(&sessions_table_lock);
++	hash_for_each(sessions_table, bkt, sess, hlist) {
++		if (READ_ONCE(sess->state) != SMB2_SESSION_VALID ||
++		    !sess->kerberos_expiry || now < sess->kerberos_expiry)
++			continue;
++
++		if (cmpxchg(&sess->state, SMB2_SESSION_VALID,
++			    SMB2_SESSION_EXPIRED) == SMB2_SESSION_VALID)
++			ksmbd_counter_inc(KSMBD_COUNTER_SESSION_TIMEOUTS);
++	}
++	up_read(&sessions_table_lock);
++}
++
+ static int ksmbd_chann_del(struct ksmbd_conn *conn, struct ksmbd_session *sess)
+ {
+ 	struct channel *chann;
+@@ -457,7 +565,7 @@ static int ksmbd_chann_del(struct ksmbd_conn *conn, struct ksmbd_session *sess)
+ 	return 0;
+ }
+ 
+-void ksmbd_sessions_deregister(struct ksmbd_conn *conn)
++void ksmbd_conn_sessions_cleanup(struct ksmbd_conn *conn)
+ {
+ 	struct ksmbd_session *sess;
+ 	unsigned long id;
+diff --git a/fs/smb/server/mgmt/user_session.h b/fs/smb/server/mgmt/user_session.h
+index 3e52d4cc1324..217258551d6d 100644
+--- a/fs/smb/server/mgmt/user_session.h
++++ b/fs/smb/server/mgmt/user_session.h
+@@ -72,6 +72,8 @@ struct ksmbd_session {
+ 	struct rw_semaphore		rpc_lock;
+ };
+ 
++#define KSMBD_MAX_CHANNELS	32
++
+ static inline int test_session_flag(struct ksmbd_session *sess, int bit)
+ {
+ 	return sess->flags & bit;
+@@ -98,7 +100,11 @@ bool is_ksmbd_session_in_connection(struct ksmbd_conn *conn,
+ 				     unsigned long long id);
+ int ksmbd_session_register(struct ksmbd_conn *conn,
+ 			   struct ksmbd_session *sess);
+-void ksmbd_sessions_deregister(struct ksmbd_conn *conn);
++void ksmbd_session_unregister(struct ksmbd_conn *conn,
++			      struct ksmbd_session *sess);
++void ksmbd_conn_sessions_cleanup(struct ksmbd_conn *conn);
++bool ksmbd_conn_has_valid_or_expired_session(struct ksmbd_conn *conn);
++void ksmbd_expire_sessions(void);
+ struct ksmbd_session *__session_lookup(unsigned long long id);
+ struct ksmbd_session *ksmbd_session_lookup_all(struct ksmbd_conn *conn,
+ 					       unsigned long long id);
+diff --git a/fs/smb/server/proc.c b/fs/smb/server/proc.c
+index 826353ed0553..19f0f2cfbf54 100644
+--- a/fs/smb/server/proc.c
++++ b/fs/smb/server/proc.c
+@@ -178,6 +178,8 @@ static int proc_show_ksmbd_stats(struct seq_file *m, void *v)
+ 	proc_show_runtime_totals(m);
+ 	seq_printf(m, "sessions:\t%lld\n",
+ 		   ksmbd_counter_sum(KSMBD_COUNTER_SESSIONS));
++	seq_printf(m, "session_timeouts:\t%lld\n",
++		   ksmbd_counter_sum(KSMBD_COUNTER_SESSION_TIMEOUTS));
+ 	seq_printf(m, "tree_connects:\t%lld\n",
+ 		   ksmbd_counter_sum(KSMBD_COUNTER_TREE_CONNS));
+ 	seq_printf(m, "requests:\t%lld\n",
+diff --git a/fs/smb/server/server.c b/fs/smb/server/server.c
+index 26c424e6682e..e113b23d96f9 100644
+--- a/fs/smb/server/server.c
++++ b/fs/smb/server/server.c
+@@ -403,7 +403,7 @@ static int ksmbd_server_process_request(struct ksmbd_conn *conn)
+ 
+ static int ksmbd_server_terminate_conn(struct ksmbd_conn *conn)
+ {
+-	ksmbd_sessions_deregister(conn);
++	ksmbd_conn_sessions_cleanup(conn);
+ 	destroy_lease_table(conn);
+ 	return 0;
+ }
+diff --git a/fs/smb/server/smb2pdu.c b/fs/smb/server/smb2pdu.c
+index 184b28072a6f..3cb39dc7b149 100644
+--- a/fs/smb/server/smb2pdu.c
++++ b/fs/smb/server/smb2pdu.c
+@@ -83,8 +83,6 @@ struct channel *lookup_chann_list(struct ksmbd_session *sess, struct ksmbd_conn
+ 	return chann;
+ }
+ 
+-#define KSMBD_MAX_CHANNELS	32
+-
+ static int register_session_channel(struct ksmbd_session *sess,
+ 				    struct ksmbd_conn *conn,
+ 				    const char *sess_key)
+@@ -914,8 +912,14 @@ static bool smb2_session_expired_cmd_allowed(struct ksmbd_work *work,
+ 
+ static bool smb2_session_kerberos_expired(struct ksmbd_session *sess)
+ {
+-	return sess->kerberos_expiry &&
+-		ktime_get_real_seconds() >= sess->kerberos_expiry;
++	if (!sess->kerberos_expiry ||
++	    ktime_get_real_seconds() < sess->kerberos_expiry)
++		return false;
++
++	if (cmpxchg(&sess->state, SMB2_SESSION_VALID,
++		    SMB2_SESSION_EXPIRED) == SMB2_SESSION_VALID)
++		ksmbd_counter_inc(KSMBD_COUNTER_SESSION_TIMEOUTS);
++	return true;
+ }
+ 
+ /**
+@@ -950,9 +954,8 @@ int smb2_check_user_session(struct ksmbd_work *work)
+ 		if (!work->next_smb2_rcv_hdr_off && sess_id)
+ 			work->sess = ksmbd_session_lookup_all_states(conn, sess_id);
+ 		if (work->sess) {
+-			if (smb2_session_kerberos_expired(work->sess)) {
+-				work->sess->state = SMB2_SESSION_EXPIRED;
+-			} else if (work->sess->state != SMB2_SESSION_VALID) {
++			if (!smb2_session_kerberos_expired(work->sess) &&
++			    work->sess->state != SMB2_SESSION_VALID) {
+ 				ksmbd_user_session_put(work->sess);
+ 				work->sess = NULL;
+ 			}
+@@ -977,8 +980,7 @@ int smb2_check_user_session(struct ksmbd_work *work)
+ 					sess_id, work->sess->id);
+ 			return -EINVAL;
+ 		}
+-		if (smb2_session_kerberos_expired(work->sess))
+-			work->sess->state = SMB2_SESSION_EXPIRED;
++		smb2_session_kerberos_expired(work->sess);
+ 		if (work->sess->state != SMB2_SESSION_VALID) {
+ 			pr_err("compound request on a non-valid session (state %d)\n",
+ 					work->sess->state);
+@@ -995,7 +997,6 @@ int smb2_check_user_session(struct ksmbd_work *work)
+ 	work->sess = ksmbd_session_lookup_all_states(conn, sess_id);
+ 	if (work->sess) {
+ 		if (smb2_session_kerberos_expired(work->sess)) {
+-			work->sess->state = SMB2_SESSION_EXPIRED;
+ 			return smb2_session_expired_cmd_allowed(work, cmd) ?
+ 				1 : -EKEYEXPIRED;
+ 		}
+@@ -2192,7 +2193,7 @@ int smb2_sess_setup(struct ksmbd_work *work)
+ 	struct ksmbd_conn *conn = work->conn;
+ 	struct smb2_sess_setup_req *req;
+ 	struct smb2_sess_setup_rsp *rsp;
+-	struct ksmbd_session *sess;
++	struct ksmbd_session *sess = NULL;
+ 	struct negotiate_message *negblob;
+ 	unsigned int negblob_len, negblob_off;
+ 	int rc = 0;
+@@ -2333,6 +2334,9 @@ int smb2_sess_setup(struct ksmbd_work *work)
+ 			goto out_err;
+ 		}
+ 
++		if (work->session_setup_reauth)
++			WRITE_ONCE(sess->state, SMB2_SESSION_IN_PROGRESS);
++
+ 		conn->binding = false;
+ 	}
+ 	work->sess = sess;
+@@ -2444,6 +2448,14 @@ int smb2_sess_setup(struct ksmbd_work *work)
+ 	}
+ 
+ 	if (rc < 0) {
++		bool setup_in_progress = sess &&
++			READ_ONCE(sess->state) == SMB2_SESSION_IN_PROGRESS &&
++			!(req->Flags & SMB2_SESSION_REQ_FLAG_BINDING);
++
++		/* Authentication errors must not leave the new session published. */
++		if (setup_in_progress)
++			ksmbd_session_unregister(conn, sess);
++
+ 		if (sess && conn->dialect == SMB311_PROT_ID &&
+ 		    (req->Flags & SMB2_SESSION_REQ_FLAG_BINDING)) {
+ 			struct preauth_session *preauth_sess;
+@@ -2477,7 +2489,8 @@ int smb2_sess_setup(struct ksmbd_work *work)
+ 			 * For binding requests, session belongs to another
+ 			 * connection. Do not expire it.
+ 			 */
+-			if (!(req->Flags & SMB2_SESSION_REQ_FLAG_BINDING)) {
++			if (!(req->Flags & SMB2_SESSION_REQ_FLAG_BINDING) &&
++			    !setup_in_progress) {
+ 				sess->last_active = jiffies;
+ 				sess->kerberos_expiry = 0;
+ 				sess->state = SMB2_SESSION_EXPIRED;
+diff --git a/fs/smb/server/smb2pdu.h b/fs/smb/server/smb2pdu.h
+index 1836259be897..2a8a2bc9a8a1 100644
+--- a/fs/smb/server/smb2pdu.h
++++ b/fs/smb/server/smb2pdu.h
+@@ -61,8 +61,6 @@ struct preauth_integrity_info {
+ #define SMB2_SESSION_IN_PROGRESS	BIT(0)
+ #define SMB2_SESSION_VALID		BIT(1)
+ 
+-#define SMB2_SESSION_TIMEOUT		(10 * HZ)
+-
+ /* Apple Defined Contexts */
+ #define SMB2_CREATE_AAPL		"AAPL"
+ 
+diff --git a/fs/smb/server/stats.h b/fs/smb/server/stats.h
+index bc864efa0d46..8b32b8b4e8be 100644
+--- a/fs/smb/server/stats.h
++++ b/fs/smb/server/stats.h
+@@ -15,6 +15,7 @@
+ 
+ enum {
+ 	KSMBD_COUNTER_SESSIONS = 0,
++	KSMBD_COUNTER_SESSION_TIMEOUTS,
+ 	KSMBD_COUNTER_TREE_CONNS,
+ 	KSMBD_COUNTER_REQUESTS,
+ 	KSMBD_COUNTER_STATUS_SUCCESS,
+-- 
+2.55.0
+
