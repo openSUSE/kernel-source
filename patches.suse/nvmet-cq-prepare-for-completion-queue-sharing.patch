@@ -1,0 +1,272 @@
+From: Wilfred Mallawa <wilfred.mallawa@wdc.com>
+Date: Thu, 24 Apr 2025 15:13:50 +1000
+Subject: nvmet: cq: prepare for completion queue sharing
+Patch-mainline: v6.16-rc1
+Git-commit: cbc5acdbbcf7dc11b64ab09efd21f6bd02d77d02
+References: bsc#1281231 CVE-2026-89970
+
+For the PCI transport, the NVMe specification allows submission queues
+to share completion queues, however, this is not supported in the
+current NVMe target implementation. This is a preparatory patch to allow
+for completion queue (CQ) sharing between different submission queues
+(SQ).
+
+To support queue sharing, reference counting completion queues is
+required. This patch adds the refcount_t field ref to struct nvmet_cq
+coupled with respective nvmet_cq_init(), nvmet_cq_get(), nvmet_cq_put(),
+nvmet_cq_is_deletable() and nvmet_cq_destroy() functions.
+
+A CQ reference count is initialized with nvmet_cq_init() when a CQ is
+created. Using nvmet_cq_get(), a reference to a CQ is taken when an SQ is
+created that uses the respective CQ. Similarly. when an SQ is destroyed,
+the reference count to the respective CQ from the SQ being destroyed is
+decremented with nvmet_cq_put(). The last reference to a CQ is dropped
+on a CQ deletion using nvmet_cq_put(), which invokes nvmet_cq_destroy()
+to fully cleanup after the CQ. The helper function nvmet_cq_in_use() is
+used to determine if any SQs are still using the CQ pending deletion.
+In which case, the CQ must not be deleted. This should protect scenarios
+where a bad host may attempt to delete a CQ without first having deleted
+SQ(s) using that CQ.
+
+Additionally, this patch adds an array of struct nvmet_cq to the
+nvmet_ctrl structure. This allows for the controller to keep track of CQs
+as they are created and destroyed, similar to the current tracking done
+for SQs. The memory for this array is freed when the controller is freed.
+A struct nvmet_ctrl reference is also added to the nvmet_cq structure to
+allow for CQs to be removed from the controller whilst keeping the new
+API similar to the existing API for SQs.
+
+Sample callchain with CQ refcounting for the PCI endpoint target
+(pci-epf):
+
+i.   nvmet_execute_create_cq -> nvmet_pci_epf_create_cq
+     -> nvmet_cq_create -> nvmet_cq_init [cq refcount=1]
+
+ii.  nvmet_execute_create_sq -> nvmet_pci_epf_create_sq
+     -> nvmet_sq_create -> nvmet_sq_init -> nvmet_cq_get [cq refcount=2]
+
+iii. nvmet_execute_delete_sq - > nvmet_pci_epf_delete_sq ->
+     -> nvmet_sq_destroy -> nvmet_cq_put [cq refcount 1]
+
+iv.  nvmet_execute_delete_cq -> nvmet_pci_epf_delete_cq
+     -> nvmet_cq_put [cq refcount 0]
+
+Signed-off-by: Wilfred Mallawa <wilfred.mallawa@wdc.com>
+Reviewed-by: Chaitanya Kulkarni <kch@nvidia.com>
+Reviewed-by: Damien Le Moal <dlemoal@kernel.org>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Acked-by: Daniel Wagner <dwagner@suse.de>
+---
+ drivers/nvme/target/admin-cmd.c |    4 +-
+ drivers/nvme/target/core.c      |   68 +++++++++++++++++++++++++++++++---------
+ drivers/nvme/target/nvmet.h     |   12 +++++--
+ drivers/nvme/target/pci-epf.c   |    1 
+ 4 files changed, 66 insertions(+), 19 deletions(-)
+
+--- a/drivers/nvme/target/admin-cmd.c
++++ b/drivers/nvme/target/admin-cmd.c
+@@ -96,7 +96,7 @@ static void nvmet_execute_delete_cq(stru
+ 		goto complete;
+ 	}
+ 
+-	status = nvmet_check_io_cqid(ctrl, cqid);
++	status = nvmet_check_io_cqid(ctrl, cqid, false);
+ 	if (status != NVME_SC_SUCCESS)
+ 		goto complete;
+ 
+@@ -122,7 +122,7 @@ static void nvmet_execute_create_cq(stru
+ 		goto complete;
+ 	}
+ 
+-	status = nvmet_check_io_cqid(ctrl, cqid);
++	status = nvmet_check_io_cqid(ctrl, cqid, true);
+ 	if (status != NVME_SC_SUCCESS)
+ 		goto complete;
+ 
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@ -813,11 +813,43 @@ void nvmet_req_complete(struct nvmet_req
+ }
+ EXPORT_SYMBOL_GPL(nvmet_req_complete);
+ 
++void nvmet_cq_init(struct nvmet_cq *cq)
++{
++	refcount_set(&cq->ref, 1);
++}
++EXPORT_SYMBOL_GPL(nvmet_cq_init);
++
++bool nvmet_cq_get(struct nvmet_cq *cq)
++{
++	return refcount_inc_not_zero(&cq->ref);
++}
++EXPORT_SYMBOL_GPL(nvmet_cq_get);
++
++void nvmet_cq_put(struct nvmet_cq *cq)
++{
++	if (refcount_dec_and_test(&cq->ref))
++		nvmet_cq_destroy(cq);
++}
++EXPORT_SYMBOL_GPL(nvmet_cq_put);
++
+ void nvmet_cq_setup(struct nvmet_ctrl *ctrl, struct nvmet_cq *cq,
+ 		u16 qid, u16 size)
+ {
+ 	cq->qid = qid;
+ 	cq->size = size;
++
++	ctrl->cqs[qid] = cq;
++}
++
++void nvmet_cq_destroy(struct nvmet_cq *cq)
++{
++	struct nvmet_ctrl *ctrl = cq->ctrl;
++
++	if (ctrl) {
++		ctrl->cqs[cq->qid] = NULL;
++		nvmet_ctrl_put(cq->ctrl);
++		cq->ctrl = NULL;
++	}
+ }
+ 
+ void nvmet_sq_setup(struct nvmet_ctrl *ctrl, struct nvmet_sq *sq,
+@@ -837,41 +869,39 @@ static void nvmet_confirm_sq(struct perc
+ 	complete(&sq->confirm_done);
+ }
+ 
+-u16 nvmet_check_cqid(struct nvmet_ctrl *ctrl, u16 cqid)
++u16 nvmet_check_cqid(struct nvmet_ctrl *ctrl, u16 cqid, bool create)
+ {
+-	if (!ctrl->sqs)
++	if (!ctrl->cqs)
+ 		return NVME_SC_INTERNAL | NVME_STATUS_DNR;
+ 
+ 	if (cqid > ctrl->subsys->max_qid)
+ 		return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
+ 
+-	/*
+-	 * Note: For PCI controllers, the NVMe specifications allows multiple
+-	 * SQs to share a single CQ. However, we do not support this yet, so
+-	 * check that there is no SQ defined for a CQ. If one exist, then the
+-	 * CQ ID is invalid for creation as well as when the CQ is being
+-	 * deleted (as that would mean that the SQ was not deleted before the
+-	 * CQ).
+-	 */
+-	if (ctrl->sqs[cqid])
++	if ((create && ctrl->cqs[cqid]) || (!create && !ctrl->cqs[cqid]))
+ 		return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
+ 
+ 	return NVME_SC_SUCCESS;
+ }
+ 
+-u16 nvmet_check_io_cqid(struct nvmet_ctrl *ctrl, u16 cqid)
++u16 nvmet_check_io_cqid(struct nvmet_ctrl *ctrl, u16 cqid, bool create)
+ {
+ 	if (!cqid)
+ 		return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
+-	return nvmet_check_cqid(ctrl, cqid);
++	return nvmet_check_cqid(ctrl, cqid, create);
+ }
+ 
++bool nvmet_cq_in_use(struct nvmet_cq *cq)
++{
++	return refcount_read(&cq->ref) > 1;
++}
++EXPORT_SYMBOL_GPL(nvmet_cq_in_use);
++
+ u16 nvmet_cq_create(struct nvmet_ctrl *ctrl, struct nvmet_cq *cq,
+ 		    u16 qid, u16 size)
+ {
+ 	u16 status;
+ 
+-	status = nvmet_check_cqid(ctrl, qid);
++	status = nvmet_check_cqid(ctrl, qid, true);
+ 	if (status != NVME_SC_SUCCESS)
+ 		return status;
+ 
+@@ -1619,12 +1649,17 @@ struct nvmet_ctrl *nvmet_alloc_ctrl(stru
+ 	if (!ctrl->sqs)
+ 		goto out_free_changed_ns_list;
+ 
++	ctrl->cqs = kcalloc(subsys->max_qid + 1, sizeof(struct nvmet_cq *),
++			   GFP_KERNEL);
++	if (!ctrl->cqs)
++		goto out_free_sqs;
++
+ 	ret = ida_alloc_range(&cntlid_ida,
+ 			     subsys->cntlid_min, subsys->cntlid_max,
+ 			     GFP_KERNEL);
+ 	if (ret < 0) {
+ 		args->status = NVME_SC_CONNECT_CTRL_BUSY | NVME_STATUS_DNR;
+-		goto out_free_sqs;
++		goto out_free_cqs;
+ 	}
+ 	ctrl->cntlid = ret;
+ 
+@@ -1685,6 +1720,8 @@ struct nvmet_ctrl *nvmet_alloc_ctrl(stru
+ 	mutex_unlock(&subsys->lock);
+ 	nvmet_stop_keep_alive_timer(ctrl);
+ 	ida_free(&cntlid_ida, ctrl->cntlid);
++out_free_cqs:
++	kfree(ctrl->cqs);
+ out_free_sqs:
+ 	kfree(ctrl->sqs);
+ out_free_changed_ns_list:
+@@ -1721,6 +1758,7 @@ static void nvmet_ctrl_free(struct kref
+ 
+ 	nvmet_async_events_free(ctrl);
+ 	kfree(ctrl->sqs);
++	kfree(ctrl->cqs);
+ 	kfree(ctrl->changed_ns_list);
+ 	kfree(ctrl);
+ 
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@ -141,8 +141,10 @@ static inline struct device *nvmet_ns_de
+ }
+ 
+ struct nvmet_cq {
++	struct nvmet_ctrl	*ctrl;
+ 	u16			qid;
+ 	u16			size;
++	refcount_t		ref;
+ };
+ 
+ struct nvmet_sq {
+@@ -247,6 +249,7 @@ struct nvmet_pr_log_mgr {
+ struct nvmet_ctrl {
+ 	struct nvmet_subsys	*subsys;
+ 	struct nvmet_sq		**sqs;
++	struct nvmet_cq		**cqs;
+ 
+ 	void			*drvdata;
+ 
+@@ -571,12 +574,17 @@ void nvmet_execute_set_features(struct n
+ void nvmet_execute_get_features(struct nvmet_req *req);
+ void nvmet_execute_keep_alive(struct nvmet_req *req);
+ 
+-u16 nvmet_check_cqid(struct nvmet_ctrl *ctrl, u16 cqid);
+-u16 nvmet_check_io_cqid(struct nvmet_ctrl *ctrl, u16 cqid);
++u16 nvmet_check_cqid(struct nvmet_ctrl *ctrl, u16 cqid, bool create);
++u16 nvmet_check_io_cqid(struct nvmet_ctrl *ctrl, u16 cqid, bool create);
++void nvmet_cq_init(struct nvmet_cq *cq);
+ void nvmet_cq_setup(struct nvmet_ctrl *ctrl, struct nvmet_cq *cq, u16 qid,
+ 		u16 size);
+ u16 nvmet_cq_create(struct nvmet_ctrl *ctrl, struct nvmet_cq *cq, u16 qid,
+ 		u16 size);
++void nvmet_cq_destroy(struct nvmet_cq *cq);
++bool nvmet_cq_get(struct nvmet_cq *cq);
++void nvmet_cq_put(struct nvmet_cq *cq);
++bool nvmet_cq_in_use(struct nvmet_cq *cq);
+ u16 nvmet_check_sqid(struct nvmet_ctrl *ctrl, u16 sqid, bool create);
+ void nvmet_sq_setup(struct nvmet_ctrl *ctrl, struct nvmet_sq *sq, u16 qid,
+ 		u16 size);
+--- a/drivers/nvme/target/pci-epf.c
++++ b/drivers/nvme/target/pci-epf.c
+@@ -1347,6 +1347,7 @@ static u16 nvmet_pci_epf_delete_cq(struc
+ 	if (test_and_clear_bit(NVMET_PCI_EPF_Q_IRQ_ENABLED, &cq->flags))
+ 		nvmet_pci_epf_remove_irq_vector(ctrl, cq->vector);
+ 	nvmet_pci_epf_mem_unmap(ctrl->nvme_epf, &cq->pci_map);
++	tctrl->cqs[cqid] = NULL;
+ 
+ 	return NVME_SC_SUCCESS;
+ }

@@ -49,8 +49,6 @@ try:
         return subprocess.run(
             ["git", "fetch", self.name],
             cwd=repo_dir,
-            capture_output=True,
-            text=True,
             check=True
         )
 
