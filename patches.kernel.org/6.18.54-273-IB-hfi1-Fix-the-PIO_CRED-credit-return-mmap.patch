@@ -1,0 +1,124 @@
+From: Shuhei Takeshita <jyohuku.alterego@gmail.com>
+Date: Sun, 9 Aug 2026 12:27:43 +0900
+Subject: [PATCH] IB/hfi1: Fix the PIO_CRED credit-return mmap
+References: bsc#1258210
+Patch-mainline: 6.18.54
+Git-commit: 62f0f34fbd2b2d5653d33d3b9d42fdcabb1c0101
+
+commit 62f0f34fbd2b2d5653d33d3b9d42fdcabb1c0101 upstream.
+
+hfi1_file_mmap()'s PIO_CRED case must hand user space the single
+credit-return page that holds this context's entry.  That page is the
+second or third page of the per-node credit-return allocation once the
+hardware send context index reaches 64 or 128, so the failure below is
+intermittent: when the entry lands on the first page the offset is zero
+and everything works.
+
+Two things are wrong.
+
+First, cr_page_offset is a byte offset but .va is a struct
+credit_return *, so adding it is pointer arithmetic and scales the offset
+by sizeof(struct credit_return) == 64.  memvirt then lands 256 KiB or
+512 KiB past a 10240-byte allocation.  With an IOMMU translating, that
+address is inside the vmalloc range but in no vm_area, so
+dma_mmap_coherent() -> iommu_dma_mmap() finds no pages, vmalloc_to_pfn()
+returns page_to_pfn(NULL), and remap_pfn_range() installs a frame above
+MAXPHYADDR.  The first user read then takes:
+
+  psm2_ep_open_pr: Corrupted page table at address 7a14d007e000
+  PGD 800000013886a067 P4D 800000013886a067 PUD 13886b067 PMD 13886c067
+                                            PTE 800049168e911235
+  Oops: Bad pagetable: 000d [#1] SMP PTI
+
+Second, and still wrong once the arithmetic is corrected,
+dma_mmap_coherent() describes a whole coherent buffer and selects the
+page within it with vma->vm_pgoff.  Offsetting cpu_addr has no effect:
+for a vmap'd allocation iommu_dma_mmap() uses cpu_addr only to locate the
+vm_area and then maps pages[vm_pgoff], which hfi1_file_mmap() has just
+set to 0.  User space therefore always receives the first credit-return
+page, every credit read is for the wrong context, and send PIO stalls
+forever.
+
+Use the DMA API as intended: pass the base of the allocation with its
+full length and select the page with vm_pgoff.  A separate length is
+needed because memlen must keep describing the VMA for the existing size
+check.  The dma-direct path stays correct as well, since dma_direct_mmap()
+adds the same vm_pgoff to the base pfn.
+
+Tested on a Dell T7610 (Xeon E5-2650 v2, Intel IOMMU in DMA-FQ mode)
+against a Threadripper PRO 3995WX peer, both Omni-Path 100.  Before this
+change psm2_ep_open() Oopses the kernel; with only the arithmetic
+corrected psm2_ep_open() succeeds but any transfer that uses send PIO
+hangs, PSM2_SDMA=2 (send PIO disabled) completing normally while
+PSM2_SDMA=0 (send PIO only) hangs every time.  With this change send PIO,
+send DMA and the default mixed mode all work.
+
+Fixes: 1ec82317a1da ("IB/hfi1: Use dma_mmap_coherent for matching buffers")
+Cc: stable@vger.kernel.org
+Signed-off-by: Shuhei Takeshita <jyohuku.alterego@gmail.com>
+Link: https://patch.msgid.link/20260809032743.2671579-3-jyohuku.alterego@gmail.com
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/infiniband/hw/hfi1/file_ops.c | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/infiniband/hw/hfi1/file_ops.c b/drivers/infiniband/hw/hfi1/file_ops.c
+index 781aa467775e..a7a8a39e69fb 100644
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@ -326,6 +326,7 @@ static int hfi1_file_mmap(struct file *fp, struct vm_area_struct *vma)
+ 	void *memvirt = NULL;
+ 	dma_addr_t memdma = 0;
+ 	u8 subctxt, mapio = 0, vmf = 0, type;
++	size_t memdmalen = 0;
+ 	ssize_t memlen = 0;
+ 	int ret = 0;
+ 	u16 ctxt;
+@@ -371,7 +372,9 @@ static int hfi1_file_mmap(struct file *fp, struct vm_area_struct *vma)
+ 		mapio = 1;
+ 		break;
+ 	case PIO_CRED: {
++		struct credit_return_base *cr = &dd->cr_base[uctxt->sc->node];
+ 		u64 cr_page_offset;
++
+ 		if (flags & VM_WRITE) {
+ 			ret = -EPERM;
+ 			goto done;
+@@ -381,11 +384,18 @@ static int hfi1_file_mmap(struct file *fp, struct vm_area_struct *vma)
+ 		 * second or third page allocated for credit returns (if number
+ 		 * of enabled contexts > 64 and 128 respectively).
+ 		 */
+-		cr_page_offset = ((u64)uctxt->sc->hw_free -
+-				  (u64)dd->cr_base[uctxt->sc->node].va) &
++		cr_page_offset = ((u64)uctxt->sc->hw_free - (u64)cr->va) &
+ 				 PAGE_MASK;
+-		memvirt = dd->cr_base[uctxt->sc->node].va + cr_page_offset;
+-		memdma = dd->cr_base[uctxt->sc->node].dma + cr_page_offset;
++		/*
++		 * dma_mmap_coherent() describes the whole coherent buffer and
++		 * selects the page within it with vma->vm_pgoff, so pass the
++		 * base of the allocation and its length and let vm_pgoff pick
++		 * the page.
++		 */
++		vma->vm_pgoff = cr_page_offset >> PAGE_SHIFT;
++		memvirt = cr->va;
++		memdma = cr->dma;
++		memdmalen = TXE_NUM_CONTEXTS * sizeof(struct credit_return);
+ 		memlen = PAGE_SIZE;
+ 		flags &= ~VM_MAYWRITE;
+ 		flags |= VM_DONTCOPY | VM_DONTEXPAND;
+@@ -567,7 +577,8 @@ static int hfi1_file_mmap(struct file *fp, struct vm_area_struct *vma)
+ 		ret = 0;
+ 	} else if (memdma) {
+ 		ret = dma_mmap_coherent(&dd->pcidev->dev, vma,
+-					memvirt, memdma, memlen);
++					memvirt, memdma,
++					memdmalen ? memdmalen : memlen);
+ 	} else if (mapio) {
+ 		ret = io_remap_pfn_range(vma, vma->vm_start,
+ 					 PFN_DOWN(memaddr),
+-- 
+2.53.0
+
