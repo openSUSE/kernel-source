@@ -5,10 +5,10 @@ from obsapi import api
 import http.cookiejar
 import configparser
 import urllib.parse
-import collections
 import subprocess
 import tempfile
 import base64
+import types
 import time
 import bz2
 import sys
@@ -19,7 +19,11 @@ if not hasattr(ET, 'indent'):  # should be available since python 3.9
     import ETindent
     ET.indent = ETindent.indent
 
-PkgRepo = collections.namedtuple('PkgRepo', ['api', 'org', 'repo', 'branch', 'commit'])
+if sys.version_info.major == 3 and sys.version_info.minor < 7:
+    def PkgRepo(api, org, repo, branch=None, commit=None):
+        return types.SimpleNamespace(api=api, org=org, repo=repo, branch=branch, commit=commit)
+else:
+    from obsapi.pkgrepo import PkgRepo
 
 def expand_home(path):
     if path.startswith('~/'):
