@@ -281,10 +281,15 @@ Constraint: hardware:disk:size unit=G %i
                 self._submit(prjrepo, 'Update ' + self.package + ' maintainer list.' if maintainers else
                 'Normalize ' + maintfile + ' formatting\nThe ' + maintfile + ' formatting is not entirely consistent.\nMake the formatting uniform across the whole file to facilitate automated updates.')
 
-    def fork_repo(self, upstream_repo, reset_branch, re_fork):
+    def fork_repo(self, upstream_repo, reset_branch, re_fork, default_branch=False):
         upstream_info = self.tea.repo_exists(upstream_repo.org, upstream_repo.repo)
         if upstream_info:
             upstream_info = upstream_info.json()
+            if default_branch:
+                self.log_progress('Switching to default branch ...')
+                upstream_repo.branch = upstream_info['default_branch']
+                upstream_repo.commit = self.tea.branchinfo(upstream_repo.org, upstream_repo.repo, upstream_repo.branch)['commit']['id']
+                self.log_progress('%s\n' % (upstream_repo,))
         if upstream_repo.branch:
             assert upstream_repo.branch in self.tea.repo_branches(upstream_repo.org, upstream_repo.repo)
         if upstream_repo.commit:  # Maybe check it's part of the branch as well?
@@ -324,7 +329,7 @@ Constraint: hardware:disk:size unit=G %i
 
 
 class Uploader(UploaderBase):
-    def __init__(self, api, data, user_project, reset_branch=False, re_fork=False, logfile=None, progress=True, ignore_kabi=False, upload_all=False):
+    def __init__(self, api, data, user_project, reset_branch=False, re_fork=False, logfile=None, progress=True, ignore_kabi=False, upload_all=False, default_branch=False):
         self.progress = sys.stderr if progress else None
         self.data = data
         self.upstream_project, self.package = get_kernel_project_package(self.data)
@@ -342,4 +347,4 @@ class Uploader(UploaderBase):
         self.reset_branch = reset_branch
         self.re_fork = re_fork
         self.upload_all = upload_all
-        self.fork_repo(self.upstream, self.reset_branch, self.re_fork)
+        self.fork_repo(self.upstream, self.reset_branch, self.re_fork, default_branch)
