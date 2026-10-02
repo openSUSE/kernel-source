@@ -182,14 +182,6 @@ qdupcheck () {
 }
 
 
-qdiffcheck () {
-	local git_dir
-	git_dir=$("$_libdir"/../linux_git.sh) || return 1
-	local rev=$(tag_get git-commit < $(q top) | GIT_DIR=$git_dir expand_git_ref)
-	interdiff <(GIT_DIR=$git_dir $_libdir/git-f1 $rev) $(q top)
-}
-
-
 #unset _references _destination
 qcp () {
 	# capture and save some options
