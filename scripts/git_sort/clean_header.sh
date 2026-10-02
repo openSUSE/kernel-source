@@ -23,9 +23,9 @@
 
 progname=$(basename "$0")
 _libdir=$(dirname "$(readlink -f "$0")")
-git_dir=$("$_libdir"/../linux_git.sh) || exit 1
+linux_dir=$("$_libdir"/../linux_git.sh) || exit 1
+git_cmd="git -C $linux_dir"
 
-export GIT_DIR=$git_dir
 : ${EDITOR:=${VISUAL:=vi}}
 
 . "$_libdir"/lib_from.sh
@@ -83,7 +83,7 @@ expand_git_ref () {
 	# take the first word only, which will discard cruft like "(partial)"
 	while read commit rest; do
 		local hash
-		local cmd="git log -n1 --pretty=format:%H '$commit' --"
+		local cmd="$git_cmd log -n1 --pretty=format:%H '$commit' --"
 		if [ -z "$opt_quiet" ] && ! hash=$(eval "$cmd"); then
 			return 1
 		else
@@ -191,7 +191,7 @@ var_override commit "$opt_commit" "command line commit"
 
 if [ -z "$commit" ]; then
 	patch_subject=$(echo -n "$header" | tag_get subject | remove_subject_annotation)
-	log_grep=$(git log --reverse --pretty="tformat:%h%x09%ai%x09%aN <%aE>%x09%s" -F --grep "$patch_subject" | grep -F "$patch_subject" || true)
+	log_grep=$($git_cmd log --reverse --pretty="tformat:%h%x09%ai%x09%aN <%aE>%x09%s" -F --grep "$patch_subject" | grep -F "$patch_subject" || true)
 	log_grep_nb=$(echo "$log_grep" | wc -l)
 	if [ -n "$log_grep" -a $log_grep_nb -eq 1 ]; then
 		log_grep_commit=$(echo "$log_grep" | awk '{print $1}' | expand_git_ref)
@@ -219,7 +219,7 @@ if [ -z "$commit" ]; then
 else
 	commit_str=$commit
 	if [ -n "${body%---}" ]; then
-		cl_orig=$(git format-patch --stdout -p $commit^..$commit | cheat_diffstat | diffstat -lp1 | wc -l)
+		cl_orig=$($git_cmd format-patch --stdout -p $commit^..$commit | cheat_diffstat | diffstat -lp1 | wc -l)
 		cl_patch=$(echo -n "${body%---}" | cheat_diffstat | diffstat -lp1 | wc -l)
 		if [ $cl_orig -ne $cl_patch ]; then
 			commit_str+=" (partial)"
@@ -227,11 +227,11 @@ else
 	fi
 	header=$(echo -n "$header" | tag_add Git-commit "$commit_str")
 
-	git_describe=$(git describe --contains --match "v*" $commit 2>/dev/null || true)
+	git_describe=$($git_cmd describe --contains --match "v*" $commit 2>/dev/null || true)
 	git_describe=${git_describe%%[~^]*}
 	if [ -z "$git_describe" ]; then
 		git_describe="Queued in subsystem maintainer repository"
-		result=$(git describe --contains --all $commit)
+		result=$($git_cmd describe --contains --all $commit)
 		if echo "$result" | grep -Eq "^remotes/"; then
 			remote=$(echo "$result" | cut -d/ -f2)
 		else
@@ -240,13 +240,13 @@ else
 				echo "Error: cannot use stash to describe patch. Stopping to avoid possibly erroneous results." > /dev/stderr
 				exit 1
 			else
-				if ! remote=$(git config --get branch.$branch.remote); then
+				if ! remote=$($git_cmd config --get branch.$branch.remote); then
 					echo "Error: \"$branch\" does not look like a remote tracking branch. Failed to get information about repository URL." > /dev/stderr
 					exit 1
 				fi
 			fi
 		fi
-		describe_url=$(git config --get remote.$remote.url)
+		describe_url=$($git_cmd config --get remote.$remote.url)
 	fi
 fi
 
@@ -322,7 +322,7 @@ fi
 
 
 if [ -n "$commit" ]; then
-	original_header=$(git format-patch --stdout -p $commit^..$commit | awk -f "$_libdir"/patch_header.awk && echo ---)
+	original_header=$($git_cmd format-patch --stdout -p $commit^..$commit | awk -f "$_libdir"/patch_header.awk && echo ---)
 
 
 	# Clean From:
@@ -388,8 +388,8 @@ fi
 
 # Add Acked-by:
 
-name=$(git config --get user.name)
-email=$(git config --get user.email)
+name=$($git_cmd config --get user.name)
+email=$($git_cmd config --get user.email)
 
 if [ -z "$name" -o -z "$email" ]; then
 	name_str=${name:-(empty name)}
