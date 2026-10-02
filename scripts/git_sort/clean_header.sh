@@ -22,15 +22,15 @@
 
 
 progname=$(basename "$0")
-libdir=$(dirname "$(readlink -f "$0")")
-git_dir=$("$libdir"/../linux_git.sh) || exit 1
+_libdir=$(dirname "$(readlink -f "$0")")
+git_dir=$("$_libdir"/../linux_git.sh) || exit 1
 
 export GIT_DIR=$git_dir
 : ${EDITOR:=${VISUAL:=vi}}
 
-. "$libdir"/lib_from.sh
-. "$libdir"/lib_tag.sh
-. "$libdir"/lib.sh
+. "$_libdir"/lib_from.sh
+. "$_libdir"/lib_tag.sh
+. "$_libdir"/lib.sh
 
 usage () {
 	echo "Usage: $progname [options] [patch file]"
@@ -109,11 +109,11 @@ if echo -n "${patch%---}" | grep -q $'\r'; then
 	patch=$(echo -n "${patch%---}" | sed -e 's/\r//g' && echo ---)
 fi
 
-body=$(echo -n "${patch%---}" | awk -f "$libdir"/patch_body.awk && echo ---)
+body=$(echo -n "${patch%---}" | awk -f "$_libdir"/patch_body.awk && echo ---)
 # * Remove "From" line with tag, since it points to a local commit from
 #   kernel.git that I created
 # * Remove "Conflicts" section
-header=$(echo -n "${patch%---}" | awk -f "$libdir"/patch_header.awk | from_extract | awk -f "$libdir"/clean_conflicts.awk && echo ---)
+header=$(echo -n "${patch%---}" | awk -f "$_libdir"/patch_header.awk | from_extract | awk -f "$_libdir"/clean_conflicts.awk && echo ---)
 
 
 # Git-commit:
@@ -276,7 +276,7 @@ fi
 
 
 if [ -n "$commit" ]; then
-	original_header=$(git format-patch --stdout -p $commit^..$commit | awk -f "$libdir"/patch_header.awk && echo ---)
+	original_header=$(git format-patch --stdout -p $commit^..$commit | awk -f "$_libdir"/patch_header.awk && echo ---)
 
 
 	# Clean From:
