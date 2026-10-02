@@ -182,14 +182,6 @@ qdupcheck () {
 }
 
 
-qdiffcheck () {
-	local git_dir
-	git_dir=$("$_libdir"/../linux_git.sh) || return 1
-	local rev=$(tag_get git-commit < $(q top) | GIT_DIR=$git_dir expand_git_ref)
-	interdiff <(GIT_DIR=$git_dir $_libdir/git-f1 $rev) $(q top)
-}
-
-
 #unset _references _destination
 qcp () {
 	# capture and save some options
@@ -273,8 +265,8 @@ _saveopts () {
 
 #unset series
 qadd () {
-	local git_dir
-	git_dir=$("$_libdir"/../linux_git.sh) || return 1
+	local linux_git
+	linux_git=$("$_libdir"/../linux_git.sh) || return 1
 
 	if [ $BASH_SUBSHELL -gt 0 ]; then
 		echo "Error: it looks like this function is being run in a subshell. It will not be effective because its purpose is to set an environment variable. You could run it like this instead: \`${FUNCNAME[0]} <<< \$(<cmd>)\`." > /dev/stderr
@@ -291,7 +283,7 @@ qadd () {
 		(
 			[ ${#series[@]} -gt 0 ] && printf "%s\n" "${series[@]}"
 			[ -n "$_series" ] && echo "$_series"
-		) | GIT_DIR=$git_dir "$_libdir"/git_sort_debug
+		) | LINUX_GIT=$linux_git "$_libdir"/git_sort_debug
 	)"
 
 	if [ -z "${series[0]}" ]; then
@@ -301,8 +293,8 @@ qadd () {
 
 
 qedit () {
-	local git_dir
-	git_dir=$("$_libdir"/../linux_git.sh) || return 1
+	local linux_git
+	linux_git=$("$_libdir"/../linux_git.sh) || return 1
 
 	if [ "${tmpfile+set}" = "set" ]; then
 		local _tmpfile=$tmpfile
@@ -315,7 +307,7 @@ qedit () {
 	${EDITOR:-${VISUAL:-vi}} "$tmpfile"
 
 	mapfile -t series <<< "$(grep . "$tmpfile" |
-		GIT_DIR=$git_dir $_libdir/git_sort_debug)"
+		LINUX_GIT=$linux_git $_libdir/git_sort_debug)"
 
 	if [ -z "${series[0]}" ]; then
 		unset series[0]
@@ -364,8 +356,8 @@ qskip () {
 _stablecheck () {
 	local entry=$1
 	local patch=$2
-	local git_dir
-	git_dir=$("$_libdir"/../linux_git.sh) || return 1
+	local linux_git
+	linux_git=$("$_libdir"/../linux_git.sh) || return 1
 
 	local rev=$(echo "$patch" | awk '{
 		match($0, "patch-([[:digit:]]+\\.[[:digit:]]+)\\.([[:digit:]]+)(-([[:digit:]]+))?", a)
@@ -375,15 +367,13 @@ _stablecheck () {
 			print "v" a[1] "..v" a[1] "." a[2]
 		}
 	}')
-	local output=$(GIT_DIR=$git_dir git log "$rev" --pretty=tformat:%H --grep "$entry")
+	local output=$(git -C $linux_git log "$rev" --pretty=tformat:%H --grep "$entry")
 	local nb=$(echo "$output" | wc -l)
 	if [ "$output" -a $nb -eq 1 ]; then
-		echo -en "This commit was backported to a stable branch as\n\t"
-		GIT_DIR=$git_dir $_libdir/git-overview -m "$output"
-		echo
+		echo "This commit was backported to a stable branch"
 	elif [ $nb -gt 1 ]; then
 		echo "Warning: $nb potential stable commits found:" > /dev/stderr
-		GIT_DIR=$git_dir git log "$rev" --oneline --grep "$entry" > /dev/stderr
+		git -C $linux_git log "$rev" --oneline --grep "$entry" > /dev/stderr
 	else
 		echo "Warning: no potential stable commit found." > /dev/stderr
 	fi
