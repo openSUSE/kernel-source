@@ -370,9 +370,7 @@ _stablecheck () {
 	local output=$(GIT_DIR=$git_dir git log "$rev" --pretty=tformat:%H --grep "$entry")
 	local nb=$(echo "$output" | wc -l)
 	if [ "$output" -a $nb -eq 1 ]; then
-		echo -en "This commit was backported to a stable branch as\n\t"
-		GIT_DIR=$git_dir $_libdir/git-overview -m "$output"
-		echo
+		echo "This commit was backported to a stable branch"
 	elif [ $nb -gt 1 ]; then
 		echo "Warning: $nb potential stable commits found:" > /dev/stderr
 		GIT_DIR=$git_dir git log "$rev" --oneline --grep "$entry" > /dev/stderr
