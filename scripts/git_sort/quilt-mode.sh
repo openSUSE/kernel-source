@@ -273,8 +273,8 @@ _saveopts () {
 
 #unset series
 qadd () {
-	local git_dir
-	git_dir=$("$_libdir"/../linux_git.sh) || return 1
+	local linux_git
+	linux_git=$("$_libdir"/../linux_git.sh) || return 1
 
 	if [ $BASH_SUBSHELL -gt 0 ]; then
 		echo "Error: it looks like this function is being run in a subshell. It will not be effective because its purpose is to set an environment variable. You could run it like this instead: \`${FUNCNAME[0]} <<< \$(<cmd>)\`." > /dev/stderr
@@ -291,7 +291,7 @@ qadd () {
 		(
 			[ ${#series[@]} -gt 0 ] && printf "%s\n" "${series[@]}"
 			[ -n "$_series" ] && echo "$_series"
-		) | GIT_DIR=$git_dir "$_libdir"/git_sort_debug
+		) | LINUX_GIT=$linux_git "$_libdir"/git_sort_debug
 	)"
 
 	if [ -z "${series[0]}" ]; then
@@ -301,8 +301,8 @@ qadd () {
 
 
 qedit () {
-	local git_dir
-	git_dir=$("$_libdir"/../linux_git.sh) || return 1
+	local linux_git
+	linux_git=$("$_libdir"/../linux_git.sh) || return 1
 
 	if [ "${tmpfile+set}" = "set" ]; then
 		local _tmpfile=$tmpfile
@@ -315,7 +315,7 @@ qedit () {
 	${EDITOR:-${VISUAL:-vi}} "$tmpfile"
 
 	mapfile -t series <<< "$(grep . "$tmpfile" |
-		GIT_DIR=$git_dir $_libdir/git_sort_debug)"
+		LINUX_GIT=$linux_git $_libdir/git_sort_debug)"
 
 	if [ -z "${series[0]}" ]; then
 		unset series[0]
