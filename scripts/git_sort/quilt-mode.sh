@@ -356,8 +356,8 @@ qskip () {
 _stablecheck () {
 	local entry=$1
 	local patch=$2
-	local git_dir
-	git_dir=$("$_libdir"/../linux_git.sh) || return 1
+	local linux_git
+	linux_git=$("$_libdir"/../linux_git.sh) || return 1
 
 	local rev=$(echo "$patch" | awk '{
 		match($0, "patch-([[:digit:]]+\\.[[:digit:]]+)\\.([[:digit:]]+)(-([[:digit:]]+))?", a)
@@ -367,13 +367,13 @@ _stablecheck () {
 			print "v" a[1] "..v" a[1] "." a[2]
 		}
 	}')
-	local output=$(GIT_DIR=$git_dir git log "$rev" --pretty=tformat:%H --grep "$entry")
+	local output=$(git -C $linux_git log "$rev" --pretty=tformat:%H --grep "$entry")
 	local nb=$(echo "$output" | wc -l)
 	if [ "$output" -a $nb -eq 1 ]; then
 		echo "This commit was backported to a stable branch"
 	elif [ $nb -gt 1 ]; then
 		echo "Warning: $nb potential stable commits found:" > /dev/stderr
-		GIT_DIR=$git_dir git log "$rev" --oneline --grep "$entry" > /dev/stderr
+		git -C $linux_git log "$rev" --oneline --grep "$entry" > /dev/stderr
 	else
 		echo "Warning: no potential stable commit found." > /dev/stderr
 	fi
