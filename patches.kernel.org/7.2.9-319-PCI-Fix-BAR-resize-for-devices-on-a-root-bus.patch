@@ -1,0 +1,132 @@
+From: Liz Fong-Jones <lizf@honeycomb.io>
+Date: Fri, 18 Sep 2026 03:56:33 +0000
+Subject: [PATCH] PCI: Fix BAR resize for devices on a root bus
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1012628
+Patch-mainline: 7.2.9
+Git-commit: d58384c22739848efe14b34e9586e4f1242f33c0
+
+commit d58384c22739848efe14b34e9586e4f1242f33c0 upstream.
+
+pci_do_resource_release_and_resize() releases device BARs that share a
+bridge window with the BAR being resized, but when the device sits directly
+on a root bus (pdev->bus->self == NULL) it then skips resource assignment
+entirely and returns success, leaving the BARs it just released unassigned
+(IORESOURCE_UNSET).
+
+Skipping pbus_reassign_bridge_resources() is correct in that case -- there
+is no bridge window to adjust -- but the device BARs still have to be
+reassigned. Before the BAR release was consolidated into the PCI core, this
+case worked for amdgpu because the driver released the BARs itself and then
+called pci_assign_unassigned_bus_resources() unconditionally after the
+resize, which assigns unassigned device BARs also on a root bus. Commit
+db92e3fef53e ("drm/amdgpu: Remove driver side BAR release before resize")
+removed that call, so nothing assigns the released BARs anymore.
+
+This breaks amdgpu completely on the SolidRun HoneyComb LX2K (NXP LX2160A,
+arm64, ACPI), where ACPI doesn't expose the Root Port so the GPU endpoint
+appears directly on a "root bus" of its segment:
+
+  amdgpu 0004:01:00.0: BAR 0 [mem 0xa400000000-0xa40fffffff 64bit pref]: releasing
+  amdgpu 0004:01:00.0: BAR 2 [mem 0xa410000000-0xa4101fffff 64bit pref]: releasing
+  amdgpu 0004:01:00.0: sw_init of IP block <gmc_v8_0> failed -19
+  amdgpu 0004:01:00.0: amdgpu_device_ip_init failed
+  amdgpu 0004:01:00.0: Fatal error during GPU init
+
+No error is logged because the resize path reports success; amdgpu then
+finds BAR 0 IORESOURCE_UNSET and bails out with -ENODEV.
+
+When there is no upstream bridge, call pci_bus_assign_resources() on the
+root bus to place the BARs released above, using the same alignment-sorted
+algorithm as normal enumeration instead of a manual per-BAR loop. This also
+walks the rest of the hierarchy under the root bus, as
+pci_assign_unassigned_bus_resources() used to for amdgpu before commit
+db92e3fef53e ("drm/amdgpu: Remove driver side BAR release before resize")
+removed that call -- the core-side fix that commit asked for ("such a
+problem should be fixed inside pci_resize_resource() instead").
+
+pci_bus_assign_resources() returns void, so failure is detected by checking
+whether the released BARs are still assigned afterward; if not, roll back
+as in the bridged case. This is stricter than the bridged path -- it fails
+on any unplaced resource, not just required ones -- since a root bus
+typically has one shared window, and failing loudly seemed better than
+leaving something silently unassigned.
+
+The root bus path also had a locking bug that any fix here necessarily
+touches: the old "goto out" jumped to up_read(&pci_bus_sem) without a
+matching down_read() (as does the "goto restore" taken when
+pci_dev_res_add_to_list() fails in the release loop). Take pci_bus_sem
+before the BAR release loop so every path through the function holds it
+exactly once.
+
+Fixes: 337b1b566db0 ("PCI: Fix restoring BARs on BAR resize rollback path")
+Link: https://bugs.launchpad.net/ubuntu/+source/linux-hwe-7.0/+bug/2159596
+Suggested-by: Ilpo Järvinen <ilpo.jarvinen@linux.intel.com>
+Assisted-by: Claude:claude-fable-5 checkpatch
+Assisted-by: Claude:claude-sonnet-5
+Signed-off-by: Liz Fong-Jones <lizf@honeycomb.io>
+[bhelgaas: commit log]
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Reviewed-by: Ilpo Järvinen <ilpo.jarvinen@linux.intel.com>
+Cc: stable@vger.kernel.org
+Link: https://patch.msgid.link/20260918035633.566823-1-lizf@honeycomb.io
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/pci/setup-bus.c | 23 +++++++++++++++++------
+ 1 file changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/pci/setup-bus.c b/drivers/pci/setup-bus.c
+index c0a949f2c995..9e13489cac71 100644
+--- a/drivers/pci/setup-bus.c
++++ b/drivers/pci/setup-bus.c
+@@ -2380,6 +2380,7 @@ int pci_do_resource_release_and_resize(struct pci_dev *pdev, int resno, int size
+ 	struct resource *res = pci_resource_n(pdev, resno);
+ 	struct pci_dev_resource *dev_res;
+ 	struct pci_bus *bus = pdev->bus;
++	struct pci_dev *bridge = pci_upstream_bridge(pdev);
+ 	struct resource *b_win, *r;
+ 	LIST_HEAD(saved);
+ 	unsigned int i;
+@@ -2397,6 +2398,8 @@ int pci_do_resource_release_and_resize(struct pci_dev *pdev, int resno, int size
+ 	if (ret)
+ 		return ret;
+ 
++	down_read(&pci_bus_sem);
++
+ 	pci_dev_for_each_resource(pdev, r, i) {
+ 		if (i >= PCI_BRIDGE_RESOURCES)
+ 			break;
+@@ -2415,13 +2418,21 @@ int pci_do_resource_release_and_resize(struct pci_dev *pdev, int resno, int size
+ 
+ 	pci_resize_resource_set_size(pdev, resno, size);
+ 
+-	if (!bus->self)
+-		goto out;
++	if (bridge) {
++		ret = pbus_reassign_bridge_resources(bus, res, &saved);
++		if (ret)
++			goto restore;
++	} else {
++		/* No bridge window to adjust; let the core reassign the bus. */
++		pci_bus_assign_resources(bus);
+ 
+-	down_read(&pci_bus_sem);
+-	ret = pbus_reassign_bridge_resources(bus, res, &saved);
+-	if (ret)
+-		goto restore;
++		list_for_each_entry(dev_res, &saved, list) {
++			if (!resource_assigned(dev_res->res)) {
++				ret = -ENOSPC;
++				goto restore;
++			}
++		}
++	}
+ 
+ out:
+ 	up_read(&pci_bus_sem);
+-- 
+2.55.0
+
