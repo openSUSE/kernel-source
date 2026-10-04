@@ -1,0 +1,181 @@
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Fri, 18 Sep 2026 01:32:09 +0200
+Subject: [PATCH] bpf: Make post-verification instruction rewrites killable
+References: bsc#1012628
+Patch-mainline: 7.2.9
+Git-commit: 261b61d3735b042ae25634f795c4540be0fc140c
+
+[ Upstream commit 261b61d3735b042ae25634f795c4540be0fc140c ]
+
+After do_check() returns, the verifier runs several instruction rewrite
+passes. Some of them patch or remove one instruction at a time. Each
+operation moves the remaining instruction and auxiliary-data arrays and
+adjusts all branch offsets, making the overall work quadratic in the
+program length.
+
+A privileged loader can submit 131072 unconditional jumps by zero followed
+by a valid return. Verification finishes quickly, but bpf_opt_remove_nops()
+then spends a long time removing each jump separately. Since this
+post-verification work neither checks for signals nor reschedules, a pending
+SIGKILL cannot terminate the task until the rewrite finishes.
+
+Make bpf_patch_insn_data() and verifier_remove_insns() common cancellation
+and rescheduling points. These helpers run from BPF_PROG_LOAD process
+context, and bpf_patch_insn_data() can already sleep while reallocating
+auxiliary data.
+
+Report interrupted constant blinding as -EINTR and propagate it through
+both JIT paths, including kernels that permit interpreter fallback.
+Other blinding failures retain the existing fallback behavior.
+
+This does not reduce the quadratic cost of the rewrite passes, but it makes
+the work preemptible and allows a killed loader to be torn down promptly.
+
+Fixes: 52875a04f4b2 ("bpf: verifier: remove dead code")
+Reported-by: Nicholas Carlini <npc@anthropic.com>
+Suggested-by: Nicholas Carlini <npc@anthropic.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Acked-by: Eduard Zingerman <eddyz87@gmail.com>
+Link: https://patch.msgid.link/20260917233222.2542500-2-memxor@gmail.com
+Signed-off-by: Eduard Zingerman <eddyz87@gmail.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ kernel/bpf/core.c   | 21 +++++++++++++++++----
+ kernel/bpf/fixups.c | 24 ++++++++++++++++++++++--
+ 2 files changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 883cb7a800b1..71ee96a77ae2 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -19,6 +19,7 @@
+ 
+ #include <uapi/linux/btf.h>
+ #include <linux/filter.h>
++#include <linux/sched/signal.h>
+ #include <linux/skbuff.h>
+ #include <linux/static_call.h>
+ #include <linux/vmalloc.h>
+@@ -1612,6 +1613,8 @@ struct bpf_prog *bpf_jit_blind_constants(struct bpf_verifier_env *env, struct bp
+ 			 * fix it up here on error.
+ 			 */
+ 			bpf_jit_prog_release_other(prog, clone);
++			if (env && fatal_signal_pending(current))
++				return ERR_PTR(-EINTR);
+ 			return IS_ERR(tmp) ? tmp : ERR_PTR(-ENOMEM);
+ 		}
+ 
+@@ -2641,11 +2644,14 @@ static struct bpf_prog *bpf_prog_jit_compile(struct bpf_verifier_env *env, struc
+ 	orig_prog = prog;
+ 	prog = bpf_jit_blind_constants(env, prog);
+ 	/*
+-	 * If blinding was requested and we failed during blinding, we must fall
+-	 * back to the interpreter.
++	 * Fall back to the interpreter after blinding failures, except when
++	 * the loader was killed.
+ 	 */
+-	if (IS_ERR(prog))
++	if (IS_ERR(prog)) {
++		if (PTR_ERR(prog) == -EINTR)
++			return prog;
+ 		goto out_restore;
++	}
+ 
+ 	prog = bpf_int_jit_compile(env, prog);
+ 	if (prog->jited) {
+@@ -2668,6 +2674,8 @@ static struct bpf_prog *bpf_prog_jit_compile(struct bpf_verifier_env *env, struc
+ struct bpf_prog *__bpf_prog_select_runtime(struct bpf_verifier_env *env, struct bpf_prog *fp,
+ 					   int *err)
+ {
++	struct bpf_prog *jit_prog;
++
+ 	/* In case of BPF to BPF calls, verifier did all the prep
+ 	 * work with regards to JITing, etc.
+ 	 */
+@@ -2690,7 +2698,12 @@ struct bpf_prog *__bpf_prog_select_runtime(struct bpf_verifier_env *env, struct
+ 		if (*err)
+ 			return fp;
+ 
+-		fp = bpf_prog_jit_compile(env, fp);
++		jit_prog = bpf_prog_jit_compile(env, fp);
++		if (IS_ERR(jit_prog)) {
++			*err = PTR_ERR(jit_prog);
++			return fp;
++		}
++		fp = jit_prog;
+ 		bpf_prog_jit_attempt_done(fp);
+ 		if (!fp->jited && jit_needed) {
+ 			*err = -ENOTSUPP;
+diff --git a/kernel/bpf/fixups.c b/kernel/bpf/fixups.c
+index 48acb61854ed..19c1b8f1b317 100644
+--- a/kernel/bpf/fixups.c
++++ b/kernel/bpf/fixups.c
+@@ -8,6 +8,7 @@
+ #include <linux/bsearch.h>
+ #include <linux/sort.h>
+ #include <linux/perf_event.h>
++#include <linux/sched/signal.h>
+ #include <net/xdp.h>
+ #include "disasm.h"
+ 
+@@ -240,12 +241,28 @@ static void adjust_poke_descs(struct bpf_prog *prog, u32 off, u32 len)
+ 	}
+ }
+ 
++/*
++ * Some post-verification instruction rewriting passes require an
++ * O(prog->len) operation per instruction. Keep their shared primitives
++ * killable and preemptible.
++ */
++static bool bpf_rewrite_must_abort(void)
++{
++	if (fatal_signal_pending(current))
++		return true;
++	cond_resched();
++	return false;
++}
++
+ struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 off,
+ 				     const struct bpf_insn *patch, u32 len)
+ {
+ 	struct bpf_prog *new_prog;
+ 	struct bpf_insn_aux_data *new_data = NULL;
+ 
++	if (bpf_rewrite_must_abort())
++		return NULL;
++
+ 	if (len > 1) {
+ 		new_data = vrealloc(env->insn_aux_data,
+ 				    array_size(env->prog->len + len - 1,
+@@ -457,6 +474,9 @@ static int verifier_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt)
+ 	unsigned int orig_prog_len = env->prog->len;
+ 	int err;
+ 
++	if (bpf_rewrite_must_abort())
++		return -EINTR;
++
+ 	if (bpf_prog_is_offloaded(env->prog->aux))
+ 		bpf_prog_offload_remove_insns(env, off, cnt);
+ 
+@@ -1316,7 +1336,7 @@ int bpf_jit_subprogs(struct bpf_verifier_env *env)
+ 		}
+ 		prog = bpf_jit_blind_constants(env, prog);
+ 		if (IS_ERR(prog)) {
+-			err = -ENOMEM;
++			err = PTR_ERR(prog);
+ 			prog = orig_prog;
+ 			goto out_restore;
+ 		}
+@@ -1395,7 +1415,7 @@ int bpf_fixup_call_args(struct bpf_verifier_env *env)
+ 		err = bpf_jit_subprogs(env);
+ 		if (err == 0)
+ 			return 0;
+-		if (err == -EFAULT)
++		if (err == -EFAULT || err == -EINTR)
+ 			return err;
+ 	}
+ #ifndef CONFIG_BPF_JIT_ALWAYS_ON
+-- 
+2.55.0
+
