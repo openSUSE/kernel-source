@@ -66,7 +66,7 @@ def compile_busybox(busybox_build_dir, container_engine, platform, cross_compile
         workspace_path_rw=busybox_build_dir,
         platform=platform,
         env_dict={},
-        cmd_str=container_compile_sequence,
+        command=["bash", "-c", container_compile_sequence],
         workspace_mount="/build",
         tty=True
     )
@@ -80,7 +80,7 @@ def generate_applet_symlinks(container_engine, busybox_build_dir, platform, init
             workspace_path_rw=busybox_build_dir,
             platform=platform,
             env_dict={},
-            cmd_str="./busybox --list"
+            command=["./busybox", "--list"]
         )
         applets = applet_result.stdout.strip().splitlines()
 
@@ -281,7 +281,7 @@ def create_dracut_initrd(
                 workspace_path_rw=workspace,
                 platform=container_platform,
                 env_dict={},
-                cmd_str=dracut_cmd,
+                command=["bash", "-c", dracut_cmd],
                 workspace_mount="/workspace/",
                 extra_volumes={str(module_install_root): "/module_root"},
                 tty=True

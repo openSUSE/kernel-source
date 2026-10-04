@@ -75,7 +75,7 @@ class TestBuildCommand(unittest.TestCase):
             workspace_path_rw="/home/user/src",
             platform="linux/amd64",
             env_dict={"ARCH": "x86_64", "CROSS_COMPILE": "x86_64-linux-gnu-"},
-            cmd_str="make bzImage"
+            command=["bash", "-c", "make bzImage"]
         )
 
         self.assertEqual(cmd[0], "podman")
@@ -97,14 +97,14 @@ class TestBuildCommand(unittest.TestCase):
         """Verify defaults apply when optional args are omitted."""
         cmd = self.engine.build_command()
         self.assertEqual(cmd[cmd.index("--platform") + 1], "linux/x86_64")
-        self.assertEqual(cmd[-4:], [self.image, "bash", "-c", "bash"])
+        self.assertEqual(cmd[-1], self.image)
         self.assertNotIn("-w", cmd)
 
     def test_docker_omits_podman_specific_flags(self):
         """Verify docker's command omits podman-only flags."""
         docker_engine = ContainerEngine(runtime="docker", storage_root=self.storage_root, image=self.image)
         cmd = docker_engine.build_command(
-            workspace_path_rw="/tmp/space", platform="linux/arm64", env_dict={}, cmd_str="exit 0")
+            workspace_path_rw="/tmp/space", platform="linux/arm64", env_dict={}, command=["exit", "0"])
         self.assertNotIn("--root", cmd)
         self.assertNotIn("--userns=keep-id", cmd)
         self.assertNotIn("--security-opt", cmd)
@@ -123,7 +123,7 @@ class TestBuildCommand(unittest.TestCase):
         }
         cmd = self.engine.build_command(
             workspace_path_rw="/tmp/space", platform="linux/amd64", env_dict={},
-            extra_volumes=extra_vols, cmd_str="make", memory_limit="8g", cpu_limit="4")
+            extra_volumes=extra_vols, command=["make"], memory_limit="8g", cpu_limit="4")
 
         self.assertEqual(cmd[cmd.index("--memory") + 1], "8g")
         self.assertEqual(cmd[cmd.index("--cpus") + 1], "4")
@@ -136,23 +136,23 @@ class TestBuildCommand(unittest.TestCase):
             self.assertTrue(mount_found, f"Volume mapping '{expected_mount}' missing.")
 
     def test_interactive_sets_it_flag(self):
-        cmd = self.engine.build_command(cmd_str="bash", interactive=True)
+        cmd = self.engine.build_command(command=["bash"], interactive=True)
         self.assertIn("-it", cmd)
 
     def test_tty_sets_t_only_not_it(self):
         """tty=True is for streaming a non-interactive command's output live, it should not also open stdin (-i)"""
-        cmd = self.engine.build_command(cmd_str="bash", tty=True)
+        cmd = self.engine.build_command(command=["bash"], tty=True)
         self.assertIn("-t", cmd)
         self.assertNotIn("-it", cmd)
         self.assertNotIn("-i", cmd)
 
     def test_interactive_sets_it_only_not_t(self):
-        cmd = self.engine.build_command(cmd_str="bash", interactive=True, tty=True)
+        cmd = self.engine.build_command(command=["bash"], interactive=True, tty=True)
         self.assertIn("-it", cmd)
         self.assertNotIn("-t", cmd)
 
     def test_neither_interactive_nor_tty_omits_both_flags(self):
-        cmd = self.engine.build_command(cmd_str="bash")
+        cmd = self.engine.build_command(command=["bash"])
         self.assertNotIn("-it", cmd)
         self.assertNotIn("-t", cmd)
 
@@ -170,6 +170,35 @@ class TestBuildCommand(unittest.TestCase):
             runtime="podman", storage_root=self.storage_root, image=self.image, name="kernel-sandbox-abc1234-x86_64-default")
         cmd = named_engine.build_command()
         self.assertEqual(cmd[cmd.index("--name") + 1], "kernel-sandbox-abc1234-x86_64-default")
+
+    def test_entrypoint_none(self):
+        cmd = self.engine.build_command(entrypoint=None)
+        self.assertNotIn("--entrypoint", cmd)
+
+    def test_entrypoint_empty_string(self):
+        cmd = self.engine.build_command(entrypoint="")
+        self.assertIn("--entrypoint", cmd)
+        idx = cmd.index("--entrypoint")
+        self.assertEqual(cmd[idx + 1], "")  # --entrypoint ""
+        self.assertIn(self.image, cmd)
+
+    def test_entrypoint_custom_binary(self):
+        cmd = self.engine.build_command(entrypoint="/bin/sh")
+        self.assertIn("--entrypoint", cmd)
+        idx = cmd.index("--entrypoint")
+        self.assertEqual(cmd[idx + 1], "/bin/sh")
+        self.assertIn(self.image, cmd)
+
+    def test_explicit_command_and_args_lists(self):
+        cmd = self.engine.build_command(
+            entrypoint="", command=["/bin/sh", "-c"], args=["echo hello", "echo world"])
+        image_idx = cmd.index(self.image)
+        self.assertEqual(cmd[image_idx + 1:], ["/bin/sh", "-c", "echo hello", "echo world"])
+
+    def test_explicit_command_and_args_arrays(self):
+        cmd = self.engine.build_command(command=["./busybox"], args=["--list"])
+        image_idx = cmd.index(self.image)
+        self.assertEqual(cmd[image_idx + 1:], ["./busybox", "--list"])
 
 
 class TestBuildPullCommand(unittest.TestCase):
@@ -365,7 +394,7 @@ class TestExecuteCommandAndPullImage(unittest.TestCase):
     def test_execute_command_success(self):
         engine = ContainerEngine(
             runtime=self._mock_runtime("echo container-output; exit 0"), storage_root="/tmp", image="mock-image")
-        res = engine.execute_command(cmd_str="anything")
+        res = engine.execute_command(command=["anything"])
         self.assertEqual(res.returncode, 0)
         self.assertIn("container-output", res.stdout)
 
@@ -373,7 +402,7 @@ class TestExecuteCommandAndPullImage(unittest.TestCase):
         engine = ContainerEngine(
             runtime=self._mock_runtime("echo fail-here >&2; exit 5"), storage_root="/tmp", image="mock-image")
         with self.assertRaises(ContainerRuntimeError) as ctx:
-            engine.execute_command(cmd_str="anything")
+            engine.execute_command(command=["anything"])
         self.assertIn("fail-here", str(ctx.exception))
         self.assertIn("Exit Code 5", str(ctx.exception))
 
@@ -381,7 +410,7 @@ class TestExecuteCommandAndPullImage(unittest.TestCase):
         engine = ContainerEngine(
             runtime="/does-not-exist/podman", storage_root="/tmp", image="mock-image")
         with self.assertRaises(ContainerRuntimeError) as ctx:
-            engine.execute_command(cmd_str="anything")
+            engine.execute_command(command=["anything"])
         self.assertIn("Failed to launch container runtime", str(ctx.exception))
         self.assertIn("No such file or directory: '/does-not-exist/podman'", str(ctx.exception))
 
@@ -391,7 +420,7 @@ class TestExecuteCommandAndPullImage(unittest.TestCase):
         non_exec.chmod(0o644)  # EACCES, not ENOENT
         engine = ContainerEngine(runtime=str(non_exec), storage_root="/tmp", image="mock-image")
         with self.assertRaises(ContainerRuntimeError) as ctx:
-            engine.execute_command(cmd_str="anything")
+            engine.execute_command(command=["anything"])
         self.assertIn("Failed to launch container runtime", str(ctx.exception))
         self.assertIn("Permission denied:", str(ctx.exception))
 
@@ -404,7 +433,7 @@ class TestExecuteCommandAndPullImage(unittest.TestCase):
         )
         engine = ContainerEngine(runtime=runtime, storage_root="/tmp", image="mock-image", name="hung-container")
         with self.assertRaises(ContainerRuntimeError) as ctx:
-            engine.execute_command(cmd_str="anything", timeout=0.3)
+            engine.execute_command(command=["anything"], timeout=0.3)
         self.assertIn("Containerized execution timed out after 0.3s:", str(ctx.exception))
 
         logged_calls = call_log.read_text().strip().splitlines()
@@ -414,7 +443,7 @@ class TestExecuteCommandAndPullImage(unittest.TestCase):
         engine = ContainerEngine(
             runtime=self._mock_runtime("printf '\\377\\376 bad-bytes'; exit 0"),
             storage_root="/tmp", image="mock-image")
-        res = engine.execute_command(cmd_str="anything")
+        res = engine.execute_command(command=["anything"])
         self.assertEqual(res.returncode, 0)
         self.assertEqual(res.stdout, "�� bad-bytes")
 

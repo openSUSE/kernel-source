@@ -440,7 +440,7 @@ class TestInstallModules(unittest.TestCase):
         BuildEngine().install_modules(
             Path("/workspace"), _Engine(), "linux/amd64", {}, "", "gcc", "gcc", Path("/mods"), "x86_64")
         self.assertEqual(len(engine_calls), 1)
-        self.assertIn("modules_install", engine_calls[0]["cmd_str"])
+        self.assertIn("modules_install", " ".join(engine_calls[0]["command"]))
 
     def test_failure_propagates_as_container_runtime_error(self):
         class _FailingEngine:

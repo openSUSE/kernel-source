@@ -186,7 +186,10 @@ class BuildEngine:
                     "ARCH": ctx.linux_arch,
                     "HOSTCC": ctx.host_cc,
                     "CC": ctx.cc,
-                    "CROSS_COMPILE": ctx.cross_compile
+                    "CROSS_COMPILE": ctx.cross_compile,
+                    "GIT_MARKER": git_marker,
+                    "CONFIG_PATCH_CMDS": " && ".join(config_patch_cmds),
+                    "JOBS": str(jobs),
                 }
 
                 # FIXME: native arch container compilation is too slow, hence prefering cross_compilation always
@@ -195,7 +198,7 @@ class BuildEngine:
                     workspace_path_rw=linux_dir,
                     platform=ctx.host_arch_platform,  # FIXME
                     env_dict=env_dict,
-                    cmd_str=container_cmd,
+                    command=["bash", "-c", container_cmd],
                     workspace_mount="/workspace/",
                     tty=True,
                     timeout=CONTAINER_BUILD_TIMEOUT
@@ -349,7 +352,7 @@ class BuildEngine:
             workspace_path_rw=linux_dir,
             platform=host_arch_platform,
             env_dict=env_dict,
-            cmd_str=container_compile_sequence,
+            command=["bash", "-c", container_compile_sequence],
             workspace_mount="/workspace/",
             extra_volumes={str(module_install_root): "/module_root"},
             timeout=CONTAINER_BUILD_TIMEOUT
