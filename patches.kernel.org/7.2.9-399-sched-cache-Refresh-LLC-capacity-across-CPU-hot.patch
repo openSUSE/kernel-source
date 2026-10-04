@@ -1,0 +1,170 @@
+From: Davi Chaves Azevedo <davichazbh@gmail.com>
+Date: Mon, 21 Sep 2026 17:37:27 -0700
+Subject: [PATCH] sched/cache: Refresh LLC capacity across CPU hotplug, to fix
+ capacity underestimation bug
+References: bsc#1012628
+Patch-mainline: 7.2.9
+Git-commit: 3cb0243767fd033bdce95f4f1b5882172a2f8119
+
+commit 3cb0243767fd033bdce95f4f1b5882172a2f8119 upstream.
+
+The scheduler scales LLC capacity by the fraction of cache-sharing CPUs
+covered by a domain:
+
+  llc_bytes = cache_size * span_weight / shared_weight
+
+During CPU teardown, sched_cpu_deactivate() rebuilds scheduler domains
+before cacheinfo_cpu_pre_down() removes the CPU from shared_cpu_map. The
+new domains therefore use the old sharing weight. The later call to
+sched_update_llc_bytes() looks up the departing CPU's sd_llc, which has
+already been detached, and returns without correcting the surviving CPUs.
+
+On a Ryzen 5 7535U with twelve logical CPUs sharing a 16 MiB LLC,
+offlining one SMT sibling left the remaining CPUs with:
+
+  llc_bytes = floor(16777216 * 11 / 12) = 15379114 bytes
+
+The correct capacity is still 16777216 bytes. On systems with active
+cache-aware scheduling, an underestimated capacity can cause
+exceed_llc_capacity() to reject aggregation for a process whose footprint
+would fit. Unchanged cpuset partitions sharing the physical cache can
+also retain stale capacity when a CPU comes online in another partition.
+
+Pass the cache-sharing mask already retained by cacheinfo to the
+scheduler update. Refresh every surviving CPU using its own LLC domain
+so that each partition receives the correct share. This also preserves
+the correction needed as cache-sharing maps grow during boot.
+
+Keep the existing CPU-hotplug and scheduler-domain synchronization. The
+update remains on the hotplug path; no steady-state scheduling operation
+or persistent allocation is added.
+
+Fixes: 7030513a0877 ("sched/cache: Calculate the LLC size and store it in sched_domain")
+Signed-off-by: Davi Chaves Azevedo <davichazbh@gmail.com>
+Signed-off-by: Tim Chen <tim.c.chen@linux.intel.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Reviewed-by: Chen Yu <yu.c.chen@intel.com>
+Reviewed-by: Tim Chen <tim.c.chen@linux.intel.com>
+Reviewed-by: K Prateek Nayak <kprateek.nayak@amd.com>
+Tested-by: Chen Yu <yu.c.chen@intel.com>
+Tested-by: K Prateek Nayak <kprateek.nayak@amd.com>
+Cc: <stable@kernel.org> # v7.2.x
+Link: https://patch.msgid.link/6751d93e15889e624796c74db0bfe66603d60b1b.1790035273.git.tim.c.chen@linux.intel.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/base/cacheinfo.c       | 11 ++++++-----
+ include/linux/sched/topology.h |  4 ++--
+ kernel/sched/topology.c        | 22 +++++++++++++---------
+ 3 files changed, 21 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/base/cacheinfo.c b/drivers/base/cacheinfo.c
+index 9f9c72727a05..7a47a392568a 100644
+--- a/drivers/base/cacheinfo.c
++++ b/drivers/base/cacheinfo.c
+@@ -1040,9 +1040,10 @@ static int cacheinfo_cpu_online(unsigned int cpu)
+ 	rc = cache_add_dev(cpu);
+ 	if (rc)
+ 		goto err;
+-	if (cpu_map_shared_cache(true, cpu, &cpu_map))
++	if (cpu_map_shared_cache(true, cpu, &cpu_map)) {
+ 		update_per_cpu_data_slice_size(true, cpu, cpu_map);
+-	sched_update_llc_bytes(cpu);
++		sched_update_llc_bytes(cpu_map);
++	}
+ 	return 0;
+ err:
+ 	free_cache_attributes(cpu);
+@@ -1059,10 +1060,10 @@ static int cacheinfo_cpu_pre_down(unsigned int cpu)
+ 		cpu_cache_sysfs_exit(cpu);
+ 
+ 	free_cache_attributes(cpu);
+-	if (nr_shared > 1)
++	if (nr_shared > 1) {
+ 		update_per_cpu_data_slice_size(false, cpu, cpu_map);
+-
+-	sched_update_llc_bytes(cpu);
++		sched_update_llc_bytes(cpu_map);
++	}
+ 
+ 	return 0;
+ }
+diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
+index b5d9d7c2b8ad..f96812d71c51 100644
+--- a/include/linux/sched/topology.h
++++ b/include/linux/sched/topology.h
+@@ -281,9 +281,9 @@ static inline int task_node(const struct task_struct *p)
+ }
+ 
+ #ifdef CONFIG_SCHED_CACHE
+-extern void sched_update_llc_bytes(unsigned int cpu);
++extern void sched_update_llc_bytes(const struct cpumask *cpus);
+ #else
+-static inline void sched_update_llc_bytes(unsigned int cpu) { }
++static inline void sched_update_llc_bytes(const struct cpumask *cpus) { }
+ #endif
+ 
+ #endif /* _LINUX_SCHED_TOPOLOGY_H */
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index 622e2e01974c..70b63224a230 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -985,8 +985,8 @@ void sched_cache_active_set(void)
+ }
+ 
+ /*
+- * Update the bottom sched_domain's llc_bytes for @cpu and all its
+- * LLC siblings. Called from cacheinfo_cpu_online() or
++ * Update the bottom sched_domain's llc_bytes for @cpus sharing a physical
++ * LLC. Called from cacheinfo_cpu_online() or
+  * cacheinfo_cpu_pre_down() with cpu hotplug lock held.
+  *
+  * Note: get_effective_llc_bytes() returns 0 on PowerPC.
+@@ -996,17 +996,13 @@ void sched_cache_active_set(void)
+  * and does not populates the per-CPU struct cpu_cacheinfo array
+  * that get_cpu_cacheinfo_llc() reads.
+  */
+-void sched_update_llc_bytes(unsigned int cpu)
++void sched_update_llc_bytes(const struct cpumask *cpus)
+ {
+ 	struct sched_domain *sd, *sdp;
+ 	unsigned int i;
+ 
+ 	sched_domains_mutex_lock();
+ 
+-	sdp = rcu_dereference_sched_domain(per_cpu(sd_llc, cpu));
+-	if (!sdp)
+-		goto unlock;
+-
+ 	/*
+ 	 * ci->shared_cpu_map is built incrementally as CPUs come
+ 	 * online, so the first CPU in an LLC initially sees
+@@ -1014,14 +1010,22 @@ void sched_update_llc_bytes(unsigned int cpu)
+ 	 * get_effective_llc_bytes().  Re-evaluating every LLC
+ 	 * sibling on each online event corrects this once the full
+ 	 * shared_cpu_map is known.
++	 *
++	 * The departing CPU's domains have already been detached when
++	 * cacheinfo removes it. Use the surviving cache siblings instead.
++	 * They may belong to different cpuset partitions, so use each CPU's
++	 * own LLC domain to scale its share of the physical cache.
+ 	 */
+-	for_each_cpu(i, sched_domain_span(sdp)) {
++	for_each_cpu(i, cpus) {
++		sdp = rcu_dereference_sched_domain(per_cpu(sd_llc, i));
++		if (!sdp)
++			continue;
++
+ 		sd = rcu_dereference_sched_domain(cpu_rq(i)->sd);
+ 		if (sd)
+ 			sd->llc_bytes = get_effective_llc_bytes(i, sdp);
+ 	}
+ 
+-unlock:
+ 	sched_domains_mutex_unlock();
+ }
+ 
+-- 
+2.55.0
+
