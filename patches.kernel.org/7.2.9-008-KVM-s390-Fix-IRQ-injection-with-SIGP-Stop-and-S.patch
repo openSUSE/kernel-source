@@ -1,0 +1,176 @@
+From: Claudio Imbrenda <imbrenda@linux.ibm.com>
+Date: Wed, 12 Aug 2026 12:44:33 +0200
+Subject: [PATCH] KVM: s390: Fix IRQ injection with SIGP Stop and Store Status
+References: bsc#1012628
+Patch-mainline: 7.2.9
+Git-commit: d343407b728a80b74be3c24b59f15e60289ea527
+
+[ Upstream commit d343407b728a80b74be3c24b59f15e60289ea527 ]
+
+When __inject_sigp_stop() is called for a Stop and Store Status
+operation, if the vCPU is running, the interrupt is marked as pending
+and the status is stored by the thread performing the KVM_RUN IOCTL.
+
+If the vCPU is already stopped, the status is stored immediately.
+
+Storing the status means writing into userspace, which might fault, and
+__inject_sigp_stop() is called from do_inject_vcpu() which in turn is
+always called holding a spinlock, which is obviously an issue.
+
+Fix this by returning -EWOULDBLOCK from __inject_sigp_stop(), and
+adding a bool flag to indicate whether a store status is needed. The
+callers of do_inject_vcpu() are modified to pass the pointer to the
+bool flag; whenever a Store Status operation is needed, the callers can
+now perform it outside the spinlock.
+
+Opportunistically refactor kvm_s390_set_irq_state() to use
+scoped_guard() and __free().
+
+Fixes: 6cddd432e3da ("KVM: s390: handle stop irqs without action_bits")
+Signed-off-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+[ Added Fixes tag while picking -- Claudio ]
+Message-ID: <20260812104436.109741-7-imbrenda@linux.ibm.com>
+Stable-dep-of: f3a557067d57 ("KVM: s390: Add missing srcu in kvm_s390_set_irq_state()")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ arch/s390/kvm/interrupt.c | 70 +++++++++++++++++++++------------------
+ 1 file changed, 38 insertions(+), 32 deletions(-)
+
+diff --git a/arch/s390/kvm/interrupt.c b/arch/s390/kvm/interrupt.c
+index 70431eb38aa5..6397b53e33f5 100644
+--- a/arch/s390/kvm/interrupt.c
++++ b/arch/s390/kvm/interrupt.c
+@@ -1550,23 +1550,21 @@ static int __inject_set_prefix(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq)
+ }
+ 
+ #define KVM_S390_STOP_SUPP_FLAGS (KVM_S390_STOP_FLAG_STORE_STATUS)
+-static int __inject_sigp_stop(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq)
++static int __inject_sigp_stop(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq, bool *storestatus)
+ {
+ 	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ 	struct kvm_s390_stop_info *stop = &li->irq.stop;
+-	int rc = 0;
+ 
+ 	vcpu->stat.inject_stop_signal++;
+ 	trace_kvm_s390_inject_vcpu(vcpu->vcpu_id, KVM_S390_SIGP_STOP, 0, 0);
+ 
+ 	if (irq->u.stop.flags & ~KVM_S390_STOP_SUPP_FLAGS)
+ 		return -EINVAL;
+-
+ 	if (is_vcpu_stopped(vcpu)) {
+-		if (irq->u.stop.flags & KVM_S390_STOP_FLAG_STORE_STATUS)
+-			rc = kvm_s390_store_status_unloaded(vcpu,
+-						KVM_S390_STORE_STATUS_NOADDR);
+-		return rc;
++		if (!(irq->u.stop.flags & KVM_S390_STOP_FLAG_STORE_STATUS))
++			return 0;
++		*storestatus = true;
++		return -EWOULDBLOCK;
+ 	}
+ 
+ 	if (test_and_set_bit(IRQ_PEND_SIGP_STOP, &li->pending_irqs))
+@@ -2102,7 +2100,7 @@ void kvm_s390_clear_stop_irq(struct kvm_vcpu *vcpu)
+ 	spin_unlock(&li->lock);
+ }
+ 
+-static int do_inject_vcpu(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq)
++static int do_inject_vcpu(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq, bool *storestatus)
+ {
+ 	int rc;
+ 
+@@ -2114,7 +2112,7 @@ static int do_inject_vcpu(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq)
+ 		rc = __inject_set_prefix(vcpu, irq);
+ 		break;
+ 	case KVM_S390_SIGP_STOP:
+-		rc = __inject_sigp_stop(vcpu, irq);
++		rc = __inject_sigp_stop(vcpu, irq, storestatus);
+ 		break;
+ 	case KVM_S390_RESTART:
+ 		rc = __inject_sigp_restart(vcpu);
+@@ -2150,11 +2148,16 @@ static int do_inject_vcpu(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq)
+ int kvm_s390_inject_vcpu(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq)
+ {
+ 	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
++	bool storestatus = false;
+ 	int rc;
+ 
+ 	spin_lock(&li->lock);
+-	rc = do_inject_vcpu(vcpu, irq);
++	rc = do_inject_vcpu(vcpu, irq, &storestatus);
+ 	spin_unlock(&li->lock);
++
++	if (rc == -EWOULDBLOCK && storestatus)
++		rc = kvm_s390_store_status_unloaded(vcpu, KVM_S390_STORE_STATUS_NOADDR);
++
+ 	if (!rc)
+ 		kvm_s390_vcpu_wakeup(vcpu);
+ 	return rc;
+@@ -3190,7 +3193,8 @@ int kvm_set_msi(struct kvm_kernel_irq_routing_entry *e, struct kvm *kvm,
+ int kvm_s390_set_irq_state(struct kvm_vcpu *vcpu, void __user *irqstate, int len)
+ {
+ 	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+-	struct kvm_s390_irq *buf;
++	struct kvm_s390_irq *buf __free(kvfree) = NULL;
++	bool tmp, storestatus = false;
+ 	int r = 0;
+ 	int n;
+ 
+@@ -3198,31 +3202,33 @@ int kvm_s390_set_irq_state(struct kvm_vcpu *vcpu, void __user *irqstate, int len
+ 	if (!buf)
+ 		return -ENOMEM;
+ 
+-	if (copy_from_user((void *) buf, irqstate, len)) {
+-		r = -EFAULT;
+-		goto out_free;
+-	}
++	if (copy_from_user((void *)buf, irqstate, len))
++		return -EFAULT;
+ 
+-	/*
+-	 * Don't allow setting the interrupt state
+-	 * when there are already interrupts pending
+-	 */
+-	spin_lock(&li->lock);
+-	if (li->pending_irqs) {
+-		r = -EBUSY;
+-		goto out_unlock;
+-	}
++	scoped_guard(spinlock, &li->lock) {
++		/*
++		 * Don't allow setting the interrupt state
++		 * when there are already interrupts pending
++		 */
++		if (li->pending_irqs)
++			return -EBUSY;
+ 
+-	for (n = 0; n < len / sizeof(*buf); n++) {
+-		r = do_inject_vcpu(vcpu, &buf[n]);
+-		if (r)
+-			break;
++		for (n = 0; n < len / sizeof(*buf); n++) {
++			tmp = false;
++			r = do_inject_vcpu(vcpu, &buf[n], &tmp);
++			if (r == -EWOULDBLOCK && tmp) {
++				storestatus = true;
++				r = 0;
++			}
++			if (r)
++				break;
++		}
+ 	}
+ 
+-out_unlock:
+-	spin_unlock(&li->lock);
+-out_free:
+-	vfree(buf);
++	if (storestatus) {
++		n = kvm_s390_store_status_unloaded(vcpu, KVM_S390_STORE_STATUS_NOADDR);
++		return r ? r : n;
++	}
+ 
+ 	return r;
+ }
+-- 
+2.55.0
+
