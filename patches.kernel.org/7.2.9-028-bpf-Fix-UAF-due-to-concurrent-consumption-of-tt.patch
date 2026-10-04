@@ -1,0 +1,203 @@
+From: Pu Lehui <pulehui@huawei.com>
+Date: Sat, 5 Sep 2026 02:11:39 +0000
+Subject: [PATCH] bpf: Fix UAF due to concurrent consumption of ttrace lists in
+ alloc_bulk
+References: bsc#1012628
+Patch-mainline: 7.2.9
+Git-commit: 1c21452d02eec2f008e2c5535820f85adbd7587a
+
+[ Upstream commit 1c21452d02eec2f008e2c5535820f85adbd7587a ]
+
+Syzkaller repeatedly triggered UAF splats related to nodes in
+waiting_for_gp_ttrace within the bpf memalloc:
+
+BUG: KASAN: slab-use-after-free in llist_del_first+0x85/0x110 lib/llist.c:61
+Read of size 8 at addr ffff8881572cd080 by task syz.4.470/5112
+ ...
+ llist_del_first+0x85/0x110 lib/llist.c:61
+ alloc_bulk+0x193/0x460 kernel/bpf/memalloc.c:229
+ bpf_mem_refill+0x386/0x560 kernel/bpf/memalloc.c:436
+
+Freed by task 14:
+ ...
+ __free_rcu kernel/bpf/memalloc.c:281 [inline]
+ __free_rcu_tasks_trace+0x48/0xd0 kernel/bpf/memalloc.c:291
+ rcu_tasks_invoke_cbs+0x1ec/0x3e0 kernel/rcu/tasks.h:571
+ rcu_tasks_one_gp+0x13d/0x220 kernel/rcu/tasks.h:621
+ rcu_tasks_kthread+0xf3/0x120 kernel/rcu/tasks.h:651
+
+The reason is that the UAF occurs after the RCU Tasks Trace GP expires:
+when the __free_rcu() callback runs, there is no synchronization
+protecting llist_del_all() against concurrent alloc_bulk() operating on
+waiting_for_gp_ttrace, leading to the race condition below:
+
+CPU0                                           CPU1
+                                               __free_rcu (RCU Tasks Trace callback)
+alloc_bulk
+  llist_del_first(&c->waiting_for_gp_ttrace)
+    entry = smp_load_acquire(&head->first);
+    do {
+      if (entry == NULL)
+        return NULL;
+                                               free_all(llist_del_all(&c->waiting_for_gp_ttrace))
+                                                 llist_for_each_safe(pos, t, llnode)
+                                                   free_one(pos);
+      next = READ_ONCE(entry->next); <-- trigger UAF
+    } while (!try_cmpxchg(&head->first, &entry, next));
+
+In addition, there is also a theoretical race condition on the
+free_by_rcu_ttrace list. This race requires two preconditions: an
+in-flight Tasks Trace GP keeping c->call_rcu_ttrace_in_progress == 1,
+and concurrent cross-CPU frees repopulating c->free_by_rcu_ttrace with
+new nodes. Under these conditions, the following scenario triggers UAF:
+
+// CPU0
+// irq work is still busy (on PREEMPT_RT)
+alloc_bulk()
+  llist_del_first(&c->free_by_rcu_ttrace)
+    entry = smp_load_acquire(&head->first);
+    do {
+      if (entry == NULL)
+        return NULL;
+
+        // CPU1
+        bpf_mem_alloc_destroy()
+          WRITE_ONCE(c->draining, true)
+          // wait for CPU0
+          irq_work_sync()
+
+                // CPU2
+                do_call_rcu_ttrace(tgt(CPU0))
+                  if (c->draining) {
+                    llist_del_all(&c->free_by_rcu_ttrace)
+                    free_all()
+                  }
+
+// CPU0 continue
+      next = READ_ONCE(entry->next); <-- trigger UAF
+    while (!try_cmpxchg(&head->first, &entry, next));
+
+Fix this by introducing a raw spinlock to synchronize the concurrent
+consumption on waiting_for_gp_ttrace and free_by_rcu_ttrace.
+
+Fixes: 04fabf00b4d3 ("bpf: Allow reuse from waiting_for_gp_ttrace list.")
+Suggested-by: Alexei Starovoitov <ast@kernel.org>
+Suggested-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Pu Lehui <pulehui@huawei.com>
+Acked-by: Hou Tao <houtao1@huawei.com>
+Link: https://lore.kernel.org/r/20260905021139.4116529-1-pulehui@huaweicloud.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ kernel/bpf/memalloc.c | 50 ++++++++++++++++++++++++-------------------
+ 1 file changed, 28 insertions(+), 22 deletions(-)
+
+diff --git a/kernel/bpf/memalloc.c b/kernel/bpf/memalloc.c
+index e9662db7198f..8a8f088e83e6 100644
+--- a/kernel/bpf/memalloc.c
++++ b/kernel/bpf/memalloc.c
+@@ -119,6 +119,7 @@ struct bpf_mem_cache {
+ 	struct llist_head waiting_for_gp_ttrace;
+ 	struct rcu_head rcu_ttrace;
+ 	atomic_t call_rcu_ttrace_in_progress;
++	raw_spinlock_t lock;
+ };
+ 
+ struct bpf_mem_caches {
+@@ -214,25 +215,24 @@ static void alloc_bulk(struct bpf_mem_cache *c, int cnt, int node, bool atomic)
+ 	gfp = __GFP_NOWARN | __GFP_ACCOUNT;
+ 	gfp |= atomic ? GFP_NOWAIT : GFP_KERNEL;
+ 
+-	for (i = 0; i < cnt; i++) {
+-		/*
+-		 * For every 'c' llist_del_first(&c->free_by_rcu_ttrace); is
+-		 * done only by one CPU == current CPU. Other CPUs might
+-		 * llist_add() and llist_del_all() in parallel.
+-		 */
+-		obj = llist_del_first(&c->free_by_rcu_ttrace);
+-		if (!obj)
+-			break;
+-		add_obj_to_free_list(c, obj);
+-	}
+-	if (i >= cnt)
+-		return;
++	/*
++	 * c->lock serializes concurrent llist_del_first() against
++	 * llist_del_all() in __free_rcu() and do_call_rcu_ttrace().
++	 */
++	scoped_guard(raw_spinlock_irqsave, &c->lock) {
++		for (i = 0; i < cnt; i++) {
++			obj = llist_del_first(&c->free_by_rcu_ttrace);
++			if (!obj)
++				break;
++			add_obj_to_free_list(c, obj);
++		}
+ 
+-	for (; i < cnt; i++) {
+-		obj = llist_del_first(&c->waiting_for_gp_ttrace);
+-		if (!obj)
+-			break;
+-		add_obj_to_free_list(c, obj);
++		for (; i < cnt; i++) {
++			obj = llist_del_first(&c->waiting_for_gp_ttrace);
++			if (!obj)
++				break;
++			add_obj_to_free_list(c, obj);
++		}
+ 	}
+ 	if (i >= cnt)
+ 		return;
+@@ -279,8 +279,12 @@ static int free_all(struct bpf_mem_cache *c, struct llist_node *llnode, bool per
+ static void __free_rcu(struct rcu_head *head)
+ {
+ 	struct bpf_mem_cache *c = container_of(head, struct bpf_mem_cache, rcu_ttrace);
++	struct llist_node *llnode;
++
++	scoped_guard(raw_spinlock_irqsave, &c->lock)
++		llnode = llist_del_all(&c->waiting_for_gp_ttrace);
+ 
+-	free_all(c, llist_del_all(&c->waiting_for_gp_ttrace), !!c->percpu_size);
++	free_all(c, llnode, !!c->percpu_size);
+ 	atomic_set(&c->call_rcu_ttrace_in_progress, 0);
+ }
+ 
+@@ -300,7 +304,8 @@ static void do_call_rcu_ttrace(struct bpf_mem_cache *c)
+ 
+ 	if (atomic_xchg(&c->call_rcu_ttrace_in_progress, 1)) {
+ 		if (unlikely(READ_ONCE(c->draining))) {
+-			llnode = llist_del_all(&c->free_by_rcu_ttrace);
++			scoped_guard(raw_spinlock_irqsave, &c->lock)
++				llnode = llist_del_all(&c->free_by_rcu_ttrace);
+ 			free_all(c, llnode, !!c->percpu_size);
+ 		}
+ 		return;
+@@ -535,6 +540,7 @@ int bpf_mem_alloc_init(struct bpf_mem_alloc *ma, int size, bool percpu)
+ 			c->objcg = objcg;
+ 			c->percpu_size = percpu_size;
+ 			c->tgt = c;
++			raw_spin_lock_init(&c->lock);
+ 			init_refill_work(c);
+ 			prefill_mem_cache(c, cpu);
+ 		}
+@@ -557,7 +563,7 @@ int bpf_mem_alloc_init(struct bpf_mem_alloc *ma, int size, bool percpu)
+ 			c->objcg = objcg;
+ 			c->percpu_size = percpu_size;
+ 			c->tgt = c;
+-
++			raw_spin_lock_init(&c->lock);
+ 			init_refill_work(c);
+ 			prefill_mem_cache(c, cpu);
+ 		}
+@@ -609,7 +615,7 @@ int bpf_mem_alloc_percpu_unit_init(struct bpf_mem_alloc *ma, int size)
+ 		c->objcg = objcg;
+ 		c->percpu_size = percpu_size;
+ 		c->tgt = c;
+-
++		raw_spin_lock_init(&c->lock);
+ 		init_refill_work(c);
+ 		prefill_mem_cache(c, cpu);
+ 	}
+-- 
+2.55.0
+
