@@ -15,6 +15,49 @@ class ConfigurationError(KernelSandboxError):
     pass
 
 
+class ConfigSpecError(KernelSandboxError):
+    """Raised when a container command spec file is missing/unreadable/violates SPEC_SCHEMA"""
+    pass
+
+
+def is_list_of_str(v):
+    return isinstance(v, list) and all(isinstance(i, str) for i in v)
+
+
+def load_yaml_spec(spec_file, schema=None):
+    """Loads a YAML spec file and validates it against schema: {key: (required, is_valid_func, expected_str)}"""
+    try:
+        with open(spec_file, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError, UnicodeDecodeError) as e:
+        raise ConfigSpecError(f"'{spec_file}': {e}") from e
+
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ConfigSpecError(f"'{spec_file}': expected a YAML mapping")
+
+    if schema:
+        unknown_keys = set(data) - set(schema)
+        if unknown_keys:
+            raise ConfigSpecError(f"'{spec_file}': unknown key(s): {', '.join(sorted(unknown_keys))}")
+
+        for key, (required, is_valid, expected) in schema.items():
+            if key not in data:
+                if required:
+                    raise ConfigSpecError(f"'{spec_file}': missing mandatory key '{key}'")
+                continue
+
+            value = data[key]
+            if value is None and not required:
+                continue
+
+            if not is_valid(value):
+                raise ConfigSpecError(f"'{spec_file}': '{key}' must be '{expected}', instead got: {value}")
+
+    return data
+
+
 def get_host_arch():
     """Returns the host architecture."""
     arch = platform.machine()

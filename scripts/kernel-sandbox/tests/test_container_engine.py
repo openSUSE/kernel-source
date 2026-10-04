@@ -3,9 +3,11 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 import libs.container_engine as container_engine_module
+from libs.config_manager import ConfigSpecError, load_yaml_spec
 from libs.container_engine import ContainerEngine, ContainerRuntimeError
 
 
@@ -199,6 +201,124 @@ class TestBuildCommand(unittest.TestCase):
         cmd = self.engine.build_command(command=["./busybox"], args=["--list"])
         image_idx = cmd.index(self.image)
         self.assertEqual(cmd[image_idx + 1:], ["./busybox", "--list"])
+
+    @contextmanager
+    def create_spec_yaml(self, content: str):
+        """helper to create, and automatically clean up temporary YAML spec files"""
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml") as f:
+            f.write(content)
+            f.flush()
+            yield f.name
+
+    def test_spec_from_yaml_file(self):
+        yaml_content = (
+            "entrypoint: /bin/sh\n"
+            "command:\n"
+            "  - -c\n"
+            "args:\n"
+            "  - echo hello\n"
+        )
+        with self.create_spec_yaml(yaml_content) as spec_file:
+            cmd = self.engine.build_command(spec=spec_file)
+            self.assertIn("--entrypoint", cmd)
+            self.assertEqual(cmd[cmd.index("--entrypoint") + 1], "/bin/sh")
+            image_idx = cmd.index(self.image)
+            self.assertEqual(cmd[image_idx + 1:], ["-c", "echo hello"])
+
+    def test_spec_mutually_exclusive_with_command_or_args_or_entrypoint(self):
+        with self.create_spec_yaml("command: [bash]\n") as spec_file:
+            with self.assertRaises(ContainerRuntimeError):
+                self.engine.build_command(spec=spec_file, command=["bash"])
+            with self.assertRaises(ContainerRuntimeError):
+                self.engine.build_command(spec=spec_file, args=["arg"])
+            with self.assertRaises(ContainerRuntimeError):
+                self.engine.build_command(spec=spec_file, entrypoint="/bin/sh")
+
+    def test_load_yaml_spec_missing_file_raises(self):
+        with self.assertRaises(ConfigSpecError):
+            load_yaml_spec("/non_existent/path.yaml")
+
+    def test_load_yaml_spec_invalid_yaml_raises_container_runtime_error(self):
+        """corrupt YAML in a command spec must immediately raise ConfigSpecError."""
+        with self.create_spec_yaml("command: [invalid command") as spec_file:
+            with self.assertRaises(ConfigSpecError) as ctx:
+                load_yaml_spec(spec_file)
+            self.assertIn(spec_file, str(ctx.exception))
+
+    def test_build_command_with_invalid_yaml_fails_stop(self):
+        """build_command with corrupt spec must raise ConfigSpecError"""
+        with self.create_spec_yaml("command: [invalid command") as spec_file:
+            with self.assertRaises(ConfigSpecError):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_yaml_list_root_raises_runtime_error(self):
+        """spec_root as a list raises ConfigSpecError."""
+        with self.create_spec_yaml("- /bin/bash\n- -c\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"expected a YAML mapping"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_yaml_list_containing_command_literal_raises_runtime_error(self):
+        """spec_root as a list containing the literal string 'command' (['command']) must raise ConfigSpecError."""
+        with self.create_spec_yaml("- command\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"expected a YAML mapping"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_yaml_scalar_root_raises_runtime_error(self):
+        """spec_root as a scalar must raise ConfigSpecError."""
+        with self.create_spec_yaml("command\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"expected a YAML mapping"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_missing_command_key_raises_runtime_error(self):
+        """spec mapping missing 'command' key must raise ConfigSpecError."""
+        with self.create_spec_yaml("entrypoint: /bin/sh\nargs: [echo, hello]\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"missing mandatory key 'command'"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_string_command_raises_spec_error(self):
+        """spec with command as a single string instead of a list must raise ConfigSpecError."""
+        with self.create_spec_yaml("command: /bin/bash\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"'command' must be 'a list of str'"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_int_command_raises_spec_error(self):
+        """spec with command as an integer must raise ConfigSpecError."""
+        with self.create_spec_yaml("command: 12345\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"'command' must be 'a list of str'"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_empty_or_null_command_raises_spec_error(self):
+        """spec with empty or null command must raise ConfigSpecError."""
+        with self.create_spec_yaml("command: []\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"'command' must be 'a list of str'"):
+                self.engine.build_command(spec=spec_file)
+        with self.create_spec_yaml("command: null\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"'command' must be 'a list of str'"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_null_optional_fields_succeeds(self):
+        """optional fields explicitly set to null should be accepted."""
+        with self.create_spec_yaml("command: [bash]\nentrypoint: null\nargs: null\n") as spec_file:
+            cmd = self.engine.build_command(spec=spec_file)
+            self.assertIn(self.image, cmd)
+
+    def test_build_command_with_non_list_args_raises_spec_error(self):
+        """spec with args as a string instead of a list must raise ConfigSpecError."""
+        with self.create_spec_yaml("command: [bash]\nargs: 'echo hello'\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"'args' must be 'a list of str'"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_non_string_entrypoint_raises_spec_error(self):
+        """spec with entrypoint as a list instead of a string must raise ConfigSpecError."""
+        with self.create_spec_yaml("command: [bash]\nentrypoint: ['/bin/sh']\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"'entrypoint' must be 'a string'"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_unknown_keys_raises_spec_error(self):
+        """spec with unrecognized keys must raise ConfigSpecError."""
+        with self.create_spec_yaml("command: [bash]\nextra_key: foo\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"unknown key\(s\): extra_key"):
+                self.engine.build_command(spec=spec_file)
 
 
 class TestBuildPullCommand(unittest.TestCase):
