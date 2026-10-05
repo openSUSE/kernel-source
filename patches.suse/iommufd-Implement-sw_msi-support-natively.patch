@@ -1,0 +1,326 @@
+From: Jason Gunthorpe <jgg@nvidia.com>
+Date: Wed, 19 Feb 2025 17:31:41 -0800
+Subject: iommufd: Implement sw_msi support natively
+Patch-mainline: v6.15-rc1
+Git-commit: 40f5175d0eb77f902ba8e2a5df2a8f3a218c8843
+References: jsc#PED-16989
+
+iommufd has a model where the iommu_domain can be changed while the VFIO
+device is attached. In this case, the MSI should continue to work. This
+corner case has not worked because the dma-iommu implementation of sw_msi
+is tied to a single domain.
+
+Implement the sw_msi mapping directly and use a global per-fd table to
+associate assigned IOVA to the MSI pages. This allows the MSI pages to
+be loaded into a domain before it is attached ensuring that MSI is not
+disrupted.
+
+Link: https://patch.msgid.link/r/e13d23eeacd67c0a692fc468c85b483f4dd51c57.1740014950.git.nicolinc@nvidia.com
+Signed-off-by: Nicolin Chen <nicolinc@nvidia.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ drivers/iommu/iommufd/device.c          |  161 +++++++++++++++++++++++++++-----
+ drivers/iommu/iommufd/hw_pagetable.c    |    3 
+ drivers/iommu/iommufd/iommufd_private.h |   23 ++++
+ drivers/iommu/iommufd/main.c            |    9 +
+ 4 files changed, 173 insertions(+), 23 deletions(-)
+
+--- a/drivers/iommu/iommufd/device.c
++++ b/drivers/iommu/iommufd/device.c
+@@ -5,6 +5,7 @@
+ #include <linux/iommufd.h>
+ #include <linux/slab.h>
+ #include <uapi/linux/iommufd.h>
++#include <linux/msi.h>
+ 
+ #include "../iommu-priv.h"
+ #include "io_pagetable.h"
+@@ -293,36 +294,152 @@ u32 iommufd_device_to_id(struct iommufd_
+ }
+ EXPORT_SYMBOL_NS_GPL(iommufd_device_to_id, IOMMUFD);
+ 
++/*
++ * Get a iommufd_sw_msi_map for the msi physical address requested by the irq
++ * layer. The mapping to IOVA is global to the iommufd file descriptor, every
++ * domain that is attached to a device using the same MSI parameters will use
++ * the same IOVA.
++ */
++static __maybe_unused struct iommufd_sw_msi_map *
++iommufd_sw_msi_get_map(struct iommufd_ctx *ictx, phys_addr_t msi_addr,
++		       phys_addr_t sw_msi_start)
++{
++	struct iommufd_sw_msi_map *cur;
++	unsigned int max_pgoff = 0;
++
++	lockdep_assert_held(&ictx->sw_msi_lock);
++
++	list_for_each_entry(cur, &ictx->sw_msi_list, sw_msi_item) {
++		if (cur->sw_msi_start != sw_msi_start)
++			continue;
++		max_pgoff = max(max_pgoff, cur->pgoff + 1);
++		if (cur->msi_addr == msi_addr)
++			return cur;
++	}
++
++	if (ictx->sw_msi_id >=
++	    BITS_PER_BYTE * sizeof_field(struct iommufd_sw_msi_maps, bitmap))
++		return ERR_PTR(-EOVERFLOW);
++
++	cur = kzalloc(sizeof(*cur), GFP_KERNEL);
++	if (!cur)
++		return ERR_PTR(-ENOMEM);
++
++	cur->sw_msi_start = sw_msi_start;
++	cur->msi_addr = msi_addr;
++	cur->pgoff = max_pgoff;
++	cur->id = ictx->sw_msi_id++;
++	list_add_tail(&cur->sw_msi_item, &ictx->sw_msi_list);
++	return cur;
++}
++
++static int iommufd_sw_msi_install(struct iommufd_ctx *ictx,
++				  struct iommufd_hwpt_paging *hwpt_paging,
++				  struct iommufd_sw_msi_map *msi_map)
++{
++	unsigned long iova;
++
++	lockdep_assert_held(&ictx->sw_msi_lock);
++
++	iova = msi_map->sw_msi_start + msi_map->pgoff * PAGE_SIZE;
++	if (!test_bit(msi_map->id, hwpt_paging->present_sw_msi.bitmap)) {
++		int rc;
++
++		rc = iommu_map(hwpt_paging->common.domain, iova,
++			       msi_map->msi_addr, PAGE_SIZE,
++			       IOMMU_WRITE | IOMMU_READ | IOMMU_MMIO,
++			       GFP_KERNEL_ACCOUNT);
++		if (rc)
++			return rc;
++		__set_bit(msi_map->id, hwpt_paging->present_sw_msi.bitmap);
++	}
++	return 0;
++}
++
++/*
++ * Called by the irq code if the platform translates the MSI address through the
++ * IOMMU. msi_addr is the physical address of the MSI page. iommufd will
++ * allocate a fd global iova for the physical page that is the same on all
++ * domains and devices.
++ */
++#ifdef CONFIG_IRQ_MSI_IOMMU
++int iommufd_sw_msi(struct iommu_domain *domain, struct msi_desc *desc,
++		   phys_addr_t msi_addr)
++{
++	struct device *dev = msi_desc_to_dev(desc);
++	struct iommufd_hwpt_paging *hwpt_paging;
++	struct iommu_attach_handle *raw_handle;
++	struct iommufd_attach_handle *handle;
++	struct iommufd_sw_msi_map *msi_map;
++	struct iommufd_ctx *ictx;
++	unsigned long iova;
++	int rc;
++
++	/*
++	 * It is safe to call iommu_attach_handle_get() here because the iommu
++	 * core code invokes this under the group mutex which also prevents any
++	 * change of the attach handle for the duration of this function.
++	 */
++	iommu_group_mutex_assert(dev);
++
++	raw_handle =
++		iommu_attach_handle_get(dev->iommu_group, IOMMU_NO_PASID, 0);
++	if (IS_ERR(raw_handle))
++		return 0;
++	hwpt_paging = find_hwpt_paging(domain->iommufd_hwpt);
++
++	handle = to_iommufd_handle(raw_handle);
++	/* No IOMMU_RESV_SW_MSI means no change to the msi_msg */
++	if (handle->idev->igroup->sw_msi_start == PHYS_ADDR_MAX)
++		return 0;
++
++	ictx = handle->idev->ictx;
++	guard(mutex)(&ictx->sw_msi_lock);
++	/*
++	 * The input msi_addr is the exact byte offset of the MSI doorbell, we
++	 * assume the caller has checked that it is contained with a MMIO region
++	 * that is secure to map at PAGE_SIZE.
++	 */
++	msi_map = iommufd_sw_msi_get_map(handle->idev->ictx,
++					 msi_addr & PAGE_MASK,
++					 handle->idev->igroup->sw_msi_start);
++	if (IS_ERR(msi_map))
++		return PTR_ERR(msi_map);
++
++	rc = iommufd_sw_msi_install(ictx, hwpt_paging, msi_map);
++	if (rc)
++		return rc;
++	__set_bit(msi_map->id, handle->idev->igroup->required_sw_msi.bitmap);
++
++	iova = msi_map->sw_msi_start + msi_map->pgoff * PAGE_SIZE;
++	msi_desc_set_iommu_msi_iova(desc, iova, PAGE_SHIFT);
++	return 0;
++}
++#endif
++
+ static int iommufd_group_setup_msi(struct iommufd_group *igroup,
+ 				   struct iommufd_hwpt_paging *hwpt_paging)
+ {
+-	phys_addr_t sw_msi_start = igroup->sw_msi_start;
+-	int rc;
++	struct iommufd_ctx *ictx = igroup->ictx;
++	struct iommufd_sw_msi_map *cur;
++
++	if (igroup->sw_msi_start == PHYS_ADDR_MAX)
++		return 0;
+ 
+ 	/*
+-	 * If the IOMMU driver gives a IOMMU_RESV_SW_MSI then it is asking us to
+-	 * call iommu_get_msi_cookie() on its behalf. This is necessary to setup
+-	 * the MSI window so iommu_dma_prepare_msi() can install pages into our
+-	 * domain after request_irq(). If it is not done interrupts will not
+-	 * work on this domain.
+-	 *
+-	 * FIXME: This is conceptually broken for iommufd since we want to allow
+-	 * userspace to change the domains, eg switch from an identity IOAS to a
+-	 * DMA IOAS. There is currently no way to create a MSI window that
+-	 * matches what the IRQ layer actually expects in a newly created
+-	 * domain.
++	 * Install all the MSI pages the device has been using into the domain
+ 	 */
+-	if (sw_msi_start != PHYS_ADDR_MAX && !hwpt_paging->msi_cookie) {
+-		rc = iommu_get_msi_cookie(hwpt_paging->common.domain,
+-					  sw_msi_start);
++	guard(mutex)(&ictx->sw_msi_lock);
++	list_for_each_entry(cur, &ictx->sw_msi_list, sw_msi_item) {
++		int rc;
++
++		if (cur->sw_msi_start != igroup->sw_msi_start ||
++		    !test_bit(cur->id, igroup->required_sw_msi.bitmap))
++			continue;
++
++		rc = iommufd_sw_msi_install(ictx, hwpt_paging, cur);
+ 		if (rc)
+ 			return rc;
+-
+-		/*
+-		 * iommu_get_msi_cookie() can only be called once per domain,
+-		 * it returns -EBUSY on later calls.
+-		 */
+-		hwpt_paging->msi_cookie = true;
+ 	}
+ 	return 0;
+ }
+--- a/drivers/iommu/iommufd/hw_pagetable.c
++++ b/drivers/iommu/iommufd/hw_pagetable.c
+@@ -155,6 +155,7 @@ iommufd_hwpt_paging_alloc(struct iommufd
+ 			goto out_abort;
+ 		}
+ 	}
++	iommu_domain_set_sw_msi(hwpt->domain, iommufd_sw_msi);
+ 
+ 	/*
+ 	 * Set the coherency mode before we do iopt_table_add_domain() as some
+@@ -250,6 +251,7 @@ iommufd_hwpt_nested_alloc(struct iommufd
+ 		goto out_abort;
+ 	}
+ 	hwpt->domain->owner = ops;
++	iommu_domain_set_sw_msi(hwpt->domain, iommufd_sw_msi);
+ 
+ 	if (WARN_ON_ONCE(hwpt->domain->type != IOMMU_DOMAIN_NESTED)) {
+ 		rc = -EINVAL;
+@@ -302,6 +304,7 @@ iommufd_viommu_alloc_hwpt_nested(struct
+ 		goto out_abort;
+ 	}
+ 	hwpt->domain->owner = viommu->iommu_dev->ops;
++	iommu_domain_set_sw_msi(hwpt->domain, iommufd_sw_msi);
+ 
+ 	if (WARN_ON_ONCE(hwpt->domain->type != IOMMU_DOMAIN_NESTED)) {
+ 		rc = -EINVAL;
+--- a/drivers/iommu/iommufd/iommufd_private.h
++++ b/drivers/iommu/iommufd/iommufd_private.h
+@@ -19,12 +19,32 @@ struct iommu_group;
+ struct iommu_option;
+ struct iommufd_device;
+ 
++struct iommufd_sw_msi_map {
++	struct list_head sw_msi_item;
++	phys_addr_t sw_msi_start;
++	phys_addr_t msi_addr;
++	unsigned int pgoff;
++	unsigned int id;
++};
++
++/* Bitmap of struct iommufd_sw_msi_map::id */
++struct iommufd_sw_msi_maps {
++	DECLARE_BITMAP(bitmap, 64);
++};
++
++int iommufd_sw_msi(struct iommu_domain *domain, struct msi_desc *desc,
++		   phys_addr_t msi_addr);
++
+ struct iommufd_ctx {
+ 	struct file *file;
+ 	struct xarray objects;
+ 	struct xarray groups;
+ 	wait_queue_head_t destroy_wait;
+ 
++	struct mutex sw_msi_lock;
++	struct list_head sw_msi_list;
++	unsigned int sw_msi_id;
++
+ 	u8 account_mode;
+ 	/* Compatibility with VFIO no iommu */
+ 	u8 no_iommu_mode;
+@@ -276,10 +296,10 @@ struct iommufd_hwpt_paging {
+ 	struct iommufd_ioas *ioas;
+ 	bool auto_domain : 1;
+ 	bool enforce_cache_coherency : 1;
+-	bool msi_cookie : 1;
+ 	bool nest_parent : 1;
+ 	/* Head at iommufd_ioas::hwpt_list */
+ 	struct list_head hwpt_item;
++	struct iommufd_sw_msi_maps present_sw_msi;
+ };
+ 
+ struct iommufd_hwpt_nested {
+@@ -376,6 +396,7 @@ struct iommufd_group {
+ 	struct iommu_group *group;
+ 	struct iommufd_hw_pagetable *hwpt;
+ 	struct list_head device_list;
++	struct iommufd_sw_msi_maps required_sw_msi;
+ 	phys_addr_t sw_msi_start;
+ };
+ 
+--- a/drivers/iommu/iommufd/main.c
++++ b/drivers/iommu/iommufd/main.c
+@@ -226,6 +226,8 @@ static int iommufd_fops_open(struct inod
+ 	xa_init(&ictx->groups);
+ 	ictx->file = filp;
+ 	init_waitqueue_head(&ictx->destroy_wait);
++	mutex_init(&ictx->sw_msi_lock);
++	INIT_LIST_HEAD(&ictx->sw_msi_list);
+ 	filp->private_data = ictx;
+ 	return 0;
+ }
+@@ -233,6 +235,8 @@ static int iommufd_fops_open(struct inod
+ static int iommufd_fops_release(struct inode *inode, struct file *filp)
+ {
+ 	struct iommufd_ctx *ictx = filp->private_data;
++	struct iommufd_sw_msi_map *next;
++	struct iommufd_sw_msi_map *cur;
+ 	struct iommufd_object *obj;
+ 
+ 	/*
+@@ -261,6 +265,11 @@ static int iommufd_fops_release(struct i
+ 			break;
+ 	}
+ 	WARN_ON(!xa_empty(&ictx->groups));
++
++	mutex_destroy(&ictx->sw_msi_lock);
++	list_for_each_entry_safe(cur, next, &ictx->sw_msi_list, sw_msi_item)
++		kfree(cur);
++
+ 	kfree(ictx);
+ 	return 0;
+ }
