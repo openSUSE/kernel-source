@@ -320,6 +320,28 @@ class TestBuildCommand(unittest.TestCase):
             with self.assertRaisesRegex(ConfigSpecError, r"unknown key\(s\): extra_key"):
                 self.engine.build_command(spec=spec_file)
 
+    def test_compile_kernel_yaml_end_to_end_argv_generation(self):
+        """verify assets/compile_kernel.yaml produces expected container argv structure."""
+        spec_path = Path(__file__).resolve().parent.parent / "assets" / "compile_kernel.yaml"
+        cmd = self.engine.build_command(
+            spec=spec_path,
+            env_dict={
+                "ARCH": "x86_64",
+                "CROSS_COMPILE": "",
+                "CC": "gcc",
+                "HOSTCC": "gcc",
+                "ENABLE_CONFIGS": "CONFIG_VIRTIO_PCI",
+                "DISABLE_CONFIGS": "CONFIG_FOO",
+                "JOBS": "8",
+            }
+        )
+        self.assertIn(self.image, cmd)
+        image_idx = cmd.index(self.image)
+        self.assertEqual(cmd[image_idx + 1:image_idx + 3], ["/bin/bash", "-c"])
+        script = cmd[image_idx + 3]
+        self.assertIn('make clean', script)
+        self.assertIn('make oldconfig', script)
+
 
 class TestBuildPullCommand(unittest.TestCase):
     def test_podman_includes_root_as_two_tokens(self):

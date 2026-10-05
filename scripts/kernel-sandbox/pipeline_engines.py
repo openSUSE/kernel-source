@@ -155,24 +155,11 @@ class BuildEngine:
                     f"Please verify the branch contains config/{ctx.arch}/{ctx.config_flavor}.")
 
             linux_dir = config_file.parent
-            # amend the kernel config to have networking up and 9p passthrough for fast mode
-            config_patch_cmds = [
-                f"./scripts/config --enable {cfg}" for cfg in ctx.enable_configs
-                ] + [f"./scripts/config --disable {cfg}" for cfg in ctx.disable_configs]
-            config_patch_str = " && ".join(config_patch_cmds)
-            config_patch_str = f"{config_patch_str} && " if config_patch_str else ""
             if ctx.jobs is not None:
                 jobs = ctx.jobs
                 logger.info(f"[BUILD] Using user-specified build jobs: -j{jobs} (overriding automatic memory calculation)")
             else:
                 jobs = get_max_build_jobs()
-            container_cmd = (
-                f"echo \"{git_marker}\" > localversion && "
-                f"make clean && "
-                f"{config_patch_str}"
-                f"yes \"\" | make oldconfig && "
-                f"make -j{jobs}"
-            )
 
             with ContainerEngine(
                     runtime=runtime,
@@ -188,17 +175,19 @@ class BuildEngine:
                     "CC": ctx.cc,
                     "CROSS_COMPILE": ctx.cross_compile,
                     "GIT_MARKER": git_marker,
-                    "CONFIG_PATCH_CMDS": " && ".join(config_patch_cmds),
+                    "ENABLE_CONFIGS": " ".join(ctx.enable_configs),
+                    "DISABLE_CONFIGS": " ".join(ctx.disable_configs),
                     "JOBS": str(jobs),
                 }
 
                 # FIXME: native arch container compilation is too slow, hence prefering cross_compilation always
                 # will revisit this later.
+                compile_spec = Path(__file__).resolve().parent / "assets" / "compile_kernel.yaml"
                 container_engine.execute_command(
                     workspace_path_rw=linux_dir,
                     platform=ctx.host_arch_platform,  # FIXME
                     env_dict=env_dict,
-                    command=["bash", "-c", container_cmd],
+                    spec=compile_spec,
                     workspace_mount="/workspace/",
                     tty=True,
                     timeout=CONTAINER_BUILD_TIMEOUT

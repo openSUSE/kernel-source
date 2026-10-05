@@ -238,6 +238,29 @@ class TestBuildEngineExecuteFast(unittest.TestCase):
 
         self.assertEqual(MockContainerEngine.last_instance.remove_container_calls, 2)
 
+    def test_valid_pipeline_build_moved_to_spec(self):
+        """test build pipeline with command spec and config symbols"""
+        ctx = self._ctx(enable_configs=["CONFIG_DEBUG_INFO", "CONFIG_FOO"], disable_configs=["CONFIG_BAR"])
+        self._write_config(ctx)
+        self._write_sequence_patch(ctx)
+        sp_dir = self.workspace / f"kernel-sandbox-sp-{ctx.commit_hash[:7]}-{ctx.arch}-{ctx.config_flavor}" / "current"
+        built_kernel = sp_dir / "arch" / ctx.boot_arch / "boot" / ctx.build_image_name
+        built_kernel.parent.mkdir(parents=True)
+        built_kernel.write_text("mock-bzImage-bytes")
+
+        BuildEngine()._execute_fast(ctx)
+
+        calls = MockContainerEngine.last_instance.calls
+        self.assertEqual(len(calls), 1)
+        env = calls[0]["env_dict"]
+        self.assertEqual(env["ENABLE_CONFIGS"], "CONFIG_DEBUG_INFO CONFIG_FOO")
+        self.assertEqual(env["DISABLE_CONFIGS"], "CONFIG_BAR")
+        self.assertNotIn("CONFIG_PATCH_CMDS", env)
+
+        # verify compile_kernel.yaml command_spec is read
+        spec_content = Path(calls[0]["spec"]).read_text()
+        self.assertIn("ENABLE_CONFIGS", spec_content)
+
     def test_missing_built_kernel_after_successful_compile_raises(self):
         ctx = self._ctx()
         self._write_config(ctx)
