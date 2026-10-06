@@ -1,0 +1,250 @@
+From: Jason Gunthorpe <jgg@nvidia.com>
+Date: Wed, 19 Feb 2025 17:31:38 -0800
+Subject: iommu: Make iommu_dma_prepare_msi() into a generic operation
+Patch-mainline: v6.15-rc1
+Git-commit: 288683c92b1abc32277c83819bea287af614d239
+References: jsc#PED-16989
+
+SW_MSI supports IOMMU to translate an MSI message before the MSI message
+is delivered to the interrupt controller. On such systems, an iommu_domain
+must have a translation for the MSI message for interrupts to work.
+
+The IRQ subsystem will call into IOMMU to request that a physical page be
+set up to receive MSI messages, and the IOMMU then sets an IOVA that maps
+to that physical page. Ultimately the IOVA is programmed into the device
+via the msi_msg.
+
+Generalize this by allowing iommu_domain owners to provide implementations
+of this mapping. Add a function pointer in struct iommu_domain to allow a
+domain owner to provide its own implementation.
+
+Have dma-iommu supply its implementation for IOMMU_DOMAIN_DMA types during
+the iommu_get_dma_cookie() path. For IOMMU_DOMAIN_UNMANAGED types used by
+VFIO (and iommufd for now), have the same iommu_dma_sw_msi set as well in
+the iommu_get_msi_cookie() path.
+
+Hold the group mutex while in iommu_dma_prepare_msi() to ensure the domain
+doesn't change or become freed while running. Races with IRQ operations
+from VFIO and domain changes from iommufd are possible here.
+
+Replace the msi_prepare_lock with a lockdep assertion for the group mutex
+as documentation. For the dmau_iommu.c each iommu_domain is unique to a
+group.
+
+Link: https://patch.msgid.link/r/4ca696150d2baee03af27c4ddefdb7b0b0280e7b.1740014950.git.nicolinc@nvidia.com
+Signed-off-by: Nicolin Chen <nicolinc@nvidia.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ drivers/iommu/dma-iommu.c |   33 ++++++++++++++-------------------
+ drivers/iommu/iommu.c     |   29 +++++++++++++++++++++++++++++
+ include/linux/iommu.h     |   44 ++++++++++++++++++++++++++++++--------------
+ 3 files changed, 73 insertions(+), 33 deletions(-)
+
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@ -24,6 +24,7 @@
+ #include <linux/memremap.h>
+ #include <linux/mm.h>
+ #include <linux/mutex.h>
++#include <linux/msi.h>
+ #include <linux/of_iommu.h>
+ #include <linux/pci.h>
+ #include <linux/scatterlist.h>
+@@ -102,6 +103,9 @@ static int __init iommu_dma_forcedac_set
+ }
+ early_param("iommu.forcedac", iommu_dma_forcedac_setup);
+ 
++static int iommu_dma_sw_msi(struct iommu_domain *domain, struct msi_desc *desc,
++			    phys_addr_t msi_addr);
++
+ /* Number of entries per flush queue */
+ #define IOVA_DEFAULT_FQ_SIZE	256
+ #define IOVA_SINGLE_FQ_SIZE	32768
+@@ -398,6 +402,7 @@ int iommu_get_dma_cookie(struct iommu_do
+ 		return -ENOMEM;
+ 
+ 	mutex_init(&domain->iova_cookie->mutex);
++	iommu_domain_set_sw_msi(domain, iommu_dma_sw_msi);
+ 	return 0;
+ }
+ 
+@@ -429,6 +434,7 @@ int iommu_get_msi_cookie(struct iommu_do
+ 
+ 	cookie->msi_iova = base;
+ 	domain->iova_cookie = cookie;
++	iommu_domain_set_sw_msi(domain, iommu_dma_sw_msi);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(iommu_get_msi_cookie);
+@@ -443,6 +449,9 @@ void iommu_put_dma_cookie(struct iommu_d
+ 	struct iommu_dma_cookie *cookie = domain->iova_cookie;
+ 	struct iommu_dma_msi_page *msi, *tmp;
+ 
++	if (domain->sw_msi != iommu_dma_sw_msi)
++		return;
++
+ 	if (!cookie)
+ 		return;
+ 
+@@ -1800,33 +1809,19 @@ out_free_page:
+ 	return NULL;
+ }
+ 
+-/**
+- * iommu_dma_prepare_msi() - Map the MSI page in the IOMMU domain
+- * @desc: MSI descriptor, will store the MSI page
+- * @msi_addr: MSI target address to be mapped
+- *
+- * Return: 0 on success or negative error code if the mapping failed.
+- */
+-int iommu_dma_prepare_msi(struct msi_desc *desc, phys_addr_t msi_addr)
++static int iommu_dma_sw_msi(struct iommu_domain *domain, struct msi_desc *desc,
++			    phys_addr_t msi_addr)
+ {
+ 	struct device *dev = msi_desc_to_dev(desc);
+-	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+-	struct iommu_dma_msi_page *msi_page;
+-	static DEFINE_MUTEX(msi_prepare_lock); /* see below */
++	const struct iommu_dma_msi_page *msi_page;
+ 
+-	if (!domain || !domain->iova_cookie) {
++	if (!domain->iova_cookie) {
+ 		msi_desc_set_iommu_msi_iova(desc, 0, 0);
+ 		return 0;
+ 	}
+ 
+-	/*
+-	 * In fact the whole prepare operation should already be serialised by
+-	 * irq_domain_mutex further up the callchain, but that's pretty subtle
+-	 * on its own, so consider this locking as failsafe documentation...
+-	 */
+-	mutex_lock(&msi_prepare_lock);
++	iommu_group_mutex_assert(dev);
+ 	msi_page = iommu_dma_get_msi_page(dev, msi_addr, domain);
+-	mutex_unlock(&msi_prepare_lock);
+ 	if (!msi_page)
+ 		return -ENOMEM;
+ 
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -3595,3 +3595,32 @@ err_unlock:
+ 	return ret;
+ }
+ EXPORT_SYMBOL_NS_GPL(iommu_replace_group_handle, IOMMUFD_INTERNAL);
++
++#if IS_ENABLED(CONFIG_IRQ_MSI_IOMMU)
++/**
++ * iommu_dma_prepare_msi() - Map the MSI page in the IOMMU domain
++ * @desc: MSI descriptor, will store the MSI page
++ * @msi_addr: MSI target address to be mapped
++ *
++ * The implementation of sw_msi() should take msi_addr and map it to
++ * an IOVA in the domain and call msi_desc_set_iommu_msi_iova() with the
++ * mapping information.
++ *
++ * Return: 0 on success or negative error code if the mapping failed.
++ */
++int iommu_dma_prepare_msi(struct msi_desc *desc, phys_addr_t msi_addr)
++{
++	struct device *dev = msi_desc_to_dev(desc);
++	struct iommu_group *group = dev->iommu_group;
++	int ret = 0;
++
++	if (!group)
++		return 0;
++
++	mutex_lock(&group->mutex);
++	if (group->domain && group->domain->sw_msi)
++		ret = group->domain->sw_msi(group->domain, desc, msi_addr);
++	mutex_unlock(&group->mutex);
++	return ret;
++}
++#endif /* CONFIG_IRQ_MSI_IOMMU */
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -44,6 +44,8 @@ struct iommu_dma_cookie;
+ struct iommu_fault_param;
+ struct iommufd_ctx;
+ struct iommufd_viommu;
++struct msi_desc;
++struct msi_msg;
+ 
+ #define IOMMU_FAULT_PERM_READ	(1 << 0) /* read */
+ #define IOMMU_FAULT_PERM_WRITE	(1 << 1) /* write */
+@@ -216,6 +218,12 @@ struct iommu_domain {
+ 	struct iommu_domain_geometry geometry;
+ 	struct iommu_dma_cookie *iova_cookie;
+ 	int (*iopf_handler)(struct iopf_group *group);
++
++#if IS_ENABLED(CONFIG_IRQ_MSI_IOMMU)
++	int (*sw_msi)(struct iommu_domain *domain, struct msi_desc *desc,
++		      phys_addr_t msi_addr);
++#endif
++
+ 	void *fault_data;
+ 	union {
+ 		struct {
+@@ -234,6 +242,16 @@ struct iommu_domain {
+ 	};
+ };
+ 
++static inline void iommu_domain_set_sw_msi(
++	struct iommu_domain *domain,
++	int (*sw_msi)(struct iommu_domain *domain, struct msi_desc *desc,
++		      phys_addr_t msi_addr))
++{
++#if IS_ENABLED(CONFIG_IRQ_MSI_IOMMU)
++	domain->sw_msi = sw_msi;
++#endif
++}
++
+ static inline bool iommu_is_dma_domain(struct iommu_domain *domain)
+ {
+ 	return domain->type & __IOMMU_DOMAIN_DMA_API;
+@@ -1474,6 +1492,18 @@ static inline ioasid_t iommu_alloc_globa
+ static inline void iommu_free_global_pasid(ioasid_t pasid) {}
+ #endif /* CONFIG_IOMMU_API */
+ 
++#ifdef CONFIG_IRQ_MSI_IOMMU
++#ifdef CONFIG_IOMMU_API
++int iommu_dma_prepare_msi(struct msi_desc *desc, phys_addr_t msi_addr);
++#else
++static inline int iommu_dma_prepare_msi(struct msi_desc *desc,
++					phys_addr_t msi_addr)
++{
++	return 0;
++}
++#endif /* CONFIG_IOMMU_API */
++#endif /* CONFIG_IRQ_MSI_IOMMU */
++
+ #if IS_ENABLED(CONFIG_LOCKDEP) && IS_ENABLED(CONFIG_IOMMU_API)
+ void iommu_group_mutex_assert(struct device *dev);
+ #else
+@@ -1507,26 +1537,12 @@ static inline void iommu_debugfs_setup(v
+ #endif
+ 
+ #ifdef CONFIG_IOMMU_DMA
+-#include <linux/msi.h>
+-
+ int iommu_get_msi_cookie(struct iommu_domain *domain, dma_addr_t base);
+-
+-int iommu_dma_prepare_msi(struct msi_desc *desc, phys_addr_t msi_addr);
+-
+ #else /* CONFIG_IOMMU_DMA */
+-
+-struct msi_desc;
+-struct msi_msg;
+-
+ static inline int iommu_get_msi_cookie(struct iommu_domain *domain, dma_addr_t base)
+ {
+ 	return -ENODEV;
+ }
+-
+-static inline int iommu_dma_prepare_msi(struct msi_desc *desc, phys_addr_t msi_addr)
+-{
+-	return 0;
+-}
+ #endif	/* CONFIG_IOMMU_DMA */
+ 
+ /*
