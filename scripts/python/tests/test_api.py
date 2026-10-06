@@ -860,6 +860,9 @@ class FakeOBS:
     def __init__(self, prjmeta):
         self.prjmeta = prjmeta
 
+    get_kernel_projects = OBSAPI.get_kernel_projects
+    get_project_repo_archs = OBSAPI.get_project_repo_archs
+
     def project_exists(self, project):
         prj = self.prjmeta.get(project, None)
         return FakeRequest(prj) if prj else None
