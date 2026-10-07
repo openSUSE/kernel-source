@@ -1,5 +1,6 @@
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -100,6 +101,17 @@ class BuildEngine:
                 f"Please verify that the branch contains config/{ctx.arch}/{ctx.config_flavor}."
             )
 
+        overlapping = set(ctx.enable_configs) & set(ctx.disable_configs)
+        if overlapping:
+            raise PipelineError(
+                f"Conflicting kernel configuration: symbols present in both enable and disable lists: {sorted(overlapping)}"
+            )
+
+        CONFIG_SYMBOL_REGEX = re.compile(r"^[A-Z0-9_]+$")
+        for cfg in ctx.enable_configs + ctx.disable_configs:
+            if not cfg or not CONFIG_SYMBOL_REGEX.fullmatch(cfg):
+                raise PipelineError(f"Invalid kernel configuration symbol: '{cfg}'")
+
         # guard the whole cache-check -> build -> cache-write sequence for this
         # specific (commit, arch, config)
         lock_path = artifacts_dir.parent / ".kernel-sandbox-build.lock"
@@ -155,6 +167,7 @@ class BuildEngine:
                     f"Please verify the branch contains config/{ctx.arch}/{ctx.config_flavor}.")
 
             linux_dir = config_file.parent
+
             if ctx.jobs is not None:
                 jobs = ctx.jobs
                 logger.info(f"[BUILD] Using user-specified build jobs: -j{jobs} (overriding automatic memory calculation)")

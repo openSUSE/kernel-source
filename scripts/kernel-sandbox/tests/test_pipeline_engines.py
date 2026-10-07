@@ -261,6 +261,57 @@ class TestBuildEngineExecuteFast(unittest.TestCase):
         spec_content = Path(calls[0]["spec"]).read_text()
         self.assertIn("ENABLE_CONFIGS", spec_content)
 
+    def test_invalid_config_symbol_raises_pipeline_error(self):
+        """kernel config symbols with shell metachars must raise PipelineError"""
+        proof_file = Path(self.tmp_dir.name) / "injected_hazard.txt"
+        malicious_cfg = f"DEBUG_INFO; touch '{proof_file}'"
+        ctx = self._ctx(enable_configs=[malicious_cfg])
+        self._write_config(ctx)
+        self._write_sequence_patch(ctx)
+
+        with self.assertRaisesRegex(PipelineError, r"Invalid kernel configuration symbol"):
+            BuildEngine()._execute_fast(ctx)
+        self.assertFalse(proof_file.exists())
+
+    def test_invalid_config_symbol_unicode_rejected(self):
+        """kernel config symbols containing unicode must be rejected with PipelineError"""
+        ctx_base = self._ctx()
+        self._write_config(ctx_base)
+        for bad_sym in ["CONFIG_DEBUG¹", "CONFIG_TEST_é", "CONFIG_FOO_٣", "CONFIG_TEST\u200b"]:
+            ctx = self._ctx(enable_configs=[bad_sym])
+            with self.assertRaisesRegex(PipelineError, r"Invalid kernel configuration symbol"):
+                BuildEngine()._execute_fast(ctx)
+
+    def test_invalid_config_symbol_boundary_formats(self):
+        """empty symbols, options, assignments, and lowercase symbols must be rejected"""
+        ctx_base = self._ctx()
+        self._write_config(ctx_base)
+        for bad_sym in ["", "-CONFIG_FOO", "--enable", "CONFIG_FOO=y", "config_debug", "CONFIG FOO"]:
+            ctx = self._ctx(enable_configs=[bad_sym])
+            with self.assertRaisesRegex(PipelineError, r"Invalid kernel configuration symbol"):
+                BuildEngine()._execute_fast(ctx)
+
+    def test_overlapping_enable_and_disable_configs_raises_pipeline_error(self):
+        """symbols present in both enable and disable lists must raise PipelineError"""
+        ctx = self._ctx(enable_configs=["CONFIG_DEBUG_INFO"], disable_configs=["CONFIG_DEBUG_INFO"])
+        self._write_config(ctx)
+        with self.assertRaisesRegex(PipelineError, r"Conflicting kernel configuration"):
+            BuildEngine()._execute_fast(ctx)
+
+    def test_valid_symbol_variants_accepted(self):
+        """valid kernel symbols and optional prefixes must be accepted"""
+        ctx = self._ctx(enable_configs=["CONFIG_9P_FS", "CONFIG_VIRTIO_PCI", "9P_FS"])
+        self._write_config(ctx)
+        self._write_sequence_patch(ctx)
+        sp_dir = self.workspace / f"kernel-sandbox-sp-{ctx.commit_hash[:7]}-{ctx.arch}-{ctx.config_flavor}" / "current"
+        built_kernel = sp_dir / "arch" / ctx.boot_arch / "boot" / ctx.build_image_name
+        built_kernel.parent.mkdir(parents=True)
+        built_kernel.write_text("mock-bzImage-bytes")
+
+        BuildEngine()._execute_fast(ctx)
+        calls = MockContainerEngine.last_instance.calls
+        self.assertEqual(len(calls), 1)
+
     def test_missing_built_kernel_after_successful_compile_raises(self):
         ctx = self._ctx()
         self._write_config(ctx)
