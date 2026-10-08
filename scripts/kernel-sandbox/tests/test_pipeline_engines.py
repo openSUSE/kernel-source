@@ -514,7 +514,12 @@ class TestInstallModules(unittest.TestCase):
         BuildEngine().install_modules(
             Path("/workspace"), _Engine(), "linux/amd64", {}, "", "gcc", "gcc", Path("/mods"), "x86_64")
         self.assertEqual(len(engine_calls), 1)
-        self.assertIn("modules_install", " ".join(engine_calls[0]["command"]))
+        spec_path = Path(engine_calls[0]["spec"])
+        self.assertTrue(spec_path.exists())
+        self.assertEqual(spec_path.name, "install_modules.yaml")
+        spec_content = spec_path.read_text()
+        self.assertIn("modules_install", spec_content)
+        self.assertIn("INSTALL_MOD_PATH=/module_root", spec_content)
 
     def test_failure_propagates_as_container_runtime_error(self):
         class _FailingEngine:

@@ -342,6 +342,22 @@ class TestBuildCommand(unittest.TestCase):
         self.assertIn('make clean', script)
         self.assertIn('make oldconfig', script)
 
+    def test_install_modules_yaml_end_to_end_argv_generation(self):
+        """verify assets/install_modules.yaml produces expected container argv structure."""
+        spec_path = Path(__file__).resolve().parent.parent / "assets" / "install_modules.yaml"
+        cmd = self.engine.build_command(
+            spec=spec_path,
+            env_dict={
+                "ARCH": "x86_64",
+                "CROSS_COMPILE": "",
+                "CC": "gcc",
+                "HOSTCC": "gcc",
+            }
+        )
+        self.assertIn(self.image, cmd)
+        image_idx = cmd.index(self.image)
+        self.assertEqual(cmd[image_idx + 1:], ["make", "modules_install", "INSTALL_MOD_PATH=/module_root"])
+
 
 class TestBuildPullCommand(unittest.TestCase):
     def test_podman_includes_root_as_two_tokens(self):

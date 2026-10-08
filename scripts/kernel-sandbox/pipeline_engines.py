@@ -346,15 +346,13 @@ class BuildEngine:
             self, linux_dir, container_engine, host_arch_platform, env_dict, cross_compile, cc, host_cc, module_install_root, linux_arch):
         """compile kernel modules inside the container"""
         logger.info("[BUILD] Installing kernel modules inside the container environment...")
-        make_args_str = f"ARCH={linux_arch} CROSS_COMPILE={cross_compile} CC={cc} HOSTCC={host_cc}"
-        build_steps = [f"make {make_args_str} -j$(nproc --all) modules_install INSTALL_MOD_PATH=/module_root"]
-        container_compile_sequence = " && ".join(build_steps)
+        modules_spec = Path(__file__).resolve().parent / "assets" / "install_modules.yaml"
 
         container_engine.execute_command(
             workspace_path_rw=linux_dir,
             platform=host_arch_platform,
             env_dict=env_dict,
-            command=["bash", "-c", container_compile_sequence],
+            spec=modules_spec,
             workspace_mount="/workspace/",
             extra_volumes={str(module_install_root): "/module_root"},
             timeout=CONTAINER_BUILD_TIMEOUT
