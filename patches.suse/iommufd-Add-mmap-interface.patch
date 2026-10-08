@@ -1,0 +1,282 @@
+From: Nicolin Chen <nicolinc@nvidia.com>
+Date: Wed, 9 Jul 2025 22:59:09 -0700
+Subject: iommufd: Add mmap interface
+Patch-mainline: v6.17-rc1
+Git-commit: 56e9a0d8e53f56f313d332888a32a44a71f3a9ab
+References: jsc#PED-16989
+
+For vIOMMU passing through HW resources to user space (VMs), allowing a VM
+to control the passed through HW directly by accessing hardware registers,
+add an mmap infrastructure to map the physical MMIO pages to user space.
+
+Maintain a maple tree per ictx as a translation table managing mmappable
+regions, from an allocated for-user mmap offset to an iommufd_mmap struct,
+where it stores the real physical address range for io_remap_pfn_range().
+
+Keep track of the lifecycle of the mmappable region by taking refcount of
+its owner, so as to enforce user space to unmap the region first before it
+can destroy its owner object.
+
+To allow an IOMMU driver to add and delete mmappable regions onto/from the
+maple tree, add iommufd_viommu_alloc/destroy_mmap helpers.
+
+Link: https://patch.msgid.link/r/9a888a326b12aa5fe940083eae1156304e210fe0.1752126748.git.nicolinc@nvidia.com
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Reviewed-by: Pranjal Shrivastava <praan@google.com>
+Reviewed-by: Lu Baolu <baolu.lu@linux.intel.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Nicolin Chen <nicolinc@nvidia.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ drivers/iommu/iommufd/driver.c          |   52 ++++++++++++++++++++++++++
+ drivers/iommu/iommufd/iommufd_private.h |   14 +++++++
+ drivers/iommu/iommufd/main.c            |   63 ++++++++++++++++++++++++++++++++
+ include/linux/iommufd.h                 |   42 +++++++++++++++++++++
+ 4 files changed, 171 insertions(+)
+
+--- a/drivers/iommu/iommufd/driver.c
++++ b/drivers/iommu/iommufd/driver.c
+@@ -31,6 +31,58 @@ void _iommufd_object_undepend(struct iom
+ }
+ EXPORT_SYMBOL_NS_GPL(_iommufd_object_undepend, IOMMUFD);
+ 
++/*
++ * Allocate an @offset to return to user space to use for an mmap() syscall
++ *
++ * Driver should use a per-structure helper in include/linux/iommufd.h
++ */
++int _iommufd_alloc_mmap(struct iommufd_ctx *ictx, struct iommufd_object *owner,
++			phys_addr_t mmio_addr, size_t length,
++			unsigned long *offset)
++{
++	struct iommufd_mmap *immap;
++	unsigned long startp;
++	int rc;
++
++	if (!PAGE_ALIGNED(mmio_addr))
++		return -EINVAL;
++	if (!length || !PAGE_ALIGNED(length))
++		return -EINVAL;
++
++	immap = kzalloc(sizeof(*immap), GFP_KERNEL);
++	if (!immap)
++		return -ENOMEM;
++	immap->owner = owner;
++	immap->length = length;
++	immap->mmio_addr = mmio_addr;
++
++	/* Skip the first page to ease caller identifying the returned offset */
++	rc = mtree_alloc_range(&ictx->mt_mmap, &startp, immap, immap->length,
++			       PAGE_SIZE, ULONG_MAX, GFP_KERNEL);
++	if (rc < 0) {
++		kfree(immap);
++		return rc;
++	}
++
++	/* mmap() syscall will right-shift the offset in vma->vm_pgoff too */
++	immap->vm_pgoff = startp >> PAGE_SHIFT;
++	*offset = startp;
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(_iommufd_alloc_mmap, IOMMUFD);
++
++/* Driver should use a per-structure helper in include/linux/iommufd.h */
++void _iommufd_destroy_mmap(struct iommufd_ctx *ictx,
++			   struct iommufd_object *owner, unsigned long offset)
++{
++	struct iommufd_mmap *immap;
++
++	immap = mtree_erase(&ictx->mt_mmap, offset);
++	WARN_ON_ONCE(!immap || immap->owner != owner);
++	kfree(immap);
++}
++EXPORT_SYMBOL_NS_GPL(_iommufd_destroy_mmap, IOMMUFD);
++
+ /* Caller should xa_lock(&viommu->vdevs) to protect the return value */
+ struct device *iommufd_viommu_find_dev(struct iommufd_viommu *viommu,
+ 				       unsigned long vdev_id)
+--- a/drivers/iommu/iommufd/iommufd_private.h
++++ b/drivers/iommu/iommufd/iommufd_private.h
+@@ -7,6 +7,7 @@
+ #include <linux/iommu.h>
+ #include <linux/iommufd.h>
+ #include <linux/iova_bitmap.h>
++#include <linux/maple_tree.h>
+ #include <linux/rwsem.h>
+ #include <linux/uaccess.h>
+ #include <linux/xarray.h>
+@@ -40,6 +41,7 @@ struct iommufd_ctx {
+ 	struct xarray objects;
+ 	struct xarray groups;
+ 	wait_queue_head_t destroy_wait;
++	struct maple_tree mt_mmap;
+ 
+ 	struct mutex sw_msi_lock;
+ 	struct list_head sw_msi_list;
+@@ -51,6 +53,18 @@ struct iommufd_ctx {
+ 	struct iommufd_ioas *vfio_ioas;
+ };
+ 
++/* Entry for iommufd_ctx::mt_mmap */
++struct iommufd_mmap {
++	struct iommufd_object *owner;
++
++	/* Page-shifted start position in mt_mmap to validate vma->vm_pgoff */
++	unsigned long vm_pgoff;
++
++	/* Physical range for io_remap_pfn_range() */
++	phys_addr_t mmio_addr;
++	size_t length;
++};
++
+ /*
+  * The IOVA to PFN map. The map automatically copies the PFNs into multiple
+  * domains and permits sharing of PFNs between io_pagetable instances. This
+--- a/drivers/iommu/iommufd/main.c
++++ b/drivers/iommu/iommufd/main.c
+@@ -275,6 +275,7 @@ static int iommufd_fops_open(struct inod
+ 	xa_init_flags(&ictx->objects, XA_FLAGS_ALLOC1 | XA_FLAGS_ACCOUNT);
+ 	xa_init(&ictx->groups);
+ 	ictx->file = filp;
++	mt_init_flags(&ictx->mt_mmap, MT_FLAGS_ALLOC_RANGE);
+ 	init_waitqueue_head(&ictx->destroy_wait);
+ 	mutex_init(&ictx->sw_msi_lock);
+ 	INIT_LIST_HEAD(&ictx->sw_msi_list);
+@@ -475,11 +476,73 @@ static long iommufd_fops_ioctl(struct fi
+ 	return ret;
+ }
+ 
++static void iommufd_fops_vma_open(struct vm_area_struct *vma)
++{
++	struct iommufd_mmap *immap = vma->vm_private_data;
++
++	refcount_inc(&immap->owner->users);
++}
++
++static void iommufd_fops_vma_close(struct vm_area_struct *vma)
++{
++	struct iommufd_mmap *immap = vma->vm_private_data;
++
++	refcount_dec(&immap->owner->users);
++}
++
++static const struct vm_operations_struct iommufd_vma_ops = {
++	.open = iommufd_fops_vma_open,
++	.close = iommufd_fops_vma_close,
++};
++
++/* The vm_pgoff must be pre-allocated from mt_mmap, and given to user space */
++static int iommufd_fops_mmap(struct file *filp, struct vm_area_struct *vma)
++{
++	struct iommufd_ctx *ictx = filp->private_data;
++	size_t length = vma->vm_end - vma->vm_start;
++	struct iommufd_mmap *immap;
++	int rc;
++
++	if (!PAGE_ALIGNED(length))
++		return -EINVAL;
++	if (!(vma->vm_flags & VM_SHARED))
++		return -EINVAL;
++	if (vma->vm_flags & VM_EXEC)
++		return -EPERM;
++
++	/* vma->vm_pgoff carries a page-shifted start position to an immap */
++	immap = mtree_load(&ictx->mt_mmap, vma->vm_pgoff << PAGE_SHIFT);
++	if (!immap)
++		return -ENXIO;
++	/*
++	 * mtree_load() returns the immap for any contained mmio_addr, so only
++	 * allow the exact immap thing to be mapped
++	 */
++	if (vma->vm_pgoff != immap->vm_pgoff || length != immap->length)
++		return -ENXIO;
++
++	vma->vm_pgoff = 0;
++	vma->vm_private_data = immap;
++	vma->vm_ops = &iommufd_vma_ops;
++	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
++
++	rc = io_remap_pfn_range(vma, vma->vm_start,
++				immap->mmio_addr >> PAGE_SHIFT, length,
++				vma->vm_page_prot);
++	if (rc)
++		return rc;
++
++	/* vm_ops.open won't be called for mmap itself. */
++	refcount_inc(&immap->owner->users);
++	return rc;
++}
++
+ static const struct file_operations iommufd_fops = {
+ 	.owner = THIS_MODULE,
+ 	.open = iommufd_fops_open,
+ 	.release = iommufd_fops_release,
+ 	.unlocked_ioctl = iommufd_fops_ioctl,
++	.mmap = iommufd_fops_mmap,
+ };
+ 
+ /**
+--- a/include/linux/iommufd.h
++++ b/include/linux/iommufd.h
+@@ -251,6 +251,11 @@ int _iommufd_object_depend(struct iommuf
+ 			   struct iommufd_object *obj_depended);
+ void _iommufd_object_undepend(struct iommufd_object *obj_dependent,
+ 			      struct iommufd_object *obj_depended);
++int _iommufd_alloc_mmap(struct iommufd_ctx *ictx, struct iommufd_object *owner,
++			phys_addr_t mmio_addr, size_t length,
++			unsigned long *offset);
++void _iommufd_destroy_mmap(struct iommufd_ctx *ictx,
++			   struct iommufd_object *owner, unsigned long offset);
+ struct device *iommufd_viommu_find_dev(struct iommufd_viommu *viommu,
+ 				       unsigned long vdev_id);
+ int iommufd_viommu_get_vdev_id(struct iommufd_viommu *viommu,
+@@ -271,6 +276,20 @@ _iommufd_object_undepend(struct iommufd_
+ {
+ }
+ 
++static inline int _iommufd_alloc_mmap(struct iommufd_ctx *ictx,
++				      struct iommufd_object *owner,
++				      phys_addr_t mmio_addr, size_t length,
++				      unsigned long *offset)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline void _iommufd_destroy_mmap(struct iommufd_ctx *ictx,
++					 struct iommufd_object *owner,
++					 unsigned long offset)
++{
++}
++
+ static inline struct device *
+ iommufd_viommu_find_dev(struct iommufd_viommu *viommu, unsigned long vdev_id)
+ {
+@@ -338,4 +357,27 @@ static inline int iommufd_viommu_report_
+ 		_iommufd_object_undepend(&dependent->member.obj,               \
+ 					 &depended->member.obj);               \
+ 	})
++
++/*
++ * Helpers for IOMMU driver to alloc/destroy an mmapable area for a structure.
++ *
++ * To support an mmappable MMIO region, kernel driver must first register it to
++ * iommufd core to allocate an @offset, during a driver-structure initialization
++ * (e.g. viommu_init op). Then, it should report to user space this @offset and
++ * the @length of the MMIO region for mmap syscall.
++ */
++static inline int iommufd_viommu_alloc_mmap(struct iommufd_viommu *viommu,
++					    phys_addr_t mmio_addr,
++					    size_t length,
++					    unsigned long *offset)
++{
++	return _iommufd_alloc_mmap(viommu->ictx, &viommu->obj, mmio_addr,
++				   length, offset);
++}
++
++static inline void iommufd_viommu_destroy_mmap(struct iommufd_viommu *viommu,
++					       unsigned long offset)
++{
++	_iommufd_destroy_mmap(viommu->ictx, &viommu->obj, offset);
++}
+ #endif
