@@ -38,8 +38,7 @@ class TestLinuxGit(unittest.TestCase):
 
 
     def test_nonbare(self):
-        self.run_one(bare=False, var=self.tmpdir,
-                     output=os.path.join(self.tmpdir, ".git") + "\n")
+        self.run_one(bare=False, var=self.tmpdir, output=self.tmpdir + "\n")
 
 
     def test_nonbare_git(self):

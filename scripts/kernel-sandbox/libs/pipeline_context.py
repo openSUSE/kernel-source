@@ -8,7 +8,8 @@ class PipelineContext:
     """Fields required regardless of mode."""
     def __init__(
             self, workspace, build_root, cache_dir, commit_hash, arch, config_flavor, mode,
-            refresh_cache, use_busybox_initrd, qemu_bin, extra_qemu, host_arch, ssh_enabled, qemu_profile=None):
+            refresh_cache, use_busybox_initrd, qemu_bin, extra_qemu, host_arch, ssh_enabled,
+            qemu_profile=None, jobs=None):
         self.workspace = workspace
         self.build_root = build_root
         self.cache_dir = cache_dir
@@ -23,6 +24,7 @@ class PipelineContext:
         self.host_arch = host_arch
         self.ssh_enabled = ssh_enabled
         self.qemu_profile = qemu_profile
+        self.jobs = jobs
 
     @property
     def artifacts_dir(self):

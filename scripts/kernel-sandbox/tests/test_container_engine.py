@@ -334,7 +334,8 @@ class TestRun(unittest.TestCase):
             mock_stdout.seek(0)
             self.assertIn("shown live", mock_stdout.read())
 
-    def test_interactive_failure_falls_back_to_generic_message(self):
+    def test_interactive_failure_falls_back_to_streamed_not_captured_message(self):
+        """interactive sessions inherit the real fds untouched, stdout/stderr not captured"""
         with tempfile.TemporaryFile(mode="w+") as mock_stderr:
             with _redirect_real_fd(2, mock_stderr):
                 with self.assertRaises(ContainerRuntimeError) as ctx:
@@ -342,7 +343,8 @@ class TestRun(unittest.TestCase):
                         [sys.executable, "-c", "import sys; sys.stderr.write('live error'); sys.exit(1)"],
                         interactive=True)
 
-            self.assertIn("Unknown container error", str(ctx.exception))
+            self.assertIn("output was streamed live to the terminal above and was not captured", str(ctx.exception))
+            self.assertNotIn("Unknown container error", str(ctx.exception))
             mock_stderr.seek(0)
             self.assertIn("live error", mock_stderr.read())
 
