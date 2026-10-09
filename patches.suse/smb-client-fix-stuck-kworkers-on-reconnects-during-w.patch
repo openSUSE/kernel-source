@@ -1,0 +1,269 @@
+From f348b9cfb9d4fbeceb4ba143de7580d5991930c6 Mon Sep 17 00:00:00 2001
+From: Enzo Matsumiya <ematsumiya@suse.de>
+Date: Fri, 8 May 2026 14:36:41 -0300
+References: bsc#1253005
+Patch-mainline: Never, fixed by external subsystem (netfs)
+Subject: [PATCH 1/6] smb: client: fix stuck kworkers on reconnects during
+ writes
+
+On write-heavy workloads (e.g. 1000s of concurrent writes), a network
+outage might leave the kernel hanging:
+
+(running/spinning tasks)
+- high contention of TCP_Server_Info::_srv_mutex -- because of the
+  many sends waiting on it while the current holder waits for
+  sock_sendmsg() to timeout
+
+(sleeping/D-state tasks)
+- async writevs coming from fsync -> fdatawrite -> do_writepages keeps
+  waiting forever because it's deadlocked with wait_for_free_credits()
+  taking too long to be woken up
+
+Writers starts erroring out slowly, but tasks that are still waiting
+for the mutex/credits are eventually considered hanging (by softlockup
+detector in the first case, by hung task detector if the latter).
+
+The second case mostly happens when servers are slow to grant credits
+for new sessions -- it's mostly fixed by a cond_resched() in
+cifs_writepages() error cases.
+
+For the first case, reconnects themselves get stuck waiting for the
+mutex, delaying even further the recovery.
+
+Main reason for such high contention is because smb_send_kvec() keeps
+retrying unconditionally (when sock_sendmsg() returns -EAGAIN) for
+~15s without ever checking if server/socket are even in a valid state,
+and also there's no yield mechanism to allow some other thread (e.g.
+cifsd or echo) to detect the need for reconnect.
+
+To fix this, we must check for TCP_Server_Info::tcpStatus in some
+targeted points:
+
+- in between sends:
+  - relieve the mutex contention (bail out earlier from smb_send_kvec()
+    without having to wait for socket timeout)
+  - and, thus, allow reconnects to take place instead of keep retrying
+    sending data through a dead connection
+- in between write retries (cifs_writev_requeue):
+  - write retries currently have no server health checks, making the
+    retries attempts a blind shot
+
+This patch adds check_server_down() helper and call it from:
+- as a condition in wait_event_state() in wait_for_response()
+- smb_send_kvec(), before sock_sendmsg() (wakes up the above if helper
+  returns non-zero)
+- smb2_plain_req_init(), before smb2_reconnect() -- this is required
+  so we don't even enter SMB2 PDU commands and get stuck waiting for
+  any ongoing reconnects on commands that can't wait too long i.e.
+  from VFS (namely open/create, read, and write)
+
+check_server_down() checks TCP_Server_Info::tcpStatus and returns
+-ECONNABORTED if CifsNeedReconnect, -EHOSTDOWN if CifsExiting, 0
+otherwise (these others should already have the appropriate handling).
+When needed, ops are retried on reconnect (or by userspace, in case
+of writev) instead of immediately.
+
+This is similar to what's done on the receiving side in
+cifs_readv_from_socket() with server_unresponsive().
+
+Also change __smb_send_rqst() to log error only when
+rc != -ECONNABORTED to avoid flooding dmesg when we're going to
+reconnect anyway.
+
+Signed-off-by: Enzo Matsumiya <ematsumiya@suse.de>
+---
+ fs/smb/client/cifsglob.h  |   16 ++++++++++++++++
+ fs/smb/client/dir.c       |    6 ++++++
+ fs/smb/client/file.c      |   10 ++++++++--
+ fs/smb/client/inode.c     |    5 +++++
+ fs/smb/client/smb2pdu.c   |   16 ++++++++++++++++
+ fs/smb/client/transport.c |   33 ++++++++++++++++++++++++---------
+ 6 files changed, 75 insertions(+), 11 deletions(-)
+
+--- a/fs/smb/client/cifsglob.h
++++ b/fs/smb/client/cifsglob.h
+@@ -783,6 +783,22 @@
+ 	memalloc_nofs_restore(nofs_flag);
+ }
+ 
++static inline int check_server_down(struct TCP_Server_Info *server)
++{
++	int status = READ_ONCE(server->tcpStatus);
++
++	if (likely(status == CifsGood))
++		return 0;
++
++	if (status == CifsNeedReconnect)
++		return -ECONNABORTED;
++
++	if (status == CifsExiting)
++		return -EHOSTDOWN;
++
++	return 0;
++}
++
+ struct cifs_credits {
+ 	unsigned int value;
+ 	unsigned int instance;
+--- a/fs/smb/client/dir.c
++++ b/fs/smb/client/dir.c
+@@ -478,6 +478,12 @@
+ 		goto out;
+ 
+ 	server = tcon->ses->server;
++	rc = check_server_down(server);
++	if (unlikely(rc)) {
++		if (rc == -ECONNABORTED)
++			rc = -EAGAIN;
++		goto out;
++	}
+ 
+ 	if (server->ops->new_lease_key)
+ 		server->ops->new_lease_key(&fid);
+--- a/fs/smb/client/file.c
++++ b/fs/smb/client/file.c
+@@ -2781,6 +2781,7 @@
+ 		if (nr_pages == 0) {
+ 			kref_put(&wdata->refcount, cifs_writedata_release);
+ 			add_credits_and_wake_if(server, credits, 0);
++			cond_resched();
+ 			continue;
+ 		}
+ 
+@@ -2821,6 +2822,7 @@
+ 
+ 		if (wbc->sync_mode == WB_SYNC_ALL && rc == -EAGAIN) {
+ 			index = saved_index;
++			cond_resched();
+ 			continue;
+ 		}
+ 
+@@ -2830,8 +2832,11 @@
+ 			break;
+ 		}
+ 
+-		if (rc != 0 && saved_rc == 0)
+-			saved_rc = rc;
++		if (rc != 0) {
++			if (saved_rc == 0)
++				saved_rc = rc;
++			cond_resched();
++		}
+ 
+ 		wbc->nr_to_write -= nr_pages;
+ 		if (wbc->nr_to_write <= 0)
+@@ -2847,6 +2852,7 @@
+ 		 */
+ 		scanned = true;
+ 		index = 0;
++		cond_resched();
+ 		goto retry;
+ 	}
+ 
+--- a/fs/smb/client/inode.c
++++ b/fs/smb/client/inode.c
+@@ -974,6 +974,11 @@
+ 		return PTR_ERR(tlink);
+ 	tcon = tlink_tcon(tlink);
+ 	server = tcon->ses->server;
++	rc = check_server_down(server);
++	if (unlikely(rc)) {
++		cifs_put_tlink(tlink);
++		return rc;
++	}
+ 
+ 	/*
+ 	 * 1. Fetch file metadata if not provided (data)
+--- a/fs/smb/client/smb2pdu.c
++++ b/fs/smb/client/smb2pdu.c
+@@ -396,6 +396,22 @@
+ {
+ 	int rc;
+ 
++	rc = check_server_down(server);
++	if (unlikely(rc)) {
++		if (rc == -EHOSTDOWN)
++			return rc;
++
++		switch (smb2_command) {
++		case SMB2_READ:
++		case SMB2_WRITE:
++		case SMB2_CREATE:
++			wake_up_all(&server->response_q);
++			cond_resched();
++			msleep(200);
++			return rc;
++		}
++	}
++
+ 	rc = smb2_reconnect(smb2_command, tcon, server);
+ 	if (rc)
+ 		return rc;
+--- a/fs/smb/client/transport.c
++++ b/fs/smb/client/transport.c
+@@ -195,6 +195,16 @@
+ 
+ 	while (msg_data_left(smb_msg)) {
+ 		/*
++		 * Don't even attempt sending data over a dead connection.
++		 * (avoid stuck sends and -EPIPE errors)
++		 */
++		rc = check_server_down(server);
++		if (unlikely(rc)) {
++			wake_up_all(&server->response_q);
++			return rc;
++		}
++
++		/*
+ 		 * If blocking send, we try 3 times, since each can block
+ 		 * for 5 seconds. For nonblocking  we have to try more
+ 		 * but wait increasing amounts of time allowing time for
+@@ -427,10 +437,13 @@
+ 						  server->conn_id, server->hostname);
+ 	}
+ smbd_done:
+-	if (rc < 0 && rc != -EINTR)
+-		cifs_server_dbg(VFS, "Error %d sending data on socket to server\n",
+-			 rc);
+-	else if (rc > 0)
++	if (rc < 0 && rc != -EINTR) {
++		if (rc != -ECONNABORTED) {
++			cifs_server_dbg(VFS, "Error %d sending data on socket to server\n", rc);
++			rc = -ECONNABORTED;
++		}
++		cifs_signal_cifsd_for_reconnect(server, false);
++	} else if (rc > 0)
+ 		rc = 0;
+ out:
+ 	cifs_in_send_dec(server);
+@@ -759,8 +772,9 @@
+ 		 * since there's no one else to do a reconnect.
+ 		 */
+ 		error = wait_event_killable_timeout(server->response_q,
+-						    midQ->mid_state != MID_REQUEST_SUBMITTED &&
+-						    midQ->mid_state != MID_RESPONSE_RECEIVED,
++						    (midQ->mid_state != MID_REQUEST_SUBMITTED &&
++						     midQ->mid_state != MID_RESPONSE_RECEIVED) ||
++						    check_server_down(server) != 0,
+ 						    10 * HZ);
+ 
+ 		/* timeout elapsed with no response */
+@@ -768,14 +782,15 @@
+ 			return -EAGAIN;
+ 	} else {
+ 		error = wait_event_freezekillable_unsafe(server->response_q,
+-							 midQ->mid_state != MID_REQUEST_SUBMITTED &&
+-							 midQ->mid_state != MID_RESPONSE_RECEIVED);
++							 (midQ->mid_state != MID_REQUEST_SUBMITTED &&
++							  midQ->mid_state != MID_RESPONSE_RECEIVED) ||
++							 check_server_down(server) != 0);
+ 	}
+ 
+ 	if (error < 0)
+ 		return -ERESTARTSYS;
+ 
+-	return 0;
++	return check_server_down(server);
+ }
+ 
+ struct mid_q_entry *

@@ -71,51 +71,6 @@ var_override () {
 	fi
 }
 
-# expand_git_ref [options]
-# Options:
-#    -q, --quiet          Do not error out if a refspec is not found, just print an empty line
-expand_git_ref () {
-	local result=$(getopt -o q --long quiet -n "${BASH_SOURCE[0]}:${FUNCNAME[0]}()" -- "$@")
-	local opt_quiet
-
-	if [ $? != 0 ]; then
-		echo "Error: getopt error" >&2
-		exit 1
-	fi
-
-	eval set -- "$result"
-
-	while true ; do
-		case "$1" in
-			-q|--quiet)
-						opt_quiet=1
-						;;
-			--)
-						shift
-						break
-						;;
-			*)
-						echo "Error: could not parse arguments" >&2
-						exit 1
-						;;
-		esac
-		shift
-	done
-
-	local commit rest
-	# take the first word only, which will discard cruft like "(partial)"
-	while read commit rest; do
-		local hash
-		local cmd="git log -n1 --pretty=format:%H '$commit' --"
-		if [ -z "$opt_quiet" ] && ! hash=$(eval "$cmd"); then
-			return 1
-		else
-			hash=$(eval "$cmd" 2>/dev/null || true)
-		fi
-		echo $hash
-	done
-}
-
 # remove_subject_annotation
 remove_subject_annotation () {
 	sed -re 's/^( *\[[^]]*\] *)+//'

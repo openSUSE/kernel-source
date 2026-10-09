@@ -10,7 +10,56 @@ from libs.image_customizer import DependencyError, ImageCustomizationError
 from libs.initrd_builder import InitrdBuildError
 from libs.pipeline_context import FastModeContext, RpmModeContext
 from libs.virtual_engine import VirtualEngineError
-from pipeline_engines import BootEngine, BuildEngine, ImagePreparer, PipelineError
+from pipeline_engines import BootEngine, BuildEngine, ImagePreparer, PipelineError, get_max_build_jobs
+
+
+class TestGetMaxBuildJobs(unittest.TestCase):
+    def setUp(self):
+        self._original_calc_ram = pipeline_engines.calc_available_ram_gb
+        self._original_cpu_count = pipeline_engines.os.cpu_count
+        self._original_logger_warning = pipeline_engines.logger.warning
+
+    def tearDown(self):
+        pipeline_engines.calc_available_ram_gb = self._original_calc_ram
+        pipeline_engines.os.cpu_count = self._original_cpu_count
+        pipeline_engines.logger.warning = self._original_logger_warning
+
+    def _mock(self, ram_gb, cpu_count):
+        pipeline_engines.calc_available_ram_gb = lambda: ram_gb
+        pipeline_engines.os.cpu_count = lambda: cpu_count
+
+    def test_cpu_bound_when_ram_plentiful(self):
+        """plenty of RAM -> jobs == cpu_count"""
+        self._mock(ram_gb=64.0, cpu_count=16)
+        self.assertEqual(get_max_build_jobs(), 16)
+
+    def test_mem_bound_when_ram_scarce(self):
+        """little RAM -> jobs == mem_jobs, clamped below cpu_count"""
+        self._mock(ram_gb=4.0, cpu_count=16)
+        # usable = 4.0 - min_headroom_gb(1.0) = 3.0; mem_jobs = int(3.0 / ram_per_job_gb(0.5)) = 6
+        jobs = get_max_build_jobs()
+        self.assertEqual(jobs, 6)
+        self.assertLess(jobs, 16)
+
+    def test_zero_available_ram_produces_1_job(self):
+        """available_ram_gb == 0 -> 1"""
+        self._mock(ram_gb=0.0, cpu_count=16)
+        self.assertEqual(get_max_build_jobs(), 1)
+
+    def test_link_reserve_warning_fires_when_ram_below_threshold(self):
+        self._mock(ram_gb=4.0, cpu_count=16)
+        warnings = []
+        pipeline_engines.logger.warning = lambda msg: warnings.append(msg)
+        get_max_build_jobs()  # link_reserve_gb=6.0 + min_headroom_gb=1.0 > 4.0 available
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("may OOM", warnings[0])
+
+    def test_link_reserve_warning_does_not_fire_when_sufficient_mem(self):
+        self._mock(ram_gb=64.0, cpu_count=16)
+        warnings = []
+        pipeline_engines.logger.warning = lambda msg: warnings.append(msg)
+        get_max_build_jobs()
+        self.assertEqual(warnings, [])
 
 
 def _write_script(path, body, shebang="#!/bin/sh"):

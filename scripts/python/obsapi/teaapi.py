@@ -154,6 +154,9 @@ class TeaAPI(api.API):
     def delete_branch(self, org, repo, branch):
         return self.check_delete(self.repo_path(org, repo) + '/branches/' + branch)
 
+    def branchinfo(self, org, repo, branch):
+        return self.check_get(self.repo_path(org, repo) + '/branches/' + branch).json()
+
     def repo_commit(self, org, repo, commit):
         return self.get(self.repo_path(org, repo) + '/git/commits/' + commit, params = {
             'stat' : False,

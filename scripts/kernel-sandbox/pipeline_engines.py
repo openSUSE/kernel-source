@@ -1,4 +1,5 @@
 import hashlib
+import os
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,56 @@ from libs.errors import KernelSandboxError
 logger = get_logger(__name__)
 CONTAINER_PULL_TIMEOUT = 300
 CONTAINER_BUILD_TIMEOUT = 7200
+
+
+def calc_available_ram_gb():
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024**2)  # kB -> GB
+    except (IOError, ValueError, IndexError):
+        pass
+    try:
+        total_ram_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024**3)
+        return total_ram_gb * 0.90  # 90% safety net, just a blind estimate, when we dont have live MemAvailable
+    except (ValueError, OSError):
+        return 8.0  # safe fallback
+
+
+def get_max_build_jobs(ram_per_job_gb=0.5, link_reserve_gb=6.0, min_headroom_gb=1.0):
+    """max parallel compile jobs (-jN) for a kernel build.
+
+    observations: (16-core/15GB box, config/x86_64/default),
+    (monitor_cmd: ps -C cc1,cc1plus,clang,as --no-headers -o rss)
+    (CONFIG_LTO=none, and no rustc data/observation, yet!)
+        SLE12-SP5 : compile concurrent-sum peak 1.32GB @ 16 jobs | link peak 1.29GB
+        SLE15-SP7 : link peak 5.12GB
+        SL-16.0   : compile concurrent-sum peak 2.29GB @ 15 jobs | link peak 5.19GB
+        SL-16.1   : compile concurrent-sum peak 2.29GB @ 16 jobs | link peak 5.33GB
+
+    across the above observations, single-job rss varied widely(255MB-1231MB), so ram_per_job_gb=0.5 carries ~3x headroom.
+
+    link_reserve_gb=6.0 covers the worst observed link peak (~5.33GB, SL-16.1) with some headroom.
+    """
+    cpu_count = os.cpu_count() or 1  # Host side count; if podman carries cpu/mem limits, then we should consider nproc --all limits
+    available_ram_gb = calc_available_ram_gb()
+    usable_for_compile_gb = max(0.0, available_ram_gb - min_headroom_gb)
+    mem_jobs = int(usable_for_compile_gb / ram_per_job_gb)
+
+    jobs = max(1, min(cpu_count, mem_jobs))
+    logger.debug(f"[get_max_build_jobs]: no of parallel build jobs: {jobs}")
+
+    # warning only. link stage is a fixed-size spike.
+    if available_ram_gb < (link_reserve_gb + min_headroom_gb):
+        logger.warning(
+            f"[get_max_build_jobs]: {available_ram_gb:.1f}GB available, but the link stage has peaked at "
+            f"~{link_reserve_gb:.1f}GB in measurement across SLE12-SP5..SL-16.1; "
+            "the link phase (not compile) may OOM. consider supplying max number of build jobs "
+            "with --jobs argument"
+        )
+
+    return jobs
 
 
 class PipelineError(KernelSandboxError):
@@ -110,12 +161,17 @@ class BuildEngine:
                 ] + [f"./scripts/config --disable {cfg}" for cfg in ctx.disable_configs]
             config_patch_str = " && ".join(config_patch_cmds)
             config_patch_str = f"{config_patch_str} && " if config_patch_str else ""
+            if ctx.jobs is not None:
+                jobs = ctx.jobs
+                logger.info(f"[BUILD] Using user-specified build jobs: -j{jobs} (overriding automatic memory calculation)")
+            else:
+                jobs = get_max_build_jobs()
             container_cmd = (
                 f"echo \"{git_marker}\" > localversion && "
                 f"make clean && "
                 f"{config_patch_str}"
                 f"yes \"\" | make oldconfig && "
-                f"make -j$(nproc --all)"
+                f"make -j{jobs}"
             )
 
             with ContainerEngine(

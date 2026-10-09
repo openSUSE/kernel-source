@@ -170,7 +170,12 @@ class ContainerEngine:
             raise ContainerRuntimeError(f"Failed to launch container runtime ({printable}): {e}")
 
         except subprocess.CalledProcessError as e:
-            error_msg = e.stderr.strip() if e.stderr else "Unknown container error"
+            if e.stderr:
+                error_msg = e.stderr.strip()
+            elif stream_output:
+                error_msg = "output was streamed live to the terminal above and was not captured"
+            else:
+                error_msg = "Unknown container error"
             raise ContainerRuntimeError(
                 f"Containerized execution failed (Exit Code {e.returncode}): {error_msg}\nCommand: {printable}"
             )

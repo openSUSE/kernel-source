@@ -4,6 +4,7 @@ from bugzilla._cli import DEFAULT_BZ
 from datetime import datetime, timedelta
 
 CVSS_PATTERN = re.compile(r"CVSSv3.1:SUSE:CVE-[0-9]{4}-[0-9]{4,}:([0-9].[0-9])")
+BOT_ACCOUNTS = [ 'swamp@suse.de', 'bwiedemann+obsbugzillabot@suse.com', 'maint-coord+maintenance-robot@suse.de', 'smash_bz@suse.de', 'kernel-security-sentinel@lists.suse.com' ]
 
 def handle_email(email):
     if '__empty-env-var__' in email:
