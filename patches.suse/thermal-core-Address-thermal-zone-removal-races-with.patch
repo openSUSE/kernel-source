@@ -1,0 +1,177 @@
+From: "Rafael J. Wysocki" <rafael.j.wysocki@intel.com>
+Date: Fri, 27 Mar 2026 10:49:52 +0100
+Subject: thermal: core: Address thermal zone removal races with resume
+Patch-mainline: v7.0-rc7
+Git-commit: 45b859b0728267a6199ee5002d62e6c6f3e8c89d
+References: bsc#1264042 CVE-2026-31731
+
+Since thermal_zone_pm_complete() and thermal_zone_device_resume()
+re-initialize the poll_queue delayed work for the given thermal zone,
+the cancel_delayed_work_sync() in thermal_zone_device_unregister()
+may miss some already running work items and the thermal zone may
+be freed prematurely [1].
+
+There are two failing scenarios that both start with
+running thermal_pm_notify_complete() right before invoking
+thermal_zone_device_unregister() for one of the thermal zones.
+
+In the first scenario, there is a work item already running for
+the given thermal zone when thermal_pm_notify_complete() calls
+thermal_zone_pm_complete() for that thermal zone and it continues to
+run when thermal_zone_device_unregister() starts.  Since the poll_queue
+delayed work has been re-initialized by thermal_pm_notify_complete(), the
+running work item will be missed by the cancel_delayed_work_sync() in
+thermal_zone_device_unregister() and if it continues to run past the
+freeing of the thermal zone object, a use-after-free will occur.
+
+In the second scenario, thermal_zone_device_resume() queued up by
+thermal_pm_notify_complete() runs right after the thermal_zone_exit()
+called by thermal_zone_device_unregister() has returned.  The poll_queue
+delayed work is re-initialized by it before cancel_delayed_work_sync() is
+called by thermal_zone_device_unregister(), so it may continue to run
+after the freeing of the thermal zone object, which also leads to a
+use-after-free.
+
+Address the first failing scenario by ensuring that no thermal work
+items will be running when thermal_pm_notify_complete() is called.
+For this purpose, first move the cancel_delayed_work() call from
+thermal_zone_pm_complete() to thermal_zone_pm_prepare() to prevent
+new work from entering the workqueue going forward.  Next, switch
+over to using a dedicated workqueue for thermal events and update
+the code in thermal_pm_notify() to flush that workqueue after
+thermal_pm_notify_prepare() has returned which will take care of
+all leftover thermal work already on the workqueue (that leftover
+work would do nothing useful anyway because all of the thermal zones
+have been flagged as suspended).
+
+The second failing scenario is addressed by adding a tz->state check
+to thermal_zone_device_resume() to prevent it from re-initializing
+the poll_queue delayed work if the thermal zone is going away.
+
+Note that the above changes will also facilitate relocating the suspend
+and resume of thermal zones closer to the suspend and resume of devices,
+respectively.
+
+Joey Lee:
+Modified original patch to remove WQ_PERCPU because v6.12 kernel
+does NOT have it. The WQ_PERCPU is introduced by
+'930c2ea566aff59e962c50b2421d5fcc3b98b8be workqueue: Add new WQ_PERCPU flag'
+since v6.17. And, the patch is related to more workqueue WQ_PERCPU patches
+in v6.18.
+
+Fixes: 5a5efdaffda5 ("thermal: core: Resume thermal zones asynchronously")
+Reported-by: syzbot+3b3852c6031d0f30dfaf@syzkaller.appspotmail.com
+Closes: https://syzbot.org/bug?extid=3b3852c6031d0f30dfaf
+Reported-by: Mauricio Faria de Oliveira <mfo@igalia.com>
+Closes: https://lore.kernel.org/linux-pm/20260324-thermal-core-uaf-init_delayed_work-v1-1-6611ae76a8a1@igalia.com/ [1]
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Reviewed-by: Mauricio Faria de Oliveira <mfo@igalia.com>
+Tested-by: Mauricio Faria de Oliveira <mfo@igalia.com>
+Reviewed-by: Lukasz Luba <lukasz.luba@arm.com>
+Cc: All applicable <stable@vger.kernel.org>
+Link: https://patch.msgid.link/6267615.lOV4Wx5bFT@rafael.j.wysocki
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/thermal/thermal_core.c |   32 ++++++++++++++++++++++++++------
+ 1 file changed, 26 insertions(+), 6 deletions(-)
+
+--- a/drivers/thermal/thermal_core.c
++++ b/drivers/thermal/thermal_core.c
+@@ -42,6 +42,8 @@ static struct thermal_governor *def_gove
+ 
+ static bool thermal_pm_suspended;
+ 
++static struct workqueue_struct *thermal_wq __ro_after_init;
++
+ /*
+  * Governor section: set of functions to handle thermal governors
+  *
+@@ -328,7 +330,7 @@ static void thermal_zone_device_set_poll
+ 	if (delay > HZ)
+ 		delay = round_jiffies_relative(delay);
+ 
+-	mod_delayed_work(system_freezable_power_efficient_wq, &tz->poll_queue, delay);
++	mod_delayed_work(thermal_wq, &tz->poll_queue, delay);
+ }
+ 
+ static void thermal_zone_recheck(struct thermal_zone_device *tz, int error)
+@@ -1687,6 +1689,10 @@ static void thermal_zone_device_resume(s
+ 
+ 	mutex_lock(&tz->lock);
+ 
++	/* If the thermal zone is going away, there's nothing to do. */
++	if (tz->state & TZ_STATE_FLAG_EXIT)
++		return;
++
+ 	tz->state &= ~(TZ_STATE_FLAG_SUSPENDED | TZ_STATE_FLAG_RESUMING);
+ 
+ 	thermal_debug_tz_resume(tz);
+@@ -1718,6 +1724,9 @@ static void thermal_zone_pm_prepare(stru
+ 
+ 	tz->state |= TZ_STATE_FLAG_SUSPENDED;
+ 
++	/* Prevent new work from getting to the workqueue subsequently. */
++	cancel_delayed_work(&tz->poll_queue);
++
+ 	mutex_unlock(&tz->lock);
+ }
+ 
+@@ -1725,8 +1734,6 @@ static void thermal_zone_pm_complete(str
+ {
+ 	mutex_lock(&tz->lock);
+ 
+-	cancel_delayed_work(&tz->poll_queue);
+-
+ 	reinit_completion(&tz->resume);
+ 	tz->state |= TZ_STATE_FLAG_RESUMING;
+ 
+@@ -1736,7 +1743,7 @@ static void thermal_zone_pm_complete(str
+ 	 */
+ 	INIT_DELAYED_WORK(&tz->poll_queue, thermal_zone_device_resume);
+ 	/* Queue up the work without a delay. */
+-	mod_delayed_work(system_freezable_power_efficient_wq, &tz->poll_queue, 0);
++	mod_delayed_work(thermal_wq, &tz->poll_queue, 0);
+ 
+ 	mutex_unlock(&tz->lock);
+ }
+@@ -1756,8 +1763,12 @@ static int thermal_pm_notify(struct noti
+ 
+ 		list_for_each_entry(tz, &thermal_tz_list, node)
+ 			thermal_zone_pm_prepare(tz);
+-
+ 		mutex_unlock(&thermal_list_lock);
++		/*
++		 * Allow any leftover thermal work items already on the
++		 * worqueue to complete so they don't get in the way later.
++		 */
++		flush_workqueue(thermal_wq);
+ 		break;
+ 	case PM_POST_HIBERNATION:
+ 	case PM_POST_RESTORE:
+@@ -1797,9 +1808,16 @@ static int __init thermal_init(void)
+ 	if (result)
+ 		goto error;
+ 
++	thermal_wq = alloc_workqueue("thermal_events",
++				      WQ_FREEZABLE | WQ_POWER_EFFICIENT, 0);
++	if (!thermal_wq) {
++		result = -ENOMEM;
++		goto unregister_netlink;
++	}
++
+ 	result = thermal_register_governors();
+ 	if (result)
+-		goto unregister_netlink;
++		goto destroy_workqueue;
+ 
+ 	thermal_class = kzalloc(sizeof(*thermal_class), GFP_KERNEL);
+ 	if (!thermal_class) {
+@@ -1826,6 +1844,8 @@ static int __init thermal_init(void)
+ 
+ unregister_governors:
+ 	thermal_unregister_governors();
++destroy_workqueue:
++	destroy_workqueue(thermal_wq);
+ unregister_netlink:
+ 	thermal_netlink_exit();
+ error:
