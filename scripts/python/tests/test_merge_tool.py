@@ -70,7 +70,7 @@ class TestMergeTool(unittest.TestCase):
         self.ks_dir = Path(tempfile.mkdtemp(prefix="gs_ks"))
         self.env['HOME'] = str(self.ks_dir)
 
-        pygit2.init_repository(self.ks_dir)
+        pygit2.init_repository(self.ks_dir, initial_head="master")
         subprocess.check_call(
             ("git", "config", "--add", "mergetool.git-sort.cmd",
              "%s $LOCAL $BASE $REMOTE $MERGED" % (
