@@ -217,14 +217,15 @@ class TestMergeTool(unittest.TestCase):
         # the merge driver is invoked automatically and resolves the
         # conflict, so "git merge" succeeds directly without the need to
         # separately invoke a mergetool
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ("git", "merge", "--no-edit", "other",), cwd=self.ks_dir, env=self.env,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+        proc.wait()
         self.assertEqual(proc.returncode, 0)
-        retval = proc.stdout
+        stdout, _ = proc.communicate()
         self.assertIn(
             "1 commits changed section from base to remote.",
-            [line.strip() for line in retval.decode().splitlines()])
+            [line.strip() for line in stdout.decode().splitlines()])
         self.assertEqual(
                 tests.support.format_series((
                     (None, (
