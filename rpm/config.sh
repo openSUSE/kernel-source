@@ -13,6 +13,7 @@ MULTIBUILD="Yes"
 LIVEPATCH=livepatch
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:Factory
+OBS_PROJECT_ARM32=openSUSE:Factory:LegacyARM
 OBS_PROJECT_ARM=openSUSE:Factory:ARM
 OBS_PROJECT_LEGACYX86=openSUSE:Factory:LegacyX86
 OBS_PROJECT_PPC=openSUSE:Factory:PowerPC
