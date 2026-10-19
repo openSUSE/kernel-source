@@ -57,6 +57,39 @@ def get_default_repo_path() -> Optional[str]:
     return None
 
 
+def resolve_repo_path(repo_param: Optional[str] = None) -> str:
+    """
+    Resolves and validates the Linux kernel Git repository path once at entry.
+    Discovers default path via linux_git.sh if repo_param is not provided.
+    Exits with error if the repository is not found or is invalid.
+    """
+    raw_path = repo_param or get_default_repo_path()
+    if not raw_path:
+        sys.stderr.write(
+            'Error: No Linux git repository found (please set the "LINUX_GIT" environment variable).\n'
+        )
+        sys.exit(1)
+
+    repo_path = os.path.abspath(os.path.expanduser(raw_path))
+    if not os.path.exists(repo_path):
+        sys.stderr.write(f"Error: Repository path '{repo_path}' does not exist.\n")
+        sys.exit(1)
+
+    try:
+        subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=repo_path,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        sys.stderr.write(f"Error: Path '{repo_path}' is not a valid Git repository.\n")
+        sys.exit(1)
+
+    return repo_path
+
+
 def resolve_db_path(db_param: Optional[str] = None) -> str:
     """Resolves DB path, defaulting to .git/alt-commits.db inside the kernel-source repository."""
     if db_param:
@@ -104,8 +137,8 @@ def get_db_connection(db_path: str) -> sqlite3.Connection:
 
 
 def load_ignored_shas(
+    repo_path: str,
     ignored_param: Optional[str] = None,
-    repo_path: Optional[str] = None,
 ) -> Tuple[Set[str], str]:
     """
     Loads ignored commit SHAs from either origin/scripts branch or local file,
@@ -115,11 +148,10 @@ def load_ignored_shas(
     local_path = resolve_ignored_path(ignored_param)
     local_ts = int(os.path.getmtime(local_path)) if os.path.exists(local_path) else 0
 
-    target_repo = repo_path or get_default_repo_path() or "."
     remote_shas: Optional[Set[str]] = None
     remote_ts = 0
 
-    if os.path.exists(target_repo):
+    if os.path.exists(repo_path):
         candidate_paths = [
             "scripts/alt-commits/alt-commits-ignored.txt",
             "scripts/alt_commit/alt-commits-ignored.txt",
