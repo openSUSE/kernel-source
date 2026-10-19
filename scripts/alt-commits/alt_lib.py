@@ -161,14 +161,14 @@ def load_ignored_shas(
             try:
                 subprocess.run(
                     ["git", "cat-file", "-e", f"origin/scripts:{rel_path}"],
-                    cwd=target_repo,
+                    cwd=repo_path,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     check=True,
                 )
                 res_time = subprocess.run(
                     ["git", "log", "-1", "--format=%at", "origin/scripts", "--", rel_path],
-                    cwd=target_repo,
+                    cwd=repo_path,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     universal_newlines=True,
@@ -180,7 +180,7 @@ def load_ignored_shas(
                     if remote_ts > local_ts:
                         res_show = subprocess.run(
                             ["git", "show", f"origin/scripts:{rel_path}"],
-                            cwd=target_repo,
+                            cwd=repo_path,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
                             universal_newlines=True,
