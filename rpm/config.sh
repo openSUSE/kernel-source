@@ -27,5 +27,3 @@ BUILD_PDF=No
 GENERATE_COMPILE_COMMANDS=Yes
 # Set gcc version to the one used for build in IBS
 GCC_VERSION=13
-# Workaround hybrid git workflow bug in SLFO 1.0/1.1
-NOEXEC=Yes
