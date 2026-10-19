@@ -35,6 +35,28 @@ def format_size(size_bytes: int | float) -> str:
     return f"{bytes_val:.2f} TB"
 
 
+def get_default_repo_path() -> Optional[str]:
+    """Determines the default path to the mainline Linux git repository via linux_git.sh."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    linux_git_sh = os.path.abspath(os.path.join(script_dir, "..", "linux_git.sh"))
+    if os.path.exists(linux_git_sh):
+        try:
+            res = subprocess.run(
+                [linux_git_sh],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                check=True,
+            )
+            out = res.stdout.strip()
+            if out:
+                return out
+        except Exception:
+            pass
+
+    return None
+
+
 def resolve_db_path(db_param: Optional[str] = None) -> str:
     """Resolves DB path, defaulting to .git/alt-commits.db inside the kernel-source repository."""
     if db_param:
@@ -93,7 +115,7 @@ def load_ignored_shas(
     local_path = resolve_ignored_path(ignored_param)
     local_ts = int(os.path.getmtime(local_path)) if os.path.exists(local_path) else 0
 
-    target_repo = repo_path or os.environ.get("LINUX_GIT") or "."
+    target_repo = repo_path or get_default_repo_path() or "."
     remote_shas: Optional[Set[str]] = None
     remote_ts = 0
 
