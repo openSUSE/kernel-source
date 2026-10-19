@@ -136,6 +136,57 @@ def get_db_connection(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def get_remote_ignored_status(
+    ignored_param: Optional[str] = None,
+    repo_path: Optional[str] = None,
+) -> Tuple[bool, Optional[str], str]:
+    """
+    Checks if origin/scripts branch in the script's repository (kernel-source)
+    has a newer version of the ignored file than the local file on disk.
+    Returns (is_newer, remote_rel_path, local_file_path).
+    """
+    local_path = resolve_ignored_path(ignored_param)
+    local_ts = int(os.path.getmtime(local_path)) if os.path.exists(local_path) else 0
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    target_repo = repo_path or script_dir
+
+    if not os.path.exists(target_repo):
+        return False, None, local_path
+
+    candidate_paths = [
+        "scripts/alt-commits/alt-commits-ignored.txt",
+        "alt-commits-ignored.txt",
+    ]
+    for rel_path in candidate_paths:
+        try:
+            subprocess.run(
+                ["git", "cat-file", "-e", f"origin/scripts:{rel_path}"],
+                cwd=target_repo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            res_time = subprocess.run(
+                ["git", "log", "-1", "--format=%at", "origin/scripts", "--", rel_path],
+                cwd=target_repo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                check=True,
+            )
+            ts_str = res_time.stdout.strip()
+            if ts_str.isdigit():
+                remote_ts = int(ts_str)
+                if remote_ts > local_ts:
+                    return True, rel_path, local_path
+            return False, rel_path, local_path
+        except Exception:
+            continue
+
+    return False, None, local_path
+
+
 def load_ignored_shas(
     repo_path: str,
     ignored_param: Optional[str] = None,
@@ -145,59 +196,28 @@ def load_ignored_shas(
     whichever is newer, WITHOUT modifying the local file on disk.
     Returns (set_of_shas, local_save_path).
     """
-    local_path = resolve_ignored_path(ignored_param)
-    local_ts = int(os.path.getmtime(local_path)) if os.path.exists(local_path) else 0
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    is_newer, rel_path, local_path = get_remote_ignored_status(ignored_param, script_dir)
 
-    remote_shas: Optional[Set[str]] = None
-    remote_ts = 0
-
-    if os.path.exists(repo_path):
-        candidate_paths = [
-            "scripts/alt-commits/alt-commits-ignored.txt",
-            "scripts/alt_commit/alt-commits-ignored.txt",
-            "alt-commits-ignored.txt",
-        ]
-        for rel_path in candidate_paths:
-            try:
-                subprocess.run(
-                    ["git", "cat-file", "-e", f"origin/scripts:{rel_path}"],
-                    cwd=repo_path,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=True,
-                )
-                res_time = subprocess.run(
-                    ["git", "log", "-1", "--format=%at", "origin/scripts", "--", rel_path],
-                    cwd=repo_path,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True,
-                    check=True,
-                )
-                ts_str = res_time.stdout.strip()
-                if ts_str.isdigit():
-                    remote_ts = int(ts_str)
-                    if remote_ts > local_ts:
-                        res_show = subprocess.run(
-                            ["git", "show", f"origin/scripts:{rel_path}"],
-                            cwd=repo_path,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            universal_newlines=True,
-                            errors="replace",
-                            check=True,
-                        )
-                        remote_shas = set()
-                        for line in res_show.stdout.splitlines():
-                            s = line.strip().lower()
-                            if s and not s.startswith("#"):
-                                remote_shas.add(s)
-                break
-            except Exception:
-                continue
-
-    if remote_shas is not None and remote_ts > local_ts:
-        return remote_shas, local_path
+    if is_newer and rel_path:
+        try:
+            res_show = subprocess.run(
+                ["git", "show", f"origin/scripts:{rel_path}"],
+                cwd=script_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                errors="replace",
+                check=True,
+            )
+            remote_shas = {
+                line.strip().lower()
+                for line in res_show.stdout.splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            }
+            return remote_shas, local_path
+        except Exception:
+            pass
 
     shas = set()
     if os.path.exists(local_path):
@@ -254,43 +274,13 @@ def check_ignored_up_to_date(ignored_param: Optional[str] = None) -> None:
         sys.stderr.write(f"Error: Failed to execute 'git fetch': {e}\n")
         sys.exit(1)
 
-    local_path = resolve_ignored_path(ignored_param)
-    local_ts = int(os.path.getmtime(local_path)) if os.path.exists(local_path) else 0
-
-    candidate_paths = [
-        "scripts/alt-commits/alt-commits-ignored.txt",
-        "scripts/alt_commit/alt-commits-ignored.txt",
-        "alt-commits-ignored.txt",
-    ]
-    for rel_path in candidate_paths:
-        try:
-            subprocess.run(
-                ["git", "cat-file", "-e", f"origin/scripts:{rel_path}"],
-                cwd=target_repo,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
-            res_time = subprocess.run(
-                ["git", "log", "-1", "--format=%at", "origin/scripts", "--", rel_path],
-                cwd=target_repo,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                check=True,
-            )
-            ts_str = res_time.stdout.strip()
-            if ts_str.isdigit():
-                remote_ts = int(ts_str)
-                if remote_ts > local_ts:
-                    sys.stderr.write(
-                        f"Error: The remote ignored file 'origin/scripts:{rel_path}' is newer than the local file '{local_path}'.\n"
-                        "Please update your local file from the origin/scripts branch before running alt-browser.\n"
-                    )
-                    sys.exit(1)
-            break
-        except Exception:
-            continue
+    is_newer, rel_path, local_path = get_remote_ignored_status(ignored_param, target_repo)
+    if is_newer:
+        sys.stderr.write(
+            f"Error: The remote ignored file 'origin/scripts:{rel_path}' is newer than the local file '{local_path}'.\n"
+            "Please update your local file from the origin/scripts branch before running alt-browser.\n"
+        )
+        sys.exit(1)
 
 
 class FileLock:
