@@ -198,6 +198,7 @@ class TestMergeTool(unittest.TestCase):
                                           "series.conf",), cwd=self.ks_dir, env=self.env)
         self.assertEqual(retval.decode().strip(), "M  series.conf")
 
+    @unittest.skipIf(sys.version_info.major == 3 and sys.version_info.minor < 6, "python before 3.6 not supported, pygit2 features")
     def test_moved_driver(self):
         # configure series_merge_tool as a merge driver instead of a
         # mergetool, mirroring scripts/extra-gitconfig and
