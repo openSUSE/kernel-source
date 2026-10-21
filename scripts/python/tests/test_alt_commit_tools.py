@@ -168,6 +168,7 @@ class TestDbAndCliExecution(unittest.TestCase):
                 "CREATE TABLE hashes (hash_value BLOB PRIMARY KEY, group_id INTEGER, detection_type INTEGER);"
             )
             conn.execute("CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT);")
+            conn.execute("INSERT INTO state (key, value) VALUES ('algorithm_version', ?);", (str(alt_lib.ALGORITHM_VERSION),))
             conn.commit()
             conn.close()
 
@@ -189,6 +190,22 @@ class TestDbAndCliExecution(unittest.TestCase):
             self.assertEqual(res.returncode, 0, f"alt-lookup stats failed: {res.stderr}")
             self.assertIn("DATABASE METRICS & STATISTICS", res.stdout)
             self.assertIn("Total Linked Hashes:  0", res.stdout)
+
+    def test_get_db_algorithm_version(self):
+        self.assertEqual(alt_lib.get_db_algorithm_version("/nonexistent/test.db"), 0)
+
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp_db:
+            conn = sqlite3.connect(tmp_db.name)
+            conn.execute("CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT);")
+            conn.commit()
+            conn.close()
+            self.assertEqual(alt_lib.get_db_algorithm_version(tmp_db.name), 0)
+
+            conn = sqlite3.connect(tmp_db.name)
+            conn.execute("INSERT INTO state (key, value) VALUES ('algorithm_version', '42');")
+            conn.commit()
+            conn.close()
+            self.assertEqual(alt_lib.get_db_algorithm_version(tmp_db.name), 42)
 
 
 class TestEndToEndCherryPickPipeline(unittest.TestCase):
@@ -403,6 +420,37 @@ class TestEndToEndCherryPickPipeline(unittest.TestCase):
         self.assertEqual(res.returncode, 0)
         self.assertIn(self.sha_a, res.stdout)
         self.assertIn(self.sha_b, res.stdout)
+
+    def test_rebuild_and_outdated_version_auto_scan(self):
+        """Validates that algorithm_version is tracked and that outdated DB version triggers auto-rebuild."""
+        self.assertEqual(alt_lib.get_db_algorithm_version(self.db_path), alt_lib.ALGORITHM_VERSION)
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE state SET value = '0' WHERE key = 'algorithm_version';")
+        dummy_sha = bytes.fromhex("1111111111111111111111111111111111111111")
+        conn.execute("INSERT INTO hashes (hash_value, group_id, detection_type) VALUES (?, 99999, 1);", (dummy_sha,))
+        conn.commit()
+        conn.close()
+
+        self.assertEqual(alt_lib.get_db_algorithm_version(self.db_path), 0)
+
+        lookup_tool = ALT_COMMITS_DIR / "alt-lookup"
+        res = subprocess.run(
+            [sys.executable, str(lookup_tool), "--db", self.db_path, self.sha_a, self.sha_b],
+            env={**self.git_env, "LINUX_GIT": self.repo_dir},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        self.assertEqual(res.returncode, 0, f"alt-lookup auto-rebuild failed: {res.stderr}")
+        self.assertEqual(res.stderr, "")
+        self.assertEqual(alt_lib.get_db_algorithm_version(self.db_path), alt_lib.ALGORITHM_VERSION)
+
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT group_id FROM hashes WHERE hash_value = ?", (dummy_sha,))
+        self.assertIsNone(cur.fetchone())
+        conn.close()
 
 
 if __name__ == "__main__":

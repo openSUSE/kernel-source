@@ -10,6 +10,7 @@ from typing import Dict, Optional, Set, TextIO, Tuple
 
 DB_NAME = "alt-commits.db"
 IGNORED_NAME = "alt-commits-ignored.txt"
+ALGORITHM_VERSION = 1  # Increment whenever scanning/grouping algorithm changes
 
 
 class DetectionType(IntEnum):
@@ -134,6 +135,23 @@ def get_db_connection(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA busy_timeout = 5000;")
     return conn
+
+
+def get_db_algorithm_version(db_path: str) -> int:
+    """Returns the algorithm version recorded in the database, or 0 if unversioned or missing."""
+    if not os.path.exists(db_path):
+        return 0
+    try:
+        conn = get_db_connection(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM state WHERE key = 'algorithm_version'")
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0] and str(row[0]).isdigit():
+            return int(row[0])
+    except Exception:
+        pass
+    return 0
 
 
 def get_remote_ignored_status(
