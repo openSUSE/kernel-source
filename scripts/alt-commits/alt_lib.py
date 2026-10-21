@@ -206,7 +206,6 @@ def get_remote_ignored_status(
 
 
 def load_ignored_shas(
-    repo_path: str,
     ignored_param: Optional[str] = None,
 ) -> Tuple[Set[str], str]:
     """

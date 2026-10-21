@@ -68,7 +68,7 @@ class TestIgnoreFileHandling(unittest.TestCase):
         shas = {"aaaabbbbcccc1111222233334444555566667777", "1111222233334444555566667777888899990000"}
         alt_lib.save_ignored_shas(ignore_file, shas)
 
-        loaded_shas, resolved_path = alt_lib.load_ignored_shas(self.git_dir, ignore_file)
+        loaded_shas, resolved_path = alt_lib.load_ignored_shas(ignore_file)
         self.assertEqual(loaded_shas, shas)
         self.assertEqual(resolved_path, ignore_file)
 
@@ -81,7 +81,7 @@ class TestIgnoreFileHandling(unittest.TestCase):
             f.write("# Another comment\n")
             f.write("fedcba0987654321fedcba0987654321fedcba09\n")
 
-        loaded_shas, _ = alt_lib.load_ignored_shas(self.git_dir, ignore_file)
+        loaded_shas, _ = alt_lib.load_ignored_shas(ignore_file)
         self.assertEqual(
             loaded_shas,
             {
@@ -92,7 +92,7 @@ class TestIgnoreFileHandling(unittest.TestCase):
 
     def test_load_ignored_shas_nonexistent(self):
         ignore_file = os.path.join(self.tmpdir, "nonexistent.txt")
-        loaded_shas, resolved_path = alt_lib.load_ignored_shas(self.git_dir, ignore_file)
+        loaded_shas, resolved_path = alt_lib.load_ignored_shas(ignore_file)
         self.assertEqual(loaded_shas, set())
         self.assertEqual(resolved_path, ignore_file)
 
