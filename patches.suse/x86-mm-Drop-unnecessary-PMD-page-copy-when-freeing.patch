@@ -1,0 +1,146 @@
+From: Mikhail Gavrilov <mikhail.v.gavrilov@gmail.com>
+Date: Thu, 24 Sep 2026 03:31:16 +0500
+Subject: x86/mm: Drop unnecessary PMD page copy when freeing
+Git-commit: e3ee38c1bc0b11a8d3e63dce7050759b61864286
+Patch-mainline: v7.3-rc6
+References: git-fixes
+
+On a box with a discrete GPU, lockdep reports a possible deadlock as
+soon as kswapd shrinks the TTM page pool. The immediate cause is an
+x86 commit that added an mmap_read_lock() to kernel page protection
+munging code.
+
+The huge vmap code holds the same lock over a GFP_KERNEL allocation,
+which is a no-no now that reclaim can take it. That allocation is in a
+page table *free* path and ends up being for dubious purposes[1].
+Basically, it tries to avoid hardware setting Accessed=1 in page table
+entries that are unreachable by the hardware, a non-issue.
+
+Remove the PMD copy. Detach the original PMD page at the PUD, flush
+the mid-level caches, and free the PTE tables straight from the
+detached PMD page. With no allocation left, the locking issue is gone.
+
+Lockdep splat/analysis:
+
+  WARNING: possible circular locking dependency detected
+  7.3.0-rc3-f6e7b42bf05b+ #183 Tainted: G     U
+  ------------------------------------------------------
+  kswapd0/269 is trying to acquire lock:
+  ((init_mm).mmap_lock){++++}-{4:4}, at: change_page_attr_set_clr+0x29a/0x4a0
+  but task is already holding lock:
+  (pool_shrink_rwsem){.+.+}-{4:4}, at: ttm_pool_shrink+0xb2/0x330 [ttm]
+  Chain exists of:
+    (init_mm).mmap_lock --> fs_reclaim --> pool_shrink_rwsem
+
+The cycle is built from three edges:
+
+  1) pool_shrink_rwsem -> (init_mm).mmap_lock
+
+     The TTM shrinker restores the caching attribute of every page it
+     frees, while holding pool_shrink_rwsem:
+
+       ttm_pool_shrink()
+       -> ttm_pool_dispose_list()
+       -> ttm_pool_free_page()
+       -> set_pages_wb()
+       -> change_page_attr_set_clr()   [ init_mm mmap read lock ]
+
+  2) fs_reclaim -> pool_shrink_rwsem
+
+     The same shrinker, called from reclaim.
+
+  3) (init_mm).mmap_lock -> fs_reclaim
+
+     ioremap() installing a huge PUD mapping over an existing PMD table:
+
+       ioremap_page_range()
+       -> vmap_range_noflush()
+       -> vmap_try_huge_pud()          [ init_mm mmap read lock ]
+       -> pud_free_pmd_page()
+       -> __get_free_page(GFP_KERNEL)  [ enters reclaim ]
+
+[ dhansen: Lots of changelog munging/trimming and merged comments from my
+	   version of the fix. ]
+
+Fixes: d5d8b8662e6e ("x86/mm/pat: Acquire init_mm read lock on attribute changes to avoid UAF")
+Suggested-by: Pedro Falcato <pfalcato@suse.de>
+Signed-off-by: Mikhail Gavrilov <mikhail.v.gavrilov@gmail.com>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: Pedro Falcato <pfalcato@suse.de>
+Link: https://lore.kernel.org/20260916062222.27347-1-mikhail.v.gavrilov@gmail.com
+Link: https://lore.kernel.org/all/e11449f0-d9ad-4d1b-ab21-2be7d71fe335@intel.com/ [1]
+Link: https://patch.msgid.link/20260923223116.20090-1-mikhail.v.gavrilov@gmail.com
+Cc: stable@vger.kernel.org
+
+Acked-by: Pedro Falcato <pfalcato@suse.de>
+---
+ arch/x86/mm/pgtable.c |   38 ++++++++++++++------------------------
+ 1 file changed, 14 insertions(+), 24 deletions(-)
+
+--- a/arch/x86/mm/pgtable.c
++++ b/arch/x86/mm/pgtable.c
+@@ -815,50 +815,40 @@ int pmd_clear_huge(pmd_t *pmd)
+ }
+ 
+ #ifdef CONFIG_X86_64
+-/**
+- * pud_free_pmd_page - Clear pud entry and free pmd page.
+- * @pud: Pointer to a PUD.
+- * @addr: Virtual address associated with pud.
+- *
+- * Context: The pud range has been unmapped and TLB purged.
+- * Return: 1 if clearing the entry succeeded. 0 otherwise.
+- *
+- * NOTE: Callers must allow a single page allocation.
++/*
++ * Given a PUD poitner, detach and free the pointed-to
++ * PMD page and any PTE page children. The entire range
++ * under the PUD must not have any valid translations
++ * and the TLB must have already been flushed.
+  */
+ int pud_free_pmd_page(pud_t *pud, unsigned long addr)
+ {
+-	pmd_t *pmd, *pmd_sv;
++	pmd_t *pmd;
+ 	pte_t *pte;
+ 	int i;
+ 
+ 	pmd = pud_pgtable(*pud);
+-	pmd_sv = (pmd_t *)__get_free_page(GFP_KERNEL);
+-	if (!pmd_sv)
+-		return 0;
+-
+-	for (i = 0; i < PTRS_PER_PMD; i++) {
+-		pmd_sv[i] = pmd[i];
+-		if (!pmd_none(pmd[i]))
+-			pmd_clear(&pmd[i]);
+-	}
+ 
++	/* Detach the PMD page: */
+ 	pud_clear(pud);
+ 
+-	/* INVLPG to clear all paging-structure caches */
++	/*
++	 * PMD and all its descendents are unreachable
++	 * via normal page walks. Make them unreachable
++	 * in cached mid-level walks too:
++	 */
+ 	flush_tlb_kernel_range(addr, addr + PAGE_SIZE-1);
+ 
+ 	for (i = 0; i < PTRS_PER_PMD; i++) {
+-		if (!pmd_none(pmd_sv[i])) {
+-			pte = (pte_t *)pmd_page_vaddr(pmd_sv[i]);
++		if (!pmd_none(pmd[i])) {
++			pte = (pte_t *)pmd_page_vaddr(pmd[i]);
+ 			free_page((unsigned long)pte);
+ 		}
+ 	}
+ 
+-	free_page((unsigned long)pmd_sv);
+ 
+ 	pagetable_pmd_dtor(virt_to_ptdesc(pmd));
+ 	free_page((unsigned long)pmd);
+-
+ 	return 1;
+ }
+ 
