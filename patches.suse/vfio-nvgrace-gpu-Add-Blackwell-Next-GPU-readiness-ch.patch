@@ -1,0 +1,323 @@
+From: Ankit Agrawal <ankita@nvidia.com>
+Date: Tue, 2 Jun 2026 06:30:15 +0000
+Subject: vfio/nvgrace-gpu: Add Blackwell-Next GPU readiness check via CXL
+ DVSEC
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v7.2-rc1
+Git-commit: 682ecb14e83840e87ea36c6d7c16c5111ce18784
+References: jsc#PED-16989
+
+Add a CXL DVSEC-based readiness check for Blackwell-Next GPUs alongside
+the existing legacy BAR0 polling path. The CXL Device DVSEC offset is
+discovered at probe time. Probe, fault and read/write paths then branch
+on that to use either the legacy BAR0 polling or the CXL DVSEC polling.
+
+The CXL path polls Memory_Active, requiring MEM_INFO_VALID within 1s and
+MEM_ACTIVE within Memory_Active_Timeout (up to 256s) as per CXL spec r4.0
+sec 8.1.3.8.2. Given the long worst-case wait, the CXL poll runs outside
+memory_lock with only a quick readiness check is done under the lock.
+
+The poll loops sleep with schedule_timeout_killable() and return -EINTR
+on a fatal signal. This avoids hung-task panics during the long
+uninterruptible wait. Extend this to the legacy based wait as well for
+improvement.
+
+In the fault handler the wait runs locklessly before memory_lock. If a
+reset races in, the in-lock recheck returns -EAGAIN and the wait is
+retried rather than returning a spurious VM_FAULT_SIGBUS.
+
+Add PCI_DVSEC_CXL_MEM_ACTIVE_TIMEOUT to pci_regs.h for the timeout field.
+
+Cc: Ilpo Järvinen <ilpo.jarvinen@linux.intel.com>
+Cc: Kevin Tian <kevin.tian@intel.com>
+Suggested-by: Alex Williamson <alex@shazbot.org>
+Signed-off-by: Ankit Agrawal <ankita@nvidia.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Link: https://lore.kernel.org/r/20260602063015.3915-1-ankita@nvidia.com
+Signed-off-by: Alex Williamson <alex@shazbot.org>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ drivers/vfio/pci/nvgrace-gpu/main.c |  162 +++++++++++++++++++++++++++++++++---
+ include/uapi/linux/pci_regs.h       |    1 
+ 2 files changed, 151 insertions(+), 12 deletions(-)
+
+--- a/drivers/vfio/pci/nvgrace-gpu/main.c
++++ b/drivers/vfio/pci/nvgrace-gpu/main.c
+@@ -3,10 +3,13 @@
+  * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved
+  */
+ 
++#include <linux/bitfield.h>
+ #include <linux/sizes.h>
++#include <linux/time64.h>
+ #include <linux/vfio_pci_core.h>
+ #include <linux/delay.h>
+ #include <linux/jiffies.h>
++#include <linux/sched.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/memory-failure.h>
+ 
+@@ -63,6 +66,8 @@ struct nvgrace_gpu_pci_core_device {
+ 	bool has_mig_hw_bug;
+ 	/* GPU has just been reset */
+ 	bool reset_done;
++	/* CXL Device DVSEC offset; 0 if not present (legacy GB path) */
++	int cxl_dvsec;
+ };
+ 
+ static void nvgrace_gpu_init_fake_bar_emu_regs(struct vfio_device *core_vdev)
+@@ -241,7 +246,7 @@ static void nvgrace_gpu_close_device(str
+ 	vfio_pci_core_close_device(core_vdev);
+ }
+ 
+-static int nvgrace_gpu_wait_device_ready(void __iomem *io)
++static int nvgrace_gpu_wait_device_ready_legacy(void __iomem *io)
+ {
+ 	unsigned long timeout = jiffies + msecs_to_jiffies(POLL_TIMEOUT_MS);
+ 
+@@ -249,16 +254,97 @@ static int nvgrace_gpu_wait_device_ready
+ 		if ((ioread32(io + C2C_LINK_BAR0_OFFSET) == STATUS_READY) &&
+ 		    (ioread32(io + HBM_TRAINING_BAR0_OFFSET) == STATUS_READY))
+ 			return 0;
+-		msleep(POLL_QUANTUM_MS);
++		if (schedule_timeout_killable(msecs_to_jiffies(POLL_QUANTUM_MS)))
++			return -EINTR;
+ 	} while (!time_after(jiffies, timeout));
+ 
+ 	return -ETIME;
+ }
+ 
+ /*
++ * Decode the 3-bit Memory_Active_Timeout field from CXL DVSEC Range 1 Low
++ * (bits 15:13) into milliseconds. Encoding per CXL spec r4.0 sec 8.1.3.8.2:
++ * 000b = 1s, 001b = 4s, 010b = 16s, 011b = 64s, 100b = 256s,
++ * 101b-111b = reserved (clamped to 256s).
++ */
++static inline unsigned long cxl_mem_active_timeout_ms(u8 timeout)
++{
++	return MSEC_PER_SEC << (2 * min_t(u8, timeout, 4));
++}
++
++/*
++ * Check if CXL DVSEC reports memory as valid and active.
++ */
++static inline bool cxl_dvsec_mem_is_active(u32 status)
++{
++	return (status & PCI_DVSEC_CXL_MEM_INFO_VALID) &&
++	       (status & PCI_DVSEC_CXL_MEM_ACTIVE);
++}
++
++static int nvgrace_gpu_test_device_ready_cxl(struct nvgrace_gpu_pci_core_device *nvdev,
++					     u32 *status)
++{
++	struct pci_dev *pdev = nvdev->core_device.pdev;
++	int cxl_dvsec = nvdev->cxl_dvsec;
++	u32 val;
++
++	pci_read_config_dword(pdev,
++			      cxl_dvsec + PCI_DVSEC_CXL_RANGE_SIZE_LOW(0),
++			      &val);
++
++	if (val == ~0U)
++		return -ENODEV;
++
++	if (status)
++		*status = val;
++
++	if (cxl_dvsec_mem_is_active(val))
++		return 0;
++
++	return -EAGAIN;
++}
++
++/*
++ * As per CXL spec r4.0 sec 8.1.3.8.2, MEM_INFO_VALID needs to be set
++ * within 1s and MEM_ACTIVE within Memory_Active_Timeout (up to ~256s)
++ * after reset and bootup.
++ */
++static int nvgrace_gpu_wait_device_ready_cxl(struct nvgrace_gpu_pci_core_device *nvdev)
++{
++	unsigned long deadline = jiffies + msecs_to_jiffies(POLL_QUANTUM_MS);
++	bool active_phase = false;
++	u32 status;
++	int ret;
++
++	for (;;) {
++		ret = nvgrace_gpu_test_device_ready_cxl(nvdev, &status);
++		if (ret != -EAGAIN)
++			return ret;
++
++		if (!active_phase && (status & PCI_DVSEC_CXL_MEM_INFO_VALID)) {
++			u8 t = FIELD_GET(PCI_DVSEC_CXL_MEM_ACTIVE_TIMEOUT, status);
++
++			deadline = jiffies +
++				   msecs_to_jiffies(cxl_mem_active_timeout_ms(t));
++			active_phase = true;
++		}
++
++		if (time_after(jiffies, deadline))
++			return -ETIME;
++
++		if (schedule_timeout_killable(msecs_to_jiffies(POLL_QUANTUM_MS)))
++			return -EINTR;
++	}
++}
++
++/*
+  * If the GPU memory is accessed by the CPU while the GPU is not ready
+  * after reset, it can cause harmless corrected RAS events to be logged.
+  * Make sure the GPU is ready before establishing the mappings.
++ *
++ * Since the CXL polling wait could take 256s, it happens outside
++ * memory_lock. Only do quick readiness check under the lock. Legacy
++ * keeps the in-lock poll.
+  */
+ static int
+ nvgrace_gpu_check_device_ready(struct nvgrace_gpu_pci_core_device *nvdev)
+@@ -274,7 +360,10 @@ nvgrace_gpu_check_device_ready(struct nv
+ 	if (!__vfio_pci_memory_enabled(vdev))
+ 		return -EIO;
+ 
+-	ret = nvgrace_gpu_wait_device_ready(vdev->barmap[0]);
++	if (nvdev->cxl_dvsec)
++		ret = nvgrace_gpu_test_device_ready_cxl(nvdev, NULL);
++	else
++		ret = nvgrace_gpu_wait_device_ready_legacy(vdev->barmap[0]);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -312,9 +401,33 @@ static vm_fault_t nvgrace_gpu_vfio_pci_h
+ 	pfn = PHYS_PFN(memregion->memphys) + addr_to_pgoff(vma, addr);
+ 
+ 	if (is_aligned_for_order(vma, addr, pfn, order)) {
++		/*
++		 * Exit early under memory_lock to avoid a potentially lengthy
++		 * device readiness wait on a runtime-suspended device. Any
++		 * race after the lock is dropped is benign as the re-check
++		 * inside the scoped guard below catches it.
++		 */
++		scoped_guard(rwsem_read, &vdev->memory_lock) {
++			if (vdev->pm_runtime_engaged)
++				return VM_FAULT_SIGBUS;
++		}
++
++retry:
++		if (nvdev->cxl_dvsec && READ_ONCE(nvdev->reset_done) &&
++		    nvgrace_gpu_wait_device_ready_cxl(nvdev))
++			return VM_FAULT_SIGBUS;
++
+ 		scoped_guard(rwsem_read, &vdev->memory_lock) {
+-			if (vdev->pm_runtime_engaged ||
+-			    nvgrace_gpu_check_device_ready(nvdev))
++			int rc;
++
++			if (vdev->pm_runtime_engaged)
++				return VM_FAULT_SIGBUS;
++
++			/* Re-run the wait if a reset raced us, not SIGBUS. */
++			rc = nvgrace_gpu_check_device_ready(nvdev);
++			if (rc == -EAGAIN)
++				goto retry;
++			if (rc)
+ 				return VM_FAULT_SIGBUS;
+ 
+ 			ret = vfio_pci_vmf_insert_pfn(vdev, vmf, pfn, order);
+@@ -742,6 +855,12 @@ nvgrace_gpu_read_mem(struct nvgrace_gpu_
+ 	else
+ 		mem_count = min(count, memregion->memlength - (size_t)offset);
+ 
++	if (nvdev->cxl_dvsec && READ_ONCE(nvdev->reset_done)) {
++		ret = nvgrace_gpu_wait_device_ready_cxl(nvdev);
++		if (ret)
++			return ret;
++	}
++
+ 	scoped_guard(rwsem_read, &vdev->memory_lock) {
+ 		ret = nvgrace_gpu_check_device_ready(nvdev);
+ 		if (ret)
+@@ -876,6 +995,12 @@ nvgrace_gpu_write_mem(struct nvgrace_gpu
+ 	 */
+ 	mem_count = min(count, memregion->memlength - (size_t)offset);
+ 
++	if (nvdev->cxl_dvsec && READ_ONCE(nvdev->reset_done)) {
++		ret = nvgrace_gpu_wait_device_ready_cxl(nvdev);
++		if (ret)
++			return ret;
++	}
++
+ 	scoped_guard(rwsem_read, &vdev->memory_lock) {
+ 		ret = nvgrace_gpu_check_device_ready(nvdev);
+ 		if (ret)
+@@ -1121,14 +1246,24 @@ static bool nvgrace_gpu_has_mig_hw_bug(s
+  * is beneficial to make the check to ensure the device is in an
+  * expected state.
+  *
+- * Ensure that the BAR0 region is enabled before accessing the
++ * On Blackwell-Next systems, memory readiness is determined via the
++ * CXL Device DVSEC in PCI config space and does not require BAR0.
++ * For the legacy path, ensure BAR0 is enabled before accessing the
+  * registers.
+  */
+-static int nvgrace_gpu_probe_check_device_ready(struct pci_dev *pdev)
++static int nvgrace_gpu_probe_check_device_ready(struct nvgrace_gpu_pci_core_device *nvdev)
+ {
++	struct pci_dev *pdev = nvdev->core_device.pdev;
+ 	void __iomem *io;
+ 	int ret;
+ 
++	/*
++	 * Note that the worst-case wait here is ~256s (vs ~30s on the
++	 * legacy path) and may block device unbind/sysfs for the duration.
++	 */
++	if (nvdev->cxl_dvsec)
++		return nvgrace_gpu_wait_device_ready_cxl(nvdev);
++
+ 	ret = pci_enable_device(pdev);
+ 	if (ret)
+ 		return ret;
+@@ -1143,7 +1278,7 @@ static int nvgrace_gpu_probe_check_devic
+ 		goto iomap_exit;
+ 	}
+ 
+-	ret = nvgrace_gpu_wait_device_ready(io);
++	ret = nvgrace_gpu_wait_device_ready_legacy(io);
+ 
+ 	pci_iounmap(pdev, io);
+ iomap_exit:
+@@ -1161,10 +1296,6 @@ static int nvgrace_gpu_probe(struct pci_
+ 	u64 memphys, memlength;
+ 	int ret;
+ 
+-	ret = nvgrace_gpu_probe_check_device_ready(pdev);
+-	if (ret)
+-		return ret;
+-
+ 	ret = nvgrace_gpu_fetch_memory_property(pdev, &memphys, &memlength);
+ 	if (!ret)
+ 		ops = &nvgrace_gpu_pci_ops;
+@@ -1174,6 +1305,13 @@ static int nvgrace_gpu_probe(struct pci_
+ 	if (IS_ERR(nvdev))
+ 		return PTR_ERR(nvdev);
+ 
++	nvdev->cxl_dvsec = pci_find_dvsec_capability(pdev, PCI_VENDOR_ID_CXL,
++						     PCI_DVSEC_CXL_DEVICE);
++
++	ret = nvgrace_gpu_probe_check_device_ready(nvdev);
++	if (ret)
++		goto out_put_vdev;
++
+ 	dev_set_drvdata(&pdev->dev, &nvdev->core_device);
+ 
+ 	if (ops == &nvgrace_gpu_pci_ops) {
+--- a/include/uapi/linux/pci_regs.h
++++ b/include/uapi/linux/pci_regs.h
+@@ -1242,6 +1242,7 @@
+ #define  PCI_DVSEC_CXL_RANGE_SIZE_LOW(i)		(0x1C + (i * 0x10))
+ #define   PCI_DVSEC_CXL_MEM_INFO_VALID			_BITUL(0)
+ #define   PCI_DVSEC_CXL_MEM_ACTIVE			_BITUL(1)
++#define   PCI_DVSEC_CXL_MEM_ACTIVE_TIMEOUT		__GENMASK(15, 13)
+ #define   PCI_DVSEC_CXL_MEM_SIZE_LOW			__GENMASK(31, 28)
+ #define  PCI_DVSEC_CXL_RANGE_BASE_HIGH(i)		(0x20 + (i * 0x10))
+ #define  PCI_DVSEC_CXL_RANGE_BASE_LOW(i)		(0x24 + (i * 0x10))
