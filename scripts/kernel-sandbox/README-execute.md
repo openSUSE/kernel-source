@@ -110,8 +110,8 @@ local commit/branch) before pointing kernel-sandbox at that ref.
 
 ## Discovering which architectures and config flavors you can test
 
-`--arch` is currently limited to `x86_64` and `arm64` (defaults to your host
-arch).
+`--arch` supports `x86_64`, `arm64`, `ppc64le`, and `s390x` (defaults to your
+host arch).
 
 `--config` accepts whatever flavor directories actually exist in the kernel
 source tree you are testing - list them directly from a checkout:
@@ -138,7 +138,7 @@ path it looked for.
 | Flag | Description |
 |---|---|
 | `--tag TAG` / `--commit HASH` | Git ref to build (mutually exclusive). Defaults to `HEAD` if neither is given. |
-| `--arch {x86_64,arm64}` | Target architecture (default: host arch). |
+| `--arch {x86_64,arm64,ppc64le,s390x}` | Target architecture (default: host arch). |
 | `--config FLAVOR` | Config flavor under `config/<arch>/` (default: `default`). |
 | `--mode {fast,rpm}` | `fast` = direct bzImage boot (default). `rpm` = full RPM build + QCOW2 injection. |
 | `--use-busybox-initrd` | Fast mode only: swap the default dracut initrd for a minimal busybox one. **No SSH in this mode** - console only. |
