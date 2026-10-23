@@ -15,6 +15,49 @@ class ConfigurationError(KernelSandboxError):
     pass
 
 
+class ConfigSpecError(KernelSandboxError):
+    """Raised when a container command spec file is missing/unreadable/violates SPEC_SCHEMA"""
+    pass
+
+
+def is_list_of_str(v):
+    return isinstance(v, list) and all(isinstance(i, str) for i in v)
+
+
+def load_yaml_spec(spec_file, schema=None):
+    """Loads a YAML spec file and validates it against schema: {key: (required, is_valid_func, expected_str)}"""
+    try:
+        with open(spec_file, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError, UnicodeDecodeError) as e:
+        raise ConfigSpecError(f"'{spec_file}': {e}") from e
+
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ConfigSpecError(f"'{spec_file}': expected a YAML mapping")
+
+    if schema:
+        unknown_keys = set(data) - set(schema)
+        if unknown_keys:
+            raise ConfigSpecError(f"'{spec_file}': unknown key(s): {', '.join(sorted(unknown_keys))}")
+
+        for key, (required, is_valid, expected) in schema.items():
+            if key not in data:
+                if required:
+                    raise ConfigSpecError(f"'{spec_file}': missing mandatory key '{key}'")
+                continue
+
+            value = data[key]
+            if value is None and not required:
+                continue
+
+            if not is_valid(value):
+                raise ConfigSpecError(f"'{spec_file}': '{key}' must be '{expected}', instead got: {value}")
+
+    return data
+
+
 def get_host_arch():
     """Returns the host architecture."""
     arch = platform.machine()
@@ -71,6 +114,15 @@ class ConfigManager:
             f"Parsed contexts -> IBS_PROJECT: '{ibs_project}', OBS_PROJECT: '{obs_project}'\n"
             f"Please add a directive rule inside kernel_sandbox_profiles.yaml and retry"
         )
+
+    def get_kabi_container_image(self):
+        """Returns the container image used for kabi validation."""
+        kabi_container_image = self.yaml_data.get("kabi_container_image")
+        if not kabi_container_image or not isinstance(kabi_container_image, str):
+            raise ConfigurationError(
+                "kabi_container_image is missing or empty in kernel_sandbox_profiles.yaml"
+            )
+        return kabi_container_image
 
     def _get_required_profile_key(self, arch, key):
         """Returns arch_profile[key], raising ConfigurationError if `key` is absent from the yaml profile."""
