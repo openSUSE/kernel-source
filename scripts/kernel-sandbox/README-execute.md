@@ -141,6 +141,7 @@ path it looked for.
 | `--arch {x86_64,arm64,ppc64le,s390x}` | Target architecture (default: host arch). |
 | `--config FLAVOR` | Config flavor under `config/<arch>/` (default: `default`). |
 | `--mode {fast,rpm}` | `fast` = direct bzImage boot (default). `rpm` = full RPM build + QCOW2 injection. |
+| `--check-kabi` / `--no-check-kabi` | Enable or disable kABI checks (`ksymvers`/`ksymtypes`) in fast mode when `kabi/<arch>/symvers-<flavor>` and `symtypes-<flavor>` exist (default: `--check-kabi`). |
 | `--use-busybox-initrd` | Fast mode only: swap the default dracut initrd for a minimal busybox one. **No SSH in this mode** - console only. |
 | `--extra-qemu "..."` | Raw extra arguments appended to the QEMU invocation. |
 | `--refresh-cache` | Ignore cached kernel/RPM/initrd artifacts and rebuild from scratch. |
@@ -157,8 +158,9 @@ path it looked for.
 ## Common sandbox invocations
 
 ### Fast mode (direct bzImage boot with workspace mount)
-This is the default mode. It compiles the kernel in a container, packs a dracut
-initrd, and boots QEMU in a few minutes.
+This is the default mode. It compiles the kernel in a container, runs kABI
+checks if reference files are present under `kabi/<arch>/`,
+packs a dracut initrd, and boots QEMU in a few minutes.
 
 > **CPU usage note.** `sequence-patch --rapid` (rapidquilt) threads across every
 > online CPU - this intentionally uses 100% of every core. On a higher-end
@@ -171,10 +173,23 @@ initrd, and boots QEMU in a few minutes.
 > calculation - fewer jobs to keep your laptop usable, or more because you know
 > the box can take it - pass `--jobs N` / `-j N`. It only applies to the
 > `build` phase; `image`/`boot` ignore it with a warning if you pass it there.
+>
+> **kABI checks.** By default (`--check-kabi`), if both
+> `kabi/<arch>/symvers-<flavor>` and `kabi/<arch>/symtypes-<flavor>` exist in
+> the worktree, `kernel-sandbox` exports `KBUILD_SYMTYPES=1` during compilation
+> and runs `ksymvers`/`ksymtypes` validation right after archiving the compiled
+> kernel and modules. If a kABI breakage is detected, the pipeline stops before
+> `image`/`boot`, while leaving the compiled kernel and modules cached so you
+> can still run `image` and `boot` (or re-run without `--refresh-cache`) to test
+> the kernel in QEMU. Pass `--no-check-kabi` to skip kABI validation during a
+> fresh build.
 
 ```bash
 # Compile and boot a specific commit for the "default|rt|azure|kvmsmall" flavor
 LINUX_GIT=/srv/git/linux.git/ ./scripts/kernel-sandbox/kernel-sandbox --commit "origin/SL-16.0" --config <default|rt|azure|kvmsmall>
+
+# Skip kABI check during build
+LINUX_GIT=/srv/git/linux.git/ ./scripts/kernel-sandbox/kernel-sandbox --commit "origin/SL-16.0" --config default --no-check-kabi
 
 # Same, but against a tag instead of a commit
 LINUX_GIT=/srv/git/linux.git/ ./scripts/kernel-sandbox/kernel-sandbox --tag rpm-6.12.0-160000.37 --config <default|rt|azure|kvmsmall>

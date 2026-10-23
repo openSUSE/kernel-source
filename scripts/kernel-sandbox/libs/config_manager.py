@@ -115,6 +115,15 @@ class ConfigManager:
             f"Please add a directive rule inside kernel_sandbox_profiles.yaml and retry"
         )
 
+    def get_kabi_container_image(self):
+        """Returns the container image used for kabi validation."""
+        kabi_container_image = self.yaml_data.get("kabi_container_image")
+        if not kabi_container_image or not isinstance(kabi_container_image, str):
+            raise ConfigurationError(
+                "kabi_container_image is missing or empty in kernel_sandbox_profiles.yaml"
+            )
+        return kabi_container_image
+
     def _get_required_profile_key(self, arch, key):
         """Returns arch_profile[key], raising ConfigurationError if `key` is absent from the yaml profile."""
         arch_profile = self.get_arch_profile(arch)
