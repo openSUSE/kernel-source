@@ -9,7 +9,7 @@ class PipelineContext:
     def __init__(
             self, workspace, build_root, cache_dir, commit_hash, arch, config_flavor, mode,
             refresh_cache, use_busybox_initrd, qemu_bin, extra_qemu, host_arch, ssh_enabled,
-            qemu_profile=None, jobs=None):
+            qemu_profile=None, jobs=None, check_kabi=True):
         self.workspace = workspace
         self.build_root = build_root
         self.cache_dir = cache_dir
@@ -25,6 +25,7 @@ class PipelineContext:
         self.ssh_enabled = ssh_enabled
         self.qemu_profile = qemu_profile
         self.jobs = jobs
+        self.check_kabi = check_kabi
 
     @property
     def artifacts_dir(self):
@@ -37,7 +38,8 @@ class FastModeContext(PipelineContext):
     def __init__(
             self, kernel_image_name="", build_image_name="", linux_arch="", boot_arch="",
             cross_compile="", target_arch_platform="", host_arch_platform="", container_image="",
-            cc="", host_cc="", enable_configs=None, disable_configs=None, **common_fields):
+            kabi_container_image="", cc="", host_cc="", enable_configs=None, disable_configs=None,
+            **common_fields):
         super().__init__(**common_fields)
         self.kernel_image_name = kernel_image_name
         self.build_image_name = build_image_name
@@ -47,6 +49,7 @@ class FastModeContext(PipelineContext):
         self.target_arch_platform = target_arch_platform
         self.host_arch_platform = host_arch_platform
         self.container_image = container_image
+        self.kabi_container_image = kabi_container_image
         self.cc = cc
         self.host_cc = host_cc
         self.enable_configs = enable_configs if enable_configs is not None else []
