@@ -134,7 +134,8 @@ class TestBuildEngineExecuteFast(unittest.TestCase):
             extra_qemu="", host_arch="x86_64", ssh_enabled=False,
             kernel_image_name="bzImage", build_image_name="bzImage", linux_arch="x86_64",
             boot_arch="x86", cross_compile="", target_arch_platform="linux/amd64",
-            host_arch_platform="linux/amd64", container_image="mock-image", cc="gcc", host_cc="gcc",
+            host_arch_platform="linux/amd64", container_image="mock-image",
+            kabi_container_image="mock-kabi-image", cc="gcc", host_cc="gcc",
             enable_configs=[], disable_configs=[],
         )
         fields.update(overrides)
@@ -142,6 +143,14 @@ class TestBuildEngineExecuteFast(unittest.TestCase):
 
     def _write_config(self, ctx):
         (self.workspace / "config" / ctx.arch / ctx.config_flavor).mkdir(parents=True)
+
+    def _write_kabi_refs(self, ctx, symvers=True, symtypes=True):
+        kabi_dir = self.workspace / "kabi" / ctx.arch
+        kabi_dir.mkdir(parents=True, exist_ok=True)
+        if symvers:
+            (kabi_dir / f"symvers-{ctx.config_flavor}").write_text("0x0000\tsym\tvmlinux\tEXPORT_SYMBOL\n")
+        if symtypes:
+            (kabi_dir / f"symtypes-{ctx.config_flavor}").write_text("s#sym struct sym { int a; }\n")
 
     def _write_sequence_patch(self, ctx, extra_body=""):
         sp_dir = self.workspace / f"kernel-sandbox-sp-{ctx.commit_hash[:7]}-{ctx.arch}-{ctx.config_flavor}" / "current"
@@ -238,6 +247,80 @@ class TestBuildEngineExecuteFast(unittest.TestCase):
 
         self.assertEqual(MockContainerEngine.last_instance.remove_container_calls, 2)
 
+    def test_valid_pipeline_build_moved_to_spec(self):
+        """test build pipeline with command spec and config symbols"""
+        ctx = self._ctx(enable_configs=["CONFIG_DEBUG_INFO", "CONFIG_FOO"], disable_configs=["CONFIG_BAR"])
+        self._write_config(ctx)
+        self._write_sequence_patch(ctx)
+        sp_dir = self.workspace / f"kernel-sandbox-sp-{ctx.commit_hash[:7]}-{ctx.arch}-{ctx.config_flavor}" / "current"
+        built_kernel = sp_dir / "arch" / ctx.boot_arch / "boot" / ctx.build_image_name
+        built_kernel.parent.mkdir(parents=True)
+        built_kernel.write_text("mock-bzImage-bytes")
+
+        BuildEngine()._execute_fast(ctx)
+
+        calls = MockContainerEngine.last_instance.calls
+        self.assertEqual(len(calls), 1)
+        env = calls[0]["env_dict"]
+        self.assertEqual(env["ENABLE_CONFIGS"], "CONFIG_DEBUG_INFO CONFIG_FOO")
+        self.assertEqual(env["DISABLE_CONFIGS"], "CONFIG_BAR")
+        self.assertNotIn("CONFIG_PATCH_CMDS", env)
+
+        # verify compile_kernel.yaml command_spec is read
+        spec_content = Path(calls[0]["spec"]).read_text()
+        self.assertIn("ENABLE_CONFIGS", spec_content)
+
+    def test_invalid_config_symbol_raises_pipeline_error(self):
+        """kernel config symbols with shell metachars must raise PipelineError"""
+        proof_file = Path(self.tmp_dir.name) / "injected_hazard.txt"
+        malicious_cfg = f"DEBUG_INFO; touch '{proof_file}'"
+        ctx = self._ctx(enable_configs=[malicious_cfg])
+        self._write_config(ctx)
+        self._write_sequence_patch(ctx)
+
+        with self.assertRaisesRegex(PipelineError, r"Invalid kernel configuration symbol"):
+            BuildEngine()._execute_fast(ctx)
+        self.assertFalse(proof_file.exists())
+
+    def test_invalid_config_symbol_unicode_rejected(self):
+        """kernel config symbols containing unicode must be rejected with PipelineError"""
+        ctx_base = self._ctx()
+        self._write_config(ctx_base)
+        for bad_sym in ["CONFIG_DEBUG¹", "CONFIG_TEST_é", "CONFIG_FOO_٣", "CONFIG_TEST\u200b"]:
+            ctx = self._ctx(enable_configs=[bad_sym])
+            with self.assertRaisesRegex(PipelineError, r"Invalid kernel configuration symbol"):
+                BuildEngine()._execute_fast(ctx)
+
+    def test_invalid_config_symbol_boundary_formats(self):
+        """empty symbols, options, assignments, and lowercase symbols must be rejected"""
+        ctx_base = self._ctx()
+        self._write_config(ctx_base)
+        for bad_sym in ["", "-CONFIG_FOO", "--enable", "CONFIG_FOO=y", "config_debug", "CONFIG FOO"]:
+            ctx = self._ctx(enable_configs=[bad_sym])
+            with self.assertRaisesRegex(PipelineError, r"Invalid kernel configuration symbol"):
+                BuildEngine()._execute_fast(ctx)
+
+    def test_overlapping_enable_and_disable_configs_raises_pipeline_error(self):
+        """symbols present in both enable and disable lists must raise PipelineError"""
+        ctx = self._ctx(enable_configs=["CONFIG_DEBUG_INFO"], disable_configs=["CONFIG_DEBUG_INFO"])
+        self._write_config(ctx)
+        with self.assertRaisesRegex(PipelineError, r"Conflicting kernel configuration"):
+            BuildEngine()._execute_fast(ctx)
+
+    def test_valid_symbol_variants_accepted(self):
+        """valid kernel symbols and optional prefixes must be accepted"""
+        ctx = self._ctx(enable_configs=["CONFIG_9P_FS", "CONFIG_VIRTIO_PCI", "9P_FS"])
+        self._write_config(ctx)
+        self._write_sequence_patch(ctx)
+        sp_dir = self.workspace / f"kernel-sandbox-sp-{ctx.commit_hash[:7]}-{ctx.arch}-{ctx.config_flavor}" / "current"
+        built_kernel = sp_dir / "arch" / ctx.boot_arch / "boot" / ctx.build_image_name
+        built_kernel.parent.mkdir(parents=True)
+        built_kernel.write_text("mock-bzImage-bytes")
+
+        BuildEngine()._execute_fast(ctx)
+        calls = MockContainerEngine.last_instance.calls
+        self.assertEqual(len(calls), 1)
+
     def test_missing_built_kernel_after_successful_compile_raises(self):
         ctx = self._ctx()
         self._write_config(ctx)
@@ -261,6 +344,107 @@ class TestBuildEngineExecuteFast(unittest.TestCase):
         self.assertTrue(cached.exists())
         self.assertEqual(cached.read_text(), "mock-bzImage-bytes")
         self.assertEqual(MockContainerEngine.last_instance.pull_calls, 1)
+
+    def test_should_test_kabi_decision_matrix(self):
+        """_should_test_kabi returns True only when check_kabi=True and both symvers and symtypes exist"""
+        ctx = self._ctx(check_kabi=True)
+        # Neither file exists -> logs WARNING and returns False
+        with self.assertLogs("kernel_sandbox", level="WARNING") as log_ctx:
+            self.assertFalse(BuildEngine._should_test_kabi(ctx))
+        self.assertTrue(any("Disabling kabi checks, reference missing" in msg for msg in log_ctx.output))
+
+        # Only symvers exists -> logs WARNING and returns False
+        self._write_kabi_refs(ctx, symvers=True, symtypes=False)
+        with self.assertLogs("kernel_sandbox", level="WARNING") as log_ctx:
+            self.assertFalse(BuildEngine._should_test_kabi(ctx))
+        self.assertTrue(any("Disabling kabi checks, reference missing" in msg for msg in log_ctx.output))
+
+        # Only symtypes exists -> logs WARNING and returns False
+        (self.workspace / "kabi" / ctx.arch / f"symvers-{ctx.config_flavor}").unlink()
+        with self.assertLogs("kernel_sandbox", level="WARNING") as log_ctx:
+            self.assertFalse(BuildEngine._should_test_kabi(ctx))
+        self.assertTrue(any("Disabling kabi checks, reference missing" in msg for msg in log_ctx.output))
+
+        # Both symvers and symtypes exist -> returns True
+        self._write_kabi_refs(ctx, symvers=True, symtypes=True)
+        self.assertTrue(BuildEngine._should_test_kabi(ctx))
+
+        # Disabled via --no-check-kabi even when both files exist
+        ctx_disabled = self._ctx(check_kabi=False)
+        self.assertFalse(BuildEngine._should_test_kabi(ctx_disabled))
+
+    def test_kabi_enabled_exports_kbuild_symtypes_and_calls_check_kabi(self):
+        """when kABI refs exist, compile receives KBUILD_SYMTYPES=1 and check_kabi is invoked after archiving"""
+        ctx = self._ctx(check_kabi=True, jobs=6)
+        self._write_config(ctx)
+        self._write_kabi_refs(ctx, symvers=True, symtypes=True)
+        self._write_sequence_patch(ctx)
+        sp_dir = self.workspace / f"kernel-sandbox-sp-{ctx.commit_hash[:7]}-{ctx.arch}-{ctx.config_flavor}" / "current"
+        built_kernel = sp_dir / "arch" / ctx.boot_arch / "boot" / ctx.build_image_name
+        built_kernel.parent.mkdir(parents=True)
+        built_kernel.write_text("mock-bzImage-bytes")
+
+        kabi_calls = []
+        engine = BuildEngine()
+        engine.check_kabi = lambda c, rt, ldir, j: kabi_calls.append((c, rt, ldir, j))
+        engine._execute_fast(ctx)
+
+        compile_engine = MockContainerEngine.last_instance
+        self.assertEqual(compile_engine.calls[0]["env_dict"].get("KBUILD_SYMTYPES"), "1")
+        self.assertEqual(kabi_calls, [(ctx, "mock-runtime", sp_dir, 6)])
+
+    def test_no_check_kabi_omits_kbuild_symtypes_and_skips_check_kabi(self):
+        """when --no-check-kabi is passed, KBUILD_SYMTYPES is omitted and check_kabi is not called"""
+        ctx = self._ctx(check_kabi=False)
+        self._write_config(ctx)
+        self._write_kabi_refs(ctx, symvers=True, symtypes=True)
+        self._write_sequence_patch(ctx)
+        sp_dir = self.workspace / f"kernel-sandbox-sp-{ctx.commit_hash[:7]}-{ctx.arch}-{ctx.config_flavor}" / "current"
+        built_kernel = sp_dir / "arch" / ctx.boot_arch / "boot" / ctx.build_image_name
+        built_kernel.parent.mkdir(parents=True)
+        built_kernel.write_text("mock-bzImage-bytes")
+
+        kabi_calls = []
+        engine = BuildEngine()
+        engine.check_kabi = lambda c, rt, ldir, j: kabi_calls.append((c, rt, ldir, j))
+        engine._execute_fast(ctx)
+
+        compile_engine = MockContainerEngine.last_instance
+        self.assertNotIn("KBUILD_SYMTYPES", compile_engine.calls[0]["env_dict"])
+        self.assertEqual(kabi_calls, [])
+
+    def test_kabi_check_failure_raises_pipeline_error_after_archiving_kernel_to_cache(self):
+        """kABI failure must stop the pipeline with PipelineError while leaving built kernel cached"""
+        ctx = self._ctx(check_kabi=True)
+        self._write_config(ctx)
+        self._write_kabi_refs(ctx, symvers=True, symtypes=True)
+        self._write_sequence_patch(ctx)
+        sp_dir = self.workspace / f"kernel-sandbox-sp-{ctx.commit_hash[:7]}-{ctx.arch}-{ctx.config_flavor}" / "current"
+        built_kernel = sp_dir / "arch" / ctx.boot_arch / "boot" / ctx.build_image_name
+        built_kernel.parent.mkdir(parents=True)
+        built_kernel.write_text("mock-bzImage-bytes")
+
+        class _FailOnKabiEngine(MockContainerEngine):
+            def __init__(self, runtime, storage_root, image, name=None):
+                super().__init__(runtime, storage_root, image, name=name)
+                if image == "mock-kabi-image":
+                    self.fail_execute_with = ContainerRuntimeError("ksymvers compare failed")
+
+        pipeline_engines.ContainerEngine = _FailOnKabiEngine
+
+        with self.assertRaises(PipelineError) as ctx_err:
+            BuildEngine()._execute_fast(ctx)
+
+        # Kernel artifact must already be archived in cache despite kABI failure
+        cached = ctx.artifacts_dir / ctx.kernel_image_name
+        self.assertTrue(cached.exists())
+        self.assertEqual(cached.read_text(), "mock-bzImage-bytes")
+
+        # Error message must guide developer on running image and boot phases
+        err_msg = str(ctx_err.exception)
+        self.assertIn("kABI check failed", err_msg)
+        self.assertIn("image", err_msg)
+        self.assertIn("boot", err_msg)
 
 
 class TestBuildEngineExecuteRpm(unittest.TestCase):
@@ -440,7 +624,12 @@ class TestInstallModules(unittest.TestCase):
         BuildEngine().install_modules(
             Path("/workspace"), _Engine(), "linux/amd64", {}, "", "gcc", "gcc", Path("/mods"), "x86_64")
         self.assertEqual(len(engine_calls), 1)
-        self.assertIn("modules_install", engine_calls[0]["cmd_str"])
+        spec_path = Path(engine_calls[0]["spec"])
+        self.assertTrue(spec_path.exists())
+        self.assertEqual(spec_path.name, "install_modules.yaml")
+        spec_content = spec_path.read_text()
+        self.assertIn("modules_install", spec_content)
+        self.assertIn("INSTALL_MOD_PATH=/module_root", spec_content)
 
     def test_failure_propagates_as_container_runtime_error(self):
         class _FailingEngine:
@@ -451,6 +640,73 @@ class TestInstallModules(unittest.TestCase):
             BuildEngine().install_modules(
                 Path("/workspace"), _FailingEngine(), "linux/amd64", {}, "", "gcc", "gcc", Path("/mods"), "x86_64")
         self.assertEqual("module build crashed", str(ctx_err.exception))
+
+
+class TestCheckKabi(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.tmp_dir.name) / "workspace"
+        self.workspace.mkdir()
+        self.cache_dir = Path(self.tmp_dir.name) / "cache"
+        self.cache_dir.mkdir()
+        self._original_container_engine = pipeline_engines.ContainerEngine
+        pipeline_engines.ContainerEngine = MockContainerEngine
+        MockContainerEngine.last_instance = None
+
+    def tearDown(self):
+        pipeline_engines.ContainerEngine = self._original_container_engine
+        self.tmp_dir.cleanup()
+
+    def _ctx(self, **overrides):
+        fields = dict(
+            workspace=self.workspace, build_root=self.workspace / "tmp", cache_dir=self.cache_dir,
+            commit_hash="abc1234def", arch="x86_64", config_flavor="default", mode="fast",
+            refresh_cache=False, use_busybox_initrd=True, qemu_bin="qemu-system-x86_64",
+            extra_qemu="", host_arch="x86_64", ssh_enabled=False,
+            host_arch_platform="linux/amd64", kabi_container_image="mock-kabi-image",
+        )
+        fields.update(overrides)
+        return FastModeContext(**fields)
+
+    def test_check_kabi_invokes_spec_with_expected_mounts_and_env(self):
+        ctx = self._ctx()
+        linux_dir = self.workspace / "current"
+        linux_dir.mkdir()
+
+        BuildEngine().check_kabi(ctx, "podman", linux_dir, 8)
+
+        engine = MockContainerEngine.last_instance
+        self.assertEqual(engine.image, "mock-kabi-image")
+        self.assertEqual(engine.name, f"kernel-sandbox-kabi-{ctx.commit_hash[:7]}-{ctx.arch}-{ctx.config_flavor}")
+        self.assertEqual(engine.pull_calls, 1)
+        self.assertEqual(len(engine.calls), 1)
+        call = engine.calls[0]
+        spec_path = Path(call["spec"])
+        self.assertTrue(spec_path.exists())
+        self.assertEqual(spec_path.name, "check_kabi.yaml")
+        spec_content = spec_path.read_text()
+        self.assertIn("ksymvers compare", spec_content)
+        self.assertIn("ksymtypes compare", spec_content)
+        self.assertEqual(call["workspace_path_rw"], linux_dir)
+        self.assertEqual(call["env_dict"], {"KABI_ARCH": "x86_64", "KABI_FLAVOR": "default", "JOBS": "8"})
+        self.assertEqual(call["extra_volumes"], {str(self.workspace / "kabi"): "/kabi"})
+
+    def test_check_kabi_wraps_container_runtime_error_in_pipeline_error(self):
+        ctx = self._ctx()
+        linux_dir = self.workspace / "current"
+        linux_dir.mkdir()
+
+        class _FailingKabiEngine(MockContainerEngine):
+            def __init__(self, runtime, storage_root, image, name=None):
+                super().__init__(runtime, storage_root, image, name=name)
+                self.fail_execute_with = ContainerRuntimeError("kabi mismatch")
+
+        pipeline_engines.ContainerEngine = _FailingKabiEngine
+        with self.assertRaises(PipelineError) as ctx_err:
+            BuildEngine().check_kabi(ctx, "podman", linux_dir, 4)
+
+        self.assertIn("kABI check failed for commit abc1234", str(ctx_err.exception))
+        self.assertEqual(MockContainerEngine.last_instance.remove_container_calls, 2)
 
 
 class TestImagePreparer(unittest.TestCase):
