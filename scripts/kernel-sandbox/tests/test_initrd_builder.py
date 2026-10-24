@@ -94,7 +94,7 @@ class TestCompileBusybox(unittest.TestCase):
         self.assertEqual(kwargs["platform"], "linux/amd64")
         self.assertEqual(kwargs["workspace_mount"], "/build")
 
-        cmd_str = kwargs["cmd_str"]
+        cmd_str = kwargs["command"][2]
         self.assertIn("make defconfig", cmd_str)
         self.assertIn('sed -i "s/# CONFIG_STATIC is not set/CONFIG_STATIC=y/" .config', cmd_str)
         self.assertIn('sed -i "s/CONFIG_TC=y/# CONFIG_TC is not set/" .config', cmd_str)
@@ -110,7 +110,7 @@ class TestCompileBusybox(unittest.TestCase):
             cross_compile="aarch64-suse-linux-",
             build_config_patches={"CONFIG_FOO": "y", "CONFIG_BAR": "n"}
         )
-        cmd_str = engine.calls[0]["cmd_str"]
+        cmd_str = engine.calls[0]["command"][2]
         self.assertIn('sed -i "s/# CONFIG_FOO is not set/CONFIG_FOO=y/" .config', cmd_str)
         self.assertIn('sed -i "s/CONFIG_BAR=y/# CONFIG_BAR is not set/" .config', cmd_str)
 
@@ -119,13 +119,13 @@ class MockBusyboxContainerEngineExecCmd:
     def __init__(self, mock_make_dir):
         self.mock_make_dir = str(mock_make_dir)
 
-    def execute_command(self, cmd_str, workspace_path_rw, **kwargs):
+    def execute_command(self, command, workspace_path_rw, **kwargs):
         env = dict(os.environ)
         env["PATH"] = f"{self.mock_make_dir}:{env.get('PATH', '')}"
         result = subprocess.run(
-            ["sh", "-c", cmd_str], cwd=str(workspace_path_rw), env=env, capture_output=True, text=True)
+            command, cwd=str(workspace_path_rw), env=env, capture_output=True, text=True)
         if result.returncode != 0:
-            raise AssertionError(f"exec of cmd_str: {cmd_str} failed: {result.stderr}")
+            raise AssertionError(f"exec of command: {' '.join(command)} failed: {result.stderr}")
         return result
 
 
@@ -337,7 +337,7 @@ class TestCreateBusyboxInitrd(unittest.TestCase):
         self.assertGreater(len(content), 0)
 
         compile_call = MockBusyboxContainerEngine.last_instance.calls[0]
-        self.assertIn("make defconfig", compile_call["cmd_str"])
+        self.assertIn("make defconfig", compile_call["command"][2])
 
     def test_skips_download_when_archive_already_cached(self):
         archive_path = self.cache_dir / "busybox-source" / "busybox-snapshot.tar.bz2"
@@ -458,7 +458,7 @@ class TestCreateDracutInitrd(unittest.TestCase):
         custom_init = self.module_install_root / "custom_init"
         self.assertIn(str(self.workspace.resolve()), custom_init.read_text())
 
-        cmd_str = MockDracutContainerEngine.last_instance.calls[0]["cmd_str"]
+        cmd_str = MockDracutContainerEngine.last_instance.calls[0]["command"][2]
         self.assertIn(f"/module_root/lib/modules/{kernel_version}", cmd_str)
 
     def test_usr_lib_modules_path_detected_when_present(self):
@@ -472,7 +472,7 @@ class TestCreateDracutInitrd(unittest.TestCase):
             kernel_version=kernel_version, module_install_root=self.module_install_root,
             output_path=output_path
         )
-        cmd_str = MockDracutContainerEngine.last_instance.calls[0]["cmd_str"]
+        cmd_str = MockDracutContainerEngine.last_instance.calls[0]["command"][2]
         self.assertIn(f"/module_root/usr/lib/modules/{kernel_version}", cmd_str)
 
     def test_missing_output_file_raises(self):
