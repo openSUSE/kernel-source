@@ -1,0 +1,269 @@
+From 2f37fba846c9fdff5fc15b6d93656057ccd13031 Mon Sep 17 00:00:00 2001
+From: Ibrahim Hashimov <security@auditcode.ai>
+Date: Sat, 25 Jul 2026 15:51:54 +0200
+Subject: [PATCH] mac802154: fix use-after-free of sdata via queued RX frames
+Git-commit: 2f37fba846c9fdff5fc15b6d93656057ccd13031
+Patch-mainline: v7.3-rc3
+References: CVE-2026-97595 bsc#1283736
+
+The RX softirq producer ieee802154_subif_frame() queues received beacon
+and MAC-command frames onto local->rx_beacon_list / rx_mac_cmd_list and
+schedules a process-context worker, storing a raw mac_pkt->sdata (and
+skb->dev == sdata->dev) with neither a reference nor any locking:
+
+ - the lists have no lock: the softirq producer list_add_tail()s while the
+   mac_wq worker list_del()s, so sibling interfaces on the same phy corrupt
+   the list;
+
+ - the workers dereference the interface after it may have been freed.
+   mac802154_rx_mac_cmd_worker() touches mac_pkt->sdata directly, and
+   mac802154_rx_beacon_worker() -> mac802154_process_beacon() dereferences
+   skb->dev (== sdata->dev). Removing an interface frees its sdata
+   (netdev_priv) while a queued frame still points at it, so a later worker
+   run is a use-after-free.
+
+Reproduced under KASAN by flooding a victim interface with MAC command
+frames and removing it (the beacon path is the same class via skb->dev):
+
+  BUG: KASAN: slab-use-after-free in mac802154_rx_mac_cmd_worker+0x463/0x630 [mac802154]
+  Read of size 4 at addr ffff888002f9ea18 by task kworker/u8:1/31
+  Workqueue: phy0-mac-cmds mac802154_rx_mac_cmd_worker [mac802154]
+  Call Trace:
+   mac802154_rx_mac_cmd_worker+0x463/0x630 [mac802154]
+   process_one_work+0x611/0xe80
+   worker_thread+0x52e/0xdc0
+   kthread+0x30c/0x630
+   ret_from_fork+0x2fd/0x3e0
+
+Fix both lists together:
+
+ - add local->rx_lock and take it around every list access: the softirq
+   producer (plain spin_lock, softirq context) and the workers and flush
+   (spin_lock_bh, process context);
+
+ - pin the interface for the lifetime of a queued frame with
+   netdev_hold()/netdev_put(), so the worker can safely dereference sdata /
+   skb->dev even while the interface is being removed;
+
+ - dequeue under the lock at the head and loop-drain the whole list in the
+   workers (they previously processed one frame per run and relied on a
+   later enqueue to drain the rest);
+
+ - drop not-yet-started frames of an interface before it is unregistered,
+   from ieee802154_if_remove() (after the RCU grace period) and from the
+   ieee802154_remove_interfaces() loop -- the latter is the whole-phy
+   teardown path, which does not go through ieee802154_if_remove().
+
+An in-flight worker that already dequeued a frame keeps its own netdev
+reference; unregister_netdevice() then waits it out in netdev_run_todo(),
+which runs at rtnl_unlock() (rtnl released) and after the interface has
+been closed, so it does not pin rtnl. A worker blocked in an association
+TX only delays that one interface's unregister (the usual "waiting for %s
+to become free"), it does not hold rtnl. netdev_hold() is used for this
+reason instead of a cancel_work_sync() under rtnl, which would block on
+the worker's unbounded MLME TX wait via ieee802154_sync_queue().
+
+The mac-command worker additionally skips processing for a stopped
+interface (ieee802154_sdata_running()), avoiding a needless association
+response during teardown.
+
+Fixes: 57588c71177f ("mac802154: Handle passive scanning")
+Cc: stable@vger.kernel.org
+Signed-off-by: Ibrahim Hashimov <security@auditcode.ai>
+Assisted-by: AuditCode-AI:2026.07
+Reviewed-by: Miquel Raynal <miquel.raynal@bootlin.com>
+Link: https://lore.kernel.org/20260725135154.99876-1-security@auditcode.ai
+Signed-off-by: Stefan Schmidt <stefan@datenfreihafen.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ include/net/cfg802154.h      |    1 
+ net/mac802154/ieee802154_i.h |    9 +++++
+ net/mac802154/iface.c        |    6 +++
+ net/mac802154/main.c         |    1 
+ net/mac802154/rx.c           |   70 ++++++++++++++++++++++++++++++++++++++-----
+ net/mac802154/scan.c         |   10 +-----
+ 6 files changed, 82 insertions(+), 15 deletions(-)
+
+--- a/include/net/cfg802154.h
++++ b/include/net/cfg802154.h
+@@ -350,6 +350,7 @@ struct cfg802154_mac_pkt {
+ 	struct list_head node;
+ 	struct sk_buff *skb;
+ 	struct ieee802154_sub_if_data *sdata;
++	netdevice_tracker dev_tracker;
+ 	u8 page;
+ 	u8 channel;
+ };
+--- a/net/mac802154/ieee802154_i.h
++++ b/net/mac802154/ieee802154_i.h
+@@ -70,6 +70,10 @@ struct ieee802154_local {
+ 	/* Asynchronous tasks */
+ 	struct list_head rx_beacon_list;
+ 	struct work_struct rx_beacon_work;
++	/* Serializes rx_beacon_list and rx_mac_cmd_list against the RX
++	 * softirq producer, the mac_wq workers and the teardown flush.
++	 */
++	spinlock_t rx_lock;
+ 
+ 	bool started;
+ 	bool suspended;
+@@ -275,6 +279,11 @@ static inline bool mac802154_is_beaconin
+ 	return test_bit(IEEE802154_IS_BEACONING, &local->ongoing);
+ }
+ 
++void mac802154_flush_list(struct list_head *list,
++			  struct ieee802154_sub_if_data *sdata);
++void mac802154_flush_queued_pkts(struct ieee802154_local *local,
++				 struct ieee802154_sub_if_data *sdata);
++
+ /* interface handling */
+ int ieee802154_iface_init(void);
+ void ieee802154_iface_exit(void);
+--- a/net/mac802154/iface.c
++++ b/net/mac802154/iface.c
+@@ -695,6 +695,7 @@ void ieee802154_if_remove(struct ieee802
+ 	mutex_unlock(&sdata->local->iflist_mtx);
+ 
+ 	synchronize_rcu();
++	mac802154_flush_queued_pkts(sdata->local, sdata);
+ 	unregister_netdevice(sdata->dev);
+ }
+ 
+@@ -706,6 +707,11 @@ void ieee802154_remove_interfaces(struct
+ 	list_for_each_entry_safe(sdata, tmp, &local->interfaces, list) {
+ 		list_del(&sdata->list);
+ 
++		/* Best-effort: a frame the RX softirq queues for this sdata
++		 * after the flush still pins the netdev, so the
++		 * unregister_netdevice() below waits it out.
++		 */
++		mac802154_flush_queued_pkts(local, sdata);
+ 		unregister_netdevice(sdata->dev);
+ 	}
+ 	mutex_unlock(&local->iflist_mtx);
+--- a/net/mac802154/main.c
++++ b/net/mac802154/main.c
+@@ -90,6 +90,7 @@ ieee802154_alloc_hw(size_t priv_data_len
+ 
+ 	INIT_LIST_HEAD(&local->interfaces);
+ 	INIT_LIST_HEAD(&local->rx_beacon_list);
++	spin_lock_init(&local->rx_lock);
+ 	mutex_init(&local->iflist_mtx);
+ 
+ 	tasklet_setup(&local->tasklet, ieee802154_tasklet_handler);
+--- a/net/mac802154/rx.c
++++ b/net/mac802154/rx.c
+@@ -35,16 +35,23 @@ void mac802154_rx_beacon_worker(struct w
+ 		container_of(work, struct ieee802154_local, rx_beacon_work);
+ 	struct cfg802154_mac_pkt *mac_pkt;
+ 
+-	mac_pkt = list_first_entry_or_null(&local->rx_beacon_list,
+-					   struct cfg802154_mac_pkt, node);
+-	if (!mac_pkt)
+-		return;
++	for (;;) {
++		spin_lock_bh(&local->rx_lock);
++		mac_pkt = list_first_entry_or_null(&local->rx_beacon_list,
++						   struct cfg802154_mac_pkt, node);
++		if (mac_pkt)
++			list_del(&mac_pkt->node);
++		spin_unlock_bh(&local->rx_lock);
++		if (!mac_pkt)
++			break;
+ 
+-	mac802154_process_beacon(local, mac_pkt->skb, mac_pkt->page, mac_pkt->channel);
++		mac802154_process_beacon(local, mac_pkt->skb,
++					 mac_pkt->page, mac_pkt->channel);
+ 
+-	list_del(&mac_pkt->node);
+-	kfree_skb(mac_pkt->skb);
+-	kfree(mac_pkt);
++		netdev_put(mac_pkt->sdata->dev, &mac_pkt->dev_tracker);
++		kfree_skb(mac_pkt->skb);
++		kfree(mac_pkt);
++	}
+ }
+ 
+ static int
+@@ -137,7 +144,10 @@ ieee802154_subif_frame(struct ieee802154
+ 		mac_pkt->sdata = sdata;
+ 		mac_pkt->page = sdata->local->scan_page;
+ 		mac_pkt->channel = sdata->local->scan_channel;
++		netdev_hold(sdata->dev, &mac_pkt->dev_tracker, GFP_ATOMIC);
++		spin_lock(&sdata->local->rx_lock);
+ 		list_add_tail(&mac_pkt->node, &sdata->local->rx_beacon_list);
++		spin_unlock(&sdata->local->rx_lock);
+ 		queue_work(sdata->local->mac_wq, &sdata->local->rx_beacon_work);
+ 		return NET_RX_SUCCESS;
+ 	case IEEE802154_FC_TYPE_ACK:
+@@ -176,6 +186,50 @@ ieee802154_print_addr(const char *name,
+ 	}
+ }
+ 
++/**
++ * mac802154_flush_list - free queued RX frames on @list
++ * @list: rx_beacon_list or rx_mac_cmd_list
++ * @sdata: only free frames received on this interface, or %NULL for all
++ *
++ * Each frame pins the net_device it was received on (via netdev_hold()),
++ * so release that reference as the frame is dropped. Caller must hold
++ * local->rx_lock.
++ */
++void mac802154_flush_list(struct list_head *list,
++			  struct ieee802154_sub_if_data *sdata)
++{
++	struct cfg802154_mac_pkt *mac_pkt, *tmp;
++
++	list_for_each_entry_safe(mac_pkt, tmp, list, node) {
++		if (sdata && mac_pkt->sdata != sdata)
++			continue;
++		list_del(&mac_pkt->node);
++		netdev_put(mac_pkt->sdata->dev, &mac_pkt->dev_tracker);
++		kfree_skb(mac_pkt->skb);
++		kfree(mac_pkt);
++	}
++}
++
++/**
++ * mac802154_flush_queued_pkts - drop queued RX work referencing @sdata
++ * @local: the mac802154 device
++ * @sdata: interface being removed
++ *
++ * The workers dereference the queued frame's interface directly
++ * (mac_pkt->sdata) or through skb->dev in mac802154_process_beacon(). Drop
++ * the not-yet-started entries belonging to @sdata before it is unregistered
++ * so their netdev reference is released; an entry already dequeued by a
++ * running worker keeps its own reference until the worker completes, which
++ * unregister_netdevice() then waits out.
++ */
++void mac802154_flush_queued_pkts(struct ieee802154_local *local,
++				 struct ieee802154_sub_if_data *sdata)
++{
++	spin_lock_bh(&local->rx_lock);
++	mac802154_flush_list(&local->rx_beacon_list, sdata);
++	spin_unlock_bh(&local->rx_lock);
++}
++
+ static int
+ ieee802154_parse_frame_start(struct sk_buff *skb, struct ieee802154_hdr *hdr)
+ {
+--- a/net/mac802154/scan.c
++++ b/net/mac802154/scan.c
+@@ -100,13 +100,9 @@ static unsigned int mac802154_scan_get_c
+ 
+ static void mac802154_flush_queued_beacons(struct ieee802154_local *local)
+ {
+-	struct cfg802154_mac_pkt *mac_pkt, *tmp;
+-
+-	list_for_each_entry_safe(mac_pkt, tmp, &local->rx_beacon_list, node) {
+-		list_del(&mac_pkt->node);
+-		kfree_skb(mac_pkt->skb);
+-		kfree(mac_pkt);
+-	}
++	spin_lock_bh(&local->rx_lock);
++	mac802154_flush_list(&local->rx_beacon_list, NULL);
++	spin_unlock_bh(&local->rx_lock);
+ }
+ 
+ static void
