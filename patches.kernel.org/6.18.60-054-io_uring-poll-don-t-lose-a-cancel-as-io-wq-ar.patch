@@ -1,0 +1,110 @@
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Thu, 15 Oct 2026 19:30:38 +0000
+Subject: [PATCH] io_uring/poll: don't lose a cancel as io-wq arms poll
+References: bsc#1258210
+Patch-mainline: 6.18.60
+Git-commit: 6d2d4c2530e95ff6ddeb98195d49d99dbca14369
+
+Commit 6d2d4c2530e95ff6ddeb98195d49d99dbca14369 upstream.
+
+A request on a pollable file that was forced to io-wq is issued without
+blocking there. If that ends in -EAGAIN, io_wq_submit_work() arms poll
+for it and returns. It looks at IO_WQ_WORK_CANCEL once, before it issues
+the request.
+
+Somebody who wants to cancel the request in between finds it running:
+
+  io-wq worker                          io_try_cancel()
+  io_wq_submit_work()
+    IO_WQ_WORK_CANCEL isn't set
+    io_issue_sqe() = -EAGAIN
+                                        io_async_cancel_one()
+                                          sets IO_WQ_WORK_CANCEL
+                                          signals the worker
+                                          = -EALREADY
+                                        io_poll_cancel() = -ENOENT
+                                        ...
+                                        = -ENOENT
+    io_arm_poll_handler() = IO_APOLL_OK
+    return
+
+Nobody looks at the flag again, and the signal doesn't matter to a
+worker that doesn't sleep. The request is armed as if nothing had
+happened:
+
+ - a linked timeout completes with -ENOENT, and the request it was
+   meant to limit waits for as long as it takes.
+ - IORING_OP_ASYNC_CANCEL returns -EALREADY, and the request stays.
+ - IORING_REGISTER_SYNC_CANCEL waits for the request to complete if it
+   gets -EALREADY. Since commit 5623eb1ed035 ("io_uring/tctx: add
+   separate lock for list of tctx's in ctx") it doesn't sleep but spins,
+   so its next attempt finds the armed poll.
+
+The same goes for a multishot poll, recv or accept that is armed from
+io-wq.
+
+With a read of an empty pipe, IOSQE_ASYNC, and a linked timeout of 5ms
+or a cancel in the same submission, in a guest that is slow enough (TCG,
+KASAN), the request is lost in 21 of 24 rounds of 40 or 100 attempts.
+
+While it arms poll from io-wq, __io_arm_poll_handler() owns the request.
+Look at the flag once the request is in the hash table. The table is
+searched and the request is added with ->uring_lock held, and the flag is
+set before the search. So either the search finds the request, or it
+came first and the flag is seen. With the request marked as cancelled, the
+task work that is queued, right away or because ownership can't be
+released, fails it with -ECANCELED.
+
+What the canceller is told doesn't change. In this window a linked timeout
+still completes with -ENOENT rather than -ETIME, a cancel request with
+-EALREADY, and one with IORING_ASYNC_CANCEL_ALL or _ANY with a count that
+doesn't include the request. But the request is cancelled, so what is new
+is a request that completes with -ECANCELED after such a result.
+
+This doesn't help in two cases:
+
+ - IORING_ASYNC_CANCEL_ALL and _ANY, if the work is flagged after the
+   test added here, while io-wq still has it as the current work of the
+   worker. io_cancel_cb() stamps it with the sequence of the cancel, so the
+   search of the hash table on behalf of the same cancel takes it for
+   done and skips it.
+ - requests that are parked elsewhere by io-wq, like IORING_OP_FUTEX_WAIT
+   and IORING_OP_WAITID. They have the same problem.
+
+Fixes: 90fa02883f06 ("io_uring: implement async hybrid mode for pollable requests")
+Assisted-by: LLM
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Link: https://patch.msgid.link/20261015-b4-io-uring-fixes-v1-14-c1556f5d7bf5@toxicpanda.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ io_uring/poll.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/io_uring/poll.c b/io_uring/poll.c
+index f122a0070155..f308eb793d72 100644
+--- a/io_uring/poll.c
++++ b/io_uring/poll.c
+@@ -614,6 +614,18 @@ static int __io_arm_poll_handler(struct io_kiocb *req,
+ 
+ 	io_poll_add_hash(req, issue_flags);
+ 
++	/*
++	 * Whoever tried to cancel the request while io-wq was running it has
++	 * flagged the work item. If it searched the hash table before the
++	 * request got there it found nothing, and it won't come back. Both
++	 * the search and the insertion are done with ->uring_lock held, and
++	 * the flag is set before the search. If the search came first,
++	 * the flag is visible by now.
++	 */
++	if (ipt->owning &&
++	    (atomic_read(&req->work.flags) & IO_WQ_WORK_CANCEL))
++		io_poll_mark_cancelled(req);
++
+ 	if (mask && (poll->events & EPOLLET) &&
+ 	    io_poll_can_finish_inline(req, ipt)) {
+ 		__io_poll_execute(req, mask, 0);
+-- 
+2.56.0
+
