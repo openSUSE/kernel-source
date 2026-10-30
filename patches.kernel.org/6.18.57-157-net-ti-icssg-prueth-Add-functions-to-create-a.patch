@@ -1,0 +1,334 @@
+From: Meghana Malladi <m-malladi@ti.com>
+Date: Tue, 18 Nov 2025 19:25:37 +0530
+Subject: [PATCH] net: ti: icssg-prueth: Add functions to create and destroy
+ Rx/Tx queues
+References: bsc#1258210
+Patch-mainline: 6.18.57
+Git-commit: 41dde7f1d01343ebebe265edd8f4b59bca591db8
+
+[ Upstream commit 41dde7f1d01343ebebe265edd8f4b59bca591db8 ]
+
+Each port for a given ICSSG instance has their own set of
+Tx and Rx queues. Add functions to create and destroy these
+queues, which will be further used while performing ndo_bpf
+operations to set up XSK Tx/Rx queues for a given port.
+
+In the destroy Rx queue sequence add teardown wait to ensure
+that all the descriptors including the TDCM (teardown completion
+marker) have been serviced and freed to avoid any sort of descriptor
+leaks.
+
+Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+Signed-off-by: Meghana Malladi <m-malladi@ti.com>
+Link: https://patch.msgid.link/20251118135542.380574-2-m-malladi@ti.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Stable-dep-of: eb8c426c9803 ("net: ti: icssg-prueth: fix use-after-free of CPPI descriptor in RX path")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/net/ethernet/ti/icssg/icssg_common.c |  10 +-
+ drivers/net/ethernet/ti/icssg/icssg_prueth.c | 177 ++++++++++++-------
+ drivers/net/ethernet/ti/icssg/icssg_prueth.h |   2 +
+ 3 files changed, 127 insertions(+), 62 deletions(-)
+
+diff --git a/drivers/net/ethernet/ti/icssg/icssg_common.c b/drivers/net/ethernet/ti/icssg/icssg_common.c
+index bd1dc034b3bd..73d0e7575efa 100644
+--- a/drivers/net/ethernet/ti/icssg/icssg_common.c
++++ b/drivers/net/ethernet/ti/icssg/icssg_common.c
+@@ -719,8 +719,10 @@ static int emac_rx_packet(struct prueth_emac *emac, u32 flow_id, u32 *xdp_state)
+ 		return ret;
+ 	}
+ 
+-	if (cppi5_desc_is_tdcm(desc_dma)) /* Teardown ? */
++	if (cppi5_desc_is_tdcm(desc_dma)) {
++		complete(&emac->tdown_complete);
+ 		return 0;
++	}
+ 
+ 	desc_rx = k3_cppi_desc_pool_dma2virt(rx_chn->desc_pool, desc_dma);
+ 	swdata = cppi5_hdesc_get_swdata(desc_rx);
+@@ -804,7 +806,7 @@ static int emac_rx_packet(struct prueth_emac *emac, u32 flow_id, u32 *xdp_state)
+ 	return ret;
+ }
+ 
+-static void prueth_rx_cleanup(void *data, dma_addr_t desc_dma)
++void prueth_rx_cleanup(void *data, dma_addr_t desc_dma)
+ {
+ 	struct prueth_rx_chn *rx_chn = data;
+ 	struct cppi5_host_desc_t *desc_rx;
+@@ -822,6 +824,7 @@ static void prueth_rx_cleanup(void *data, dma_addr_t desc_dma)
+ 
+ 	k3_cppi_desc_pool_free(rx_chn->desc_pool, desc_rx);
+ }
++EXPORT_SYMBOL_GPL(prueth_rx_cleanup);
+ 
+ static int prueth_tx_ts_cookie_get(struct prueth_emac *emac)
+ {
+@@ -1025,7 +1028,7 @@ enum netdev_tx icssg_ndo_start_xmit(struct sk_buff *skb, struct net_device *ndev
+ }
+ EXPORT_SYMBOL_GPL(icssg_ndo_start_xmit);
+ 
+-static void prueth_tx_cleanup(void *data, dma_addr_t desc_dma)
++void prueth_tx_cleanup(void *data, dma_addr_t desc_dma)
+ {
+ 	struct prueth_tx_chn *tx_chn = data;
+ 	struct cppi5_host_desc_t *desc_tx;
+@@ -1051,6 +1054,7 @@ static void prueth_tx_cleanup(void *data, dma_addr_t desc_dma)
+ 
+ 	prueth_xmit_free(tx_chn, desc_tx);
+ }
++EXPORT_SYMBOL_GPL(prueth_tx_cleanup);
+ 
+ irqreturn_t prueth_rx_irq(int irq, void *dev_id)
+ {
+diff --git a/drivers/net/ethernet/ti/icssg/icssg_prueth.c b/drivers/net/ethernet/ti/icssg/icssg_prueth.c
+index d95a37e562cd..284106982aaa 100644
+--- a/drivers/net/ethernet/ti/icssg/icssg_prueth.c
++++ b/drivers/net/ethernet/ti/icssg/icssg_prueth.c
+@@ -743,6 +743,114 @@ static int icssg_update_vlan_mcast(struct net_device *vdev, int vid,
+ 	return 0;
+ }
+ 
++static void prueth_destroy_txq(struct prueth_emac *emac)
++{
++	int ret, i;
++
++	atomic_set(&emac->tdown_cnt, emac->tx_ch_num);
++	/* ensure new tdown_cnt value is visible */
++	smp_mb__after_atomic();
++	/* tear down and disable UDMA channels */
++	reinit_completion(&emac->tdown_complete);
++	for (i = 0; i < emac->tx_ch_num; i++)
++		k3_udma_glue_tdown_tx_chn(emac->tx_chns[i].tx_chn, false);
++
++	ret = wait_for_completion_timeout(&emac->tdown_complete,
++					  msecs_to_jiffies(1000));
++	if (!ret)
++		netdev_err(emac->ndev, "tx teardown timeout\n");
++
++	for (i = 0; i < emac->tx_ch_num; i++) {
++		napi_disable(&emac->tx_chns[i].napi_tx);
++		hrtimer_cancel(&emac->tx_chns[i].tx_hrtimer);
++		k3_udma_glue_reset_tx_chn(emac->tx_chns[i].tx_chn,
++					  &emac->tx_chns[i],
++					  prueth_tx_cleanup);
++		k3_udma_glue_disable_tx_chn(emac->tx_chns[i].tx_chn);
++	}
++}
++
++static void prueth_destroy_rxq(struct prueth_emac *emac)
++{
++	int i, ret;
++
++	/* tear down and disable UDMA channels */
++	reinit_completion(&emac->tdown_complete);
++	k3_udma_glue_tdown_rx_chn(emac->rx_chns.rx_chn, true);
++
++	/* When RX DMA Channel Teardown is initiated, it will result in an
++	 * interrupt and a Teardown Completion Marker (TDCM) is queued into
++	 * the RX Completion queue. Acknowledging the interrupt involves
++	 * popping the TDCM descriptor from the RX Completion queue via the
++	 * RX NAPI Handler. To avoid timing out when waiting for the TDCM to
++	 * be popped, schedule the RX NAPI handler to run immediately.
++	 */
++	if (!napi_if_scheduled_mark_missed(&emac->napi_rx)) {
++		if (napi_schedule_prep(&emac->napi_rx))
++			__napi_schedule(&emac->napi_rx);
++	}
++
++	ret = wait_for_completion_timeout(&emac->tdown_complete,
++					  msecs_to_jiffies(1000));
++	if (!ret)
++		netdev_err(emac->ndev, "rx teardown timeout\n");
++
++	for (i = 0; i < PRUETH_MAX_RX_FLOWS; i++) {
++		napi_disable(&emac->napi_rx);
++		hrtimer_cancel(&emac->rx_hrtimer);
++		k3_udma_glue_reset_rx_chn(emac->rx_chns.rx_chn, i,
++					  &emac->rx_chns,
++					  prueth_rx_cleanup);
++	}
++
++	prueth_destroy_xdp_rxqs(emac);
++	k3_udma_glue_disable_rx_chn(emac->rx_chns.rx_chn);
++}
++
++static int prueth_create_txq(struct prueth_emac *emac)
++{
++	int ret, i;
++
++	for (i = 0; i < emac->tx_ch_num; i++) {
++		ret = k3_udma_glue_enable_tx_chn(emac->tx_chns[i].tx_chn);
++		if (ret)
++			goto reset_tx_chan;
++		napi_enable(&emac->tx_chns[i].napi_tx);
++	}
++	return 0;
++
++reset_tx_chan:
++	/* Since interface is not yet up, there is wouldn't be
++	 * any SKB for completion. So set false to free_skb
++	 */
++	prueth_reset_tx_chan(emac, i, false);
++	return ret;
++}
++
++static int prueth_create_rxq(struct prueth_emac *emac)
++{
++	int ret;
++
++	ret = prueth_prepare_rx_chan(emac, &emac->rx_chns, PRUETH_MAX_PKT_SIZE);
++	if (ret)
++		return ret;
++
++	ret = k3_udma_glue_enable_rx_chn(emac->rx_chns.rx_chn);
++	if (ret)
++		goto reset_rx_chn;
++
++	ret = prueth_create_xdp_rxqs(emac);
++	if (ret)
++		goto reset_rx_chn;
++
++	napi_enable(&emac->napi_rx);
++	return 0;
++
++reset_rx_chn:
++	prueth_reset_rx_chan(&emac->rx_chns, PRUETH_MAX_RX_FLOWS, false);
++	return ret;
++}
++
+ /**
+  * emac_ndo_open - EMAC device open
+  * @ndev: network adapter device
+@@ -754,7 +862,7 @@ static int icssg_update_vlan_mcast(struct net_device *vdev, int vid,
+ static int emac_ndo_open(struct net_device *ndev)
+ {
+ 	struct prueth_emac *emac = netdev_priv(ndev);
+-	int ret, i, num_data_chn = emac->tx_ch_num;
++	int ret, num_data_chn = emac->tx_ch_num;
+ 	struct icssg_flow_cfg __iomem *flow_cfg;
+ 	struct prueth *prueth = emac->prueth;
+ 	int slice = prueth_emac_slice(emac);
+@@ -827,28 +935,13 @@ static int emac_ndo_open(struct net_device *ndev)
+ 		goto stop;
+ 
+ 	/* Prepare RX */
+-	ret = prueth_prepare_rx_chan(emac, &emac->rx_chns, PRUETH_MAX_PKT_SIZE);
++	ret = prueth_create_rxq(emac);
+ 	if (ret)
+ 		goto free_tx_ts_irq;
+ 
+-	ret = prueth_create_xdp_rxqs(emac);
+-	if (ret)
+-		goto reset_rx_chn;
+-
+-	ret = k3_udma_glue_enable_rx_chn(emac->rx_chns.rx_chn);
++	ret = prueth_create_txq(emac);
+ 	if (ret)
+-		goto destroy_xdp_rxqs;
+-
+-	for (i = 0; i < emac->tx_ch_num; i++) {
+-		ret = k3_udma_glue_enable_tx_chn(emac->tx_chns[i].tx_chn);
+-		if (ret)
+-			goto reset_tx_chan;
+-	}
+-
+-	/* Enable NAPI in Tx and Rx direction */
+-	for (i = 0; i < emac->tx_ch_num; i++)
+-		napi_enable(&emac->tx_chns[i].napi_tx);
+-	napi_enable(&emac->napi_rx);
++		goto destroy_rxq;
+ 
+ 	/* start PHY */
+ 	phy_start(ndev->phydev);
+@@ -859,15 +952,8 @@ static int emac_ndo_open(struct net_device *ndev)
+ 
+ 	return 0;
+ 
+-reset_tx_chan:
+-	/* Since interface is not yet up, there is wouldn't be
+-	 * any SKB for completion. So set false to free_skb
+-	 */
+-	prueth_reset_tx_chan(emac, i, false);
+-destroy_xdp_rxqs:
+-	prueth_destroy_xdp_rxqs(emac);
+-reset_rx_chn:
+-	prueth_reset_rx_chan(&emac->rx_chns, max_rx_flows, false);
++destroy_rxq:
++	prueth_destroy_rxq(emac);
+ free_tx_ts_irq:
+ 	free_irq(emac->tx_ts_irq, emac);
+ stop:
+@@ -897,9 +983,6 @@ static int emac_ndo_stop(struct net_device *ndev)
+ {
+ 	struct prueth_emac *emac = netdev_priv(ndev);
+ 	struct prueth *prueth = emac->prueth;
+-	int rx_flow = PRUETH_RX_FLOW_DATA;
+-	int max_rx_flows;
+-	int ret, i;
+ 
+ 	/* inform the upper layers. */
+ 	netif_tx_stop_all_queues(ndev);
+@@ -913,32 +996,8 @@ static int emac_ndo_stop(struct net_device *ndev)
+ 	else
+ 		__dev_mc_unsync(ndev, icssg_prueth_del_mcast);
+ 
+-	atomic_set(&emac->tdown_cnt, emac->tx_ch_num);
+-	/* ensure new tdown_cnt value is visible */
+-	smp_mb__after_atomic();
+-	/* tear down and disable UDMA channels */
+-	reinit_completion(&emac->tdown_complete);
+-	for (i = 0; i < emac->tx_ch_num; i++)
+-		k3_udma_glue_tdown_tx_chn(emac->tx_chns[i].tx_chn, false);
+-
+-	ret = wait_for_completion_timeout(&emac->tdown_complete,
+-					  msecs_to_jiffies(1000));
+-	if (!ret)
+-		netdev_err(ndev, "tx teardown timeout\n");
+-
+-	prueth_reset_tx_chan(emac, emac->tx_ch_num, true);
+-	for (i = 0; i < emac->tx_ch_num; i++) {
+-		napi_disable(&emac->tx_chns[i].napi_tx);
+-		hrtimer_cancel(&emac->tx_chns[i].tx_hrtimer);
+-	}
+-
+-	max_rx_flows = PRUETH_MAX_RX_FLOWS;
+-	k3_udma_glue_tdown_rx_chn(emac->rx_chns.rx_chn, true);
+-
+-	prueth_reset_rx_chan(&emac->rx_chns, max_rx_flows, true);
+-	prueth_destroy_xdp_rxqs(emac);
+-	napi_disable(&emac->napi_rx);
+-	hrtimer_cancel(&emac->rx_hrtimer);
++	prueth_destroy_txq(emac);
++	prueth_destroy_rxq(emac);
+ 
+ 	cancel_work_sync(&emac->rx_mode_work);
+ 
+@@ -951,10 +1010,10 @@ static int emac_ndo_stop(struct net_device *ndev)
+ 
+ 	free_irq(emac->tx_ts_irq, emac);
+ 
+-	free_irq(emac->rx_chns.irq[rx_flow], emac);
++	free_irq(emac->rx_chns.irq[PRUETH_RX_FLOW_DATA], emac);
+ 	prueth_ndev_del_tx_napi(emac, emac->tx_ch_num);
+ 
+-	prueth_cleanup_rx_chns(emac, &emac->rx_chns, max_rx_flows);
++	prueth_cleanup_rx_chns(emac, &emac->rx_chns, PRUETH_MAX_RX_FLOWS);
+ 	prueth_cleanup_tx_chns(emac);
+ 
+ 	prueth->emacs_initialized--;
+diff --git a/drivers/net/ethernet/ti/icssg/icssg_prueth.h b/drivers/net/ethernet/ti/icssg/icssg_prueth.h
+index f0fa9688d9a0..5cc90b66035a 100644
+--- a/drivers/net/ethernet/ti/icssg/icssg_prueth.h
++++ b/drivers/net/ethernet/ti/icssg/icssg_prueth.h
+@@ -501,5 +501,7 @@ u32 emac_xmit_xdp_frame(struct prueth_emac *emac,
+ 			struct xdp_frame *xdpf,
+ 			struct page *page,
+ 			unsigned int q_idx);
++void prueth_rx_cleanup(void *data, dma_addr_t desc_dma);
++void prueth_tx_cleanup(void *data, dma_addr_t desc_dma);
+ 
+ #endif /* __NET_TI_ICSSG_PRUETH_H */
+-- 
+2.56.0
+

@@ -1,0 +1,213 @@
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <ckoenig.leichtzumerken@gmail.com>
+Date: Wed, 7 Oct 2026 14:46:57 +0200
+Subject: [PATCH] drm/exec: don't immediately add prelocked obj to array of
+ locked objs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1258210
+Patch-mainline: 6.18.59
+Git-commit: 26401a4999f1596a515b2e704e7066ac09306488
+
+commit 26401a4999f1596a515b2e704e7066ac09306488 upstream.
+
+When a contention is detected the drm_exec object grabs a reference to
+the contended object, unlocks all other objects and pre-locks the
+contended one before anything else.
+
+The problem is that it is possible that this pre-locked object was about
+to be destroyed and drm_exec is now holding the last reference to it.
+
+So we never actually see this pre-locked object again to be explicitly
+locked and so also never reserve a slot for a dma_fence object on it.
+
+Should the driver now use drm_exec_for_each_locked_object() to add a new
+fence to all locked objects we eventually see a warning or even a
+BUG_ON() to prevent random memory corruption.
+
+Fix this by keeping the prelocked object out of the array of locked objs
+until it was explicitly mentioned by the driver again.
+
+If the prelocked object is never mentioned again by the driver
+just unlock and drop the reference at the end of the locking loop.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reported-by: Vitaly Prosyak <vitaly.prosyak@amd.com>
+Reviewed-by: Vitaly Prosyak <vitaly.prosyak@amd.com>
+Tested-by: Vitaly Prosyak <vitaly.prosyak@amd.com>
+Fixes: 09593216bff1 ("drm: execution context for GEM buffers v7")
+CC: stable@vger.kernel.org # v6.6+
+Link: https://lore.kernel.org/r/20261007124657.9664-1-christian.koenig@amd.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/gpu/drm/drm_exec.c | 73 ++++++++++++++++++++++----------------
+ include/drm/drm_exec.h     | 15 ++++----
+ 2 files changed, 52 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_exec.c b/drivers/gpu/drm/drm_exec.c
+index 5c97f8ba8498..3e775cefa3d0 100644
+--- a/drivers/gpu/drm/drm_exec.c
++++ b/drivers/gpu/drm/drm_exec.c
+@@ -51,6 +51,16 @@
+ /* Dummy value used to initially enter the retry loop */
+ #define DRM_EXEC_DUMMY ((void *)~0)
+ 
++/* Unlock and put the prelocked obj */
++static void drm_exec_drop_prelocked(struct drm_exec *exec)
++{
++	if (exec->prelocked) {
++		dma_resv_unlock(exec->prelocked->resv);
++		drm_gem_object_put(exec->prelocked);
++		exec->prelocked = NULL;
++	}
++}
++
+ /* Unlock all objects and drop references */
+ static void drm_exec_unlock_all(struct drm_exec *exec)
+ {
+@@ -61,8 +71,7 @@ static void drm_exec_unlock_all(struct drm_exec *exec)
+ 		drm_gem_object_put(obj);
+ 	}
+ 
+-	drm_gem_object_put(exec->prelocked);
+-	exec->prelocked = NULL;
++	drm_exec_drop_prelocked(exec);
+ }
+ 
+ /**
+@@ -121,6 +130,14 @@ EXPORT_SYMBOL(drm_exec_fini);
+ bool drm_exec_cleanup(struct drm_exec *exec)
+ {
+ 	if (likely(!exec->contended)) {
++
++		/*
++		 * The contended and prelocked object might never be passed to
++		 * drm_exec_lock_obj() again. This can happen when the object
++		 * is about to be cleaned up and we now hold the last reference
++		 * to it. Make sure that we don't unnecessarily keep it around.
++		 */
++		drm_exec_drop_prelocked(exec);
+ 		ww_acquire_done(&exec->ticket);
+ 		return false;
+ 	}
+@@ -178,16 +195,16 @@ static int drm_exec_lock_contended(struct drm_exec *exec)
+ 		dma_resv_lock_slow(obj->resv, &exec->ticket);
+ 	}
+ 
+-	ret = drm_exec_obj_locked(exec, obj);
+-	if (unlikely(ret))
+-		goto error_unlock;
++	/*
++	 * It is perfectly possible that we see another contention before the
++	 * first one is fully handled.
++	 */
++	drm_exec_drop_prelocked(exec);
+ 
++	/* We move the reference from contended to prelocked here */
+ 	exec->prelocked = obj;
+ 	return 0;
+ 
+-error_unlock:
+-	dma_resv_unlock(obj->resv);
+-
+ error_dropref:
+ 	drm_gem_object_put(obj);
+ 	return ret;
+@@ -215,35 +232,31 @@ int drm_exec_lock_obj(struct drm_exec *exec, struct drm_gem_object *obj)
+ 	if (exec->prelocked == obj) {
+ 		drm_gem_object_put(exec->prelocked);
+ 		exec->prelocked = NULL;
+-		return 0;
+-	}
++	} else {
++		if (exec->flags & DRM_EXEC_INTERRUPTIBLE_WAIT)
++			ret = dma_resv_lock_interruptible(obj->resv,
++							  &exec->ticket);
++		else
++			ret = dma_resv_lock(obj->resv, &exec->ticket);
++
++		if (unlikely(ret == -EDEADLK)) {
++			drm_gem_object_get(obj);
++			exec->contended = obj;
++			return -EDEADLK;
++		}
+ 
+-	if (exec->flags & DRM_EXEC_INTERRUPTIBLE_WAIT)
+-		ret = dma_resv_lock_interruptible(obj->resv, &exec->ticket);
+-	else
+-		ret = dma_resv_lock(obj->resv, &exec->ticket);
++		if (unlikely(ret == -EALREADY) &&
++		    exec->flags & DRM_EXEC_IGNORE_DUPLICATES)
++			return 0;
+ 
+-	if (unlikely(ret == -EDEADLK)) {
+-		drm_gem_object_get(obj);
+-		exec->contended = obj;
+-		return -EDEADLK;
++		if (unlikely(ret))
++			return ret;
+ 	}
+ 
+-	if (unlikely(ret == -EALREADY) &&
+-	    exec->flags & DRM_EXEC_IGNORE_DUPLICATES)
+-		return 0;
+-
+-	if (unlikely(ret))
+-		return ret;
+-
+ 	ret = drm_exec_obj_locked(exec, obj);
+ 	if (ret)
+-		goto error_unlock;
+-
+-	return 0;
++		dma_resv_unlock(obj->resv);
+ 
+-error_unlock:
+-	dma_resv_unlock(obj->resv);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(drm_exec_lock_obj);
+diff --git a/include/drm/drm_exec.h b/include/drm/drm_exec.h
+index dee6ebdbe416..1962f8d2056d 100644
+--- a/include/drm/drm_exec.h
++++ b/include/drm/drm_exec.h
+@@ -67,13 +67,15 @@ drm_exec_obj(struct drm_exec *exec, unsigned long index)
+ 
+ /* Helper for drm_exec_for_each_locked_object(). Internal use only. */
+ #define __drm_exec_for_each_locked_object(exec, obj, __index)		\
+-	for (unsigned long __index = 0; ((obj) = drm_exec_obj(exec, __index)); ++__index)
++	for (unsigned long __index = 0; ((obj) = drm_exec_obj(exec, __index)); \
++	     ++__index)
+ /**
+  * drm_exec_for_each_locked_object - iterate over all the locked objects
+  * @exec: drm_exec object
+  * @obj: the current GEM object
+  *
+- * Iterate over all the locked GEM objects inside the drm_exec object.
++ * Iterate over all the explicitly locked GEM objects inside the drm_exec
++ * container, except for the contended and implicit prelocked one.
+  */
+ #define drm_exec_for_each_locked_object(exec, obj)			\
+ 	__drm_exec_for_each_locked_object(exec, obj, __UNIQUE_ID(drm_exec))
+@@ -88,12 +90,13 @@ drm_exec_obj(struct drm_exec *exec, unsigned long index)
+  * @exec: drm_exec object
+  * @obj: the current GEM object
+  *
+- * Iterate over all the locked GEM objects inside the drm_exec object in
+- * reverse locking order. Note that the internal index may wrap around,
+- * but that will be caught by drm_exec_obj(), returning a NULL object.
++ * Iterate over all the explicitly locked GEM objects inside the drm_exec
++ * container in reverse locking order. Note that the internal index may wrap
++ * around, but that will be caught by drm_exec_obj(), returning a NULL object.
+  */
+ #define drm_exec_for_each_locked_object_reverse(exec, obj)		\
+-	__drm_exec_for_each_locked_object_reverse(exec, obj, __UNIQUE_ID(drm_exec))
++	__drm_exec_for_each_locked_object_reverse(exec, obj,		\
++						  __UNIQUE_ID(drm_exec))
+ 
+ /**
+  * drm_exec_until_all_locked - loop until all GEM objects are locked
+-- 
+2.56.0
+

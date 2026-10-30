@@ -1,0 +1,216 @@
+From: Jakub Kicinski <kuba@kernel.org>
+Date: Mon, 3 Aug 2026 12:31:35 -0700
+Subject: [PATCH] eth: bnxt: avoid deadlock when canceling IRQ affinity
+ notifier
+References: bsc#1258210
+Patch-mainline: 6.18.57
+Git-commit: 51e96fa31f7e7eac2cba8f854e24d36600cc040b
+
+[ Upstream commit 51e96fa31f7e7eac2cba8f854e24d36600cc040b ]
+
+Unregistering IRQ affinity notifiers waits for the callback synchronously.
+bnxt takes the netdev instance lock in the notifier (to restart the queue)
+and cancels the work under the same lock. This may obviously deadlock.
+
+Move the restart to the async service task. The queue restart isn't
+super time sensitive. Store the new TPH tag, schedule the task.
+Safely canceling the service task is already ironed out.
+
+In bnxt_request_irq() the order of registering notifier, affinity and
+initial TPH programming has to be inverted. I think it was racy
+previously since user may trigger an update as soon as notifier
+is installed.
+
+There's a small known gap - if pcie_tph_get_cpu_st() fails at init
+and the target tag is 0 we may miss programming the entry.
+This does not seem worth fixing, the code has skip-on-failure
+all over the place, anyway.
+
+Fixes: c214410c47d6 ("bnxt_en: Add TPH support in BNXT driver")
+Tested-by: Vishvambar Panth S <vishvambar.panth-s@broadcom.com>
+Link: https://patch.msgid.link/20260803193135.2030368-5-kuba@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c | 86 ++++++++++++++++-------
+ drivers/net/ethernet/broadcom/bnxt/bnxt.h |  3 +
+ 2 files changed, 64 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 35c8684d1b4c..744587e6cc63 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -11647,12 +11647,13 @@ static void bnxt_irq_affinity_notify(struct irq_affinity_notify *notify,
+ {
+ 	struct bnxt_irq *irq;
+ 	u16 tag;
+-	int err;
+ 
+ 	irq = container_of(notify, struct bnxt_irq, affinity_notify);
+ 
+ #ifdef CONFIG_RFS_ACCEL
+ 	if (irq->bp->dev->rx_cpu_rmap && irq->ring_nr < irq->bp->rx_nr_rings) {
++		int err;
++
+ 		err = cpu_rmap_update(irq->bp->dev->rx_cpu_rmap, irq->ring_nr,
+ 				      mask);
+ 		if (err)
+@@ -11670,20 +11671,11 @@ static void bnxt_irq_affinity_notify(struct irq_affinity_notify *notify,
+ 		return;
+ 
+ 	if (pcie_tph_get_cpu_st(irq->bp->pdev, TPH_MEM_TYPE_VM,
+-				cpumask_first(irq->cpu_mask), &tag))
++				cpumask_first(mask), &tag))
+ 		return;
+ 
+-	if (pcie_tph_set_st_entry(irq->bp->pdev, irq->msix_nr, tag))
+-		return;
+-
+-	netdev_lock(irq->bp->dev);
+-	if (netif_running(irq->bp->dev)) {
+-		err = netdev_rx_queue_restart(irq->bp->dev, irq->ring_nr);
+-		if (err)
+-			netdev_err(irq->bp->dev,
+-				   "RX queue restart failed: err=%d\n", err);
+-	}
+-	netdev_unlock(irq->bp->dev);
++	WRITE_ONCE(irq->new_tag, tag);
++	bnxt_queue_sp_work(irq->bp, BNXT_TPH_UPDATE_SP_EVENT);
+ }
+ 
+ static void bnxt_irq_affinity_release(struct kref *ref)
+@@ -11754,6 +11746,8 @@ static void bnxt_free_irq(struct bnxt *bp)
+ 		}
+ 
+ 		irq->requested = 0;
++		irq->tag = 0;
++		irq->new_tag = 0;
+ 	}
+ 
+ 	/* Disable TPH support */
+@@ -11793,6 +11787,7 @@ static int bnxt_request_irq(struct bnxt *bp)
+ 	for (i = 0, j = 0; i < bp->cp_nr_rings; i++) {
+ 		int map_idx = bnxt_cp_num_to_irq_num(bp, i);
+ 		struct bnxt_irq *irq = &bp->irq_tbl[map_idx];
++		unsigned int cpu_num;
+ 		u16 tag;
+ 
+ 		if (IS_ENABLED(CONFIG_RFS_ACCEL) &&
+@@ -11818,8 +11813,19 @@ static int bnxt_request_irq(struct bnxt *bp)
+ 		irq->have_cpumask = 1;
+ 		irq->msix_nr = map_idx;
+ 		irq->ring_nr = i;
+-		cpumask_set_cpu(cpumask_local_spread(i, numa_node),
+-				irq->cpu_mask);
++		cpu_num = cpumask_local_spread(i, numa_node);
++		cpumask_set_cpu(cpu_num, irq->cpu_mask);
++
++		/* Init ST table entry if we can get the mapping */
++		if (!pcie_tph_get_cpu_st(bp->pdev, TPH_MEM_TYPE_VM,
++					 cpu_num, &tag)) {
++			pcie_tph_set_st_entry(bp->pdev, irq->msix_nr, tag);
++			irq->tag = tag;
++			irq->new_tag = tag;
++		}
++
++		bnxt_register_irq_notifier(bp, irq);
++
+ 		rc = irq_update_affinity_hint(irq->vector, irq->cpu_mask);
+ 		if (rc) {
+ 			netdev_warn(bp->dev,
+@@ -11827,16 +11833,6 @@ static int bnxt_request_irq(struct bnxt *bp)
+ 				    irq->vector);
+ 			break;
+ 		}
+-
+-		bnxt_register_irq_notifier(bp, irq);
+-
+-		/* Init ST table entry */
+-		if (pcie_tph_get_cpu_st(irq->bp->pdev, TPH_MEM_TYPE_VM,
+-					cpumask_first(irq->cpu_mask),
+-					&tag))
+-			continue;
+-
+-		pcie_tph_set_st_entry(irq->bp->pdev, irq->msix_nr, tag);
+ 	}
+ 	return rc;
+ }
+@@ -14301,6 +14297,43 @@ static void bnxt_rtnl_unlock_sp(struct bnxt *bp)
+ 	rtnl_unlock();
+ }
+ 
++static void bnxt_tph_update(struct bnxt *bp)
++{
++	struct net_device *dev = bp->dev;
++	int i;
++
++	bnxt_rtnl_lock_sp(bp);
++	if (!test_bit(BNXT_STATE_OPEN, &bp->state))
++		goto unlock;
++
++	for (i = 0; i < bp->rx_nr_rings; i++) {
++		struct bnxt_irq *irq;
++		int map_idx, err;
++		u16 tag;
++
++		map_idx = bnxt_cp_num_to_irq_num(bp, i);
++		irq = &bp->irq_tbl[map_idx];
++		tag = READ_ONCE(irq->new_tag);
++		if (irq->tag == tag)
++			continue;
++
++		if (pcie_tph_set_st_entry(bp->pdev, irq->msix_nr, tag))
++			continue;
++
++		err = netdev_rx_queue_restart(dev, irq->ring_nr);
++		if (err) {
++			netdev_err(dev, "RX queue restart failed: err=%d\n",
++				   err);
++			continue;
++		}
++
++		irq->tag = tag;
++	}
++
++unlock:
++	bnxt_rtnl_unlock_sp(bp);
++}
++
+ /* Only called from bnxt_sp_task() */
+ static void bnxt_reset(struct bnxt *bp, bool silent)
+ {
+@@ -14739,6 +14772,9 @@ static void bnxt_sp_task(struct work_struct *work)
+ 			bnxt_devlink_health_fw_report(bp);
+ 	}
+ 
++	if (test_and_clear_bit(BNXT_TPH_UPDATE_SP_EVENT, &bp->sp_event))
++		bnxt_tph_update(bp);
++
+ 	smp_mb__before_atomic();
+ 	clear_bit(BNXT_STATE_IN_SP_TASK, &bp->state);
+ }
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.h b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 7ca57bbc5ff6..1859612fa213 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -1253,6 +1253,8 @@ struct bnxt_irq {
+ 	struct bnxt	*bp;
+ 	int		msix_nr;
+ 	int		ring_nr;
++	u16		tag;
++	u16		new_tag;
+ 	struct irq_affinity_notify affinity_notify;
+ };
+ 
+@@ -2622,6 +2624,7 @@ struct bnxt {
+ #define BNXT_RING_COAL_NOW_SP_EVENT	17
+ #define BNXT_FW_RESET_NOTIFY_SP_EVENT	18
+ #define BNXT_FW_EXCEPTION_SP_EVENT	19
++#define BNXT_TPH_UPDATE_SP_EVENT	20
+ #define BNXT_LINK_CFG_CHANGE_SP_EVENT	21
+ #define BNXT_THERMAL_THRESHOLD_SP_EVENT	22
+ #define BNXT_FW_ECHO_REQUEST_SP_EVENT	23
+-- 
+2.56.0
+

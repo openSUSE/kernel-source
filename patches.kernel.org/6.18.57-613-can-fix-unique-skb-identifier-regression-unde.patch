@@ -1,0 +1,281 @@
+From: Oliver Hartkopp <socketcan@hartkopp.net>
+Date: Tue, 13 Oct 2026 09:43:25 +0200
+Subject: [PATCH] can: fix unique skb identifier regression under RPS
+References: bsc#1258210
+Patch-mainline: 6.18.57
+Git-commit: 7093c3b8314a4ef7405c4066a2521398c455efe7
+
+commit 7093c3b8314a4ef7405c4066a2521398c455efe7 upstream.
+
+Commit d4fb6514ff8e ("can: use skb hash instead of private variable in
+headroom") moved the per-skb unique identifier used for raw_rcv()
+duplicate detection into skb->hash.
+
+With RPS enabled, get_rps_cpu() calls skb_get_hash() before the frame
+reaches the CAN subsystem. Since CAN skbs have no L3/L4 headers, the
+flow dissector assigns every CAN frame the same non-zero software
+hash. can_set_skb_uid() only generated a new identifier when
+skb->hash was 0, so it kept this constant hash. When the SLAB
+allocator later reused the same skb address, raw_rcv() mistook the
+next legitimate frame for a duplicate and dropped it.
+
+Fix this by storing the CAN UID in the CAN skb extension
+(struct can_skb_ext::can_skb_uid) instead of skb->hash, decoupling it
+from any hash the network stack may compute. can_set_skb_uid() keeps
+its "assign only if unset" behaviour, which preserves UIDs set before
+transmission (e.g. by isotp to identify echo frames) across the local
+loopback path.
+
+Frames whose extension is shared with another clone (e.g. via tc mirred
+or netem duplicate) are given a private extension copy before the UID
+is assigned, so that independently received skb clones from real CAN
+interfaces (skbcnt = 0) don't end up with the same UID.
+The limitation that tc mirred/netem skb duplicates might be dropped in
+raw_rcv for looped back isotp echo frame skbs is accepted. There is no
+valid use-case for tc mirred or netem together with isotp which is not
+capable to operate on different CAN interfaces simultaneously.
+For routing and modifying CAN frames together with isotp use can-gw.
+
+can-gw and vxcan additionally clear the UID of forwarded/duplicated
+frames so each newly routed frame gets its own unique identifier.
+
+[ backport to 6.18: no CAN skb extensions available, so the UID is kept
+  in struct can_skb_priv::skbcnt in the headroom (effectively reverting
+  d4fb6514ff8e) and isotp is adapted accordingly. As skb clones share
+  the headroom, the private extension copy for tc mirred/netem
+  duplicates is not applicable. The UID resets in can-gw and vxcan are
+  omitted, as writing to the shared headroom of cloned skbs would also
+  alter the UID of the original skb. This keeps the pre-d4fb6514ff8e
+  behaviour for routed and vxcan forwarded frames. ]
+
+Fixes: d4fb6514ff8e ("can: use skb hash instead of private variable in headroom")
+Reported-by: Joerg Willmann <joe@clnt.de>
+Closes: https://lore.kernel.org/linux-can/2859AD3D-C805-41A0-9036-C5E8EE152419@clnt.de/
+Signed-off-by: Oliver Hartkopp <socketcan@hartkopp.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/net/can/dev/skb.c |  2 ++
+ include/linux/can/skb.h   |  2 ++
+ net/can/af_can.c          |  6 ++----
+ net/can/bcm.c             |  2 ++
+ net/can/isotp.c           | 11 +++++++----
+ net/can/j1939/socket.c    |  1 +
+ net/can/j1939/transport.c |  2 ++
+ net/can/raw.c             |  7 ++++---
+ 8 files changed, 22 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/net/can/dev/skb.c b/drivers/net/can/dev/skb.c
+index 0da615afa04d..3ebd4f779b9b 100644
+--- a/drivers/net/can/dev/skb.c
++++ b/drivers/net/can/dev/skb.c
+@@ -202,6 +202,7 @@ static void init_can_skb_reserve(struct sk_buff *skb)
+ 	skb_reset_transport_header(skb);
+ 
+ 	can_skb_reserve(skb);
++	can_skb_prv(skb)->skbcnt = 0;
+ }
+ 
+ struct sk_buff *alloc_can_skb(struct net_device *dev, struct can_frame **cf)
+@@ -311,6 +312,7 @@ static bool can_skb_headroom_valid(struct net_device *dev, struct sk_buff *skb)
+ 	if (skb->ip_summed == CHECKSUM_NONE) {
+ 		/* init headroom */
+ 		can_skb_prv(skb)->ifindex = dev->ifindex;
++		can_skb_prv(skb)->skbcnt = 0;
+ 
+ 		skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 
+diff --git a/include/linux/can/skb.h b/include/linux/can/skb.h
+index 869ea574a40a..27d0ca115c6c 100644
+--- a/include/linux/can/skb.h
++++ b/include/linux/can/skb.h
+@@ -49,11 +49,13 @@ bool can_dropped_invalid_skb(struct net_device *dev, struct sk_buff *skb);
+ /**
+  * struct can_skb_priv - private additional data inside CAN sk_buffs
+  * @ifindex:	ifindex of the first interface the CAN frame appeared on
++ * @skbcnt:	atomic counter to have an unique id together with skb pointer
+  * @frame_len:	length of CAN frame in data link layer
+  * @cf:		align to the following CAN frame at skb->data
+  */
+ struct can_skb_priv {
+ 	int ifindex;
++	u32 skbcnt;
+ 	unsigned int frame_len;
+ 	struct can_frame cf[];
+ };
+diff --git a/net/can/af_can.c b/net/can/af_can.c
+index 7a026f3a70a0..52d72d56f2dd 100644
+--- a/net/can/af_can.c
++++ b/net/can/af_can.c
+@@ -644,10 +644,8 @@ static int can_rcv_filter(struct can_dev_rcv_lists *dev_rcv_lists, struct sk_buf
+ void can_set_skb_uid(struct sk_buff *skb)
+ {
+ 	/* create non-zero unique skb identifier together with *skb */
+-	while (!(skb->hash))
+-		skb->hash = atomic_inc_return(&skbcounter);
+-
+-	skb->sw_hash = 1;
++	while (!(can_skb_prv(skb)->skbcnt))
++		can_skb_prv(skb)->skbcnt = atomic_inc_return(&skbcounter);
+ }
+ EXPORT_SYMBOL(can_set_skb_uid);
+ 
+diff --git a/net/can/bcm.c b/net/can/bcm.c
+index 67d5e3ecc04f..6d67af0a3b14 100644
+--- a/net/can/bcm.c
++++ b/net/can/bcm.c
+@@ -350,6 +350,7 @@ static void bcm_can_tx(struct bcm_op *op, struct canfd_frame *cf)
+ 
+ 	can_skb_reserve(skb);
+ 	can_skb_prv(skb)->ifindex = dev->ifindex;
++	can_skb_prv(skb)->skbcnt = 0;
+ 
+ 	skb_put_data(skb, cf, op->cfsiz);
+ 
+@@ -1619,6 +1620,7 @@ static int bcm_tx_send(struct msghdr *msg, int ifindex, struct sock *sk,
+ 	}
+ 
+ 	can_skb_prv(skb)->ifindex = dev->ifindex;
++	can_skb_prv(skb)->skbcnt = 0;
+ 	skb->dev = dev;
+ 	can_skb_set_owner(skb, sk);
+ 	err = can_send(skb, 1); /* send with loopback */
+diff --git a/net/can/isotp.c b/net/can/isotp.c
+index e7f937015b8e..525ed477d15c 100644
+--- a/net/can/isotp.c
++++ b/net/can/isotp.c
+@@ -302,6 +302,7 @@ static int isotp_send_fc(struct sock *sk, int ae, u8 flowstatus)
+ 
+ 	can_skb_reserve(nskb);
+ 	can_skb_prv(nskb)->ifindex = dev->ifindex;
++	can_skb_prv(nskb)->skbcnt = 0;
+ 
+ 	nskb->dev = dev;
+ 	can_skb_set_owner(nskb, sk);
+@@ -876,6 +877,7 @@ static void isotp_send_cframe(struct isotp_sock *so)
+ 
+ 	can_skb_reserve(skb);
+ 	can_skb_prv(skb)->ifindex = dev->ifindex;
++	can_skb_prv(skb)->skbcnt = 0;
+ 
+ 	/* set uid in tx skb to identify CF echo frames */
+ 	can_set_skb_uid(skb);
+@@ -904,7 +906,7 @@ static void isotp_send_cframe(struct isotp_sock *so)
+ 		pr_notice_once("can-isotp: cfecho is %08X != 0\n", old_cfecho);
+ 
+ 	/* set consecutive frame echo tag */
+-	WRITE_ONCE(so->cfecho, skb->hash);
++	WRITE_ONCE(so->cfecho, can_skb_prv(skb)->skbcnt);
+ 
+ 	/* send frame with local echo enabled */
+ 	can_send_ret = can_send(skb, 1);
+@@ -967,7 +969,7 @@ static void isotp_rcv_echo(struct sk_buff *skb, void *data)
+ 	spin_lock(&so->rx_lock);
+ 
+ 	/* so->cfecho may since belong to a new transfer; recheck under lock */
+-	if (READ_ONCE(so->cfecho) != skb->hash)
++	if (READ_ONCE(so->cfecho) != can_skb_prv(skb)->skbcnt)
+ 		goto out_unlock;
+ 
+ 	/* cancel local echo timeout */
+@@ -1199,6 +1201,7 @@ static int isotp_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
+ 
+ 	can_skb_reserve(skb);
+ 	can_skb_prv(skb)->ifindex = dev->ifindex;
++	can_skb_prv(skb)->skbcnt = 0;
+ 
+ 	/* set uid in tx skb to identify CF echo frames */
+ 	can_set_skb_uid(skb);
+@@ -1240,7 +1243,7 @@ static int isotp_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
+ 			cf->data[ae] |= size;
+ 
+ 		/* set CF echo tag for isotp_rcv_echo() (SF-mode) */
+-		WRITE_ONCE(so->cfecho, skb->hash);
++		WRITE_ONCE(so->cfecho, can_skb_prv(skb)->skbcnt);
+ 	} else {
+ 		/* send first frame */
+ 
+@@ -1257,7 +1260,7 @@ static int isotp_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
+ 			so->txfc.bs = 0;
+ 
+ 			/* set CF echo tag for isotp_rcv_echo() (CF-mode) */
+-			WRITE_ONCE(so->cfecho, skb->hash);
++			WRITE_ONCE(so->cfecho, can_skb_prv(skb)->skbcnt);
+ 		} else {
+ 			/* standard flow control check */
+ 			new_state = ISOTP_WAIT_FIRST_FC;
+diff --git a/net/can/j1939/socket.c b/net/can/j1939/socket.c
+index 3b41d13f7dc3..852e1b1b805f 100644
+--- a/net/can/j1939/socket.c
++++ b/net/can/j1939/socket.c
+@@ -898,6 +898,7 @@ static struct sk_buff *j1939_sk_alloc_skb(struct net_device *ndev,
+ 
+ 	can_skb_reserve(skb);
+ 	can_skb_prv(skb)->ifindex = ndev->ifindex;
++	can_skb_prv(skb)->skbcnt = 0;
+ 	skb_reserve(skb, offsetof(struct can_frame, data));
+ 
+ 	ret = memcpy_from_msg(skb_put(skb, size), msg, size);
+diff --git a/net/can/j1939/transport.c b/net/can/j1939/transport.c
+index 9d9c342d26d5..72f6c06e1e5b 100644
+--- a/net/can/j1939/transport.c
++++ b/net/can/j1939/transport.c
+@@ -613,6 +613,7 @@ sk_buff *j1939_tp_tx_dat_new(struct j1939_priv *priv,
+ 	skb->dev = priv->ndev;
+ 	can_skb_reserve(skb);
+ 	can_skb_prv(skb)->ifindex = priv->ndev->ifindex;
++	can_skb_prv(skb)->skbcnt = 0;
+ 	/* reserve CAN header */
+ 	skb_reserve(skb, offsetof(struct can_frame, data));
+ 
+@@ -1548,6 +1549,7 @@ j1939_session *j1939_session_fresh_new(struct j1939_priv *priv,
+ 	skb->dev = priv->ndev;
+ 	can_skb_reserve(skb);
+ 	can_skb_prv(skb)->ifindex = priv->ndev->ifindex;
++	can_skb_prv(skb)->skbcnt = 0;
+ 	skcb = j1939_skb_to_cb(skb);
+ 	memcpy(skcb, rel_skcb, sizeof(*skcb));
+ 
+diff --git a/net/can/raw.c b/net/can/raw.c
+index e55550636df3..def1d83c567c 100644
+--- a/net/can/raw.c
++++ b/net/can/raw.c
+@@ -75,8 +75,8 @@ MODULE_ALIAS("can-proto-1");
+  */
+ 
+ struct uniqframe {
++	u32 skbcnt;
+ 	const struct sk_buff *skb;
+-	u32 hash;
+ 	unsigned int join_rx_count;
+ };
+ 
+@@ -164,7 +164,7 @@ static void raw_rcv(struct sk_buff *oskb, void *data)
+ 
+ 	/* eliminate multiple filter matches for the same skb */
+ 	if (this_cpu_ptr(ro->uniq)->skb == oskb &&
+-	    this_cpu_ptr(ro->uniq)->hash == oskb->hash) {
++	    this_cpu_ptr(ro->uniq)->skbcnt == can_skb_prv(oskb)->skbcnt) {
+ 		if (!ro->join_filters)
+ 			return;
+ 
+@@ -174,7 +174,7 @@ static void raw_rcv(struct sk_buff *oskb, void *data)
+ 			return;
+ 	} else {
+ 		this_cpu_ptr(ro->uniq)->skb = oskb;
+-		this_cpu_ptr(ro->uniq)->hash = oskb->hash;
++		this_cpu_ptr(ro->uniq)->skbcnt = can_skb_prv(oskb)->skbcnt;
+ 		this_cpu_ptr(ro->uniq)->join_rx_count = 1;
+ 		/* drop first frame to check all enabled filters? */
+ 		if (ro->join_filters && ro->count > 1)
+@@ -955,6 +955,7 @@ static int raw_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
+ 
+ 	can_skb_reserve(skb);
+ 	can_skb_prv(skb)->ifindex = dev->ifindex;
++	can_skb_prv(skb)->skbcnt = 0;
+ 
+ 	/* fill the skb before testing for valid CAN frames */
+ 	err = memcpy_from_msg(skb_put(skb, size), msg, size);
+-- 
+2.56.0
+

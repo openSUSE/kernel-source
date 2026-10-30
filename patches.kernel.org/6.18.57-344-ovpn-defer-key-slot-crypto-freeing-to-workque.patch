@@ -1,0 +1,154 @@
+From: Ralf Lici <ralf@mandelbit.com>
+Date: Wed, 29 Jul 2026 12:21:46 +0200
+Subject: [PATCH] ovpn: defer key slot crypto freeing to workqueue
+References: bsc#1258210
+Patch-mainline: 6.18.57
+Git-commit: 2da3dfa1ddfe55a065f484750c83660e3bd4ac00
+
+[ Upstream commit 2da3dfa1ddfe55a065f484750c83660e3bd4ac00 ]
+
+Key slots are released through a kref and the existing release path
+frees the AEAD transforms from an RCU callback. That is not safe for all
+crypto implementations: crypto_free_aead can sleep, for example when an
+async or hardware implementation has teardown work to complete.
+
+Use queue_rcu_work for key-slot release. This keeps the RCU grace period
+needed by lockless key-slot readers, but runs the actual crypto teardown
+from workqueue context where sleeping is allowed. Once the rcu_work
+callback runs, pre-existing RCU readers are gone, and the final kref put
+already proves that no transform user remains, so the worker can release
+the AEAD transforms and free the slot directly.
+
+The previous patch drains ovpn_wq during module exit, so queued key-slot
+teardown work cannot outlive module text.
+
+Fixes: 8534731dbf2d ("ovpn: implement packet processing")
+Signed-off-by: Ralf Lici <ralf@mandelbit.com>
+Signed-off-by: Antonio Quartulli <antonio@openvpn.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/net/ovpn/crypto.c      | 10 +---------
+ drivers/net/ovpn/crypto.h      |  4 +++-
+ drivers/net/ovpn/crypto_aead.c | 19 ++++++++++++++-----
+ drivers/net/ovpn/crypto_aead.h |  1 -
+ 4 files changed, 18 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/net/ovpn/crypto.c b/drivers/net/ovpn/crypto.c
+index 2e95f29514fc..7e545428900a 100644
+--- a/drivers/net/ovpn/crypto.c
++++ b/drivers/net/ovpn/crypto.c
+@@ -18,20 +18,12 @@
+ #include "crypto_aead.h"
+ #include "crypto.h"
+ 
+-static void ovpn_ks_destroy_rcu(struct rcu_head *head)
+-{
+-	struct ovpn_crypto_key_slot *ks;
+-
+-	ks = container_of(head, struct ovpn_crypto_key_slot, rcu);
+-	ovpn_aead_crypto_key_slot_destroy(ks);
+-}
+-
+ void ovpn_crypto_key_slot_release(struct kref *kref)
+ {
+ 	struct ovpn_crypto_key_slot *ks;
+ 
+ 	ks = container_of(kref, struct ovpn_crypto_key_slot, refcount);
+-	call_rcu(&ks->rcu, ovpn_ks_destroy_rcu);
++	queue_rcu_work(ovpn_wq, &ks->free_work);
+ }
+ 
+ /* can only be invoked when all peer references have been dropped (i.e. RCU
+diff --git a/drivers/net/ovpn/crypto.h b/drivers/net/ovpn/crypto.h
+index 0e284fec3a75..e3feb16d5498 100644
+--- a/drivers/net/ovpn/crypto.h
++++ b/drivers/net/ovpn/crypto.h
+@@ -10,6 +10,8 @@
+ #ifndef _NET_OVPN_OVPNCRYPTO_H_
+ #define _NET_OVPN_OVPNCRYPTO_H_
+ 
++#include <linux/workqueue.h>
++
+ #include "pktid.h"
+ #include "proto.h"
+ 
+@@ -45,8 +47,8 @@ struct ovpn_crypto_key_slot {
+ 
+ 	struct ovpn_pktid_recv pid_recv ____cacheline_aligned_in_smp;
+ 	struct ovpn_pktid_xmit pid_xmit ____cacheline_aligned_in_smp;
++	struct rcu_work free_work;
+ 	struct kref refcount;
+-	struct rcu_head rcu;
+ };
+ 
+ struct ovpn_crypto_state {
+diff --git a/drivers/net/ovpn/crypto_aead.c b/drivers/net/ovpn/crypto_aead.c
+index 2cca759feffa..aa3cd9837cc0 100644
+--- a/drivers/net/ovpn/crypto_aead.c
++++ b/drivers/net/ovpn/crypto_aead.c
+@@ -9,6 +9,7 @@
+ 
+ #include <crypto/aead.h>
+ #include <linux/skbuff.h>
++#include <linux/workqueue.h>
+ #include <net/ip.h>
+ #include <net/ipv6.h>
+ #include <net/udp.h>
+@@ -294,13 +295,19 @@ static struct crypto_aead *ovpn_aead_init(const char *title,
+ 	return ERR_PTR(ret);
+ }
+ 
+-void ovpn_aead_crypto_key_slot_destroy(struct ovpn_crypto_key_slot *ks)
++static void ovpn_aead_crypto_key_slot_free(struct ovpn_crypto_key_slot *ks)
+ {
+-	if (!ks)
+-		return;
+-
+ 	crypto_free_aead(ks->encrypt);
+ 	crypto_free_aead(ks->decrypt);
++}
++
++static void ovpn_aead_crypto_key_slot_free_work(struct work_struct *work)
++{
++	struct ovpn_crypto_key_slot *ks;
++
++	ks = container_of(to_rcu_work(work), struct ovpn_crypto_key_slot,
++			  free_work);
++	ovpn_aead_crypto_key_slot_free(ks);
+ 	kfree(ks);
+ }
+ 
+@@ -334,6 +341,7 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
+ 
+ 	ks->encrypt = NULL;
+ 	ks->decrypt = NULL;
++	INIT_RCU_WORK(&ks->free_work, ovpn_aead_crypto_key_slot_free_work);
+ 	kref_init(&ks->refcount);
+ 	ks->key_id = kc->key_id;
+ 
+@@ -367,7 +375,8 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
+ 	return ks;
+ 
+ destroy_ks:
+-	ovpn_aead_crypto_key_slot_destroy(ks);
++	ovpn_aead_crypto_key_slot_free(ks);
++	kfree(ks);
+ 	return ERR_PTR(ret);
+ }
+ 
+diff --git a/drivers/net/ovpn/crypto_aead.h b/drivers/net/ovpn/crypto_aead.h
+index 65a2ff307898..fae3b585a43b 100644
+--- a/drivers/net/ovpn/crypto_aead.h
++++ b/drivers/net/ovpn/crypto_aead.h
+@@ -22,7 +22,6 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
+ 
+ struct ovpn_crypto_key_slot *
+ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc);
+-void ovpn_aead_crypto_key_slot_destroy(struct ovpn_crypto_key_slot *ks);
+ 
+ enum ovpn_cipher_alg ovpn_aead_crypto_alg(struct ovpn_crypto_key_slot *ks);
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,144 @@
+From: Paulo Alcantara <pc@manguebit.org>
+Date: Fri, 25 Sep 2026 19:35:12 -0300
+Subject: [PATCH] smb: client: flush and commit data before querying allocated
+ ranges
+References: bsc#1258210
+Patch-mainline: 6.18.56
+Git-commit: aa994489bd835547c191827acc460192e147032d
+
+commit aa994489bd835547c191827acc460192e147032d upstream.
+
+The mode 0 / FALLOC_FL_KEEP_SIZE fallocate emulation for small interior
+ranges in smb3_simple_fallocate_range() issues
+FSCTL_QUERY_ALLOCATED_RANGES and zero-fills any sub-range the server
+reports as an unallocated hole, to force block allocation without
+changing file contents.
+
+This is unsafe against Windows servers.  Per the Win32 documentation,
+FSCTL_QUERY_ALLOCATED_RANGES only reports ranges that *may* contain
+nonzero data and is explicitly not coherent with recently written data:
+
+  "a call to FSCTL_QUERY_ALLOCATED_RANGES [after writing to a network
+   file] would not necessarily return a correct list of allocated
+   regions.  To ensure coherency [...] flush the data to the file"
+
+fsx (generic/363) reproduces the resulting corruption against Windows
+Server 2022: a range is written, an uncached read returns the data, yet
+the next FSCTL_QUERY_ALLOCATED_RANGES on that range reports it as a whole
+hole, so the emulation overwrites live data with zeroes.  A network trace
+confirmed the WRITE, the READ returning data and the query returning an
+empty range list within microseconds.  Samba does not exhibit this; its
+query is coherent with the written data.
+
+Write back the dirty pages, drain any outstanding I/O and issue an SMB2
+FLUSH to force the server to commit the data before querying the
+allocated ranges, so the query reflects the data actually present.
+
+With this, generic/363 passes against both Windows Server 2022 and Samba
+over 100000 fsx operations.
+
+Fixes: 966a3cb7c7db ("cifs: improve fallocate emulation")
+Reviewed-by: David Howells <dhowells@redhat.com>
+Reviewed-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Paulo Alcantara <pc@manguebit.org>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Ronnie Sahlberg <ronniesahlberg@gmail.com>
+Cc: Shyam Prasad N <sprasad@microsoft.com>
+Cc: Tom Talpey <tom@talpey.com>
+Cc: Bharath SM <bharathsm@microsoft.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/smb/client/smb2ops.c | 32 ++++++++++++++++++++++++++------
+ 1 file changed, 26 insertions(+), 6 deletions(-)
+
+diff --git a/fs/smb/client/smb2ops.c b/fs/smb/client/smb2ops.c
+index 20802cd26caf..91e1e7b52bfc 100644
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -3697,6 +3697,24 @@ static int smb3_simple_fallocate_range(unsigned int xid,
+ 		goto out;
+ 	}
+ 
++	filemap_invalidate_lock(inode->i_mapping);
++
++	/*
++	 * Flush and commit the data to the server, otherwise
++	 * FSCTL_QUERY_ALLOCATED_RANGES might report recently written data as
++	 * unallocated holes on Windows Servers, and the loop below would
++	 * then zero-fill them and corrupt the file.
++	 */
++	rc = filemap_write_and_wait_range(inode->i_mapping, off,
++					  off + len - 1);
++	if (rc)
++		goto out_unlock;
++	netfs_wait_for_outstanding_io(inode);
++	rc = SMB2_flush(xid, tcon, cfile->fid.persistent_fid,
++			cfile->fid.volatile_fid);
++	if (rc)
++		goto out_unlock;
++
+ 	in_data.file_offset = cpu_to_le64(off);
+ 	in_data.length = cpu_to_le64(len);
+ 	rc = SMB2_ioctl(xid, tcon, cfile->fid.persistent_fid,
+@@ -3706,7 +3724,7 @@ static int smb3_simple_fallocate_range(unsigned int xid,
+ 			1024 * sizeof(struct file_allocated_range_buffer),
+ 			(char **)&out_data, &out_data_len);
+ 	if (rc)
+-		goto out;
++		goto out_unlock;
+ 
+ 	tmp_data = out_data;
+ 	while (len) {
+@@ -3716,12 +3734,12 @@ static int smb3_simple_fallocate_range(unsigned int xid,
+ 		if (out_data_len == 0) {
+ 			rc = smb3_simple_fallocate_write_range(xid, tcon,
+ 					       cfile, off, len, buf);
+-			goto out;
++			goto out_unlock;
+ 		}
+ 
+ 		if (out_data_len < sizeof(struct file_allocated_range_buffer)) {
+ 			rc = -EINVAL;
+-			goto out;
++			goto out_unlock;
+ 		}
+ 
+ 		range_start = le64_to_cpu(tmp_data->file_offset);
+@@ -3729,7 +3747,7 @@ static int smb3_simple_fallocate_range(unsigned int xid,
+ 		if (check_add_overflow(range_start, range_len, &range_end) ||
+ 		    range_end > S64_MAX) {
+ 			rc = -EINVAL;
+-			goto out;
++			goto out_unlock;
+ 		}
+ 
+ 		if (off < range_start) {
+@@ -3744,11 +3762,11 @@ static int smb3_simple_fallocate_range(unsigned int xid,
+ 			rc = smb3_simple_fallocate_write_range(xid, tcon,
+ 					       cfile, off, l, buf);
+ 			if (rc)
+-				goto out;
++				goto out_unlock;
+ 			off = off + l;
+ 			len = len - l;
+ 			if (len == 0)
+-				goto out;
++				goto out_unlock;
+ 		}
+ 		/*
+ 		 * We are at a section of allocated data, just skip forward
+@@ -3767,6 +3785,8 @@ static int smb3_simple_fallocate_range(unsigned int xid,
+ 		out_data_len -= sizeof(struct file_allocated_range_buffer);
+ 	}
+ 
++ out_unlock:
++	filemap_invalidate_unlock(inode->i_mapping);
+  out:
+ 	kfree(out_data);
+ 	kvfree(buf);
+-- 
+2.56.0
+
