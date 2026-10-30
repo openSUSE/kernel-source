@@ -1,0 +1,127 @@
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Thu, 15 Oct 2026 19:30:39 +0000
+Subject: [PATCH] io_uring: don't lose a cancel as io-wq parks a request
+References: bsc#1258210
+Patch-mainline: 6.18.60
+Git-commit: 5cb049d2203d7a81a1c1a737c8df4575e71078e3
+
+Commit 5cb049d2203d7a81a1c1a737c8df4575e71078e3 upstream.
+
+IORING_OP_FUTEX_WAIT, IORING_OP_FUTEX_WAITV and IORING_OP_WAITID don't
+block. They put the request on a list of the ring, where a wake up or a
+cancellation finds it, and return IOU_ISSUE_SKIP_COMPLETE. They do so as
+well if they are run by io-wq, e.g. because of IOSQE_ASYNC.
+
+io_wq_submit_work() looks at IO_WQ_WORK_CANCEL once, before it issues the
+request. Somebody who wants to cancel the request after that, and before
+it is on the list, finds it running:
+
+  io-wq worker                          io_try_cancel()
+  io_wq_submit_work()
+    IO_WQ_WORK_CANCEL isn't set
+                                        io_async_cancel_one()
+                                          sets IO_WQ_WORK_CANCEL
+                                          signals the worker
+                                          = -EALREADY
+                                        ...
+                                        io_futex_cancel() = -ENOENT
+                                        ...
+    io_futex_wait()
+      adds the request to ->futex_list
+    = IOU_ISSUE_SKIP_COMPLETE
+
+Nobody looks at the flag again. IORING_OP_ASYNC_CANCEL returns -EALREADY
+and the request stays.
+
+It is the problem that "io_uring/poll: don't lose a cancel as io-wq arms
+poll" deals with for poll.
+
+Look at the flag once the request is on the list, and cancel it if it is
+set. The lists are searched and the requests are added with ->uring_lock
+held, and the flag is set before the search. So either the search finds
+the request, or it came first and the flag is seen.
+
+What the canceller is told doesn't change, see the other patch, also for
+IORING_ASYNC_CANCEL_ALL and _ANY.
+
+Fixes: 194bb58c6090 ("io_uring: add support for futex wake and wait")
+Fixes: 8f350194d5cf ("io_uring: add support for vectored futex waits")
+Fixes: f31ecf671ddc ("io_uring: add IORING_OP_WAITID support")
+Assisted-by: LLM
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Link: https://patch.msgid.link/20261015-b4-io-uring-fixes-v1-15-c1556f5d7bf5@toxicpanda.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ io_uring/futex.c    |  4 ++++
+ io_uring/io_uring.h | 17 +++++++++++++++++
+ io_uring/waitid.c   |  2 ++
+ 3 files changed, 23 insertions(+)
+
+diff --git a/io_uring/futex.c b/io_uring/futex.c
+index 7f3b97c99692..c052207a8baa 100644
+--- a/io_uring/futex.c
++++ b/io_uring/futex.c
+@@ -278,6 +278,8 @@ int io_futexv_wait(struct io_kiocb *req, unsigned int issue_flags)
+ 		 */
+ 		__set_current_state(TASK_RUNNING);
+ 		hlist_add_head(&req->hash_node, &ctx->futex_list);
++		if (io_wq_cancel_seen(req, issue_flags))
++			__io_futex_cancel(req);
+ 	} else {
+ 		iof->futexv_unqueued = 1;
+ 		if (woken != -1)
+@@ -318,6 +320,8 @@ int io_futex_wait(struct io_kiocb *req, unsigned int issue_flags)
+ 			       &ifd->q, NULL, NULL);
+ 	if (!ret) {
+ 		hlist_add_head(&req->hash_node, &ctx->futex_list);
++		if (io_wq_cancel_seen(req, issue_flags))
++			__io_futex_cancel(req);
+ 		io_ring_submit_unlock(ctx, issue_flags);
+ 
+ 		return IOU_ISSUE_SKIP_COMPLETE;
+diff --git a/io_uring/io_uring.h b/io_uring/io_uring.h
+index ecaba6d95ae0..899c3a3bd6f4 100644
+--- a/io_uring/io_uring.h
++++ b/io_uring/io_uring.h
+@@ -396,6 +396,23 @@ static inline void io_ring_submit_lock(struct io_ring_ctx *ctx,
+ 	lockdep_assert_held(&ctx->uring_lock);
+ }
+ 
++/*
++ * For a handler that is run by io-wq and parks the request on a list where
++ * cancellations find it, rather than completing it. Whoever tried to cancel
++ * the request before that found it running. It has flagged the work item,
++ * has searched the list in vain, and won't come back. To be called with
++ * ->uring_lock held, which the search needs as well, once the request is on
++ * the list: if the search came first, the flag is visible.
++ */
++static inline bool io_wq_cancel_seen(struct io_kiocb *req,
++				     unsigned int issue_flags)
++{
++	lockdep_assert_held(&req->ctx->uring_lock);
++
++	return (issue_flags & IO_URING_F_IOWQ) &&
++	       (atomic_read(&req->work.flags) & IO_WQ_WORK_CANCEL);
++}
++
+ static inline void io_commit_cqring(struct io_ring_ctx *ctx)
+ {
+ 	/* order cqe stores with ring update */
+diff --git a/io_uring/waitid.c b/io_uring/waitid.c
+index a91491650440..2ba2369681d0 100644
+--- a/io_uring/waitid.c
++++ b/io_uring/waitid.c
+@@ -349,6 +349,8 @@ int io_waitid(struct io_kiocb *req, unsigned int issue_flags)
+ 		 * a waitqueue callback, or if someone cancels it.
+ 		 */
+ 		if (!io_waitid_drop_issue_ref(req)) {
++			if (io_wq_cancel_seen(req, issue_flags))
++				__io_waitid_cancel(req, true);
+ 			io_ring_submit_unlock(ctx, issue_flags);
+ 			return IOU_ISSUE_SKIP_COMPLETE;
+ 		}
+-- 
+2.56.0
+
