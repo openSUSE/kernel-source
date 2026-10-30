@@ -1,0 +1,97 @@
+From: Jens Axboe <axboe@kernel.dk>
+Date: Thu, 15 Oct 2026 16:38:45 -0600
+Subject: [PATCH] io_uring/timeout: don't lose a cancel as io-wq arms a timeout
+References: bsc#1258210
+Patch-mainline: 6.18.60
+Git-commit: 89f193dc3ef462059387e9691bf6af4b1808379a
+
+Commit 89f193dc3ef462059387e9691bf6af4b1808379a upstream.
+
+An IORING_OP_TIMEOUT run by io-wq, because of IOSQE_ASYNC, has the same
+problem as poll, futex and waitid. io_wq_submit_work() looks at
+IO_WQ_WORK_CANCEL once, before it issues the request. A cancel in between
+flags the work, gets -EALREADY, and searches ->timeout_list in vain,
+while the worker then adds the request and starts the timer:
+
+  io-wq worker                          io_try_cancel()
+  io_wq_submit_work()
+    IO_WQ_WORK_CANCEL isn't set
+                                        io_async_cancel_one()
+                                          sets IO_WQ_WORK_CANCEL
+                                          = -EALREADY
+                                        io_timeout_cancel() = -ENOENT
+    io_timeout()
+      adds the request to ->timeout_list
+      hrtimer_start()
+    = IOU_ISSUE_SKIP_COMPLETE
+
+Nobody looks at the flag again, and the timeout runs its course. At ring
+exit, io_uring_try_cancel_requests() cancels io-wq work and then kills
+the timeouts the same way, so an exiting task can get stuck for the full
+duration of such a timeout.
+
+Look at the flag under ->timeout_lock, which the search takes as well,
+and fail the request if it is set. If the search came first, the flag is
+visible. If it comes later, it finds the request on the list.
+
+Fixes: ce35a47a3a02 ("io_uring: add IOSQE_ASYNC")
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ io_uring/io_uring.h | 14 ++++++++++----
+ io_uring/timeout.c  |  7 +++++++
+ 2 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/io_uring/io_uring.h b/io_uring/io_uring.h
+index 4b3acbb39436..922bdf68aec8 100644
+--- a/io_uring/io_uring.h
++++ b/io_uring/io_uring.h
+@@ -419,16 +419,22 @@ static inline void io_ring_submit_lock(struct io_ring_ctx *ctx,
+  * cancellations find it, rather than completing it. Whoever tried to cancel
+  * the request before that found it running. It has flagged the work item,
+  * has searched the list in vain, and won't come back. To be called with
+- * ->uring_lock held, which the search needs as well, once the request is on
+- * the list: if the search came first, the flag is visible.
++ * the lock the search takes held: if the search came first, the flag is
++ * visible. For most lists that is ->uring_lock, timeouts use ->timeout_lock.
+  */
++static inline bool __io_wq_cancel_seen(struct io_kiocb *req,
++				       unsigned int issue_flags)
++{
++	return (issue_flags & IO_URING_F_IOWQ) &&
++	       (atomic_read(&req->work.flags) & IO_WQ_WORK_CANCEL);
++}
++
+ static inline bool io_wq_cancel_seen(struct io_kiocb *req,
+ 				     unsigned int issue_flags)
+ {
+ 	lockdep_assert_held(&req->ctx->uring_lock);
+ 
+-	return (issue_flags & IO_URING_F_IOWQ) &&
+-	       (atomic_read(&req->work.flags) & IO_WQ_WORK_CANCEL);
++	return __io_wq_cancel_seen(req, issue_flags);
+ }
+ 
+ static inline void io_commit_cqring(struct io_ring_ctx *ctx)
+diff --git a/io_uring/timeout.c b/io_uring/timeout.c
+index f1682a3f401b..dbbb9615ec9e 100644
+--- a/io_uring/timeout.c
++++ b/io_uring/timeout.c
+@@ -634,6 +634,13 @@ int io_timeout(struct io_kiocb *req, unsigned int issue_flags)
+ 
+ 	raw_spin_lock_irq(&ctx->timeout_lock);
+ 
++	/* the list is searched under ->timeout_lock, see io_wq_cancel_seen() */
++	if (__io_wq_cancel_seen(req, issue_flags)) {
++		raw_spin_unlock_irq(&ctx->timeout_lock);
++		io_req_task_queue_fail(req, -ECANCELED);
++		return IOU_ISSUE_SKIP_COMPLETE;
++	}
++
+ 	/*
+ 	 * sqe->off holds how many events that need to occur for this
+ 	 * timeout event to be satisfied. If it isn't set, then this is
+-- 
+2.56.0
+
