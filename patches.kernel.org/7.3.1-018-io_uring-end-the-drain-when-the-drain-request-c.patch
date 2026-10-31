@@ -1,0 +1,144 @@
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 19 Oct 2026 13:30:51 -0600
+Subject: [PATCH] io_uring: end the drain when the drain request completes
+References: bsc#1012628
+Patch-mainline: 7.3.1
+Git-commit: ecb6817b769fd7d71af2c9f446188649020b2e53
+
+commit ecb6817b769fd7d71af2c9f446188649020b2e53 upstream.
+
+Since requests are drained based on allocated requests, the drain stays
+active after the drain request has posted its CQE, until it is freed and
+a new request finds the defer list empty. A drain request run by io-wq
+is freed only after the worker drops its reference, so a request
+submitted after the drain completed can still be deferred behind it,
+and get issued much later than the application expects.
+
+A drain request dispatched from the defer list runs alone. Track it,
+and end the drain when its CQE is flushed and nothing else is deferred.
+Have io-wq complete drain requests through task_work, so that this
+happens under ->uring_lock before the CQE is visible. Linked drain
+requests keep waiting until the link is freed.
+
+Reported-by: Wei Gao <wegao@suse.com>
+Link: https://lore.kernel.org/io-uring/20261018070154.16944-1-wegao@suse.com/
+Fixes: 8fb7aee05591 ("io_uring: drain based on allocates reqs")
+Cc: stable@vger.kernel.org
+Tested-by: Wei Gao <wegao@suse.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ include/linux/io_uring_types.h |  2 ++
+ io_uring/io_uring.c            | 42 +++++++++++++++++++++++++++++++---
+ 2 files changed, 41 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/io_uring_types.h b/include/linux/io_uring_types.h
+index 8126af652845..e90e5b5dd70a 100644
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -521,6 +521,8 @@ struct io_ring_ctx {
+ 	struct callback_head		poll_wq_task_work;
+ 	struct list_head		defer_list;
+ 	unsigned			nr_drained;
++	/* drain request dispatched from ->defer_list, until it completes */
++	struct io_kiocb			*drain_req;
+ 
+ 	/* protected by ->completion_lock */
+ 	unsigned			nr_req_allocated;
+diff --git a/io_uring/io_uring.c b/io_uring/io_uring.c
+index cf5218d100d9..91178f2fca09 100644
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -451,6 +451,9 @@ static __cold noinline void io_queue_deferred(struct io_ring_ctx *ctx)
+ 
+ 	lockdep_assert_held(&ctx->uring_lock);
+ 	__io_req_caches_free(ctx);
++	/* nothing outside of ->defer_list is alive */
++	if (ctx->nr_req_allocated == ctx->nr_drained)
++		ctx->drain_req = NULL;
+ 
+ 	while (!list_empty(&ctx->defer_list)) {
+ 		struct io_defer_entry *de = list_first_entry(&ctx->defer_list,
+@@ -462,6 +465,9 @@ static __cold noinline void io_queue_deferred(struct io_ring_ctx *ctx)
+ 
+ 		list_del_init(&de->list);
+ 		ctx->nr_drained -= io_linked_nr(de->req);
++		/* it runs alone, track its completion unless it's a link */
++		if ((de->req->flags & REQ_F_IO_DRAIN) && !de->req->link)
++			ctx->drain_req = de->req;
+ 		io_req_task_queue(de->req);
+ 		kfree(de);
+ 		first = false;
+@@ -923,9 +929,11 @@ static void io_req_complete_post(struct io_kiocb *req, unsigned issue_flags)
+ 
+ 	/*
+ 	 * Handle special CQ sync cases via task_work. DEFER_TASKRUN requires
+-	 * the submitter task context, IOPOLL protects with uring_lock.
++	 * the submitter task context, IOPOLL protects with uring_lock. A drain
++	 * request ends the drain under uring_lock as its CQE is posted.
+ 	 */
+-	if ((ctx->int_flags & IO_RING_F_LOCKLESS_CQ) || (req->flags & REQ_F_REISSUE)) {
++	if ((ctx->int_flags & IO_RING_F_LOCKLESS_CQ) ||
++	    (req->flags & (REQ_F_REISSUE | REQ_F_IO_DRAIN))) {
+ defer_complete:
+ 		req->io_task_work.func = io_req_task_complete;
+ 		io_req_task_work_add(req);
+@@ -1126,11 +1134,33 @@ static void io_free_batch_list(struct io_ring_ctx *ctx,
+ 	} while (node);
+ }
+ 
++/*
++ * The dispatched drain request ran alone, and anything submitted after it was
++ * deferred. Once it completed, new requests may run if nothing is waiting.
++ */
++static __cold bool io_drain_req_completed(struct io_ring_ctx *ctx)
++{
++	struct io_wq_work_node *node;
++
++	__wq_list_for_each(node, &ctx->submit_state.compl_reqs) {
++		struct io_kiocb *req = container_of(node, struct io_kiocb,
++					    comp_list);
++
++		/* a requeued request hasn't completed */
++		if (req == ctx->drain_req && !(req->flags & REQ_F_REISSUE)) {
++			ctx->drain_req = NULL;
++			return true;
++		}
++	}
++	return false;
++}
++
+ void __io_submit_flush_completions(struct io_ring_ctx *ctx)
+ 	__must_hold(&ctx->uring_lock)
+ {
+ 	struct io_submit_state *state = &ctx->submit_state;
+ 	struct io_wq_work_node *node;
++	bool drain_done = false;
+ 
+ 	__io_cq_lock(ctx);
+ 	__wq_list_for_each(node, &state->compl_reqs) {
+@@ -1152,13 +1182,19 @@ void __io_submit_flush_completions(struct io_ring_ctx *ctx)
+ 	}
+ 	__io_cq_unlock_post(ctx);
+ 
++	if (unlikely(ctx->int_flags & IO_RING_F_DRAIN_ACTIVE) && ctx->drain_req)
++		drain_done = io_drain_req_completed(ctx);
++
+ 	if (!wq_list_empty(&state->compl_reqs)) {
+ 		io_free_batch_list(ctx, state->compl_reqs.first);
+ 		INIT_WQ_LIST(&state->compl_reqs);
+ 	}
+ 
+-	if (unlikely(ctx->int_flags & IO_RING_F_DRAIN_ACTIVE))
++	if (unlikely(ctx->int_flags & IO_RING_F_DRAIN_ACTIVE)) {
+ 		io_queue_deferred(ctx);
++		if (drain_done && list_empty(&ctx->defer_list))
++			ctx->int_flags &= ~IO_RING_F_DRAIN_ACTIVE;
++	}
+ 
+ 	ctx->submit_state.cq_flush = false;
+ }
+-- 
+2.56.0
+
