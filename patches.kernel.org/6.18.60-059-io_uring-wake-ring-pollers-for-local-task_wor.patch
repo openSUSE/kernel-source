@@ -1,0 +1,121 @@
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Thu, 15 Oct 2026 19:30:43 +0000
+Subject: [PATCH] io_uring: wake ring pollers for local task_work
+References: bsc#1258210
+Patch-mainline: 6.18.60
+Git-commit: b88902d8745a701d24275d012f0830e3628e2a22
+
+Commit b88902d8745a701d24275d012f0830e3628e2a22 upstream.
+
+With IORING_SETUP_DEFER_TASKRUN completions are queued as local work, and
+only become CQEs when the submitter enters the kernel to wait for events.
+For an application that finds out via poll() or epoll on the ring fd when
+it is time to do that, io_uring_poll() reports EPOLLIN if local work is
+pending.
+
+That only helps if the work is there at the time of the call. When
+DEFER_TASKRUN was added, io_req_local_work_add() did io_cqring_wake(),
+which took care of tasks sleeping in poll() as well. Then polling got a
+wait queue of its own, ->poll_wq, and the wake up in
+io_req_local_work_add() was replaced by waking the submitter directly.
+Since then ->poll_wq is only woken when CQEs are committed, which for
+such a ring is done by the very task that is waiting to be told to:
+
+  submitter                           completion
+  poll(ring_fd)
+    io_uring_poll()  // nothing yet
+    schedule()
+                                      io_req_local_work_add()
+                                        // ->cq_wait_nr: nobody waits
+  // sleeps on
+
+Wake ->poll_wq when the first entry is put on the work list. Like for the
+eventfd, that must not be done right away if the work is queued from a
+wake up handler, as the chain of wake ups could get back to the wait
+queue whose lock is held. Use an RCU callback in that case, with a
+reference to the ring.
+
+[ 6.18: io_req_local_work_add() lives in io_uring.c, and ->poll_activated is a bitfield rather than an int_flags bit ]
+
+Fixes: 130bd686d9be ("io_uring: waitqueue-less cq waiting")
+Assisted-by: LLM
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Link: https://patch.msgid.link/20261015-b4-io-uring-fixes-v1-19-c1556f5d7bf5@toxicpanda.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/linux/io_uring_types.h |  3 +++
+ io_uring/io_uring.c            | 34 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/include/linux/io_uring_types.h b/include/linux/io_uring_types.h
+index 4f1607e00359..2576f72eada5 100644
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -445,6 +445,9 @@ struct io_ring_ctx {
+ 	u32				iowq_limits[2];
+ 
+ 	struct callback_head		poll_wq_task_work;
++	/* deferred ->poll_wq wake up for local task_work */
++	struct rcu_head			poll_wq_rcu;
++	atomic_t			poll_wq_rcu_pending;
+ 	struct list_head		defer_list;
+ 	unsigned			nr_drained;
+ 
+diff --git a/io_uring/io_uring.c b/io_uring/io_uring.c
+index 68a86a2c5d7c..44d9f54915ac 100644
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -1219,6 +1219,37 @@ static void io_ctx_mark_taskrun(struct io_ring_ctx *ctx)
+ 	}
+ }
+ 
++static void io_poll_wq_wake_rcu(struct rcu_head *rcu)
++{
++	struct io_ring_ctx *ctx = container_of(rcu, struct io_ring_ctx,
++					       poll_wq_rcu);
++
++	atomic_set(&ctx->poll_wq_rcu_pending, 0);
++	io_poll_wq_wake(ctx);
++	percpu_ref_put(&ctx->refs);
++}
++
++/*
++ * io_uring_poll() reports pending local work as EPOLLIN, as it takes a trip to
++ * the kernel to turn it into CQEs. Let those know who are asleep already.
++ */
++static void io_local_work_wake_poll(struct io_ring_ctx *ctx, unsigned int flags)
++{
++	if (!(flags & IOU_F_TWQ_IN_WAKE)) {
++		io_poll_wq_wake(ctx);
++		return;
++	}
++	/*
++	 * Called from a wake up handler with some wait queue lock held, this
++	 * one could lead back to it. Do it from a clean context.
++	 */
++	if (!wq_has_sleeper(&ctx->poll_wq) ||
++	    atomic_xchg(&ctx->poll_wq_rcu_pending, 1))
++		return;
++	percpu_ref_get(&ctx->refs);
++	call_rcu_hurry(&ctx->poll_wq_rcu, io_poll_wq_wake_rcu);
++}
++
+ static void io_req_local_work_add(struct io_kiocb *req, unsigned flags)
+ {
+ 	struct io_ring_ctx *ctx = req->ctx;
+@@ -1276,6 +1307,9 @@ static void io_req_local_work_add(struct io_kiocb *req, unsigned flags)
+ 		io_ctx_mark_taskrun(ctx);
+ 		if (ctx->has_evfd)
+ 			io_eventfd_signal(ctx, false, flags & IOU_F_TWQ_IN_WAKE);
++		/* whoever sets the flag wakes ->poll_wq afterwards */
++		if (ctx->poll_activated)
++			io_local_work_wake_poll(ctx, flags);
+ 	}
+ 
+ 	nr_wait = atomic_read(&ctx->cq_wait_nr);
+-- 
+2.56.0
+

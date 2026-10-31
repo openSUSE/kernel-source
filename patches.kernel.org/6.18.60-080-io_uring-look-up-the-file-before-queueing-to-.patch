@@ -1,0 +1,144 @@
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Thu, 15 Oct 2026 19:31:07 +0000
+Subject: [PATCH] io_uring: look up the file before queueing to io-wq
+References: bsc#1258210
+Patch-mainline: 6.18.60
+Git-commit: 98bc044d5a5374f8d3605fe55a8e2df6d6fc3f82
+
+Commit 98bc044d5a5374f8d3605fe55a8e2df6d6fc3f82 upstream.
+
+io_prep_async_work() decides by the file of a request what kind of work
+it is for io-wq. I/O on regular files and block devices is bounded work,
+limited to min(SQ entries, 4 * CPUs) workers, for anything else that may
+block indefinitely the limit is RLIMIT_NPROC. Writes to a regular file
+are hashed by the inode, so that they are run one after the other instead
+of having a bunch of workers fight for the inode lock.
+
+Since the file is only assigned when a request is issued, a request that
+is queued without an attempt to issue it, REQ_F_FORCE_ASYNC, doesn't have
+one at that point. io_prep_async_work() takes that for "not a regular
+file or block device":
+
+- Reads and writes end up as unbound work. 32 reads with IOSQE_ASYNC from
+  a slow block device on a ring with 4 SQ entries get 32 workers, not 4.
+- Writes aren't hashed. Four buffered writes to one file get four
+  workers, three of which do nothing but wait for the lock.
+
+The late assignment is for the benefit of links, where a request may use
+a fixed file that one of its predecessors installs. By the time a request
+gets to io_queue_iowq() these are done, it is as good as issued. Assign
+the file there.
+
+io_assign_file() moves up and is forced inline. With a third caller the
+compiler may stop inlining it, and every request that is issued would
+pay for a call.
+
+IORING_OP_SPLICE is left as it is, unbound and not hashed. The file of
+the request is where it writes to, which says nothing about how long it
+takes: a splice from an empty pipe or a socket into a regular file waits
+for its input. As bounded work, four of these on a ring with 4 SQ entries
+keep all other bounded work of the task from running, and as hashed work
+one of them blocks all writes to that file.
+
+REQ_F_FORCE_ASYNC is not only set for IOSQE_ASYNC. What changes, and
+brings back what was the case before the file assignment was deferred:
+
+- Requests with IOSQE_ASYNC or IOSQE_IO_DRAIN, and all requests that are
+  submitted while a drain is active: reads and writes on regular files
+  and block devices count against the limit for bounded workers, including
+  the one set with IORING_REGISTER_IOWQ_MAX_WORKERS, so fewer of them run
+  at the same time.
+- Of these, writes to one regular file are run one at a time, unless they
+  are O_DIRECT and the filesystem has FOP_DIO_PARALLEL_WRITE.
+- IORING_OP_FALLOCATE and IORING_OP_FTRUNCATE, which always go to io-wq,
+  are run one at a time per file, and in turn with these writes.
+- The descriptor or the fixed file slot is looked up when the request is
+  queued, not when a worker gets around to it, so closing or replacing it
+  in between no longer has an effect on the request.
+
+Fixes: 6bf9c47a3989 ("io_uring: defer file assignment")
+Assisted-by: LLM
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Link: https://patch.msgid.link/20261015-b4-io-uring-fixes-v1-43-c1556f5d7bf5@toxicpanda.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ io_uring/io_uring.c | 43 +++++++++++++++++++++++++++++--------------
+ 1 file changed, 29 insertions(+), 14 deletions(-)
+
+diff --git a/io_uring/io_uring.c b/io_uring/io_uring.c
+index 96e27af812d5..8b16e4618506 100644
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -466,17 +466,46 @@ static void io_prep_async_link(struct io_kiocb *req)
+ 	}
+ }
+ 
++/* Called for every request that is issued: keep it inline */
++static __always_inline bool io_assign_file(struct io_kiocb *req,
++					   const struct io_issue_def *def,
++					   unsigned int issue_flags)
++{
++	if (req->file || !def->needs_file)
++		return true;
++
++	if (req->flags & REQ_F_FIXED_FILE)
++		req->file = io_file_get_fixed(req, req->cqe.fd, issue_flags);
++	else
++		req->file = io_file_get_normal(req, req->cqe.fd);
++
++	return !!req->file;
++}
++
+ static void io_queue_iowq(struct io_kiocb *req)
+ {
+ 	struct io_uring_task *tctx = req->tctx;
+ 
+ 	BUG_ON(!tctx);
++	lockdep_assert_held(&req->ctx->uring_lock);
+ 
+ 	if ((current->flags & PF_KTHREAD) || !tctx->io_wq) {
+ 		io_req_task_queue_fail(req, -ECANCELED);
+ 		return;
+ 	}
+ 
++	/*
++	 * The file is looked up as late as possible, as it may be the result
++	 * of an earlier request of the link. This one is up now, and what kind
++	 * of work it is depends on the file. If that fails, leave the error
++	 * handling to the worker.
++	 *
++	 * Not for a splice: whatever it writes to, it may wait for its input
++	 * for ever. It has to remain unbound work that isn't hashed.
++	 */
++	if (req->opcode != IORING_OP_SPLICE)
++		io_assign_file(req, &io_issue_defs[req->opcode], 0);
++
+ 	/* init ->work of the whole link before punting */
+ 	io_prep_async_link(req);
+ 
+@@ -1830,20 +1859,6 @@ static __cold void io_drain_req(struct io_kiocb *req)
+ 		ctx->drain_active = false;
+ }
+ 
+-static bool io_assign_file(struct io_kiocb *req, const struct io_issue_def *def,
+-			   unsigned int issue_flags)
+-{
+-	if (req->file || !def->needs_file)
+-		return true;
+-
+-	if (req->flags & REQ_F_FIXED_FILE)
+-		req->file = io_file_get_fixed(req, req->cqe.fd, issue_flags);
+-	else
+-		req->file = io_file_get_normal(req, req->cqe.fd);
+-
+-	return !!req->file;
+-}
+-
+ #define REQ_ISSUE_SLOW_FLAGS	(REQ_F_CREDS | REQ_F_ARM_LTIMEOUT)
+ 
+ static inline int __io_issue_sqe(struct io_kiocb *req,
+-- 
+2.56.0
+
