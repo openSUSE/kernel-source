@@ -24,7 +24,7 @@ class UploaderBase:
         self.log_progress('Updating .gitattributes to put tarballs into LFS.\n')
         self.tea.update_gitattr(self.user, self.upstream.repo, self.user_branch)
         self.log_progress('Updating branch %s with content of %s\n' % (self.user_branch, self.data))
-        self.tea.update_content(self.user, self.upstream.repo, self.user_branch, self.data, message, [ignore_kabi_file] if self.ignore_kabi_badness else None, self.upload_all)
+        self.tea.update_content(self.user, self.upstream.repo, self.user_branch, self.data, message, [ignore_kabi_file] if self.ignore_kabi_badness else None)
         self.commit = self.tea.repo_branches(self.user, self.upstream.repo)[self.user_branch]['commit']['id']
         self.log_progress('commit sha: %s\n' % (self.commit,))
         return self.commit
@@ -329,7 +329,7 @@ Constraint: hardware:disk:size unit=G %i
 
 
 class Uploader(UploaderBase):
-    def __init__(self, api, data, user_project, reset_branch=False, re_fork=False, logfile=None, progress=True, ignore_kabi=False, upload_all=False, default_branch=False):
+    def __init__(self, api, data, user_project, reset_branch=False, re_fork=False, logfile=None, progress=True, ignore_kabi=False, default_branch=False):
         self.progress = sys.stderr if progress else None
         self.data = data
         self.upstream_project, self.package = get_kernel_project_package(self.data)
@@ -346,5 +346,4 @@ class Uploader(UploaderBase):
         self.ignore_kabi_badness = ignore_kabi
         self.reset_branch = reset_branch
         self.re_fork = re_fork
-        self.upload_all = upload_all
         self.fork_repo(self.upstream, self.reset_branch, self.re_fork, default_branch)
