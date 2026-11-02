@@ -1,0 +1,196 @@
+From: Vishwaroop A <va@nvidia.com>
+Date: Thu, 13 Aug 2026 20:00:27 +0000
+Subject: spi: tegra210-quad: Process small PIO transfers in hard IRQ context
+Git-commit: 252ee24aff97cd0a14c192c200753487ed88ee24
+Patch-mainline: v7.4-rc1
+References: bsc#1288594
+
+On heavily loaded systems, workqueue scheduling delays can exceed
+transfer timeouts even for high-priority queues, causing false
+timeouts for latency-sensitive devices like TPM despite hardware
+completing in microseconds.
+
+Process small PIO transfers (those that complete the whole spi_transfer
+in a single chunk) directly in hard IRQ context instead of deferring to
+the workqueue. This reduces completion latency from 1000ms+ to
+microseconds and matches the pattern used by other SPI drivers.
+
+To avoid touching the spi_transfer object from hard IRQ context (which
+would race with the synchronous teardown path that clears curr_xfer on
+timeout), tegra_qspi_start_cpu_based_transfer() caches the "this PIO
+chunk completes the whole transfer" decision into a scalar
+tqspi->is_last_pio_chunk *before* unmasking the IRQ. The hard-IRQ
+fastpath consumes that scalar with READ_ONCE() and never dereferences
+curr_xfer or any spi_transfer fields. Multi-chunk PIO transfers are
+intentionally kept on the workqueue (only the final chunk sets the
+flag) so the fastpath can never recurse into
+tegra_qspi_start_cpu_based_transfer() from hard IRQ context, and DMA
+transfers always go through the workqueue because their completion
+path sleeps on the DMA engine.
+
+The fastpath also gates on the per-IRQ tx_status / rx_status locals
+being zero, because handle_cpu_based_xfer()'s error path calls
+tegra_qspi_reset() -> device_reset(), which can sleep and must not run
+from hard IRQ context.
+
+is_curr_dma_xfer and is_last_pio_chunk are written from process
+context (the transfer-start functions) and read lock-free from the
+hard IRQ handler and the workqueue handler, so the writes use
+WRITE_ONCE() and the reads use READ_ONCE() to prevent compiler tearing
+and silence KCSAN data-race warnings.
+
+Signed-off-by: Vishwaroop A <va@nvidia.com>
+Link: https://patch.msgid.link/20260813200027.2711863-4-va@nvidia.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Acked-by: Ivan T. Ivanov <iivanov@suse.de>
+---
+ drivers/spi/spi-tegra210-quad.c |   88 +++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 79 insertions(+), 9 deletions(-)
+
+--- a/drivers/spi/spi-tegra210-quad.c
++++ b/drivers/spi/spi-tegra210-quad.c
+@@ -214,6 +214,18 @@ struct tegra_qspi {
+ 	unsigned int				dma_buf_size;
+ 	unsigned int				max_buf_size;
+ 	bool					is_curr_dma_xfer;
++	/*
++	 * Cached "this PIO chunk completes the whole transfer" decision,
++	 * computed by tegra_qspi_start_cpu_based_transfer() before it
++	 * unmasks the IRQ. Used by the hard IRQ small-PIO fastpath in
++	 * place of dereferencing curr_xfer->len, so the ISR cannot touch
++	 * the spi_transfer object even on a late IRQ that races with the
++	 * synchronous teardown path. Multi-chunk PIO transfers always go
++	 * through the workqueue (this flag is only set on the final
++	 * chunk), so the fastpath cannot recurse into
++	 * tegra_qspi_start_cpu_based_transfer() from hard IRQ context.
++	 */
++	bool					is_last_pio_chunk;
+ 
+ 	struct completion			rx_dma_complete;
+ 	struct completion			tx_dma_complete;
+@@ -732,7 +744,13 @@ static int tegra_qspi_start_dma_based_tr
+ 
+ 	tegra_qspi_writel(tqspi, tqspi->command1_reg, QSPI_COMMAND1);
+ 
+-	tqspi->is_curr_dma_xfer = true;
++	/*
++	 * WRITE_ONCE() pairs with READ_ONCE() in tegra_qspi_isr() and
++	 * tegra_qspi_work_handler(); the flag is read lock-free across
++	 * the hard-IRQ / process-context boundary so the annotation
++	 * prevents compiler tearing and silences KCSAN.
++	 */
++	WRITE_ONCE(tqspi->is_curr_dma_xfer, true);
+ 	tqspi->dma_control_reg = val;
+ 	val |= QSPI_DMA_EN;
+ 	tegra_qspi_writel(tqspi, val, QSPI_DMA_CTL);
+@@ -754,6 +772,20 @@ static int tegra_qspi_start_cpu_based_tr
+ 	tegra_qspi_writel(qspi, val, QSPI_DMA_BLK);
+ 
+ 	/*
++	 * Snapshot whether this PIO chunk completes the whole transfer
++	 * before unmasking the IRQ, so the hard IRQ small-PIO fastpath
++	 * can decide whether to drain inline without dereferencing the
++	 * spi_transfer object. cur_pos / curr_dma_words / bytes_per_word
++	 * are stable here: they are written by
++	 * tegra_qspi_calculate_curr_xfer_param() earlier in this code
++	 * path. The IRQ cannot fire until the QSPI_COMMAND1 write below
++	 * kicks the transfer off, so this store happens-before any ISR
++	 * that observes the unmask.
++	 */
++	WRITE_ONCE(qspi->is_last_pio_chunk,
++		   qspi->cur_pos + qspi->curr_dma_words * qspi->bytes_per_word >= t->len);
++
++	/*
+ 	 * Reset the cached transfer status before unmasking the IRQ for
+ 	 * this chunk so the cache represents only the IRQ for THIS chunk;
+ 	 * a stale RDY from the previous chunk would otherwise mislead
+@@ -765,7 +797,7 @@ static int tegra_qspi_start_cpu_based_tr
+ 	smp_store_release(&qspi->trans_status, 0);
+ 	tegra_qspi_unmask_irq(qspi);
+ 
+-	qspi->is_curr_dma_xfer = false;
++	WRITE_ONCE(qspi->is_curr_dma_xfer, false);
+ 	val = qspi->command1_reg;
+ 	val |= QSPI_PIO;
+ 	tegra_qspi_writel(qspi, val, QSPI_COMMAND1);
+@@ -1828,7 +1860,7 @@ static void tegra_qspi_work_handler(stru
+ 	 * DMA handler also needs to sleep in wait_for_completion_*(), which
+ 	 * cannot be done while holding spinlock.
+ 	 */
+-	if (!tqspi->is_curr_dma_xfer)
++	if (!READ_ONCE(tqspi->is_curr_dma_xfer))
+ 		handle_cpu_based_xfer(tqspi);
+ 	else
+ 		handle_dma_based_xfer(tqspi);
+@@ -1856,6 +1888,7 @@ static irqreturn_t tegra_qspi_isr(int ir
+ {
+ 	struct tegra_qspi *tqspi = context_data;
+ 	u32 status_reg, trans_status;
++	u32 tx_status = 0, rx_status = 0;
+ 
+ 	if (!READ_ONCE(tqspi->curr_xfer)) {
+ 		tegra_qspi_mask_clear_irq(tqspi);
+@@ -1866,13 +1899,15 @@ static irqreturn_t tegra_qspi_isr(int ir
+ 	status_reg = tegra_qspi_readl(tqspi, QSPI_FIFO_STATUS);
+ 	trans_status = tegra_qspi_readl(tqspi, QSPI_TRANS_STATUS);
+ 
+-	if (tqspi->cur_direction & DATA_DIR_TX)
+-		WRITE_ONCE(tqspi->tx_status,
+-			   status_reg & (QSPI_TX_FIFO_UNF | QSPI_TX_FIFO_OVF));
++	if (tqspi->cur_direction & DATA_DIR_TX) {
++		tx_status = status_reg & (QSPI_TX_FIFO_UNF | QSPI_TX_FIFO_OVF);
++		WRITE_ONCE(tqspi->tx_status, tx_status);
++	}
+ 
+-	if (tqspi->cur_direction & DATA_DIR_RX)
+-		WRITE_ONCE(tqspi->rx_status,
+-			   status_reg & (QSPI_RX_FIFO_OVF | QSPI_RX_FIFO_UNF));
++	if (tqspi->cur_direction & DATA_DIR_RX) {
++		rx_status = status_reg & (QSPI_RX_FIFO_OVF | QSPI_RX_FIFO_UNF);
++		WRITE_ONCE(tqspi->rx_status, rx_status);
++	}
+ 
+ 	WRITE_ONCE(tqspi->status_reg, status_reg);
+ 	/*
+@@ -1906,6 +1941,41 @@ static irqreturn_t tegra_qspi_isr(int ir
+ 		return IRQ_HANDLED;
+ 	}
+ 
++	/*
++	 * Small-PIO fastpath: drain the FIFO inline only when this chunk
++	 * completes the entire outstanding transfer and no error bit was
++	 * latched, to avoid workqueue scheduling latency for TPM-style
++	 * short reads.
++	 *
++	 * The "last chunk" decision is computed and cached as a scalar by
++	 * tegra_qspi_start_cpu_based_transfer() before it unmasks the IRQ,
++	 * so the hard-IRQ fastpath never dereferences the spi_transfer
++	 * pointer here. That keeps the ISR safe against any teardown race
++	 * where the synchronous path could clear curr_xfer concurrently.
++	 *
++	 * The fastpath dispatch decision is made while still holding
++	 * tqspi->lock, so the recovery_in_progress guard above covers it
++	 * atomically with queue_work() below: an ISR that reaches the
++	 * fastpath cannot race a tegra_qspi_handle_timeout() that
++	 * subsequently observes recovery_in_progress == true, because
++	 * that path calls synchronize_irq() before proceeding. We drop
++	 * the lock before calling handle_cpu_based_xfer() so it can take
++	 * tqspi->lock internally without deadlocking.
++	 *
++	 * Multi-chunk PIO continuation stays on the workqueue so that
++	 * tegra_qspi_start_cpu_based_transfer() can re-arm the IRQ from
++	 * process context. DMA transfers also stay on the workqueue
++	 * because their completion path sleeps on the DMA engine.
++	 * tegra_qspi_handle_error() -> device_reset() can sleep, so the
++	 * fastpath only runs when both status words are clean.
++	 */
++	if (!READ_ONCE(tqspi->is_curr_dma_xfer) &&
++	    READ_ONCE(tqspi->is_last_pio_chunk) &&
++	    !tx_status && !rx_status) {
++		spin_unlock(&tqspi->lock);
++		return handle_cpu_based_xfer(tqspi);
++	}
++
+ 	queue_work(tqspi->wq, &tqspi->irq_work);
+ 
+ 	spin_unlock(&tqspi->lock);
