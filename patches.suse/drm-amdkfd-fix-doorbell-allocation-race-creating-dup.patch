@@ -1,0 +1,176 @@
+From bebad45050945a3d668d6701fb77ae2571c5d44b Mon Sep 17 00:00:00 2001
+From: Henry Martin <bsdhenrymartin@gmail.com>
+Date: Sat, 10 Oct 2026 11:02:30 +0800
+Subject: drm/amdkfd: fix doorbell allocation race creating duplicate allocations
+Git-commit: bebad45050945a3d668d6701fb77ae2571c5d44b
+Patch-mainline: v7.4-rc1
+Alt-commit: 4e27ba5ad5f76932d4f6cbacd25c81c2dd40ec4a
+References: git-fixes
+
+The check-and-allocate sequence on pdd->qpd.proc_doorbells is
+lockless at every call site of kfd_alloc_process_doorbells():
+kfd_get_process_doorbells() (mmap of /dev/kfd),
+kfd_ioctl_create_queue() and the CRIU restore path each test the
+pointer under different locking (or none), so two racing threads can
+both observe NULL and each allocate a doorbell BO and bitmap,
+orphaning one allocation and handing the two mappings different
+backing pages.
+
+Move the serialization into kfd_alloc_process_doorbells() itself,
+using a new per-process-device mutex so all three call sites are
+covered regardless of their own locking.  The device-global
+kfd->doorbell_mutex is not suitable here: it is acquired under
+dqm->lock on the kernel-doorbell path (start_cpsch() -> pm_init() ->
+kq_initialize() -> kfd_get_kernel_doorbell()), so holding it across
+the sleeping allocations above would create a lock-ordering
+inversion with dqm->lock via TTM eviction, and it would also
+serialize doorbell setup of unrelated processes behind a
+device-wide lock for per-process state.
+
+This issue was discovered by Tencent CodeBuddy Security.
+
+v3 (Felix Kuehling):
+- Removed unlocked check in kfd_get_process_doorbell flagged as
+  problematic by Sashiko Bot. Fall back to the locked check inside
+  kfd_alloc_process_doorbells
+- Added missing mutex_destroy
+v4 (Felix Kuehling):
+- Removed unlocked checks around other kfd_alloc_process_doorbells calls
+
+Fixes: 16f0013157bf ("drm/amdkfd: Allocate doorbells only when needed")
+Signed-off-by: Henry Martin <bsdhenrymartin@gmail.com>
+Signed-off-by: Felix Kuehling <felix.kuehling@amd.com>
+Reviewed-by: Felix Kuehling <felix.kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 4e27ba5ad5f76932d4f6cbacd25c81c2dd40ec4a)
+
+Cc: stable@vger.kernel.org
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c  |   18 +++++++-----------
+ drivers/gpu/drm/amd/amdkfd/kfd_doorbell.c |   23 +++++++++++++++++------
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h     |    3 +++
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c  |    2 ++
+ 4 files changed, 29 insertions(+), 17 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -339,12 +339,10 @@ static int kfd_ioctl_create_queue(struct
+ 		goto err_bind_process;
+ 	}
+ 
+-	if (!pdd->qpd.proc_doorbells) {
+-		err = kfd_alloc_process_doorbells(dev->kfd, pdd);
+-		if (err) {
+-			pr_debug("failed to allocate process doorbells\n");
+-			goto err_bind_process;
+-		}
++	err = kfd_alloc_process_doorbells(dev->kfd, pdd);
++	if (err) {
++		pr_debug("failed to allocate process doorbells\n");
++		goto err_bind_process;
+ 	}
+ 
+ 	/* Starting with GFX11, wptr BOs must be mapped to GART for MES to determine work
+@@ -2294,11 +2292,9 @@ static int criu_restore_devices(struct k
+ 			goto exit;
+ 		}
+ 
+-		if (!pdd->qpd.proc_doorbells) {
+-			ret = kfd_alloc_process_doorbells(dev->kfd, pdd);
+-			if (ret)
+-				goto exit;
+-		}
++		ret = kfd_alloc_process_doorbells(dev->kfd, pdd);
++		if (ret)
++			goto exit;
+ 	}
+ 
+ 	/*
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_doorbell.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_doorbell.c
+@@ -239,11 +239,9 @@ phys_addr_t kfd_get_process_doorbells(st
+ 	struct amdgpu_device *adev = pdd->dev->adev;
+ 	uint32_t first_db_index;
+ 
+-	if (!pdd->qpd.proc_doorbells) {
+-		if (kfd_alloc_process_doorbells(pdd->dev->kfd, pdd))
+-			/* phys_addr_t 0 is error */
+-			return 0;
+-	}
++	if (kfd_alloc_process_doorbells(pdd->dev->kfd, pdd))
++		/* phys_addr_t 0 is error */
++		return 0;
+ 
+ 	first_db_index = amdgpu_doorbell_index_on_bar(adev,
+ 						      pdd->qpd.proc_doorbells,
+@@ -257,12 +255,21 @@ int kfd_alloc_process_doorbells(struct k
+ 	int r;
+ 	struct qcm_process_device *qpd = &pdd->qpd;
+ 
++	mutex_lock(&pdd->doorbell_mutex);
++
++	/* Another thread may have won the check-and-allocate race */
++	if (qpd->proc_doorbells) {
++		mutex_unlock(&pdd->doorbell_mutex);
++		return 0;
++	}
++
+ 	/* Allocate bitmap for dynamic doorbell allocation */
+ 	qpd->doorbell_bitmap = bitmap_zalloc(KFD_MAX_NUM_OF_QUEUES_PER_PROCESS,
+ 					     GFP_KERNEL);
+ 	if (!qpd->doorbell_bitmap) {
+ 		DRM_ERROR("Failed to allocate process doorbell bitmap\n");
+-		return -ENOMEM;
++		r = -ENOMEM;
++		goto unlock;
+ 	}
+ 
+ 	r = init_doorbell_bitmap(&pdd->qpd, kfd);
+@@ -284,11 +291,15 @@ int kfd_alloc_process_doorbells(struct k
+ 		DRM_ERROR("Failed to allocate process doorbells\n");
+ 		goto err;
+ 	}
++
++	mutex_unlock(&pdd->doorbell_mutex);
+ 	return 0;
+ 
+ err:
+ 	bitmap_free(qpd->doorbell_bitmap);
+ 	qpd->doorbell_bitmap = NULL;
++unlock:
++	mutex_unlock(&pdd->doorbell_mutex);
+ 	return r;
+ }
+ 
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -754,6 +754,9 @@ struct kfd_process_device {
+ 	/* per-process-per device QCM data structure */
+ 	struct qcm_process_device qpd;
+ 
++	/* Serializes process doorbell allocation for this device */
++	struct mutex doorbell_mutex;
++
+ 	/*Apertures*/
+ 	uint64_t lds_base;
+ 	uint64_t lds_limit;
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -1062,6 +1062,7 @@ static void kfd_process_destroy_pdds(str
+ 		}
+ 
+ 		atomic_dec(&pdd->dev->kfd->kfd_processes_count);
++		mutex_destroy(&pdd->doorbell_mutex);
+ 
+ 		kfree(pdd);
+ 		p->pdds[i] = NULL;
+@@ -1607,6 +1608,7 @@ struct kfd_process_device *kfd_create_pr
+ 	pdd->dev = dev;
+ 	INIT_LIST_HEAD(&pdd->qpd.queues_list);
+ 	INIT_LIST_HEAD(&pdd->qpd.priv_queue_list);
++	mutex_init(&pdd->doorbell_mutex);
+ 	pdd->qpd.dqm = dev->dqm;
+ 	pdd->qpd.pqm = &p->pqm;
+ 	pdd->qpd.evicted = 0;
