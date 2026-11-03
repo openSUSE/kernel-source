@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 
 import fcntl
 import os
@@ -38,7 +38,7 @@ def format_size(size_bytes: Union[int, float]) -> str:
 
 def get_default_repo_path() -> Optional[str]:
     """Determines the default path to the mainline Linux git repository via linux_git.sh."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     linux_git_sh = os.path.abspath(os.path.join(script_dir, "..", "linux_git.sh"))
     if os.path.exists(linux_git_sh):
         try:

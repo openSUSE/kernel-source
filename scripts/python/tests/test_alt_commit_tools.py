@@ -15,16 +15,12 @@ if sys.version_info < (3, 6):
 
 from contextlib import redirect_stderr
 from pathlib import Path
+from alt_commits import alt_lib
 
 # Locate repository root and scripts directory
 TESTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TESTS_DIR.parents[2]
 ALT_COMMITS_DIR = REPO_ROOT / "scripts" / "alt-commits"
-
-if str(ALT_COMMITS_DIR) not in sys.path:
-    sys.path.insert(0, str(ALT_COMMITS_DIR))
-
-import alt_lib
 
 
 class TestRepoResolution(unittest.TestCase):
