@@ -9,6 +9,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+
+if sys.version_info < (3, 6):
+    raise unittest.SkipTest("alt-commits suite requires Python 3.6+ (SLE 15+)")
+
 from contextlib import redirect_stderr
 from pathlib import Path
 
@@ -156,7 +160,7 @@ class TestDbAndCliExecution(unittest.TestCase):
             self.assertEqual(
                 res.returncode,
                 0,
-                f"{tool} --help failed with stderr: {res.stderr}",
+                "{0} --help failed with stderr: {1}".format(tool, res.stderr),
             )
             self.assertIn("usage:", res.stdout.lower())
 
@@ -187,7 +191,7 @@ class TestDbAndCliExecution(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 universal_newlines=True,
             )
-            self.assertEqual(res.returncode, 0, f"alt-lookup stats failed: {res.stderr}")
+            self.assertEqual(res.returncode, 0, "alt-lookup stats failed: {0}".format(res.stderr))
             self.assertIn("DATABASE METRICS & STATISTICS", res.stdout)
             self.assertIn("Total Linked Hashes:  0", res.stdout)
 
@@ -220,20 +224,22 @@ class TestEndToEndCherryPickPipeline(unittest.TestCase):
         self.db_path = os.path.join(self.test_dir, "test.db")
         os.makedirs(self.repo_dir)
 
-        self.git_env = {
-            **os.environ,
+        self.git_env = os.environ.copy()
+        self.git_env.update({
             "GIT_AUTHOR_NAME": "Test Author",
             "GIT_AUTHOR_EMAIL": "author@example.com",
             "GIT_COMMITTER_NAME": "Test Committer",
             "GIT_COMMITTER_EMAIL": "committer@example.com",
             "GIT_AUTHOR_DATE": "1600000000 +0000",
             "GIT_COMMITTER_DATE": "1600000000 +0000",
-        }
+        })
 
         def git_run(*args, extra_env=None):
-            e = {**self.git_env, **(extra_env or {})}
+            e = self.git_env.copy()
+            if extra_env:
+                e.update(extra_env)
             subprocess.check_call(
-                ["git", "-C", self.repo_dir, *args],
+                ["git", "-C", self.repo_dir] + list(args),
                 env=e,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -255,7 +261,7 @@ class TestEndToEndCherryPickPipeline(unittest.TestCase):
 
         with open(code_file, "a") as f:
             f.write("/* cherry-pick note */\n")
-        git_run("commit", "-am", f"net: fix memory leak\n\n(cherry picked from commit {self.sha_a})")
+        git_run("commit", "-am", "net: fix memory leak\n\n(cherry picked from commit {0})".format(self.sha_a))
         self.sha_b = self._get_rev("HEAD")
 
         # 2. Group 2: Commit X and Commit Y (Rank 2: Identical patch diff, no tag)
@@ -314,7 +320,7 @@ class TestEndToEndCherryPickPipeline(unittest.TestCase):
             stderr=subprocess.PIPE,
             universal_newlines=True,
         )
-        self.assertEqual(res_scan.returncode, 0, f"alt-scan failed: {res_scan.stderr}")
+        self.assertEqual(res_scan.returncode, 0, "alt-scan failed: {0}".format(res_scan.stderr))
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
@@ -336,7 +342,7 @@ class TestEndToEndCherryPickPipeline(unittest.TestCase):
             stderr=subprocess.PIPE,
             universal_newlines=True,
         )
-        self.assertEqual(res_cmp.returncode, 0, f"Expected match between sha_a and sha_b: {res_cmp.stderr}")
+        self.assertEqual(res_cmp.returncode, 0, "Expected match between sha_a and sha_b: {0}".format(res_cmp.stderr))
 
         # Single SHA lookup should return the sibling SHA
         res_lookup = subprocess.run(
@@ -357,7 +363,7 @@ class TestEndToEndCherryPickPipeline(unittest.TestCase):
             stderr=subprocess.PIPE,
             universal_newlines=True,
         )
-        self.assertEqual(res.returncode, 0, f"Expected patch diff match between sha_x and sha_y: {res.stderr}")
+        self.assertEqual(res.returncode, 0, "Expected patch diff match between sha_x and sha_y: {0}".format(res.stderr))
 
     def test_subject_and_timestamp_match(self):
         """Validates Rank 3 subject & author timestamp match between Commit M and Commit S."""
@@ -378,7 +384,7 @@ class TestEndToEndCherryPickPipeline(unittest.TestCase):
             stderr=subprocess.PIPE,
             universal_newlines=True,
         )
-        self.assertEqual(res.returncode, 0, f"Expected Rank 3 match: {res.stderr}")
+        self.assertEqual(res.returncode, 0, "Expected Rank 3 match: {0}".format(res.stderr))
 
         # Filter excluding type 3 (-t 2) should fail to match
         res_filtered = subprocess.run(
@@ -437,12 +443,12 @@ class TestEndToEndCherryPickPipeline(unittest.TestCase):
         lookup_tool = ALT_COMMITS_DIR / "alt-lookup"
         res = subprocess.run(
             [sys.executable, str(lookup_tool), "--db", self.db_path, self.sha_a, self.sha_b],
-            env={**self.git_env, "LINUX_GIT": self.repo_dir},
+            env=dict(self.git_env, LINUX_GIT=self.repo_dir),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
         )
-        self.assertEqual(res.returncode, 0, f"alt-lookup auto-rebuild failed: {res.stderr}")
+        self.assertEqual(res.returncode, 0, "alt-lookup auto-rebuild failed: {0}".format(res.stderr))
         self.assertEqual(res.stderr, "")
         self.assertEqual(alt_lib.get_db_algorithm_version(self.db_path), alt_lib.ALGORITHM_VERSION)
 

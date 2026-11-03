@@ -6,7 +6,7 @@ import sqlite3
 import subprocess
 import sys
 from enum import IntEnum
-from typing import Dict, Optional, Set, TextIO, Tuple
+from typing import Dict, Optional, Set, TextIO, Tuple, Union
 
 DB_NAME = "alt-commits.db"
 IGNORED_NAME = "alt-commits-ignored.txt"
@@ -26,7 +26,7 @@ DETECTION_LABELS: Dict[int, str] = {
 }
 
 
-def format_size(size_bytes: int | float) -> str:
+def format_size(size_bytes: Union[int, float]) -> str:
     """Formats file size into human-readable units."""
     bytes_val = float(size_bytes)
     for unit in ["B", "KB", "MB", "GB"]:
