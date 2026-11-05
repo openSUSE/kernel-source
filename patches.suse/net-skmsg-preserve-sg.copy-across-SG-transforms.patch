@@ -1,0 +1,168 @@
+From: Yiming Qian <yimingqian591@gmail.com>
+Date: Wed, 10 Jun 2026 06:21:36 +0000
+Subject: net: skmsg: preserve sg.copy across SG transforms
+Patch-mainline: v7.2-rc1
+Git-commit: 406e8a651a7b854c41fecd5117bb282b3a6c2c6b
+References: CVE-2026-63830 bsc#1272178
+
+The sk_msg sg.copy bitmap is part of the scatterlist entry ownership
+state. A set bit tells sk_msg_compute_data_pointers() not to expose the
+entry through writable BPF ctx->data. This protects entries backed by
+pages that are not private to the sk_msg, such as splice-backed file
+page-cache pages.
+
+Several sk_msg transform paths move, copy, split, or compact
+msg->sg.data[] entries without moving the matching sg.copy bit. This can
+make an externally backed entry arrive at a new slot with a clear copy
+bit. A later SK_MSG verdict can then expose sg_virt(sge) as writable
+ctx->data and BPF stores can modify the original page cache.
+
+Keep sg.copy synchronized with sg.data[] whenever entries are
+transferred, shifted, split, or copied into a new sk_msg. Clear the bit
+when an entry is replaced by a newly allocated private page or freed.
+This covers the BPF pull/push/pop helpers, sk_msg_shift_left/right(),
+sk_msg_xfer(), and tls_split_open_record(), including the partial tail
+entry created during TLS open-record splitting.
+
+Fixes: d3b18ad31f93 ("tls: add bpf support to sk_msg handling")
+Cc: stable@vger.kernel.org
+Reported-by: Yiming Qian <yimingqian591@gmail.com>
+Reported-by: Keenan Dong <keenanat2000@gmail.com>
+Signed-off-by: Yiming Qian <yimingqian591@gmail.com>
+Link: https://patch.msgid.link/20260610062137.49075-1-yimingqian591@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[ SLE12-SP5 adaptation:
+  - sg.copy is still a bool copy[MAX_MSG_FRAGS] array here (the bitmap
+    conversion is not backported), so __assign_bit()/__clear_bit()/
+    test_bit() on sg.copy become plain array assignments/reads, and the
+    linux/bitops.h include and sk_msg_sg_copy() __assign_bit() cleanup
+    are dropped. sk_msg_sg_copy_assign() is kept with array semantics so
+    that call sites match upstream.
+  - sk_msg_xfer() here does not account sg.size; only the copy-flag
+    lines are added.
+  - bpf_msg_push_data(), bpf_msg_pop_data() and sk_msg_shift_left/right()
+    do not exist in this tree, so those hunks are dropped. ]
+Signed-off-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/linux/skmsg.h | 9 +++++++++
+ net/core/filter.c     | 4 ++++
+ net/core/skmsg.c      | 2 ++
+ net/tls/tls_sw.c      | 4 ++++
+ 4 files changed, 19 insertions(+)
+
+diff --git a/include/linux/skmsg.h b/include/linux/skmsg.h
+index d81628d46..915880c43 100644
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@ -175,9 +175,12 @@ static inline void sk_msg_xfer(struct sk_msg *dst, struct sk_msg *src,
+ 			       int which, u32 size)
+ {
+ 	dst->sg.data[which] = src->sg.data[which];
++	dst->sg.copy[which] = src->sg.copy[which];
+ 	dst->sg.data[which].length  = size;
+ 	src->sg.data[which].length -= size;
+ 	src->sg.data[which].offset += size;
++	if (!src->sg.data[which].length)
++		src->sg.copy[which] = false;
+ }
+ 
+ static inline void sk_msg_xfer_full(struct sk_msg *dst, struct sk_msg *src)
+@@ -251,6 +254,12 @@ static inline void sk_msg_sg_copy(struct sk_msg *msg, u32 i, bool copy_state)
+ 	} while (1);
+ }
+ 
++static inline void sk_msg_sg_copy_assign(struct sk_msg *dst, u32 dst_i,
++					 const struct sk_msg *src, u32 src_i)
++{
++	dst->sg.copy[dst_i] = src->sg.copy[src_i];
++}
++
+ static inline void sk_msg_sg_copy_set(struct sk_msg *msg, u32 start)
+ {
+ 	sk_msg_sg_copy(msg, start, true);
+diff --git a/net/core/filter.c b/net/core/filter.c
+index d1d1e21e4..b61c34c14 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -2243,11 +2243,13 @@ BPF_CALL_4(bpf_msg_pull_data, struct sk_msg *, msg, u32, start,
+ 		poffset += len;
+ 		sge->length = 0;
+ 		put_page(sg_page(sge));
++		msg->sg.copy[i] = false;
+ 
+ 		sk_msg_iter_var_next(i);
+ 	} while (i != last_sge);
+ 
+ 	sg_set_page(&msg->sg.data[first_sge], page, copy, 0);
++	msg->sg.copy[first_sge] = false;
+ 
+ 	/* To repair sg ring we need to shift entries. If we only
+ 	 * had a single entry though we can just replace it and
+@@ -2273,9 +2275,11 @@ BPF_CALL_4(bpf_msg_pull_data, struct sk_msg *, msg, u32, start,
+ 			break;
+ 
+ 		msg->sg.data[i] = msg->sg.data[move_from];
++		sk_msg_sg_copy_assign(msg, i, msg, move_from);
+ 		msg->sg.data[move_from].length = 0;
+ 		msg->sg.data[move_from].page_link = 0;
+ 		msg->sg.data[move_from].offset = 0;
++		msg->sg.copy[move_from] = false;
+ 		sk_msg_iter_var_next(i);
+ 	} while (1);
+ 
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 942b4d4ac..581664d22 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -64,6 +64,7 @@ int sk_msg_alloc(struct sock *sk, struct sk_msg *msg, int len,
+ 			sge = &msg->sg.data[msg->sg.end];
+ 			sg_unmark_end(sge);
+ 			sg_set_page(sge, pfrag->page, use, orig_offset);
++			msg->sg.copy[msg->sg.end] = false;
+ 			get_page(pfrag->page);
+ 			sk_msg_iter_next(msg, end);
+ 		}
+@@ -173,6 +174,7 @@ static int sk_msg_free_elem(struct sock *sk, struct sk_msg *msg, u32 i,
+ 		sk_mem_uncharge(sk, len);
+ 	if (!msg->skb)
+ 		put_page(sg_page(sge));
++	msg->sg.copy[i] = false;
+ 	memset(sge, 0, sizeof(*sge));
+ 	return len;
+ }
+diff --git a/net/tls/tls_sw.c b/net/tls/tls_sw.c
+index d9d63ed11..50ac50f56 100644
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -497,6 +497,7 @@ static int tls_split_open_record(struct sock *sk, struct tls_rec *from,
+ 	struct scatterlist *sge, *osge, *nsge;
+ 	u32 orig_size = msg_opl->sg.size;
+ 	struct scatterlist tmp = { };
++	u32 tmp_i = 0;
+ 	struct sk_msg *msg_npl;
+ 	struct tls_rec *new;
+ 	int ret;
+@@ -518,6 +519,7 @@ static int tls_split_open_record(struct sock *sk, struct tls_rec *from,
+ 		if (sge->length > apply) {
+ 			u32 len = sge->length - apply;
+ 
++			tmp_i = i;
+ 			get_page(sg_page(sge));
+ 			sg_set_page(&tmp, sg_page(sge), len,
+ 				    sge->offset + apply);
+@@ -549,6 +551,7 @@ static int tls_split_open_record(struct sock *sk, struct tls_rec *from,
+ 	nsge = sk_msg_elem(msg_npl, j);
+ 	if (tmp.length) {
+ 		memcpy(nsge, &tmp, sizeof(*nsge));
++		sk_msg_sg_copy_assign(msg_npl, j, msg_opl, tmp_i);
+ 		sk_msg_iter_var_next(j);
+ 		nsge = sk_msg_elem(msg_npl, j);
+ 	}
+@@ -556,6 +559,7 @@ static int tls_split_open_record(struct sock *sk, struct tls_rec *from,
+ 	osge = sk_msg_elem(msg_opl, i);
+ 	while (osge->length) {
+ 		memcpy(nsge, osge, sizeof(*nsge));
++		sk_msg_sg_copy_assign(msg_npl, j, msg_opl, i);
+ 		sg_unmark_end(nsge);
+ 		sk_msg_iter_var_next(i);
+ 		sk_msg_iter_var_next(j);
