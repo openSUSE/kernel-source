@@ -1,0 +1,129 @@
+From: Ryosuke Yasuoka <ryasuoka@redhat.com>
+Date: Mon, 1 Jun 2026 16:53:15 +0900
+Subject: [PATCH] drm/virtio: abort virtqueue wait on device removal to avoid
+ hung task
+References: bsc#1258210
+Patch-mainline: 6.18.61
+Git-commit: a46991b334f663fa0e0e9c051e50587ef977ac8b
+
+[ Upstream commit a46991b334f663fa0e0e9c051e50587ef977ac8b ]
+
+virtio_gpu_queue_ctrl_sgs() and virtio_gpu_queue_cursor() use
+wait_event() without any abort condition when waiting for virtqueue
+space. If the host device stops processing commands, these waits block
+indefinitely inside a drm_dev_enter/exit() critical section. Since
+drm_dev_unplug(), which is called in device removal and system shutdown
+call path, blocks on synchronize_srcu() until all critical sections
+complete, device removal and system shutdown also hang.
+
+Add a vqs_released flag to virtio_gpu_device and include it in the
+wait_event() condition. Set the flag and wake up both queues in a new
+virtio_gpu_release_vqs() helper, called before drm_dev_unplug() in both
+virtio_gpu_remove() and virtio_gpu_shutdown(). When the flag is set, the
+wait returns immediately and the command is aborted, following the same
+cleanup path as drm_dev_enter() failure.
+
+Signed-off-by: Ryosuke Yasuoka <ryasuoka@redhat.com>
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Link: https://patch.msgid.link/20260601-virtio-gpu_wait_event-v3-1-89530517a98a@redhat.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/gpu/drm/virtio/virtgpu_drv.c | 15 +++++++++++++++
+ drivers/gpu/drm/virtio/virtgpu_drv.h |  1 +
+ drivers/gpu/drm/virtio/virtgpu_vq.c  | 23 +++++++++++++++++++++--
+ 3 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.c b/drivers/gpu/drm/virtio/virtgpu_drv.c
+index d9556e1b67b1..78cc388b434d 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.c
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.c
+@@ -118,10 +118,24 @@ static int virtio_gpu_probe(struct virtio_device *vdev)
+ 	return ret;
+ }
+ 
++/*
++ * Release pending virtqueue waits so the drm_dev_enter/exit() critical
++ * sections complete before drm_dev_unplug() blocks on synchronize_srcu().
++ */
++static void virtio_gpu_release_vqs(struct drm_device *dev)
++{
++	struct virtio_gpu_device *vgdev = dev->dev_private;
++
++	vgdev->vqs_released = true;
++	wake_up_all(&vgdev->ctrlq.ack_queue);
++	wake_up_all(&vgdev->cursorq.ack_queue);
++}
++
+ static void virtio_gpu_remove(struct virtio_device *vdev)
+ {
+ 	struct drm_device *dev = vdev->priv;
+ 
++	virtio_gpu_release_vqs(dev);
+ 	drm_dev_unplug(dev);
+ 
+ 	if (drm_core_check_feature(dev, DRIVER_ATOMIC))
+@@ -135,6 +149,7 @@ static void virtio_gpu_shutdown(struct virtio_device *vdev)
+ {
+ 	struct drm_device *dev = vdev->priv;
+ 
++	virtio_gpu_release_vqs(dev);
+ 	/* stop talking to the device */
+ 	drm_dev_unplug(dev);
+ }
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
+index 8575c7787fc3..51b78f8a8aa2 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -260,6 +260,7 @@ struct virtio_gpu_device {
+ 
+ 	struct virtio_gpu_queue ctrlq;
+ 	struct virtio_gpu_queue cursorq;
++	bool vqs_released;
+ 	struct kmem_cache *vbufs;
+ 
+ 	atomic_t pending_commands;
+diff --git a/drivers/gpu/drm/virtio/virtgpu_vq.c b/drivers/gpu/drm/virtio/virtgpu_vq.c
+index 592ad4f9b100..244a791ab915 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_vq.c
++++ b/drivers/gpu/drm/virtio/virtgpu_vq.c
+@@ -422,7 +422,19 @@ static int virtio_gpu_queue_ctrl_sgs(struct virtio_gpu_device *vgdev,
+ 	if (vq->num_free < elemcnt) {
+ 		spin_unlock(&vgdev->ctrlq.qlock);
+ 		virtio_gpu_notify(vgdev);
+-		wait_event(vgdev->ctrlq.ack_queue, vq->num_free >= elemcnt);
++		wait_event(vgdev->ctrlq.ack_queue,
++			   vq->num_free >= elemcnt || vgdev->vqs_released);
++		/*
++		 * Set by virtio_gpu_release_vqs() to unblock
++		 * synchronize_srcu() wait in drm_dev_unplug().
++		 */
++		if (vgdev->vqs_released) {
++			if (fence && vbuf->objs)
++				virtio_gpu_array_unlock_resv(vbuf->objs);
++			free_vbuf(vgdev, vbuf);
++			drm_dev_exit(idx);
++			return -ENODEV;
++		}
+ 		goto again;
+ 	}
+ 
+@@ -592,7 +604,14 @@ static void virtio_gpu_queue_cursor(struct virtio_gpu_device *vgdev,
+ 	ret = virtqueue_add_sgs(vq, sgs, outcnt, 0, vbuf, GFP_ATOMIC);
+ 	if (ret == -ENOSPC) {
+ 		spin_unlock(&vgdev->cursorq.qlock);
+-		wait_event(vgdev->cursorq.ack_queue, vq->num_free >= outcnt);
++		wait_event(vgdev->cursorq.ack_queue,
++			   vq->num_free >= outcnt || vgdev->vqs_released);
++		/* See comment in virtio_gpu_queue_ctrl_sgs(). */
++		if (vgdev->vqs_released) {
++			free_vbuf(vgdev, vbuf);
++			drm_dev_exit(idx);
++			return;
++		}
+ 		spin_lock(&vgdev->cursorq.qlock);
+ 		goto retry;
+ 	} else {
+-- 
+2.56.0
+

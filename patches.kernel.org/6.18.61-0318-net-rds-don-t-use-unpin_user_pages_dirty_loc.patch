@@ -1,0 +1,247 @@
+From: Allison Henderson <achender@kernel.org>
+Date: Wed, 29 Jul 2026 21:16:26 -0700
+Subject: [PATCH] net/rds: don't use unpin_user_pages_dirty_lock() from atomic
+ context
+References: bsc#1258210
+Patch-mainline: 6.18.61
+Git-commit: d100966325f782aa7775e5f0e8fb04f66f56308e
+
+[ Upstream commit d100966325f782aa7775e5f0e8fb04f66f56308e ]
+
+rds_rdma_free_op() and rds_atomic_free_op() are reached from the IB
+send completion path via
+
+  rds_ib_tasklet_fn_send()
+    rds_ib_send_cqe_handler()
+      rds_message_put()
+        rds_message_purge()
+          rds_rdma_free_op() / rds_atomic_free_op()
+
+which runs in tasklet (softirq) context.  Both functions unpin the
+user pages of the op with unpin_user_pages_dirty_lock(), which uses
+set_page_dirty_lock() and thus may take the folio lock and sleep.
+Sleeping in softirq context is not allowed and can deadlock or crash.
+
+Dirtying the pages with the non-sleeping set_page_dirty() instead
+would just trade one bug for another, as pointed out during review:
+the pinned range can be file-backed.  rds_pin_pages() pins with
+FOLL_LONGTERM, which refuses fs-dax but takes the page-cache pages
+of a MAP_SHARED file mapping just fine, and RDS does not restrict
+what memory the caller registers as an RDMA destination.
+
+For a file-backed page, set_page_dirty() from a tasklet can take
+non-irq-safe filesystem locks (e.g. mapping->i_private_lock and
+inode->i_lock in block_dirty_folio()) and deadlock against the task
+it interrupted.  Without the folio lock, it races with truncation
+clearing folio->mapping, which is the race set_page_dirty_lock()
+exists to close.  The pre-pin_user_pages() version of this code
+dirtied pages that way from the tasklet, so that bug is older than
+the sleeping unpin.
+
+The page dirtying therefore has to move to process context, not
+merely avoid the folio lock.  When the final rds_message_put() runs
+in atomic context, rds_rdma_free_op() and rds_atomic_free_op() now
+leave the op's pages pinned and flag the op. Later, rds_message_put()
+hands the message to a work item that unpins the flagged ops' pages
+and frees the message from process context. Here,
+unpin_user_pages_dirty_lock() is safe outside the atomic context.
+Everything else keeps running in the caller's context exactly as
+before: the rest of the purge - the zerocopy completion, the socket
+put and the MR reference drops - as well as RDMA writes, whose pages
+the remote side only reads and which unpin without dirtying,
+everything on rds_tcp, and final puts that already happen in process
+context (socket close, connection teardown).
+
+Deferring only the unpin means the work item touches nothing but the
+pinned pages and the rds module's own memory: it cannot call back
+into a transport module, so it changes nothing about the transports'
+shutdown and unload ordering.  rds_exit() drains any pending unpin
+work via destroy_workqueue(rds_wq) before the module goes away.
+
+The Oracle UEK kernel avoids the sleeping unpin by calling
+set_page_dirty() directly from the tasklet, which is subject to the
+file-backed page problem above, so this deliberately does not follow
+UEK here.
+
+Signed-off-by: Allison Henderson <achender@kernel.org>
+Link: https://patch.msgid.link/20260730041629.3512480-2-achender@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ net/rds/message.c | 26 +++++++++++++++++++++++++
+ net/rds/rdma.c    | 49 ++++++++++++++++++++++++++++++++++++-----------
+ net/rds/rds.h     | 10 ++++++++++
+ 3 files changed, 74 insertions(+), 11 deletions(-)
+
+diff --git a/net/rds/message.c b/net/rds/message.c
+index 19202aa33f6f..bdd340f4cce6 100644
+--- a/net/rds/message.c
++++ b/net/rds/message.c
+@@ -180,6 +180,19 @@ static void rds_message_purge(struct rds_message *rm)
+ 		kref_put(&rm->atomic.op_rdma_mr->r_kref, __rds_put_mr_final);
+ }
+ 
++static void rds_message_unpin_worker(struct work_struct *work)
++{
++	struct rds_message *rm = container_of(work, struct rds_message,
++					      m_unpin_work);
++
++	if (rm->rdma.op_unpin_deferred)
++		rds_rdma_op_unpin_pages(&rm->rdma);
++	if (rm->atomic.op_unpin_deferred)
++		rds_atomic_op_unpin_page(&rm->atomic);
++
++	kfree(rm);
++}
++
+ void rds_message_put(struct rds_message *rm)
+ {
+ 	rdsdebug("put rm %p ref %d\n", rm, refcount_read(&rm->m_refcount));
+@@ -187,8 +200,21 @@ void rds_message_put(struct rds_message *rm)
+ 	if (refcount_dec_and_test(&rm->m_refcount)) {
+ 		BUG_ON(!list_empty(&rm->m_sock_item));
+ 		BUG_ON(!list_empty(&rm->m_conn_item));
++
+ 		rds_message_purge(rm);
+ 
++		/* A final put in atomic context cannot dirty the ops'
++		 * user pages on unpin, so rds_rdma_free_op() and
++		 * rds_atomic_free_op() deferred it.  Finish the unpin,
++		 * and the free, from process context.
++		 */
++		if (rm->rdma.op_unpin_deferred ||
++		    rm->atomic.op_unpin_deferred) {
++			INIT_WORK(&rm->m_unpin_work, rds_message_unpin_worker);
++			queue_work(rds_wq, &rm->m_unpin_work);
++			return;
++		}
++
+ 		kfree(rm);
+ 	}
+ }
+diff --git a/net/rds/rdma.c b/net/rds/rdma.c
+index 34d9333e4229..37695056756b 100644
+--- a/net/rds/rdma.c
++++ b/net/rds/rdma.c
+@@ -483,22 +483,36 @@ void rds_rdma_unuse(struct rds_sock *rs, u32 r_key, int force)
+ 		kref_put(&mr->r_kref, __rds_put_mr_final);
+ }
+ 
+-void rds_rdma_free_op(struct rm_rdma_op *ro)
++void rds_rdma_op_unpin_pages(struct rm_rdma_op *ro)
+ {
+ 	unsigned int i;
+ 
++	for (i = 0; i < ro->op_nents; i++) {
++		struct page *page = sg_page(&ro->op_sg[i]);
++
++		/* Mark page dirty if it was possibly modified, which
++		 * is the case for a RDMA_READ which copies from remote
++		 * to local memory
++		 */
++		unpin_user_pages_dirty_lock(&page, 1, !ro->op_write);
++	}
++}
++
++void rds_rdma_free_op(struct rm_rdma_op *ro)
++{
+ 	if (ro->op_odp_mr) {
+ 		kref_put(&ro->op_odp_mr->r_kref, __rds_put_mr_final);
++	} else if (in_task() || ro->op_write) {
++		/* An RDMA write's pages are only read by the remote
++		 * side; unpinning without dirtying does not sleep.
++		 */
++		rds_rdma_op_unpin_pages(ro);
+ 	} else {
+-		for (i = 0; i < ro->op_nents; i++) {
+-			struct page *page = sg_page(&ro->op_sg[i]);
+-
+-			/* Mark page dirty if it was possibly modified, which
+-			 * is the case for a RDMA_READ which copies from remote
+-			 * to local memory
+-			 */
+-			unpin_user_pages_dirty_lock(&page, 1, !ro->op_write);
+-		}
++		/* Dirtying the pages on unpin can sleep; leave them
++		 * pinned and have rds_message_put() finish the unpin
++		 * from process context.
++		 */
++		ro->op_unpin_deferred = 1;
+ 	}
+ 
+ 	kfree(ro->op_notifier);
+@@ -507,7 +521,7 @@ void rds_rdma_free_op(struct rm_rdma_op *ro)
+ 	ro->op_odp_mr = NULL;
+ }
+ 
+-void rds_atomic_free_op(struct rm_atomic_op *ao)
++void rds_atomic_op_unpin_page(struct rm_atomic_op *ao)
+ {
+ 	struct page *page = sg_page(ao->op_sg);
+ 
+@@ -515,6 +529,19 @@ void rds_atomic_free_op(struct rm_atomic_op *ao)
+ 	 * is the case for a RDMA_READ which copies from remote
+ 	 * to local memory */
+ 	unpin_user_pages_dirty_lock(&page, 1, true);
++}
++
++void rds_atomic_free_op(struct rm_atomic_op *ao)
++{
++	if (in_task()) {
++		rds_atomic_op_unpin_page(ao);
++	} else {
++		/* Dirtying the page on unpin can sleep; leave it
++		 * pinned and have rds_message_put() finish the unpin
++		 * from process context.
++		 */
++		ao->op_unpin_deferred = 1;
++	}
+ 
+ 	kfree(ao->op_notifier);
+ 	ao->op_notifier = NULL;
+diff --git a/net/rds/rds.h b/net/rds/rds.h
+index a029e5fcdea7..a4816da16293 100644
+--- a/net/rds/rds.h
++++ b/net/rds/rds.h
+@@ -424,6 +424,12 @@ struct rds_message {
+ 
+ 	void			*m_final_op;
+ 
++	/* Unpins the ops' user pages and frees the message from
++	 * process context when the final put happens in atomic
++	 * context: dirtying the pages on unpin can sleep.
++	 */
++	struct work_struct	m_unpin_work;
++
+ 	struct {
+ 		struct rm_atomic_op {
+ 			int			op_type;
+@@ -447,6 +453,7 @@ struct rds_message {
+ 			unsigned int		op_mapped:1;
+ 			unsigned int		op_silent:1;
+ 			unsigned int		op_active:1;
++			unsigned int		op_unpin_deferred:1;
+ 			struct scatterlist	*op_sg;
+ 			struct rds_notifier	*op_notifier;
+ 
+@@ -462,6 +469,7 @@ struct rds_message {
+ 			unsigned int		op_mapped:1;
+ 			unsigned int		op_silent:1;
+ 			unsigned int		op_active:1;
++			unsigned int		op_unpin_deferred:1;
+ 			unsigned int		op_bytes;
+ 			unsigned int		op_nents;
+ 			unsigned int		op_count;
+@@ -938,6 +946,8 @@ int rds_cmsg_rdma_map(struct rds_sock *rs, struct rds_message *rm,
+ 			  struct cmsghdr *cmsg);
+ void rds_rdma_free_op(struct rm_rdma_op *ro);
+ void rds_atomic_free_op(struct rm_atomic_op *ao);
++void rds_rdma_op_unpin_pages(struct rm_rdma_op *ro);
++void rds_atomic_op_unpin_page(struct rm_atomic_op *ao);
+ void rds_rdma_send_complete(struct rds_message *rm, int wc_status);
+ void rds_atomic_send_complete(struct rds_message *rm, int wc_status);
+ int rds_cmsg_atomic(struct rds_sock *rs, struct rds_message *rm,
+-- 
+2.56.0
+

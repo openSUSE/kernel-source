@@ -1,0 +1,148 @@
+From: Felix Fietkau <nbd@nbd.name>
+Date: Sat, 1 Aug 2026 14:53:29 +0000
+Subject: [PATCH] wifi: mt76: mt7603: fix U-APSD service period termination
+References: bsc#1258210
+Patch-mainline: 6.18.61
+Git-commit: 697badc27a9b3b2a8d86092abeed767714f735a2
+
+[ Upstream commit 697badc27a9b3b2a8d86092abeed767714f735a2 ]
+
+Frames released from the driver PS queue were all tagged with MORE_DATA
+and none of them ever carried the EOSP bit, so from the client's point of
+view a U-APSD service period was started but never finished. Clients that
+keep their receiver on until EOSP arrives stop sending trigger frames,
+and all downlink traffic for that station stalls until they give up.
+ieee80211_sta_eosp() only cleared the service period state inside
+mac80211, which is why the mismatch went unnoticed.
+
+Assign MORE_DATA per frame and set the wire EOSP bit on the last one. If
+the last released frame is a bufferable MMPDU it has no QoS control field
+to carry EOSP, so let mac80211 append a QoS-Null frame instead.
+
+Also stop handing the remaining frame budget to
+mt76_release_buffered_frames() once frames have been released from the PS
+queue: both would signal the end of the same service period. Releasing
+fewer frames than requested is allowed, and MORE_DATA tells the client to
+trigger again.
+
+Link: https://patch.msgid.link/20260801145334.1166751-5-nbd@nbd.name
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ .../net/wireless/mediatek/mt76/mt7603/main.c  | 74 ++++++++++++++++---
+ 1 file changed, 63 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7603/main.c b/drivers/net/wireless/mediatek/mt76/mt7603/main.c
+index 0d7c84941cd0..f8a43d9f72f9 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7603/main.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7603/main.c
+@@ -423,13 +423,33 @@ mt7603_sta_ps(struct mt76_dev *mdev, struct ieee80211_sta *sta, bool ps)
+ 	mt7603_ps_tx_list(dev, &list);
+ }
+ 
++static struct ieee80211_hdr *
++mt7603_ps_skb_hdr(struct sk_buff *skb)
++{
++	return (struct ieee80211_hdr *)&skb->data[MT_TXD_SIZE];
++}
++
++/*
++ * Buffered frames can be recycled into the PS queue by mt7603_filter_tx(), so
++ * both bits have to be assigned, not just set.
++ */
+ static void
+-mt7603_ps_set_more_data(struct sk_buff *skb)
++mt7603_ps_set_flags(struct sk_buff *skb, bool more_data, bool eosp)
+ {
+-	struct ieee80211_hdr *hdr;
++	struct ieee80211_hdr *hdr = mt7603_ps_skb_hdr(skb);
++
++	if (more_data)
++		hdr->frame_control |= cpu_to_le16(IEEE80211_FCTL_MOREDATA);
++	else
++		hdr->frame_control &= ~cpu_to_le16(IEEE80211_FCTL_MOREDATA);
++
++	if (!ieee80211_is_data_qos(hdr->frame_control))
++		return;
+ 
+-	hdr = (struct ieee80211_hdr *)&skb->data[MT_TXD_SIZE];
+-	hdr->frame_control |= cpu_to_le16(IEEE80211_FCTL_MOREDATA);
++	if (eosp)
++		*ieee80211_get_qos_ctl(hdr) |= IEEE80211_QOS_CTL_EOSP;
++	else
++		*ieee80211_get_qos_ctl(hdr) &= ~IEEE80211_QOS_CTL_EOSP;
+ }
+ 
+ static void
+@@ -442,7 +462,10 @@ mt7603_release_buffered_frames(struct ieee80211_hw *hw,
+ 	struct mt7603_dev *dev = hw->priv;
+ 	struct mt7603_sta *msta = (struct mt7603_sta *)sta->drv_priv;
+ 	struct sk_buff_head list;
+-	struct sk_buff *skb, *tmp;
++	struct sk_buff *skb, *tmp, *last;
++	bool eosp_null, uapsd;
++	u16 pending = 0;
++	u8 last_tid;
+ 
+ 	__skb_queue_head_init(&list);
+ 
+@@ -458,20 +481,49 @@ mt7603_release_buffered_frames(struct ieee80211_hw *hw,
+ 
+ 		skb_set_queue_mapping(skb, MT_TXQ_PSD);
+ 		__skb_unlink(skb, &msta->psq);
+-		mt7603_ps_set_more_data(skb);
+ 		__skb_queue_tail(&list, skb);
+ 		nframes--;
+ 	}
++
++	skb_queue_walk(&msta->psq, skb)
++		pending |= BIT(skb->priority);
+ 	spin_unlock_bh(&dev->ps_lock);
+ 
+-	if (!skb_queue_empty(&list))
+-		ieee80211_sta_eosp(sta);
++	last = skb_peek_tail(&list);
++	if (!last) {
++		mt76_release_buffered_frames(hw, sta, tids, nframes, reason,
++					     more_data);
++		return;
++	}
++
++	/*
++	 * End the service period here instead of passing the remaining frame
++	 * budget on to mt76_release_buffered_frames(), which would signal the
++	 * end of the same service period a second time.
++	 */
++	uapsd = reason == IEEE80211_FRAME_RELEASE_UAPSD;
++	more_data |= !!(pending & tids);
++
++	skb_queue_walk(&list, skb)
++		mt7603_ps_set_flags(skb, skb != last || more_data,
++				    skb == last && uapsd);
++
++	/*
++	 * EOSP lives in the QoS control field, so a bufferable MMPDU cannot
++	 * terminate a U-APSD service period on its own. In that case mac80211
++	 * has to append a QoS-Null frame, which ends the SP through its tx
++	 * status.
++	 */
++	eosp_null = uapsd &&
++		    !ieee80211_is_data_qos(mt7603_ps_skb_hdr(last)->frame_control);
++	last_tid = __fls(tids);
+ 
+ 	mt7603_ps_tx_list(dev, &list);
+ 
+-	if (nframes)
+-		mt76_release_buffered_frames(hw, sta, tids, nframes, reason,
+-					     more_data);
++	if (eosp_null)
++		ieee80211_send_eosp_nullfunc(sta, last_tid);
++	else
++		ieee80211_sta_eosp(sta);
+ }
+ 
+ static int
+-- 
+2.56.0
+

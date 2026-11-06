@@ -1,0 +1,200 @@
+From: Harald Freudenberger <freude@linux.ibm.com>
+Date: Mon, 31 Aug 2026 10:38:32 +0200
+Subject: [PATCH] s390/crypto: Fix use of mutex in atomic context in PAES
+References: bsc#1258210
+Patch-mainline: 6.18.61
+Git-commit: 749990db95d45cc3d96aab999ac7f110259b200c
+
+[ Upstream commit 749990db95d45cc3d96aab999ac7f110259b200c ]
+
+The PAES CTR implementation used a mutex to lock one page of exclusive
+memory for fast CTR processing. Unfortunately a mutex is not save to
+use in atomic or interrupt context. So use a binary semaphore instead
+which is save to use in such environments.
+
+Furthermore rework the code to get rid of conditional locking. So
+restructure the PAES CRT code by extracting the main loop into a
+separate function and just give in information about the (locked) page
+can be used or not (is not locked).
+
+Fixes: 6cd87cb5ef6c ("s390/crypto: Rework protected key AES for true asynch support")
+Signed-off-by: Harald Freudenberger <freude@linux.ibm.com>
+Reviewed-by: Holger Dengler <dengler@linux.ibm.com>
+Cc: stable@vger.kernel.org # 6.16+
+Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+[ sashal: Dropped the tested parameter from __ctr_paes_do_crypt(), its callers and the paes_convert_key() calls, since this tree's API lacks it. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ arch/s390/crypto/paes_s390.c | 107 +++++++++++++++++++----------------
+ 1 file changed, 57 insertions(+), 50 deletions(-)
+
+diff --git a/arch/s390/crypto/paes_s390.c b/arch/s390/crypto/paes_s390.c
+index 02bcac750a72..5198a99ec30e 100644
+--- a/arch/s390/crypto/paes_s390.c
++++ b/arch/s390/crypto/paes_s390.c
+@@ -20,7 +20,7 @@
+ #include <linux/init.h>
+ #include <linux/miscdevice.h>
+ #include <linux/module.h>
+-#include <linux/mutex.h>
++#include <linux/semaphore.h>
+ #include <linux/spinlock.h>
+ #include <crypto/aes.h>
+ #include <crypto/algapi.h>
+@@ -42,7 +42,7 @@
+ #define PXTS_256_PROTKEY_SIZE	(32 + 32 + 32)	/* k1 + k2 + verification pattern */
+ 
+ static u8 *ctrblk;
+-static DEFINE_MUTEX(ctrblk_lock);
++static DEFINE_SEMAPHORE(ctrblk_sem, 1);
+ 
+ static cpacf_mask_t km_functions, kmc_functions, kmctr_functions;
+ 
+@@ -911,41 +911,14 @@ static inline unsigned int __ctrblk_init(u8 *ctrptr, u8 *iv, unsigned int nbytes
+ 	return n;
+ }
+ 
+-static int ctr_paes_do_crypt(struct s390_paes_ctx *ctx,
+-			     struct s390_pctr_req_ctx *req_ctx,
+-			     bool maysleep)
++static int __ctr_paes_do_crypt(struct s390_paes_ctx *ctx,
++			       struct ctr_param *param,
++			       struct skcipher_walk *walk,
++			       bool maysleep, bool locked)
+ {
+-	struct ctr_param *param = &req_ctx->param;
+-	struct skcipher_walk *walk = &req_ctx->walk;
+-	u8 buf[AES_BLOCK_SIZE], *ctrptr;
+ 	unsigned int nbytes, n, k;
+-	int pk_state, locked, rc = 0;
+-
+-	if (!req_ctx->param_init_done) {
+-		/* fetch and check protected key state */
+-		spin_lock_bh(&ctx->pk_lock);
+-		pk_state = ctx->pk_state;
+-		switch (pk_state) {
+-		case PK_STATE_NO_KEY:
+-			rc = -ENOKEY;
+-			break;
+-		case PK_STATE_CONVERT_IN_PROGRESS:
+-			rc = -EKEYEXPIRED;
+-			break;
+-		case PK_STATE_VALID:
+-			memcpy(param->key, ctx->pk.protkey, sizeof(param->key));
+-			req_ctx->param_init_done = true;
+-			break;
+-		default:
+-			rc = pk_state < 0 ? pk_state : -EIO;
+-			break;
+-		}
+-		spin_unlock_bh(&ctx->pk_lock);
+-	}
+-	if (rc)
+-		goto out;
+-
+-	locked = mutex_trylock(&ctrblk_lock);
++	u8 *ctrptr;
++	int rc = 0;
+ 
+ 	/*
+ 	 * Note that in case of partial processing or failure the walk
+@@ -965,37 +938,71 @@ static int ctr_paes_do_crypt(struct s390_paes_ctx *ctx,
+ 				       AES_BLOCK_SIZE);
+ 			crypto_inc(walk->iv, AES_BLOCK_SIZE);
+ 			rc = skcipher_walk_done(walk, nbytes - k);
+-			if (rc) {
+-				if (locked)
+-					mutex_unlock(&ctrblk_lock);
++			if (rc)
+ 				goto out;
+-			}
+ 		}
+ 		if (k < n) {
+ 			if (!maysleep) {
+-				if (locked)
+-					mutex_unlock(&ctrblk_lock);
+ 				rc = -EKEYEXPIRED;
+ 				goto out;
+ 			}
+ 			rc = paes_convert_key(ctx);
+-			if (rc) {
+-				if (locked)
+-					mutex_unlock(&ctrblk_lock);
++			if (rc)
+ 				goto out;
+-			}
+ 			spin_lock_bh(&ctx->pk_lock);
+ 			memcpy(param->key, ctx->pk.protkey, sizeof(param->key));
+ 			spin_unlock_bh(&ctx->pk_lock);
+ 		}
+ 	}
+-	if (locked)
+-		mutex_unlock(&ctrblk_lock);
++
++out:
++	return rc;
++}
++
++static int ctr_paes_do_crypt(struct s390_paes_ctx *ctx,
++			     struct s390_pctr_req_ctx *req_ctx,
++			     bool maysleep)
++{
++	struct ctr_param *param = &req_ctx->param;
++	struct skcipher_walk *walk = &req_ctx->walk;
++	u8 buf[AES_BLOCK_SIZE];
++	int pk_state, rc = 0;
++
++	if (!req_ctx->param_init_done) {
++		/* fetch and check protected key state */
++		spin_lock_bh(&ctx->pk_lock);
++		pk_state = ctx->pk_state;
++		switch (pk_state) {
++		case PK_STATE_NO_KEY:
++			rc = -ENOKEY;
++			break;
++		case PK_STATE_CONVERT_IN_PROGRESS:
++			rc = -EKEYEXPIRED;
++			break;
++		case PK_STATE_VALID:
++			memcpy(param->key, ctx->pk.protkey, sizeof(param->key));
++			req_ctx->param_init_done = true;
++			break;
++		default:
++			rc = pk_state < 0 ? pk_state : -EIO;
++			break;
++		}
++		spin_unlock_bh(&ctx->pk_lock);
++	}
++	if (rc)
++		goto out;
++
++	if (down_trylock(&ctrblk_sem) == 0) {
++		rc = __ctr_paes_do_crypt(ctx, param, walk, maysleep, true);
++		up(&ctrblk_sem);
++	} else {
++		rc = __ctr_paes_do_crypt(ctx, param, walk, maysleep, false);
++	}
+ 
+ 	/* final block may be < AES_BLOCK_SIZE, copy only nbytes */
+-	if (nbytes) {
++	if (!rc && walk->nbytes > 0) {
+ 		memset(buf, 0, AES_BLOCK_SIZE);
+-		memcpy(buf, walk->src.virt.addr, nbytes);
++		memcpy(buf, walk->src.virt.addr, walk->nbytes);
+ 		while (1) {
+ 			if (cpacf_kmctr(ctx->fc, param, buf,
+ 					buf, AES_BLOCK_SIZE,
+@@ -1012,7 +1019,7 @@ static int ctr_paes_do_crypt(struct s390_paes_ctx *ctx,
+ 			memcpy(param->key, ctx->pk.protkey, sizeof(param->key));
+ 			spin_unlock_bh(&ctx->pk_lock);
+ 		}
+-		memcpy(walk->dst.virt.addr, buf, nbytes);
++		memcpy(walk->dst.virt.addr, buf, walk->nbytes);
+ 		crypto_inc(walk->iv, AES_BLOCK_SIZE);
+ 		rc = skcipher_walk_done(walk, 0);
+ 	}
+-- 
+2.56.0
+

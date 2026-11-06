@@ -1,0 +1,142 @@
+From: Christian Brauner <brauner@kernel.org>
+Date: Fri, 9 Oct 2026 23:51:58 +0200
+Subject: [PATCH] ntfs3: free replaced mount options after a grace period
+References: bsc#1258210
+Patch-mainline: 6.18.61
+Git-commit: 56c3824de56b5275c02ff6b6aa27ddbacfbb9b25
+
+[ Upstream commit 56c3824de56b5275c02ff6b6aa27ddbacfbb9b25 ]
+
+ntfs_fs_reconfigure() replaces the old mount options with new mount
+options in sbi->options. The old mount options land in fs_context and
+are freed as soon as remount returns. With a pathwalk held up in
+ntfs_nls_to_utf16() between loading sbi->options and dereferencing it
+while a remount replaces them:
+
+  BUG: KASAN: slab-use-after-free in ntfs_nls_to_utf16+0x7ae/0x7c0
+  Read of size 8 at addr ff110001044fd448 by task walker/98
+  Call Trace:
+   <TASK>
+   ntfs_nls_to_utf16+0x7ae/0x7c0
+   ntfs_d_hash+0x22b/0x500
+   link_path_walk+0x11ad/0x1d30
+   path_lookupat+0x63/0xb00
+   filename_lookup+0x1f1/0x5b0
+   vfs_statx+0xd7/0x3b0
+  [...]
+  Allocated by task 95:
+   __kmalloc_node_track_caller_noprof+0x2a2/0x730
+   kmemdup_noprof+0x25/0x50
+   ntfs_fill_super+0x1e5/0x4550
+  [...]
+  Freed by task 97:
+   kfree+0x1db/0x5b0
+   put_fs_context+0x13c/0x7d0
+   path_mount+0x54a/0x2130
+   __x64_sys_mount+0x20c/0x270
+
+That info is needed in rcu lookup in the dentry hash and dentry compary
+methods for ntfs3 and causes a UAF today. Delay freeing with an rcu
+grace period.
+
+ntfs_nls_to_utf16() reads ->nls and ->ads once under rcu_read_lock() so
+the hooks pair with the release in ntfs_fs_reconfigure(). That also
+covers callers outside of rcu pathwalk such as ntfs_lookup(). They don't
+hold rcu_read_lock() themselves and wouldn't be protected by the grace
+period otherwise. Remount refuses to change the iocharset so ->nls stays
+valid after rcu_read_unlock().
+
+Fixes: a3a956c78efa ("fs/ntfs3: Add option "nocase"")
+Cc: stable@vger.kernel.org
+Link: https://patch.msgid.link/20261009-work-fixes-rcu-v1-8-7446d2d335e6@kernel.org
+Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+[ sashal: Dropped the ads snapshot and its later use in ntfs_nls_to_utf16() because the ADS option and delimiter code don't exist here, keeping only the RCU snapshot of nls. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/ntfs3/dir.c     |  9 ++++++++-
+ fs/ntfs3/ntfs_fs.h |  2 ++
+ fs/ntfs3/super.c   | 16 +++++++++++++++-
+ 3 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ntfs3/dir.c b/fs/ntfs3/dir.c
+index 6d588efaf9fd..9441a98feb5b 100644
+--- a/fs/ntfs3/dir.c
++++ b/fs/ntfs3/dir.c
+@@ -185,11 +185,18 @@ int ntfs_nls_to_utf16(struct ntfs_sb_info *sbi, const u8 *name, u32 name_len,
+ {
+ 	int ret, slen;
+ 	const u8 *end;
+-	struct nls_table *nls = sbi->options->nls;
++	struct ntfs_mount_options *opts;
++	struct nls_table *nls;
+ 	u16 *uname = uni->name;
+ 
+ 	static_assert(sizeof(wchar_t) == sizeof(u16));
+ 
++	/* ntfs_fs_reconfigure() may replace the options, but not ->nls */
++	rcu_read_lock();
++	opts = READ_ONCE(sbi->options);
++	nls = opts->nls;
++	rcu_read_unlock();
++
+ 	if (!nls) {
+ 		/* utf8 -> utf16 */
+ 		ret = _utf8s_to_utf16s(name, name_len, endian, uname, max_ulen);
+diff --git a/fs/ntfs3/ntfs_fs.h b/fs/ntfs3/ntfs_fs.h
+index 9cacca339705..f7ca4ea54e40 100644
+--- a/fs/ntfs3/ntfs_fs.h
++++ b/fs/ntfs3/ntfs_fs.h
+@@ -90,6 +90,8 @@ enum utf16_endian;
+ struct ntfs_mount_options {
+ 	char *nls_name;
+ 	struct nls_table *nls;
++	/* ->d_hash() and ->d_compare() read the options in rcu pathwalk */
++	struct rcu_head rcu;
+ 
+ 	kuid_t fs_uid;
+ 	kgid_t fs_gid;
+diff --git a/fs/ntfs3/super.c b/fs/ntfs3/super.c
+index 74f071ace3ad..8b37eb020411 100644
+--- a/fs/ntfs3/super.c
++++ b/fs/ntfs3/super.c
+@@ -249,6 +249,11 @@ static inline void put_mount_options(struct ntfs_mount_options *options)
+ 	kfree(options);
+ }
+ 
++static void put_mount_options_rcu(struct rcu_head *head)
++{
++	put_mount_options(container_of(head, struct ntfs_mount_options, rcu));
++}
++
+ enum Opt {
+ 	Opt_uid,
+ 	Opt_gid,
+@@ -413,6 +418,7 @@ static int ntfs_fs_reconfigure(struct fs_context *fc)
+ 	struct super_block *sb = fc->root->d_sb;
+ 	struct ntfs_sb_info *sbi = sb->s_fs_info;
+ 	struct ntfs_mount_options *new_opts = fc->fs_private;
++	struct ntfs_mount_options *old_opts;
+ 	int ro_rw;
+ 
+ 	/* If ntfs3 is used as legacy ntfs enforce read-only mode. */
+@@ -449,7 +455,15 @@ static int ntfs_fs_reconfigure(struct fs_context *fc)
+ 
+ out:
+ 	sync_filesystem(sb);
+-	swap(sbi->options, fc->fs_private);
++	old_opts = sbi->options;
++	/* pairs with the READ_ONCE() in ntfs_nls_to_utf16() */
++	smp_store_release(&sbi->options, new_opts);
++	fc->fs_private = NULL;
++	/*
++	 * ntfs_d_hash() and ntfs_d_compare() of a pathwalk in rcu mode may
++	 * still read the old options through the sbi.
++	 */
++	call_rcu(&old_opts->rcu, put_mount_options_rcu);
+ 
+ 	return 0;
+ }
+-- 
+2.56.0
+
