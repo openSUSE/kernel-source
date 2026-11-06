@@ -15,6 +15,11 @@
 # Please submit bugfixes or comments via https://bugs.opensuse.org/
 #
 
+%if 0%{?suse_version} > 1500
+%bcond_without libalternatives
+%else
+%bcond_with libalternatives
+%endif
 %{?sle15_python_module_pythons}
 Name:           python-obsapi
 Version:        0
@@ -40,6 +45,13 @@ Requires:       python-certifi
 Requires:       python-kutil
 Requires:       python-www-authenticate
 BuildArch:      noarch
+%if %{with libalternatives}
+BuildRequires:  alts
+Requires:       alts
+%else
+Requires(post): update-alternatives
+Requires(postun): update-alternatives
+%endif
 %python_subpackages
 
 %description
@@ -62,6 +74,9 @@ requires-python = '>=3.4'
 [project.urls]
 source = 'https://github.com/hramrach/kernel-source/tree/scripts'
 
+[project.scripts]
+bs-upload-kernel = 'obsapi.uploader:main'
+
 END
 
 %build
@@ -69,12 +84,24 @@ END
 
 %install
 %pyproject_install
+%python_clone -a %{buildroot}%{_bindir}/bs-upload-kernel
 %fdupes %{buildroot}%{python3_sitelib}
 
 %check
 %pytest -k api
 
+%if %{without libalternatives}
+
+%post
+%python_install_alternative bs-upload-kernel
+
+%postun
+%python_uninstall_alternative bs-upload-kernel
+
+%endif
+
 %files %{python_files}
+%python_alternative %{_bindir}/bs-upload-kernel
 %{python_sitelib}/obsapi
 %{python_sitelib}/obsapi-%{version}*-info
 
