@@ -690,7 +690,7 @@ class TestOBS(APITest):
         # permissions not stored exactly in git, ssh refuses to read 644 files
         key = os.path.join(self.tmpdir.name, 'testkey')
         shutil.copy('tests/api/testkey', key)
-        os.chmod(key, 0o400)
+        os.chmod(key, 0o600)
         shutil.copy('tests/api/testkey.pub', os.path.join(self.tmpdir.name, 'testkey.pub'))
         config = configparser.ConfigParser(delimiters=('='), interpolation=None)
         config.read(self.config)
