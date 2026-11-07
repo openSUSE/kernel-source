@@ -1,0 +1,137 @@
+From: Ian Bridges <icb@fastmail.org>
+Date: Tue, 3 Nov 2026 16:37:18 -0500
+Subject: [PATCH] ksmbd: fix use-after-free after a failed durable reconnect
+References: bsc#1012628
+Patch-mainline: 7.3.2
+Git-commit: 248b5819591c577727930e4e255a455235fab50a
+
+[ Upstream commit 248b5819591c577727930e4e255a455235fab50a ]
+
+ksmbd_reopen_durable_fd() republishes a detached durable handle in the
+reconnecting session's file table and takes no reference for that entry.
+If smb2_open() then fails, cleanup relies on the final ksmbd_fd_put() to
+remove the volatile id.
+
+Two reconnects of the same handle can both take a lookup reference before
+either attaches it. If the one that reopens first then fails and drops
+its references first, the other request makes the final put through
+ksmbd_put_durable_fd(). That frees the handle without removing the first
+session's table entry, so tearing that session down writes to freed
+memory.
+
+  BUG: KASAN: slab-use-after-free in __close_file_table_ids+0x14d/0x740 [ksmbd]
+  Call Trace:
+   __close_file_table_ids+0x14d/0x740 [ksmbd]
+   ksmbd_destroy_file_table+0x76/0x100 [ksmbd]
+   ksmbd_session_destroy+0xf8/0x480 [ksmbd]
+   ksmbd_dispose_sessions+0x13e/0x200 [ksmbd]
+   ksmbd_conn_sessions_cleanup+0x4c3/0x6d0 [ksmbd]
+  Freed by task 1030:
+   __ksmbd_close_fd+0x97d/0x1000 [ksmbd]
+   smb2_open+0x14eb/0xd9f0 [ksmbd]
+
+Commit 3515503322f4 ("ksmbd: fix durable reconnect error path file
+lifetime") handles a final put made by the reconnecting request, but not
+one made by another holder.
+
+Remove the volatile id under the file-table lock on this error path,
+before the references are dropped, as ksmbd_close_fd() does on the
+request_open path just above. Removal then no longer depends on which
+holder makes the final put. The stale comment in the reconnect cleanup
+is updated to match. A successful reconnect is unchanged.
+
+Fixes: c8efcc786146 ("ksmbd: add support for durable handles v1/v2")
+Cc: stable@vger.kernel.org
+Signed-off-by: Ian Bridges <icb@fastmail.org>
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/smb/server/smb2pdu.c   |  9 +++++----
+ fs/smb/server/vfs_cache.c | 28 ++++++++++++++++++++++++++++
+ fs/smb/server/vfs_cache.h |  2 ++
+ 3 files changed, 35 insertions(+), 4 deletions(-)
+
+diff --git a/fs/smb/server/smb2pdu.c b/fs/smb/server/smb2pdu.c
+index 1a29c75f1780..3f1ab9a20307 100644
+--- a/fs/smb/server/smb2pdu.c
++++ b/fs/smb/server/smb2pdu.c
+@@ -5525,6 +5525,8 @@ int smb2_open(struct ksmbd_work *work)
+ 				ksmbd_close_fd(work, fp->volatile_id);
+ 				smb2_complete_request_open(work);
+ 			} else {
++				if (dh_info.reconnected && fp == dh_info.fp)
++					ksmbd_unpublish_reopened_fd(work, fp);
+ 				ksmbd_fd_put(work, fp);
+ 			}
+ 		}
+@@ -5538,10 +5540,9 @@ int smb2_open(struct ksmbd_work *work)
+ 	if (dh_info.reconnected) {
+ 		/*
+ 		 * If reconnect succeeded, fp was republished in the
+-		 * session file table.  On a later error, ksmbd_fd_put()
+-		 * above drops the session reference; drop the durable
+-		 * lookup reference through the same session-aware path so
+-		 * final close removes the volatile id before freeing fp.
++		 * session file table, and the error path above has
++		 * already removed its volatile id.  Drop the durable
++		 * lookup reference through the same session-aware path.
+ 		 */
+ 		if (rc && fp == dh_info.fp)
+ 			ksmbd_fd_put(work, dh_info.fp);
+diff --git a/fs/smb/server/vfs_cache.c b/fs/smb/server/vfs_cache.c
+index 119235ec83f7..1efa9f814560 100644
+--- a/fs/smb/server/vfs_cache.c
++++ b/fs/smb/server/vfs_cache.c
+@@ -851,6 +851,34 @@ void ksmbd_wake_session_blocked_works(struct ksmbd_session *sess)
+ 	read_unlock(&ft->lock);
+ }
+ 
++/**
++ * ksmbd_unpublish_reopened_fd() - remove a reopened durable handle from the
++ *	session file table after its CREATE failed
++ * @work:	smb work of the failed CREATE
++ * @fp:		durable handle republished by ksmbd_reopen_durable_fd()
++ *
++ * The reopen publishes @fp in this session's table without taking a reference
++ * for the entry, so the CREATE error path's puts need not be the last ones.
++ * Another holder of a global-table reference, such as a concurrent reconnect
++ * of the same handle, can drop the last one through ksmbd_put_durable_fd(),
++ * which frees @fp without touching this table.  Remove the id here, while
++ * the caller still holds its references.
++ *
++ * Every path that removes the id before the final put also clears
++ * @fp->volatile_id under ft->lock, so a valid id is still @fp's entry.
++ */
++void ksmbd_unpublish_reopened_fd(struct ksmbd_work *work, struct ksmbd_file *fp)
++{
++	struct ksmbd_file_table *ft = &work->sess->file_table;
++
++	write_lock(&ft->lock);
++	if (has_file_id(fp->volatile_id)) {
++		idr_remove(ft->idr, fp->volatile_id);
++		fp->volatile_id = KSMBD_NO_FID;
++	}
++	write_unlock(&ft->lock);
++}
++
+ int ksmbd_close_fd(struct ksmbd_work *work, u64 id)
+ {
+ 	struct ksmbd_file	*fp;
+diff --git a/fs/smb/server/vfs_cache.h b/fs/smb/server/vfs_cache.h
+index 61238bc4de26..84ca73f48314 100644
+--- a/fs/smb/server/vfs_cache.h
++++ b/fs/smb/server/vfs_cache.h
+@@ -198,6 +198,8 @@ static inline bool ksmbd_stream_fd(struct ksmbd_file *fp)
+ int ksmbd_init_file_table(struct ksmbd_file_table *ft);
+ void ksmbd_destroy_file_table(struct ksmbd_session *sess);
+ int ksmbd_close_fd(struct ksmbd_work *work, u64 id);
++void ksmbd_unpublish_reopened_fd(struct ksmbd_work *work,
++				 struct ksmbd_file *fp);
+ struct ksmbd_file *ksmbd_lookup_fd_fast(struct ksmbd_work *work, u64 id);
+ struct ksmbd_file *ksmbd_lookup_foreign_fd(struct ksmbd_work *work, u64 id);
+ struct ksmbd_file *ksmbd_lookup_fd_slow(struct ksmbd_work *work, u64 id,
+-- 
+2.56.0
+

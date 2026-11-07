@@ -1,0 +1,150 @@
+From: Eduard Zateev <hackerowskiy@gmail.com>
+Date: Tue, 20 Oct 2026 21:45:45 +0200
+Subject: [PATCH] smb: client: hold server info until cifsd exits
+References: bsc#1012628
+Patch-mainline: 7.3.2
+Git-commit: 482c117c6dbeee382790168af10959810450ab09
+
+commit 482c117c6dbeee382790168af10959810450ab09 upstream.
+
+The last session reference can be dropped while the cifsd demultiplex
+thread is still running clean_demultiplex_info(). That thread frees
+TCP_Server_Info there, racing with cifs_put_tcp_session() as it releases
+the server crypto state. syzbot reported a KASAN use-after-free in
+cifs_crypto_secmech_release().
+
+Keep an object reference for the cifsd thread. Defer final crypto,
+session-key, network namespace, string, and structure cleanup until both
+the last session reference and the thread reference are dropped. Drop the
+thread reference after clean_demultiplex_info() has finished using the
+server.
+
+Build-tested with ARCH=arm64 and W=1 for
+fs/smb/client/connect.o. The KASAN reproducer was not run on the patched
+kernel.
+
+Fixes: a5c3e1c725af ("Revert "cifs: No need to send SIGKILL to demux_thread during umount"")
+Reported-by: syzbot+5c3ed2a0de3270efc921@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=5c3ed2a0de3270efc921
+Reported-by: syzbot+c2ec61adfbcb24e5ec20@syzkaller.appspotmail.com
+Closes: https://syzbot.org/bug?extid=c2ec61adfbcb24e5ec20
+Assisted-by: LLM OpenAI Codex
+Signed-off-by: Eduard Zateev <hackerowskiy@gmail.com>
+Cc: stable@vger.kernel.org
+Tested-by: Michail Andreas Michalopoulos <mike.michalo@gmail.com>
+Signed-off-by: Paulo Alcantara <pc@manguebit.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/smb/client/cifsglob.h |  2 ++
+ fs/smb/client/connect.c  | 33 +++++++++++++++++++++------------
+ 2 files changed, 23 insertions(+), 12 deletions(-)
+
+diff --git a/fs/smb/client/cifsglob.h b/fs/smb/client/cifsglob.h
+index 5c5b76a9e9fe..92174c4483a2 100644
+--- a/fs/smb/client/cifsglob.h
++++ b/fs/smb/client/cifsglob.h
+@@ -16,6 +16,7 @@
+ #include <linux/scatterlist.h>
+ #include <linux/mm.h>
+ #include <linux/mempool.h>
++#include <linux/refcount.h>
+ #include <linux/workqueue.h>
+ #include <linux/utsname.h>
+ #include <linux/sched/mm.h>
+@@ -679,6 +680,7 @@ struct TCP_Server_Info {
+ 	spinlock_t srv_lock;  /* protect anything here that is not protected */
+ 	__u64 conn_id; /* connection identifier (useful for debugging) */
+ 	int srv_count; /* reference counter */
++	refcount_t obj_refs; /* struct lifetime: srv_count users + cifsd */
+ 	int rfc1001_sessinit; /* whether to estasblish netbios session */
+ 	bool with_rfc1001; /* if netbios session is used */
+ 	/* 15 character server name + 0x20 16th byte indicating type = srv */
+diff --git a/fs/smb/client/connect.c b/fs/smb/client/connect.c
+index e9f53424dea5..b04acc050faf 100644
+--- a/fs/smb/client/connect.c
++++ b/fs/smb/client/connect.c
+@@ -1062,6 +1062,19 @@ cifs_enable_signing(struct TCP_Server_Info *server, bool mnt_sign_required)
+ 	return 0;
+ }
+ 
++static void cifs_tcp_server_put(struct TCP_Server_Info *server)
++{
++	if (!refcount_dec_and_test(&server->obj_refs))
++		return;
++
++	cifs_crypto_secmech_release(server);
++	kfree_sensitive(server->session_key.response);
++	put_net(cifs_net_ns(server));
++	kfree(server->leaf_fullpath);
++	kfree(server->hostname);
++	kfree_sensitive(server);
++}
++
+ static noinline_for_stack void
+ clean_demultiplex_info(struct TCP_Server_Info *server)
+ {
+@@ -1147,14 +1160,11 @@ clean_demultiplex_info(struct TCP_Server_Info *server)
+ 		 */
+ 	}
+ 
+-	put_net(cifs_net_ns(server));
+-	kfree(server->leaf_fullpath);
+-	kfree(server->hostname);
+-	kfree_sensitive(server);
+-
+ 	length = atomic_dec_return(&tcpSesAllocCount);
+ 	if (length > 0)
+ 		mempool_resize(cifs_req_poolp, length + cifs_min_rcv);
++
++	cifs_tcp_server_put(server);
+ }
+ 
+ static int
+@@ -1731,7 +1741,7 @@ cifs_put_tcp_session(struct TCP_Server_Info *server, int from_reconnect)
+ 	else
+ 		cancel_delayed_work_sync(&server->reconnect);
+ 
+-	/* For secondary channels, we pick up ref-count on the primary server */
++	/* For secondary channels, drop the reference on the primary server */
+ 	if (SERVER_IS_CHAN(server))
+ 		cifs_put_tcp_session(server->primary_server, from_reconnect);
+ 
+@@ -1739,15 +1749,11 @@ cifs_put_tcp_session(struct TCP_Server_Info *server, int from_reconnect)
+ 	server->tcpStatus = CifsExiting;
+ 	spin_unlock(&server->srv_lock);
+ 
+-	cifs_crypto_secmech_release(server);
+-
+-	kfree_sensitive(server->session_key.response);
+-	server->session_key.response = NULL;
+-	server->session_key.len = 0;
+-
+ 	task = xchg(&server->tsk, NULL);
+ 	if (task)
+ 		send_sig(SIGKILL, task, 1);
++
++	cifs_tcp_server_put(server);
+ }
+ 
+ struct TCP_Server_Info *
+@@ -1769,6 +1775,7 @@ cifs_get_tcp_session(struct smb3_fs_context *ctx,
+ 		rc = -ENOMEM;
+ 		goto out_err;
+ 	}
++	refcount_set(&tcp_ses->obj_refs, 1);
+ 
+ 	tcp_ses->hostname = kstrdup(ctx->server_hostname, GFP_KERNEL);
+ 	if (!tcp_ses->hostname) {
+@@ -1907,6 +1914,8 @@ cifs_get_tcp_session(struct smb3_fs_context *ctx,
+ 		module_put(THIS_MODULE);
+ 		goto out_err_crypto_release;
+ 	}
++	/* Keep the server alive until the demultiplex thread has exited */
++	refcount_inc(&tcp_ses->obj_refs);
+ 	/* thread created, put it on the list */
+ 	spin_lock(&cifs_tcp_ses_lock);
+ 	list_add(&tcp_ses->tcp_ses_list, &cifs_tcp_ses_list);
+-- 
+2.56.0
+

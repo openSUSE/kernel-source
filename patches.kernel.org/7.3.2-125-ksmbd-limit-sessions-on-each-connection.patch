@@ -1,0 +1,359 @@
+From: Namjae Jeon <linkinjeon@kernel.org>
+Date: Sat, 17 Oct 2026 00:18:02 +0900
+Subject: [PATCH] ksmbd: limit sessions on each connection
+References: bsc#1012628
+Patch-mainline: 7.3.2
+Git-commit: dc6aa1ba8b7fff8800ad9bf143f17d308e02ec68
+
+commit dc6aa1ba8b7fff8800ad9bf143f17d308e02ec68 upstream.
+
+The pending setup limit only counts InProgress sessions. A client can
+complete authentication repeatedly and retain an unbounded number of Valid
+sessions on one connection.
+
+Reserve a connection slot before allocating a session and retain a
+connection reference while authentication is in progress. The first SMB3
+channel takes over that reservation; binding to another connection reserves
+one slot there. Reauthentication and authentication continuation reuse the
+existing reservation. Return slots on allocation or insertion failure,
+channel removal, and final session destruction.
+
+Accept max_sessions_per_connection in reserved startup-request space and
+default to 64 when older tools leave it zero. Keep the request size and
+existing field offsets unchanged. Expose the configured limit in procfs.
+The existing connection limits bound the aggregate number of sessions
+without a separate global session allocation limit.
+
+Fixes: d7fd1f98607f ("ksmbd: follow SMB2 session expiration semantics")
+Cc: stable@vger.kernel.org
+Reported-by: Abdifatah Suruur <suruurism@gmail.com>
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/smb/server/connection.c        |  1 +
+ fs/smb/server/connection.h        |  2 ++
+ fs/smb/server/ksmbd_netlink.h     |  3 +-
+ fs/smb/server/mgmt/user_session.c | 50 +++++++++++++++++++++++++------
+ fs/smb/server/mgmt/user_session.h |  6 +++-
+ fs/smb/server/proc.c              |  2 ++
+ fs/smb/server/server.c            |  2 ++
+ fs/smb/server/server.h            |  3 ++
+ fs/smb/server/smb2pdu.c           | 16 +++++++++-
+ fs/smb/server/transport_ipc.c     |  7 +++++
+ 10 files changed, 80 insertions(+), 12 deletions(-)
+
+diff --git a/fs/smb/server/connection.c b/fs/smb/server/connection.c
+index d211861ff86f..cbfef65b3743 100644
+--- a/fs/smb/server/connection.c
++++ b/fs/smb/server/connection.c
+@@ -306,6 +306,7 @@ struct ksmbd_conn *ksmbd_conn_alloc(void)
+ 	atomic_set(&conn->req_running, 0);
+ 	atomic_set(&conn->r_count, 0);
+ 	atomic_set(&conn->refcnt, 1);
++	atomic64_set(&conn->session_count, 0);
+ 	conn->total_credits = 1;
+ 	conn->outstanding_credits = 0;
+ 
+diff --git a/fs/smb/server/connection.h b/fs/smb/server/connection.h
+index 371f17b4f02a..8671ca6fe126 100644
+--- a/fs/smb/server/connection.h
++++ b/fs/smb/server/connection.h
+@@ -77,6 +77,8 @@ struct ksmbd_conn {
+ 	struct rw_semaphore		session_lock;
+ 	/* smb session 1 per user */
+ 	struct xarray			sessions;
++	/* New sessions and SMB3 channels each reserve one connection slot. */
++	atomic64_t			session_count;
+ 	unsigned long			creation_time;
+ 	unsigned long			last_active;
+ 	/* How many request are running currently */
+diff --git a/fs/smb/server/ksmbd_netlink.h b/fs/smb/server/ksmbd_netlink.h
+index 2673522c76bc..93ebf3f6fbef 100644
+--- a/fs/smb/server/ksmbd_netlink.h
++++ b/fs/smb/server/ksmbd_netlink.h
+@@ -114,7 +114,8 @@ struct ksmbd_startup_request {
+ 	__s8	bind_interfaces_only;
+ 	__u32	max_ip_connections;	/* Number of maximum connection per ip address */
+ 	__s8	aapl_model[32];		/* AAPL model string for Finder icon, e.g. "Xserve" */
+-	__s8	reserved[467];		/* Reserved room */
++	__u32	max_sessions_per_connection; /* Maximum sessions per connection */
++	__s8	reserved[463];		/* Reserved room */
+ 	__u32	ifc_list_sz;		/* interfaces list size */
+ 	__s8	____payload[];
+ } __packed;
+diff --git a/fs/smb/server/mgmt/user_session.c b/fs/smb/server/mgmt/user_session.c
+index 694391a3c093..c0ad669f5c94 100644
+--- a/fs/smb/server/mgmt/user_session.c
++++ b/fs/smb/server/mgmt/user_session.c
+@@ -3,6 +3,7 @@
+  *   Copyright (C) 2018 Samsung Electronics Co., Ltd.
+  */
+ 
++#include <linux/atomic.h>
+ #include <linux/list.h>
+ #include <linux/slab.h>
+ #include <linux/rwsem.h>
+@@ -18,6 +19,7 @@
+ #include "../vfs_cache.h"
+ #include "../misc.h"
+ #include "../stats.h"
++#include "../server.h"
+ 
+ static DEFINE_IDA(session_ida);
+ 
+@@ -26,6 +28,21 @@ static DEFINE_IDA(session_ida);
+ static DEFINE_HASHTABLE(sessions_table, SESSION_HASH_BITS);
+ static DECLARE_RWSEM(sessions_table_lock);
+ 
++int ksmbd_session_reserve_slot(struct ksmbd_conn *conn)
++{
++	if (atomic64_inc_return(&conn->session_count) >
++	    READ_ONCE(server_conf.max_sessions_per_connection)) {
++		atomic64_dec(&conn->session_count);
++		return -ENOSPC;
++	}
++	return 0;
++}
++
++void ksmbd_session_release_slot(struct ksmbd_conn *conn)
++{
++	atomic64_dec(&conn->session_count);
++}
++
+ struct ksmbd_session_rpc {
+ 	int			id;
+ 	unsigned int		method;
+@@ -273,6 +290,7 @@ static void free_channel_list(struct ksmbd_session *sess)
+ 	down_write(&sess->chann_lock);
+ 	xa_for_each(&sess->ksmbd_chann_list, index, chann) {
+ 		xa_erase(&sess->ksmbd_chann_list, index);
++		ksmbd_session_release_slot(chann->conn);
+ 		ksmbd_conn_put(chann->conn);
+ 		kfree_sensitive(chann);
+ 	}
+@@ -400,9 +418,12 @@ int ksmbd_session_rpc_method(struct ksmbd_session *sess, int id)
+ 
+ void ksmbd_session_destroy(struct ksmbd_session *sess)
+ {
++	struct ksmbd_conn *setup_conn;
++
+ 	if (!sess)
+ 		return;
+ 
++	setup_conn = sess->setup_conn;
+ 	delete_proc_session(sess);
+ 	ksmbd_tree_conn_session_logoff(sess);
+ 	ksmbd_destroy_file_table(sess);
+@@ -412,9 +433,14 @@ void ksmbd_session_destroy(struct ksmbd_session *sess)
+ 	ksmbd_session_rpc_clear_list(sess);
+ 	free_channel_list(sess);
+ 	kfree_sensitive(sess->Preauth_HashValue);
+-	ksmbd_release_id(&session_ida, sess->id);
++	if (sess->id)
++		ksmbd_release_id(&session_ida, sess->id);
+ 	ida_destroy(&sess->tree_conn_ida);
+ 	kfree_sensitive(sess);
++	if (setup_conn) {
++		ksmbd_session_release_slot(setup_conn);
++		ksmbd_conn_put(setup_conn);
++	}
+ }
+ 
+ static void ksmbd_session_remove_from_table(struct ksmbd_session *sess)
+@@ -602,6 +628,7 @@ static int ksmbd_chann_del(struct ksmbd_conn *conn, struct ksmbd_session *sess)
+ 	if (!chann)
+ 		return -ENOENT;
+ 
++	ksmbd_session_release_slot(chann->conn);
+ 	ksmbd_conn_put(chann->conn);
+ 	kfree_sensitive(chann);
+ 	return 0;
+@@ -841,7 +868,7 @@ static int __init_smb2_session(struct ksmbd_session *sess)
+ 	return 0;
+ }
+ 
+-static struct ksmbd_session *__session_create(int protocol)
++static struct ksmbd_session *__session_create(struct ksmbd_conn *conn, int protocol)
+ {
+ 	struct ksmbd_session *sess;
+ 	int ret;
+@@ -849,15 +876,17 @@ static struct ksmbd_session *__session_create(int protocol)
+ 	if (protocol != CIFDS_SESSION_FLAG_SMB2)
+ 		return NULL;
+ 
++	if (ksmbd_session_reserve_slot(conn))
++		return NULL;
++
+ 	sess = kzalloc_obj(struct ksmbd_session, KSMBD_DEFAULT_GFP);
+-	if (!sess)
++	if (!sess) {
++		ksmbd_session_release_slot(conn);
+ 		return NULL;
++	}
+ 
++	sess->setup_conn = ksmbd_conn_get(conn);
+ 	ida_init(&sess->tree_conn_ida);
+-
+-	if (ksmbd_init_file_table(&sess->file_table))
+-		goto error;
+-
+ 	sess->last_active = jiffies;
+ 	sess->state = SMB2_SESSION_IN_PROGRESS;
+ 	set_session_flag(sess, protocol);
+@@ -870,6 +899,9 @@ static struct ksmbd_session *__session_create(int protocol)
+ 	init_rwsem(&sess->rpc_lock);
+ 	init_rwsem(&sess->chann_lock);
+ 
++	if (ksmbd_init_file_table(&sess->file_table))
++		goto error;
++
+ 	ret = __init_smb2_session(sess);
+ 	if (ret)
+ 		goto error;
+@@ -888,9 +920,9 @@ static struct ksmbd_session *__session_create(int protocol)
+ 	return NULL;
+ }
+ 
+-struct ksmbd_session *ksmbd_smb2_session_create(void)
++struct ksmbd_session *ksmbd_smb2_session_create(struct ksmbd_conn *conn)
+ {
+-	return __session_create(CIFDS_SESSION_FLAG_SMB2);
++	return __session_create(conn, CIFDS_SESSION_FLAG_SMB2);
+ }
+ 
+ int ksmbd_acquire_tree_conn_id(struct ksmbd_session *sess)
+diff --git a/fs/smb/server/mgmt/user_session.h b/fs/smb/server/mgmt/user_session.h
+index 217258551d6d..b922baa35673 100644
+--- a/fs/smb/server/mgmt/user_session.h
++++ b/fs/smb/server/mgmt/user_session.h
+@@ -37,6 +37,8 @@ struct ksmbd_session {
+ 	char				ClientGUID[SMB2_CLIENT_GUID_SIZE];
+ 
+ 	struct ksmbd_user		*user;
++	/* Holds the connection slot until an SMB3 channel takes it over. */
++	struct ksmbd_conn		*setup_conn;
+ 	unsigned int			sequence_number;
+ 	unsigned int			flags;
+ 
+@@ -89,7 +91,9 @@ static inline void clear_session_flag(struct ksmbd_session *sess, int bit)
+ 	sess->flags &= ~bit;
+ }
+ 
+-struct ksmbd_session *ksmbd_smb2_session_create(void);
++struct ksmbd_session *ksmbd_smb2_session_create(struct ksmbd_conn *conn);
++int ksmbd_session_reserve_slot(struct ksmbd_conn *conn);
++void ksmbd_session_release_slot(struct ksmbd_conn *conn);
+ 
+ void ksmbd_session_destroy(struct ksmbd_session *sess);
+ 
+diff --git a/fs/smb/server/proc.c b/fs/smb/server/proc.c
+index 19f0f2cfbf54..e5a9158c09bd 100644
+--- a/fs/smb/server/proc.c
++++ b/fs/smb/server/proc.c
+@@ -161,6 +161,8 @@ static int proc_show_ksmbd_stats(struct seq_file *m, void *v)
+ 	seq_printf(m, "max_connections:\t%u\n", server_conf.max_connections);
+ 	seq_printf(m, "max_connections_per_ip:\t%u\n",
+ 		   server_conf.max_ip_connections);
++	seq_printf(m, "max_sessions_per_connection:\t%u\n",
++		   server_conf.max_sessions_per_connection);
+ 	seq_printf(m, "max_inflight_requests:\t%u\n",
+ 		   server_conf.max_inflight_req);
+ 	seq_printf(m, "deadtime_seconds:\t%lu\n", server_conf.deadtime / HZ);
+diff --git a/fs/smb/server/server.c b/fs/smb/server/server.c
+index e0d00ed22461..ff85cbc47066 100644
+--- a/fs/smb/server/server.c
++++ b/fs/smb/server/server.c
+@@ -456,6 +456,8 @@ static int server_conf_init(void)
+ 				KSMBD_AUTH_MSKRB5;
+ #endif
+ 	server_conf.max_inflight_req = SMB2_MAX_CREDITS;
++	server_conf.max_sessions_per_connection =
++		KSMBD_DEFAULT_MAX_SESSIONS_PER_CONNECTION;
+ 	return 0;
+ }
+ 
+diff --git a/fs/smb/server/server.h b/fs/smb/server/server.h
+index 4d4d268b59d5..7b7df3fafe5b 100644
+--- a/fs/smb/server/server.h
++++ b/fs/smb/server/server.h
+@@ -8,6 +8,8 @@
+ 
+ #include "smbacl.h"
+ 
++#define KSMBD_DEFAULT_MAX_SESSIONS_PER_CONNECTION	64
++
+ /*
+  * Server state type
+  */
+@@ -44,6 +46,7 @@ struct ksmbd_server_config {
+ 	unsigned int		max_connections;
+ 	unsigned int		max_inflight_req;
+ 	unsigned int		max_ip_connections;
++	unsigned int		max_sessions_per_connection;
+ 
+ 	char			*conf[SERVER_CONF_WORK_GROUP + 1];
+ 	struct task_struct	*dh_task;
+diff --git a/fs/smb/server/smb2pdu.c b/fs/smb/server/smb2pdu.c
+index 79b2dca091ea..2ac6aa9b88ab 100644
+--- a/fs/smb/server/smb2pdu.c
++++ b/fs/smb/server/smb2pdu.c
+@@ -116,14 +116,28 @@ static int register_session_channel(struct ksmbd_session *sess,
+ 		goto out;
+ 	}
+ 
++	if (sess->setup_conn != conn) {
++		rc = ksmbd_session_reserve_slot(conn);
++		if (rc) {
++			kfree_sensitive(chann);
++			goto out;
++		}
++	}
++
+ 	chann->conn = ksmbd_conn_get(conn);
+ 	memcpy(chann->sess_key, sess_key, sizeof(chann->sess_key));
+ 	old = xa_store(&sess->ksmbd_chann_list, (long)conn, chann,
+ 		       KSMBD_DEFAULT_GFP);
+ 	if (xa_is_err(old)) {
++		if (sess->setup_conn != conn)
++			ksmbd_session_release_slot(conn);
+ 		ksmbd_conn_put(chann->conn);
+ 		kfree_sensitive(chann);
+ 		rc = xa_err(old);
++	} else if (sess->setup_conn == conn) {
++		/* Transfer the initial reservation and reference to this channel. */
++		sess->setup_conn = NULL;
++		ksmbd_conn_put(conn);
+ 	}
+ out:
+ 	up_write(&sess->chann_lock);
+@@ -2461,7 +2475,7 @@ int smb2_sess_setup(struct ksmbd_work *work)
+ 
+ 	ksmbd_conn_lock(conn);
+ 	if (!req->hdr.SessionId) {
+-		sess = ksmbd_smb2_session_create();
++		sess = ksmbd_smb2_session_create(conn);
+ 		if (!sess) {
+ 			rc = -ENOMEM;
+ 			goto out_err;
+diff --git a/fs/smb/server/transport_ipc.c b/fs/smb/server/transport_ipc.c
+index f5cfc320500e..eb07cdf17410 100644
+--- a/fs/smb/server/transport_ipc.c
++++ b/fs/smb/server/transport_ipc.c
+@@ -353,6 +353,13 @@ static int ipc_server_config_on_startup(struct ksmbd_startup_request *req)
+ 	if (req->max_ip_connections)
+ 		server_conf.max_ip_connections = req->max_ip_connections;
+ 
++	if (req->max_sessions_per_connection)
++		server_conf.max_sessions_per_connection =
++			req->max_sessions_per_connection;
++	else
++		server_conf.max_sessions_per_connection =
++			KSMBD_DEFAULT_MAX_SESSIONS_PER_CONNECTION;
++
+ 	ret = ksmbd_set_netbios_name(req->netbios_name);
+ 	ret |= ksmbd_set_server_string(req->server_string);
+ 	ret |= ksmbd_set_work_group(req->work_group);
+-- 
+2.56.0
+

@@ -1,0 +1,189 @@
+From: Stefan Metzmacher <metze@samba.org>
+Date: Fri, 9 Oct 2026 12:02:13 +0200
+Subject: [PATCH] smb: smbdirect: don't hand out already failed sockets in
+ smbdirect_socket_accept()
+References: bsc#1012628
+Patch-mainline: 7.3.2
+Git-commit: 5c171c90c446bdce80ebaecfc5ed2c410bcc7427
+
+[ Upstream commit 5c171c90c446bdce80ebaecfc5ed2c410bcc7427 ]
+
+A socket on the ready list is in SMBDIRECT_SOCKET_NEGOTIATE_RUNNING,
+but it may fail before smbdirect_socket_accept() picks it up, e.g.
+RDMA_CM_EVENT_DISCONNECTED already moved it to
+SMBDIRECT_SOCKET_DISCONNECTED.
+
+smbdirect_socket_accept() unconditionally overwrote the status with
+SMBDIRECT_SOCKET_CONNECTED and handed out the already disconnected
+socket. smbdirect_socket_cleanup_work() then called rdma_disconnect()
+on it again, and before the recent commit
+smbdirect_socket_destroy_sync() waited forever for an
+RDMA_CM_EVENT_DISCONNECTED that already happened.
+
+Now we check first_error and change the status to
+SMBDIRECT_SOCKET_CONNECTED only via cmpxchg() from
+SMBDIRECT_SOCKET_NEGOTIATE_RUNNING, while we still hold listen.lock.
+If the socket already failed, we move it to the orphaned list and
+queue purge_orphaned_work, like smbdirect_listen_orphan_socket() does,
+and try the next one. If we only found failed sockets, we wait for
+the next one.
+
+Fixes: dc691b91ad16 ("smb: smbdirect: introduce smbdirect_socket_{listen,accept}()")
+Reported-by: Sashiko <sashiko-bot+sashiko@kernel.org>
+Closes: https://sashiko.dev/#/patchset/cover.1791224972.git.metze%40samba.org
+Closes: https://sashiko.dev/#/bug/linux-f9dbca09-30a7-4145-9bdb-4676759982c8
+Cc: Namjae Jeon <linkinjeon@kernel.org>
+Cc: Paulo Alcantara <pc@manguebit.org>
+Cc: Tom Talpey <tom@talpey.com>
+Cc: linux-cifs@vger.kernel.org
+Cc: samba-technical@lists.samba.org
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Stefan Metzmacher <metze@samba.org>
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/smb/smbdirect/accept.c | 84 +++++++++++++++++++++++++++++++++------
+ 1 file changed, 72 insertions(+), 12 deletions(-)
+
+diff --git a/fs/smb/smbdirect/accept.c b/fs/smb/smbdirect/accept.c
+index 977144442974..e7e5eb75a5ae 100644
+--- a/fs/smb/smbdirect/accept.c
++++ b/fs/smb/smbdirect/accept.c
+@@ -836,7 +836,11 @@ static long smbdirect_socket_wait_for_accept(struct smbdirect_socket *lsc, long
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	return 0;
++	/*
++	 * Return the remaining timeout, so the caller can carry it
++	 * over to the next smbdirect_socket_wait_for_accept() call.
++	 */
++	return ret;
+ }
+ 
+ struct smbdirect_socket *smbdirect_socket_accept(struct smbdirect_socket *lsc,
+@@ -846,6 +850,7 @@ struct smbdirect_socket *smbdirect_socket_accept(struct smbdirect_socket *lsc,
+ 	struct smbdirect_socket *nsc;
+ 	unsigned long flags;
+ 
++again:
+ 	if (lsc->status != SMBDIRECT_SOCKET_LISTENING) {
+ 		arg->err = -EINVAL;
+ 		return NULL;
+@@ -857,7 +862,7 @@ struct smbdirect_socket *smbdirect_socket_accept(struct smbdirect_socket *lsc,
+ 	}
+ 
+ 	if (list_empty_careful(&lsc->listen.ready)) {
+-		int ret;
++		long ret;
+ 
+ 		if (timeo == 0) {
+ 			arg->err = -EAGAIN;
+@@ -865,16 +870,64 @@ struct smbdirect_socket *smbdirect_socket_accept(struct smbdirect_socket *lsc,
+ 		}
+ 
+ 		ret = smbdirect_socket_wait_for_accept(lsc, timeo);
+-		if (ret) {
++		if (ret < 0) {
+ 			arg->err = ret;
+ 			return NULL;
+ 		}
++		/*
++		 * Carry the remaining timeout over, so that a stream of
++		 * failed connections that we orphan and skip (goto again)
++		 * can't reset the caller's timeout and wait forever.
++		 */
++		timeo = ret;
+ 	}
+ 
+ 	spin_lock_irqsave(&lsc->listen.lock, flags);
+-	nsc = list_first_entry_or_null(&lsc->listen.ready,
+-				       struct smbdirect_socket,
+-				       accept.list);
++	/*
++	 * Recheck under the lock.
++	 */
++	if (lsc->status != SMBDIRECT_SOCKET_LISTENING) {
++		arg->err = -EINVAL;
++		spin_unlock_irqrestore(&lsc->listen.lock, flags);
++		return NULL;
++	}
++	if (lsc->first_error) {
++		arg->err = lsc->first_error;
++		spin_unlock_irqrestore(&lsc->listen.lock, flags);
++		return NULL;
++	}
++
++	while ((nsc = list_first_entry_or_null(&lsc->listen.ready,
++					       struct smbdirect_socket,
++					       accept.list))) {
++		/*
++		 * nsc may have failed after it was moved
++		 * to the ready list, e.g. RDMA_CM_EVENT_DISCONNECTED
++		 * already moved it to SMBDIRECT_SOCKET_DISCONNECTED.
++		 * We must not overwrite that with
++		 * SMBDIRECT_SOCKET_CONNECTED and hand
++		 * out an already disconnected socket.
++		 *
++		 * Doing this under listen.lock means nsc
++		 * still belongs to us, so we can just move
++		 * a failed socket to the orphaned list,
++		 * like smbdirect_listen_orphan_socket() does,
++		 * and try the next one.
++		 */
++		if (!READ_ONCE(nsc->first_error) &&
++		    cmpxchg(&nsc->status,
++			    SMBDIRECT_SOCKET_NEGOTIATE_RUNNING,
++			    SMBDIRECT_SOCKET_CONNECTED) ==
++		    SMBDIRECT_SOCKET_NEGOTIATE_RUNNING)
++			break;
++
++		smbdirect_log_rdma_event(nsc, SMBDIRECT_LOG_INFO,
++			"orphaning failed socket status=%s first_error=%1pe\n",
++			smbdirect_socket_status_string(nsc->status),
++			SMBDIRECT_DEBUG_ERR_PTR(nsc->first_error));
++		list_move_tail(&nsc->accept.list, &lsc->listen.orphaned);
++		queue_work(lsc->workqueues.cleanup, &lsc->listen.purge_orphaned_work);
++	}
+ 	if (nsc) {
+ 		WRITE_ONCE(nsc->accept.listener, NULL);
+ 		list_del_init_careful(&nsc->accept.list);
+@@ -882,8 +935,13 @@ struct smbdirect_socket *smbdirect_socket_accept(struct smbdirect_socket *lsc,
+ 	}
+ 	spin_unlock_irqrestore(&lsc->listen.lock, flags);
+ 	if (!nsc) {
+-		arg->err = -EAGAIN;
+-		return NULL;
++		/*
++		 * If we only found failed sockets or no socket,
++		 * we wait for the next one.
++		 *
++		 * A possible -EAGAIN/-ETIMEOUT is handled above.
++		 */
++		goto again;
+ 	}
+ 
+ 	/*
+@@ -892,12 +950,14 @@ struct smbdirect_socket *smbdirect_socket_accept(struct smbdirect_socket *lsc,
+ 	 * so it didn't grant any credits to us.
+ 	 *
+ 	 * The caller expects a connected socket
+-	 * now as there are no credits anyway.
++	 * now as there are no credits anyway,
++	 * above we already changed to SMBDIRECT_SOCKET_CONNECTED
++	 * under the lsc->listen.lock and with cmpxchg.
+ 	 *
+-	 * Then we send the negotiation response in
+-	 * order to grant credits to the peer.
++	 * Now we send the negotiation response in
++	 * order to grant credits to the peer,
++	 * as the socket is now visible to the application layer.
+ 	 */
+-	nsc->status = SMBDIRECT_SOCKET_CONNECTED;
+ 	smbdirect_accept_negotiate_finish(nsc, 0);
+ 
+ 	return nsc;
+-- 
+2.56.0
+

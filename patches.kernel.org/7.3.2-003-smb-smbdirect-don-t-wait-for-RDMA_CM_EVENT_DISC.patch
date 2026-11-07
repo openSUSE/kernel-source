@@ -1,0 +1,166 @@
+From: Stefan Metzmacher <metze@samba.org>
+Date: Fri, 9 Oct 2026 12:02:11 +0200
+Subject: [PATCH] smb: smbdirect: don't wait for RDMA_CM_EVENT_DISCONNECTED in
+ smbdirect_socket_destroy_sync()
+References: bsc#1012628
+Patch-mainline: 7.3.2
+Git-commit: 4ca76b89917ad5b317e07ae4f0edc16f7c2a1248
+
+[ Upstream commit 4ca76b89917ad5b317e07ae4f0edc16f7c2a1248 ]
+
+smbdirect_socket_destroy_sync() waited for RDMA_CM_EVENT_DISCONNECTED
+after smbdirect_socket_cleanup_work() called rdma_disconnect(). That
+can take very long, e.g. if the peer just disappeared, until the
+rdma cm gives up, or forever if the event already happened, but the
+status was overwritten afterwards.
+
+This is not needed: smbdirect_socket_destroy() drains the qp under
+rdma_lock_handler(), destroys it and calls rdma_destroy_id(), which
+only waits for a currently running event handler and makes sure no
+further events are delivered. The rest of the disconnect protocol
+(DREQ/DREP and timewait for IB, abrupt close for iWarp) is handled
+by the rdma core asynchronously. drivers/nvme/host/rdma.c also just
+calls rdma_disconnect() and ib_drain_qp() before rdma_destroy_id().
+
+So smbdirect_socket_destroy() now also accepts
+SMBDIRECT_SOCKET_DISCONNECTING and changes the status to
+SMBDIRECT_SOCKET_DISCONNECTED itself under rdma_lock_handler().
+
+We could still get RDMA_CM_EVENT_DISCONNECTED in the small
+windows between rdma_unlock_handler() and rdma_destroy_id(),
+but in that case smbdirect_connection_rdma_event_handler()
+is basically a no-op.
+
+Fixes: 422a2436697d ("smb: smbdirect: introduce smbdirect_socket_destroy[_sync]()")
+Cc: Namjae Jeon <linkinjeon@kernel.org>
+Cc: Paulo Alcantara <pc@manguebit.org>
+Cc: Tom Talpey <tom@talpey.com>
+Cc: linux-cifs@vger.kernel.org
+Cc: samba-technical@lists.samba.org
+Cc: linux-rdma@vger.kernel.org
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Stefan Metzmacher <metze@samba.org>
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/smb/smbdirect/connection.c | 12 ++++----
+ fs/smb/smbdirect/socket.c     | 56 ++++++++++++++++++++++++++++-------
+ 2 files changed, 52 insertions(+), 16 deletions(-)
+
+diff --git a/fs/smb/smbdirect/connection.c b/fs/smb/smbdirect/connection.c
+index afd31fa12a36..f48c857bda5a 100644
+--- a/fs/smb/smbdirect/connection.c
++++ b/fs/smb/smbdirect/connection.c
+@@ -83,9 +83,9 @@ static int smbdirect_connection_rdma_event_handler(struct rdma_cm_id *id,
+ 		 * smbdirect_socket_schedule_cleanup[_status]() =>
+ 		 * smbdirect_socket_cleanup_work().
+ 		 *
+-		 * As otherwise we'd set SMBDIRECT_SOCKET_DISCONNECTING,
+-		 * but never ever get RDMA_CM_EVENT_DISCONNECTED and
+-		 * never reach SMBDIRECT_SOCKET_DISCONNECTED.
++		 * As otherwise we'd set SMBDIRECT_SOCKET_DISCONNECTING
++		 * and call rdma_disconnect(), but never ever get
++		 * RDMA_CM_EVENT_DISCONNECTED.
+ 		 */
+ 		if (event->event == RDMA_CM_EVENT_DEVICE_REMOVAL)
+ 			smbdirect_socket_schedule_cleanup_status(sc,
+@@ -113,9 +113,9 @@ static int smbdirect_connection_rdma_event_handler(struct rdma_cm_id *id,
+ 		 * smbdirect_socket_schedule_cleanup_status() =>
+ 		 * smbdirect_socket_cleanup_work().
+ 		 *
+-		 * As otherwise we'd set SMBDIRECT_SOCKET_DISCONNECTING,
+-		 * but never ever get RDMA_CM_EVENT_DISCONNECTED and
+-		 * never reach SMBDIRECT_SOCKET_DISCONNECTED.
++		 * As otherwise we'd set SMBDIRECT_SOCKET_DISCONNECTING
++		 * and call rdma_disconnect(), but never ever get
++		 * RDMA_CM_EVENT_DISCONNECTED.
+ 		 *
+ 		 * This is also a normal disconnect so
+ 		 * SMBDIRECT_LOG_INFO should be good enough
+diff --git a/fs/smb/smbdirect/socket.c b/fs/smb/smbdirect/socket.c
+index bb02df6158b9..c36cb7cc0088 100644
+--- a/fs/smb/smbdirect/socket.c
++++ b/fs/smb/smbdirect/socket.c
+@@ -511,7 +511,13 @@ static void smbdirect_socket_destroy(struct smbdirect_socket *sc)
+ 	if (sc->status == SMBDIRECT_SOCKET_DESTROYED)
+ 		return;
+ 
+-	WARN_ONCE(sc->status != SMBDIRECT_SOCKET_DISCONNECTED,
++	/*
++	 * smbdirect_socket_destroy_sync() doesn't wait
++	 * for RDMA_CM_EVENT_DISCONNECTED, so we may still
++	 * be in SMBDIRECT_SOCKET_DISCONNECTING
++	 * (or already reached SMBDIRECT_SOCKET_DISCONNECTED)
++	 */
++	WARN_ONCE(sc->status < SMBDIRECT_SOCKET_DISCONNECTING,
+ 		  "status=%s first_error=%1pe",
+ 		  smbdirect_socket_status_string(sc->status),
+ 		  SMBDIRECT_DEBUG_ERR_PTR(sc->first_error));
+@@ -542,6 +548,32 @@ static void smbdirect_socket_destroy(struct smbdirect_socket *sc)
+ 	if (sc->rdma.cm_id)
+ 		rdma_lock_handler(sc->rdma.cm_id);
+ 
++	/*
++	 * We hold the handler lock, so the rdma event
++	 * handlers can't change the status anymore.
++	 *
++	 * If RDMA_CM_EVENT_DISCONNECTED didn't arrive yet,
++	 * we just stop waiting for it here.
++	 *
++	 * We already disabled disconnect_work above
++	 * and before we call rdma_unlock_handler below
++	 * we call smbdirect_connection_destroy_qp which
++	 * sets sc->ib.qp = NULL.
++	 *
++	 * Between rdma_unlock_handler() and
++	 * rdma_destroy_id() below there's a small
++	 * windows where RDMA_CM_EVENT_DISCONNECTED
++	 * could still arrive.
++	 *
++	 * But smbdirect_connection_rdma_event_handler
++	 * will be a noop when calling smbdirect_socket_schedule_cleanup*
++	 * ib_drain_qp() also won't be called.
++	 */
++	if (sc->status < SMBDIRECT_SOCKET_DISCONNECTED) {
++		sc->status = SMBDIRECT_SOCKET_DISCONNECTED;
++		smbdirect_socket_wake_up_all(sc);
++	}
++
+ 	if (sc->ib.qp) {
+ 		smbdirect_log_rdma_event(sc, SMBDIRECT_LOG_INFO,
+ 			"drain qp\n");
+@@ -679,17 +711,21 @@ void smbdirect_socket_destroy_sync(struct smbdirect_socket *sc)
+ 		"destroying rdma session\n");
+ 	if (sc->status < SMBDIRECT_SOCKET_DISCONNECTING)
+ 		smbdirect_socket_cleanup_work(&sc->disconnect_work);
+-	if (sc->status < SMBDIRECT_SOCKET_DISCONNECTED) {
+-		smbdirect_log_rdma_event(sc, SMBDIRECT_LOG_INFO,
+-			"wait for transport being disconnected\n");
+-		wait_event(sc->status_wait, sc->status == SMBDIRECT_SOCKET_DISCONNECTED);
+-		smbdirect_log_rdma_event(sc, SMBDIRECT_LOG_INFO,
+-			"waited for transport being disconnected\n");
+-	}
+ 
+ 	/*
+-	 * Once we reached SMBDIRECT_SOCKET_DISCONNECTED,
+-	 * we should call smbdirect_socket_destroy()
++	 * We don't wait for RDMA_CM_EVENT_DISCONNECTED,
++	 * rdma_disconnect() was already called by
++	 * smbdirect_socket_cleanup_work() if needed
++	 * and smbdirect_socket_destroy() drains the qp,
++	 * destroys it and calls rdma_destroy_id(), which
++	 * only waits for a currently running event handler
++	 * and makes sure no further events are delivered.
++	 * The rest of the disconnect protocol is handled
++	 * by the rdma core asynchronously.
++	 *
++	 * Waiting for RDMA_CM_EVENT_DISCONNECTED could
++	 * take very long or forever, e.g. if the peer
++	 * just disappeared.
+ 	 */
+ 	smbdirect_socket_destroy(sc);
+ 	smbdirect_log_rdma_event(sc, SMBDIRECT_LOG_INFO,
+-- 
+2.56.0
+

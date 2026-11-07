@@ -1,0 +1,137 @@
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Thu, 15 Oct 2026 19:30:31 +0000
+Subject: [PATCH] io_uring: don't lose the DEFER_TASKRUN wake up
+References: bsc#1012628
+Patch-mainline: 7.3.2
+Git-commit: 8257f6ec45ee07c6ed933c59d8982b03cc7bc1ca
+
+[ Upstream commit 8257f6ec45ee07c6ed933c59d8982b03cc7bc1ca ]
+
+Since local task_work moved to the mpscq, ->cq_wait_nr is a credit: the
+add that counts it down to zero, or exchanges it for IO_CQ_WAKE_INIT,
+issues the only wake up of the wait cycle, and every later add returns
+early as the count is <= 0.
+
+An add looks at the count after it has queued its entry, so an add that
+gets delayed in between can take the credit of a later cycle. That was
+assumed to cause an early wake up at worst, but the waiter publishes the
+count before it changes its task state:
+
+CPU0 (submitter, io_cqring_wait)      CPU1 (io_req_local_work_add)
+                                      mpscq_push(req A)
+io_run_local_work()  // runs req A
+atomic_set(&ctx->cq_wait_nr, 1)
+                                      atomic_read(&ctx->cq_wait_nr) == 1
+                                      atomic_xchg(.., IO_CQ_WAKE_INIT)
+                                      wake_up_state(.., TASK_INTERRUPTIBLE)
+                                        // still TASK_RUNNING, no-op
+set_current_state(TASK_INTERRUPTIBLE)
+io_local_work_pending() == false
+schedule()
+                                      mpscq_push(req B)
+                                      cq_wait_nr <= 0, return
+
+The task now sleeps with req B queued, until a signal or a timeout ends
+the wait.
+
+Set the task state first and only then make the count visible, so that
+whoever takes the credit finds a task it can wake. The full barrier that
+orders the count against the check of the work list is kept. Do the same
+for the wait of the BPF driven loop, which copied the sequence.
+
+Fixes: d46ab2c98aba ("io_uring: switch local task_work to a mpscq")
+Assisted-by: LLM
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Link: https://patch.msgid.link/20261015-b4-io-uring-fixes-v1-7-c1556f5d7bf5@toxicpanda.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ io_uring/loop.c |  8 +-------
+ io_uring/tw.c   |  2 +-
+ io_uring/wait.c |  3 +--
+ io_uring/wait.h | 15 +++++++++++++++
+ 4 files changed, 18 insertions(+), 10 deletions(-)
+
+diff --git a/io_uring/loop.c b/io_uring/loop.c
+index 3d472b7827fa..2340459164a1 100644
+--- a/io_uring/loop.c
++++ b/io_uring/loop.c
+@@ -10,12 +10,6 @@ static inline int io_loop_nr_cqes(const struct io_ring_ctx *ctx,
+ 	return lp->cq_wait_idx - READ_ONCE(ctx->rings->cq.tail);
+ }
+ 
+-static inline void io_loop_wait_start(struct io_ring_ctx *ctx, unsigned nr_wait)
+-{
+-	atomic_set(&ctx->cq_wait_nr, nr_wait);
+-	set_current_state(TASK_INTERRUPTIBLE);
+-}
+-
+ static inline void io_loop_wait_finish(struct io_ring_ctx *ctx)
+ {
+ 	__set_current_state(TASK_RUNNING);
+@@ -25,7 +19,7 @@ static inline void io_loop_wait_finish(struct io_ring_ctx *ctx)
+ static void io_loop_wait(struct io_ring_ctx *ctx, struct iou_loop_params *lp,
+ 			 unsigned nr_wait)
+ {
+-	io_loop_wait_start(ctx, nr_wait);
++	io_cq_wait_arm(ctx, nr_wait);
+ 
+ 	if (unlikely(io_local_work_pending(ctx) ||
+ 		     io_loop_nr_cqes(ctx, lp) <= 0) ||
+diff --git a/io_uring/tw.c b/io_uring/tw.c
+index f9affd68dd26..98e3b1bc61b4 100644
+--- a/io_uring/tw.c
++++ b/io_uring/tw.c
+@@ -165,7 +165,7 @@ void io_req_local_work_add(struct io_kiocb *req, unsigned flags)
+ 
+ 	/*
+ 	 * The xchg() in mpscq_push() implies a full barrier, which pairs with
+-	 * the barrier in set_current_state() on the io_cqring_wait() side. This
++	 * the barrier in io_cq_wait_arm() on the io_cqring_wait() side. This
+ 	 * ensures that either we see the updated ->cq_wait_nr, or waiters going
+ 	 * to sleep will observe the work added to the list, which is similar to
+ 	 * the wait/wake task state sync.
+diff --git a/io_uring/wait.c b/io_uring/wait.c
+index 967be6ee1276..62f010132100 100644
+--- a/io_uring/wait.c
++++ b/io_uring/wait.c
+@@ -267,8 +267,7 @@ int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
+ 		unsigned long check_cq;
+ 
+ 		if (ctx->flags & IORING_SETUP_DEFER_TASKRUN) {
+-			atomic_set(&ctx->cq_wait_nr, nr_wait);
+-			set_current_state(TASK_INTERRUPTIBLE);
++			io_cq_wait_arm(ctx, nr_wait);
+ 		} else {
+ 			prepare_to_wait_exclusive(&ctx->cq_wait, &iowq.wq,
+ 							TASK_INTERRUPTIBLE);
+diff --git a/io_uring/wait.h b/io_uring/wait.h
+index b7b9c46b1b01..eb5ae8a6fc94 100644
+--- a/io_uring/wait.h
++++ b/io_uring/wait.h
+@@ -14,6 +14,21 @@
+  */
+ #define IO_CQ_WAKE_INIT		(-1)
+ 
++/*
++ * Start a wait cycle of the current task. The add that uses up ->cq_wait_nr
++ * may be one that queued its entry long ago and only now gets to look at the
++ * count. As nobody else wakes us after that, it has to find us sleeping, hence
++ * the task state must be visible before the count is. The barrier pairs with
++ * the xchg() in mpscq_push(), see io_req_local_work_add().
++ */
++static inline void io_cq_wait_arm(struct io_ring_ctx *ctx, int nr_wait)
++{
++	__set_current_state(TASK_INTERRUPTIBLE);
++	atomic_set_release(&ctx->cq_wait_nr, nr_wait);
++	/* order the above against looking at the work list */
++	smp_mb();
++}
++
+ struct ext_arg {
+ 	size_t argsz;
+ 	struct timespec64 ts;
+-- 
+2.56.0
+

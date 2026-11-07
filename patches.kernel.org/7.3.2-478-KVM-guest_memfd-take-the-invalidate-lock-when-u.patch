@@ -1,0 +1,135 @@
+From: Shivank Garg <shivankg@amd.com>
+Date: Tue, 1 Sep 2026 07:20:38 +0000
+Subject: [PATCH] KVM: guest_memfd: take the invalidate lock when unbinding a
+ dying file
+References: bsc#1012628
+Patch-mainline: 7.3.2
+Git-commit: 0ee2c883b62deb74d8c43007e8049dc006d3a2fb
+
+commit 0ee2c883b62deb74d8c43007e8049dc006d3a2fb upstream.
+
+kvm_gmem_unbind() takes mapping->invalidate_lock only if the
+get_file_active() succeeds. When the guest_memfd file is dying, its
+reference count is already zero so get_file_active fails and the binding
+is removed without holding the invalidate lock.
+
+kvm_gmem_invalidate_{start,end}() checks f->bindings independently to
+decide whether to begin or end KVM MMU invalidation. So, the bindings
+must therefore remain stable between the two calls. Otherwise, unbind
+can remove a binding after start increments mmu_invalidate_in_progress,
+but before end finds the binding and decrements it.
+Example, unbind race with memory failure:
+
+  CPU 0: memory failure               CPU 1: memslot delete
+  ----------------------------------  ---------------------------
+                                      (guest_memfd file is dying)
+  kvm_gmem_error_folio()
+    kvm_gmem_invalidate_start()
+      finds binding
+      mmu_invalidate_in_progress++
+                                      kvm_gmem_unbind()
+                                        get_file_active() fails
+                                        removes binding
+    kvm_gmem_invalidate_end()
+      no binding found
+      counter stays elevated
+
+mmu_invalidate_retry() then returns 1 forever, so guest page faults
+retry without ever installing a mapping and the guest hangs.
+
+Remove the distinction between live and dying files in the unbind path.
+Always use slot->gmem.file and take the invalidate lock when it's non-NULL.
+Normal unbind callers hold slots_lock, which prevents release from clearing
+the pointer or freeing the file state until unbind completes. Final VM
+teardown can only see a NULL pointer because guest_memfd pins the KVM until
+release has cleared all bindings.
+
+Fixes: ae431059e75d ("KVM: guest_memfd: Remove bindings on memslot deletion when gmem is dying")
+Cc: stable@vger.kernel.org
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Closes: https://lore.kernel.org/all/20260728092027.225CF1F000E9@smtp.kernel.org
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Shivank Garg <shivankg@amd.com>
+Reviewed-by: David Hildenbrand (Arm) <david@kernel.org>
+Link: https://patch.msgid.link/20260901-gmem-unbind-fix-v2-1-12febe1d2216@amd.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ virt/kvm/guest_memfd.c | 44 +++++++++++++++++-------------------------
+ 1 file changed, 18 insertions(+), 26 deletions(-)
+
+diff --git a/virt/kvm/guest_memfd.c b/virt/kvm/guest_memfd.c
+index 7fb8295f424b..dcb0cd16c4aa 100644
+--- a/virt/kvm/guest_memfd.c
++++ b/virt/kvm/guest_memfd.c
+@@ -686,48 +686,40 @@ int kvm_gmem_commit_memory_region(struct kvm *kvm, struct kvm_memory_slot *slot)
+ 	return r;
+ }
+ 
+-static void __kvm_gmem_unbind(struct kvm_memory_slot *slot, struct gmem_file *f)
++void kvm_gmem_unbind(struct kvm_memory_slot *slot)
+ {
++	struct file *file = slot->gmem.file;
+ 	unsigned long start = slot->gmem.pgoff;
+ 	unsigned long end = start + slot->npages;
++	struct gmem_file *f;
+ 
+-	xa_store_range(&f->bindings, start, end - 1, NULL, GFP_KERNEL);
+-
+-	/*
+-	 * synchronize_srcu(&kvm->srcu) ensured that kvm_gmem_get_pfn()
+-	 * cannot see this memslot.
+-	 */
+-	WRITE_ONCE(slot->gmem.file, NULL);
+-}
+-
+-void kvm_gmem_unbind(struct kvm_memory_slot *slot)
+-{
+ 	/*
+ 	 * Nothing to do if the underlying file was _already_ closed, as
+ 	 * kvm_gmem_release() invalidates and nullifies all bindings.
+ 	 */
+-	if (!slot->gmem.file)
++	if (!file)
+ 		return;
+ 
+-	CLASS(gmem_get_file, file)(slot);
+-
+ 	/*
+ 	 * However, if the file is _being_ closed, then the bindings need to be
+ 	 * removed as kvm_gmem_release() might not run until after the memslot
+-	 * is freed.  Note, modifying the bindings is safe even though the file
+-	 * is dying as kvm_gmem_release() nullifies slot->gmem.file under
+-	 * slots_lock, and only puts its reference to KVM after destroying all
+-	 * bindings.  I.e. reaching this point means kvm_gmem_release() hasn't
+-	 * yet destroyed the bindings or freed the gmem_file, and can't do so
+-	 * until the caller drops slots_lock.
++	 * is freed.  Modifying the bindings is safe even if the file is dying
++	 * as kvm_gmem_release() nullifies slot->gmem.file under slots_lock,
++	 * and only puts its reference to KVM after destroying all bindings.
++	 * I.e. reaching this point means kvm_gmem_release() hasn't destroyed
++	 * the bindings or freed the gmem_file and can't do so until the caller
++	 * drops slots_lock, so there's no need to verify the file is live.
+ 	 */
+-	if (!file) {
+-		__kvm_gmem_unbind(slot, slot->gmem.file->private_data);
+-		return;
+-	}
++	f = file->private_data;
+ 
+ 	filemap_invalidate_lock(file->f_mapping);
+-	__kvm_gmem_unbind(slot, file->private_data);
++	xa_store_range(&f->bindings, start, end - 1, NULL, GFP_KERNEL);
++
++	/*
++	 * synchronize_srcu(&kvm->srcu) ensured that kvm_gmem_get_pfn()
++	 * cannot see this memslot.
++	 */
++	WRITE_ONCE(slot->gmem.file, NULL);
+ 	filemap_invalidate_unlock(file->f_mapping);
+ }
+ 
+-- 
+2.56.0
+
