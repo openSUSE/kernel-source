@@ -1,9 +1,10 @@
-from kutil.config import get_source_timestamp, read_source_timestamp, get_kernel_project_package, list_files, list_specs
+from kutil.config import get_source_timestamp, read_source_timestamp, get_kernel_project_package, list_files, list_specs, uniq
 from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership, get_maintainership
 from obsapi.obsapi import OBSAPI, PkgRepo
 import xml.etree.ElementTree as ET
 from obsapi.api import APIError
 import subprocess
+import argparse
 import tempfile
 import difflib
 import json
@@ -347,3 +348,53 @@ class Uploader(UploaderBase):
         self.reset_branch = reset_branch
         self.re_fork = re_fork
         self.fork_repo(self.upstream, self.reset_branch, self.re_fork, default_branch)
+
+
+def main():
+    params = sys.argv[1:]
+    progname = sys.argv[0]
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-A', '--apiurl', default='https://api.opensuse.org', help='OBS API URL')
+    parser.add_argument('-i', '--ignore-kabi', action='store_true', help='disable kABI check at build time')
+    parser.add_argument('--no-init', action='store_true', help='do not create or update OBS project')
+    parser.add_argument('-c', '--enable-checks', action='store_true', help='do no skip rpmlint checks')
+    parser.add_argument('-d', '--debuginfo', action='store_true', help='enable debuginfo in OBS project')
+    parser.add_argument('-r', '--rebuild', action='store_true', help='do not ignore out-of-project dependency updates')
+    parser.add_argument('-s', '--submit', nargs='?', const=True, help='create a gitea PR, optionally provide text')
+    parser.add_argument('-m', '--main', action='store_true', help='Use the default branch of the upstream repository')
+    parser.add_argument('--set-git-maintainers', action='store_true', help='Set maintainers in build project _maintainership.json')
+    parser.add_argument('-l', '--log', nargs=1, help='log API calls to file')
+    parser.add_argument('--reset-branch', action='store_true', help='reset git branch head to upstream')
+    parser.add_argument('--re-fork', action='store_true', help='delete and re-fork repository if needed')
+    parser.add_argument('--maintainer', dest='maintainers', action='append', help='specify OBS project maintainers')
+    parser.add_argument('--flavor', dest='limit_packages', action='append', help='build only specified packages')
+    parser.add_argument('-q', '--quiet', dest='verbose', action='store_false', default=True, help='do not show progress')
+    parser.add_argument('-v', '--verbose', dest='verbose', action='store_true', default=True, help='show progress')
+    parser.add_argument('data', help='directory produced by tar-up')
+    parser.add_argument('project', help='OBS project to upload to')
+    args = parser.parse_args(params)
+    if args.maintainers:
+        args.maintainers = uniq(args.maintainers)
+
+    logfile = None
+    if args.log:
+        logfile = open(args.log[0], 'a')
+        sys.stderr.write('Logging API calls to %s\n' % (logfile.name,))
+
+    try:
+        ul = Uploader(api=args.apiurl, data=args.data, user_project=args.project, reset_branch=args.reset_branch, re_fork=args.re_fork,
+                      logfile=logfile, progress=args.verbose, ignore_kabi=args.ignore_kabi, default_branch=args.main)
+        if args.set_git_maintainers:
+                ul.set_git_maintainers(args.maintainers)
+        ul.upload()
+        if args.submit:
+            ul.submit(message=None if args.submit == True else args.submit)
+        if not args.no_init:
+            ul.create_project(limit_packages=args.limit_packages, maintainers=args.maintainers,
+                              debuginfo=args.debuginfo, rpm_checks=args.enable_checks, rebuild=args.rebuild)
+        ul.create_package(limit_packages=args.limit_packages, no_init=args.no_init)
+    except APIError as e:
+        sys.stderr.write('ERROR: %s\n' % (e,))
+        return 1
+    return 0
