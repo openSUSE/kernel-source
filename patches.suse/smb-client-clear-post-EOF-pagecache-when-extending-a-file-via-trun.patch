@@ -1,0 +1,209 @@
+From: Paulo Alcantara <pc@manguebit.org>
+Date: Sun, 20 Sep 2026 15:05:44 -0300
+Subject: [PATCH] smb: client: clear post-EOF pagecache when extending a file
+ via truncate
+Git-commit: 35024595f641e790e24609f3f046e1667e3b280a
+References: git-fixes
+Patch-mainline: v7.3-rc6
+
+cifs_setsize() relied on pagecache_isize_extended() to zero the tail of
+the folio straddling the old EOF, but that helper is a no-op on CIFS
+(i_blkbits is 14), so data dirtied past EOF through an mmap survived
+and became visible once the file was extended.
+
+Use netfs_clear_stale_post_isize() instead, called after i_size is
+updated since cifs_setsize() callers hold i_rwsem exclusively for the
+whole resize.  truncate_pagecache() is then called as in
+truncate_setsize(): a no-op on extend, and it drops the pagecache
+beyond the new EOF on shrink.
+
+Also thread old_size as an explicit parameter through cifs_setsize()
+and cifs_resize_file_locked(), captured by each caller before its own
+resize RPC.  This closes a race where a concurrent stat() could adopt
+the RPC's already-updated server size via is_size_safe_to_change()
+before cifs_setsize() reads old_size itself.
+
+Closes: https://sashiko.dev/#/patchset/20260921230755.1133425-1-pc%40manguebit.org
+Fixes: c510edb9734a ("cifs: call pagecache_isize_extended() in cifs_setsize() when extending")
+Reviewed-by: David Howells <dhowells@redhat.com>
+Reviewed-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Paulo Alcantara <pc@manguebit.org>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Ronnie Sahlberg <ronniesahlberg@gmail.com>
+Cc: Shyam Prasad N <sprasad@microsoft.com>
+Cc: Tom Talpey <tom@talpey.com>
+Cc: Bharath SM <bharathsm@microsoft.com>
+Cc: stable@vger.kernel.org
+[hcarvalho: netfs_clear_stale_post_isize() is not available in this tree, so
+add a minimal local cifs_clear_stale_post_isize() that implements its
+exclusive-resize case.]
+Signed-off-by: Henrique Carvalho <henrique.carvalho@suse.com>
+---
+ fs/smb/client/cifsfs.h  |    2 -
+ fs/smb/client/inode.c   |   54 ++++++++++++++++++++++++++++++++++++++++++++-----
+ fs/smb/client/smb2ops.c |   13 +++++++----
+ 3 files changed, 58 insertions(+), 11 deletions(-)
+
+--- a/fs/smb/client/cifsfs.h
++++ b/fs/smb/client/cifsfs.h
+@@ -134,7 +134,7 @@ extern ssize_t cifs_file_copychunk_range
+ 					size_t len, unsigned int flags);
+ 
+ extern long cifs_ioctl(struct file *filep, unsigned int cmd, unsigned long arg);
+-extern void cifs_setsize(struct inode *inode, loff_t offset);
++extern void cifs_setsize(struct inode *inode, loff_t old_size, loff_t offset);
+ extern int cifs_truncate_page(struct address_space *mapping, loff_t from);
+ 
+ struct smb3_fs_context;
+--- a/fs/smb/client/inode.c
++++ b/fs/smb/client/inode.c
+@@ -9,6 +9,7 @@
+ #include <linux/stat.h>
+ #include <linux/slab.h>
+ #include <linux/pagemap.h>
++#include <linux/rmap.h>
+ #include <linux/freezer.h>
+ #include <linux/sched/signal.h>
+ #include <linux/wait_bit.h>
+@@ -2816,20 +2817,62 @@ int cifs_truncate_page(struct address_sp
+ 	return rc;
+ }
+ 
+-void cifs_setsize(struct inode *inode, loff_t offset)
++/*
++ * Zero any data left in the pagecache within the [from, to) hole by a write
++ * through an mmap so that it isn't exposed as file content once the file is
++ * extended.  Only the folio straddling @from can hold such data, as pages
++ * wholly beyond the EOF can't be faulted in.
++ *
++ * i_size must already be updated to @to and the caller must hold i_rwsem
++ * exclusively for the whole resize, so staleness is decided from the folio's
++ * dirty state.  pagecache_isize_extended() can't be used as it is a no-op
++ * when the block size is >= PAGE_SIZE, as on CIFS.
++ *
++ * This is the exclusive-resize case of upstream's
++ * netfs_clear_stale_post_isize(), which isn't available in this tree.
++ */
++static void cifs_clear_stale_post_isize(struct inode *inode, loff_t from,
++					loff_t to)
++{
++	struct folio *folio;
++
++	if (from >= to)
++		return;
++
++	folio = filemap_lock_folio(inode->i_mapping, from >> PAGE_SHIFT);
++	if (IS_ERR(folio))
++		return;
++
++	folio_wait_writeback(folio);
++
++	if (folio_mkclean(folio))
++		folio_mark_dirty(folio);
++
++	if (folio_test_uptodate(folio) && folio_test_dirty(folio)) {
++		loff_t fpos = folio_pos(folio);
++
++		if (from < fpos + folio_size(folio))
++			folio_zero_segment(folio, from - fpos,
++					   min_t(loff_t, to - fpos,
++						 folio_size(folio)));
++	}
++
++	folio_unlock(folio);
++	folio_put(folio);
++}
++
++void cifs_setsize(struct inode *inode, loff_t old_size, loff_t offset)
+ {
+ 	struct cifsInodeInfo *cifs_i = CIFS_I(inode);
+-	loff_t old_size;
+ 
+ 	spin_lock(&inode->i_lock);
+-	old_size = i_size_read(inode);
+ 	i_size_write(inode, offset);
+ 	spin_unlock(&inode->i_lock);
+ 
+ 	/* Cached inode must be refreshed on truncate */
+ 	cifs_i->time = 0;
+ 	if (offset > old_size)
+-		pagecache_isize_extended(inode, old_size, offset);
++		cifs_clear_stale_post_isize(inode, old_size, offset);
+ 	truncate_pagecache(inode, offset);
+ }
+ 
+@@ -2841,6 +2884,7 @@ cifs_set_file_size(struct inode *inode,
+ 	struct cifsFileInfo *open_file;
+ 	struct cifsInodeInfo *cifsInode = CIFS_I(inode);
+ 	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
++	loff_t old_size = i_size_read(inode);
+ 	struct tcon_link *tlink = NULL;
+ 	struct cifs_tcon *tcon = NULL;
+ 	struct TCP_Server_Info *server;
+@@ -2897,7 +2941,7 @@ cifs_set_file_size(struct inode *inode,
+ set_size_out:
+ 	if (rc == 0) {
+ 		netfs_resize_file(&cifsInode->netfs, attrs->ia_size, true);
+-		cifs_setsize(inode, attrs->ia_size);
++		cifs_setsize(inode, old_size, attrs->ia_size);
+ 		/*
+ 		 * i_blocks is not related to (i_size / i_blksize), but instead
+ 		 * 512 byte (2**9) size is required for calculating num blocks.
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -2062,6 +2062,7 @@ smb2_duplicate_extents(const unsigned in
+ 	struct inode *inode;
+ 	struct duplicate_extents_to_file dup_ext_buf;
+ 	struct cifs_tcon *tcon = tlink_tcon(trgtfile->tlink);
++	loff_t old_size;
+ 
+ 	/* server fileays advertise duplicate extent support with this flag */
+ 	if ((le32_to_cpu(tcon->fsAttrInfo.Attributes) &
+@@ -2079,7 +2080,8 @@ smb2_duplicate_extents(const unsigned in
+ 			       trgtfile->fid.volatile_fid, tcon->tid,
+ 			       tcon->ses->Suid, src_off, dest_off, len);
+ 	inode = d_inode(trgtfile->dentry);
+-	if (inode->i_size < dest_off + len) {
++	old_size = i_size_read(inode);
++	if (old_size < dest_off + len) {
+ 		rc = smb2_set_file_size(xid, tcon, trgtfile, dest_off + len, false);
+ 		if (rc)
+ 			goto duplicate_extents_out;
+@@ -2092,7 +2094,7 @@ smb2_duplicate_extents(const unsigned in
+ 		 * to make sure that file's cached size is updated immediately
+ 		 */
+ 		netfs_resize_file(netfs_inode(inode), dest_off + len, true);
+-		cifs_setsize(inode, dest_off + len);
++		cifs_setsize(inode, old_size, dest_off + len);
+ 	}
+ 	rc = SMB2_ioctl(xid, tcon, trgtfile->fid.persistent_fid,
+ 			trgtfile->fid.volatile_fid,
+@@ -3573,7 +3575,7 @@ static long smb3_simple_falloc(struct fi
+ 	struct cifsFileInfo *cfile = file->private_data;
+ 	long rc = -EOPNOTSUPP;
+ 	unsigned int xid;
+-	loff_t new_eof;
++	loff_t old_eof, new_eof;
+ 
+ 	xid = get_xid();
+ 
+@@ -3594,7 +3596,8 @@ static long smb3_simple_falloc(struct fi
+ 	/*
+ 	 * Extending the file
+ 	 */
+-	if ((keep_size == false) && i_size_read(inode) < off + len) {
++	old_eof = i_size_read(inode);
++	if ((keep_size == false) && old_eof < off + len) {
+ 		rc = inode_newsize_ok(inode, off + len);
+ 		if (rc)
+ 			goto out;
+@@ -3607,7 +3610,7 @@ static long smb3_simple_falloc(struct fi
+ 				  cfile->fid.volatile_fid, cfile->pid, new_eof);
+ 		if (rc == 0) {
+ 			netfs_resize_file(&cifsi->netfs, new_eof, true);
+-			cifs_setsize(inode, new_eof);
++			cifs_setsize(inode, old_eof, new_eof);
+ 			cifs_truncate_page(inode->i_mapping, inode->i_size);
+ 			truncate_setsize(inode, new_eof);
+ 		}
