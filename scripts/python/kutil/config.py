@@ -1,4 +1,4 @@
-#! /usr/bin/env python3
+#!/usr/bin/python3
 """
 Synopsis: determine the current kernel source version from a series of patches
           as being referenced from series.conf
