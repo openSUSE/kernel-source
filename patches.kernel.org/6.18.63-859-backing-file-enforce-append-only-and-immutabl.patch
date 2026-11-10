@@ -1,0 +1,135 @@
+From: Christian Brauner <brauner@kernel.org>
+Date: Thu, 29 Oct 2026 15:00:21 +0100
+Subject: [PATCH] backing-file: enforce append-only and immutable backing
+ inodes
+References: bsc#1258210
+Patch-mainline: 6.18.63
+Git-commit: 19b18e01d0361ce495be153ecce80b581086ab3f
+
+[ Upstream commit 19b18e01d0361ce495be153ecce80b581086ab3f ]
+
+FUSE passthrough opens the backing file anew whenever the FUSE file is
+opened. fuse_passthrough_open() passes the flags of that open to
+backing_file_open() which opens the backing file with vfs_open() and the
+credentials of the server. But vfs_open() doesn't go through may_open().
+So the backing inode is never checked for S_APPEND and S_IMMUTABLE. The
+checks that did run were done on the FUSE inode and that one never has
+either flag.
+
+So anyone who may open the FUSE file for writing can overwrite an
+append-only backing file anywhere or write to an immutable one. The
+server only has to register the file and a read-only or even an O_PATH
+file descriptor is enough for that. Registering requires CAP_SYS_ADMIN
+but the writer can be any user that the server lets open the file.
+
+The FUSE inode is checked instead of the backing inode in a few more
+places:
+
+- do_mmap() refuses a shared mapping of an append-only file that was
+  opened for writing. A FUSE file opened with O_RDWR | O_APPEND passes
+  the open check and can then be mapped shared and written to at any
+  offset.
+
+- fcntl(F_SETFL) and RWF_NOAPPEND refuse to take append mode away from a
+  file on an append-only inode. On the FUSE file both succeed. A
+  synchronous write still appends because the backing file was opened
+  with O_APPEND. But an asynchronous write is submitted with the flags
+  of the user's kiocb and lands at the given offset.
+
+Do the checks on the backing inode. backing_file_open() refuses to open
+an immutable inode for writing and an append-only inode for writing
+without O_APPEND, just like may_open(). backing_file_mmap() refuses a
+shared mapping of an append-only inode, just like do_mmap(). And writes
+and splices to a backing file in append mode fail if append mode was
+taken away from the user file.
+
+A FUSE file that was opened before the backing file became append-only
+can still write anywhere. That's what happens on the native filesystem
+as well and the backing file of such a file isn't in append mode. Two
+differences remain. F_SETFL succeeds and the next write fails. And FUSE
+reports EIO for a refused open because it turns every error from opening
+the backing file into EIO.
+
+overlayfs uses the same helpers but it mirrors S_APPEND and S_IMMUTABLE
+in its own inode and a chattr through the overlay never sets them on the
+upper inode. So for overlayfs this only changes something if the upper
+inode is changed behind the overlay's back.
+
+Fixes: 4a90451bbc7f ("fuse: implement open in passthrough mode")
+Reported-by: Chris Mason <mason@kernel.org>
+Cc: stable@vger.kernel.org # v6.9+
+Link: https://patch.msgid.link/20261029-work-fs-ai-fixes-v1-2-88f22792f6f7@kernel.org
+Reviewed-by: Amir Goldstein <amir73il@gmail.com>
+Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/backing-file.c | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/fs/backing-file.c b/fs/backing-file.c
+index 6f16e23f7046..5cca636207d1 100644
+--- a/fs/backing-file.c
++++ b/fs/backing-file.c
+@@ -35,9 +35,21 @@ struct file *backing_file_open(const struct file *user_file, int flags,
+ 			       const struct cred *cred)
+ {
+ 	const struct path *user_path = file_user_path(user_file);
++	struct inode *real_inode = d_inode(real_path->dentry);
+ 	struct file *f;
+ 	int error;
+ 
++	/*
++	 * may_open() checked the inode of the user file, which need not carry
++	 * S_APPEND and S_IMMUTABLE of the backing inode.
++	 */
++	if ((flags & O_ACCMODE) != O_RDONLY) {
++		if (IS_IMMUTABLE(real_inode))
++			return ERR_PTR(-EPERM);
++		if (IS_APPEND(real_inode) && !(flags & O_APPEND))
++			return ERR_PTR(-EPERM);
++	}
++
+ 	f = alloc_empty_backing_file(flags, cred, user_file);
+ 	if (IS_ERR(f))
+ 		return f;
+@@ -222,6 +234,14 @@ ssize_t backing_file_write_iter(struct file *file, struct iov_iter *iter,
+ 	if (!iov_iter_count(iter))
+ 		return 0;
+ 
++	/*
++	 * F_SETFL and RWF_NOAPPEND can take append mode away from the user
++	 * file. They checked its inode, not the backing one.
++	 */
++	if ((file->f_flags & O_APPEND) && !(flags & IOCB_APPEND) &&
++	    IS_APPEND(file_inode(file)))
++		return -EPERM;
++
+ 	ret = file_remove_privs(iocb->ki_filp);
+ 	if (ret)
+ 		return ret;
+@@ -309,6 +329,10 @@ ssize_t backing_file_splice_write(struct pipe_inode_info *pipe,
+ 	if (!out->f_op->splice_write)
+ 		return -EINVAL;
+ 
++	/* splice refuses a user file in append mode, so F_SETFL cleared it */
++	if ((out->f_flags & O_APPEND) && IS_APPEND(file_inode(out)))
++		return -EPERM;
++
+ 	ret = file_remove_privs(iocb->ki_filp);
+ 	if (ret)
+ 		return ret;
+@@ -339,6 +363,10 @@ int backing_file_mmap(struct file *file, struct vm_area_struct *vma,
+ 	if (!can_mmap_file(file))
+ 		return -ENODEV;
+ 
++	/* do_mmap() checked the inode of the user file */
++	if ((vma->vm_flags & VM_SHARED) && IS_APPEND(file_inode(file)))
++		return -EACCES;
++
+ 	vma_set_file(vma, file);
+ 
+ 	old_cred = override_creds(ctx->cred);
+-- 
+2.56.0
+
