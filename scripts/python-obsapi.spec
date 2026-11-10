@@ -26,7 +26,7 @@ Version:        0
 Release:        0
 Summary:        Utility libraries for talking to OBS and Gitea API
 License:        GPL-2.0-only
-URL:            https://github.com/hramrach/kernel-source/tree/scripts
+URL:            https://github.com/openSUSE/kernel-source/tree/scripts/scripts
 BuildRequires:  %{python_module PyYAML}
 BuildRequires:  %{python_module certifi}
 BuildRequires:  %{python_module flit-core >= 3.11}
