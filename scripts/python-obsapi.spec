@@ -88,7 +88,7 @@ END
 %fdupes %{buildroot}%{python3_sitelib}
 
 %check
-%pytest -k api
+%pytest
 
 %if %{without libalternatives}
 
