@@ -229,7 +229,7 @@ def create_busybox_initrd(
             raise InitrdBuildError(f"Failed to compile busybox: {e}")
 
     if template_path is None:
-        template_path = Path(__file__).resolve().parent.parent / "assets" / "initrd_init.tmpl"
+        template_path = Path(__file__).resolve().parent / "assets" / "initrd_init.tmpl"
     template_text = _load_template(template_path, "Asset busybox template initialization target")
 
     init_path = initrd_dir / "custom_init"
@@ -253,7 +253,7 @@ def create_dracut_initrd(
     """Generates a full-featured dracut initrd utilizing modules built from the container environment."""
     logger.info("Creating containerized dracut initrd...")
     custom_init_template = _load_template(
-        Path(__file__).resolve().parent.parent / "assets" / "initrd_init_full.tmpl", "Dracut custom init template")
+        Path(__file__).resolve().parent / "assets" / "initrd_init_full.tmpl", "Dracut custom init template")
 
     custom_init_dest = module_install_root / "custom_init"
     custom_init_dest.write_text(
@@ -266,7 +266,7 @@ def create_dracut_initrd(
         kmoddir = f"/module_root/lib/modules/{kernel_version}"
 
     dracut_cmd_template = _load_template(
-        Path(__file__).resolve().parent.parent / "assets" / "dracut_cmd.tmpl", "Dracut command template")
+        Path(__file__).resolve().parent / "assets" / "dracut_cmd.tmpl", "Dracut command template")
     dracut_cmd = _render_template(dracut_cmd_template, {"KMODDIR": kmoddir, "KERNEL_VERSION": kernel_version})
 
     try:

@@ -67,7 +67,7 @@ def install_rpms_to_image(
         raise DependencyError(f"{virt_customize_bin} not found - required for RPM mode. Install with: zypper in guestfs-tools")
 
     logger.info("[BUILD] Using virt-customize to inject RPMs and configure image...")
-    qcow2_setup_src = Path(__file__).resolve().parent.parent / "assets" / "qcow2_setup.tmpl"
+    qcow2_setup_src = Path(__file__).resolve().parent / "assets" / "qcow2_setup.tmpl"
     if not qcow2_setup_src.exists():
         raise ImageCustomizationError(f"QCOW2 setup template missing at {qcow2_setup_src}")
 
