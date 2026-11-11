@@ -4,7 +4,7 @@ import pygit2
 from pygit2 import Oid, Tree, Blob, Reference, Branch, InvalidSpecError, GitError
 from pygit2 import Object as GitObject
 
-from libs.console import get_logger
+from kernel_sandbox.console import get_logger
 
 logger = get_logger(__name__)
 

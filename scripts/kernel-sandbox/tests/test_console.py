@@ -3,7 +3,7 @@ import logging
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 
-from libs.console import (
+from kernel_sandbox.console import (
     LOGGER_NAME,
     configure_logging,
     get_logger,

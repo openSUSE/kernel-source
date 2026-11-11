@@ -6,8 +6,8 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from libs.console import get_logger
-from libs.errors import KernelSandboxError
+from kernel_sandbox.console import get_logger
+from kernel_sandbox.errors import KernelSandboxError
 
 logger = get_logger(__name__)
 DEFAULT_VIRT_CUSTOMIZE_TIMEOUT = 900

@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 import pygit2
 from pygit2 import Commit, Blob
-from libs.kernel_source_git import Repository
+from kernel_sandbox.kernel_source_git import Repository
 
 
 class TestKernelRepository(unittest.TestCase):

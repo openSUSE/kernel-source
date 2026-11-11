@@ -6,11 +6,11 @@ import shutil
 import subprocess
 import tarfile
 from pathlib import Path
-from libs.console import get_logger
-from libs.container_engine import ContainerEngine, ContainerRuntimeError
-from libs.errors import KernelSandboxError
-from libs.lock import file_lock
-from libs.storage_manager import HTTPDownloader
+from kernel_sandbox.console import get_logger
+from kernel_sandbox.container_engine import ContainerEngine, ContainerRuntimeError
+from kernel_sandbox.errors import KernelSandboxError
+from kernel_sandbox.lock import file_lock
+from kernel_sandbox.storage_manager import HTTPDownloader
 
 logger = get_logger(__name__)
 

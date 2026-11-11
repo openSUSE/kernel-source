@@ -4,12 +4,12 @@ import unittest
 from pathlib import Path
 
 import pipeline_engines
-from libs.cache_metadata import read_cache_metadata
-from libs.container_engine import ContainerRuntimeError
-from libs.image_customizer import DependencyError, ImageCustomizationError
-from libs.initrd_builder import InitrdBuildError
-from libs.pipeline_context import FastModeContext, RpmModeContext
-from libs.virtual_engine import VirtualEngineError
+from kernel_sandbox.cache_metadata import read_cache_metadata
+from kernel_sandbox.container_engine import ContainerRuntimeError
+from kernel_sandbox.image_customizer import DependencyError, ImageCustomizationError
+from kernel_sandbox.initrd_builder import InitrdBuildError
+from kernel_sandbox.pipeline_context import FastModeContext, RpmModeContext
+from kernel_sandbox.virtual_engine import VirtualEngineError
 from pipeline_engines import BootEngine, BuildEngine, ImagePreparer, PipelineError, get_max_build_jobs
 
 

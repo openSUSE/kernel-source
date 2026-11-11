@@ -10,7 +10,7 @@ initrd** (direct `bzImage` boot, no full RPM build, SSH available out of the
 box).
 
 > **Heads up - the initrd and boot layers are evolving.**
-> `libs/initrd_builder.py` and its `--use-busybox-initrd`/dracut machinery are
+> `kernel_sandbox/initrd_builder.py` and its `--use-busybox-initrd`/dracut machinery are
 > expected to be obsoleted/rewritten in the future. We are evaluating
 > `rapido-linux/rapido` and `virtme-ng` to handle the VM orchestration and
 > initrd generation. If you fixing/extending the initrd internals, keep changes
@@ -396,7 +396,7 @@ LINUX_GIT=/srv/git/linux.git/ ./scripts/kernel-sandbox/kernel-sandbox --commit "
 ```
 
 ### Rebuilding just the initrd (dracut/init script changes)
-If you are iterating on `libs/initrd_builder.py`, `assets/dracut_cmd.tmpl`, or
+If you are iterating on `kernel_sandbox/initrd_builder.py`, `assets/dracut_cmd.tmpl`, or
 `assets/initrd_init*.tmpl` and don't need to recompile the kernel itself, delete
 only the cached `initrd_custom.gz` for that commit/arch/config, then rerun just
 the `image` phase - `build` stays a cache hit, so it is much faster than a full
@@ -553,7 +553,7 @@ cleanup path under that combination hasn't been verified yet, so it isn't the
 default today, will revisit later.
 
 ### Reproducing `--mode rpm`'s image-customization step by hand
-If `libs/image_customizer.py`'s `install_rpms_to_image()` (the `virt-customize`
+If `kernel_sandbox/image_customizer.py`'s `install_rpms_to_image()` (the `virt-customize`
 step that installs your built RPMs into the base qcow2) fails and the wrapped
 error isn't enough to diagnose, here is the same sequence run manually, one step
 at a time, against a throwaway qcow2:

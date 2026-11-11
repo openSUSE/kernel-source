@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from libs.pipeline_context import FastModeContext, PipelineContext, RpmModeContext
+from kernel_sandbox.pipeline_context import FastModeContext, PipelineContext, RpmModeContext
 
 
 def _common_fields(**overrides):

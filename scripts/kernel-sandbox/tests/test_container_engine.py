@@ -6,9 +6,9 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 
-import libs.container_engine as container_engine_module
-from libs.config_manager import ConfigSpecError, load_yaml_spec
-from libs.container_engine import ContainerEngine, ContainerRuntimeError
+import kernel_sandbox.container_engine as container_engine_module
+from kernel_sandbox.config_manager import ConfigSpecError, load_yaml_spec
+from kernel_sandbox.container_engine import ContainerEngine, ContainerRuntimeError
 
 
 def _mock_executable(directory, name):

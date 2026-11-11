@@ -7,9 +7,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import libs.initrd_builder as initrd_builder
-from libs.container_engine import ContainerRuntimeError
-from libs.initrd_builder import (
+import kernel_sandbox.initrd_builder as initrd_builder
+from kernel_sandbox.container_engine import ContainerRuntimeError
+from kernel_sandbox.initrd_builder import (
     InitrdBuildError,
     compile_busybox,
     create_busybox_initrd,
