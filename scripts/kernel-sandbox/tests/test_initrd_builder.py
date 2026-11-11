@@ -1,4 +1,5 @@
 import gzip
+import sys
 import io
 import os
 import subprocess
@@ -279,7 +280,7 @@ class TestPackRamdiskArchive(unittest.TestCase):
             "    if path:\n"
             "        sys.stdout.buffer.write(path + b'-' + (b'X' * 2048))\n"
         )
-        mock_cpio = self.mock_cpio(mock_cpio_script, shebang="#!/usr/bin/env python3")
+        mock_cpio = self.mock_cpio(mock_cpio_script, shebang=f"#!{sys.executable}")
 
         output = Path(self.tmp_dir.name) / "out" / "initrd.gz"
         pack_ramdisk_archive(self.initrd_dir, output, cpio_timeout=10, cpio_bin=mock_cpio)
