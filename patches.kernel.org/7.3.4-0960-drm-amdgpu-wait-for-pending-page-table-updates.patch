@@ -1,0 +1,109 @@
+From: John Fisher <jfisher84@gmail.com>
+Date: Fri, 9 Oct 2026 09:45:17 +1300
+Subject: [PATCH] drm/amdgpu: wait for pending page table updates before
+ switching a VM to CPU updates
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1012628
+Patch-mainline: 7.3.4
+Git-commit: 53d9ef2f518add783bb48a69d77bbc8aea99e911
+
+[ Upstream commit 53d9ef2f518add783bb48a69d77bbc8aea99e911 ]
+
+amdgpu_vm_make_compute() switches a VM from SDMA to CPU page table
+updates when a KFD process acquires it. It syncs "with the last SDMA
+update/clear" through amdgpu_bo_sync_wait() on the root PD, but that
+walks the reservation with DMA_RESV_USAGE_READ, and the clears of the
+VM's page tables (the root PD from amdgpu_vm_init(), and the PDs/PTs
+the seq64 mapping allocates at the render node's open) are added there
+by amdgpu_vm_sdma_commit() with DMA_RESV_USAGE_BOOKKEEP only:
+amdgpu_vm_pt_clear() commits them with a NULL fence, so they do not
+reach vm->last_update. The CPU path's own waits (amdgpu_vm_cpu_update(),
+amdgpu_bo_kmap()) use DMA_RESV_USAGE_KERNEL. None of them waits for a
+clear that is still queued.
+
+When one is, the CPU writes the first entries of the new compute VM (the
+KFD trap handler's TBA/TMA page at AMDGPU_VA_RESERVED_TRAP_START, mapped
+during ACQUIRE_VM) into a page directory the SDMA then clears. The
+entries are gone, the handler's page is unmapped, and the first wave
+save of any queue of the process faults in the SQC instruction fetch at
+the handler's address (GCVM_L2_PROTECTION_FAULT_STATUS 0x008012B1,
+PERMISSION_FAULTS 0xb). The MES then fails REMOVE_QUEUE and SUSPEND, and
+the device takes a MODE1 reset with VRAM lost on 7.2.9; on 7.3-rc6 the
+queue is reset instead.
+
+The window is the time between the render node's open and ACQUIRE_VM.
+ROCr spends milliseconds there and is practically never hit; a minimal
+KFD client that opens the render node and acquires the VM at once is hit
+most of the time. On a Radeon AI PRO R9700 (gfx1201, Resizable BAR, so
+vm_update_mode defaults to CPU updates for compute VMs), a wave reading
+the trap handler's page right after queue creation found it unmapped in
+8 of 12 runs; a 5 ms sleep between the open and ACQUIRE_VM made that 0
+of 9, and the same sleep after queue creation instead 3 of 3.
+
+The wait covered these jobs until commit 926c79ad6ecd ("drm/amdgpu:
+promote the implicit sync to the dependent read fences") narrowed
+amdgpu_sync_resv() from DMA_RESV_USAGE_BOOKKEEP to DMA_RESV_USAGE_READ;
+the VM's page table jobs have been added with BOOKKEEP since commit
+4247084057cf ("drm/amdgpu: use DMA_RESV_USAGE_BOOKKEEP v2"), so from
+v6.16 on the sync in amdgpu_vm_make_compute() waits for nothing of
+them.
+
+Record the clears in vm->last_update, as amdgpu_vm_update_pdes() does
+with its updates, and wait for it, uninterruptibly, before switching the
+update functions. The clears all go through vm->delayed, so the last one
+covers the earlier ones; immediate clears are not recorded, as before.
+
+With this, on 7.3-rc6 and on 7.2.9, the same client reads the handler
+10 of 10 times, 8 busy queues on the 4 compute slots complete in 5 of 5
+runs on 7.3-rc6 and 3 of 3 on 7.2.9 (1 of 6 before), 16 and 32 queues
+complete on 7.3-rc6, and two processes with 8 queues each complete
+together on both, with no fault.
+
+Fixes: 926c79ad6ecd ("drm/amdgpu: promote the implicit sync to the dependent read fences")
+Cc: Prike Liang <Prike.Liang@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: John Fisher <jfisher84@gmail.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 9ec91b35baba45209c3fcd00f086224a158dd512)
+Cc: stable@vger.kernel.org # v6.16+
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c    | 5 +----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c | 2 +-
+ 2 files changed, 2 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 4a63b472f68e..fc3a8d38d514 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -2725,10 +2725,7 @@ int amdgpu_vm_make_compute(struct amdgpu_device *adev, struct amdgpu_vm *vm)
+ 
+ 	if (vm->use_cpu_for_update) {
+ 		/* Sync with last SDMA update/clear before switching to CPU */
+-		r = amdgpu_bo_sync_wait(vm->root.bo,
+-					AMDGPU_FENCE_OWNER_UNDEFINED, true);
+-		if (r)
+-			goto unreserve_bo;
++		dma_fence_wait(vm->last_update, false);
+ 
+ 		vm->update_funcs = &amdgpu_vm_cpu_funcs;
+ 		r = amdgpu_vm_pt_map_tables(adev, vm);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c
+index e43a60d09808..cef4171b4ad0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c
+@@ -422,7 +422,7 @@ int amdgpu_vm_pt_clear(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 	if (r)
+ 		goto exit;
+ 
+-	r = vm->update_funcs->commit(&params, NULL);
++	r = vm->update_funcs->commit(&params, &vm->last_update);
+ exit:
+ 	drm_dev_exit(idx);
+ 	return r;
+-- 
+2.56.0
+

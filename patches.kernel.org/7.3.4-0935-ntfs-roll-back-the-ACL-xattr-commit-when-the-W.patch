@@ -1,0 +1,146 @@
+From: Hongling Zeng <zenghongling@kylinos.cn>
+Date: Tue, 13 Oct 2026 09:56:52 +0800
+Subject: [PATCH] ntfs: roll back the ACL xattr commit when the WSL mode update
+ fails
+References: bsc#1012628
+Patch-mainline: 7.3.4
+Git-commit: 89467388e8afc6b55ea7cd38bc1f469df7747db0
+
+[ Upstream commit 89467388e8afc6b55ea7cd38bc1f469df7747db0 ]
+
+ntfs_set_acl_ex() commits the ACL xattr before it rewrites the WSL
+mode EA, and removes it again when the rewrite fails.  That only
+undoes a set that created the xattr: when the update replaced or
+removed an existing one, the old ACL is discarded along with the
+failed update.  No error is recorded when the undo fails, so the
+new, typically more permissive, ACL is left on disk while i_mode,
+the mode EA and the cached ACL keep the old values.  After a
+remount, a chmod 0640 -> 0777 that reported failure leaves the file
+accessible to the relaxed ACL while stat() still reports 0640.
+
+Save the previous xattr before committing the update, and restore it
+when the mode EA rewrite fails.  A removed xattr is created again,
+since XATTR_REPLACE fails with -ENODATA once the removal dropped the
+entry.  Remove the new xattr only when there was no previous one, and
+skip the undo when the commit changed nothing.  A failed rollback is
+recorded: NVolSetErrors(), which the next persistence point persists
+as VOLUME_IS_DIRTY, and a log message the errors= policy acts on.
+The flag cannot be written to disk here directly: the target inode's
+mrec_lock is held and the $Volume mrec_lock cannot be nested under
+it.
+
+Fixes: fc053f05ca28 ("ntfs: add reparse and ea operations")
+Cc: stable@vger.kernel.org
+Suggested-by: Hyunchul Lee <hyc.lee@gmail.com>
+Signed-off-by: Hongling Zeng <zenghongling@kylinos.cn>
+Reviewed-by: Hyunchul Lee <hyc.lee@gmail.com>
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/ntfs/ea.c | 67 ++++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/fs/ntfs/ea.c b/fs/ntfs/ea.c
+index b4fcfbe2da4c..6ac551fe8ea6 100644
+--- a/fs/ntfs/ea.c
++++ b/fs/ntfs/ea.c
+@@ -1027,8 +1027,9 @@ static noinline int ntfs_set_acl_ex(struct mnt_idmap *idmap,
+ {
+ 	const char *name;
+ 	size_t size, name_len;
+-	void *value;
+-	int err;
++	void *value, *old_value = NULL;
++	int err, old_len = -ENODATA;
++	bool acl_committed = false;
+ 	int flags;
+ 	umode_t mode;
+ 
+@@ -1072,7 +1073,34 @@ static noinline int ntfs_set_acl_ex(struct mnt_idmap *idmap,
+ 	}
+ 
+ 	mutex_lock(&NTFS_I(inode)->mrec_lock);
++	if (!init_acl) {
++		/* Save the old xattr for rollback. */
++		old_len = ntfs_get_ea(inode, name, name_len, NULL, 0);
++		if (old_len >= 0) {
++			/* kmalloc(0) returns the non-NULL ZERO_SIZE_PTR. */
++			old_value = kmalloc(old_len, GFP_NOFS);
++			if (!old_value) {
++				err = -ENOMEM;
++				goto out_unlock;
++			}
++			err = ntfs_get_ea(inode, name, name_len,
++					  old_value, old_len);
++			if (err != old_len) {
++				kfree(old_value);
++				old_value = NULL;
++				if (err >= 0)
++					err = -EIO;
++				goto out_unlock;
++			}
++		} else if (old_len != -ENODATA) {
++			err = old_len;
++			goto out_unlock;
++		}
++	}
+ 	err = ntfs_set_ea(inode, name, name_len, value, size, flags, NULL);
++	if (!err)
++		acl_committed = true;
++out_unlock:
+ 	mutex_unlock(&NTFS_I(inode)->mrec_lock);
+ 	if (err == -ENODATA && !size)
+ 		err = 0; /* Removing non existed xattr. */
+@@ -1084,8 +1112,38 @@ static noinline int ntfs_set_acl_ex(struct mnt_idmap *idmap,
+ 		mutex_lock(&NTFS_I(inode)->mrec_lock);
+ 		err = ntfs_ea_set_wsl_inode(inode, 0, &ea_size, NTFS_EA_MODE);
+ 		if (err) {
+-			ntfs_set_ea(inode, name, name_len, NULL, 0,
+-				    XATTR_REPLACE, NULL);
++			if (acl_committed) {
++				int undo_err;
++
++				if (old_len >= 0) {
++					/*
++					 * A removed or zero-length xattr must
++					 * be recreated without XATTR_REPLACE.
++					 */
++					int undo_flags = acl && old_len ?
++						XATTR_REPLACE : 0;
++
++					undo_err = ntfs_set_ea(inode, name,
++							name_len, old_value,
++							old_len, undo_flags,
++							NULL);
++				} else {
++					undo_err = ntfs_set_ea(inode, name,
++							name_len, NULL, 0,
++							XATTR_REPLACE, NULL);
++				}
++				if (undo_err) {
++					/*
++					 * Record a failed rollback so the next
++					 * persistence point marks the volume
++					 * dirty.  Run chkdsk.
++					 */
++					NVolSetErrors(NTFS_I(inode)->vol);
++					ntfs_error(inode->i_sb,
++						   "Failed to undo the ACL xattr: %d",
++						   undo_err);
++				}
++			}
+ 			mutex_unlock(&NTFS_I(inode)->mrec_lock);
+ 			inode->i_mode = old_mode;
+ 			goto out;
+@@ -1098,6 +1156,7 @@ static noinline int ntfs_set_acl_ex(struct mnt_idmap *idmap,
+ 	}
+ 
+ out:
++	kfree(old_value);
+ 	kfree(value);
+ 
+ 	return err;
+-- 
+2.56.0
+

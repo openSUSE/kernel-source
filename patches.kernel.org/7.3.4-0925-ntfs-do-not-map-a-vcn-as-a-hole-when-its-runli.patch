@@ -1,0 +1,150 @@
+From: Matthias Goergens <matthias.goergens@gmail.com>
+Date: Wed, 30 Sep 2026 11:48:33 +0800
+Subject: [PATCH] ntfs: do not map a vcn as a hole when its runlist lookup
+ failed
+References: bsc#1012628
+Patch-mainline: 7.3.4
+Git-commit: e727ea7fc4e36b3d14b7bb304e82918aa6e2024a
+
+[ Upstream commit e727ea7fc4e36b3d14b7bb304e82918aa6e2024a ]
+
+ntfs_attr_vcn_to_rl() retries ntfs_map_runlist_nolock() for any lcn up
+to LCN_RL_NOT_MAPPED, which includes LCN_ENOENT, but turns a failed
+retry into an error only for LCN_RL_NOT_MAPPED.  For LCN_ENOENT the
+error is dropped and the read path maps the range as a hole.
+
+An LCN_ENOENT below allocated_size comes from a base extent with a
+highest_vcn of 0, which ntfs_mapping_pairs_decompress() takes to map the
+whole attribute, so the runlist ends after its last mapping pair.  If
+the pairs end early, the retry finds the same extent and fails with
+-ENOENT.  On a crafted volume with 4 KiB clusters, a 64-cluster file
+whose mapping pairs stop after 16 clusters reads 48 clusters of zeros,
+with no error.
+
+The same layout gets a crafted $MFT past the check from "ntfs: fail the
+mount when $MFT needs its own extent records".  With 512-byte clusters
+and $MFT's mapping pairs ending at vcn 4, an unpatched kernel hangs on
+the folio lock reading records 0-3.  With the check alone, the -EIO is
+dropped, records 2 and 3 read as zeros and the mount carries on until
+check_mft_mirror() finds the zeroed record 2.
+
+Fail the lookup whenever the retry leaves @vcn unmapped below
+allocated_size, -ENOENT included.  At or beyond allocated_size the end
+of the runlist is still returned as it is.
+
+A failed expansion in ntfs_non_resident_attr_expand() or
+ntfs_attrlist_repack() truncates the runlist under the runlist lock but
+restores allocated_size only after dropping it.  A lookup in between
+would now fail, so restore allocated_size before dropping the lock in
+both, under size_lock, which ntfs_attr_vcn_to_rl() takes to read it.
+
+The crafted file now fails from vcn 16 on with -EIO, and the crafted
+volume fails to mount with the check's message.
+
+Fixes: 495e90fa3348 ("ntfs: update attrib operations")
+Cc: stable@vger.kernel.org
+Signed-off-by: Matthias Goergens <matthias.goergens@gmail.com>
+Reviewed-by: Hyunchul Lee <hyc.lee@gmail.com>
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/ntfs/attrib.c   | 30 ++++++++++++++++++++----------
+ fs/ntfs/attrlist.c |  8 ++++++--
+ 2 files changed, 26 insertions(+), 12 deletions(-)
+
+diff --git a/fs/ntfs/attrib.c b/fs/ntfs/attrib.c
+index f8eecdcf5785..c5df913d3cba 100644
+--- a/fs/ntfs/attrib.c
++++ b/fs/ntfs/attrib.c
+@@ -354,14 +354,16 @@ struct runlist_element *ntfs_attr_vcn_to_rl(struct ntfs_inode *ni, s64 vcn, s64
+ 	}
+ 
+ 	/*
+-	 * The runlist fragment containing @vcn could not be mapped, e.g.
+-	 * because the extent mft record holding it is corrupt.  Do not hand
+-	 * LCN_RL_NOT_MAPPED back to callers, which would treat it as a hole.
+-	 * At or beyond the allocated size nothing is mapped, and the runlist
+-	 * ends there with LCN_RL_NOT_MAPPED if only a later extent has been
+-	 * mapped, so return that end as it is.
++	 * Neither the runlist nor the retry mapped @vcn, e.g. because the
++	 * extent mft record holding it is corrupt or because the mapping
++	 * pairs end too soon.  ntfs_map_runlist_nolock() reports the latter
++	 * as -ENOENT, as @vcn lies past the extent it found.  Below the
++	 * allocated size, callers would treat LCN_RL_NOT_MAPPED or LCN_ENOENT
++	 * as a hole, so fail instead.  At or beyond it nothing is mapped: the
++	 * runlist ends there with LCN_ENOENT, or with LCN_RL_NOT_MAPPED if
++	 * only a later extent has been mapped, so return that end as it is.
+ 	 */
+-	if (*lcn == LCN_RL_NOT_MAPPED) {
++	if (*lcn <= LCN_RL_NOT_MAPPED) {
+ 		unsigned long flags;
+ 		s64 allocated_size;
+ 
+@@ -4484,6 +4486,7 @@ static int ntfs_non_resident_attr_expand(struct ntfs_inode *ni, const s64 newsiz
+ 	struct ntfs_inode *base_ni;
+ 	struct super_block *sb = ni->vol->sb;
+ 	size_t new_rl_count;
++	unsigned long flags;
+ 
+ 	ntfs_debug("Inode 0x%llx, attr 0x%x, new size %lld old size %lld\n",
+ 			(unsigned long long)ni->mft_no, ni->type,
+@@ -4714,11 +4717,20 @@ static int ntfs_non_resident_attr_expand(struct ntfs_inode *ni, const s64 newsiz
+ 	if (err2)
+ 		ntfs_debug("Leaking clusters");
+ 
+-	/* Now, truncate the runlist itself. */
++	/*
++	 * Now, truncate the runlist itself.  Restore allocated_size before
++	 * dropping the lock: ntfs_attr_vcn_to_rl() fails a lookup below the
++	 * allocated size that falls past the end of the runlist.
++	 */
+ 	if (ni != locked_ni)
+ 		down_write(&ni->runlist.lock);
+ 	err2 = ntfs_rl_truncate_nolock(vol, &ni->runlist,
+ 			ntfs_bytes_to_cluster(vol, org_alloc_size));
++	if (!err2) {
++		write_lock_irqsave(&ni->size_lock, flags);
++		ni->allocated_size = org_alloc_size;
++		write_unlock_irqrestore(&ni->size_lock, flags);
++	}
+ 	if (ni != locked_ni)
+ 		up_write(&ni->runlist.lock);
+ 	if (err2) {
+@@ -4730,8 +4742,6 @@ static int ntfs_non_resident_attr_expand(struct ntfs_inode *ni, const s64 newsiz
+ 		ni->runlist.rl = NULL;
+ 		ntfs_error(sb, "Couldn't truncate runlist. Rollback failed");
+ 	} else {
+-		/* Prepare to mapping pairs update. */
+-		ni->allocated_size = org_alloc_size;
+ 		/* Restore mapping pairs. */
+ 		if (ni != locked_ni)
+ 			down_read(&ni->runlist.lock);
+diff --git a/fs/ntfs/attrlist.c b/fs/ntfs/attrlist.c
+index 1abe0ec2a398..78e9a1dc7925 100644
+--- a/fs/ntfs/attrlist.c
++++ b/fs/ntfs/attrlist.c
+@@ -168,14 +168,18 @@ static int ntfs_attrlist_repack(struct inode *attr_vi,
+ 	return 0;
+ 
+ restore_old_runlist:
++	/*
++	 * Restore allocated_size before dropping the runlist lock:
++	 * ntfs_attr_vcn_to_rl() fails a lookup below the allocated size that
++	 * falls past the end of the runlist.
++	 */
+ 	down_write(&attr_ni->runlist.lock);
+ 	attr_ni->runlist.rl = old_rl;
+ 	attr_ni->runlist.count = old_rl_count;
+-	up_write(&attr_ni->runlist.lock);
+-
+ 	write_lock_irqsave(&attr_ni->size_lock, flags);
+ 	attr_ni->allocated_size = old_alloc_size;
+ 	write_unlock_irqrestore(&attr_ni->size_lock, flags);
++	up_write(&attr_ni->runlist.lock);
+ 
+ 	restore_err = ntfs_attr_update_mapping_pairs_locked(
+ 			attr_ni, 0, locked_ni);
+-- 
+2.56.0
+

@@ -1,0 +1,143 @@
+From: Vaibhav Nagare <vnagare@redhat.com>
+Date: Mon, 12 Oct 2026 12:58:02 +0530
+Subject: [PATCH] bnxt_en: don't leave an XDP program installed when the open
+ fails
+References: bsc#1012628
+Patch-mainline: 7.3.4
+Git-commit: 78731b46967e3e7102b5cd5062bef185f3404b5c
+
+[ Upstream commit 78731b46967e3e7102b5cd5062bef185f3404b5c ]
+
+bnxt_xdp_set() stores the new program and drops the reference on the old
+one before reopening the NIC.  If bnxt_open_nic() then fails, ndo_bpf()
+returns an error with the new program still in bp->xdp_prog.  The caller
+treats the error as "nothing was installed" and drops its own reference,
+so bp->xdp_prog is left pointing at a freed program and the next XDP
+update dereferences it:
+
+  BUG: unable to handle page fault for address: ff78ecc80ddd1038
+  RIP: 0010:__bpf_prog_put+0x5/0x80
+  Call Trace:
+   bnxt_xdp_set+0xad/0x1b0 [bnxt_en]
+   dev_xdp_propagate+0x36/0xa0
+   bond_xdp_set+0xeb/0x2d0 [bonding]
+   dev_xdp_install+0x1b1/0x350
+   bpf_xdp_link_update+0xc5/0x1b0
+   link_update+0x104/0x1e0
+   __sys_bpf+0x662/0xcf0
+
+Seen on a 6.12 based kernel after bnxt_alloc_mem() failed an order-4
+allocation on a fragmented host:
+
+  bnxt_en 0000:a0:00.1 ens4f1np1: nic open fail (rc: fffffff4)
+  bond1: (slave ens4f1np1): Error -12 calling ndo_bpf
+
+Bonding is not required to hit this; a plain XDP attach on a bnxt
+interface takes the same path.
+
+Restore the previous program when an attach or a replace fails, and
+recompute the page-mode and XDP TX ring configuration from it.  The
+configuration matters because bnxt_init_one_rx_ring() only assigns
+rxr->xdp_prog in page mode, and __bnxt_set_rx_skb_mode() derives
+dev->max_mtu from the installed program.  Release the old program only
+once the change has been committed.
+
+A detach is not undone.  dev_xdp_detach_link() clears the core's record
+of the program even when the driver returns an error, so putting the
+program back would leave the driver running a program the core has
+already dropped.  If the reopen fails during a detach, bnxt_xdp_set()
+therefore returns 0 with the device closed; bnxt_open_nic() has already
+logged the failure.
+
+Found in a crash dump; the change was not tested on hardware.
+
+Fixes: c6d30e8391b8 ("bnxt_en: Add basic XDP support.")
+Cc: stable@vger.kernel.org
+Signed-off-by: Vaibhav Nagare <vnagare@redhat.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/20261012072802.2153706-1-vnagare@redhat.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c | 49 +++++++++++++------
+ 1 file changed, 33 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+index 9e5009be8e98..96845c8646e0 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+@@ -381,11 +381,31 @@ int bnxt_xdp_xmit(struct net_device *dev, int num_frames,
+ 	return nxmit;
+ }
+ 
++static void bnxt_xdp_apply_cfg(struct bnxt *bp, int tx_xdp)
++{
++	struct net_device *dev = bp->dev;
++	int tc = bp->num_tc ? : 1;
++
++	if (bp->xdp_prog) {
++		bnxt_set_rx_skb_mode(bp, true);
++		xdp_features_set_redirect_target_locked(dev, true);
++	} else {
++		xdp_features_clear_redirect_target_locked(dev);
++		bnxt_set_rx_skb_mode(bp, false);
++	}
++	bp->tx_nr_rings_xdp = tx_xdp;
++	bp->tx_nr_rings = bp->tx_nr_rings_per_tc * tc + tx_xdp;
++	bnxt_set_cp_rings(bp, true);
++	bnxt_set_tpa_flags(bp);
++	bnxt_set_ring_params(bp);
++}
++
+ static int bnxt_xdp_set(struct bnxt *bp, struct bpf_prog *prog)
+ {
+ 	struct net_device *dev = bp->dev;
+ 	int tx_xdp = 0, rc, tc;
+ 	struct bpf_prog *old;
++	int old_tx_xdp;
+ 
+ 	netdev_assert_locked(dev);
+ 
+@@ -418,25 +438,22 @@ static int bnxt_xdp_set(struct bnxt *bp, struct bpf_prog *prog)
+ 	if (netif_running(dev))
+ 		bnxt_close_nic(bp, true, false);
+ 
++	old_tx_xdp = bp->tx_nr_rings_xdp;
+ 	old = xchg(&bp->xdp_prog, prog);
+-	if (old)
+-		bpf_prog_put(old);
+-
+-	if (prog) {
+-		bnxt_set_rx_skb_mode(bp, true);
+-		xdp_features_set_redirect_target_locked(dev, true);
+-	} else {
+-		xdp_features_clear_redirect_target_locked(dev);
+-		bnxt_set_rx_skb_mode(bp, false);
++	bnxt_xdp_apply_cfg(bp, tx_xdp);
++
++	if (netif_running(dev)) {
++		rc = bnxt_open_nic(bp, true, false);
++		/* a detach cannot be undone, only an attach */
++		if (rc && prog) {
++			WRITE_ONCE(bp->xdp_prog, old);
++			bnxt_xdp_apply_cfg(bp, old_tx_xdp);
++			return rc;
++		}
+ 	}
+-	bp->tx_nr_rings_xdp = tx_xdp;
+-	bp->tx_nr_rings = bp->tx_nr_rings_per_tc * tc + tx_xdp;
+-	bnxt_set_cp_rings(bp, true);
+-	bnxt_set_tpa_flags(bp);
+-	bnxt_set_ring_params(bp);
+ 
+-	if (netif_running(dev))
+-		return bnxt_open_nic(bp, true, false);
++	if (old)
++		bpf_prog_put(old);
+ 
+ 	return 0;
+ }
+-- 
+2.56.0
+

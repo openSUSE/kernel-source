@@ -1,0 +1,128 @@
+From: Niklas Cassel <cassel@kernel.org>
+Date: Tue, 20 Oct 2026 12:11:08 +0200
+Subject: [PATCH] ata: libata-sff: fix race between IRQ deferral and
+ ata_sff_flush_pio_task()
+References: bsc#1012628
+Patch-mainline: 7.3.4
+Git-commit: 69be770908ae57354a41d7e1cc99ab46278d2e86
+
+[ Upstream commit 69be770908ae57354a41d7e1cc99ab46278d2e86 ]
+
+Commit 4a2e5409472e ("ata: libata-sff: don't busy-wait for PIO data-in
+command completion") allowed the interrupt handler to queue
+ap->sff_pio_task from ata_sff_hsm_move() when a PIO data-in command is
+still busy after its final data block.
+
+ata_sff_flush_pio_task(), however, was written under the assumption that
+cancel_delayed_work_sync() is enough to prevent sff_pio_task from being
+queued again before the HSM state is reset to HSM_ST_IDLE and
+sff_pio_task_link is cleared.
+
+The flush runs early during error handling, at a point where the timed
+out command is still active, the port is not frozen yet, and interrupts
+are still being serviced.  If the final data-block interrupt of a PIO
+data-in command is serviced in the window between
+cancel_delayed_work_sync() and the reset of hsm_task_state, the
+interrupt handler queues sff_pio_task after the cancel has completed.
+When that work item then executes on ata_sff_wq after the flush cleared
+ap->sff_pio_task_link, ata_sff_pio_task() hits
+BUG_ON(ap->sff_pio_task_link == NULL) while holding the host lock with
+interrupts disabled; alternatively it proceeds on a stale link while
+error handling owns the port.
+
+Fix this by resetting hsm_task_state to HSM_ST_IDLE before cancelling
+the work item.  Once the state is IDLE, __ata_sff_port_intr() can no
+longer enter ata_sff_hsm_move(), so the interrupt handler can no longer
+queue the pio task, and cancel_delayed_work_sync() drains whatever was
+queued before the reset.
+
+Also make ata_sff_pio_task() bail out quietly when the HSM state was
+marked idle by the flush, both at entry and after re-acquiring the port
+lock following ata_msleep(), since a work item can already be running
+when the flush resets the state.
+
+Reported-by: sashiko-bot <sashiko-bot@kernel.org>
+Link: https://lore.kernel.org/linux-ide/sashiko-outbox-177477@kernel.org/
+Fixes: 4a2e5409472e ("ata: libata-sff: don't busy-wait for PIO data-in command completion")
+Cc: stable@vger.kernel.org
+Reviewed-by: Damien Le Moal <dlemoal@kernel.org>
+Link: https://lore.kernel.org/r/20261020101107.1449635-2-cassel@kernel.org
+Signed-off-by: Niklas Cassel <cassel@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/ata/libata-sff.c | 32 +++++++++++++++++++++++++++++---
+ 1 file changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/ata/libata-sff.c b/drivers/ata/libata-sff.c
+index d5ef0338735c..c2aad525010c 100644
+--- a/drivers/ata/libata-sff.c
++++ b/drivers/ata/libata-sff.c
+@@ -1196,8 +1196,6 @@ void ata_sff_flush_pio_task(struct ata_port *ap)
+ {
+ 	trace_ata_sff_flush_pio_task(ap);
+ 
+-	cancel_delayed_work_sync(&ap->sff_pio_task);
+-
+ 	/*
+ 	 * We wanna reset the HSM state to IDLE.  If we do so without
+ 	 * grabbing the port lock, critical sections protected by it which
+@@ -1205,11 +1203,26 @@ void ata_sff_flush_pio_task(struct ata_port *ap)
+ 	 * example, we may set IDLE in between the time
+ 	 * __ata_sff_port_intr() checks for HSM_ST_IDLE and before it calls
+ 	 * ata_sff_hsm_move() causing ata_sff_hsm_move() to BUG().
++	 *
++	 * Reset the state before cancelling the work item: once the state
++	 * is IDLE, __ata_sff_port_intr() can no longer enter
++	 * ata_sff_hsm_move(), which prevents the interrupt handler from
++	 * queueing sff_pio_task when deferring the completion of a PIO
++	 * data-in command.  The SCSI error handler cannot dispatch new
++	 * commands while error handling is in progress, so issue-time
++	 * queuing is not possible either.
+ 	 */
+ 	spin_lock_irq(ap->lock);
+ 	ap->hsm_task_state = HSM_ST_IDLE;
+ 	spin_unlock_irq(ap->lock);
+ 
++	/*
++	 * Now that the interrupt handler can no longer queue the pio task,
++	 * cancel it.  This also drains a work item that the interrupt
++	 * handler managed to queue before the HSM state was reset.
++	 */
++	cancel_delayed_work_sync(&ap->sff_pio_task);
++
+ 	ap->sff_pio_task_link = NULL;
+ }
+ 
+@@ -1233,7 +1246,13 @@ static void ata_sff_pio_task(struct work_struct *work)
+ 	}
+ 
+ fsm_start:
+-	WARN_ON_ONCE(ap->hsm_task_state == HSM_ST_IDLE);
++	/*
++	 * ata_sff_flush_pio_task() may have marked the HSM idle after this
++	 * work item was queued or while it was running.  There is nothing
++	 * left to do.
++	 */
++	if (ap->hsm_task_state == HSM_ST_IDLE)
++		goto out_unlock;
+ 
+ 	wait_mask = ATA_BUSY;
+ 	if (ap->hsm_task_state == HSM_ST_LAST)
+@@ -1252,6 +1271,13 @@ static void ata_sff_pio_task(struct work_struct *work)
+ 		ata_msleep(ap, 2);
+ 		spin_lock_irq(ap->lock);
+ 
++		/*
++		 * ata_sff_flush_pio_task() may have marked the HSM idle
++		 * while the port lock was dropped for ata_msleep().
++		 */
++		if (ap->hsm_task_state == HSM_ST_IDLE)
++			goto out_unlock;
++
+ 		status = ata_sff_busy_wait(ap, wait_mask, 10);
+ 		if (status & wait_mask) {
+ 			ata_sff_queue_pio_task(link, ATA_SHORT_PAUSE);
+-- 
+2.56.0
+

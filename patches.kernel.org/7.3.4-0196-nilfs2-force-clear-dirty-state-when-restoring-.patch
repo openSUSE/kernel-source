@@ -1,0 +1,207 @@
+From: Jiaming Zhang <r772577952@gmail.com>
+Date: Wed, 2 Sep 2026 19:21:21 +0800
+Subject: [PATCH] nilfs2: force clear dirty state when restoring from the
+ shadow map
+References: bsc#1012628
+Patch-mainline: 7.3.4
+Git-commit: cb6702e63e0a16afd83875294e5ce53becdd1b1f
+
+[ Upstream commit cb6702e63e0a16afd83875294e5ce53becdd1b1f ]
+
+When garbage collection fails, nilfs2 rolls the DAT metadata file's page
+cache back to a shadow copy taken before GC started.
+nilfs_clear_dirty_pages() drops the dirty state of the folios in the DAT
+cache, then nilfs_copy_back_pages() overwrites them with the saved
+contents and warns if one is still dirty:
+
+	/* overwrite existing folio in the destination cache */
+	WARN_ON(folio_test_dirty(dfolio));
+
+nilfs_clear_dirty_pages() used to clear the dirty state unconditionally,
+which is safe here because the rollback runs with the log writer
+stopped, so nothing else can dirty the cache while it runs.  The same
+helper is also used when writeback finds dirty folios after the
+filesystem has degraded to read-only, where it does run concurrently
+with the log writer, so commit ca76bb226bf4 ("nilfs2: do not force clear
+folio if buffer is referenced") made nilfs_clear_folio_dirty() skip a
+folio if any of its buffer heads is busy.  The rollback caller shares
+that helper, so its clearing step can now return with a folio still
+dirty.
+
+A DAT folio can hold a busy buffer head without anyone modifying the
+folio: nilfs_mdt_read_block() submits read-ahead for the blocks
+following the one it was asked for and waits only for the first, so the
+read-ahead buffers are still locked when it returns.  With a block size
+smaller than the page size, a locked read-ahead buffer can share a folio
+with a block that GC dirtied and keep the whole folio dirty past the
+clearing step.
+
+Add a force flag to nilfs_clear_dirty_pages() and
+nilfs_clear_folio_dirty() that skips the busy buffer check, and set it
+in the two calls from nilfs_mdt_restore_from_shadow_map().  The
+read-only fallback callers keep passing false, so that commit still
+protects them and the WARN_ON() is left alone.
+
+Fixes: ca76bb226bf4 ("nilfs2: do not force clear folio if buffer is referenced")
+Closes: https://lore.kernel.org/lkml/CANypQFZSYrtcshnUzOPiqatyLd-M8_OReOewQoAi_V5yY0dTtg@mail.gmail.com/
+Cc: stable@vger.kernel.org
+Suggested-by: Ryusuke Konishi <konishi.ryusuke@gmail.com>
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Jiaming Zhang <r772577952@gmail.com>
+Acked-by: Ryusuke Konishi <konishi.ryusuke@gmail.com>
+Signed-off-by: Viacheslav Dubeyko <slava@dubeyko.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/nilfs2/inode.c |  2 +-
+ fs/nilfs2/mdt.c   |  6 +++---
+ fs/nilfs2/page.c  | 50 +++++++++++++++++++++++++++--------------------
+ fs/nilfs2/page.h  |  4 ++--
+ 4 files changed, 35 insertions(+), 27 deletions(-)
+
+diff --git a/fs/nilfs2/inode.c b/fs/nilfs2/inode.c
+index 34e6096069ad..64437aed8390 100644
+--- a/fs/nilfs2/inode.c
++++ b/fs/nilfs2/inode.c
+@@ -163,7 +163,7 @@ static int nilfs_writepages(struct address_space *mapping,
+ 	int err = 0;
+ 
+ 	if (sb_rdonly(inode->i_sb)) {
+-		nilfs_clear_dirty_pages(mapping);
++		nilfs_clear_dirty_pages(mapping, false);
+ 		return -EROFS;
+ 	}
+ 
+diff --git a/fs/nilfs2/mdt.c b/fs/nilfs2/mdt.c
+index 2a435349fd21..b50c88b65183 100644
+--- a/fs/nilfs2/mdt.c
++++ b/fs/nilfs2/mdt.c
+@@ -405,7 +405,7 @@ static int nilfs_mdt_write_folio(struct folio *folio,
+ 		 * have dirty folios that try to be flushed in background.
+ 		 * So, here we simply discard this dirty folio.
+ 		 */
+-		nilfs_clear_folio_dirty(folio);
++		nilfs_clear_folio_dirty(folio, false);
+ 		folio_unlock(folio);
+ 		return -EROFS;
+ 	}
+@@ -648,10 +648,10 @@ void nilfs_mdt_restore_from_shadow_map(struct inode *inode)
+ 	if (mi->mi_palloc_cache)
+ 		nilfs_palloc_clear_cache(inode);
+ 
+-	nilfs_clear_dirty_pages(inode->i_mapping);
++	nilfs_clear_dirty_pages(inode->i_mapping, true);
+ 	nilfs_copy_back_pages(inode->i_mapping, shadow->inode->i_mapping);
+ 
+-	nilfs_clear_dirty_pages(ii->i_assoc_inode->i_mapping);
++	nilfs_clear_dirty_pages(ii->i_assoc_inode->i_mapping, true);
+ 	nilfs_copy_back_pages(ii->i_assoc_inode->i_mapping,
+ 			      NILFS_I(shadow->inode)->i_assoc_inode->i_mapping);
+ 
+diff --git a/fs/nilfs2/page.c b/fs/nilfs2/page.c
+index cf4f1c6798f5..857926da9f21 100644
+--- a/fs/nilfs2/page.c
++++ b/fs/nilfs2/page.c
+@@ -369,8 +369,9 @@ void nilfs_copy_back_pages(struct address_space *dmap,
+ /**
+  * nilfs_clear_dirty_pages - discard dirty pages in address space
+  * @mapping: address space with dirty pages for discarding
++ * @force: whether to clear the dirty state regardless of busy buffer heads
+  */
+-void nilfs_clear_dirty_pages(struct address_space *mapping)
++void nilfs_clear_dirty_pages(struct address_space *mapping, bool force)
+ {
+ 	struct folio_batch fbatch;
+ 	unsigned int i;
+@@ -391,7 +392,7 @@ void nilfs_clear_dirty_pages(struct address_space *mapping)
+ 			 * was acquired.  Skip processing in that case.
+ 			 */
+ 			if (likely(folio->mapping == mapping))
+-				nilfs_clear_folio_dirty(folio);
++				nilfs_clear_folio_dirty(folio, force);
+ 
+ 			folio_unlock(folio);
+ 		}
+@@ -403,13 +404,16 @@ void nilfs_clear_dirty_pages(struct address_space *mapping)
+ /**
+  * nilfs_clear_folio_dirty - discard dirty folio
+  * @folio: dirty folio that will be discarded
++ * @force: whether to clear the states regardless of busy buffer heads
+  *
+  * nilfs_clear_folio_dirty() clears working states including dirty state for
+- * the folio and its buffers.  If the folio has buffers, clear only if it is
+- * confirmed that none of the buffer heads are busy (none have valid
+- * references and none are locked).
++ * the folio and its buffers.  If the folio has buffers and force is false,
++ * clear only if it is confirmed that none of the buffer heads are busy (none
++ * have valid references and none are locked).  If force is true, the states
++ * are cleared unconditionally, the caller should guarantee that the folio is
++ * not being modified concurrently.
+  */
+-void nilfs_clear_folio_dirty(struct folio *folio)
++void nilfs_clear_folio_dirty(struct folio *folio, bool force)
+ {
+ 	struct buffer_head *bh, *head;
+ 
+@@ -422,24 +426,28 @@ void nilfs_clear_folio_dirty(struct folio *folio)
+ 			 BIT(BH_Async_Write) | BIT(BH_NILFS_Volatile) |
+ 			 BIT(BH_NILFS_Checked) | BIT(BH_NILFS_Redirected) |
+ 			 BIT(BH_Delay));
+-		bool busy, invalidated = false;
++
++		if (!force) {
++			bool busy, invalidated = false;
+ 
+ recheck_buffers:
+-		busy = false;
+-		bh = head;
+-		do {
+-			if (atomic_read(&bh->b_count) | buffer_locked(bh)) {
+-				busy = true;
+-				break;
++			busy = false;
++			bh = head;
++			do {
++				if (atomic_read(&bh->b_count) |
++				    buffer_locked(bh)) {
++					busy = true;
++					break;
++				}
++			} while (bh = bh->b_this_page, bh != head);
++
++			if (busy) {
++				if (invalidated)
++					return;
++				invalidate_bh_lrus();
++				invalidated = true;
++				goto recheck_buffers;
+ 			}
+-		} while (bh = bh->b_this_page, bh != head);
+-
+-		if (busy) {
+-			if (invalidated)
+-				return;
+-			invalidate_bh_lrus();
+-			invalidated = true;
+-			goto recheck_buffers;
+ 		}
+ 
+ 		bh = head;
+diff --git a/fs/nilfs2/page.h b/fs/nilfs2/page.h
+index 136cd1c143c9..c3ba3468af5c 100644
+--- a/fs/nilfs2/page.h
++++ b/fs/nilfs2/page.h
+@@ -41,8 +41,8 @@ void nilfs_folio_bug(struct folio *);
+ 
+ int nilfs_copy_dirty_pages(struct address_space *, struct address_space *);
+ void nilfs_copy_back_pages(struct address_space *, struct address_space *);
+-void nilfs_clear_folio_dirty(struct folio *folio);
+-void nilfs_clear_dirty_pages(struct address_space *mapping);
++void nilfs_clear_folio_dirty(struct folio *folio, bool force);
++void nilfs_clear_dirty_pages(struct address_space *mapping, bool force);
+ unsigned int nilfs_page_count_clean_buffers(struct folio *folio,
+ 		unsigned int from, unsigned int to);
+ unsigned long nilfs_find_uncommitted_extent(struct inode *inode,
+-- 
+2.56.0
+
