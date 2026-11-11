@@ -22,6 +22,11 @@ class TestPipelineContext(unittest.TestCase):
         self.assertEqual(ctx.arch, "x86_64")
         self.assertEqual(ctx.mode, "fast")
         self.assertTrue(ctx.use_busybox_initrd)
+        self.assertTrue(ctx.check_kabi)
+
+    def test_check_kabi_can_be_disabled(self):
+        ctx = PipelineContext(**_common_fields(check_kabi=False))
+        self.assertFalse(ctx.check_kabi)
 
     def test_artifacts_dir_composes_expected_layout(self):
         ctx = PipelineContext(**_common_fields(
@@ -32,7 +37,7 @@ class TestPipelineContext(unittest.TestCase):
 class TestFastModeContext(unittest.TestCase):
     def test_inherits_common_fields_and_adds_fast_only_fields(self):
         ctx = FastModeContext(
-            **_common_fields(),
+            **_common_fields(check_kabi=False),
             kernel_image_name="bzImage",
             build_image_name="bzImage",
             linux_arch="x86_64",
@@ -41,13 +46,16 @@ class TestFastModeContext(unittest.TestCase):
             target_arch_platform="linux/amd64",
             host_arch_platform="linux/amd64",
             container_image="registry.suse.com/bci/bci-base:latest",
+            kabi_container_image="registry.opensuse.org/kernel-build-kabi:latest",
             cc="gcc",
             host_cc="gcc",
             enable_configs=["CONFIG_VIRTIO_PCI"],
             disable_configs=["CONFIG_FOO"],
         )
         self.assertEqual(ctx.arch, "x86_64")  # inherited common field
+        self.assertFalse(ctx.check_kabi)
         self.assertEqual(ctx.kernel_image_name, "bzImage")
+        self.assertEqual(ctx.kabi_container_image, "registry.opensuse.org/kernel-build-kabi:latest")
         self.assertEqual(ctx.enable_configs, ["CONFIG_VIRTIO_PCI"])
         self.assertEqual(ctx.disable_configs, ["CONFIG_FOO"])
         self.assertIsInstance(ctx, PipelineContext)
@@ -55,6 +63,8 @@ class TestFastModeContext(unittest.TestCase):
     def test_defaults_apply_when_fast_only_fields_omitted(self):
         ctx = FastModeContext(**_common_fields())
         self.assertEqual(ctx.kernel_image_name, "")
+        self.assertEqual(ctx.kabi_container_image, "")
+        self.assertTrue(ctx.check_kabi)
         self.assertEqual(ctx.enable_configs, [])
         self.assertEqual(ctx.disable_configs, [])
 
