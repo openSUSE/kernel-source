@@ -2,6 +2,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from libs.command import get_printable_cmd
+from libs.config_manager import is_list_of_str, load_yaml_spec
 from libs.console import get_logger
 from libs.errors import KernelSandboxError
 
@@ -11,6 +12,14 @@ DEFAULT_CLEANUP_TIMEOUT = 30
 
 class ContainerRuntimeError(KernelSandboxError):
     pass
+
+
+# key -> (required, predicate, expected(human-readable-msg))
+SPEC_SCHEMA = {
+    "command": (True, lambda v: is_list_of_str(v) and bool(v), "a list of str"),  # Field(minlength=1)
+    "entrypoint": (False, lambda v: isinstance(v, str), "a string"),
+    "args": (False, is_list_of_str, "a list of str"),
+}
 
 
 class ContainerEngine:
@@ -79,9 +88,20 @@ class ContainerEngine:
             logger.warning(f"Failed to force-remove container '{self.name}': {e}")
 
     def build_command(
-            self, workspace_path_rw=None, platform="linux/x86_64", env_dict=None, cmd_str="bash",
+            self, workspace_path_rw=None, platform="linux/x86_64", env_dict=None,
+            entrypoint=None, command=None, args=None, spec=None,
             workspace_mount="/workspace/", interactive=False, tty=False,
             extra_volumes=None, memory_limit=None, cpu_limit=None, pull_policy="missing", as_root=False):
+
+        if spec is not None:
+            if any(arg is not None for arg in (entrypoint, command, args)):
+                raise ContainerRuntimeError("`spec` is mutually exclusive with `entrypoint`, `command`, and `args`.")
+
+            spec_data = load_yaml_spec(spec, SPEC_SCHEMA)
+            command = spec_data.get("command")
+            entrypoint = spec_data.get("entrypoint")
+            args = spec_data.get("args")
+
         cmd = [self.runtime]
         # docker CLI does not support --root
         if self.runtime == "podman":
@@ -122,15 +142,26 @@ class ContainerEngine:
             for k, v in env_dict.items():
                 cmd.extend(["-e", f"{k}={v}"])
 
-        cmd.extend([self.image, "bash", "-c", cmd_str])
+        # - entrypoint: overrides image ENTRYPOINT binary.
+        # - command: primary executable or shell subcommand array.
+        # - args: parameter array passed to the command.
+        if entrypoint is not None:
+            cmd.extend(["--entrypoint", str(entrypoint)])
+        cmd.append(self.image)
+        if command:
+            cmd.extend(command)
+        if args:
+            cmd.extend(args)
         return cmd
 
     def execute_command(
-            self, workspace_path_rw=None, platform="linux/x86_64", env_dict=None, cmd_str="bash",
+            self, workspace_path_rw=None, platform="linux/x86_64", env_dict=None,
+            entrypoint=None, command=None, args=None, spec=None,
             workspace_mount="/workspace/", interactive=False, tty=False,
             extra_volumes=None, memory_limit=None, cpu_limit=None, pull_policy="missing", as_root=False, timeout=None):
         cmd = self.build_command(
-            workspace_path_rw=workspace_path_rw, platform=platform, env_dict=env_dict, cmd_str=cmd_str,
+            workspace_path_rw=workspace_path_rw, platform=platform, env_dict=env_dict,
+            entrypoint=entrypoint, command=command, args=args, spec=spec,
             workspace_mount=workspace_mount, interactive=interactive, tty=tty, extra_volumes=extra_volumes,
             memory_limit=memory_limit, cpu_limit=cpu_limit, pull_policy=pull_policy, as_root=as_root)
         logger.info("Running cmd: " + get_printable_cmd(cmd))

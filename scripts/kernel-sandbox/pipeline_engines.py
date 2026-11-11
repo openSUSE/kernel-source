@@ -1,5 +1,6 @@
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -85,6 +86,24 @@ class BuildEngine:
         else:
             self._execute_rpm(ctx)
 
+    @staticmethod
+    def _should_test_kabi(ctx):
+        """Determines whether kABI checks should run for this workspace/arch/flavor."""
+        if not getattr(ctx, "check_kabi", True):
+            logger.info("kABI checks disabled via --no-check-kabi")
+            return False
+
+        symvers_ref = Path(ctx.workspace) / "kabi" / ctx.arch / f"symvers-{ctx.config_flavor}"
+        symtypes_ref = Path(ctx.workspace) / "kabi" / ctx.arch / f"symtypes-{ctx.config_flavor}"
+        if not symvers_ref.is_file() or not symtypes_ref.is_file():
+            logger.warning(
+                f"Disabling kabi checks, reference missing "
+                f"(expected kabi/{ctx.arch}/symvers-{ctx.config_flavor} and symtypes-{ctx.config_flavor})"
+            )
+            return False
+
+        return True
+
     # ------------------------------------------------------------------
     # Fast mode: containerized bzImage build
     # ------------------------------------------------------------------
@@ -99,6 +118,17 @@ class BuildEngine:
                 f"Kernel configuration missing in workspace: {config_path}\n"
                 f"Please verify that the branch contains config/{ctx.arch}/{ctx.config_flavor}."
             )
+
+        overlapping = set(ctx.enable_configs) & set(ctx.disable_configs)
+        if overlapping:
+            raise PipelineError(
+                f"Conflicting kernel configuration: symbols present in both enable and disable lists: {sorted(overlapping)}"
+            )
+
+        CONFIG_SYMBOL_REGEX = re.compile(r"^[A-Z0-9_]+$")
+        for cfg in ctx.enable_configs + ctx.disable_configs:
+            if not cfg or not CONFIG_SYMBOL_REGEX.fullmatch(cfg):
+                raise PipelineError(f"Invalid kernel configuration symbol: '{cfg}'")
 
         # guard the whole cache-check -> build -> cache-write sequence for this
         # specific (commit, arch, config)
@@ -116,6 +146,7 @@ class BuildEngine:
                 )
                 return
 
+            should_kabi_be_tested = self._should_test_kabi(ctx)
             git_marker = f"-kernel-sandbox-{ctx.commit_hash[:7]}"
 
             print_phase_header(
@@ -125,6 +156,7 @@ class BuildEngine:
                     f"cross_compile_prefix: {ctx.cross_compile or 'N/A'}",
                     f"target_linux_arch: {ctx.linux_arch}",
                     f"container_target_platform: {ctx.host_arch_platform}",
+                    f"kabi_check: {'enabled' if should_kabi_be_tested else 'disabled'}",
                     f"artifacts_store: {artifacts_dir.resolve()}",
                     f"target_kernel_cache_store: {fast_kernel_cache.resolve()}"
                 ]
@@ -155,24 +187,12 @@ class BuildEngine:
                     f"Please verify the branch contains config/{ctx.arch}/{ctx.config_flavor}.")
 
             linux_dir = config_file.parent
-            # amend the kernel config to have networking up and 9p passthrough for fast mode
-            config_patch_cmds = [
-                f"./scripts/config --enable {cfg}" for cfg in ctx.enable_configs
-                ] + [f"./scripts/config --disable {cfg}" for cfg in ctx.disable_configs]
-            config_patch_str = " && ".join(config_patch_cmds)
-            config_patch_str = f"{config_patch_str} && " if config_patch_str else ""
+
             if ctx.jobs is not None:
                 jobs = ctx.jobs
                 logger.info(f"[BUILD] Using user-specified build jobs: -j{jobs} (overriding automatic memory calculation)")
             else:
                 jobs = get_max_build_jobs()
-            container_cmd = (
-                f"echo \"{git_marker}\" > localversion && "
-                f"make clean && "
-                f"{config_patch_str}"
-                f"yes \"\" | make oldconfig && "
-                f"make -j{jobs}"
-            )
 
             with ContainerEngine(
                     runtime=runtime,
@@ -186,16 +206,23 @@ class BuildEngine:
                     "ARCH": ctx.linux_arch,
                     "HOSTCC": ctx.host_cc,
                     "CC": ctx.cc,
-                    "CROSS_COMPILE": ctx.cross_compile
+                    "CROSS_COMPILE": ctx.cross_compile,
+                    "GIT_MARKER": git_marker,
+                    "ENABLE_CONFIGS": " ".join(ctx.enable_configs),
+                    "DISABLE_CONFIGS": " ".join(ctx.disable_configs),
+                    "JOBS": str(jobs),
                 }
+                if should_kabi_be_tested:
+                    env_dict["KBUILD_SYMTYPES"] = "1"
 
                 # FIXME: native arch container compilation is too slow, hence prefering cross_compilation always
                 # will revisit this later.
+                compile_spec = Path(__file__).resolve().parent / "assets" / "compile_kernel.yaml"
                 container_engine.execute_command(
                     workspace_path_rw=linux_dir,
                     platform=ctx.host_arch_platform,  # FIXME
                     env_dict=env_dict,
-                    cmd_str=container_cmd,
+                    spec=compile_spec,
                     workspace_mount="/workspace/",
                     tty=True,
                     timeout=CONTAINER_BUILD_TIMEOUT
@@ -217,6 +244,9 @@ class BuildEngine:
             else:
                 raise PipelineError(
                     f"Built kernel image missing (checked at - {built_kernel_path} )after successful compile task pass")
+
+            if should_kabi_be_tested:
+                self.check_kabi(ctx, runtime, linux_dir, jobs)
 
     # ------------------------------------------------------------------
     # RPM mode: native host build via osc
@@ -341,20 +371,63 @@ class BuildEngine:
             self, linux_dir, container_engine, host_arch_platform, env_dict, cross_compile, cc, host_cc, module_install_root, linux_arch):
         """compile kernel modules inside the container"""
         logger.info("[BUILD] Installing kernel modules inside the container environment...")
-        make_args_str = f"ARCH={linux_arch} CROSS_COMPILE={cross_compile} CC={cc} HOSTCC={host_cc}"
-        build_steps = [f"make {make_args_str} -j$(nproc --all) modules_install INSTALL_MOD_PATH=/module_root"]
-        container_compile_sequence = " && ".join(build_steps)
+        modules_spec = Path(__file__).resolve().parent / "assets" / "install_modules.yaml"
 
         container_engine.execute_command(
             workspace_path_rw=linux_dir,
             platform=host_arch_platform,
             env_dict=env_dict,
-            cmd_str=container_compile_sequence,
+            spec=modules_spec,
             workspace_mount="/workspace/",
             extra_volumes={str(module_install_root): "/module_root"},
             timeout=CONTAINER_BUILD_TIMEOUT
         )
         logger.info(f"[BUILD] Modules installed and exported to: {module_install_root}")
+
+    def check_kabi(self, ctx, runtime, linux_dir, jobs):
+        """Run post-compile kABI checks"""
+        logger.info("[BUILD] Running kABI checks inside the kabi container")
+        kabi_spec = Path(__file__).resolve().parent / "assets" / "check_kabi.yaml"
+        kabi_dir = Path(ctx.workspace) / "kabi"
+        kabi_env = {
+            "KABI_ARCH": ctx.arch,
+            "KABI_FLAVOR": ctx.config_flavor,
+            "JOBS": str(jobs),
+        }
+
+        try:
+            with ContainerEngine(
+                runtime=runtime,
+                storage_root=Path(ctx.cache_dir) / "containers" / "storage",
+                image=ctx.kabi_container_image,
+                name=f"kernel-sandbox-kabi-{ctx.commit_hash[:7]}-{ctx.arch}-{ctx.config_flavor}"
+            ) as kabi_container:
+                kabi_container.pull_image(timeout=CONTAINER_PULL_TIMEOUT)
+                kabi_container.execute_command(
+                    workspace_path_rw=linux_dir,
+                    platform=ctx.host_arch_platform,
+                    env_dict=kabi_env,
+                    spec=kabi_spec,
+                    workspace_mount="/workspace/",
+                    extra_volumes={str(kabi_dir): "/kabi"},
+                    tty=True,
+                    timeout=300
+                )
+            logger.info("[BUILD] kABI check passed.")
+        except KernelSandboxError as e:
+            commit_short = ctx.commit_hash[:7]
+            raise PipelineError(
+                f"kABI check failed for commit {commit_short} ({ctx.arch}/{ctx.config_flavor}).\n"
+                f"The compiled kernel image and modules have already been cached in {ctx.artifacts_dir}.\n"
+                f"Stopping the pipeline now due to the kABI failure. If you still want to prepare the initrd "
+                f"and boot this kernel, run:\n"
+                f"  ./scripts/kernel-sandbox/kernel-sandbox --commit {commit_short} --arch {ctx.arch} "
+                f"--config {ctx.config_flavor} image\n"
+                f"  ./scripts/kernel-sandbox/kernel-sandbox --commit {commit_short} --arch {ctx.arch} "
+                f"--config {ctx.config_flavor} boot\n"
+                f"Or re-run the full command to boot from the cached build (pass --refresh-cache to rebuild "
+                f"and re-run the kABI check)."
+            ) from e
 
 
 class ImagePreparer:
