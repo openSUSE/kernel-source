@@ -27,11 +27,19 @@ Release:        0
 Summary:        A CLI that takes a kernel-source commit and gets you a booted QEMU VM running that kernel
 License:        GPL-2.0-only
 URL:            https://github.com/hramrach/kernel-source/tree/scripts
+BuildRequires:  %{python_module PyYAML}
+# certifi is needed by pygit2
+BuildRequires:  %{python_module certifi}
 BuildRequires:  %{python_module flit-core >= 3.11}
 BuildRequires:  %{python_module pip}
+BuildRequires:  %{python_module pygit2}
 BuildRequires:  %{python_module pytest}
 BuildRequires:  fdupes
 BuildRequires:  python-rpm-macros
+Requires:       python-PyYAML
+# certifi is needed by pygit2
+Requires:       python-certifi
+Requires:       python-pygit2
 BuildArch:      noarch
 %if %{with libalternatives}
 BuildRequires:  alts
