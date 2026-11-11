@@ -252,6 +252,8 @@ class InputEntry(object):
 
 
     def from_source_git(self, index, repo, sha, name, current_head, move_upstream):
+        name_path = Path(name)
+        name = str(name_path.relative_to(repo.workdir)) if name_path.is_absolute() else str(name_path)
         tree = repo[sha].peel(pygit2.Tree)
         blob = tree[name]
         bfile = pygit2.BlobIO(blob)

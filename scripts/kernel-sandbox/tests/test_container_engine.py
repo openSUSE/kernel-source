@@ -3,9 +3,11 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 import libs.container_engine as container_engine_module
+from libs.config_manager import ConfigSpecError, load_yaml_spec
 from libs.container_engine import ContainerEngine, ContainerRuntimeError
 
 
@@ -75,7 +77,7 @@ class TestBuildCommand(unittest.TestCase):
             workspace_path_rw="/home/user/src",
             platform="linux/amd64",
             env_dict={"ARCH": "x86_64", "CROSS_COMPILE": "x86_64-linux-gnu-"},
-            cmd_str="make bzImage"
+            command=["bash", "-c", "make bzImage"]
         )
 
         self.assertEqual(cmd[0], "podman")
@@ -97,14 +99,14 @@ class TestBuildCommand(unittest.TestCase):
         """Verify defaults apply when optional args are omitted."""
         cmd = self.engine.build_command()
         self.assertEqual(cmd[cmd.index("--platform") + 1], "linux/x86_64")
-        self.assertEqual(cmd[-4:], [self.image, "bash", "-c", "bash"])
+        self.assertEqual(cmd[-1], self.image)
         self.assertNotIn("-w", cmd)
 
     def test_docker_omits_podman_specific_flags(self):
         """Verify docker's command omits podman-only flags."""
         docker_engine = ContainerEngine(runtime="docker", storage_root=self.storage_root, image=self.image)
         cmd = docker_engine.build_command(
-            workspace_path_rw="/tmp/space", platform="linux/arm64", env_dict={}, cmd_str="exit 0")
+            workspace_path_rw="/tmp/space", platform="linux/arm64", env_dict={}, command=["exit", "0"])
         self.assertNotIn("--root", cmd)
         self.assertNotIn("--userns=keep-id", cmd)
         self.assertNotIn("--security-opt", cmd)
@@ -123,7 +125,7 @@ class TestBuildCommand(unittest.TestCase):
         }
         cmd = self.engine.build_command(
             workspace_path_rw="/tmp/space", platform="linux/amd64", env_dict={},
-            extra_volumes=extra_vols, cmd_str="make", memory_limit="8g", cpu_limit="4")
+            extra_volumes=extra_vols, command=["make"], memory_limit="8g", cpu_limit="4")
 
         self.assertEqual(cmd[cmd.index("--memory") + 1], "8g")
         self.assertEqual(cmd[cmd.index("--cpus") + 1], "4")
@@ -136,23 +138,23 @@ class TestBuildCommand(unittest.TestCase):
             self.assertTrue(mount_found, f"Volume mapping '{expected_mount}' missing.")
 
     def test_interactive_sets_it_flag(self):
-        cmd = self.engine.build_command(cmd_str="bash", interactive=True)
+        cmd = self.engine.build_command(command=["bash"], interactive=True)
         self.assertIn("-it", cmd)
 
     def test_tty_sets_t_only_not_it(self):
         """tty=True is for streaming a non-interactive command's output live, it should not also open stdin (-i)"""
-        cmd = self.engine.build_command(cmd_str="bash", tty=True)
+        cmd = self.engine.build_command(command=["bash"], tty=True)
         self.assertIn("-t", cmd)
         self.assertNotIn("-it", cmd)
         self.assertNotIn("-i", cmd)
 
     def test_interactive_sets_it_only_not_t(self):
-        cmd = self.engine.build_command(cmd_str="bash", interactive=True, tty=True)
+        cmd = self.engine.build_command(command=["bash"], interactive=True, tty=True)
         self.assertIn("-it", cmd)
         self.assertNotIn("-t", cmd)
 
     def test_neither_interactive_nor_tty_omits_both_flags(self):
-        cmd = self.engine.build_command(cmd_str="bash")
+        cmd = self.engine.build_command(command=["bash"])
         self.assertNotIn("-it", cmd)
         self.assertNotIn("-t", cmd)
 
@@ -170,6 +172,191 @@ class TestBuildCommand(unittest.TestCase):
             runtime="podman", storage_root=self.storage_root, image=self.image, name="kernel-sandbox-abc1234-x86_64-default")
         cmd = named_engine.build_command()
         self.assertEqual(cmd[cmd.index("--name") + 1], "kernel-sandbox-abc1234-x86_64-default")
+
+    def test_entrypoint_none(self):
+        cmd = self.engine.build_command(entrypoint=None)
+        self.assertNotIn("--entrypoint", cmd)
+
+    def test_entrypoint_empty_string(self):
+        cmd = self.engine.build_command(entrypoint="")
+        self.assertIn("--entrypoint", cmd)
+        idx = cmd.index("--entrypoint")
+        self.assertEqual(cmd[idx + 1], "")  # --entrypoint ""
+        self.assertIn(self.image, cmd)
+
+    def test_entrypoint_custom_binary(self):
+        cmd = self.engine.build_command(entrypoint="/bin/sh")
+        self.assertIn("--entrypoint", cmd)
+        idx = cmd.index("--entrypoint")
+        self.assertEqual(cmd[idx + 1], "/bin/sh")
+        self.assertIn(self.image, cmd)
+
+    def test_explicit_command_and_args_lists(self):
+        cmd = self.engine.build_command(
+            entrypoint="", command=["/bin/sh", "-c"], args=["echo hello", "echo world"])
+        image_idx = cmd.index(self.image)
+        self.assertEqual(cmd[image_idx + 1:], ["/bin/sh", "-c", "echo hello", "echo world"])
+
+    def test_explicit_command_and_args_arrays(self):
+        cmd = self.engine.build_command(command=["./busybox"], args=["--list"])
+        image_idx = cmd.index(self.image)
+        self.assertEqual(cmd[image_idx + 1:], ["./busybox", "--list"])
+
+    @contextmanager
+    def create_spec_yaml(self, content: str):
+        """helper to create, and automatically clean up temporary YAML spec files"""
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml") as f:
+            f.write(content)
+            f.flush()
+            yield f.name
+
+    def test_spec_from_yaml_file(self):
+        yaml_content = (
+            "entrypoint: /bin/sh\n"
+            "command:\n"
+            "  - -c\n"
+            "args:\n"
+            "  - echo hello\n"
+        )
+        with self.create_spec_yaml(yaml_content) as spec_file:
+            cmd = self.engine.build_command(spec=spec_file)
+            self.assertIn("--entrypoint", cmd)
+            self.assertEqual(cmd[cmd.index("--entrypoint") + 1], "/bin/sh")
+            image_idx = cmd.index(self.image)
+            self.assertEqual(cmd[image_idx + 1:], ["-c", "echo hello"])
+
+    def test_spec_mutually_exclusive_with_command_or_args_or_entrypoint(self):
+        with self.create_spec_yaml("command: [bash]\n") as spec_file:
+            with self.assertRaises(ContainerRuntimeError):
+                self.engine.build_command(spec=spec_file, command=["bash"])
+            with self.assertRaises(ContainerRuntimeError):
+                self.engine.build_command(spec=spec_file, args=["arg"])
+            with self.assertRaises(ContainerRuntimeError):
+                self.engine.build_command(spec=spec_file, entrypoint="/bin/sh")
+
+    def test_load_yaml_spec_missing_file_raises(self):
+        with self.assertRaises(ConfigSpecError):
+            load_yaml_spec("/non_existent/path.yaml")
+
+    def test_load_yaml_spec_invalid_yaml_raises_container_runtime_error(self):
+        """corrupt YAML in a command spec must immediately raise ConfigSpecError."""
+        with self.create_spec_yaml("command: [invalid command") as spec_file:
+            with self.assertRaises(ConfigSpecError) as ctx:
+                load_yaml_spec(spec_file)
+            self.assertIn(spec_file, str(ctx.exception))
+
+    def test_build_command_with_invalid_yaml_fails_stop(self):
+        """build_command with corrupt spec must raise ConfigSpecError"""
+        with self.create_spec_yaml("command: [invalid command") as spec_file:
+            with self.assertRaises(ConfigSpecError):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_yaml_list_root_raises_runtime_error(self):
+        """spec_root as a list raises ConfigSpecError."""
+        with self.create_spec_yaml("- /bin/bash\n- -c\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"expected a YAML mapping"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_yaml_list_containing_command_literal_raises_runtime_error(self):
+        """spec_root as a list containing the literal string 'command' (['command']) must raise ConfigSpecError."""
+        with self.create_spec_yaml("- command\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"expected a YAML mapping"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_yaml_scalar_root_raises_runtime_error(self):
+        """spec_root as a scalar must raise ConfigSpecError."""
+        with self.create_spec_yaml("command\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"expected a YAML mapping"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_missing_command_key_raises_runtime_error(self):
+        """spec mapping missing 'command' key must raise ConfigSpecError."""
+        with self.create_spec_yaml("entrypoint: /bin/sh\nargs: [echo, hello]\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"missing mandatory key 'command'"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_string_command_raises_spec_error(self):
+        """spec with command as a single string instead of a list must raise ConfigSpecError."""
+        with self.create_spec_yaml("command: /bin/bash\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"'command' must be 'a list of str'"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_int_command_raises_spec_error(self):
+        """spec with command as an integer must raise ConfigSpecError."""
+        with self.create_spec_yaml("command: 12345\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"'command' must be 'a list of str'"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_empty_or_null_command_raises_spec_error(self):
+        """spec with empty or null command must raise ConfigSpecError."""
+        with self.create_spec_yaml("command: []\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"'command' must be 'a list of str'"):
+                self.engine.build_command(spec=spec_file)
+        with self.create_spec_yaml("command: null\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"'command' must be 'a list of str'"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_null_optional_fields_succeeds(self):
+        """optional fields explicitly set to null should be accepted."""
+        with self.create_spec_yaml("command: [bash]\nentrypoint: null\nargs: null\n") as spec_file:
+            cmd = self.engine.build_command(spec=spec_file)
+            self.assertIn(self.image, cmd)
+
+    def test_build_command_with_non_list_args_raises_spec_error(self):
+        """spec with args as a string instead of a list must raise ConfigSpecError."""
+        with self.create_spec_yaml("command: [bash]\nargs: 'echo hello'\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"'args' must be 'a list of str'"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_non_string_entrypoint_raises_spec_error(self):
+        """spec with entrypoint as a list instead of a string must raise ConfigSpecError."""
+        with self.create_spec_yaml("command: [bash]\nentrypoint: ['/bin/sh']\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"'entrypoint' must be 'a string'"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_build_command_with_unknown_keys_raises_spec_error(self):
+        """spec with unrecognized keys must raise ConfigSpecError."""
+        with self.create_spec_yaml("command: [bash]\nextra_key: foo\n") as spec_file:
+            with self.assertRaisesRegex(ConfigSpecError, r"unknown key\(s\): extra_key"):
+                self.engine.build_command(spec=spec_file)
+
+    def test_compile_kernel_yaml_end_to_end_argv_generation(self):
+        """verify assets/compile_kernel.yaml produces expected container argv structure."""
+        spec_path = Path(__file__).resolve().parent.parent / "assets" / "compile_kernel.yaml"
+        cmd = self.engine.build_command(
+            spec=spec_path,
+            env_dict={
+                "ARCH": "x86_64",
+                "CROSS_COMPILE": "",
+                "CC": "gcc",
+                "HOSTCC": "gcc",
+                "ENABLE_CONFIGS": "CONFIG_VIRTIO_PCI",
+                "DISABLE_CONFIGS": "CONFIG_FOO",
+                "JOBS": "8",
+            }
+        )
+        self.assertIn(self.image, cmd)
+        image_idx = cmd.index(self.image)
+        self.assertEqual(cmd[image_idx + 1:image_idx + 3], ["/bin/bash", "-c"])
+        script = cmd[image_idx + 3]
+        self.assertIn('make clean', script)
+        self.assertIn('make oldconfig', script)
+
+    def test_install_modules_yaml_end_to_end_argv_generation(self):
+        """verify assets/install_modules.yaml produces expected container argv structure."""
+        spec_path = Path(__file__).resolve().parent.parent / "assets" / "install_modules.yaml"
+        cmd = self.engine.build_command(
+            spec=spec_path,
+            env_dict={
+                "ARCH": "x86_64",
+                "CROSS_COMPILE": "",
+                "CC": "gcc",
+                "HOSTCC": "gcc",
+            }
+        )
+        self.assertIn(self.image, cmd)
+        image_idx = cmd.index(self.image)
+        self.assertEqual(cmd[image_idx + 1:], ["make", "modules_install", "INSTALL_MOD_PATH=/module_root"])
 
 
 class TestBuildPullCommand(unittest.TestCase):
@@ -365,7 +552,7 @@ class TestExecuteCommandAndPullImage(unittest.TestCase):
     def test_execute_command_success(self):
         engine = ContainerEngine(
             runtime=self._mock_runtime("echo container-output; exit 0"), storage_root="/tmp", image="mock-image")
-        res = engine.execute_command(cmd_str="anything")
+        res = engine.execute_command(command=["anything"])
         self.assertEqual(res.returncode, 0)
         self.assertIn("container-output", res.stdout)
 
@@ -373,7 +560,7 @@ class TestExecuteCommandAndPullImage(unittest.TestCase):
         engine = ContainerEngine(
             runtime=self._mock_runtime("echo fail-here >&2; exit 5"), storage_root="/tmp", image="mock-image")
         with self.assertRaises(ContainerRuntimeError) as ctx:
-            engine.execute_command(cmd_str="anything")
+            engine.execute_command(command=["anything"])
         self.assertIn("fail-here", str(ctx.exception))
         self.assertIn("Exit Code 5", str(ctx.exception))
 
@@ -381,7 +568,7 @@ class TestExecuteCommandAndPullImage(unittest.TestCase):
         engine = ContainerEngine(
             runtime="/does-not-exist/podman", storage_root="/tmp", image="mock-image")
         with self.assertRaises(ContainerRuntimeError) as ctx:
-            engine.execute_command(cmd_str="anything")
+            engine.execute_command(command=["anything"])
         self.assertIn("Failed to launch container runtime", str(ctx.exception))
         self.assertIn("No such file or directory: '/does-not-exist/podman'", str(ctx.exception))
 
@@ -391,7 +578,7 @@ class TestExecuteCommandAndPullImage(unittest.TestCase):
         non_exec.chmod(0o644)  # EACCES, not ENOENT
         engine = ContainerEngine(runtime=str(non_exec), storage_root="/tmp", image="mock-image")
         with self.assertRaises(ContainerRuntimeError) as ctx:
-            engine.execute_command(cmd_str="anything")
+            engine.execute_command(command=["anything"])
         self.assertIn("Failed to launch container runtime", str(ctx.exception))
         self.assertIn("Permission denied:", str(ctx.exception))
 
@@ -404,7 +591,7 @@ class TestExecuteCommandAndPullImage(unittest.TestCase):
         )
         engine = ContainerEngine(runtime=runtime, storage_root="/tmp", image="mock-image", name="hung-container")
         with self.assertRaises(ContainerRuntimeError) as ctx:
-            engine.execute_command(cmd_str="anything", timeout=0.3)
+            engine.execute_command(command=["anything"], timeout=0.3)
         self.assertIn("Containerized execution timed out after 0.3s:", str(ctx.exception))
 
         logged_calls = call_log.read_text().strip().splitlines()
@@ -414,7 +601,7 @@ class TestExecuteCommandAndPullImage(unittest.TestCase):
         engine = ContainerEngine(
             runtime=self._mock_runtime("printf '\\377\\376 bad-bytes'; exit 0"),
             storage_root="/tmp", image="mock-image")
-        res = engine.execute_command(cmd_str="anything")
+        res = engine.execute_command(command=["anything"])
         self.assertEqual(res.returncode, 0)
         self.assertEqual(res.stdout, "�� bad-bytes")
 

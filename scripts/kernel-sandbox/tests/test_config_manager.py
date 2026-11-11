@@ -45,6 +45,7 @@ class TestConfigManager(unittest.TestCase):
         self.workspace_path.mkdir()
         self.yaml_path = Path(self.tmp_dir) / "kernel_sandbox_profiles.yaml"
         self.yaml_data = {
+            "kabi_container_image": "registry.opensuse.org/kernel-build-kabi:latest",
             "container_registries": {
                 "SUSE:SLFO:Main": "registry.opensuse.org/kernel-build:16.1",
                 "openSUSE:Factory": "registry.opensuse.org/kernel-build:factory",
@@ -160,6 +161,29 @@ class TestConfigManager(unittest.TestCase):
         TestRepoSetup(self.workspace_path, self.config_sh(ibs="SUSE:SLE-15-SP6:Update", obs=""))
         manager = ConfigManager(self.yaml_path, self.workspace_path)
         self.assertEqual(manager.get_container_image(), "registry.opensuse.org/kernel-build:15-sp6-update")
+
+    def test_get_kabi_container_image_returns_configured_uri(self):
+        manager = ConfigManager(yaml_path=self.yaml_path)
+        self.assertEqual(
+            manager.get_kabi_container_image(),
+            "registry.opensuse.org/kernel-build-kabi:latest"
+        )
+
+    def test_get_kabi_container_image_missing_or_invalid_raises(self):
+        for bad_val in (None, "", ["not-a-str"], {"img": "val"}):
+            yaml_data = dict(self.yaml_data)
+            if bad_val is None:
+                yaml_data.pop("kabi_container_image", None)
+            else:
+                yaml_data["kabi_container_image"] = bad_val
+            self.write_yaml(yaml_data)
+            manager = ConfigManager(yaml_path=self.yaml_path)
+            with self.assertRaises(ConfigurationError) as ctx:
+                manager.get_kabi_container_image()
+            self.assertEqual(
+                "kabi_container_image is missing or empty in kernel_sandbox_profiles.yaml",
+                str(ctx.exception),
+            )
 
     def test_get_compiler_env(self):
         TestRepoSetup(self.workspace_path, self.config_sh())
