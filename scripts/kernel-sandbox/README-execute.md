@@ -474,7 +474,7 @@ confirm no regressions were introduced:
 
 ```bash
 # under scripts/kernel-sandbox directory
-python3 -m unittest discover -v -s tests
+pytest
 ```
 
 This runs every `tests/test_*.py` file. Fix any failures (or update the affected
