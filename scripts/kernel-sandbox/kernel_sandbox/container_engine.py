@@ -1,10 +1,10 @@
 import shutil
 import subprocess
 from pathlib import Path
-from libs.command import get_printable_cmd
-from libs.config_manager import is_list_of_str, load_yaml_spec
-from libs.console import get_logger
-from libs.errors import KernelSandboxError
+from kernel_sandbox.command import get_printable_cmd
+from kernel_sandbox.config_manager import is_list_of_str, load_yaml_spec
+from kernel_sandbox.console import get_logger
+from kernel_sandbox.errors import KernelSandboxError
 
 logger = get_logger(__name__)
 DEFAULT_CLEANUP_TIMEOUT = 30
