@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from libs.console import get_logger
+from kernel_sandbox.console import get_logger
 
 logger = get_logger(__name__)
 

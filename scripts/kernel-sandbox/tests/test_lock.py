@@ -4,7 +4,7 @@ import time
 import unittest
 from pathlib import Path
 
-from libs.lock import LockTimeoutError, file_lock
+from kernel_sandbox.lock import LockTimeoutError, file_lock
 
 
 class TestFileLock(unittest.TestCase):

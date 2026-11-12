@@ -70,7 +70,7 @@ def configure_logging(logger_name=LOGGER_NAME, level=logging.INFO, log_format=DE
 def get_logger(name=None, base_name=LOGGER_NAME):
     """
     Retrieves a logger nested under base_name (ex: get_logger(__name__) inside
-    libs/storage_manager.py resolves to "kernel_sandbox.libs.storage_manager"),
+    libs/storage_manager.py resolves to "kernel_sandbox.kernel_sandbox.storage_manager"),
     auto-configuring base_name's handlers on first use if none exist yet.
     """
     base_logger = logging.getLogger(base_name)
