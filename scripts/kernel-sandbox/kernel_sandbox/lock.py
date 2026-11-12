@@ -9,8 +9,8 @@ import contextlib
 import fcntl
 import time
 from pathlib import Path
-from libs.console import get_logger
-from libs.errors import KernelSandboxError
+from kernel_sandbox.console import get_logger
+from kernel_sandbox.errors import KernelSandboxError
 
 logger = get_logger(__name__)
 
