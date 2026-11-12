@@ -3,7 +3,7 @@ import sys
 import tempfile
 import unittest
 
-from libs.virtual_engine import VirtualEngineError, VirtualMachine
+from kernel_sandbox.virtual_engine import VirtualEngineError, VirtualMachine
 
 X86_64_PROFILE = {"machine": "q35", "machine_args": "", "cpu_kvm": "host", "cpu_tcg": "max", "console": "ttyS0"}
 AARCH64_PROFILE = {"machine": "virt", "machine_args": ",gic-version=max", "cpu_kvm": "host", "cpu_tcg": "max", "console": "ttyAMA0"}
