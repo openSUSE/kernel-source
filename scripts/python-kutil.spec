@@ -21,7 +21,7 @@ Version:        0
 Release:        0
 Summary:        Utility libraries for working with SUSE kernel sources
 License:        GPL-2.0-only
-URL:            https://github.com/hramrach/kernel-source/tree/scripts
+URL:            https://github.com/openSUSE/kernel-source/tree/scripts/scripts
 BuildRequires:  %{python_module flit-core >= 3.11}
 BuildRequires:  %{python_module pip}
 BuildRequires:  %{python_module pytest}

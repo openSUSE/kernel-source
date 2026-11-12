@@ -8,16 +8,16 @@ import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
-from libs.cache_metadata import write_cache_metadata
-from libs.container_engine import ContainerEngine
-from libs.initrd_builder import create_busybox_initrd, create_dracut_initrd
-from libs.virtual_engine import VirtualMachine
-from libs.image_customizer import install_rpms_to_image
-from libs.ssh_utils import connect_ssh_and_wait, wait_for_ssh_ready
-from libs.lock import file_lock
-from libs.console import print_phase_header, get_logger
-from libs.command import get_printable_cmd
-from libs.errors import KernelSandboxError
+from kernel_sandbox.cache_metadata import write_cache_metadata
+from kernel_sandbox.container_engine import ContainerEngine
+from kernel_sandbox.initrd_builder import create_busybox_initrd, create_dracut_initrd
+from kernel_sandbox.virtual_engine import VirtualMachine
+from kernel_sandbox.image_customizer import install_rpms_to_image
+from kernel_sandbox.ssh_utils import connect_ssh_and_wait, wait_for_ssh_ready
+from kernel_sandbox.lock import file_lock
+from kernel_sandbox.console import print_phase_header, get_logger
+from kernel_sandbox.command import get_printable_cmd
+from kernel_sandbox.errors import KernelSandboxError
 
 logger = get_logger(__name__)
 CONTAINER_PULL_TIMEOUT = 300

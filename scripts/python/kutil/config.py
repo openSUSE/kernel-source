@@ -158,24 +158,31 @@ class CaseInsensitiveDict(dict):
 def read_config_sh(package_tar_up_dir):
     """Parse config.sh file and return a dict with key value pairs"""
     config_sh = os.path.join(package_tar_up_dir, 'config.sh')
+    with open(config_sh, 'rb') as f:
+        data = f.read()
+    return read_config_sh_data(data)
+
+
+def read_config_sh_data(data):
     config = CaseInsensitiveDict()
     lnnr = 0
-    with open(config_sh, 'r') as f:
-        for line in f:
-            lnnr += 1
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
+    if isinstance(data, bytes):
+        data = data.decode(errors='replace')
+    for line in data.splitlines():
+        lnnr += 1
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
 
-            if '=' in line:
-                key, raw_value = line.split('=', 1)
-                key = key.strip()
-                # shlex removes the outer quotation marks cleanly
-                parsed_tokens = shlex.split(raw_value)
-                value = parsed_tokens[0] if parsed_tokens else ""
-                config[key] = value
-            else:
-                raise ValueError('line {} malformed in {}: "{}"'.format(lnnr, config_sh, line))
+        if '=' in line:
+            key, raw_value = line.split('=', 1)
+            key = key.strip()
+            # shlex removes the outer quotation marks cleanly
+            parsed_tokens = shlex.split(raw_value)
+            value = parsed_tokens[0] if parsed_tokens else ""
+            config[key] = value
+        else:
+            raise ValueError('line {} malformed in {}: "{}"'.format(lnnr, config_sh, line))
 
     return config
 

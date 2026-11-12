@@ -1,7 +1,7 @@
 import shlex
 import subprocess
 import time
-from libs.errors import KernelSandboxError
+from kernel_sandbox.errors import KernelSandboxError
 
 
 class VirtualEngineError(KernelSandboxError):
