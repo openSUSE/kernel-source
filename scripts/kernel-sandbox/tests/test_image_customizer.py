@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from libs.image_customizer import (
+from kernel_sandbox.image_customizer import (
     DependencyError,
     ImageCustomizationError,
     extract_kernel_version_from_rpm,

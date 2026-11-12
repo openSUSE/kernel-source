@@ -3,8 +3,8 @@ import subprocess
 import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
-from libs.console import get_logger
-from libs.errors import KernelSandboxError
+from kernel_sandbox.console import get_logger
+from kernel_sandbox.errors import KernelSandboxError
 
 logger = get_logger(__name__)
 DEFAULT_QCOW2_IMG_CREATE_TIMEOUT = 60
