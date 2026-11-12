@@ -136,6 +136,9 @@ class CaseInsensitiveDict(dict):
     def __contains__(self, key):
         return super().__contains__(key.casefold())
 
+    def get(self, key, default=None):
+        return super().get(key.casefold(), default)
+
     def update(self, *args, **kwargs):
         for k, v in dict(*args, **kwargs).items():
             self[k] = v
