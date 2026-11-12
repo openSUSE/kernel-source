@@ -6,7 +6,7 @@ import socket
 import subprocess
 import time
 
-from libs.console import get_logger, print_phase_header
+from kernel_sandbox.console import get_logger, print_phase_header
 
 logger = get_logger(__name__)
 
