@@ -1,9 +1,9 @@
 import platform
 import yaml
 from pathlib import Path
-from libs.console import get_logger
-from libs.errors import KernelSandboxError
-from libs.kernel_source_git import Repository
+from kernel_sandbox.console import get_logger
+from kernel_sandbox.errors import KernelSandboxError
+from kernel_sandbox.kernel_source_git import Repository
 
 logger = get_logger(__name__)
 
