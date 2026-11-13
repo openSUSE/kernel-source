@@ -1,0 +1,245 @@
+From 17654aa629cba9a70e31cc1b7226a4fc1a1c801a Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 28 Oct 2026 23:45:07 -0400
+Subject: ACPI: scan: Do not hold physical_node_lock across device_offline() and device_online()
+Git-commit: 17654aa629cba9a70e31cc1b7226a4fc1a1c801a
+Patch-mainline: v7.4-rc3
+References: git-fixes
+
+acpi_bus_offline() and acpi_bus_online() hold the physical_node_lock of
+the ACPI device being hot-removed while they call device_offline() and
+device_online() for its physical nodes.  Offlining a CPU this way takes
+cpu_add_remove_lock and the CPU hotplug lock under physical_node_lock,
+and lockdep connects that to the uevent attribute of platform devices,
+whose store method takes physical_node_lock in
+Acpi_primary_dev_companion(): 
+
+  physical_node_lock (acpi_bus_offline())
+    -> cpu_add_remove_lock -> cpu_hotplug_lock
+    -> cpuhp_state-down (mce_cpu_pre_down() unregistering a device)
+    -> device_links_lock (device_links_purge())
+    -> kn->active of a uevent attribute (device link unregistration)
+    -> physical_node_lock (uevent_store() -> acpi_companion_match())
+
+syzbot has reported this cycle twice.  The uevent attribute waited for in
+the link unregistration is the device link's, not a platform device's,
+and the physical_node_lock taken at the end is that of the platform
+device's ACPI companion, not of the processor being ejected, so lockdep
+only connects them because they share lock classes and this is unlikely
+to deadlock.  However, lockdep turns itself off after reporting it.
+
+It can be reproduced in a QEMU guest by writing to the uevent attribute
+of an ACPI-enumerated platform device, reading the uevent attribute of a
+device link while the link is removed, offlining a CPU and ejecting one
+through sysfs.
+
+physical_node_lock protects the list of physical nodes.  Since
+acpi_unbind_one() blocks on it, holding it also keeps device_offline()
+and device_online() from running in parallel with whatever happens to a
+device after it has been unbound from its ACPI companion, but that is not
+Necessary: a reference to each device is held while the lock is dropped,
+and the removal of the devices that can actually be taken offline here
+(CPUs, memory blocks and containers) is serialized by the device hotplug
+lock or acpi_scan_lock, both of which acpi_device_hotplug() holds
+throughout.
+
+So drop physical_node_lock around device_offline() and device_online().
+Mark the nodes to offline with a new offline_pending flag, hold a
+reference to each device while the lock is dropped, and look its node up
+again afterwards to record whether it needs to be put back online,
+because it may have been unbound in the meantime.  Physical nodes added
+while the lock is not held are not offlined by the current pass, which is
+no different from adding them right after it.
+
+Since acpi_container_offline() no longer runs under the container's
+physical_node_lock, the nesting annotation added to
+acpi_scan_is_offline() by commit 4c533c801d1c ("ACPI / scan: Annotate
+physical_node_lock in acpi_scan_is_offline()") is not needed anymore, so
+drop it.
+
+Fixes: 683058e315f0 ("ACPI / hotplug: Use device offline/online for graceful hot-removal")
+Reported-by: syzbot+cea7285bc17b76ffe39f@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/r/6ae18ed0.6200f071.51519.0f60.GAE@google.com
+Reported-by: syzbot+a265816368571f78ab88@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/r/6adf293a.67317f00.38c4bc.00af.GAE@google.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Link: https://patch.msgid.link/20261029034507.2721580-3-sashal@kernel.org
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/acpi/scan.c     |  106 +++++++++++++++++++++++++++++++++++++++---------
+ include/acpi/acpi_bus.h |    1 
+ 2 files changed, 88 insertions(+), 19 deletions(-)
+
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -112,11 +112,7 @@ bool acpi_scan_is_offline(struct acpi_de
+ 	bool offline = true;
+ 	char *envp[] = { "EVENT=offline", NULL };
+ 
+-	/*
+-	 * acpi_container_offline() calls this for all of the container's
+-	 * children under the container's physical_node_lock lock.
+-	 */
+-	mutex_lock_nested(&adev->physical_node_lock, SINGLE_DEPTH_NESTING);
++	mutex_lock(&adev->physical_node_lock);
+ 
+ 	list_for_each_entry(pn, &adev->physical_node_list, node)
+ 		if (device_supports_offline(pn->dev) && !pn->dev->offline) {
+@@ -131,6 +127,59 @@ bool acpi_scan_is_offline(struct acpi_de
+ 	return offline;
+ }
+ 
++static struct acpi_device_physical_node *
++acpi_find_physical_node(struct acpi_device *adev, struct device *dev)
++{
++	struct acpi_device_physical_node *pn;
++
++	lockdep_assert_held(&adev->physical_node_lock);
++
++	list_for_each_entry(pn, &adev->physical_node_list, node)
++		if (pn->dev == dev)
++			return pn;
++
++	return NULL;
++}
++
++static struct device *acpi_next_offline_pending(struct acpi_device *adev)
++{
++	struct acpi_device_physical_node *pn;
++
++	lockdep_assert_held(&adev->physical_node_lock);
++
++	/*
++	 * Find the first physical node that is still to be offlined, clear its
++	 * offline_pending flag and return its device with a reference held.
++	 */
++	list_for_each_entry(pn, &adev->physical_node_list, node)
++		if (pn->offline_pending) {
++			pn->offline_pending = false;
++			return get_device(pn->dev);
++		}
++
++	return NULL;
++}
++
++static struct device *acpi_next_put_online(struct acpi_device *adev)
++{
++	struct acpi_device_physical_node *pn;
++
++	lockdep_assert_held(&adev->physical_node_lock);
++
++	/*
++	 * Find the first physical node that has been offlined by
++	 * acpi_bus_offline(), clear its put_online flag and return its device
++	 * with a reference held.
++	 */
++	list_for_each_entry(pn, &adev->physical_node_list, node)
++		if (pn->put_online) {
++			pn->put_online = false;
++			return get_device(pn->dev);
++		}
++
++	return NULL;
++}
++
+ static acpi_status acpi_bus_offline(acpi_handle handle, u32 lvl, void *data,
+ 				    void **ret_p)
+ {
+@@ -138,6 +187,7 @@ static acpi_status acpi_bus_offline(acpi
+ 	struct acpi_device_physical_node *pn;
+ 	bool second_pass = (bool)data;
+ 	acpi_status status = AE_OK;
++	struct device *dev;
+ 
+ 	if (!device)
+ 		return AE_OK;
+@@ -150,26 +200,43 @@ static acpi_status acpi_bus_offline(acpi
+ 	mutex_lock(&device->physical_node_lock);
+ 
+ 	list_for_each_entry(pn, &device->physical_node_list, node) {
+-		int ret;
+-
+ 		if (second_pass) {
+ 			/* Skip devices offlined by the first pass. */
+-			if (pn->put_online)
+-				continue;
++			pn->offline_pending = !pn->put_online;
+ 		} else {
++			pn->offline_pending = true;
+ 			pn->put_online = false;
+ 		}
+-		ret = device_offline(pn->dev);
++	}
++
++	/*
++	 * Drop physical_node_lock around device_offline(), because the latter
++	 * acquires locks, like the CPU hotplug ones, that must not nest under
++	 * it.
++	 */
++	while ((dev = acpi_next_offline_pending(device))) {
++		int ret;
++
++		mutex_unlock(&device->physical_node_lock);
++		ret = device_offline(dev);
++		mutex_lock(&device->physical_node_lock);
++
+ 		if (ret >= 0) {
+-			pn->put_online = !ret;
++			/* The device may have been unbound in the meantime. */
++			pn = acpi_find_physical_node(device, dev);
++			if (pn)
++				pn->put_online = !ret;
+ 		} else {
+ 			*ret_p = &device->dev;
+ 			if (second_pass) {
+-				dev_warn(pn->dev, "Offline failed.\n");
++				dev_warn(dev, "Offline failed.\n");
+ 				status = AE_ERROR;
+-				break;
+ 			}
+ 		}
++
++		put_device(dev);
++		if (ACPI_FAILURE(status))
++			break;
+ 	}
+ 
+ 	mutex_unlock(&device->physical_node_lock);
+@@ -181,18 +248,19 @@ static acpi_status acpi_bus_online(acpi_
+ 				   void **ret_p)
+ {
+ 	struct acpi_device *device = acpi_fetch_acpi_dev(handle);
+-	struct acpi_device_physical_node *pn;
++	struct device *dev;
+ 
+ 	if (!device)
+ 		return AE_OK;
+ 
+ 	mutex_lock(&device->physical_node_lock);
+ 
+-	list_for_each_entry(pn, &device->physical_node_list, node)
+-		if (pn->put_online) {
+-			device_online(pn->dev);
+-			pn->put_online = false;
+-		}
++	while ((dev = acpi_next_put_online(device))) {
++		mutex_unlock(&device->physical_node_lock);
++		device_online(dev);
++		mutex_lock(&device->physical_node_lock);
++		put_device(dev);
++	}
+ 
+ 	mutex_unlock(&device->physical_node_lock);
+ 
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -344,6 +344,7 @@ struct acpi_device_physical_node {
+ 	struct list_head node;
+ 	struct device *dev;
+ 	bool put_online:1;
++	bool offline_pending:1;
+ };
+ 
+ struct acpi_device_properties {
