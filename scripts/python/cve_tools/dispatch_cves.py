@@ -224,8 +224,9 @@ def update_bug_metadata(bzapi, todo):
         b.original_email = bugmap[b.bug].assigned_to    if b.bug in bugmap else '<unknown>'
         b.any_flags = bool(bugmap[b.bug].flags)         if b.bug in bugmap else False
         b.product = bugmap[b.bug].product               if b.bug in bugmap else ''
+        # no CVSS score in the c-k-f output, leave the deadline alone
         b.deadline = calculate_deadline(format_time(bugmap[b.bug].creation_time), b.in_cvss) \
-                                                        if b.bug in bugmap else None
+                                                        if b.bug in bugmap and b.in_cvss else None
 
         if b.bug in bugmap:
             b.cc_add = list(set(b.cc_list) - set(bugmap[b.bug].cc))
