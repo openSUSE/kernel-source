@@ -6,9 +6,9 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 
-import libs.container_engine as container_engine_module
-from libs.config_manager import ConfigSpecError, load_yaml_spec
-from libs.container_engine import ContainerEngine, ContainerRuntimeError
+import kernel_sandbox.container_engine as container_engine_module
+from kernel_sandbox.config_manager import ConfigSpecError, load_yaml_spec
+from kernel_sandbox.container_engine import ContainerEngine, ContainerRuntimeError
 
 
 def _mock_executable(directory, name):
@@ -322,7 +322,7 @@ class TestBuildCommand(unittest.TestCase):
 
     def test_compile_kernel_yaml_end_to_end_argv_generation(self):
         """verify assets/compile_kernel.yaml produces expected container argv structure."""
-        spec_path = Path(__file__).resolve().parent.parent / "assets" / "compile_kernel.yaml"
+        spec_path = Path(__file__).resolve().parent.parent / "kernel_sandbox/assets" / "compile_kernel.yaml"
         cmd = self.engine.build_command(
             spec=spec_path,
             env_dict={
@@ -344,7 +344,7 @@ class TestBuildCommand(unittest.TestCase):
 
     def test_install_modules_yaml_end_to_end_argv_generation(self):
         """verify assets/install_modules.yaml produces expected container argv structure."""
-        spec_path = Path(__file__).resolve().parent.parent / "assets" / "install_modules.yaml"
+        spec_path = Path(__file__).resolve().parent.parent / "kernel_sandbox/assets" / "install_modules.yaml"
         cmd = self.engine.build_command(
             spec=spec_path,
             env_dict={
