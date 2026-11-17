@@ -1,0 +1,168 @@
+From: Bernard Pidoux <bernard.f6bvp@gmail.com>
+Date: Thu, 29 Oct 2026 19:12:04 +0100
+Subject: [PATCH] rose: don't give the same LCI to two calls placed at the same
+ time
+References: bsc#1258210
+Patch-mainline: 6.18.64
+Git-commit: 4e9d49c39bf7161e1b14493076816c715f9ed557
+
+rose_connect() picks the logical channel of a new call with
+rose_new_lci(), which looks for an LCI used neither by a socket nor by
+a through route on the neighbour, and stores the result in rose->lci
+afterwards.  Nothing serialises the search and the store, so two
+sockets calling through the same neighbour on two CPUs can pick the
+same LCI.  An unbound socket is worse: it is only put on the socket
+list by the autobind after its LCI was chosen, so it stays invisible
+to the search for longer.  Both calls go out on the same channel, the
+neighbour accepts one of them, and the other connect() hangs until T1
+expires while the neighbour holds a circuit nobody uses.
+
+rose_new_lci() also walks rose_route_list through
+rose_route_free_lci() without rose_route_list_lock when called from
+rose_connect(), while rose_route_frame() may add or remove routes on
+another CPU.
+
+Do the autobind first, so the socket is on the list before it gets an
+LCI, then choose and store the LCI under rose_route_list_lock, as
+rose_route_frame() already does for a through route.  Assert the lock
+in rose_route_free_lci().
+
+On a QEMU bench with two 4-CPU guests, eight connect() calls started at
+the same time through one neighbour, six rounds: before, 14 duplicate
+LCIs and 14 of the 48 calls timed out; after, no duplicate and 48/48
+calls connected.
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Signed-off-by: Bernard Pidoux <bernard.f6bvp@gmail.com>
+Assisted-by: Claude:claude-opus-5-5
+(cherry picked from commit 4e9d49c39bf7161e1b14493076816c715f9ed557)
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/net/rose.h    |  1 +
+ net/rose/af_rose.c    | 32 ++++++++++++++++----------------
+ net/rose/rose_route.c | 19 +++++++++++++++++++
+ 3 files changed, 36 insertions(+), 16 deletions(-)
+
+diff --git a/include/net/rose.h b/include/net/rose.h
+index 83d6b611eb73..7ee480e0a64e 100644
+--- a/include/net/rose.h
++++ b/include/net/rose.h
+@@ -267,6 +267,7 @@ void rose_link_device_down(struct net_device *);
+ struct net_device *rose_dev_first(void);
+ struct net_device *rose_dev_get(rose_address *);
+ struct rose_route *rose_route_free_lci(unsigned int, struct rose_neigh *);
++unsigned int rose_assign_lci(struct sock *sk);
+ struct rose_neigh *rose_get_neigh(rose_address *, unsigned char *,
+ 				  unsigned char *, int);
+ int rose_rt_ioctl(unsigned int, void __user *);
+diff --git a/net/rose/af_rose.c b/net/rose/af_rose.c
+index 4912138bb2f6..614d033410fa 100644
+--- a/net/rose/af_rose.c
++++ b/net/rose/af_rose.c
+@@ -330,6 +330,7 @@ struct sock *rose_find_socket(unsigned int lci, struct rose_neigh *neigh)
+ 
+ /*
+  *	Find a unique LCI for a given device.
++ *	The caller holds rose_route_list_lock.
+  */
+ unsigned int rose_new_lci(struct rose_neigh *neigh)
+ {
+@@ -854,20 +855,6 @@ static int rose_connect(struct socket *sock, struct sockaddr *uaddr, int addr_le
+ 	sk->sk_state   = TCP_CLOSE;
+ 	sock->state = SS_UNCONNECTED;
+ 
+-	rose->neighbour = rose_get_neigh(&addr->srose_addr, &cause,
+-					 &diagnostic, 0);
+-	if (!rose->neighbour) {
+-		err = -ENETUNREACH;
+-		goto out_release;
+-	}
+-
+-	rose->lci = rose_new_lci(rose->neighbour);
+-	if (!rose->lci) {
+-		err = -ENETUNREACH;
+-		rose_neigh_put(rose->neighbour);
+-		goto out_release;
+-	}
+-
+ 	if (sock_flag(sk, SOCK_ZAPPED)) {	/* Must bind first - autobinding in this may or may not work */
+ 		struct net_device *dev;
+ 
+@@ -876,14 +863,12 @@ static int rose_connect(struct socket *sock, struct sockaddr *uaddr, int addr_le
+ 		dev = rose_dev_first();
+ 		if (!dev) {
+ 			err = -ENETUNREACH;
+-			rose_neigh_put(rose->neighbour);
+ 			goto out_release;
+ 		}
+ 
+ 		user = ax25_findbyuid(current_euid());
+ 		if (!user) {
+ 			err = -EINVAL;
+-			rose_neigh_put(rose->neighbour);
+ 			dev_put(dev);
+ 			goto out_release;
+ 		}
+@@ -897,6 +882,21 @@ static int rose_connect(struct socket *sock, struct sockaddr *uaddr, int addr_le
+ 
+ 		rose_insert_socket(sk);		/* Finish the bind */
+ 	}
++
++	rose->neighbour = rose_get_neigh(&addr->srose_addr, &cause,
++					 &diagnostic, 0);
++	if (!rose->neighbour) {
++		err = -ENETUNREACH;
++		goto out_release;
++	}
++
++	/* The socket is on the list now, so others see the LCI it gets */
++	if (!rose_assign_lci(sk)) {
++		err = -ENETUNREACH;
++		rose_neigh_put(rose->neighbour);
++		goto out_release;
++	}
++
+ 	rose->dest_addr   = addr->srose_addr;
+ 	rose->dest_call   = addr->srose_call;
+ 	rose->rand        = ((long)rose & 0xFFFF) + rose->lci;
+diff --git a/net/rose/rose_route.c b/net/rose/rose_route.c
+index 3499f034b83c..87a33f5c65d8 100644
+--- a/net/rose/rose_route.c
++++ b/net/rose/rose_route.c
+@@ -724,6 +724,8 @@ struct rose_route *rose_route_free_lci(unsigned int lci, struct rose_neigh *neig
+ {
+ 	struct rose_route *rose_route;
+ 
++	lockdep_assert_held(&rose_route_list_lock);
++
+ 	for (rose_route = rose_route_list; rose_route != NULL; rose_route = rose_route->next)
+ 		if ((rose_route->neigh1 == neigh && rose_route->lci1 == lci) ||
+ 		    (rose_route->neigh2 == neigh && rose_route->lci2 == lci))
+@@ -732,6 +734,23 @@ struct rose_route *rose_route_free_lci(unsigned int lci, struct rose_neigh *neig
+ 	return NULL;
+ }
+ 
++/*
++ *	Give a socket placing a call a free LCI on its neighbour. As for a
++ *	through route in rose_route_frame(), the search and the assignment
++ *	are done under rose_route_list_lock, so two calls cannot pick the
++ *	same LCI. The socket must already be on the socket list.
++ */
++unsigned int rose_assign_lci(struct sock *sk)
++{
++	struct rose_sock *rose = rose_sk(sk);
++
++	spin_lock_bh(&rose_route_list_lock);
++	rose->lci = rose_new_lci(rose->neighbour);
++	spin_unlock_bh(&rose_route_list_lock);
++
++	return rose->lci;
++}
++
+ /*
+  *	Find a neighbour or a route given a ROSE address.
+  */
+-- 
+2.56.0
+

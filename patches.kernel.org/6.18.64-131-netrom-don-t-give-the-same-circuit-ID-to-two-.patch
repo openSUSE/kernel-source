@@ -1,0 +1,160 @@
+From: Bernard Pidoux <bernard.f6bvp@gmail.com>
+Date: Wed, 4 Nov 2026 14:41:48 +0100
+Subject: [PATCH] netrom: don't give the same circuit ID to two sockets
+References: bsc#1258210
+Patch-mainline: 6.18.64
+Git-commit: 64166a6489d7eb3b7ba6bc8f534b008402a60fec
+
+nr_connect() and nr_rx_frame() pick a circuit ID with
+nr_find_next_circuit(), which looks for an ID that no socket on nr_list
+uses, and then store it in the socket and advance the global circuit
+counter. The search and the assignment are not done under one lock, and
+in nr_rx_frame() the new socket only goes on nr_list at the end. Two
+sockets doing it at the same time can get the same ID.
+
+The far end then answers both circuits with the same ID: the CONNACK of
+one goes to the socket found first, the other connect() never
+completes, and the frames of the two circuits are mixed up.
+
+Pick the ID and give it to the socket under nr_list_lock, with the
+socket already on nr_list: nr_connect() runs once the socket is bound,
+and nr_rx_frame() now puts the new socket on nr_list under the same
+lock. The global counter is then also only changed under that lock.
+nr_list_lock is still not taken under a socket lock.
+
+This is the same fix as rose_assign_lci() for ROSE.
+
+Tested on two QEMU guests (6.12.94, KASAN, lockdep) linked by KISS: A
+starts eight connect() calls at the same time to a listening socket on
+B, bound and unbound sockets alternately, six rounds, and looks for
+duplicate circuit IDs in /proc/net/nr. The "slow" runs add mdelay(2)
+between the choice of the ID and its assignment, to widen the window.
+
+                 connected   duplicate pairs   rounds with duplicates
+  before, slow     25/48           37                 6/6
+  after, slow      48/48            0                 0/6
+  before           48/48            0                 0/6
+  after            48/48            0                 0/6
+
+No kernel report in any run, and no lockdep report for the new
+nr_list_lock taken in nr_rx_frame().
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Signed-off-by: Bernard Pidoux <bernard.f6bvp@gmail.com>
+Assisted-by: Claude:claude-opus-5-5
+(cherry picked from commit 64166a6489d7eb3b7ba6bc8f534b008402a60fec)
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ net/netrom/af_netrom.c | 55 ++++++++++++++++++++++++------------------
+ 1 file changed, 32 insertions(+), 23 deletions(-)
+
+diff --git a/net/netrom/af_netrom.c b/net/netrom/af_netrom.c
+index e3daae77e43e..e3392e6dbc2e 100644
+--- a/net/netrom/af_netrom.c
++++ b/net/netrom/af_netrom.c
+@@ -208,29 +208,40 @@ static struct sock *nr_find_peer(unsigned char index, unsigned char id,
+ }
+ 
+ /*
+- *	Find next free circuit ID.
++ *	Give a socket the next free circuit ID. The search and the assignment
++ *	are done under nr_list_lock, which the caller holds, with the socket
++ *	already on nr_list: two sockets cannot pick the same ID.
+  */
+-static unsigned short nr_find_next_circuit(void)
++static void nr_assign_circuit(struct nr_sock *nr)
+ {
+ 	unsigned short id = circuit;
+ 	unsigned char i, j;
+-	struct sock *sk;
++	struct sock *s;
++	bool used;
++
++	lockdep_assert_held(&nr_list_lock);
+ 
+ 	for (;;) {
+ 		i = id / 256;
+ 		j = id % 256;
+ 
+ 		if (i != 0 && j != 0) {
+-			sk = nr_find_socket(i, j, NULL);
+-			if (!sk)
++			used = false;
++			sk_for_each(s, &nr_list)
++				if (nr_sk(s)->my_index == i && nr_sk(s)->my_id == j) {
++					used = true;
++					break;
++				}
++			if (!used)
+ 				break;
+-			sock_put(sk);
+ 		}
+ 
+ 		id++;
+ 	}
+ 
+-	return id;
++	nr->my_index = i;
++	nr->my_id    = j;
++	circuit      = id + 1;
+ }
+ 
+ /*
+@@ -709,14 +720,10 @@ static int nr_connect(struct socket *sock, struct sockaddr *uaddr,
+ 
+ 	nr->dest_addr = addr->sax25_call;
+ 
+-	release_sock(sk);
+-	circuit = nr_find_next_circuit();
+-	lock_sock(sk);
+-
+-	nr->my_index = circuit / 256;
+-	nr->my_id    = circuit % 256;
+-
+-	circuit++;
++	/* The socket is on nr_list now, so others see the ID it gets */
++	spin_lock_bh(&nr_list_lock);
++	nr_assign_circuit(nr);
++	spin_unlock_bh(&nr_list_lock);
+ 
+ 	/* Move to connecting socket, start sending Connect Requests */
+ 	sock->state  = SS_CONNECTING;
+@@ -1013,15 +1020,19 @@ int nr_rx_frame(struct sk_buff *skb, struct net_device *dev)
+ 	nr_make->your_index  = circuit_index;
+ 	nr_make->your_id     = circuit_id;
+ 
++	/*
++	 * Put the new socket on nr_list as it gets its circuit ID, under the
++	 * same lock, so that no other socket can be given the same ID.
++	 * nr_list_lock is not taken under a socket lock (nr_info_show() takes
++	 * them the other way round).
++	 */
+ 	bh_unlock_sock(sk);
+-	circuit = nr_find_next_circuit();
++	spin_lock_bh(&nr_list_lock);
++	nr_assign_circuit(nr_make);
++	sk_add_node(make, &nr_list);
++	spin_unlock_bh(&nr_list_lock);
+ 	bh_lock_sock(sk);
+ 
+-	nr_make->my_index    = circuit / 256;
+-	nr_make->my_id       = circuit % 256;
+-
+-	circuit++;
+-
+ 	/* Window negotiation */
+ 	if (window < nr_make->window)
+ 		nr_make->window = window;
+@@ -1056,8 +1067,6 @@ int nr_rx_frame(struct sk_buff *skb, struct net_device *dev)
+ 	bh_unlock_sock(sk);
+ 	sock_put(sk);
+ 
+-	nr_insert_socket(make);
+-
+ 	nr_start_heartbeat(make);
+ 	nr_start_idletimer(make);
+ 
+-- 
+2.56.0
+
