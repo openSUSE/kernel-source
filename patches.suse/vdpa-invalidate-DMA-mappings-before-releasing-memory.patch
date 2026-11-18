@@ -1,0 +1,163 @@
+From acbf36deb53d9e14e4768bf58883795a8232aa5b Mon Sep 17 00:00:00 2001
+From: Linfeng Sun <linfeng.sun.dev@gmail.com>
+Date: Fri, 11 Sep 2026 17:00:59 +0800
+Subject: vdpa: invalidate DMA mappings before releasing memory
+Git-commit: acbf36deb53d9e14e4768bf58883795a8232aa5b
+Patch-mainline: v7.4-rc2
+References: git-fixes
+
+vdpa can release pinned pages and file references before the device stops
+using the corresponding mappings, allowing stale DMA to corrupt memory.
+
+Invalidate mappings before dropping their backing references. For set_map
+backends, publish an IOTLB without the invalidated range and keep the old
+references if that fails. Do this immediately even within a batch.
+
+Serialize vdpa_sim set_map updates with its worker so publishing a new map
+cannot race an active transfer. Abort mlx5 map replacement when resumable
+virtqueues cannot be suspended, since changing the memory region while
+those queues remain active would preserve the same stale DMA window. Reject
+zero-sized and wrapping invalidations before calculating their inclusive
+range end.
+
+I found this bug myself, though the patch was written with AI assistance.
+
+Fixes: 4c8cf31885f6 ("vhost: introduce vDPA-based backend")
+Assisted-by: OpenAI-Codex:GPT-5
+Signed-off-by: Linfeng Sun <linfeng.sun.dev@gmail.com>
+Message-id: <20260911-fix-vdpa-iotlb-lifetime-v3-2-8766d371748e@gmail.com>
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/vdpa/mlx5/net/mlx5_vnet.c | 10 +++++++-
+ drivers/vdpa/vdpa_sim/vdpa_sim.c  |  3 +++
+ drivers/vhost/vdpa.c              | 40 ++++++++++++++++++++++++-------
+ 3 files changed, 43 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/vdpa/mlx5/net/mlx5_vnet.c b/drivers/vdpa/mlx5/net/mlx5_vnet.c
+index 8563fec2855d..0fcb18b5f30a 100644
+--- a/drivers/vdpa/mlx5/net/mlx5_vnet.c
++++ b/drivers/vdpa/mlx5/net/mlx5_vnet.c
+@@ -3059,7 +3059,15 @@ static int mlx5_vdpa_change_map(struct mlx5_vdpa_dev *mvdev,
+ 	bool teardown = !is_resumable(ndev);
+ 	int err;
+ 
+-	suspend_vqs(ndev, 0, ndev->cur_num_vqs);
++	if ((mvdev->status & VIRTIO_CONFIG_S_DRIVER_OK) && !mvdev->suspended) {
++		err = suspend_vqs(ndev, 0, ndev->cur_num_vqs);
++		if (err && !teardown) {
++			for (int i = 0; i < ndev->cur_num_vqs; i++)
++				resume_vqs(ndev, i, 1);
++			mlx5_vdpa_put_mr(mvdev, new_mr);
++			return err;
++		}
++	}
+ 	if (teardown) {
+ 		err = save_channels_info(ndev);
+ 		if (err) {
+diff --git a/drivers/vdpa/vdpa_sim/vdpa_sim.c b/drivers/vdpa/vdpa_sim/vdpa_sim.c
+index 017366cb6684..97d437d89524 100644
+--- a/drivers/vdpa/vdpa_sim/vdpa_sim.c
++++ b/drivers/vdpa/vdpa_sim/vdpa_sim.c
+@@ -638,6 +638,7 @@ static int vdpasim_set_map(struct vdpa_device *vdpa, unsigned int asid,
+ 	if (asid >= vdpasim->dev_attr.nas)
+ 		return -EINVAL;
+ 
++	mutex_lock(&vdpasim->mutex);
+ 	spin_lock(&vdpasim->iommu_lock);
+ 
+ 	iommu = &vdpasim->iommu[asid];
+@@ -652,11 +653,13 @@ static int vdpasim_set_map(struct vdpa_device *vdpa, unsigned int asid,
+ 			goto err;
+ 	}
+ 	spin_unlock(&vdpasim->iommu_lock);
++	mutex_unlock(&vdpasim->mutex);
+ 	return 0;
+ 
+ err:
+ 	vhost_iotlb_reset(iommu);
+ 	spin_unlock(&vdpasim->iommu_lock);
++	mutex_unlock(&vdpasim->mutex);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/vhost/vdpa.c b/drivers/vhost/vdpa.c
+index 43678124646a..ad3a157b4050 100644
+--- a/drivers/vhost/vdpa.c
++++ b/drivers/vhost/vdpa.c
+@@ -998,10 +998,10 @@ static void vhost_vdpa_va_unmap(struct vhost_vdpa *v, struct vhost_iotlb *iotlb,
+ 	struct vdpa_map_file *map_file;
+ 
+ 	while ((map = vhost_iotlb_itree_first(iotlb, start, last)) != NULL) {
++		vhost_vdpa_general_unmap(v, map, asid);
+ 		map_file = (struct vdpa_map_file *)map->opaque;
+ 		fput(map_file->file);
+ 		kfree(map_file);
+-		vhost_vdpa_general_unmap(v, map, asid);
+ 		vhost_iotlb_map_free(iotlb, map);
+ 	}
+ }
+@@ -1075,21 +1075,39 @@ static int vhost_vdpa_map(struct vhost_vdpa *v, struct vhost_iotlb *iotlb,
+ 	return 0;
+ }
+ 
+-static void vhost_vdpa_unmap(struct vhost_vdpa *v,
+-			     struct vhost_iotlb *iotlb,
+-			     u64 iova, u64 size)
++static int vhost_vdpa_unmap(struct vhost_vdpa *v,
++			    struct vhost_iotlb *iotlb,
++			    u64 iova, u64 size)
+ {
+ 	struct vdpa_device *vdpa = v->vdpa;
+ 	const struct vdpa_config_ops *ops = vdpa->config;
++	struct vhost_iotlb_map *map;
++	struct vhost_iotlb new_iotlb;
+ 	u32 asid = iotlb_to_asid(iotlb);
++	u64 last = iova + size - 1;
++	int ret;
+ 
+-	vhost_vdpa_iotlb_unmap(v, iotlb, iova, iova + size - 1, asid);
++	if (ops->set_map && !ops->dma_map) {
++		vhost_iotlb_init(&new_iotlb, iotlb->limit, iotlb->flags);
++		list_for_each_entry(map, &iotlb->list, link) {
++			if (map->start <= last && map->last >= iova)
++				continue;
++			ret = vhost_iotlb_add_range_ctx(&new_iotlb, map->start,
++							map->last, map->addr,
++							map->perm, map->opaque);
++			if (ret)
++				goto reset;
++		}
+ 
+-	if (ops->set_map) {
+-		if (!v->in_batch)
+-			ops->set_map(vdpa, asid, iotlb);
++		ret = ops->set_map(vdpa, asid, &new_iotlb);
++reset:
++		vhost_iotlb_reset(&new_iotlb);
++		if (ret)
++			return ret;
+ 	}
+ 
++	vhost_vdpa_iotlb_unmap(v, iotlb, iova, last, asid);
++	return 0;
+ }
+ 
+ static int vhost_vdpa_va_map(struct vhost_vdpa *v,
+@@ -1343,7 +1361,11 @@ static int vhost_vdpa_process_iotlb_msg(struct vhost_dev *dev, u32 asid,
+ 		r = vhost_vdpa_process_iotlb_update(v, iotlb, msg);
+ 		break;
+ 	case VHOST_IOTLB_INVALIDATE:
+-		vhost_vdpa_unmap(v, iotlb, msg->iova, msg->size);
++		if (!msg->size || msg->iova > U64_MAX - msg->size + 1) {
++			r = -EINVAL;
++			break;
++		}
++		r = vhost_vdpa_unmap(v, iotlb, msg->iova, msg->size);
+ 		break;
+ 	case VHOST_IOTLB_BATCH_BEGIN:
+ 		v->batch_asid = asid;
+-- 
+2.53.0
+
