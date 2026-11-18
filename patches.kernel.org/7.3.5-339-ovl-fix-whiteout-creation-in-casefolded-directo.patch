@@ -1,0 +1,216 @@
+From: Chris Mason <mason@kernel.org>
+Date: Fri, 16 Oct 2026 21:17:21 +0000
+Subject: [PATCH] ovl: fix whiteout creation in casefolded directories
+References: bsc#1012628
+Patch-mainline: 7.3.5
+Git-commit: e803c82dcdd15e87b48fca1ea8d2cfe6a7ed83d4
+
+[ Upstream commit e803c82dcdd15e87b48fca1ea8d2cfe6a7ed83d4 ]
+
+unlink and rmdir fail with EINVAL on an overlay with casefolded
+(case-insensitive) layers, if the name exists in a lower layer.
+Casefolded layers need CONFIG_UNICODE. Root can mount such an overlay,
+and so can an unprivileged user in a user namespace, with tmpfs layers.
+
+Overlayfs does not change a lower layer. To remove a name that exists
+there, it hides the name with a marker file, a whiteout. It creates the
+whiteout in the work directory, a scratch directory on the upper
+filesystem, and renames it over the name in the upper directory:
+
+- ovl_whiteout() creates the whiteout with mknod, or as a hard link to
+  an earlier whiteout.
+- ovl_cleanup_and_whiteout() then prepares the rename with
+  start_renaming_two_dentries(), which returns -EINVAL if the source or
+  the target dentry is unhashed, that is, not in the dentry hash table.
+
+With casefolded directories, both dentries can be unhashed:
+
+- The target. Lookup in a casefolded directory leaves a negative dentry
+  unhashed, so the rename target is unhashed if the name does not exist
+  in the upper directory.
+- The source, which is the new whiteout. tmpfs hashes a dentry when
+  mknod or link makes it positive, but ext4 does not, so on ext4 the
+  source is unhashed as well.
+
+The cleanup after the failure also refuses an unhashed dentry, so on
+ext4 the whiteout is left behind in the work directory.
+
+Reproduced with rm and rmdir on casefolded tmpfs and ext4 layers, also
+as uid 1000 in a user namespace.
+
+Fix this by creating the whiteout with ovl_create_temp(), which repeats
+the lookup if the new dentry is unhashed. Prepare the rename with
+start_renaming_dentry(), which looks up the target name with the
+directories locked. The caller looked the name up without a lock, so
+return -ESTALE if the name now refers to a different inode.
+
+Fixes: 833d2b3a072f ("Add start_renaming_two_dentries()")
+Cc: stable@vger.kernel.org
+Signed-off-by: Chris Mason <mason@kernel.org>
+[amir: pass the name used for lookup instead of taking a name snapshot]
+Tested-by: Hungyu Lin <dennylin0707@gmail.com>
+Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/overlayfs/dir.c       | 46 ++++++++++++++++++++++------------------
+ fs/overlayfs/overlayfs.h | 10 +--------
+ fs/overlayfs/readdir.c   |  3 ++-
+ fs/overlayfs/util.c      |  2 +-
+ 4 files changed, 29 insertions(+), 32 deletions(-)
+
+diff --git a/fs/overlayfs/dir.c b/fs/overlayfs/dir.c
+index f716ac13badf..c77af9a79d88 100644
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@ -74,39 +74,34 @@ static struct dentry *ovl_start_creating_temp(struct ovl_fs *ofs,
+ 			      &QSTR(name));
+ }
+ 
++/*
++ * The whiteout is the source of a rename, so it has to be hashed.
++ * ovl_create_temp() takes care of that for a casefolded workdir.
++ */
+ static struct dentry *ovl_whiteout(struct ovl_fs *ofs)
+ {
+ 	int err;
+ 	struct dentry *whiteout, *link;
+ 	struct dentry *workdir = ofs->workdir;
+-	struct inode *wdir = workdir->d_inode;
+-	char name[OVL_TEMPNAME_SIZE];
+ 
+ 	guard(mutex)(&ofs->whiteout_lock);
+ 
+ 	if (!ofs->whiteout) {
+-		whiteout = ovl_start_creating_temp(ofs, workdir, name);
++		whiteout = ovl_create_temp(ofs, workdir, &(struct ovl_cattr) {
++					.mode = S_IFCHR | WHITEOUT_MODE,
++					.rdev = WHITEOUT_DEV });
+ 		if (IS_ERR(whiteout))
+ 			return whiteout;
+-		err = ovl_do_whiteout(ofs, wdir, whiteout);
+-		if (!err)
+-			ofs->whiteout = dget(whiteout);
+-		end_creating(whiteout);
+-		if (err)
+-			return ERR_PTR(err);
++		ofs->whiteout = whiteout;
+ 	}
+ 
+ 	if (!ofs->no_shared_whiteout) {
+-		link = ovl_start_creating_temp(ofs, workdir, name);
+-		if (IS_ERR(link))
++		link = ovl_create_temp(ofs, workdir, &(struct ovl_cattr) {
++					.hardlink = ofs->whiteout });
++		if (!IS_ERR(link))
+ 			return link;
+-		err = ovl_do_link(ofs, ofs->whiteout, wdir, link);
+-		if (!err)
+-			whiteout = dget(link);
+-		end_creating(link);
+-		if (!err)
+-			return whiteout;
+ 
++		err = PTR_ERR(link);
+ 		if (err != -EMLINK) {
+ 			pr_warn("Failed to link whiteout - disabling whiteout inode sharing(nlink=%u, err=%u)\n",
+ 				ofs->whiteout->d_inode->i_nlink,
+@@ -120,9 +115,10 @@ static struct dentry *ovl_whiteout(struct ovl_fs *ofs)
+ }
+ 
+ int ovl_cleanup_and_whiteout(struct ovl_fs *ofs, struct dentry *dir,
+-			     struct dentry *dentry)
++			     struct dentry *dentry, const struct qstr *name)
+ {
+ 	struct dentry *whiteout;
++	struct qstr last = QSTR_LEN(name->name, name->len);
+ 	struct renamedata rd = {};
+ 	int err;
+ 	int flags = 0;
+@@ -139,9 +135,17 @@ int ovl_cleanup_and_whiteout(struct ovl_fs *ofs, struct dentry *dir,
+ 	rd.old_parent = ofs->workdir;
+ 	rd.new_parent = dir;
+ 	rd.flags = flags;
+-	err = start_renaming_two_dentries(&rd, whiteout, dentry);
++	/*
++	 * The caller looked up @dentry by @name without a lock on @dir, and a
++	 * casefolded directory leaves a negative dentry unhashed.  Nothing tells
++	 * if such a dentry is still valid, so look up @name again with @dir locked.
++	 */
++	err = start_renaming_dentry(&rd, 0, whiteout, &last);
+ 	if (!err) {
+-		err = ovl_do_rename_rd(&rd);
++		if (d_inode(rd.new_dentry) != d_inode(dentry))
++			err = -ESTALE;
++		else
++			err = ovl_do_rename_rd(&rd);
+ 		end_renaming(&rd);
+ 	}
+ 	if (err)
+@@ -847,7 +851,7 @@ static int ovl_remove_and_whiteout(struct dentry *dentry,
+ 		goto out_dput_upper;
+ 	}
+ 
+-	err = ovl_cleanup_and_whiteout(ofs, upperdir, upper);
++	err = ovl_cleanup_and_whiteout(ofs, upperdir, upper, &dentry->d_name);
+ 	if (!err)
+ 		ovl_dir_modified(dentry->d_parent, true);
+ 
+diff --git a/fs/overlayfs/overlayfs.h b/fs/overlayfs/overlayfs.h
+index 91cdd7e15696..4faebb4c6825 100644
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@ -394,14 +394,6 @@ static inline int ovl_do_rename(struct ovl_fs *ofs, struct dentry *olddir,
+ 	return ovl_do_rename_rd(&rd);
+ }
+ 
+-static inline int ovl_do_whiteout(struct ovl_fs *ofs,
+-				  struct inode *dir, struct dentry *dentry)
+-{
+-	int err = vfs_whiteout(ovl_upper_mnt_idmap(ofs), dir, dentry);
+-	pr_debug("whiteout(%pd2) = %i\n", dentry, err);
+-	return err;
+-}
+-
+ static inline struct file *ovl_do_tmpfile(struct ovl_fs *ofs,
+ 					  struct dentry *dentry, umode_t mode)
+ {
+@@ -897,7 +889,7 @@ static inline void ovl_copyflags(struct inode *from, struct inode *to)
+ /* dir.c */
+ extern const struct inode_operations ovl_dir_inode_operations;
+ int ovl_cleanup_and_whiteout(struct ovl_fs *ofs, struct dentry *dir,
+-			     struct dentry *dentry);
++			     struct dentry *dentry, const struct qstr *name);
+ struct ovl_cattr {
+ 	dev_t rdev;
+ 	umode_t mode;
+diff --git a/fs/overlayfs/readdir.c b/fs/overlayfs/readdir.c
+index 80366424b3dc..aefa41b163cd 100644
+--- a/fs/overlayfs/readdir.c
++++ b/fs/overlayfs/readdir.c
+@@ -1322,7 +1322,8 @@ int ovl_indexdir_cleanup(struct ovl_fs *ofs)
+ 			 * Whiteout orphan index to block future open by
+ 			 * handle after overlay nlink dropped to zero.
+ 			 */
+-			err = ovl_cleanup_and_whiteout(ofs, indexdir, index);
++			err = ovl_cleanup_and_whiteout(ofs, indexdir, index,
++						       &QSTR_LEN(p->name, p->len));
+ 		} else {
+ 			/* Cleanup orphan index entries */
+ 			err = ovl_cleanup(ofs, indexdir, index);
+diff --git a/fs/overlayfs/util.c b/fs/overlayfs/util.c
+index b41f4788e4f0..47734eeb97b7 100644
+--- a/fs/overlayfs/util.c
++++ b/fs/overlayfs/util.c
+@@ -1118,7 +1118,7 @@ static void ovl_cleanup_index(struct dentry *dentry)
+ 	} else if (ovl_index_all(dentry->d_sb)) {
+ 		/* Whiteout orphan index to block future open by handle */
+ 		err = ovl_cleanup_and_whiteout(OVL_FS(dentry->d_sb),
+-					       indexdir, index);
++					       indexdir, index, &name);
+ 	} else {
+ 		/* Cleanup orphan index entries */
+ 		err = ovl_cleanup(ofs, indexdir, index);
+-- 
+2.56.0
+
