@@ -1,0 +1,275 @@
+From: Jason Gunthorpe <jgg@nvidia.com>
+Date: Tue, 10 Nov 2026 07:54:17 -0500
+Subject: [PATCH] iommu/arm-smmu-v3: Handle ARM erratum for CONT under
+ invalidation with SVA
+References: bsc#1012628
+Patch-mainline: 7.3.5
+Git-commit: 84c6089a365ff5547f9ea30cb407dc5fe3124fd3
+
+[ Upstream commit 84c6089a365ff5547f9ea30cb407dc5fe3124fd3 ]
+
+The erratum (MMU-700: #3777127, S3: #3673557) deals with under
+invalidation of a CONT PTE grouping in the SMMU. The recommended work
+around is to use a range invalidation that spans the entire CONT. The only
+user of CONT in the kernel right now is through SVA sharing a CPU page
+table that contains a CONT created by the mm.
+
+Previously it was thought that this errata was dealt with because the
+driver always uses range invalidation. However, there is a subtle detail
+in the errata that the invalidation range must fully enclose the entire
+CONT for it to work.
+
+It seems that two sequential range invalidations, with a split point
+falling inside a CONT grouping, will not prevent the errata.
+
+The SMMU's range invalidation generation algorithm does not produce a
+single invalidation for a single SVA invalidation request, nor does the mm
+carefully align the SVA invalidation ranges to accommodate the splitting
+of the invalidation into several ranges.
+
+Thus, when processing a SVA invalidation, the range invalidation splitting
+routine can generate a range invalidation that is split in the middle of
+the CONT and risk under invalidation from this errata. This condition
+could be triggered by a malicious userspace manipulating the TLB gathers
+via mmap/mprotect/munmap.
+
+Update the errata list to the include the S3 variation, detect the IOMMUs
+that have it, and then have SVA invalidations use a simplified version of
+the over invalidation algorithm from the tlbi rework series. This ensures
+that a single range invalidation is issued for a single MMU notifier
+callback and now the range invalidation is guarenteed to cover any posible
+CONT.
+
+Future work to add CONT to iommu_domain page tables should either use this
+one-invalidate/one-range invalidation algorithm or disable CONT support in
+the iommu_domain.
+
+Cc: stable@vger.kernel.org
+Cc: Vijayanand Jitta <vijayanand.jitta@oss.qualcomm.com>
+Fixes: 3f1ce8e85ee0 ("iommu/arm-smmu-v3: Share process page tables")
+Reviewed-by: Mostafa Saleh <smostafa@google.com>
+Reviewed-by: Pranjal Shrivastava <peaan@google.com>
+Tested-by: Nicolin Chen <nicolinc@nvidia.com>
+Tested-by: Pranjal Shrivastava <praan@google.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Will Deacon <will@kernel.org>
+[ sashal: Adjusted header context to account for the missing ARM_SMMU_OPT_OVR_INSTCFG_DATA definition. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ Documentation/arch/arm64/silicon-errata.rst   |  3 +-
+ .../iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c   |  7 ++
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c   | 89 +++++++++++++++----
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h   |  5 ++
+ 4 files changed, 87 insertions(+), 17 deletions(-)
+
+diff --git a/Documentation/arch/arm64/silicon-errata.rst b/Documentation/arch/arm64/silicon-errata.rst
+index 99a1eb4b833d..95faec78b7f7 100644
+--- a/Documentation/arch/arm64/silicon-errata.rst
++++ b/Documentation/arch/arm64/silicon-errata.rst
+@@ -273,7 +273,8 @@ stable kernels.
+ +----------------+-----------------+-----------------+-----------------------------+
+ | ARM            | MMU L1          | #3878312        | N/A                         |
+ +----------------+-----------------+-----------------+-----------------------------+
+-| ARM            | MMU S3          | #3995052        | N/A                         |
++| ARM            | MMU S3          | #3995052,       | N/A                         |
++|                |                 | #3673557        |                             |
+ +----------------+-----------------+-----------------+-----------------------------+
+ | ARM            | GIC-700         | #2941627        | ARM64_ERRATUM_2941627       |
+ +----------------+-----------------+-----------------+-----------------------------+
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
+index 0a429c64fbf3..3f50298a1c14 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
+@@ -215,6 +215,13 @@ bool arm_smmu_sva_supported(struct arm_smmu_device *smmu)
+ 	if (system_supports_haft())
+ 		feat_mask |= ARM_SMMU_FEAT_HAFT;
+ 
++	/*
++	 * The workaround for ARM_SMMU_OPT_FULL_CONT_RANGE_INV requires range
++	 * invalidation support.
++	 */
++	if (smmu->options & ARM_SMMU_OPT_FULL_CONT_RANGE_INV)
++		feat_mask |= ARM_SMMU_FEAT_RANGE_INV;
++
+ 	if ((smmu->features & feat_mask) != feat_mask)
+ 		return false;
+ 
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+index 81baafaffc41..b510dd47f231 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+@@ -2538,6 +2538,37 @@ static void arm_smmu_cmdq_batch_add_range(struct arm_smmu_device *smmu,
+ 	}
+ }
+ 
++/*
++ * Generate a range invalidation for ARM_SMMU_OPT_FULL_CONT_RANGE_INV by
++ * ensuring the entire SVA requested range is covered with a single range
++ * invalidation command. The scale is adjusted so that the range invalidation
++ * may extend past the end of the requested range. This ensures that any CONT
++ * the MM is invalidating is covered by a single range invalidation. TTL and
++ * LEAF are always 0 because this is only used by SVA.
++ */
++static bool arm_smmu_cmdq_batch_add_range_inv(struct arm_smmu_device *smmu,
++					      struct arm_smmu_cmdq_batch *cmds,
++					      struct arm_smmu_cmd *cmd,
++					      unsigned long iova, size_t size,
++					      u8 tgsz_lg2)
++{
++	u64 cur_tg = iova >> tgsz_lg2;
++	u64 num_tg = ((iova + size - 1) >> tgsz_lg2) - cur_tg + 1;
++	unsigned int scale = fls64((num_tg - 1) / 32);
++
++	if (scale > 31)
++		return false;
++
++	cmd->data[0] |=
++		FIELD_PREP(CMDQ_TLBI_0_NUM,
++			   DIV_ROUND_UP_ULL(num_tg, 1ULL << scale) - 1) |
++		FIELD_PREP(CMDQ_TLBI_0_SCALE, scale);
++	cmd->data[1] = FIELD_PREP(CMDQ_TLBI_1_TG, (tgsz_lg2 - 10) / 2) |
++		       (cur_tg << tgsz_lg2);
++	arm_smmu_cmdq_batch_add_cmd_p(smmu, cmds, cmd);
++	return true;
++}
++
+ static bool arm_smmu_inv_size_too_big(struct arm_smmu_device *smmu, size_t size,
+ 				      size_t granule)
+ {
+@@ -2565,21 +2596,30 @@ static bool arm_smmu_inv_size_too_big(struct arm_smmu_device *smmu, size_t size,
+ static void arm_smmu_inv_to_cmdq_batch(struct arm_smmu_inv *inv,
+ 				       struct arm_smmu_cmdq_batch *cmds,
+ 				       struct arm_smmu_cmd *cmd,
+-				       bool leaf,
++				       bool single_range_inv, bool leaf,
+ 				       unsigned long iova, size_t size,
+ 				       unsigned int granule)
+ {
+-	if (arm_smmu_inv_size_too_big(inv->smmu, size, granule)) {
+-		struct arm_smmu_cmd nsize_cmd = *cmd;
++	struct arm_smmu_cmd nsize_cmd;
++
++	if (arm_smmu_inv_size_too_big(inv->smmu, size, granule))
++		goto full_inv;
+ 
+-		u64p_replace_bits(&nsize_cmd.data[0], inv->nsize_opcode,
+-				  CMDQ_0_OP);
+-		arm_smmu_cmdq_batch_add_cmd_p(inv->smmu, cmds, &nsize_cmd);
++	if (single_range_inv && size > granule) {
++		if (!arm_smmu_cmdq_batch_add_range_inv(inv->smmu, cmds, cmd,
++						       iova, size, inv->pgsize))
++			goto full_inv;
+ 		return;
+ 	}
+ 
+-	arm_smmu_cmdq_batch_add_range(inv->smmu, cmds, cmd, leaf,
+-				      iova, size, granule, inv->pgsize);
++	arm_smmu_cmdq_batch_add_range(inv->smmu, cmds, cmd, leaf, iova, size,
++				      granule, inv->pgsize);
++	return;
++
++full_inv:
++	nsize_cmd = *cmd;
++	u64p_replace_bits(&nsize_cmd.data[0], inv->nsize_opcode, CMDQ_0_OP);
++	arm_smmu_cmdq_batch_add_cmd_p(inv->smmu, cmds, &nsize_cmd);
+ }
+ 
+ static inline bool arm_smmu_invs_end_batch(struct arm_smmu_inv *cur,
+@@ -2600,7 +2640,8 @@ static inline bool arm_smmu_invs_end_batch(struct arm_smmu_inv *cur,
+ 
+ static void __arm_smmu_domain_inv_range(struct arm_smmu_invs *invs,
+ 					unsigned long iova, size_t size,
+-					unsigned int granule, bool leaf)
++					unsigned int granule,
++					bool single_range_inv, bool leaf)
+ {
+ 	struct arm_smmu_cmdq_batch cmds = {};
+ 	struct arm_smmu_inv *cur;
+@@ -2630,14 +2671,16 @@ static void __arm_smmu_domain_inv_range(struct arm_smmu_invs *invs,
+ 		case INV_TYPE_S1_ASID:
+ 			cmd = arm_smmu_make_cmd_tlbi(cur->size_opcode,
+ 						     cur->id, 0);
+-			arm_smmu_inv_to_cmdq_batch(cur, &cmds, &cmd, leaf,
+-						   iova, size, granule);
++			arm_smmu_inv_to_cmdq_batch(cur, &cmds, &cmd,
++						   single_range_inv, leaf, iova,
++						   size, granule);
+ 			break;
+ 		case INV_TYPE_S2_VMID:
+ 			cmd = arm_smmu_make_cmd_tlbi(cur->size_opcode,
+ 						     0, cur->id);
+-			arm_smmu_inv_to_cmdq_batch(cur, &cmds, &cmd, leaf,
+-						   iova, size, granule);
++			arm_smmu_inv_to_cmdq_batch(cur, &cmds, &cmd,
++						   single_range_inv, leaf, iova,
++						   size, granule);
+ 			break;
+ 		case INV_TYPE_S2_VMID_S1_CLEAR:
+ 			/* CMDQ_OP_TLBI_S12_VMALL already flushed S1 entries */
+@@ -2684,6 +2727,9 @@ void arm_smmu_domain_inv_range(struct arm_smmu_domain *smmu_domain,
+ 			       unsigned int granule, bool leaf)
+ {
+ 	struct arm_smmu_invs *invs;
++	bool single_range_inv =
++		smmu_domain->stage == ARM_SMMU_DOMAIN_SVA &&
++		(smmu_domain->smmu->options & ARM_SMMU_OPT_FULL_CONT_RANGE_INV);
+ 
+ 	/*
+ 	 * An invalidation request must follow some IOPTE change and then load
+@@ -2723,10 +2769,12 @@ void arm_smmu_domain_inv_range(struct arm_smmu_domain *smmu_domain,
+ 		unsigned long flags;
+ 
+ 		read_lock_irqsave(&invs->rwlock, flags);
+-		__arm_smmu_domain_inv_range(invs, iova, size, granule, leaf);
++		__arm_smmu_domain_inv_range(invs, iova, size, granule,
++					    single_range_inv, leaf);
+ 		read_unlock_irqrestore(&invs->rwlock, flags);
+ 	} else {
+-		__arm_smmu_domain_inv_range(invs, iova, size, granule, leaf);
++		__arm_smmu_domain_inv_range(invs, iova, size, granule,
++					    single_range_inv, leaf);
+ 	}
+ 
+ 	rcu_read_unlock();
+@@ -5009,11 +5057,20 @@ static void arm_smmu_device_iidr_probe(struct arm_smmu_device *smmu)
+ 				/* Arm errata 2268618, 2812531 */
+ 				smmu->features &= ~ARM_SMMU_FEAT_NESTING;
+ 			}
++			/* Arm errata 3777127 */
++			smmu->options |= ARM_SMMU_OPT_FULL_CONT_RANGE_INV;
+ 			break;
+ 		case IIDR_PRODUCTID_ARM_MMU_L1:
++			/* Arm errata 3878312 */
++			smmu->features &= ~ARM_SMMU_FEAT_BTM;
++			break;
+ 		case IIDR_PRODUCTID_ARM_MMU_S3:
+-			/* Arm errata 3878312/3995052 */
++			/* Arm errata 3995052 */
+ 			smmu->features &= ~ARM_SMMU_FEAT_BTM;
++			/* Arm errata 3673557 */
++			if (variant < 1 || (variant == 1 && revision < 1))
++				smmu->options |=
++					ARM_SMMU_OPT_FULL_CONT_RANGE_INV;
+ 			break;
+ 		}
+ 		break;
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
+index dd2fee2f560e..094ce28c862f 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
+@@ -934,6 +934,11 @@ struct arm_smmu_device {
+ #define ARM_SMMU_OPT_MSIPOLL		(1 << 2)
+ #define ARM_SMMU_OPT_CMDQ_FORCE_SYNC	(1 << 3)
+ #define ARM_SMMU_OPT_TEGRA241_CMDQV	(1 << 4)
++/*
++ * Range invalidation is mandatory and one range invalidation must fully span an
++ * invalidated CONT
++ */
++#define ARM_SMMU_OPT_FULL_CONT_RANGE_INV (1 << 6)
+ 	u32				options;
+ 
+ 	struct arm_smmu_cmdq		cmdq;
+-- 
+2.56.0
+
