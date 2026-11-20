@@ -1,0 +1,213 @@
+From 76248359ac32e97cd7d1bd55a4c94a2ad4009871 Mon Sep 17 00:00:00 2001
+From: Piyus Kedia <piyus@iiitd.ac.in>
+Date: Thu, 12 Nov 2026 23:08:12 +0530
+Subject: Bluetooth: L2CAP: clear the SDU before the receive callback
+Git-commit: 76248359ac32e97cd7d1bd55a4c94a2ad4009871
+Patch-mainline: v7.4-rc4
+References: git-fixes
+
+l2cap_ecred_data_rcv() completes a reassembled SDU by calling
+l2cap_ecred_recv() with chan->sdu still set, and only clears the
+reassembly state after it returns:
+
+	if (chan->sdu->len == chan->sdu_len) {
+		err = l2cap_ecred_recv(chan, chan->sdu);
+		if (!err) {
+			chan->sdu = NULL;
+			...
+
+l2cap_ecred_recv() hands the SDU to the channel's receive callback,
+which takes ownership of it on success, and then updates the credits:
+
+	err = chan->ops->recv(chan, skb);
+	...
+	l2cap_chan_le_send_credits(chan);
+
+l2cap_chan_le_send_credits() calls l2cap_le_rx_credits(), which reads
+
+	size_t sdu_len = chan->sdu ? chan->sdu->len : 0;
+
+so between the callback consuming the skb and the assignment above,
+chan->sdu is a dangling pointer that is dereferenced.
+
+For the 6LoWPAN channel the callback frees the skb outright -
+chan_recv_cb() -> recv_pkt() ends in consume_skb(skb) and returns
+NET_RX_SUCCESS - so the read is a straightforward use-after-free that
+KASAN reports:
+
+  BUG: KASAN: slab-use-after-free in l2cap_le_rx_credits
+       net/bluetooth/l2cap_core.c:576 [inline]
+  BUG: KASAN: slab-use-after-free in l2cap_chan_le_send_credits+0xa8/0x3e0
+       net/bluetooth/l2cap_core.c:6811
+  Read of size 4 at addr ffff88800e134070 by task kworker/u21:2/11352
+  Workqueue: hci0 hci_rx_work
+   l2cap_le_rx_credits net/bluetooth/l2cap_core.c:576 [inline]
+   l2cap_chan_le_send_credits+0xa8/0x3e0 net/bluetooth/l2cap_core.c:6811
+   l2cap_ecred_recv+0x63/0x120 net/bluetooth/l2cap_core.c:6873
+   l2cap_ecred_data_rcv net/bluetooth/l2cap_core.c:6976 [inline]
+   l2cap_data_channel net/bluetooth/l2cap_core.c:7028 [inline]
+   l2cap_recv_frame+0x6c3c/0x9650 net/bluetooth/l2cap_core.c:7162
+   l2cap_recv_acldata+0x6fd/0xe60 net/bluetooth/l2cap_core.c:7902
+   hci_acldata_packet net/bluetooth/hci_core.c:3865 [inline]
+   hci_rx_work+0x3c0/0xbe0 net/bluetooth/hci_core.c:4092
+  Freed by task 11352:
+   recv_pkt net/bluetooth/6lowpan.c
+   chan_recv_cb+0x88/0x150 net/bluetooth/6lowpan.c:367
+   l2cap_ecred_recv+0x61/0x160 net/bluetooth/l2cap_core.c:6864
+  The buggy address belongs to the object at ffff88800e134000
+   which belongs to the cache skbuff_head_cache of size 240
+  The buggy address is located 112 bytes inside of
+   freed 240-byte region
+
+Offset 112 is sk_buff.len.
+
+Only a multi-frame SDU is affected: the single-frame path already calls
+l2cap_ecred_recv() with chan->sdu NULL, so l2cap_le_rx_credits() reads a
+zero sdu_len there.
+
+l2cap_reassemble_sdu() completes a segmented SDU the same way and has the
+same defect.  On an ERTM or streaming channel l2cap_sock_recv_cb() calls
+l2cap_publish_rx_avail(), which reaches l2cap_chan_le_send_credits()
+through l2cap_chan_rx_avail(), and that function evaluates
+
+	u16 return_credits = l2cap_le_rx_credits(chan);
+
+in its initializer - before the mode test that makes the rest of it a
+no-op for a non-LE channel.  So chan->sdu is dereferenced on that path
+too, and the result is discarded.  What makes it a use-after-free rather
+than a stale read is a consumer that frees the skb from another thread:
+BNEP's session kthread takes it off the socket with a lockless
+skb_dequeue() (net/bluetooth/bnep/core.c:530, freed at :533) and never
+takes the socket lock, so lock_sock() is no defence.
+
+Fix both sites.
+
+Clear the reassembly state before handing the SDU to the callback, which
+makes the fragmented path behave like the single-frame one, and free the
+SDU on the spot if the callback refused it - the error path's
+kfree_skb(chan->sdu) used to do that, and the callbacks leave the skb to
+the caller when they fail.
+
+Clearing it first is also the arithmetically correct input, not merely a
+safe one.  l2cap_le_rx_credits() subtracts sdu_len from chan->rx_avail
+because a partially reassembled SDU will claim that much receive buffer
+once it completes:
+
+	if (chan->rx_avail <= sdu_len)
+		return 0;
+
+	return DIV_ROUND_UP(chan->rx_avail - sdu_len, chan->mps);
+
+A completed SDU is no longer waiting for that space.  If the callback
+queued it, l2cap_sock_recv_cb() has already called
+l2cap_publish_rx_avail(), which recomputes rx_avail from
+sk_rcvbuf - sk_rmem_alloc with that skb included in sk_rmem_alloc; if the
+callback consumed it, as the 6LoWPAN one does, it occupies nothing at
+all.  Either way the reassembly buffer is empty, so zero is the right
+sdu_len, and a NULL chan->sdu is how l2cap_le_rx_credits() expresses
+that - the same value l2cap_le_flowctl_init() depends on when it seeds
+chan->rx_credits on an idle channel.  Carrying the old length into the
+calculation instead would subtract the SDU a second time and under-grant
+credits on every delivery, and once rx_avail fell to the size of one SDU
+the channel would be granted none at all.
+
+Per Documentation/process/generated-content.rst: the use-after-free was
+found by an AI-driven fuzzing harness built on syzkaller, developed
+jointly by Kapil Vaswani and myself, which drove a virtual HCI
+controller and a 6LoWPAN channel under KASAN on x86_64.  The root-cause
+analysis, this changelog and the patch were written with the assistance
+of a large language model over an extended session, and reviewed by
+hand; the before/after testing below the --- was run by us.
+
+Fixes: ce60b9231b66 ("Bluetooth: compute LE flow credits based on recvbuf space")
+Signed-off-by: Kapil Vaswani <kapil@presceralabs.ai>
+Signed-off-by: Piyus Kedia <piyus@iiitd.ac.in>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ net/bluetooth/l2cap_core.c | 53 ++++++++++++++++++++++++++++----------
+ 1 file changed, 39 insertions(+), 14 deletions(-)
+
+diff --git a/net/bluetooth/l2cap_core.c b/net/bluetooth/l2cap_core.c
+index 486b968143d3..4ee1e62ded7e 100644
+--- a/net/bluetooth/l2cap_core.c
++++ b/net/bluetooth/l2cap_core.c
+@@ -6226,6 +6226,7 @@ static void append_skb_frag(struct sk_buff *skb, struct sk_buff *new_frag,
+ static int l2cap_reassemble_sdu(struct l2cap_chan *chan, struct sk_buff *skb,
+ 				struct l2cap_ctrl *control)
+ {
++	struct sk_buff *sdu;
+ 	int err = -EINVAL;
+ 
+ 	switch (control->sar) {
+@@ -6286,15 +6287,25 @@ static int l2cap_reassemble_sdu(struct l2cap_chan *chan, struct sk_buff *skb,
+ 		if (chan->sdu->len != chan->sdu_len)
+ 			break;
+ 
+-		err = chan->ops->recv(chan, chan->sdu);
++		/* Reassembly complete.  Hand the SDU over before the
++		 * callback, for the reason given in l2cap_ecred_data_rcv():
++		 * the callback takes ownership and may free it, while
++		 * l2cap_chan_rx_avail() -> l2cap_chan_le_send_credits() reads
++		 * chan->sdu->len on the way out - it does so before the mode
++		 * test that makes the rest of that function a no-op here.
++		 * Return directly, since the state this leaves is what the
++		 * trailing error block would otherwise set again.
++		 */
++		sdu = chan->sdu;
++		chan->sdu = NULL;
++		chan->sdu_last_frag = NULL;
++		chan->sdu_len = 0;
+ 
+-		if (!err) {
+-			/* Reassembly complete */
+-			chan->sdu = NULL;
+-			chan->sdu_last_frag = NULL;
+-			chan->sdu_len = 0;
+-		}
+-		break;
++		err = chan->ops->recv(chan, sdu);
++		if (err)
++			kfree_skb(sdu);
++
++		return err;
+ 	}
+ 
+ 	if (err) {
+@@ -7285,12 +7296,26 @@ static int l2cap_ecred_data_rcv(struct l2cap_chan *chan, struct sk_buff *skb)
+ 	skb = NULL;
+ 
+ 	if (chan->sdu->len == chan->sdu_len) {
+-		err = l2cap_ecred_recv(chan, chan->sdu);
+-		if (!err) {
+-			chan->sdu = NULL;
+-			chan->sdu_last_frag = NULL;
+-			chan->sdu_len = 0;
+-		}
++		struct sk_buff *sdu = chan->sdu;
++
++		/* The receive callback takes ownership of a reassembled SDU and
++		 * may free it, while l2cap_ecred_recv() goes on to update the
++		 * credits - which reads chan->sdu->len.  Drop the reassembly
++		 * state before handing the SDU over, and release it here if the
++		 * callback refused it, so that it is still freed exactly once.
++		 * The reassembly state is already clear at that point, so
++		 * return instead of falling into the failed: block, whose
++		 * kfree_skb(chan->sdu) would have nothing left to free.
++		 */
++		chan->sdu = NULL;
++		chan->sdu_last_frag = NULL;
++		chan->sdu_len = 0;
++
++		err = l2cap_ecred_recv(chan, sdu);
++		if (err)
++			kfree_skb(sdu);
++
++		return 0;
+ 	}
+ 
+ failed:
+-- 
+2.53.0
+
