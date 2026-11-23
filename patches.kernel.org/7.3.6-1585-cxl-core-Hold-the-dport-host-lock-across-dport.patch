@@ -1,0 +1,349 @@
+From: Dave Jiang <dave.jiang@intel.com>
+Date: Thu, 1 Oct 2026 08:47:43 -0700
+Subject: [PATCH] cxl/core: Hold the dport host lock across dport lookup and
+ use
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: b72a03ebd9586d59992ecaa6ceed11ea96835734
+
+[ Upstream commit b72a03ebd9586d59992ecaa6ceed11ea96835734 ]
+
+Callers of cxl_pci_find_port() and cxl_mem_find_port() can be handed a
+'struct cxl_dport' that is already freed, and all four dereference it
+without the lock that would prevent that.
+
+A dport is kzalloc()'d into a devres group on its host device, so it dies
+when that host unbinds. The host is &port->dev for a switch port and
+port->uport_dev for the root port.
+
+Both helpers return the dport through an output parameter. The caller's
+port reference pins struct cxl_port, not the dport allocation, and the
+lookup itself is a bare xa_load() under no lock.
+
+Add cxl_port_dport_host() to name the device that pins a dport, and
+cxl_pci_find_dport() / cxl_mem_find_dport() to look one up with that
+device's lock held and asserted. Convert the four callers to use them and
+bail if the dport is gone. cxl_port_add_dport() already follows this rule.
+
+cxl_mem_probe() chose its endpoint devm host from dport->rch, which meant
+dereferencing the dport before taking any lock. Use cxl_port_dport_host():
+rch dports only ever land on the root port, so it selects the same device
+without needing the dport.
+
+With every caller converted, the dport output parameter of
+cxl_pci_find_port() and cxl_mem_find_port() is unused. Drop it.
+
+Fixes: 733b57f262b0 ("cxl/pci: Early setup RCH dport component registers from RCRB")
+Assisted-by: LLM
+Reviewed-by: Li Ming <ming.li@zohomail.com>
+Reviewed-by: Alison Schofield <alison.schofield@intel.com>
+Link: https://patch.msgid.link/20261001154744.1095902-3-dave.jiang@intel.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/cxl/core/core.h    |  6 +---
+ drivers/cxl/core/pci.c     |  8 ++++-
+ drivers/cxl/core/port.c    | 62 ++++++++++++++++++++++++++------------
+ drivers/cxl/core/ras_rch.c | 12 +++++++-
+ drivers/cxl/cxl.h          | 22 +++++++++++---
+ drivers/cxl/mem.c          | 14 ++++++---
+ drivers/cxl/pci.c          | 11 ++++---
+ 7 files changed, 95 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/cxl/core/core.h b/drivers/cxl/core/core.h
+index bb380ec6daeb..79918fde1575 100644
+--- a/drivers/cxl/core/core.h
++++ b/drivers/cxl/core/core.h
+@@ -178,11 +178,7 @@ static inline struct device *port_to_host(struct cxl_port *port)
+ 
+ static inline struct device *dport_to_host(struct cxl_dport *dport)
+ {
+-	struct cxl_port *port = dport->port;
+-
+-	if (is_cxl_root(port))
+-		return port->uport_dev;
+-	return &port->dev;
++	return cxl_port_dport_host(dport->port);
+ }
+ #ifdef CONFIG_CXL_RAS
+ void cxl_ras_init(void);
+diff --git a/drivers/cxl/core/pci.c b/drivers/cxl/core/pci.c
+index 2f90184d1068..27dccd4daa0c 100644
+--- a/drivers/cxl/core/pci.c
++++ b/drivers/cxl/core/pci.c
+@@ -743,10 +743,16 @@ int cxl_pci_setup_regs(struct pci_dev *pdev, enum cxl_regloc_type type,
+ 	if (rc && type == CXL_REGLOC_RBI_COMPONENT && is_cxl_restricted(pdev)) {
+ 		struct cxl_dport *dport;
+ 		struct cxl_port *port __free(put_cxl_port) =
+-			cxl_pci_find_port(pdev, &dport);
++			cxl_pci_find_port(pdev);
+ 		if (!port)
+ 			return -EPROBE_DEFER;
+ 
++		guard(device)(cxl_port_dport_host(port));
++
++		dport = cxl_pci_find_dport(pdev, port);
++		if (!dport)
++			return -EPROBE_DEFER;
++
+ 		rc = cxl_rcrb_get_comp_regs(pdev, map, dport);
+ 		if (rc)
+ 			return rc;
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index 7fdf23b9d24d..230f1a3c7d6f 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -1404,13 +1404,11 @@ static int cxl_add_ep(struct cxl_dport *dport, struct device *ep_dev)
+ struct cxl_find_port_ctx {
+ 	const struct device *dport_dev;
+ 	const struct cxl_port *parent_port;
+-	struct cxl_dport **dport;
+ };
+ 
+ static int match_port_by_dport(struct device *dev, const void *data)
+ {
+ 	const struct cxl_find_port_ctx *ctx = data;
+-	struct cxl_dport *dport;
+ 	struct cxl_port *port;
+ 
+ 	if (!is_cxl_port(dev))
+@@ -1419,10 +1417,7 @@ static int match_port_by_dport(struct device *dev, const void *data)
+ 		return 0;
+ 
+ 	port = to_cxl_port(dev);
+-	dport = cxl_find_dport_by_dev(port, ctx->dport_dev);
+-	if (ctx->dport)
+-		*ctx->dport = dport;
+-	return dport != NULL;
++	return !!cxl_find_dport_by_dev(port, ctx->dport_dev);
+ }
+ 
+ static struct cxl_port *__find_cxl_port_by_dport(struct cxl_find_port_ctx *ctx)
+@@ -1441,22 +1436,21 @@ static struct cxl_port *__find_cxl_port_by_dport(struct cxl_find_port_ctx *ctx)
+ /**
+  * find_cxl_port_by_dport - find a cxl_port by one of its targets
+  * @dport_dev: device representing the dport target
+- * @dport: optional output of the 'struct cxl_dport' companion of the @dport_dev
+  *
+  * Return a 'struct cxl_port' with an elevated reference if found. Use
+  * __free(put_cxl_port) to release.
++ *
++ * The port reference does not pin the dport, which is a devm allocation of
++ * cxl_port_dport_host(). Use cxl_pci_find_dport() or cxl_mem_find_dport()
++ * under that device's lock to get it.
+  */
+-static struct cxl_port *find_cxl_port_by_dport(struct device *dport_dev,
+-					       struct cxl_dport **dport)
++static struct cxl_port *find_cxl_port_by_dport(struct device *dport_dev)
+ {
+ 	struct cxl_find_port_ctx ctx = {
+ 		.dport_dev = dport_dev,
+-		.dport = dport,
+ 	};
+-	struct cxl_port *port;
+ 
+-	port = __find_cxl_port_by_dport(&ctx);
+-	return port;
++	return __find_cxl_port_by_dport(&ctx);
+ }
+ 
+ /*
+@@ -1947,20 +1941,50 @@ int devm_cxl_enumerate_ports(struct cxl_memdev *cxlmd)
+ }
+ EXPORT_SYMBOL_NS_GPL(devm_cxl_enumerate_ports, "CXL");
+ 
+-struct cxl_port *cxl_pci_find_port(struct pci_dev *pdev,
+-				   struct cxl_dport **dport)
++struct cxl_port *cxl_pci_find_port(struct pci_dev *pdev)
+ {
+-	return find_cxl_port_by_dport(pdev->dev.parent, dport);
++	return find_cxl_port_by_dport(pdev->dev.parent);
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_pci_find_port, "CXL");
+ 
+-struct cxl_port *cxl_mem_find_port(struct cxl_memdev *cxlmd,
+-				   struct cxl_dport **dport)
++struct cxl_port *cxl_mem_find_port(struct cxl_memdev *cxlmd)
+ {
+-	return find_cxl_port_by_dport(grandparent(&cxlmd->dev), dport);
++	return find_cxl_port_by_dport(grandparent(&cxlmd->dev));
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_mem_find_port, "CXL");
+ 
++/**
++ * cxl_pci_find_dport - find the dport of @port that @pdev is below
++ * @pdev: PCI device below the dport
++ * @port: port to search, typically from cxl_pci_find_port()
++ *
++ * Context: Caller must hold the cxl_port_dport_host() lock of @port, and
++ *	    must not use the result after dropping it.
++ */
++struct cxl_dport *cxl_pci_find_dport(struct pci_dev *pdev,
++				     struct cxl_port *port)
++{
++	device_lock_assert(cxl_port_dport_host(port));
++	return cxl_find_dport_by_dev(port, pdev->dev.parent);
++}
++EXPORT_SYMBOL_NS_GPL(cxl_pci_find_dport, "CXL");
++
++/**
++ * cxl_mem_find_dport - find the dport of @port that @cxlmd is below
++ * @cxlmd: memdev below the dport
++ * @port: port to search, typically from cxl_mem_find_port()
++ *
++ * Context: Caller must hold the cxl_port_dport_host() lock of @port, and
++ *	    must not use the result after dropping it.
++ */
++struct cxl_dport *cxl_mem_find_dport(struct cxl_memdev *cxlmd,
++				     struct cxl_port *port)
++{
++	device_lock_assert(cxl_port_dport_host(port));
++	return cxl_find_dport_by_dev(port, grandparent(&cxlmd->dev));
++}
++EXPORT_SYMBOL_NS_GPL(cxl_mem_find_dport, "CXL");
++
+ static int decoder_populate_targets(struct cxl_switch_decoder *cxlsd,
+ 				    struct cxl_port *port)
+ {
+diff --git a/drivers/cxl/core/ras_rch.c b/drivers/cxl/core/ras_rch.c
+index e0e01aa5eba6..3c6aae26deed 100644
+--- a/drivers/cxl/core/ras_rch.c
++++ b/drivers/cxl/core/ras_rch.c
+@@ -118,10 +118,20 @@ void cxl_handle_rdport_errors(struct cxl_dev_state *cxlds)
+ 	int severity;
+ 
+ 	struct cxl_port *port __free(put_cxl_port) =
+-		cxl_pci_find_port(pdev, &dport);
++		cxl_pci_find_port(pdev);
+ 	if (!port)
+ 		return;
+ 
++	/*
++	 * The dport may have been freed since the lookup above, so take the
++	 * lock that pins it and find it again.
++	 */
++	guard(device)(cxl_port_dport_host(port));
++
++	dport = cxl_pci_find_dport(pdev, port);
++	if (!dport)
++		return;
++
+ 	if (!cxl_rch_get_aer_info(dport->regs.dport_aer, &aer_regs))
+ 		return;
+ 
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index b6853bc8fd81..ee408f5730c3 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -703,6 +703,18 @@ static inline bool is_cxl_root(struct cxl_port *port)
+ 	return port->uport_dev == port->dev.parent;
+ }
+ 
++/*
++ * Return the owner device of the devm allocations of @port's dports. They
++ * are freed when that device unbinds, so hold device_lock() on the returned
++ * device across any lookup and use of a 'struct cxl_dport'.
++ */
++static inline struct device *cxl_port_dport_host(struct cxl_port *port)
++{
++	if (is_cxl_root(port))
++		return port->uport_dev;
++	return &port->dev;
++}
++
+ /* Address translation functions exported to cxl_translate test module only */
+ int cxl_validate_translation_params(u8 eiw, u16 eig, int pos);
+ u64 cxl_calculate_hpa_offset(u64 dpa_offset, int pos, u8 eiw, u16 eig);
+@@ -749,10 +761,12 @@ DEFINE_FREE(put_cxl_dax_region, struct cxl_dax_region *, if (!IS_ERR_OR_NULL(_T)
+ int devm_cxl_enumerate_ports(struct cxl_memdev *cxlmd);
+ void cxl_bus_rescan(void);
+ void cxl_bus_drain(void);
+-struct cxl_port *cxl_pci_find_port(struct pci_dev *pdev,
+-				   struct cxl_dport **dport);
+-struct cxl_port *cxl_mem_find_port(struct cxl_memdev *cxlmd,
+-				   struct cxl_dport **dport);
++struct cxl_dport *cxl_pci_find_dport(struct pci_dev *pdev,
++				     struct cxl_port *port);
++struct cxl_dport *cxl_mem_find_dport(struct cxl_memdev *cxlmd,
++				     struct cxl_port *port);
++struct cxl_port *cxl_pci_find_port(struct pci_dev *pdev);
++struct cxl_port *cxl_mem_find_port(struct cxl_memdev *cxlmd);
+ bool schedule_cxl_memdev_detach(struct cxl_memdev *cxlmd);
+ 
+ struct cxl_dport *devm_cxl_add_dport(struct cxl_port *port,
+diff --git a/drivers/cxl/mem.c b/drivers/cxl/mem.c
+index 3959ec963026..493c4071245d 100644
+--- a/drivers/cxl/mem.c
++++ b/drivers/cxl/mem.c
+@@ -139,7 +139,7 @@ static int cxl_mem_probe(struct device *dev)
+ 		return rc;
+ 
+ 	struct cxl_port *parent_port __free(put_cxl_port) =
+-		cxl_mem_find_port(cxlmd, &dport);
++		cxl_mem_find_port(cxlmd);
+ 	if (!parent_port) {
+ 		dev_err(dev, "CXL port topology not found\n");
+ 		return -ENXIO;
+@@ -154,10 +154,7 @@ static int cxl_mem_probe(struct device *dev)
+ 		}
+ 	}
+ 
+-	if (dport->rch)
+-		endpoint_parent = parent_port->uport_dev;
+-	else
+-		endpoint_parent = &parent_port->dev;
++	endpoint_parent = cxl_port_dport_host(parent_port);
+ 
+ 	scoped_guard(device, endpoint_parent) {
+ 		if (!endpoint_parent->driver) {
+@@ -166,6 +163,13 @@ static int cxl_mem_probe(struct device *dev)
+ 			return -ENXIO;
+ 		}
+ 
++		/* @dport is only valid while @endpoint_parent stays bound */
++		dport = cxl_mem_find_dport(cxlmd, parent_port);
++		if (!dport) {
++			dev_err(dev, "CXL topology dport not found\n");
++			return -ENXIO;
++		}
++
+ 		rc = devm_cxl_add_endpoint(endpoint_parent, cxlmd, dport);
+ 		if (rc)
+ 			return rc;
+diff --git a/drivers/cxl/pci.c b/drivers/cxl/pci.c
+index b6dcfcf6eb5b..d51f00d4a7a7 100644
+--- a/drivers/cxl/pci.c
++++ b/drivers/cxl/pci.c
+@@ -706,22 +706,23 @@ static ssize_t rcd_pcie_cap_emit(struct device *dev, u16 offset, char *buf, size
+ 	struct device *root_dev;
+ 	struct cxl_dport *dport;
+ 	struct cxl_port *root __free(put_cxl_port) =
+-		cxl_mem_find_port(cxlmd, &dport);
++		cxl_mem_find_port(cxlmd);
+ 
+ 	if (!root)
+ 		return -ENXIO;
+ 
+-	root_dev = root->uport_dev;
++	root_dev = cxl_port_dport_host(root);
+ 	if (!root_dev)
+ 		return -ENXIO;
+ 
+-	if (!dport->regs.rcd_pcie_cap)
+-		return -ENXIO;
+-
+ 	guard(device)(root_dev);
+ 	if (!root_dev->driver)
+ 		return -ENXIO;
+ 
++	dport = cxl_mem_find_dport(cxlmd, root);
++	if (!dport || !dport->regs.rcd_pcie_cap)
++		return -ENXIO;
++
+ 	switch (width) {
+ 	case 2:
+ 		return sysfs_emit(buf, "%#x\n",
+-- 
+2.56.1
+

@@ -1,0 +1,138 @@
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Sat, 17 Oct 2026 16:37:24 +0000
+Subject: [PATCH] bpf: Keep a program until its bpf_wq callback has ended
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: 1e28a5e52d32b7d3f4c9fb24898774f941166d2b
+
+[ Upstream commit 1e28a5e52d32b7d3f4c9fb24898774f941166d2b ]
+
+bpf_wq_work() runs the callback under rcu_read_lock_trace() only, since
+the callback may sleep.  The program it belongs to need not be sleepable,
+and such a program is freed behind a plain RCU grace period.  The
+reference that the bpf_wq holds is dropped when the map element goes, or
+when another callback is set, no matter whether the work is running.
+
+If that was the last reference the program is freed under the running
+callback, and the worker goes on in the freed JIT image:
+
+  Oops: int3: 0000 [#1] SMP NOPTI
+  RIP: 0010:0xffffffffc0600947
+
+All it takes is to close the map and the program while the callback runs.
+
+Note in the program that it has a callback that runs sleepable, and wait
+for an RCU Tasks Trace grace period, which implies a plain one, before
+such a program is freed.  Let bpf_wq_work() enter its read side critical
+section before it reads callback_fn.
+
+bpf_task_work holds a reference to the program until the callback is done.
+
+Fixes: 8e83da9732d9 ("bpf: add bpf_wq_start")
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://patch.msgid.link/20261017163745.3341787-23-alexei.starovoitov@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ include/linux/bpf.h   | 10 ++++++++++
+ kernel/bpf/helpers.c  |  9 ++++++---
+ kernel/bpf/syscall.c  |  4 ++--
+ kernel/bpf/verifier.c |  2 ++
+ 4 files changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index b13b751d9a4f..0876bc846178 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1807,6 +1807,7 @@ struct bpf_prog_aux {
+ 	bool attach_btf_trace; /* true if attaching to BTF-enabled raw tp */
+ 	bool attach_tracing_prog; /* true if tracing another tracing program */
+ 	bool tramp_linked; /* true if it was ever linked to a trampoline */
++	bool sleepable_async_cb; /* has a bpf_wq or bpf_task_work callback */
+ 	bool func_proto_unreliable;
+ 	bool tail_call_reachable;
+ 	bool xdp_has_frags;
+@@ -1940,6 +1941,15 @@ struct bpf_prog {
+ 	};
+ };
+ 
++/*
++ * Does the program, or a callback of it, run under RCU Tasks Trace protection
++ * only, outside of any RCU read side critical section?
++ */
++static inline bool bpf_prog_runs_sleepable(const struct bpf_prog *prog)
++{
++	return prog->sleepable || prog->aux->sleepable_async_cb;
++}
++
+ struct bpf_array_aux {
+ 	/* Programs with direct jumps into programs part of this array. */
+ 	struct list_head poke_progs;
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 2a5af794968b..44dce0730476 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -1224,18 +1224,21 @@ static void bpf_wq_work(struct work_struct *work)
+ 
+ 	BTF_TYPE_EMIT(struct bpf_wq);
+ 
++	/* keeps the program that callback_fn belongs to */
++	rcu_read_lock_trace();
++
+ 	callback_fn = READ_ONCE(cb->callback_fn);
+ 	if (!callback_fn)
+-		return;
++		goto out;
+ 
+ 	key = map_key_from_value(map, value, &idx);
+ 
+-        rcu_read_lock_trace();
+-        migrate_disable();
++	migrate_disable();
+ 
+ 	callback_fn((u64)(long)map, (u64)(long)key, (u64)(long)value, 0, 0);
+ 
+ 	migrate_enable();
++out:
+ 	rcu_read_unlock_trace();
+ }
+ 
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 83648077c967..3a11d7233a3e 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -2465,7 +2465,7 @@ static void __bpf_prog_put_rcu_tasks(struct rcu_head *rcu)
+ {
+ 	struct bpf_prog *prog = container_of(rcu, struct bpf_prog_aux, rcu)->prog;
+ 
+-	if (prog->sleepable)
++	if (bpf_prog_runs_sleepable(prog))
+ 		call_rcu_tasks_trace(rcu, __bpf_prog_put_rcu);
+ 	else
+ 		call_rcu(rcu, __bpf_prog_put_rcu);
+@@ -2485,7 +2485,7 @@ static void __bpf_prog_put_noref(struct bpf_prog *prog, bool deferred)
+ 	if (deferred) {
+ 		if (IS_ENABLED(CONFIG_TASKS_RCU) && prog->aux->tramp_linked)
+ 			call_rcu_tasks(&prog->aux->rcu, __bpf_prog_put_rcu_tasks);
+-		else if (prog->sleepable)
++		else if (bpf_prog_runs_sleepable(prog))
+ 			call_rcu_tasks_trace(&prog->aux->rcu, __bpf_prog_put_rcu);
+ 		else
+ 			call_rcu(&prog->aux->rcu, __bpf_prog_put_rcu);
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 9b2f20392d07..327b6d5025a4 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -9953,6 +9953,8 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
+ 					 is_async_cb_sleepable(env, insn));
+ 		if (IS_ERR(async_cb))
+ 			return PTR_ERR(async_cb);
++		if (is_async_cb_sleepable(env, insn))
++			env->prog->aux->sleepable_async_cb = true;
+ 		callee = async_cb->frame[0];
+ 		callee->async_entry_cnt = state->frame[0]->async_entry_cnt + 1;
+ 
+-- 
+2.56.1
+

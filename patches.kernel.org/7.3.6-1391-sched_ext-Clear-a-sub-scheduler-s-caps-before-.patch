@@ -1,0 +1,148 @@
+From: Tejun Heo <tj@kernel.org>
+Date: Tue, 6 Oct 2026 10:29:05 -1000
+Subject: [PATCH] sched_ext: Clear a sub-scheduler's caps before
+ ops.sub_detach()
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: a546831dff38b624240a90a6ff6d2b43d9226d51
+
+[ Upstream commit a546831dff38b624240a90a6ff6d2b43d9226d51 ]
+
+A sub-scheduler can leave standing state behind on the cids delegated to it,
+cpuperf targets being the obvious case, and the kernel does not track who
+wrote it. Restoring it is the parent's job and ops.sub_detach() is the place
+for it. Today the parent can't rely on that: the dying sub-scheduler keeps
+every cap until it is marked dead after ops.exit(), so its ops.exit() or a
+late timer can write after the parent has cleaned up.
+
+Clear every cap of the sub-scheduler before ops.sub_detach(). The pshard
+caps go first as a pending sync recomputes ecaps from them, and ecaps are
+then zeroed directly. A grant racing the clear is refused under the child's
+pshard lock, so nothing hands the caps back.
+
+Fixes: 86094b95efcf ("sched_ext: Add per-shard cap delegation for sub-schedulers")
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ kernel/sched/ext/internal.h |  7 ++++++
+ kernel/sched/ext/sub.c      | 49 ++++++++++++++++++++++++++++++++++---
+ 2 files changed, 52 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/sched/ext/internal.h b/kernel/sched/ext/internal.h
+index 352547aedbb7..b9658b35bf96 100644
+--- a/kernel/sched/ext/internal.h
++++ b/kernel/sched/ext/internal.h
+@@ -828,6 +828,10 @@ struct sched_ext_ops {
+ 	/**
+ 	 * @sub_detach: Detach a sub-scheduler
+ 	 * @args: argument container, see the struct definition
++	 *
++	 * The sub-scheduler holds no caps by this point and can no longer
++	 * affect any cid. Whatever was delegated to it, e.g. cpuperf targets,
++	 * is the parent's to restore here.
+ 	 */
+ 	void (*sub_detach)(struct scx_sub_detach_args *args);
+ 
+@@ -911,6 +915,9 @@ struct sched_ext_ops {
+ 	 * ops.exit() is also called on ops.init() failure, which is a bit
+ 	 * unusual. This is to allow rich reporting through @info on how
+ 	 * ops.init() failed.
++	 *
++	 * A sub-scheduler holds no caps by the time ops.exit() runs. Its
++	 * cap-gated kfuncs are denied.
+ 	 */
+ 	void (*exit)(struct scx_exit_info *info);
+ 
+diff --git a/kernel/sched/ext/sub.c b/kernel/sched/ext/sub.c
+index 212de1cb8502..a75b43296dc9 100644
+--- a/kernel/sched/ext/sub.c
++++ b/kernel/sched/ext/sub.c
+@@ -1153,6 +1153,34 @@ void scx_offline_ecaps(struct rq *rq)
+ 	}
+ }
+ 
++/*
++ * Clear every cap @sch holds. The pshard caps go first as they are the source a
++ * pending sync recomputes ecaps from. ecaps are then zeroed directly for the
++ * cap checks.
++ */
++static void clear_all_caps(struct scx_sched *sch)
++{
++	s32 si, cpu;
++	u32 cap_bit;
++
++	/* enable may have failed before scx_alloc_pshards() */
++	if (!sch->pshard)
++		return;
++
++	for (si = 0; si < sch->nr_pshards; si++) {
++		struct scx_pshard *ps = sch->pshard[si];
++
++		guard(raw_spinlock_irqsave)(&ps->lock);
++		for (cap_bit = 0; cap_bit < __SCX_NR_CAPS; cap_bit++)
++			scx_cmask_clear(&ps->caps[cap_bit].cmask);
++	}
++
++	for_each_possible_cpu(cpu) {
++		guard(rq_lock_irqsave)(cpu_rq(cpu));
++		WRITE_ONCE(per_cpu_ptr(sch->pcpu, cpu)->ecaps, 0);
++	}
++}
++
+ /*
+  * @pcpu's sched was unhashed before the grace period, so nothing re-queues its
+  * sync node. Remove the node from @rq's pending list so the pcpu can be freed.
+@@ -1628,6 +1656,12 @@ void scx_sub_disable(struct scx_sched *sch)
+ 
+ 	scx_unlink_sched(sch);
+ 
++	/*
++	 * The parent restores what it delegated in ops.sub_detach(). @sch must
++	 * hold no caps by then.
++	 */
++	clear_all_caps(sch);
++
+ 	mutex_unlock(&scx_enable_mutex);
+ 
+ 	/*
+@@ -2306,8 +2340,8 @@ static s32 sub_cap_preamble(u64 cgroup_id, u64 caps, const struct bpf_prog_aux *
+  * All-or-nothing keeps the caller-visible result binary per cid, so the denied
+  * mask is one mask to interpret rather than a per-cap matrix.
+  *
+- * Return 0 on full success, -EPERM if any cid was refused, or a negative
+- * errno on other failures.
++ * Return 0 on full success, -EPERM if any cid was refused, -ENODEV if the child
++ * is gone or being disabled, or a negative errno on other failures.
+  */
+ __bpf_kfunc s32 scx_bpf_sub_grant(u64 cgroup_id, u64 caps,
+ 				  const struct scx_cmask *cmask__arena,
+@@ -2361,6 +2395,12 @@ __bpf_kfunc s32 scx_bpf_sub_grant(u64 cgroup_id, u64 caps,
+ 		scoped_guard (raw_spinlock, &pps->lock) {
+ 			guard(raw_spinlock_nested)(&cps->lock);
+ 
++			/* the child is being disabled, see clear_all_caps() */
++			if (unlikely(READ_ONCE(child->aborting))) {
++				ret = -ENODEV;
++				goto out;
++			}
++
+ 			/*
+ 			 * Narrow granted_cids to cids the parent holds every
+ 			 * requested cap on. All-or-nothing per cid.
+@@ -2413,9 +2453,10 @@ __bpf_kfunc s32 scx_bpf_sub_grant(u64 cgroup_id, u64 caps,
+ 		}
+ 	}
+ 
++	ret = any_denied ? -EPERM : 0;
++out:
+ 	caps_updated_deliver(&to_deliver);
+-
+-	return any_denied ? -EPERM : 0;
++	return ret;
+ }
+ 
+ /**
+-- 
+2.56.1
+

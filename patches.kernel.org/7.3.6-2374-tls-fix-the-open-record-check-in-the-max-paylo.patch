@@ -1,0 +1,107 @@
+From: Jiayuan Chen <jiayuan.chen@linux.dev>
+Date: Tue, 20 Oct 2026 20:12:39 +0800
+Subject: [PATCH] tls: fix the open record check in the max payload size
+ setsockopt
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: ed642349d87dd7067a44c30319f0cffd22780376
+
+[ Upstream commit ed642349d87dd7067a44c30319f0cffd22780376 ]
+
+do_tls_setsockopt_tx_payload_len() refuses to resize records while one is
+open, but the check is broken in two ways.
+
+It reaches for the open record through tls_sw_ctx_tx(), an unchecked cast
+of ctx->priv_ctx_tx.  Under device offload that pointer is a
+tls_offload_context_tx, so the check reads a field of the wrong struct: it
+returns EBUSY on whatever happens to be there, and never sees the record
+that really is open.  Dispatch on tx_conf.
+
+The socket lock alone is also not enough to tell no sender is in flight.
+The device tx path drops it in sk_stream_wait_memory() after
+tls_push_record() cleared open_record, so setsockopt can slip in
+mid-sendmsg and shrink the limit.  tls_push_data() latches the limit once
+per call, and a record left open by MSG_MORE can then be bigger than the
+new limit, making the u32 subtraction in the copy clamp wrap around and
+build an oversized record.  Take tx_lock like the sendmsg paths do so
+setsockopt waits for in-flight senders.  Re-reading the limit inside the
+tls_push_data() loop could close the wrap too, but a parked sender would
+still finish with the old limit, so serializing on tx_lock is simpler.
+
+Take tx_lock interruptible, as tls_sw_sendmsg() does.  Both sendmsg paths
+keep it across sk_stream_wait_memory(), which sleeps until the peer reads,
+so a plain mutex_lock() could park setsockopt in D state for as long as
+the sender waits.  The lock_sock() after it is fine uninterruptible: a
+sender sleeping for memory has released the socket lock, so that wait only
+covers short critical sections, like every other setsockopt.
+
+Fixes: 82cb5be6ad64 ("net/tls: support setting the maximum payload size")
+Signed-off-by: Jiayuan Chen <jiayuan.chen@linux.dev>
+Link: https://patch.msgid.link/20261020121240.29082-1-jiayuan.chen@linux.dev
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ net/tls/tls_main.c | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/net/tls/tls_main.c b/net/tls/tls_main.c
+index fbb274287aa5..2d1cde3f6188 100644
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@ -833,15 +833,26 @@ static int do_tls_setsockopt_no_pad(struct sock *sk, sockptr_t optval,
+ 	return rc;
+ }
+ 
++static bool tls_tx_record_is_open(struct tls_context *ctx)
++{
++	switch (ctx->tx_conf) {
++	case TLS_SW:
++		return !!tls_sw_ctx_tx(ctx)->open_rec;
++	case TLS_HW:
++		return !!tls_offload_ctx_tx(ctx)->open_record;
++	default:
++		return false;
++	}
++}
++
+ static int do_tls_setsockopt_tx_payload_len(struct sock *sk, sockptr_t optval,
+ 					    unsigned int optlen)
+ {
+ 	struct tls_context *ctx = tls_get_ctx(sk);
+-	struct tls_sw_context_tx *sw_ctx = tls_sw_ctx_tx(ctx);
+ 	u16 value;
+ 	bool tls_13 = ctx->prot_info.version == TLS_1_3_VERSION;
+ 
+-	if (sw_ctx && sw_ctx->open_rec)
++	if (tls_tx_record_is_open(ctx))
+ 		return -EBUSY;
+ 
+ 	if (sockptr_is_null(optval) || optlen != sizeof(value))
+@@ -862,6 +873,7 @@ static int do_tls_setsockopt_tx_payload_len(struct sock *sk, sockptr_t optval,
+ static int do_tls_setsockopt(struct sock *sk, int optname, sockptr_t optval,
+ 			     unsigned int optlen)
+ {
++	struct tls_context *ctx;
+ 	int rc = 0;
+ 
+ 	switch (optname) {
+@@ -881,9 +893,15 @@ static int do_tls_setsockopt(struct sock *sk, int optname, sockptr_t optval,
+ 		rc = do_tls_setsockopt_no_pad(sk, optval, optlen);
+ 		break;
+ 	case TLS_TX_MAX_PAYLOAD_LEN:
++		ctx = tls_get_ctx(sk);
++		/* Senders sleep with tx_lock held, so take it interruptible */
++		rc = mutex_lock_interruptible(&ctx->tx_lock);
++		if (rc)
++			break;
+ 		lock_sock(sk);
+ 		rc = do_tls_setsockopt_tx_payload_len(sk, optval, optlen);
+ 		release_sock(sk);
++		mutex_unlock(&ctx->tx_lock);
+ 		break;
+ 	default:
+ 		rc = -ENOPROTOOPT;
+-- 
+2.56.1
+

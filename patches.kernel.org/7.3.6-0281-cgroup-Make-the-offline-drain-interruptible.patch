@@ -1,0 +1,194 @@
+From: Tejun Heo <tj@kernel.org>
+Date: Wed, 2 Sep 2026 13:03:13 -1000
+Subject: [PATCH] cgroup: Make the offline drain interruptible
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: c367ce5b31ffd4d958f3f6c5fe1c9e820dc9f526
+
+[ Upstream commit c367ce5b31ffd4d958f3f6c5fe1c9e820dc9f526 ]
+
+cgroup_subtree_control_write() and cgroup_type_write() drain dying csses
+from the subtree before re-applying control, so that a controller being
+re-enabled gets a fresh css instead of adopting one that is still dying. The
+drain waits for offline_css() in TASK_UNINTERRUPTIBLE.
+
+Since 1dffd95575eb ("cgroup: Defer kill_css_finish() in
+cgroup_apply_control_disable()"), a disabled css offlines only after every
+task that still pins it has finished exiting. The root cause of the hang is
+an indefinite wait in a place where indefinite waits should not happen: a
+task past exit_signals() can block in its exit path for as long as, say, a
+FUSE daemon takes to answer a flush, and nothing can interrupt it because
+prepare_signal() drops every signal for an exiting group. The drain then
+escalated that into an uninterruptible wait for the writer, which sits in D
+state for as long as the exiting task does. That is the hang syzbot reports
+as "task hung in cgroup_subtree_control_write".
+
+Make the drain interruptible. Nothing has been modified when it runs, so the
+write restarts or fails with EINTR without side effects. cgroup1 mount and
+remount drain the same way and become interruptible too.
+cgroup_destroy_root() drains from a workqueue where no signal is ever
+pending and keeps waiting as before.
+
+This only stops the escalation. The write still waits for the exiting tasks,
+and the indefinite wait in the exit path remains a separate problem.
+
+Fixes: 1dffd95575eb ("cgroup: Defer kill_css_finish() in cgroup_apply_control_disable()")
+Reported-by: syzbot+bb2e19a1190a556c01b1@syzkaller.appspotmail.com
+Link: https://lore.kernel.org/all/6a23a4b4.e4db5ad2.3b7dfb.0000.GAE@google.com/
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ kernel/cgroup/cgroup-internal.h |  2 +-
+ kernel/cgroup/cgroup-v1.c       |  8 ++++--
+ kernel/cgroup/cgroup.c          | 48 ++++++++++++++++++++++-----------
+ 3 files changed, 40 insertions(+), 18 deletions(-)
+
+diff --git a/kernel/cgroup/cgroup-internal.h b/kernel/cgroup/cgroup-internal.h
+index 58797123b752..f2684f9f8e0a 100644
+--- a/kernel/cgroup/cgroup-internal.h
++++ b/kernel/cgroup/cgroup-internal.h
+@@ -254,7 +254,7 @@ void cgroup_procs_write_finish(struct task_struct *task,
+ 			       enum cgroup_attach_lock_mode lock_mode)
+ 	__releases(&cgroup_threadgroup_rwsem);
+ 
+-void cgroup_lock_and_drain_offline(struct cgroup *cgrp);
++int cgroup_lock_and_drain_offline(struct cgroup *cgrp);
+ 
+ int cgroup_mkdir(struct kernfs_node *parent_kn, const char *name, umode_t mode);
+ int cgroup_rmdir(struct kernfs_node *kn);
+diff --git a/kernel/cgroup/cgroup-v1.c b/kernel/cgroup/cgroup-v1.c
+index 7e008867f3ac..167bf6555a49 100644
+--- a/kernel/cgroup/cgroup-v1.c
++++ b/kernel/cgroup/cgroup-v1.c
+@@ -1097,7 +1097,9 @@ int cgroup1_reconfigure(struct fs_context *fc)
+ 	int ret = 0;
+ 	u32 added_mask, removed_mask;
+ 
+-	cgroup_lock_and_drain_offline(&cgrp_dfl_root.cgrp);
++	ret = cgroup_lock_and_drain_offline(&cgrp_dfl_root.cgrp);
++	if (unlikely(ret))
++		return ret;
+ 
+ 	/* See what subsystems are wanted */
+ 	ret = check_cgroupfs_options(fc);
+@@ -1262,7 +1264,9 @@ int cgroup1_get_tree(struct fs_context *fc)
+ 	if (!ns_capable(ctx->ns->user_ns, CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
+-	cgroup_lock_and_drain_offline(&cgrp_dfl_root.cgrp);
++	ret = cgroup_lock_and_drain_offline(&cgrp_dfl_root.cgrp);
++	if (unlikely(ret))
++		return ret;
+ 
+ 	ret = cgroup1_root_to_use(fc);
+ 	if (!ret && !percpu_ref_tryget_live(&ctx->root->cgrp.self.refcnt))
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index 8463b5071fbd..37be027ce140 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -1379,7 +1379,10 @@ static void cgroup_destroy_root(struct cgroup_root *root)
+ 
+ 	trace_cgroup_destroy_root(root);
+ 
+-	cgroup_lock_and_drain_offline(&cgrp_dfl_root.cgrp);
++	/* runs off a workqueue, no signal can interrupt the drain */
++	ret = cgroup_lock_and_drain_offline(&cgrp_dfl_root.cgrp);
++	if (WARN_ON_ONCE(ret))
++		cgroup_lock();
+ 
+ 	BUG_ON(atomic_read(&root->nr_cgrps));
+ 	BUG_ON(!list_empty(&cgrp->self.children));
+@@ -1687,7 +1690,8 @@ void cgroup_kn_unlock(struct kernfs_node *kn)
+  * verifies that the associated cgroup is alive.  Returns the cgroup if
+  * alive; otherwise, an ERR_PTR value.  A successful return should be undone by
+  * a matching cgroup_kn_unlock() invocation.  If @drain_offline is %true, the
+- * cgroup is drained of offlining csses before return.
++ * cgroup is drained of offlining csses before return, and an interrupted drain
++ * fails with -ERESTARTSYS.
+  *
+  * Any cgroup kernfs method implementation which requires locking the
+  * associated cgroup should use this helper.  It avoids nesting cgroup
+@@ -1697,6 +1701,7 @@ void cgroup_kn_unlock(struct kernfs_node *kn)
+ struct cgroup *cgroup_kn_lock_live(struct kernfs_node *kn, bool drain_offline)
+ {
+ 	struct cgroup *cgrp;
++	int ret;
+ 
+ 	if (kernfs_type(kn) == KERNFS_DIR)
+ 		cgrp = kn->priv;
+@@ -1713,10 +1718,16 @@ struct cgroup *cgroup_kn_lock_live(struct kernfs_node *kn, bool drain_offline)
+ 		return ERR_PTR(-ENODEV);
+ 	kernfs_break_active_protection(kn);
+ 
+-	if (drain_offline)
+-		cgroup_lock_and_drain_offline(cgrp);
+-	else
++	if (drain_offline) {
++		ret = cgroup_lock_and_drain_offline(cgrp);
++		if (unlikely(ret)) {
++			kernfs_unbreak_active_protection(kn);
++			cgroup_put(cgrp);
++			return ERR_PTR(ret);
++		}
++	} else {
+ 		cgroup_lock();
++	}
+ 
+ 	if (!cgroup_is_dead(cgrp))
+ 		return cgrp;
+@@ -3320,16 +3331,20 @@ static int cgroup_update_dfl_csses(struct cgroup *cgrp)
+  * @cgrp: root of the target subtree
+  *
+  * Because css offlining is asynchronous, userland may try to re-enable a
+- * controller while the previous css is still around.  This function grabs
+- * cgroup_mutex and drains the previous css instances of @cgrp's subtree.
++ * controller while the previous css is still around. This function grabs
++ * cgroup_mutex and waits until no css in @cgrp's subtree is dying. A dying css
++ * offlines only after every task that still pins it has finished exiting, which
++ * can take arbitrarily long, so the wait is interruptible.
++ *
++ * Returns 0 with cgroup_mutex held once the subtree is drained, or -ERESTARTSYS
++ * without it if interrupted by a signal.
+  */
+-void cgroup_lock_and_drain_offline(struct cgroup *cgrp)
+-	__acquires(&cgroup_mutex)
++int cgroup_lock_and_drain_offline(struct cgroup *cgrp)
+ {
+ 	struct cgroup *dsct;
+ 	struct cgroup_subsys_state *d_css;
+ 	struct cgroup_subsys *ss;
+-	int ssid;
++	int ssid, ret;
+ 
+ restart:
+ 	cgroup_lock();
+@@ -3343,17 +3358,20 @@ void cgroup_lock_and_drain_offline(struct cgroup *cgrp)
+ 				continue;
+ 
+ 			cgroup_get_live(dsct);
+-			prepare_to_wait(&dsct->offline_waitq, &wait,
+-					TASK_UNINTERRUPTIBLE);
+-
++			ret = prepare_to_wait_event(&dsct->offline_waitq, &wait,
++						    TASK_INTERRUPTIBLE);
+ 			cgroup_unlock();
+-			schedule();
++			if (!ret)
++				schedule();
+ 			finish_wait(&dsct->offline_waitq, &wait);
+-
+ 			cgroup_put(dsct);
++			if (unlikely(ret))
++				return ret;
+ 			goto restart;
+ 		}
+ 	}
++
++	return 0;
+ }
+ 
+ /**
+-- 
+2.56.1
+

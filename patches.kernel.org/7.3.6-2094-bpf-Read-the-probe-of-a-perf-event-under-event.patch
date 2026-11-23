@@ -1,0 +1,150 @@
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Sat, 17 Oct 2026 16:37:11 +0000
+Subject: [PATCH] bpf: Read the probe of a perf event under event_mutex
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: 3ccd700543f16a2b2ab656f35dcaeb6bd7c45e22
+
+[ Upstream commit 3ccd700543f16a2b2ab656f35dcaeb6bd7c45e22 ]
+
+For a perf event on a kprobe or uprobe event which was made in tracefs,
+bpf_get_kprobe_info() and bpf_get_uprobe_info() look the probe up by
+name in the list of dynamic events, and hand a pointer to its symbol or
+file name back to the caller. None of the callers holds event_mutex.
+
+The perf event keeps its trace event alive, nothing else. Other dynamic
+events are removed from the list and freed during the walk. And a probe
+which shares its event with other probes can be deleted while the event
+is in use, so even the probe which is found can be freed, together with
+the string, before the caller has measured and copied it. The result is
+a use-after-free in the walk, in strlen() and in the copy to user space,
+or a NULL pointer dereference.
+
+The readers are BPF_OBJ_GET_INFO_BY_FD and fdinfo of a perf link, for
+whoever holds a descriptor of the link, and BPF_TASK_FD_QUERY. The other
+side is anybody who may write to dynamic_events, kprobe_events or
+uprobe_events.
+
+Take event_mutex in bpf_get_perf_event_info() and give the caller a copy
+of the name, which it has to free.
+
+Fixes: 41bdc4b40ed6 ("bpf: introduce bpf subcommand BPF_TASK_FD_QUERY")
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://patch.msgid.link/20261017163745.3341787-10-alexei.starovoitov@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ kernel/bpf/syscall.c     | 17 +++++++++++------
+ kernel/trace/bpf_trace.c | 13 +++++++++++++
+ 2 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index e7b461f33b58..83648077c967 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -4000,19 +4000,19 @@ static int bpf_perf_link_fill_common(const struct perf_event *event,
+ 		*ulenp = 1;
+ 	}
+ 	if (!uname)
+-		return 0;
++		goto out;
+ 
+ 	if (buf) {
+ 		err = bpf_copy_to_user(uname, buf, ulen, len);
+-		if (err)
+-			return err;
+ 	} else {
+ 		char zero = '\0';
+ 
+ 		if (put_user(zero, uname))
+-			return -EFAULT;
++			err = -EFAULT;
+ 	}
+-	return 0;
++out:
++	kfree_const(buf);
++	return err;
+ }
+ 
+ #ifdef CONFIG_KPROBE_EVENTS
+@@ -4069,6 +4069,7 @@ static void bpf_perf_link_fdinfo_kprobe(const struct perf_event *event,
+ 		   name, offset, missed, addr,
+ 		   type == BPF_FD_TYPE_KRETPROBE ?  "kretprobe" : "kprobe",
+ 		   event->bpf_cookie);
++	kfree_const(name);
+ }
+ #endif
+ 
+@@ -4122,6 +4123,7 @@ static void bpf_perf_link_fdinfo_uprobe(const struct perf_event *event,
+ 		   name, offset, ref_ctr_offset,
+ 		   type == BPF_FD_TYPE_URETPROBE ?  "uretprobe" : "uprobe",
+ 		   event->bpf_cookie);
++	kfree_const(name);
+ }
+ #endif
+ 
+@@ -4220,6 +4222,7 @@ static void bpf_tracepoint_link_show_fdinfo(const struct perf_event *event,
+ 		   "event_type:\t%s\n"
+ 		   "cookie:\t%llu\n",
+ 		   name, "tracepoint", event->bpf_cookie);
++	kfree_const(name);
+ }
+ 
+ static void bpf_probe_link_show_fdinfo(const struct perf_event *event,
+@@ -5746,11 +5749,13 @@ static int bpf_task_fd_query(const union bpf_attr *attr,
+ 		err = bpf_get_perf_event_info(event, &prog_id, &fd_type,
+ 					      &buf, &probe_offset,
+ 					      &probe_addr, NULL);
+-		if (!err)
++		if (!err) {
+ 			err = bpf_task_fd_query_copy(attr, uattr, prog_id,
+ 						     fd_type, buf,
+ 						     probe_offset,
+ 						     probe_addr);
++			kfree_const(buf);
++		}
+ 		goto put_file;
+ 	}
+ 
+diff --git a/kernel/trace/bpf_trace.c b/kernel/trace/bpf_trace.c
+index 568b9ada61da..d649aaf13553 100644
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -2209,6 +2209,7 @@ int bpf_probe_unregister(struct bpf_raw_event_map *btp, struct bpf_raw_tp_link *
+ 	return tracepoint_probe_unregister(btp->tp, (void *)btp->bpf_func, link);
+ }
+ 
++/* On success the caller releases *buf with kfree_const() */
+ int bpf_get_perf_event_info(const struct perf_event *event, u32 *prog_id,
+ 			    u32 *fd_type, const char **buf,
+ 			    u64 *probe_offset, u64 *probe_addr,
+@@ -2218,6 +2219,12 @@ int bpf_get_perf_event_info(const struct perf_event *event, u32 *prog_id,
+ 	struct bpf_prog *prog;
+ 	int flags, err = 0;
+ 
++	/*
++	 * The list of dynamic events is walked, and a probe which has siblings
++	 * can be deleted, with its strings, while its event is in use.
++	 */
++	guard(mutex)(&event_mutex);
++
+ 	prog = event->prog;
+ 	if (!prog)
+ 		return -ENOENT;
+@@ -2258,6 +2265,12 @@ int bpf_get_perf_event_info(const struct perf_event *event, u32 *prog_id,
+ #endif
+ 	}
+ 
++	if (!err && *buf) {
++		*buf = kstrdup_const(*buf, GFP_KERNEL);
++		if (!*buf)
++			err = -ENOMEM;
++	}
++
+ 	return err;
+ }
+ 
+-- 
+2.56.1
+

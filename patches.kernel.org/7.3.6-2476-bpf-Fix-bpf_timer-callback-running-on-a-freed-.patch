@@ -1,0 +1,124 @@
+From: Mani Tofigh <mt4022@columbia.edu>
+Date: Tue, 27 Oct 2026 13:03:42 -0400
+Subject: [PATCH] bpf: Fix bpf_timer callback running on a freed map
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: 815a0a2a40d6c5985a153041231731651bc4024b
+
+[ Upstream commit 815a0a2a40d6c5985a153041231731651bc4024b ]
+
+A bpf_timer in an inner map can fire after the map has been freed, and
+bpf_timer_cb() then reads the freed map:
+
+  [   50.709520] BUG: KASAN: slab-use-after-free in bpf_timer_cb+0x249/0x290
+  [   50.709540] Read of size 4 at addr ff11000003bc1030 by task bpftimer/72
+  ...
+  [   50.710783] Freed by task 12:
+  ...
+  [   50.710826]  bpf_map_free+0x1a2/0x380
+
+When user space closes the map, its timers are cancelled and their
+callbacks are cleared.  Since commit 1bfbc267ec91 ("bpf: Enable
+bpf_timer and bpf_wq in any context"), bpf_timer_set_callback() and
+bpf_timer_start() run without a lock, so a program that found the timer
+just before the close can still use it afterwards:
+
+  Task A                  Task B                  Task C
+  ------                  ------                  ------
+  bpf_timer_start()
+    finds the timer
+                          bpf_timer_set_callback()
+                            finds the timer
+                                                  close(map_fd)
+                                                    clears the callback
+                                                    cancels the timer
+                            sets the callback
+    arms the timer
+                                                  deletes the map from
+                                                  the outer map
+                                                    map is freed
+  the timer fires
+    bpf_timer_cb() reads the freed map
+
+The timer is cancelled once more when it is finally freed, but that
+happens well after the inner map is freed, so a timer started this way
+can still fire on the freed map.
+
+Clear the timer's map pointer in bpf_async_cancel_and_free() before the
+map can be freed, and make the bpf_timer and bpf_wq callbacks return
+early when it is NULL.  The map is not freed until callbacks that are
+already running have finished, so a callback either sees the map while
+it is still valid or sees NULL.
+
+The reproducer below calls the two helpers in a loop on two CPUs while a
+third CPU keeps creating an inner map with a timer, closing it and
+removing it from the outer map.  This bug was identified and confirmed
+with the help of a deterministic hypervisor currently under development,
+but the non-deterministic C reproducer can typically trigger it in the
+1-50s time range.  With the fix, nothing is triggered after 600 seconds.
+
+Fixes: 1bfbc267ec91 ("bpf: Enable bpf_timer and bpf_wq in any context")
+Signed-off-by: Mani Tofigh <mt4022@columbia.edu>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Tested-by: Mahe Tardy <mahe.tardy@gmail.com>
+Link: https://patch.msgid.link/20261027-bpf-timer-freed-map-v1-1-30402b0ee99b@columbia.edu
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ kernel/bpf/helpers.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 44dce0730476..7c2e6f0e7409 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -1183,7 +1183,7 @@ static void bpf_async_refcount_put(struct bpf_async_cb *cb);
+ static enum hrtimer_restart bpf_timer_cb(struct hrtimer *hrtimer)
+ {
+ 	struct bpf_hrtimer *t = container_of(hrtimer, struct bpf_hrtimer, timer);
+-	struct bpf_map *map = t->cb.map;
++	struct bpf_map *map = READ_ONCE(t->cb.map);
+ 	void *value = t->cb.value;
+ 	bpf_callback_t callback_fn;
+ 	void *key;
+@@ -1191,7 +1191,7 @@ static enum hrtimer_restart bpf_timer_cb(struct hrtimer *hrtimer)
+ 
+ 	BTF_TYPE_EMIT(struct bpf_timer);
+ 	callback_fn = rcu_dereference_check(t->cb.callback_fn, rcu_read_lock_bh_held());
+-	if (!callback_fn)
++	if (!callback_fn || !map)
+ 		goto out;
+ 
+ 	/* bpf_timer_cb() runs in hrtimer_run_softirq. It doesn't migrate and
+@@ -1216,7 +1216,7 @@ static void bpf_wq_work(struct work_struct *work)
+ {
+ 	struct bpf_work *w = container_of(work, struct bpf_work, work);
+ 	struct bpf_async_cb *cb = &w->cb;
+-	struct bpf_map *map = cb->map;
++	struct bpf_map *map;
+ 	bpf_callback_t callback_fn;
+ 	void *value = cb->value;
+ 	void *key;
+@@ -1227,8 +1227,9 @@ static void bpf_wq_work(struct work_struct *work)
+ 	/* keeps the program that callback_fn belongs to */
+ 	rcu_read_lock_trace();
+ 
++	map = READ_ONCE(cb->map);
+ 	callback_fn = READ_ONCE(cb->callback_fn);
+-	if (!callback_fn)
++	if (!callback_fn || !map)
+ 		goto out;
+ 
+ 	key = map_key_from_value(map, value, &idx);
+@@ -1694,6 +1695,8 @@ static void bpf_async_cancel_and_free(struct bpf_async_kern *async)
+ 	if (!cb)
+ 		return;
+ 
++	/* Callbacks that run after this see NULL and return. */
++	WRITE_ONCE(cb->map, NULL);
+ 	bpf_async_update_prog_callback(cb, NULL, NULL);
+ 	/*
+ 	 * No refcount_inc_not_zero(&cb->refcnt) here. Dropping the last
+-- 
+2.56.1
+

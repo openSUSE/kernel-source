@@ -1,0 +1,126 @@
+From: Adrian Hunter <adrian.hunter@intel.com>
+Date: Sun, 20 Sep 2026 18:12:41 +0300
+Subject: [PATCH] i3c: mipi-i3c-hci: Stop rings gracefully when suspending
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: 9796ccba1254f6bd3b7e6b650ad28ffc56daf6e9
+
+[ Upstream commit 9796ccba1254f6bd3b7e6b650ad28ffc56daf6e9 ]
+
+hci_dma_suspend() tore the rings down with a single write of zero to
+RH_RING_CONTROL, clearing the RS and ENABLE fields together and without
+waiting for the ring to stop.  I3C HCI v1.1 section 6.1.2 separates those
+steps: clear RS for all running Ring Bundles, and only then clear ENABLE
+for all enabled Ring Bundles.
+
+The ring registers were also written outside hci->lock, while the
+interrupt handler, which takes that lock, could still be running on
+another CPU.  i3c_hci_sync_irq_inactive() was called only afterwards.
+
+Finally, an IBI can still be sitting in the IBI Status Ring when suspend
+runs.  Clearing HC_CONTROL.BUS_ENABLE is deferred: per the description of
+that field, if a disable request occurs while receiving an IBI, the
+actual disabling does not occur until reception of the IBI is complete.
+
+Instead, clear RS under hci->lock, wait for RING_STATUS_RUNNING to clear,
+and make the interrupt handler inactive.  Only then disable the ring
+interrupt signals, drain anything left in the IBI ring, and clear ENABLE.
+
+Fixes: 816958720443 ("i3c: mipi-i3c-hci: Add DMA suspend and resume support")
+Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+Reviewed-by: Frank Li <Frank.Li@nxp.com>
+Link: https://patch.msgid.link/20260920151248.46936-12-adrian.hunter@intel.com
+Signed-off-by: Alexandre Belloni <alexandre.belloni@bootlin.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/i3c/master/mipi-i3c-hci/dma.c | 57 +++++++++++++++++++++++++--
+ 1 file changed, 53 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/i3c/master/mipi-i3c-hci/dma.c b/drivers/i3c/master/mipi-i3c-hci/dma.c
+index ec4b469abd33..b8fcea0870ab 100644
+--- a/drivers/i3c/master/mipi-i3c-hci/dma.c
++++ b/drivers/i3c/master/mipi-i3c-hci/dma.c
+@@ -15,6 +15,7 @@
+ #include <linux/errno.h>
+ #include <linux/i3c/master.h>
+ #include <linux/io.h>
++#include <linux/iopoll.h>
+ 
+ #include "hci.h"
+ #include "cmd.h"
+@@ -1052,19 +1053,67 @@ static bool hci_dma_irq_handler(struct i3c_hci *hci)
+ 	return handled;
+ }
+ 
++/*
++ * With the bus disabled, a ring should stop within a few microseconds. The
++ * timeout is therefore only expected to expire if the hardware is stuck.
++ * Allow sufficient margin for slow systems, but keep the delay acceptable
++ * during suspend.
++ */
++#define RING_STOP_TIMEOUT_US	(100 * USEC_PER_MSEC)
++/*
++ * The ring is usually already stopped, so polling typically completes on the
++ * first iteration. Use a modest sleep interval to avoid busy-waiting without
++ * adding excessive latency.
++ */
++#define RING_STOP_SLEEP_US	100
++
+ static void hci_dma_suspend(struct i3c_hci *hci)
+ {
+ 	struct hci_rings_data *rings = hci->io_data;
+ 	int n = rings ? rings->total : 0;
++	struct hci_rh_data *rh;
++	u32 regval;
+ 
+-	for (int i = 0; i < n; i++) {
+-		struct hci_rh_data *rh = &rings->headers[i];
++	/* Gracefully stop the rings */
++	scoped_guard(spinlock_irqsave, &hci->lock) {
++		for (int i = 0; i < n; i++) {
++			rh = &rings->headers[i];
++			regval = rh_reg_read(RING_CONTROL);
++			if (regval & RING_CTRL_RUN_STOP)
++				rh_reg_write(RING_CONTROL, regval & ~RING_CTRL_RUN_STOP);
++		}
++	}
+ 
+-		rh_reg_write(INTR_SIGNAL_ENABLE, 0);
+-		rh_reg_write(RING_CONTROL, 0);
++	/* Wait for actual stop */
++	for (int i = 0; i < n; i++) {
++		rh = &rings->headers[i];
++		if (readx_poll_timeout(readl, rh->regs + RH_RING_STATUS, regval,
++				       !(regval & RING_STATUS_RUNNING),
++				       RING_STOP_SLEEP_US, RING_STOP_TIMEOUT_US))
++			dev_err(&hci->master.dev, "%s: Ring did not stop, status %#x\n",
++				__func__, regval);
+ 	}
+ 
++	/*
++	 * With the rings stopped, no more IBIs can be received. Flush and make
++	 * the interrupt handler inactive.
++	 */
+ 	i3c_hci_sync_irq_inactive(hci);
++
++	/* Disable interrupt signals and disable the rings */
++	scoped_guard(spinlock_irqsave, &hci->lock)
++		for (int i = 0; i < n; i++) {
++			rh = &rings->headers[i];
++			rh_reg_write(INTR_SIGNAL_ENABLE, 0);
++			/*
++			 * Be absolutely certain there is no unprocessed IBI.
++			 * hci_dma_drain_ibi_ring() will do nothing if there is
++			 * none.
++			 */
++			if (i < IBI_RINGS)
++				hci_dma_drain_ibi_ring(hci, rh);
++			rh_reg_write(RING_CONTROL, 0);
++		}
+ }
+ 
+ static void hci_dma_resume(struct i3c_hci *hci)
+-- 
+2.56.1
+

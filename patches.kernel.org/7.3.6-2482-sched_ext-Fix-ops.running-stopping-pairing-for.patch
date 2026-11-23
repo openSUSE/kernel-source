@@ -1,0 +1,213 @@
+From: Andrea Righi <arighi@nvidia.com>
+Date: Tue, 22 Sep 2026 18:51:46 +0200
+Subject: [PATCH] sched_ext: Fix ops.running/stopping() pairing for proxy-exec
+ donors
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: 5f882051efabaf19f9b4dbe4b50cee1d250ac19e
+
+[ Upstream commit 5f882051efabaf19f9b4dbe4b50cee1d250ac19e ]
+
+With proxy execution, pick_next_task() can select a blocked task as the
+scheduling context before find_proxy_task() resolves the execution
+context.
+
+From the BPF scheduler perspective, that donor is running while its
+scheduling context drives the lock owner; ops.tick() and other
+accounting must therefore remain enclosed by a matching
+ops.running()/ops.stopping() session.
+
+In this scenario, the session boundaries do not always match physical
+task switches. Keep the "running" session open when the same donor
+continues on the same CPU. When proxy execution migrates a donor's
+scheduling context to another CPU, end its running session on the source
+CPU and start a new session on the destination CPU only after proxy
+resolution succeeds. This prevents a failed resolution from exposing a
+provisional ops.running() event.
+
+Track these sessions with a new SCX_TASK_RUN_TRACKED flag. The explicit
+running-state tracking is also required by later donor-based accounting:
+it prevents an EXT owner executing for a non-EXT donor from being
+treated as the active EXT scheduling context when it is dequeued.
+
+This is a preparatory change for enabling proxy execution together with
+sched_ext.
+
+Acked-by: John Stultz <jstultz@google.com>
+Signed-off-by: Andrea Righi <arighi@nvidia.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Stable-dep-of: 5c23d1710606 ("sched_ext: Fix queued bypassed tasks stalling when the host loses SCX_CAP_BASE")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ include/linux/sched/ext.h                     |  1 +
+ kernel/sched/ext/ext.c                        | 72 ++++++++++++++-----
+ kernel/sched/ext/internal.h                   |  6 ++
+ .../sched_ext/include/scx/enum_defs.autogen.h |  1 +
+ 4 files changed, 64 insertions(+), 16 deletions(-)
+
+diff --git a/include/linux/sched/ext.h b/include/linux/sched/ext.h
+index 36c04797436c..81a29b3c0e5d 100644
+--- a/include/linux/sched/ext.h
++++ b/include/linux/sched/ext.h
+@@ -104,6 +104,7 @@ enum scx_ent_flags {
+ 	SCX_TASK_SUB_INIT	= 1 << 4, /* task being initialized for a sub sched */
+ 	SCX_TASK_IMMED		= 1 << 5, /* task is on local DSQ with %SCX_ENQ_IMMED */
+ 	SCX_TASK_PROTECTED	= 1 << 6, /* slice and DSQ head position protected */
++	SCX_TASK_RUN_TRACKED	= 1 << 7, /* task is in an ops.running()/stopping() session */
+ 
+ 	/*
+ 	 * Bits 8 to 10 are used to carry task state:
+diff --git a/kernel/sched/ext/ext.c b/kernel/sched/ext/ext.c
+index 4482df6d1187..c7565bc66fa1 100644
+--- a/kernel/sched/ext/ext.c
++++ b/kernel/sched/ext/ext.c
+@@ -2333,10 +2333,10 @@ static bool dequeue_task_scx(struct rq *rq, struct task_struct *p, int core_deq_
+ 	ops_dequeue(rq, p, deq_flags);
+ 
+ 	/*
+-	 * A currently running task which is going off @rq first gets dequeued
+-	 * and then stops running. As we want running <-> stopping transitions
+-	 * to be contained within runnable <-> quiescent transitions, trigger
+-	 * ->stopping() early here instead of in put_prev_task_scx().
++	 * A current scheduling context which is going off @rq first gets
++	 * dequeued and then stops running. As we want running <-> stopping
++	 * transitions to be contained within runnable <-> quiescent transitions,
++	 * trigger ->stopping() early here instead of in put_prev_task_scx().
+ 	 *
+ 	 * @p may go through multiple stopping <-> running transitions between
+ 	 * here and put_prev_task_scx() if task attribute changes occur while
+@@ -2344,11 +2344,13 @@ static bool dequeue_task_scx(struct rq *rq, struct task_struct *p, int core_deq_
+ 	 * information meaningful to the BPF scheduler and can be suppressed by
+ 	 * skipping the callbacks if the task is !QUEUED.
+ 	 */
+-	if (task_current(rq, p) &&
+-	    (SCX_HAS_OP(sch, stopping) || unlikely(p == scx_rescuee(rq)))) {
+-		update_curr_scx(rq);
+-		if (SCX_HAS_OP(sch, stopping))
+-			SCX_CALL_OP_TASK(sch, stopping, rq, p, false);
++	if (task_current_donor(rq, p) && (p->scx.flags & SCX_TASK_RUN_TRACKED)) {
++		if (SCX_HAS_OP(sch, stopping) || unlikely(p == scx_rescuee(rq))) {
++			update_curr_scx(rq);
++			if (SCX_HAS_OP(sch, stopping))
++				SCX_CALL_OP_TASK(sch, stopping, rq, p, false);
++		}
++		p->scx.flags &= ~SCX_TASK_RUN_TRACKED;
+ 	}
+ 
+ 	if (SCX_HAS_OP(sch, quiescent) && !task_on_rq_migrating(p))
+@@ -3065,10 +3067,23 @@ static enum scx_dsp_verdict dispatch_one(struct rq *rq, struct task_struct *prev
+ 	return verdict;
+ }
+ 
+-static void set_next_task_scx(struct rq *rq, struct task_struct *p, enum snt_e type)
++static void scx_start_task_running(struct rq *rq, struct task_struct *p)
+ {
+ 	struct scx_sched *sch = scx_task_sched(p);
+ 
++	if (p->scx.flags & SCX_TASK_RUN_TRACKED)
++		return;
++
++	if (SCX_HAS_OP(sch, running))
++		SCX_CALL_OP_TASK(sch, running, rq, p);
++
++	p->scx.flags |= SCX_TASK_RUN_TRACKED;
++}
++
++static void set_next_task_scx(struct rq *rq, struct task_struct *p, enum snt_e type)
++{
++	bool first = type == SNT_PICK;
++
+ 	if (type == SNT_REPICK)
+ 		return;
+ 
+@@ -3083,9 +3098,20 @@ static void set_next_task_scx(struct rq *rq, struct task_struct *p, enum snt_e t
+ 
+ 	p->se.exec_start = rq_clock_task(rq);
+ 
+-	/* see dequeue_task_scx() on why we skip when !QUEUED */
+-	if (SCX_HAS_OP(sch, running) && (p->scx.flags & SCX_TASK_QUEUED))
+-		SCX_CALL_OP_TASK(sch, running, rq, p);
++	/*
++	 * See dequeue_task_scx() for why we skip when !QUEUED.
++	 *
++	 * During a normal switch (@first), a blocked task is only a provisional
++	 * donor. Proxy resolution may fail or migrate the donor to another CPU,
++	 * so defer ops.running() until scx_proxy_donor_start() confirms that
++	 * resolution succeeded.
++	 *
++	 * !@first denotes restoration after a SAVE/RESTORE cycle. The matching
++	 * dequeue already issued ops.stopping(), so restart the session here
++	 * regardless of the donor state.
++	 */
++	if ((p->scx.flags & SCX_TASK_QUEUED) && !(p->is_blocked && first))
++		scx_start_task_running(rq, p);
+ 
+ 	clr_task_runnable(p, true);
+ 
+@@ -3131,6 +3157,12 @@ static void set_next_task_scx(struct rq *rq, struct task_struct *p, enum snt_e t
+ 
+ void scx_proxy_donor_start(struct rq *rq)
+ {
++	struct task_struct *donor = rq->donor;
++
++	lockdep_assert_rq_held(rq);
++
++	if (donor->sched_class == &ext_sched_class && (donor->scx.flags & SCX_TASK_QUEUED))
++		scx_start_task_running(rq, donor);
+ }
+ 
+ static enum scx_cpu_preempt_reason
+@@ -3206,9 +3238,17 @@ static void put_prev_task_scx(struct rq *rq, struct task_struct *p,
+ 			scx_task_slice_ended(rq, p);
+ 	}
+ 
+-	/* see dequeue_task_scx() on why we skip when !QUEUED */
+-	if (SCX_HAS_OP(sch, stopping) && (p->scx.flags & SCX_TASK_QUEUED))
+-		SCX_CALL_OP_TASK(sch, stopping, rq, p, true);
++	/*
++	 * Preserve the running session when proxy execution refreshes the same
++	 * donor around an execution-context switch on this rq.
++	 */
++	if (next != p && (p->scx.flags & SCX_TASK_QUEUED) &&
++	    (p->scx.flags & SCX_TASK_RUN_TRACKED)) {
++		if (SCX_HAS_OP(sch, stopping))
++			SCX_CALL_OP_TASK(sch, stopping, rq, p, true);
++
++		p->scx.flags &= ~SCX_TASK_RUN_TRACKED;
++	}
+ 
+ 	if (p->scx.flags & SCX_TASK_QUEUED) {
+ 		set_task_runnable(rq, p);
+diff --git a/kernel/sched/ext/internal.h b/kernel/sched/ext/internal.h
+index a0619c941e91..8d5ebec29b70 100644
+--- a/kernel/sched/ext/internal.h
++++ b/kernel/sched/ext/internal.h
+@@ -477,6 +477,12 @@ struct sched_ext_ops {
+ 	 * Therefore, always use scx_bpf_task_cpu(@p) to determine the
+ 	 * target CPU the task is going to use.
+ 	 *
++	 * Under proxy execution, the BPF scheduler continues to observe the
++	 * donor as the current scheduling context. A blocked donor enters a
++	 * ->running()/->stopping() session while its scheduling context drives
++	 * the lock owner. The lock owner executing on its behalf is intentionally
++	 * not reported through these callbacks.
++	 *
+ 	 * See ->runnable() for explanation on the task state notifiers.
+ 	 */
+ 	void (*running)(struct task_struct *p);
+diff --git a/tools/sched_ext/include/scx/enum_defs.autogen.h b/tools/sched_ext/include/scx/enum_defs.autogen.h
+index 63b6b14b19bd..6cb26ad5033c 100644
+--- a/tools/sched_ext/include/scx/enum_defs.autogen.h
++++ b/tools/sched_ext/include/scx/enum_defs.autogen.h
+@@ -105,6 +105,7 @@
+ #define HAVE_SCX_TASK_SUB_INIT
+ #define HAVE_SCX_TASK_IMMED
+ #define HAVE_SCX_TASK_PROTECTED
++#define HAVE_SCX_TASK_RUN_TRACKED
+ #define HAVE_SCX_TASK_STATE_SHIFT
+ #define HAVE_SCX_TASK_STATE_BITS
+ #define HAVE_SCX_TASK_STATE_MASK
+-- 
+2.56.1
+

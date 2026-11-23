@@ -1,0 +1,147 @@
+From: Kiran K <kiran.k@intel.com>
+Date: Wed, 19 Aug 2026 20:02:18 +0530
+Subject: [PATCH] Bluetooth: btintel_pcie: sync mbox tlv parsing with GP0 alive
+ interrupt
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: d572ea4b621ce60279da5179a0c338660c8b7331
+
+[ Upstream commit d572ea4b621ce60279da5179a0c338660c8b7331 ]
+
+Performing a target access to read the mbox TLV table while the driver
+is concurrently posting RX buffers to the firmware causes the hardware
+to return 0 for the target address, resulting in an invalid/empty TLV
+parse.
+
+Add a synchronization handshake between the mbox TLV read operation
+performed by the mbox worker and the GP0 (alive) MSI-X interrupt (which
+signals completion of RX buffer posting). The worker now waits for the
+alive interrupt before initiating the target access, ensuring the
+hardware returns valid data.
+
+Assisted-by: Gemini:gemini-3.1-pro-preview
+Signed-off-by: Kiran K <kiran.k@intel.com>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Stable-dep-of: 4f6ead67b93b ("Bluetooth: btintel_pcie: verify and serialize D-state transitions")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/bluetooth/btintel_pcie.c | 42 +++++++++++++++++++++++++++++---
+ drivers/bluetooth/btintel_pcie.h | 10 +++++++-
+ 2 files changed, 48 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/bluetooth/btintel_pcie.c b/drivers/bluetooth/btintel_pcie.c
+index 8ad639e4d3ca..9f7a9bf592f6 100644
+--- a/drivers/bluetooth/btintel_pcie.c
++++ b/drivers/bluetooth/btintel_pcie.c
+@@ -989,6 +989,24 @@ static int btintel_parse_mbox_tlv(struct btintel_pcie_data *data)
+ 	struct mbox_tlv *tlv;
+ 	struct btintel_data *cnvi_data = hci_get_priv(data->hdev);
+ 	u8 hw_variant = INTEL_HW_VARIANT(cnvi_data->cnvi_bt);
++	long t;
++
++	/* Wait for GP0 alive interrupt to post RX buffers */
++	t = wait_event_timeout(data->mbox_parse_wait_q,
++			       test_bit(BTINTEL_PCIE_MBOX_PARSE_READY, &data->flags),
++			       msecs_to_jiffies(BTINTEL_PCIE_MBOX_INTR_TIMEOUT_MS));
++	if (!t) {
++		bt_dev_warn(data->hdev,
++			    "Timeout (%u ms) waiting for alive interrupt before mbox TLV parse; skipping",
++			    BTINTEL_PCIE_MBOX_INTR_TIMEOUT_MS);
++		return 0;
++	}
++	clear_bit(BTINTEL_PCIE_MBOX_PARSE_READY, &data->flags);
++
++	bt_dev_info(data->hdev,
++		    "mbox TLV parse started at %lld ns (%lld us after mbox interrupt)",
++		    ktime_to_ns(ktime_get()),
++		    ktime_to_us(ktime_sub(ktime_get(), data->mbox_intr_ts)));
+ 
+ 	memset(&data->dump_info, 0, sizeof(data->dump_info));
+ 
+@@ -1232,12 +1250,22 @@ static void btintel_pcie_msix_gp1_handler(struct btintel_pcie_data *data)
+ 	if (target_access &&
+ 	    !test_and_set_bit(BTINTEL_PCIE_MAIL_BOX_INTR,
+ 				   &data->flags)) {
++		/* Arm the mbox<->alive handshake */
++		clear_bit(BTINTEL_PCIE_MBOX_PARSE_READY, &data->flags);
++		set_bit(BTINTEL_PCIE_MBOX_PARSE_PENDING, &data->flags);
++		data->mbox_intr_ts = ktime_get();
++
++		bt_dev_info(data->hdev,
++			    "mbox interrupt received at %lld ns; queuing mbox_work",
++			    ktime_to_ns(data->mbox_intr_ts));
++
+ 		WRITE_ONCE(data->debug_table_addr, addr);
+ 		WRITE_ONCE(data->debug_table_size, size);
+ 		if (!queue_work(data->dump_workqueue,
+-				&data->mbox_work))
+-			clear_bit(BTINTEL_PCIE_MAIL_BOX_INTR,
+-				  &data->flags);
++				&data->mbox_work)) {
++			clear_bit(BTINTEL_PCIE_MAIL_BOX_INTR, &data->flags);
++			clear_bit(BTINTEL_PCIE_MBOX_PARSE_PENDING, &data->flags);
++		}
+ 	}
+ 
+ 	/* Mailbox is read, ack to FW */
+@@ -1347,6 +1375,12 @@ static void btintel_pcie_msix_gp0_handler(struct btintel_pcie_data *data)
+ 	if (submit_rx) {
+ 		btintel_pcie_reset_ia(data);
+ 		btintel_pcie_start_rx(data);
++
++		/* Complete the mbox<->alive handshake */
++		if (test_and_clear_bit(BTINTEL_PCIE_MBOX_PARSE_PENDING, &data->flags)) {
++			set_bit(BTINTEL_PCIE_MBOX_PARSE_READY, &data->flags);
++			wake_up(&data->mbox_parse_wait_q);
++		}
+ 	}
+ 
+ 	if (signal_waitq) {
+@@ -3345,6 +3379,8 @@ static int btintel_pcie_probe(struct pci_dev *pdev,
+ 	init_waitqueue_head(&data->tx_wait_q);
+ 	data->tx_wait_done = false;
+ 
++	init_waitqueue_head(&data->mbox_parse_wait_q);
++
+ 	data->workqueue = alloc_ordered_workqueue(KBUILD_MODNAME, WQ_HIGHPRI);
+ 	if (!data->workqueue)
+ 		return -ENOMEM;
+diff --git a/drivers/bluetooth/btintel_pcie.h b/drivers/bluetooth/btintel_pcie.h
+index 81f1abd14f35..a7573b377a3e 100644
+--- a/drivers/bluetooth/btintel_pcie.h
++++ b/drivers/bluetooth/btintel_pcie.h
+@@ -126,7 +126,9 @@ enum {
+ 	BTINTEL_PCIE_FWTRIGGER_DUMP_INPROGRESS,
+ 	BTINTEL_PCIE_RECOVERY_IN_PROGRESS,
+ 	BTINTEL_PCIE_SETUP_DONE,
+-	BTINTEL_PCIE_MAIL_BOX_INTR
++	BTINTEL_PCIE_MAIL_BOX_INTR,
++	BTINTEL_PCIE_MBOX_PARSE_PENDING,
++	BTINTEL_PCIE_MBOX_PARSE_READY
+ };
+ 
+ enum btintel_pcie_tlv_type {
+@@ -179,6 +181,7 @@ enum btintel_pcie_mbox_msg {
+ 
+ /* Default interrupt timeout in msec */
+ #define BTINTEL_DEFAULT_INTR_TIMEOUT_MS	3000
++#define BTINTEL_PCIE_MBOX_INTR_TIMEOUT_MS	500
+ 
+ #define BTINTEL_PCIE_DX_TRANSITION_MAX_RETRIES	3
+ 
+@@ -587,6 +590,11 @@ struct btintel_pcie_data {
+ 	u32	debug_table_size;
+ 	struct btintel_pcie_dump_mem_info	dump_info;
+ 	struct btintel_pcie_mbox	mbox;
++
++	/* Wait queue for mbox_worker to wait for GP0 alive interrupt */
++	wait_queue_head_t	mbox_parse_wait_q;
++	/* Timestamp captured in GP1 handler when mbox interrupt is received */
++	ktime_t	mbox_intr_ts;
+ };
+ 
+ static inline u32 btintel_pcie_rd_reg32(struct btintel_pcie_data *data,
+-- 
+2.56.1
+

@@ -1,0 +1,116 @@
+From: Tejun Heo <tj@kernel.org>
+Date: Mon, 26 Oct 2026 14:17:35 -1000
+Subject: [PATCH] sched_ext: Fix bypassed tasks looping on a host without
+ SCX_CAP_ENQ
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: a676ada0d6544928c0ceb032fb991a9abe0977db
+
+[ Upstream commit a676ada0d6544928c0ceb032fb991a9abe0977db ]
+
+Bypass exists so that runnable tasks make progress without trusting the BPF
+scheduler. A host with SCX_CAP_ENQ_IMMED (BASE) but not SCX_CAP_ENQ on a cpu
+cannot run a single bypassed task there. The task loops instead:
+
+ 1. a bypassed task lands on the host's bypass DSQ for the cpu
+ 2. the cpu's dispatch descends into the host, which holds BASE there
+ 3. the host consumes the task into the local DSQ as a plain insert
+ 4. the insert needs ENQ and the host lacks it, so the task is rejected
+ 5. the reject drain reenqueues the task and it is back at step 1
+
+A bypass consume puts a task on the cpu being dispatched for, to run right
+away. That is the IMMED contract, and BASE is the cap it needs. Consume with
+SCX_ENQ_IMMED. BASE is then the one cap a bypassed task ever needs. Dispatch
+descends into a host only on a cpu where the host holds BASE, so a consume
+never lacks it.
+
+A consumed task is first on the local DSQ when dispatch enters the host with
+the DSQ empty. That is always the case for the root and normally for a
+parent dispatching into a child.
+
+A consumed task that cannot run right away is reenqueued like any IMMED task
+and goes back to the bypass DSQ. Waiting on the local DSQ would need ENQ.
+The task cannot run right away when a higher class or a HEAD insert took the
+cpu meanwhile, or when the parent queued its own task before dispatching
+into the host.
+
+Each such task waits on the bypass DSQ for the next dispatch. The reenqueue
+is not counted against the reenqueue limit, as the task's scheduler is
+bypassing.
+
+v2: The description says that the reenqueue of a consumed task is not
+counted against the reenqueue limit (sashiko).
+
+Fixes: 701b7bcad868 ("sched_ext: Add the SCX_CAP_ENQ cap")
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reviewed-by: Andrea Righi <arighi@nvidia.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ kernel/sched/ext/inlines.h | 15 ++++++++++++---
+ kernel/sched/ext/sub.c     |  6 ++++++
+ 2 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/ext/inlines.h b/kernel/sched/ext/inlines.h
+index 8de9d8fb4b25..1e39d12678c4 100644
+--- a/kernel/sched/ext/inlines.h
++++ b/kernel/sched/ext/inlines.h
+@@ -39,10 +39,18 @@ scx_dispatch_sched(struct scx_sched *sch, struct rq *rq,
+ 	if (scx_consume_global_dsq(sch, rq))
+ 		return SCX_DSP_LOCAL;
+ 
++	/*
++	 * A bypass consume puts a task on the cpu being dispatched for, to run
++	 * right away. That is an IMMED insert and needs only
++	 * %SCX_CAP_ENQ_IMMED, the base cap. Dispatch descends into @sch only on
++	 * a cpu where @sch holds the base cap, so @sch holds it here. The same
++	 * holds for the consume at the end of this function.
++	 */
+ 	if (scx_bypass_dsp_enabled(sch)) {
+ 		/* if @sch is bypassing, only the bypass DSQs are active */
+ 		if (scx_bypassing(sch, cpu)) {
+-			if (scx_consume_dispatch_q(sch, rq, scx_bypass_dsq(sch, cpu), 0))
++			if (scx_consume_dispatch_q(sch, rq, scx_bypass_dsq(sch, cpu),
++						   SCX_ENQ_IMMED))
+ 				return SCX_DSP_LOCAL;
+ 			return SCX_DSP_NONE;
+ 		}
+@@ -63,7 +71,8 @@ scx_dispatch_sched(struct scx_sched *sch, struct rq *rq,
+ 		struct scx_sched_pcpu *pcpu = per_cpu_ptr(sch->pcpu, cpu);
+ 
+ 		if (!(pcpu->bypass_host_seq++ % SCX_BYPASS_HOST_NTH) &&
+-		    scx_consume_dispatch_q(sch, rq, scx_bypass_dsq(sch, cpu), 0)) {
++		    scx_consume_dispatch_q(sch, rq, scx_bypass_dsq(sch, cpu),
++					   SCX_ENQ_IMMED)) {
+ 			__scx_add_event(sch, SCX_EV_SUB_BYPASS_DISPATCH, 1);
+ 			return SCX_DSP_LOCAL;
+ 		}
+@@ -135,7 +144,7 @@ scx_dispatch_sched(struct scx_sched *sch, struct rq *rq,
+ 	 * scheduler's ops.dispatch() doesn't yield any tasks.
+ 	 */
+ 	if (scx_bypass_dsp_enabled(sch) &&
+-	    scx_consume_dispatch_q(sch, rq, scx_bypass_dsq(sch, cpu), 0)) {
++	    scx_consume_dispatch_q(sch, rq, scx_bypass_dsq(sch, cpu), SCX_ENQ_IMMED)) {
+ 		__scx_add_event(sch, SCX_EV_SUB_BYPASS_DISPATCH, 1);
+ 		return SCX_DSP_LOCAL;
+ 	}
+diff --git a/kernel/sched/ext/sub.c b/kernel/sched/ext/sub.c
+index eb345df340f5..f1707d93bc00 100644
+--- a/kernel/sched/ext/sub.c
++++ b/kernel/sched/ext/sub.c
+@@ -2257,6 +2257,12 @@ __bpf_kfunc_start_defs();
+  * child schedulers. The child scheduler runs its dispatch operation to
+  * move tasks from dispatch queues to the local runqueue.
+  *
++ * Dispatch into a child while the local DSQ is empty, when the cpu needs a
++ * task. A child holding only %SCX_CAP_ENQ_IMMED can insert only IMMED tasks,
++ * and the consume of its bypassing descendants' bypass DSQs is one such insert.
++ * With a task already queued on the local DSQ, such an insert fails and the
++ * task is reenqueued.
++ *
+  * Returns: true on success, false if cgroup_id is invalid, not a direct
+  * child, or caller lacks dispatch permission.
+  */
+-- 
+2.56.1
+

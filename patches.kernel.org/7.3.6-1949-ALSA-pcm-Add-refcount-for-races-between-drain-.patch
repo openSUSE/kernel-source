@@ -1,0 +1,171 @@
+From: Takashi Iwai <tiwai@suse.de>
+Date: Thu, 15 Oct 2026 09:18:09 +0200
+Subject: [PATCH] ALSA: pcm: Add refcount for races between drain and unlink
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: 91d0048a97e0fdc0a071caa0ba59e659bc6f84df
+
+[ Upstream commit 91d0048a97e0fdc0a071caa0ba59e659bc6f84df ]
+
+We added a workaround for the case where a linked substream gets
+unlinked during the drain operation by another substream of the same
+linked group in the commit 9b1dbd69ba6f ("ALSA: pcm: fix
+use-after-free on linked stream runtime in snd_pcm_drain()").
+There, we just cached the parameters of the draining substream for
+avoiding UAF.
+
+Then, we check the draining substream (to_check) again in the loop and
+remove it from the queue only when it's still present.  It means,
+however, that the wait queue entry won't be removed if the substream
+went out of the link beforehand, hence a stale wq entry remains.
+Later on, this can be woken up, and this may hit a UAF, too.
+The problem surfaced more due to the recent change to call
+snd_pcm_unlink() earlier.
+
+For properly handling both cases above, in this patch, we introduce a
+refcount to the snd_pcm_runtime that indicates the substream is being
+accessed / used, then at snd_pcm_release_substream(), it's synced
+before the actual resource release via snd_refcount_sync().  This
+guarantees that the accessors are finished, and safe to release
+memories.  Along with the introduction of a refcount, the comments and
+the code changes by the former fix were partially reverted as they
+don't fit with the updated code flow any longer.
+
+Last but not least, the setup of wait queue entry and
+prepare_to_wait() call are moved before the group unref.  With this
+change, we can avoid the race between the enqueue and the wakeup, too.
+
+Fixes: 9b1dbd69ba6f ("ALSA: pcm: fix use-after-free on linked stream runtime in snd_pcm_drain()")
+Link: https://patch.msgid.link/20261015071838.31082-1-tiwai@suse.de
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ include/sound/pcm.h     |  2 ++
+ sound/core/pcm.c        |  1 +
+ sound/core/pcm_native.c | 54 ++++++++++++++++-------------------------
+ 3 files changed, 24 insertions(+), 33 deletions(-)
+
+diff --git a/include/sound/pcm.h b/include/sound/pcm.h
+index 02d8689354c4..1cf511f8d880 100644
+--- a/include/sound/pcm.h
++++ b/include/sound/pcm.h
+@@ -8,6 +8,7 @@
+  *                   Abramo Bagnara <abramo@alsa-project.org>
+  */
+ 
++#include <sound/core.h>
+ #include <sound/asound.h>
+ #include <sound/memalloc.h>
+ #include <sound/minors.h>
+@@ -414,6 +415,7 @@ struct snd_pcm_runtime {
+ 	snd_pcm_uframes_t twake; 	/* do transfer (!poll) wakeup if non-zero */
+ 	wait_queue_head_t sleep;	/* poll sleep */
+ 	wait_queue_head_t tsleep;	/* transfer sleep */
++	struct snd_refcount refcnt;	/* refcount for draining, etc */
+ 	struct snd_fasync *fasync;
+ 	bool stop_operating;		/* sync_stop will be called */
+ 	struct mutex buffer_mutex;	/* protect for buffer changes */
+diff --git a/sound/core/pcm.c b/sound/core/pcm.c
+index 6aad7a1fbf1a..423a183e395e 100644
+--- a/sound/core/pcm.c
++++ b/sound/core/pcm.c
+@@ -959,6 +959,7 @@ int snd_pcm_attach_substream(struct snd_pcm *pcm, int stream,
+ 
+ 	init_waitqueue_head(&runtime->sleep);
+ 	init_waitqueue_head(&runtime->tsleep);
++	snd_refcount_init(&runtime->refcnt);
+ 
+ 	__snd_pcm_set_state(runtime, SNDRV_PCM_STATE_OPEN);
+ 	mutex_init(&runtime->buffer_mutex);
+diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
+index 62034c4c297e..f64ff3add229 100644
+--- a/sound/core/pcm_native.c
++++ b/sound/core/pcm_native.c
+@@ -2189,9 +2189,6 @@ static int snd_pcm_drain(struct snd_pcm_substream *substream,
+ 	for (;;) {
+ 		long tout;
+ 		struct snd_pcm_runtime *to_check;
+-		unsigned int drain_rate;
+-		snd_pcm_uframes_t drain_bufsz;
+-		bool drain_no_period_wakeup;
+ 
+ 		if (signal_pending(current)) {
+ 			result = -ERESTARTSYS;
+@@ -2206,45 +2203,35 @@ static int snd_pcm_drain(struct snd_pcm_substream *substream,
+ 			runtime = s->runtime;
+ 			if (runtime->state == SNDRV_PCM_STATE_DRAINING) {
+ 				to_check = runtime;
++				/* pin the draining substream */
++				snd_refcount_get(&to_check->refcnt);
++
++				init_wait_entry(&wait, 0);
++				prepare_to_wait(&to_check->sleep, &wait,
++						TASK_INTERRUPTIBLE);
++				if (to_check->no_period_wakeup) {
++					tout = MAX_SCHEDULE_TIMEOUT;
++				} else {
++					tout = 100;
++					if (to_check->rate) {
++						long t = to_check->buffer_size *
++							1100 / to_check->rate;
++						tout = max(t, tout);
++					}
++					tout = msecs_to_jiffies(tout);
++				}
+ 				break;
+ 			}
+ 		}
+ 		snd_pcm_group_unref(group, substream);
+ 		if (!to_check)
+ 			break; /* all drained */
+-		/*
+-		 * Cache the runtime fields needed after unlock.
+-		 * A concurrent close() on the linked stream may free
+-		 * its runtime via snd_pcm_detach_substream() once we
+-		 * release the stream lock below.
+-		 */
+-		drain_no_period_wakeup = to_check->no_period_wakeup;
+-		drain_rate = to_check->rate;
+-		drain_bufsz = to_check->buffer_size;
+-		init_wait_entry(&wait, 0);
+-		prepare_to_wait(&to_check->sleep, &wait, TASK_INTERRUPTIBLE);
+ 		snd_pcm_stream_unlock_irq(substream);
+-		if (drain_no_period_wakeup)
+-			tout = MAX_SCHEDULE_TIMEOUT;
+-		else {
+-			tout = 100;
+-			if (drain_rate) {
+-				long t = drain_bufsz * 1100 / drain_rate;
+-				tout = max(t, tout);
+-			}
+-			tout = msecs_to_jiffies(tout);
+-		}
+ 		tout = schedule_timeout(tout);
+-
+ 		snd_pcm_stream_lock_irq(substream);
+-		group = snd_pcm_stream_group_ref(substream);
+-		snd_pcm_group_for_each_entry(s, substream) {
+-			if (s->runtime == to_check) {
+-				finish_wait(&to_check->sleep, &wait);
+-				break;
+-			}
+-		}
+-		snd_pcm_group_unref(group, substream);
++		finish_wait(&to_check->sleep, &wait);
++		/* unpin the draining substream again now */
++		snd_refcount_put(&to_check->refcnt);
+ 
+ 		if (card->shutdown) {
+ 			result = -ENODEV;
+@@ -2796,6 +2783,7 @@ void snd_pcm_release_substream(struct snd_pcm_substream *substream)
+ 
+ 	snd_pcm_drop(substream);
+ 	if (substream->hw_opened) {
++		snd_refcount_sync(&substream->runtime->refcnt);
+ 		if (substream->runtime->state != SNDRV_PCM_STATE_OPEN)
+ 			do_hw_free(substream);
+ 		substream->ops->close(substream);
+-- 
+2.56.1
+

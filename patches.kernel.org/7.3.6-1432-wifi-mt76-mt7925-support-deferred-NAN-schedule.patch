@@ -1,0 +1,334 @@
+From: Jacobs Wu <jacobs.wu@mediatek.com>
+Date: Mon, 24 Aug 2026 14:52:26 -0500
+Subject: [PATCH] wifi: mt76: mt7925: support deferred NAN schedule update and
+ cluster events
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: 86bd20cb500a201318d2008cf346647ce5a311e5
+
+[ Upstream commit 86bd20cb500a201318d2008cf346647ce5a311e5 ]
+
+Send the is_deferred flag in the availability control TLV so FW
+applies a deferred schedule change at the next DW boundary, and report
+the NAN_UNI_EVENT_ID_SCHED_UPDATE_DONE and STARTED_CLUSTER events to
+mac80211 via ieee80211_nan_sched_update_done() and
+ieee80211_nan_cluster_joined().
+
+Both events arrive on the BH-disabled MCU RX path, where notifying
+mac80211 inline is wrong: ieee80211_nan_sched_update_done() needs the
+wiphy mutex and may sleep, and ieee80211_nan_cluster_joined() would
+fire during NAN_START before mac80211 sets sdata->u.nan.started and
+before the supplicant subscribes to NL80211_MCGRP_NAN, so the
+self-anchor cluster-join is lost and a solo anchor master can never
+publish a service.
+
+Deliver both events from a shared nan_deferred_work selected by a
+pending bitmap instead. The bitmap spinlock is taken with
+spin_lock_bh() on the RX side, the work re-checks nan_vif under the
+wiphy mutex, and the stop path clears the bitmap. STARTED_CLUSTER
+signals new_cluster=true, and JOINED_CLUSTER is corrected to
+new_cluster=false.
+
+Fixes: a5487a682406 ("wifi: mt76: mt7925: add NAN MCU helpers")
+Co-developed-by: Sean Wang <sean.wang@mediatek.com>
+Signed-off-by: Sean Wang <sean.wang@mediatek.com>
+Co-developed-by: Stella Liu <yu-ching.liu@mediatek.com>
+Signed-off-by: Stella Liu <yu-ching.liu@mediatek.com>
+Signed-off-by: Jacobs Wu <jacobs.wu@mediatek.com>
+Link: https://patch.msgid.link/20260824195227.12589-15-sean.wang@kernel.org
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ .../net/wireless/mediatek/mt76/mt7925/init.c  |  2 +
+ .../net/wireless/mediatek/mt76/mt7925/main.c  |  7 ++
+ .../wireless/mediatek/mt76/mt7925/mt7925.h    |  1 +
+ .../net/wireless/mediatek/mt76/mt7925/nan.c   | 85 ++++++++++++++++++-
+ .../net/wireless/mediatek/mt76/mt7925/nan.h   | 12 ++-
+ .../net/wireless/mediatek/mt76/mt7925/pci.c   |  1 +
+ .../net/wireless/mediatek/mt76/mt7925/usb.c   | 15 +++-
+ drivers/net/wireless/mediatek/mt76/mt792x.h   |  8 ++
+ 8 files changed, 126 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7925/init.c b/drivers/net/wireless/mediatek/mt76/mt7925/init.c
+index cd22fcc021b1..8c3049b66a85 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7925/init.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7925/init.c
+@@ -270,6 +270,8 @@ int mt7925_register_device(struct mt792x_dev *dev)
+ 
+ 	INIT_WORK(&dev->reset_work, mt7925_mac_reset_work);
+ 	INIT_WORK(&dev->init_work, mt7925_init_work);
++	INIT_WORK(&dev->nan_deferred_work, mt7925_nan_deferred_work);
++	spin_lock_init(&dev->nan_deferred_lock);
+ 
+ 	INIT_WORK(&dev->phy.roc_work, mt7925_roc_work);
+ 	timer_setup(&dev->phy.roc_timer, mt792x_roc_timer, 0);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7925/main.c b/drivers/net/wireless/mediatek/mt76/mt7925/main.c
+index 9fee131bf638..daa0ff1526fc 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7925/main.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7925/main.c
+@@ -2627,6 +2627,13 @@ static int mt7925_stop_nan(struct ieee80211_hw *hw,
+ 	struct mt792x_dev *dev = mt792x_hw_dev(hw);
+ 	int err, ret;
+ 
++	/* Drop a deferred event queued just before stop so a stale cluster_id
++	 * cannot leak into a restart; the work re-checks liveness anyway.
++	 */
++	spin_lock_bh(&dev->nan_deferred_lock);
++	dev->nan_deferred_pending = 0;
++	spin_unlock_bh(&dev->nan_deferred_lock);
++
+ 	mt792x_mutex_acquire(dev);
+ 
+ 	err = mt7925_nan_disable(vif, dev);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7925/mt7925.h b/drivers/net/wireless/mediatek/mt76/mt7925/mt7925.h
+index 321e732347f2..33782d9ba9ed 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7925/mt7925.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7925/mt7925.h
+@@ -361,6 +361,7 @@ void mt7925_mcu_set_suspend_iter(void *priv, u8 *mac,
+ void mt7925_connac_mcu_set_suspend_iter(void *priv, u8 *mac,
+ 					struct ieee80211_vif *vif);
+ void mt7925_set_ipv6_ns_work(struct work_struct *work);
++void mt7925_nan_deferred_work(struct work_struct *work);
+ 
+ int mt7925_mcu_set_sniffer(struct mt792x_dev *dev, struct ieee80211_vif *vif,
+ 			   bool enable);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7925/nan.c b/drivers/net/wireless/mediatek/mt76/mt7925/nan.c
+index 445b8bbd7777..5fa0f11d62b6 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7925/nan.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7925/nan.c
+@@ -454,9 +454,27 @@ mt7925_nan_mcu_handle_de_event(struct mt792x_dev *dev, struct tlv *tlv)
+ 	dev_dbg(dev->mt76.dev, "nan: evt=%u cluster=%pM\n",
+ 		de_evt->event_type, de_evt->cluster_id);
+ 
+-	if (de_evt->event_type != NAN_EVENT_ID_JOINED_CLUSTER)
++	if (de_evt->event_type != NAN_EVENT_ID_JOINED_CLUSTER &&
++	    de_evt->event_type != NAN_EVENT_ID_STARTED_CLUSTER)
+ 		return;
+ 
++	/* STARTED_CLUSTER fires during NAN_START, before nan.started is set and
++	 * before the supplicant subscribes - defer past NAN_START via the work
++	 * so ieee80211_nan_cluster_joined() actually reaches userspace.
++	 */
++	if (de_evt->event_type == NAN_EVENT_ID_STARTED_CLUSTER) {
++		dev_dbg(dev->mt76.dev,
++			"nan: deferring STARTED_CLUSTER cluster=%pM\n",
++			cluster_id);
++		spin_lock_bh(&dev->nan_deferred_lock);
++		memcpy(dev->nan_started_cluster_id, cluster_id, ETH_ALEN);
++		set_bit(MT7925_NAN_DEFERRED_STARTED_CLUSTER,
++			&dev->nan_deferred_pending);
++		spin_unlock_bh(&dev->nan_deferred_lock);
++		ieee80211_queue_work(dev->mt76.hw, &dev->nan_deferred_work);
++		return;
++	}
++
+ 	if (!dev->nan_vif || !ieee80211_vif_nan_started(dev->nan_vif)) {
+ 		dev_warn(dev->mt76.dev, "nan: joined-cluster event but NAN not started\n");
+ 		return;
+@@ -468,7 +486,43 @@ mt7925_nan_mcu_handle_de_event(struct mt792x_dev *dev, struct tlv *tlv)
+ 	dev_dbg(dev->mt76.dev, "nan: own_nmi=%pM master_nmi=%pM\n",
+ 		de_evt->own_nmi, de_evt->master_nmi);
+ 
+-	ieee80211_nan_cluster_joined(dev->nan_vif, cluster_id, true, GFP_KERNEL);
++	/* joined an existing cluster, not a self-anchored new one */
++	ieee80211_nan_cluster_joined(dev->nan_vif, cluster_id, false, GFP_KERNEL);
++}
++
++/* Runs the deferred NAN MCU events in process context; takes wiphy_lock
++ * before nan_vif, which the NAN stop path frees under that mutex.
++ */
++void
++mt7925_nan_deferred_work(struct work_struct *work)
++{
++	struct mt792x_dev *dev = container_of(work, struct mt792x_dev,
++					      nan_deferred_work);
++	struct ieee80211_vif *vif;
++	unsigned long pending;
++	u8 cluster_id[ETH_ALEN];
++
++	spin_lock_bh(&dev->nan_deferred_lock);
++	pending = dev->nan_deferred_pending;
++	dev->nan_deferred_pending = 0;
++	memcpy(cluster_id, dev->nan_started_cluster_id, ETH_ALEN);
++	spin_unlock_bh(&dev->nan_deferred_lock);
++
++	if (!pending)
++		return;
++
++	wiphy_lock(dev->mt76.hw->wiphy);
++	vif = dev->nan_vif;
++	if (!vif || !ieee80211_vif_nan_started(vif))
++		goto out;
++
++	if (test_bit(MT7925_NAN_DEFERRED_STARTED_CLUSTER, &pending))
++		ieee80211_nan_cluster_joined(vif, cluster_id, true, GFP_KERNEL);
++
++	if (test_bit(MT7925_NAN_DEFERRED_SCHED_UPDATE_DONE, &pending))
++		ieee80211_nan_sched_update_done(vif);
++out:
++	wiphy_unlock(dev->mt76.hw->wiphy);
+ }
+ 
+ static void
+@@ -517,6 +571,27 @@ mt7925_nan_handle_ulw_update(struct mt792x_dev *dev, struct tlv *tlv)
+ 				GFP_KERNEL);
+ }
+ 
++static void
++mt7925_nan_handle_sched_update_done(struct mt792x_dev *dev, struct tlv *tlv)
++{
++	struct ieee80211_vif *vif;
++
++	if (!dev || !tlv)
++		return;
++
++	vif = dev->nan_vif;
++	if (!vif || !ieee80211_vif_nan_started(vif))
++		return;
++
++	/* Runs in the BH-disabled MCU-event RX path; the mac80211 helper needs
++	 * the wiphy mutex and may sleep, so hand it to the work instead.
++	 */
++	spin_lock_bh(&dev->nan_deferred_lock);
++	set_bit(MT7925_NAN_DEFERRED_SCHED_UPDATE_DONE, &dev->nan_deferred_pending);
++	spin_unlock_bh(&dev->nan_deferred_lock);
++	ieee80211_queue_work(dev->mt76.hw, &dev->nan_deferred_work);
++}
++
+ void mt7925_nan_mcu_event(struct mt792x_dev *dev, struct sk_buff *skb)
+ {
+ 	struct tlv *tlv;
+@@ -548,6 +623,9 @@ void mt7925_nan_mcu_event(struct mt792x_dev *dev, struct sk_buff *skb)
+ 		case NAN_UNI_EVENT_ID_ULW_UPDATE:
+ 			mt7925_nan_handle_ulw_update(dev, tlv);
+ 			break;
++		case NAN_UNI_EVENT_ID_SCHED_UPDATE_DONE:
++			mt7925_nan_handle_sched_update_done(dev, tlv);
++			break;
+ 		default:
+ 			break;
+ 		}
+@@ -585,6 +663,7 @@ static int mt7925_nan_avail_ctrl_tlv(struct sk_buff *skb,
+ 	avail_ctrl_tlv->avail_ctrl =
+ 		cpu_to_le16(ctrl & NAN_AVAIL_CTRL_CHECK_FOR_CHANGED);
+ 	avail_ctrl_tlv->seq_id = seq_id;
++	avail_ctrl_tlv->is_deferred = sched->deferred ? 1 : 0;
+ 
+ 	return 0;
+ }
+@@ -710,7 +789,7 @@ void mt7925_nan_local_sched_changed(struct mt792x_dev *dev,
+ 		goto out;
+ 	}
+ 
+-	mt76_mcu_skb_send_msg(mdev, skb, MCU_UNI_CMD(NAN), true);
++	mt76_mcu_skb_send_msg(mdev, skb, MCU_UNI_CMD(NAN), false);
+ out:
+ 	mt792x_mutex_release(dev);
+ }
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7925/nan.h b/drivers/net/wireless/mediatek/mt76/mt7925/nan.h
+index 08c13768b357..f9644945a22c 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7925/nan.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7925/nan.h
+@@ -97,15 +97,25 @@ enum nan_uni_cmd_tag {
+ enum nan_uni_event_tag {
+ 	NAN_UNI_EVENT_ID_DE_EVENT_IND		= 19,
+ 	NAN_UNI_EVENT_ID_ULW_UPDATE		= 39,
++	NAN_UNI_EVENT_ID_SCHED_UPDATE_DONE	= 43,
+ 	NAN_UNI_EVENT_REPORT_DW_START		= 59,
+ 	NAN_UNI_EVENT_REPORT_DW_END		= 60,
+ };
+ 
+ enum nan_disc_event_type {
+ 	NAN_EVENT_ID_DISC_MAC_ADDR		= 0,
++	NAN_EVENT_ID_STARTED_CLUSTER		= 1,
+ 	NAN_EVENT_ID_JOINED_CLUSTER		= 2,
+ };
+ 
++/* bit indices into mt792x_dev->nan_deferred_pending, set from the atomic
++ * MCU-event RX path and consumed by mt7925_nan_deferred_work()
++ */
++enum mt7925_nan_deferred_event {
++	MT7925_NAN_DEFERRED_STARTED_CLUSTER,
++	MT7925_NAN_DEFERRED_SCHED_UPDATE_DONE,
++};
++
+ /* NAN 4.0 Table 79. Device Capability attribute format, Supported Bands */
+ enum nan_supported_bands {
+ 	NAN_SUPPORTED_BAND_ID_2P4G = 2,
+@@ -345,7 +355,7 @@ struct mt7925_nan_avail_ctrl_tlv {
+ 	__le16 len;
+ 	__le16 avail_ctrl;
+ 	u8 seq_id;
+-	u8 reserved[1];
++	u8 is_deferred;
+ } __packed __aligned(4);
+ 
+ struct mt7925_nan_ch_timeline {
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7925/pci.c b/drivers/net/wireless/mediatek/mt76/mt7925/pci.c
+index d2c0a78ae9f2..76d8f8ea19ec 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7925/pci.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7925/pci.c
+@@ -55,6 +55,7 @@ static void mt7925e_unregister_device(struct mt792x_dev *dev)
+ 	cancel_delayed_work_sync(&pm->ps_work);
+ 	cancel_delayed_work_sync(&dev->mlo_pm_work);
+ 	cancel_work_sync(&pm->wake_work);
++	cancel_work_sync(&dev->nan_deferred_work);
+ 
+ 	mt7925_tx_token_put(dev);
+ 	__mt792x_mcu_drv_pmctrl(dev);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7925/usb.c b/drivers/net/wireless/mediatek/mt76/mt7925/usb.c
+index db6fd014447b..f97f787b2198 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7925/usb.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7925/usb.c
+@@ -357,6 +357,19 @@ static int mt7925u_resume(struct usb_interface *intf)
+ }
+ #endif /* CONFIG_PM */
+ 
++static void mt7925u_disconnect(struct usb_interface *usb_intf)
++{
++	struct mt792x_dev *dev = usb_get_intfdata(usb_intf);
++
++	/* mt792xu_disconnect() ends in mt76_free_device(), so the work has to
++	 * go before it rather than after mt76_unregister_device() as on PCI.
++	 */
++	if (dev)
++		cancel_work_sync(&dev->nan_deferred_work);
++
++	mt792xu_disconnect(usb_intf);
++}
++
+ MODULE_DEVICE_TABLE(usb, mt7925u_device_table);
+ MODULE_FIRMWARE(MT7925_FIRMWARE_WM);
+ MODULE_FIRMWARE(MT7925_ROM_PATCH);
+@@ -365,7 +378,7 @@ static struct usb_driver mt7925u_driver = {
+ 	.name		= KBUILD_MODNAME,
+ 	.id_table	= mt7925u_device_table,
+ 	.probe		= mt7925u_probe,
+-	.disconnect	= mt792xu_disconnect,
++	.disconnect	= mt7925u_disconnect,
+ #ifdef CONFIG_PM
+ 	.suspend	= mt7925u_suspend,
+ 	.resume		= mt7925u_resume,
+diff --git a/drivers/net/wireless/mediatek/mt76/mt792x.h b/drivers/net/wireless/mediatek/mt76/mt792x.h
+index 9efc251cb745..9722d840c1af 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt792x.h
++++ b/drivers/net/wireless/mediatek/mt76/mt792x.h
+@@ -342,6 +342,14 @@ struct mt792x_dev {
+ 	struct ieee80211_vif *nan_vif;
+ 	const struct ieee80211_iface_combination *iface_combinations;
+ 	int n_iface_combinations;
++	/* deferred NAN MCU events run out of the atomic RX path on one shared
++	 * work; see mt7925_nan_deferred_work() and enum mt7925_nan_deferred_event
++	 */
++	struct work_struct nan_deferred_work;
++	/* protects @nan_deferred_pending */
++	spinlock_t nan_deferred_lock;
++	unsigned long nan_deferred_pending;
++	u8 nan_started_cluster_id[ETH_ALEN];
+ };
+ 
+ static inline struct mt792x_bss_conf *
+-- 
+2.56.1
+

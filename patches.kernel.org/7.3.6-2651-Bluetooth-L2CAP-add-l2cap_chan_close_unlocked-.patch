@@ -1,0 +1,181 @@
+From: Pauli Virtanen <pav@iki.fi>
+Date: Sat, 29 Aug 2026 17:19:57 +0300
+Subject: [PATCH] Bluetooth: L2CAP: add l2cap_chan_close_unlocked() and locking
+ helpers
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: 608e0b7a675b2affbbf38167cad0fa63d8e064f7
+
+[ Upstream commit 608e0b7a675b2affbbf38167cad0fa63d8e064f7 ]
+
+l2cap_chan_close() requires holding chan->lock and chan->conn->lock if
+associated chan->conn exists, to guard eg. conn->chan_l. Taking the
+locks with right ordering requires handling a race condition.
+
+Add helper function l2cap_chan_(un)lock_conn that do the locking right.
+
+Add l2cap_chan_close_unlocked() that does not require locks to be held,
+as all callsites do this lock -> close -> unlock pattern.
+
+Link: https://syzkaller.appspot.com/bug?extid=0e4ebcc970728e056324
+Signed-off-by: Pauli Virtanen <pav@iki.fi>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ include/net/bluetooth/l2cap.h | 17 ++++++++++
+ net/bluetooth/l2cap_core.c    | 61 ++++++++++++++++++++++++++++++++---
+ 2 files changed, 73 insertions(+), 5 deletions(-)
+
+diff --git a/include/net/bluetooth/l2cap.h b/include/net/bluetooth/l2cap.h
+index 43a67562b238..84f557d354ca 100644
+--- a/include/net/bluetooth/l2cap.h
++++ b/include/net/bluetooth/l2cap.h
+@@ -962,6 +962,8 @@ int l2cap_add_scid(struct l2cap_chan *chan,  __u16 scid);
+ 
+ struct l2cap_chan *l2cap_chan_create(void);
+ void l2cap_chan_close(struct l2cap_chan *chan, int reason);
++void l2cap_chan_close_unlocked(struct l2cap_chan *chan, int reason)
++	__must_not_hold(&chan->lock);
+ int l2cap_chan_connect(struct l2cap_chan *chan, __le16 psm, u16 cid,
+ 		       bdaddr_t *dst, u8 dst_type, u16 timeout);
+ int l2cap_chan_reconfigure(struct l2cap_chan *chan, __u16 mtu);
+@@ -988,4 +990,19 @@ void l2cap_conn_put(struct l2cap_conn *conn);
+ int l2cap_register_user(struct l2cap_conn *conn, struct l2cap_user *user);
+ void l2cap_unregister_user(struct l2cap_conn *conn, struct l2cap_user *user);
+ 
++bool l2cap_chan_lock_conn(struct l2cap_chan *chan)
++	__acquires(&chan->lock) __cond_acquires(true, &chan->conn->lock);
++
++/* Release macro for l2cap_chan_lock_conn, so context analysis understands it */
++#define l2cap_chan_unlock_conn(chan, conn_locked)			\
++	({								\
++		struct l2cap_chan *__chan = (chan);			\
++		struct l2cap_conn *__conn = __chan->conn;		\
++		l2cap_chan_unlock(__chan);				\
++		if (conn_locked) {					\
++			mutex_unlock(&__conn->lock);			\
++			l2cap_conn_put(__conn);				\
++		}							\
++	})
++
+ #endif /* __L2CAP_H */
+diff --git a/net/bluetooth/l2cap_core.c b/net/bluetooth/l2cap_core.c
+index c5e98e088e4c..443392cb1748 100644
+--- a/net/bluetooth/l2cap_core.c
++++ b/net/bluetooth/l2cap_core.c
+@@ -59,6 +59,7 @@ static void l2cap_tx(struct l2cap_chan *chan, struct l2cap_ctrl *control,
+ static void l2cap_retrans_timeout(struct work_struct *work);
+ static void l2cap_monitor_timeout(struct work_struct *work);
+ static void l2cap_ack_timeout(struct work_struct *work);
++static void __l2cap_chan_close(struct l2cap_chan *chan, int reason);
+ 
+ static inline u8 bdaddr_type(u8 link_type, u8 bdaddr_type)
+ {
+@@ -448,7 +449,7 @@ static void l2cap_chan_timeout(struct work_struct *work)
+ 	else
+ 		reason = ETIMEDOUT;
+ 
+-	l2cap_chan_close(chan, reason);
++	__l2cap_chan_close(chan, reason);
+ 
+ 	chan->ops->close(chan);
+ 
+@@ -859,7 +860,7 @@ static void l2cap_chan_connect_reject(struct l2cap_chan *chan)
+ 	l2cap_send_cmd(conn, chan->ident, L2CAP_CONN_RSP, sizeof(rsp), &rsp);
+ }
+ 
+-void l2cap_chan_close(struct l2cap_chan *chan, int reason)
++static void __l2cap_chan_close(struct l2cap_chan *chan, int reason)
+ {
+ 	struct l2cap_conn *conn = chan->conn;
+ 
+@@ -908,8 +909,58 @@ void l2cap_chan_close(struct l2cap_chan *chan, int reason)
+ 		break;
+ 	}
+ }
++
++void l2cap_chan_close(struct l2cap_chan *chan, int reason)
++{
++	__l2cap_chan_close(chan, reason);
++}
+ EXPORT_SYMBOL(l2cap_chan_close);
+ 
++/* Take chan->lock. If chan->conn is non-NULL, take new reference on it, take
++ * chan->conn->lock, and return true. Otherwise return false.
++ */
++bool l2cap_chan_lock_conn(struct l2cap_chan *chan)
++	__context_unsafe(/* conditional locking */)
++{
++	/* Handle conn->lock > chan->lock ordering + race on chan->conn */
++	for (;;) {
++		struct l2cap_conn *conn;
++
++		l2cap_chan_lock(chan);
++		conn = chan->conn;
++		if (conn)
++			l2cap_conn_get(conn);
++		l2cap_chan_unlock(chan);
++
++		if (conn)
++			mutex_lock(&conn->lock);
++
++		l2cap_chan_lock(chan);
++
++		if (chan->conn != conn) {
++			l2cap_chan_unlock(chan);
++			if (conn) {
++				mutex_unlock(&conn->lock);
++				l2cap_conn_put(conn);
++			}
++			schedule();
++			continue;
++		}
++
++		return chan->conn;
++	}
++}
++
++void l2cap_chan_close_unlocked(struct l2cap_chan *chan, int reason)
++{
++	bool have_conn;
++
++	have_conn = l2cap_chan_lock_conn(chan);
++	__l2cap_chan_close(chan, reason);
++	l2cap_chan_unlock_conn(chan, have_conn);
++}
++EXPORT_SYMBOL(l2cap_chan_close_unlocked);
++
+ static inline u8 l2cap_get_auth_type(struct l2cap_chan *chan)
+ {
+ 	switch (chan->chan_type) {
+@@ -1600,7 +1651,7 @@ static void l2cap_conn_start(struct l2cap_conn *conn)
+ 			if (!l2cap_mode_supported(chan->mode, conn->feat_mask)
+ 			    && test_bit(CONF_STATE2_DEVICE,
+ 					&chan->conf_state)) {
+-				l2cap_chan_close(chan, ECONNRESET);
++				__l2cap_chan_close(chan, ECONNRESET);
+ 				l2cap_chan_unlock(chan);
+ 				continue;
+ 			}
+@@ -1608,7 +1659,7 @@ static void l2cap_conn_start(struct l2cap_conn *conn)
+ 			if (l2cap_check_enc_key_size(conn->hcon, chan))
+ 				l2cap_start_connection(chan);
+ 			else
+-				l2cap_chan_close(chan, ECONNREFUSED);
++				__l2cap_chan_close(chan, ECONNREFUSED);
+ 
+ 		} else if (chan->state == BT_CONNECT2) {
+ 			struct l2cap_conn_rsp rsp;
+@@ -7755,7 +7806,7 @@ static inline void l2cap_check_encryption(struct l2cap_chan *chan, u8 encrypt)
+ 			__set_chan_timer(chan, L2CAP_ENC_TIMEOUT);
+ 		} else if (chan->sec_level == BT_SECURITY_HIGH ||
+ 			   chan->sec_level == BT_SECURITY_FIPS)
+-			l2cap_chan_close(chan, ECONNREFUSED);
++			__l2cap_chan_close(chan, ECONNREFUSED);
+ 	} else {
+ 		if (chan->sec_level == BT_SECURITY_MEDIUM)
+ 			__clear_chan_timer(chan);
+-- 
+2.56.1
+

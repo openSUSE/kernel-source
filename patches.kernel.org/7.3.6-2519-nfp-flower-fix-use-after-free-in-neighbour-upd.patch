@@ -1,0 +1,150 @@
+From: Sicong Huang <congei42@163.com>
+Date: Sat, 24 Oct 2026 12:49:03 +0800
+Subject: [PATCH] nfp: flower: fix use-after-free in neighbour update work
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: 083aaafd453c3fb14411519d6ada9a8917573fdb
+
+[ Upstream commit 083aaafd453c3fb14411519d6ada9a8917573fdb ]
+
+The netevent notifier handles neighbour updates and redirects by
+queuing nfp_tun_neigh_update() on system_highpri_wq. Each work item
+holds a reference to the neighbour, but only stores a pointer to the
+flower app.
+
+During device removal, nfp_tunnel_config_stop() unregisters the
+notifier. This waits for notifier callbacks to return, but does not
+wait for the work they queued. The teardown then frees app->priv and
+app without waiting for these work items. Flushing cmsg_work in
+nfp_flower_clean() does not cover the neighbour update work.
+
+A pending work item can therefore run after the app has been freed.
+Its call to nfp_flower_get_port_id_from_netdev() can then access freed
+memory while checking whether the neighbour's device can be offloaded.
+Even notifications for unrelated devices can reach this check. The
+same problem affects shutdown and probe error paths that tear down the
+app after the netevent notifier has been registered.
+
+One possible interleaving is shown below. The neighbour belongs to
+another network device that remains registered.
+
+  CPU0 (remove)                   CPU1 (notifier / kworker)
+                                  nfp_tun_neigh_event_handler()
+                                    queue_work(system_highpri_wq, ...)
+                                    return
+                                  /* Work has not run yet. */
+  nfp_tunnel_config_stop()
+    unregister_netevent_notifier()
+    /* Notifier callbacks have finished, but work may be pending. */
+  nfp_flower_clean()
+    vfree(app->priv)
+    app->priv = NULL
+  nfp_app_free()
+    kfree(app)
+                                  nfp_tun_neigh_update()
+                                    app = update_work->app
+                                    nfp_flower_get_port_id_from_netdev()
+                                      app->priv  /* use-after-free */
+
+The work items are allocated per event and free themselves, so they
+cannot be cancelled individually, and flushing system_highpri_wq is
+not allowed. Use a dedicated workqueue for neighbour updates instead.
+In nfp_tunnel_config_stop(), unregister the notifier and destroy the
+workqueue before cleaning up the tunnel state. This prevents new work
+from being queued and waits for pending and running work to finish
+while the app and its resources are still valid.
+
+Found by code inspection.
+
+Fixes: 0ad722bd9ee3 ("nfp: flower: fix for take a mutex lock in soft irq context and rcu lock")
+Signed-off-by: Sicong Huang <congei42@163.com>
+Reviewed-by: Daniel Machon <daniel.machon@microchip.com>
+Signed-off-by: Dave Miller <davem@davem-thinkpadp1gen8.ibmlond.csb>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ .../net/ethernet/netronome/nfp/flower/main.h  |  2 ++
+ .../netronome/nfp/flower/tunnel_conf.c        | 24 ++++++++++++++-----
+ 2 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/main.h b/drivers/net/ethernet/netronome/nfp/flower/main.h
+index 2b7c947ff4f2..bd4399758ed4 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@ -94,6 +94,7 @@ struct nfp_fl_stats_id {
+  * @ipv6_off_lock:	Lock for the IPv6 address list
+  * @mac_off_ids:	IDA to manage id assignment for offloaded MACs
+  * @neigh_nb:		Notifier to monitor neighbour state
++ * @neigh_wq:		Workqueue for neighbour updates
+  */
+ struct nfp_fl_tunnel_offloads {
+ 	struct rhashtable offloaded_macs;
+@@ -103,6 +104,7 @@ struct nfp_fl_tunnel_offloads {
+ 	struct mutex ipv6_off_lock;
+ 	struct ida mac_off_ids;
+ 	struct notifier_block neigh_nb;
++	struct workqueue_struct *neigh_wq;
+ };
+ 
+ /**
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c b/drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c
+index ca30702f8878..8f5b0d3eb377 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c
+@@ -742,7 +742,7 @@ nfp_tun_neigh_event_handler(struct notifier_block *nb, unsigned long event,
+ 	if (!update_work)
+ 		return NOTIFY_DONE;
+ 
+-	queue_work(system_highpri_wq, &update_work->work);
++	queue_work(app_priv->tun.neigh_wq, &update_work->work);
+ 
+ 	return NOTIFY_DONE;
+ }
+@@ -1515,6 +1515,13 @@ int nfp_tunnel_config_start(struct nfp_app *app)
+ 	if (err)
+ 		return err;
+ 
++	priv->tun.neigh_wq = alloc_workqueue("nfp-flower-neigh",
++					     WQ_HIGHPRI | WQ_PERCPU, 0);
++	if (!priv->tun.neigh_wq) {
++		err = -ENOMEM;
++		goto err_free_macs;
++	}
++
+ 	ida_init(&priv->tun.mac_off_ids);
+ 
+ 	/* Initialise priv data for IPv4/v6 offloading. */
+@@ -1527,13 +1534,17 @@ int nfp_tunnel_config_start(struct nfp_app *app)
+ 	priv->tun.neigh_nb.notifier_call = nfp_tun_neigh_event_handler;
+ 
+ 	err = register_netevent_notifier(&priv->tun.neigh_nb);
+-	if (err) {
+-		rhashtable_free_and_destroy(&priv->tun.offloaded_macs,
+-					    nfp_check_rhashtable_empty, NULL);
+-		return err;
+-	}
++	if (err)
++		goto err_destroy_neigh_wq;
+ 
+ 	return 0;
++
++err_destroy_neigh_wq:
++	destroy_workqueue(priv->tun.neigh_wq);
++err_free_macs:
++	rhashtable_free_and_destroy(&priv->tun.offloaded_macs,
++				    nfp_check_rhashtable_empty, NULL);
++	return err;
+ }
+ 
+ void nfp_tunnel_config_stop(struct nfp_app *app)
+@@ -1543,6 +1554,7 @@ void nfp_tunnel_config_stop(struct nfp_app *app)
+ 	struct list_head *ptr, *storage;
+ 
+ 	unregister_netevent_notifier(&priv->tun.neigh_nb);
++	destroy_workqueue(priv->tun.neigh_wq);
+ 
+ 	ida_destroy(&priv->tun.mac_off_ids);
+ 
+-- 
+2.56.1
+

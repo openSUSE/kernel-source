@@ -1,0 +1,127 @@
+From: Rosen Penev <rosenp@gmail.com>
+Date: Wed, 28 Oct 2026 09:48:39 -0700
+Subject: [PATCH] net: bgmac: fix TX DMA unmapping and slot cleanup
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: 4f45e97b3aac2282f2b436d97338c9c2c484d093
+
+[ Upstream commit 4f45e97b3aac2282f2b436d97338c9c2c484d093 ]
+
+When mapping a fragment fails, bgmac_dma_tx_add() unwinds with the
+wrong slots. It passes the failed fragment's slot->dma_addr, which
+holds the mapping error, to dma_unmap_single() for the head. The
+fragment loop indexes from ring->end instead of ring->end + 1, so it
+unmaps the head a second time as a page and leaves the last mapped
+fragment mapped. None of the affected slots get their dma_addr cleared
+either, which includes the head slot when mapping the head fails.
+
+bgmac_dma_tx_ring_free() unmaps every slot with a non-zero dma_addr,
+so tearing down the ring unmaps these addresses again. It also frees
+the skbs of pending TX slots but leaves slot->skb and slot->dma_addr
+set. The slots survive a down/up cycle, and bgmac_dma_tx_add() only
+sets slot->skb on the last slot of a packet. If a slot with a stale
+pointer is later used for the head or a fragment of a scatter/gather
+packet, bgmac_dma_tx_free() frees the old skb a second time when that
+slot completes.
+
+bgmac_dma_tx_ring_free() also picks dma_unmap_single() or
+dma_unmap_page() by looking at slot->skb, which is set on the last slot
+of a packet, while the head was mapped with dma_map_single() and the
+fragments with skb_frag_dma_map().
+
+In the error path, unmap the head and each mapped fragment from their
+own slots, and clear dma_addr on every slot the failed packet touched.
+In bgmac_dma_tx_ring_free(), choose the unmap function by the SOF flag
+of the descriptor like bgmac_dma_tx_free() does, unmap every slot
+before freeing any skb, since a packet can wrap around the end of the
+ring with its skb on the last slot, and clear both fields.
+
+This was found through code inspection by an LLM while hitting other
+bugs on an Asus RT-N16. It did not hit these ones specifically.
+
+Fixes: 9cde94506eac ("bgmac: implement scatter/gather support")
+Signed-off-by: Rosen Penev <rosenp@gmail.com>
+Reviewed-by: Florian Fainelli <florian.fainelli@broadcom.com>
+Link: https://patch.msgid.link/20261028164839.28605-1-rosenp@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/net/ethernet/broadcom/bgmac.c | 47 +++++++++++++++++----------
+ 1 file changed, 30 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bgmac.c b/drivers/net/ethernet/broadcom/bgmac.c
+index 1835266fdd09..b3f0ecc583fd 100644
+--- a/drivers/net/ethernet/broadcom/bgmac.c
++++ b/drivers/net/ethernet/broadcom/bgmac.c
+@@ -208,19 +208,24 @@ static netdev_tx_t bgmac_dma_tx_add(struct bgmac *bgmac,
+ 	return NETDEV_TX_OK;
+ 
+ err_dma:
+-	dma_unmap_single(dma_dev, slot->dma_addr, skb_headlen(skb),
+-			 DMA_TO_DEVICE);
++	slot->dma_addr = 0;
+ 
+ 	while (i-- > 0) {
+-		int index = (ring->end + i) % BGMAC_TX_RING_SLOTS;
+-		struct bgmac_slot_info *slot = &ring->slots[index];
+-		u32 ctl1 = le32_to_cpu(ring->cpu_base[index].ctl1);
+-		int len = ctl1 & BGMAC_DESC_CTL1_LEN;
+-
+-		dma_unmap_page(dma_dev, slot->dma_addr, len, DMA_TO_DEVICE);
++		index = (ring->end + 1 + i) % BGMAC_TX_RING_SLOTS;
++		slot = &ring->slots[index];
++		dma_unmap_page(dma_dev, slot->dma_addr,
++			       skb_frag_size(&skb_shinfo(skb)->frags[i]),
++			       DMA_TO_DEVICE);
++		slot->dma_addr = 0;
+ 	}
+ 
++	slot = &ring->slots[ring->end % BGMAC_TX_RING_SLOTS];
++	dma_unmap_single(dma_dev, slot->dma_addr, skb_headlen(skb),
++			 DMA_TO_DEVICE);
++
+ err_dma_head:
++	slot->dma_addr = 0;
++
+ 	netdev_err(bgmac->net_dev, "Mapping error of skb on ring 0x%X\n",
+ 		   ring->mmio_base);
+ 
+@@ -535,17 +540,25 @@ static void bgmac_dma_tx_ring_free(struct bgmac *bgmac,
+ 		unsigned int len = ctl1 & BGMAC_DESC_CTL1_LEN;
+ 
+ 		slot = &ring->slots[i];
+-		dev_kfree_skb(slot->skb);
+ 
+-		if (!slot->dma_addr)
+-			continue;
++		if (slot->dma_addr) {
++			if (le32_to_cpu(dma_desc[i].ctl0) & BGMAC_DESC_CTL0_SOF)
++				dma_unmap_single(dma_dev, slot->dma_addr,
++						 len, DMA_TO_DEVICE);
++			else
++				dma_unmap_page(dma_dev, slot->dma_addr,
++					       len, DMA_TO_DEVICE);
++			slot->dma_addr = 0;
++		}
++	}
+ 
+-		if (slot->skb)
+-			dma_unmap_single(dma_dev, slot->dma_addr,
+-					 len, DMA_TO_DEVICE);
+-		else
+-			dma_unmap_page(dma_dev, slot->dma_addr,
+-				       len, DMA_TO_DEVICE);
++	/* A packet can wrap around the end of the ring with its skb on the
++	 * last slot, so free the skbs only once every slot is unmapped.
++	 */
++	for (i = 0; i < BGMAC_TX_RING_SLOTS; i++) {
++		slot = &ring->slots[i];
++		dev_kfree_skb(slot->skb);
++		slot->skb = NULL;
+ 	}
+ }
+ 
+-- 
+2.56.1
+

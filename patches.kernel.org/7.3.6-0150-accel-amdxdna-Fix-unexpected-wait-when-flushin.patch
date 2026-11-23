@@ -1,0 +1,161 @@
+From: Lizhi Hou <lizhi.hou@amd.com>
+Date: Thu, 13 Aug 2026 13:50:16 -0700
+Subject: [PATCH] accel/amdxdna: Fix unexpected wait when flushing notifier_wq
+References: bsc#1012628
+Patch-mainline: 7.3.6
+Git-commit: 445d20910429b41e88768624b914344658991a5b
+
+[ Upstream commit 445d20910429b41e88768624b914344658991a5b ]
+
+In amdxdna_gem_obj_free(), flush_workqueue(xdna->notifier_wq) waits for
+all pending work items on the device-global notifier workqueue, rather
+than only the work items associated with the BO being freed.
+
+If another BO has a pending hmm_unreg_work, freeing an unrelated BO can
+be unnecessarily blocked until that work completes.
+
+mmu_interval_notifier_remove() is deferred to a workqueue because it
+cannot be called from the MMU notifier callback itself. The BO free path
+is not a notifier callback, so call mmu_interval_notifier_remove()
+directly there and avoid the workqueue.
+
+Fixes: e486147c912f ("accel/amdxdna: Add BO import and export")
+Reviewed-by: Max Zhen <max.zhen@amd.com>
+Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
+Link: https://patch.msgid.link/20260813205016.941743-1-lizhi.hou@amd.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/accel/amdxdna/amdxdna_gem.c | 69 +++++++++++++++++++----------
+ drivers/accel/amdxdna/amdxdna_gem.h |  1 +
+ 2 files changed, 47 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/accel/amdxdna/amdxdna_gem.c b/drivers/accel/amdxdna/amdxdna_gem.c
+index 4b0d58d0329b..d305c58244fd 100644
+--- a/drivers/accel/amdxdna/amdxdna_gem.c
++++ b/drivers/accel/amdxdna/amdxdna_gem.c
+@@ -253,13 +253,16 @@ static bool amdxdna_hmm_invalidate(struct mmu_interval_notifier *mni,
+ 	struct amdxdna_gem_obj *abo = mapp->abo;
+ 	struct amdxdna_dev *xdna;
+ 
++	if (!mmu_notifier_range_blockable(range))
++		return false;
++
++	if (mapp->unmapped)
++		return true;
++
+ 	xdna = to_xdna_dev(to_gobj(abo)->dev);
+ 	XDNA_DBG(xdna, "Invalidating range 0x%lx, 0x%lx, type %d",
+ 		 mapp->range.start, mapp->range.end, abo->type);
+ 
+-	if (!mmu_notifier_range_blockable(range))
+-		return false;
+-
+ 	down_write(&xdna->notifier_lock);
+ 	abo->mem.map_invalid = true;
+ 	mapp->invalid = true;
+@@ -301,33 +304,40 @@ static void amdxdna_hmm_unregister(struct amdxdna_gem_obj *abo,
+ 
+ 	down_write(&xdna->notifier_lock);
+ 	list_for_each_entry(mapp, &abo->mem.umap_list, node) {
+-		if (!vma || compare_range(mapp, vma->vm_mm, vma->vm_start, vma->vm_end)) {
+-			if (!mapp->unmapped) {
+-				queue_work(xdna->notifier_wq, &mapp->hmm_unreg_work);
+-				mapp->unmapped = true;
+-			}
+-			if (vma)
+-				break;
+-		}
++		if (!compare_range(mapp, vma->vm_mm, vma->vm_start, vma->vm_end))
++			continue;
++
++		queue_work(xdna->notifier_wq, &mapp->hmm_unreg_work);
++		mapp->unmapped = true;
+ 	}
+ 	up_write(&xdna->notifier_lock);
+ }
+ 
+-static void amdxdna_umap_release(struct kref *ref)
++static void amdxdna_hmm_unregister_all(struct amdxdna_gem_obj *abo)
+ {
+-	struct amdxdna_umap *mapp = container_of(ref, struct amdxdna_umap, refcnt);
+-	struct amdxdna_gem_obj *abo = mapp->abo;
+-	struct amdxdna_dev *xdna;
+-
+-	mmu_interval_notifier_remove(&mapp->notifier);
++	struct amdxdna_dev *xdna = to_xdna_dev(to_gobj(abo)->dev);
++	struct amdxdna_umap *mapp, *tmp;
++	LIST_HEAD(dead);
+ 
+-	xdna = to_xdna_dev(to_gobj(mapp->abo)->dev);
+ 	down_write(&xdna->notifier_lock);
+-	list_del(&mapp->node);
+-	if (list_empty(&abo->mem.umap_list))
+-		abo->mem.uva = AMDXDNA_INVALID_ADDR;
++	list_for_each_entry_safe(mapp, tmp, &abo->mem.umap_list, node) {
++		mapp->unmapped = true;
++		mapp->cleanup = true;
++		list_move(&mapp->node, &dead);
++	}
+ 	up_write(&xdna->notifier_lock);
+ 
++	list_for_each_entry_safe(mapp, tmp, &dead, node) {
++		cancel_work_sync(&mapp->hmm_unreg_work);
++		amdxdna_umap_put(mapp);
++	}
++}
++
++static void amdxdna_umap_release(struct kref *ref)
++{
++	struct amdxdna_umap *mapp = container_of(ref, struct amdxdna_umap, refcnt);
++
++	mmu_interval_notifier_remove(&mapp->notifier);
+ 	kvfree(mapp->range.hmm_pfns);
+ 	kfree(mapp);
+ }
+@@ -341,6 +351,20 @@ static void amdxdna_hmm_unreg_work(struct work_struct *work)
+ {
+ 	struct amdxdna_umap *mapp = container_of(work, struct amdxdna_umap,
+ 						 hmm_unreg_work);
++	struct amdxdna_gem_obj *abo = mapp->abo;
++	struct amdxdna_dev *xdna;
++
++	xdna = to_xdna_dev(to_gobj(mapp->abo)->dev);
++	down_write(&xdna->notifier_lock);
++	if (mapp->cleanup) {
++		up_write(&xdna->notifier_lock);
++		return;
++	}
++
++	list_del(&mapp->node);
++	if (list_empty(&abo->mem.umap_list))
++		abo->mem.uva = AMDXDNA_INVALID_ADDR;
++	up_write(&xdna->notifier_lock);
+ 
+ 	amdxdna_umap_put(mapp);
+ }
+@@ -643,8 +667,7 @@ static void amdxdna_gem_obj_free(struct drm_gem_object *gobj)
+ 	struct amdxdna_dev *xdna = to_xdna_dev(gobj->dev);
+ 	struct amdxdna_gem_obj *abo = to_xdna_obj(gobj);
+ 
+-	amdxdna_hmm_unregister(abo, NULL);
+-	flush_workqueue(xdna->notifier_wq);
++	amdxdna_hmm_unregister_all(abo);
+ 
+ 	if (abo->pinned)
+ 		amdxdna_gem_unpin(abo);
+diff --git a/drivers/accel/amdxdna/amdxdna_gem.h b/drivers/accel/amdxdna/amdxdna_gem.h
+index 1e90e32bf3cd..fb033ced1045 100644
+--- a/drivers/accel/amdxdna/amdxdna_gem.h
++++ b/drivers/accel/amdxdna/amdxdna_gem.h
+@@ -20,6 +20,7 @@ struct amdxdna_umap {
+ 	struct kref			refcnt;
+ 	bool				invalid;
+ 	bool				unmapped;
++	bool				cleanup;
+ };
+ 
+ struct amdxdna_mem {
+-- 
+2.56.1
+
