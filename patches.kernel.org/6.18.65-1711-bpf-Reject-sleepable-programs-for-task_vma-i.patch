@@ -1,0 +1,152 @@
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Sat, 17 Oct 2026 16:37:07 +0000
+Subject: [PATCH] bpf: Reject sleepable programs for task_vma iterator
+References: bsc#1258210
+Patch-mainline: 6.18.65
+Git-commit: dfcd1765911223df60845e288ad392d5237f47a3
+
+[ Upstream commit dfcd1765911223df60845e288ad392d5237f47a3 ]
+
+A sleepable "iter.s/task_vma" program can be attached, but its ->show()
+callback runs with the mmap_lock of the iterated mm held for read. As soon
+as the program runs, bpf_iter_run_prog() calls might_fault(), and any
+bpf_copy_from_user() or bpf_copy_from_user_task() it does may really fault
+or take mmap_lock again. With lockdep this is reported as recursive
+locking of mmap_lock. Without lockdep, a fault on the reader's own mm, or
+access_process_vm() on the iterated mm, has to take mmap_lock for read
+again. If a writer queued up in the meantime that blocks behind the
+writer, which in turn waits for the read lock the iterator already holds,
+and the read() hangs:
+
+    reader (iter.s/task_vma)        other thread of the same mm
+    task_vma_seq_get_next()
+      mmap_read_lock(mm)
+                                    mmap_write_lock(mm)  <- waits
+    bpf prog: copy_from_user()
+      page fault
+        mmap_read_lock(mm)          <- queued behind the writer
+
+The reader waits killable, so the hang lasts until it gets a fatal signal.
+
+bpf_iter_link_attach() allows sleepable programs for the targets that set
+BPF_ITER_RESCHED, and task_vma sets it because cond_resched() between VMAs
+is fine with mmap_lock held. Rescheduling between objects and running a
+sleepable program inside ->show() are different properties, though, and
+task_vma only has the first one. The open-coded task_vma iterator does not
+have this problem since it hands out a snapshot of the VMA and holds no
+lock when it returns to the program.
+
+The vma handed to the program is only stable under mmap_lock, so the lock
+can't be dropped around ->show(). Add a feature flag BPF_ITER_NOSLEEP for
+targets which can't run sleepable programs although they can reschedule,
+and set it for task_vma.
+
+The check at attach time is not enough. BPF_LINK_UPDATE replaces the
+program of a link, and bpf_iter_link_replace() only compares the type, the
+attach type and the BTF id of the two programs, which are the same for a
+sleepable and a non-sleepable one. Do the check there as well. That also
+closes this way around the existing rule: so far a sleepable program could
+be put on a link of a target that doesn't set BPF_ITER_RESCHED, like the
+hash map element iterator, which runs it under rcu_read_lock().
+
+BPF_LINK_CREATE of a sleepable program for the task_vma target, and
+BPF_LINK_UPDATE to one, now fail with -EINVAL, also for programs that
+don't touch user memory and have been working since sleepable iterator
+programs exist. The programs can still be loaded. They have to be
+loaded as non-sleepable programs, or use the open-coded iterator.
+
+Fixes: b77fb25dcb34 ("bpf: Add support for bpf iterator programs to use sleepable helpers")
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://patch.msgid.link/20261017163745.3341787-6-alexei.starovoitov@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/linux/bpf.h    |  3 ++-
+ kernel/bpf/bpf_iter.c  | 17 ++++++++++++++---
+ kernel/bpf/task_iter.c |  6 +++++-
+ 3 files changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index d551905c8aae..8a34e139a121 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -2665,7 +2665,8 @@ typedef const struct bpf_func_proto *
+ 			     const struct bpf_prog *prog);
+ 
+ enum bpf_iter_feature {
+-	BPF_ITER_RESCHED	= BIT(0),
++	BPF_ITER_RESCHED	= BIT(0),	/* may cond_resched() between objects */
++	BPF_ITER_NOSLEEP	= BIT(1),	/* ->show() can't run sleepable progs */
+ };
+ 
+ #define BPF_ITER_CTX_ARG_MAX 2
+diff --git a/kernel/bpf/bpf_iter.c b/kernel/bpf/bpf_iter.c
+index 54596447fbca..c31fe8775e72 100644
+--- a/kernel/bpf/bpf_iter.c
++++ b/kernel/bpf/bpf_iter.c
+@@ -72,6 +72,15 @@ static inline bool bpf_iter_target_support_resched(const struct bpf_iter_target_
+ 	return tinfo->reg_info->feature & BPF_ITER_RESCHED;
+ }
+ 
++/* Only allow sleepable program for resched-able iterator that can run one */
++static bool bpf_iter_target_support_prog(const struct bpf_iter_target_info *tinfo,
++					 const struct bpf_prog *prog)
++{
++	return !prog->sleepable ||
++	       (bpf_iter_target_support_resched(tinfo) &&
++		!(tinfo->reg_info->feature & BPF_ITER_NOSLEEP));
++}
++
+ static bool bpf_iter_support_resched(struct seq_file *seq)
+ {
+ 	struct bpf_iter_priv_data *iter_priv;
+@@ -409,6 +418,8 @@ static int bpf_iter_link_replace(struct bpf_link *link,
+ 				 struct bpf_prog *new_prog,
+ 				 struct bpf_prog *old_prog)
+ {
++	struct bpf_iter_link *iter_link =
++		container_of(link, struct bpf_iter_link, link);
+ 	int ret = 0;
+ 
+ 	mutex_lock(&link_mutex);
+@@ -419,7 +430,8 @@ static int bpf_iter_link_replace(struct bpf_link *link,
+ 
+ 	if (link->prog->type != new_prog->type ||
+ 	    link->prog->expected_attach_type != new_prog->expected_attach_type ||
+-	    link->prog->aux->attach_btf_id != new_prog->aux->attach_btf_id) {
++	    link->prog->aux->attach_btf_id != new_prog->aux->attach_btf_id ||
++	    !bpf_iter_target_support_prog(iter_link->tinfo, new_prog)) {
+ 		ret = -EINVAL;
+ 		goto out_unlock;
+ 	}
+@@ -544,8 +556,7 @@ int bpf_iter_link_attach(const union bpf_attr *attr, bpfptr_t uattr,
+ 	if (!tinfo)
+ 		return -ENOENT;
+ 
+-	/* Only allow sleepable program for resched-able iterator */
+-	if (prog->sleepable && !bpf_iter_target_support_resched(tinfo))
++	if (!bpf_iter_target_support_prog(tinfo, prog))
+ 		return -EINVAL;
+ 
+ 	link = kzalloc(sizeof(*link), GFP_USER | __GFP_NOWARN);
+diff --git a/kernel/bpf/task_iter.c b/kernel/bpf/task_iter.c
+index 13e1aabe6f88..cf2bf388e181 100644
+--- a/kernel/bpf/task_iter.c
++++ b/kernel/bpf/task_iter.c
+@@ -737,7 +737,11 @@ static const struct bpf_iter_seq_info task_vma_seq_info = {
+ static struct bpf_iter_reg task_vma_reg_info = {
+ 	.target			= "task_vma",
+ 	.attach_target		= bpf_iter_attach_task,
+-	.feature		= BPF_ITER_RESCHED,
++	/*
++	 * ->show() runs with the mmap_lock of the iterated mm held, which a
++	 * sleepable program takes again when it faults on user memory.
++	 */
++	.feature		= BPF_ITER_RESCHED | BPF_ITER_NOSLEEP,
+ 	.ctx_arg_info_size	= 2,
+ 	.ctx_arg_info		= {
+ 		{ offsetof(struct bpf_iter__task_vma, task),
+-- 
+2.56.0
+

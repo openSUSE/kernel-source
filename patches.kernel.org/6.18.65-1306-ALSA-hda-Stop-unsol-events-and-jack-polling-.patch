@@ -1,0 +1,132 @@
+From: Takashi Iwai <tiwai@suse.de>
+Date: Wed, 7 Oct 2026 23:56:46 +0200
+Subject: [PATCH] ALSA: hda: Stop unsol events and jack polling before codec
+ unbind
+References: bsc#1258210
+Patch-mainline: 6.18.65
+Git-commit: f3607b6952ca9a5638eeef4f301daa7933ce24b1
+
+[ Upstream commit f3607b6952ca9a5638eeef4f301daa7933ce24b1 ]
+
+At unbinding a codec driver, hda_codec_driver_remove() calls the
+codec's remove callback that releases the driver resources, followed
+by snd_hda_codec_cleanup_for_unbind().  Meanwhile, the unsolicited
+events are processed asynchronously in bus->unsol_work, and
+snd_hdac_bus_process_unsol_events() checks only codec->registered flag
+before calling the driver's unsol_event callback without the lock.
+Since codec->registered is cleared only in
+snd_hda_codec_cleanup_for_unbind(), and there is no flush of the unsol
+work at unbinding, the unsol event handler may run concurrently during
+the running remove callback, which may lead to a UAF.  The same
+problem applies to the jack polling work, which is canceled only after
+the remove callback.
+
+For addressing those races, introduce a new flag unsol_disabled to
+hdac_device, to be checked it in the unsol event worker, while a new
+helper snd_hdac_device_disable_unsol() sets this flag and flushes the
+pending unsol work.  The helper is called at hda_codec_driver_remove()
+together with the cancel of jackpoll_work to assure that no
+asynchronous jack handling can run.  The flag is cleared again at
+probing the codec driver, while the events are still blocked by the
+registered flag until the codec gets registered.
+
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Assisted-by: LLM
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Link: https://patch.msgid.link/20261007215650.159871-2-tiwai@suse.de
+Stable-dep-of: 7a78c18bffc6 ("ALSA: hda: Disable unsol event handling at error and shutdown paths")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/sound/hdaudio.h |  2 ++
+ sound/hda/common/bind.c |  7 +++++++
+ sound/hda/core/bus.c    | 21 ++++++++++++++++++++-
+ 3 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/include/sound/hdaudio.h b/include/sound/hdaudio.h
+index 4e0c1d8af09f..a27cd1373580 100644
+--- a/include/sound/hdaudio.h
++++ b/include/sound/hdaudio.h
+@@ -96,6 +96,7 @@ struct hdac_device {
+ 	bool caps_overwriting:1; /* caps overwrite being in process */
+ 	bool cache_coef:1;	/* cache COEF read/write too */
+ 	unsigned int registered:1; /* codec was registered */
++	bool unsol_disabled;	/* unsol events blocked; protected by bus->reg_lock */
+ };
+ 
+ /* device/driver type used for matching */
+@@ -122,6 +123,7 @@ int snd_hdac_device_init(struct hdac_device *dev, struct hdac_bus *bus,
+ 			 const char *name, unsigned int addr);
+ void snd_hdac_device_exit(struct hdac_device *dev);
+ int snd_hdac_device_register(struct hdac_device *codec);
++void snd_hdac_device_disable_unsol(struct hdac_device *codec);
+ void snd_hdac_device_unregister(struct hdac_device *codec);
+ int snd_hdac_device_set_chip_name(struct hdac_device *codec, const char *name);
+ int snd_hdac_codec_modalias(const struct hdac_device *hdac, char *buf, size_t size);
+diff --git a/sound/hda/common/bind.c b/sound/hda/common/bind.c
+index bb1090b65699..c264d7c3f546 100644
+--- a/sound/hda/common/bind.c
++++ b/sound/hda/common/bind.c
+@@ -100,6 +100,9 @@ static int hda_codec_driver_probe(struct device *dev)
+ 	if (WARN_ON(!codec->preset))
+ 		return -EINVAL;
+ 
++	/* unsol events are still blocked until registered */
++	codec->core.unsol_disabled = false;
++
+ 	err = snd_hda_codec_set_name(codec, codec->preset->name);
+ 	if (err < 0)
+ 		goto error;
+@@ -160,6 +163,10 @@ static int hda_codec_driver_remove(struct device *dev)
+ 		return codec->bus->core.ext_ops->hdev_detach(&codec->core);
+ 	}
+ 
++	/* stop asynchronous jack handling before freeing driver resources */
++	snd_hdac_device_disable_unsol(&codec->core);
++	cancel_delayed_work_sync(&codec->jackpoll_work);
++
+ 	snd_hda_codec_disconnect_pcms(codec);
+ 	snd_hda_jack_tbl_disconnect(codec);
+ 	if (!refcount_dec_and_test(&codec->pcm_ref))
+diff --git a/sound/hda/core/bus.c b/sound/hda/core/bus.c
+index 9b196c915f37..e9c3751a1539 100644
+--- a/sound/hda/core/bus.c
++++ b/sound/hda/core/bus.c
+@@ -179,7 +179,7 @@ static void snd_hdac_bus_process_unsol_events(struct work_struct *work)
+ 		if (!(caddr & (1 << 4))) /* no unsolicited event? */
+ 			continue;
+ 		codec = bus->caddr_tbl[caddr & 0x0f];
+-		if (!codec || !codec->registered)
++		if (!codec || !codec->registered || codec->unsol_disabled)
+ 			continue;
+ 		spin_unlock_irq(&bus->reg_lock);
+ 		drv = drv_to_hdac_driver(codec->dev.driver);
+@@ -190,6 +190,25 @@ static void snd_hdac_bus_process_unsol_events(struct work_struct *work)
+ 	spin_unlock_irq(&bus->reg_lock);
+ }
+ 
++/**
++ * snd_hdac_device_disable_unsol - block and flush unsol events for the codec
++ * @codec: the HDA core device
++ *
++ * Stop dispatching the unsolicited events to the given codec, and wait for
++ * the pending unsol event handler to finish.  Called at unbinding the codec
++ * driver before releasing the driver resources.
++ */
++void snd_hdac_device_disable_unsol(struct hdac_device *codec)
++{
++	struct hdac_bus *bus = codec->bus;
++
++	spin_lock_irq(&bus->reg_lock);
++	codec->unsol_disabled = true;
++	spin_unlock_irq(&bus->reg_lock);
++	flush_work(&bus->unsol_work);
++}
++EXPORT_SYMBOL_GPL(snd_hdac_device_disable_unsol);
++
+ /**
+  * snd_hdac_bus_add_device - Add a codec to bus
+  * @bus: HDA core bus
+-- 
+2.56.0
+

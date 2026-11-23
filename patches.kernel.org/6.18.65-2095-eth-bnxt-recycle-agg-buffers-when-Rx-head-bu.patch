@@ -1,0 +1,128 @@
+From: Jakub Kicinski <kuba@kernel.org>
+Date: Tue, 27 Oct 2026 16:49:36 -0700
+Subject: [PATCH] eth: bnxt: recycle agg buffers when Rx head buffer allocation
+ fails
+References: bsc#1258210
+Patch-mainline: 6.18.65
+Git-commit: db2c610df81e34d497f49b68a0a1681c3f203bdb
+
+[ Upstream commit db2c610df81e34d497f49b68a0a1681c3f203bdb ]
+
+bnxt_rx_pkt() tries to return the aggregation buffers of a packet
+to the ring when the copybreak allocation fails, but the same logic
+is missing on the rx_skb_func() failure path. The agg BDs consumed
+by the device are then never posted again. The agg ring is only
+refilled one-for-one as completions consume its buffers, so each
+such failure permanently shrinks it. Under sustained memory pressure
+the ring drains completely, and the queue stops receiving anything
+that does not fit into the head buffer, even once memory is available
+again. Only re-creating the rings (e.g. ifdown / ifup) recovers it.
+
+Commit 296d5b541639 ("bnxt_en: Fix aggregation buffer leak under OOM
+condition.") fixed the copybreak path only. Recently
+commit bd3beb5c8691 ("eth: bnxt: disable rx-copybreak by default")
+made the non-copybreak path the default, re-surfacing the issue.
+
+With XDP, the agg buffers are attached to the xdp_buff as frags by
+this point. Their agg ring slots have already been refilled.
+We need to keep the original head page (and therefore shinfo)
+around until the xdp_buff cleanup.
+
+Note the odd split of ownership here: rx_skb_func() only deals with
+the head buffer, the agg buffers stay with the caller in whatever
+state they are in, still on the ring without XDP, or frags of the
+xdp_buff with XDP. This complicates rx_skb_func() cleaning up all
+the buffers (head and frags), which would be more intuitive.
+
+Discovered in production, severe packet loss would persist after
+a transient OOM event. Tested on a BCM57504 by failing the head
+buffer allocations in bnxt_rx_skb() (bpftrace override() of
+should_failslab() and should_fail_alloc_page()) while receiving
+1400B ICMPv6 echo requests. 341k packets were dropped on that queue,
+enough to drain its 8188 entry agg ring 40 times over, and the queue
+kept receiving large frames afterwards with no loss and no new HW drops.
+With a frags-capable XDP_PASS program at MTU 9000, receiving 8000B
+ICMPv6 echo requests while napi_build_skb() called from
+bnxt_rx_multi_page_skb() failed, 9.2k packets were dropped,
+the page pools' inflight count stayed flat and
+there were no KASAN or DEBUG_PAGEALLOC splats.
+
+Fixes: c0c050c58d84 ("bnxt_en: New Broadcom ethernet driver.")
+Fixes: 4c6c123c9af9 ("bnxt: adding bnxt_rx_agg_pages_xdp for aggregated xdp")
+Reviewed-by: Michael Chan <michael.chan@broadcom.com>
+Link: https://patch.msgid.link/20261027234940.1267225-2-kuba@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c | 33 ++++++++++++++---------
+ 1 file changed, 20 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 1c89224ea665..6e8e31616513 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -1160,7 +1160,15 @@ static struct sk_buff *bnxt_rx_multi_page_skb(struct bnxt *bp,
+ 				bp->rx_dir);
+ 	skb = napi_build_skb(frag_start, rxr->rx_page_size);
+ 	if (!skb) {
+-		page_pool_recycle_direct(rxr->page_pool, page);
++		struct page *new_page;
++
++		new_page = rxr->rx_buf_ring[RING_RX(bp, prod)].data;
++		/* The caller may still need the XDP frags from shinfo at the
++		 * end of the head page. Release the new buffer instead and
++		 * put the head back on the ring.
++		 */
++		page_pool_recycle_direct(rxr->page_pool, new_page);
++		bnxt_reuse_rx_data(rxr, cons, data);
+ 		return NULL;
+ 	}
+ 	skb_mark_for_recycle(skb);
+@@ -2273,17 +2281,8 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
+ 			skb = bnxt_copy_xdp(bnapi, &bnxt_xdp.xdp, len,
+ 					    dma_addr);
+ 		bnxt_reuse_rx_data(rxr, cons, data);
+-		if (!skb) {
+-			if (agg_bufs) {
+-				if (!xdp_active)
+-					bnxt_reuse_rx_agg_bufs(cpr, cp_cons, 0,
+-							       agg_bufs, false);
+-				else
+-					bnxt_xdp_buff_frags_free(rxr,
+-								 &bnxt_xdp.xdp);
+-			}
+-			goto oom_next_rx;
+-		}
++		if (!skb)
++			goto oom_next_rx_agg;
+ 	} else {
+ 		u32 payload;
+ 
+@@ -2294,7 +2293,7 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
+ 		skb = bp->rx_skb_func(bp, rxr, cons, data, data_ptr, dma_addr,
+ 				      payload | len);
+ 		if (!skb)
+-			goto oom_next_rx;
++			goto oom_next_rx_agg;
+ 	}
+ 
+ 	if (agg_bufs) {
+@@ -2384,6 +2383,14 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
+ 
+ 	return rc;
+ 
++oom_next_rx_agg:
++	if (agg_bufs) {
++		if (!xdp_active)
++			bnxt_reuse_rx_agg_bufs(cpr, cp_cons, 0, agg_bufs,
++					       false);
++		else
++			bnxt_xdp_buff_frags_free(rxr, &bnxt_xdp.xdp);
++	}
+ oom_next_rx:
+ 	cpr->sw_stats->rx.rx_oom_discards += 1;
+ 	rc = -ENOMEM;
+-- 
+2.56.0
+

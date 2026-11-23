@@ -1,0 +1,176 @@
+From: Sagi Maimon <maimon.sagi@gmail.com>
+Date: Wed, 7 Oct 2026 06:46:20 +0300
+Subject: [PATCH] net: axienet: free outstanding TX buffers in
+ axienet_dma_bd_release()
+References: bsc#1258210
+Patch-mainline: 6.18.65
+Git-commit: 0c20cb4cfb40cf270d6c4c2c2ff5e5d72322644a
+
+[ Upstream commit 0c20cb4cfb40cf270d6c4c2c2ff5e5d72322644a ]
+
+axienet_dma_bd_release() walks the RX ring to unmap and free every
+receive buffer before releasing it, but frees the TX descriptor ring
+with dma_free_coherent() alone.  Any descriptor that
+axienet_free_tx_chain() had not yet reclaimed still holds its skb and
+its streaming DMA mapping, and both are lost.
+
+axienet_stop() disables TX NAPI and stops the DMA engine before calling
+it, so nothing reclaims those descriptors afterwards.  Bringing the
+interface down while frames are in flight therefore leaks up to
+lp->tx_bd_num skbs and mappings each time.
+
+axienet_dma_err_handler() already walks the TX ring this way before it
+restarts the DMA engine: it unmaps every descriptor whose cntrl is still
+set - axienet_free_tx_chain() clears it on reclaim - frees any skb still
+attached, and clears the descriptor.  Move that loop into a helper,
+axienet_free_tx_bufs(), and call it from axienet_dma_bd_release() too.
+This relies on axienet_stop() having stopped the DMA engine first, as
+the RX walk in the same function already does.  The helper frees the
+skbs with dev_kfree_skb_any(), as drops: in the error handler, which
+runs from a workqueue, that frees them directly rather than deferring
+them to softirq as dev_kfree_skb_irq() did.
+
+The walk must not run on a ring that is not there.  axienet_open() does
+not check the result of the reset that runs axienet_dma_bd_init(), so
+when that reset fails tx_bd_v is either still NULL or, after an earlier
+close, points at the ring that close freed.  Clear tx_bd_v and rx_bd_v
+once their rings are freed, and skip the walk when tx_bd_v is NULL.
+That also ends the second dma_free_coherent() of a stale ring which the
+same path already did.  On the axienet_dma_bd_init() error path the TX
+ring has just been allocated zeroed, so the walk does nothing.
+
+This was reported by the Sashiko AI review bot.
+
+Tested on the AXI Ethernet MAC of an ADVA TimeCard X2 (PCIe card, with
+the built-in AXI DMA): traffic passes, and after each of ten down/up
+cycles and five module reloads, all made with traffic running and each
+running axienet_dma_bd_release(), traffic resumes and nothing is logged.
+The leak itself was not measured, and neither the failed-reset paths nor
+axienet_dma_err_handler() were exercised.
+
+Fixes: 8a3b7a252dca ("drivers/net/ethernet/xilinx: added Xilinx AXI Ethernet driver")
+Reviewed-by: Joe Damato <joe@dama.to>
+Assisted-by: LLM sparse
+Signed-off-by: Sagi Maimon <maimon.sagi@gmail.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/20261007034620.1360542-1-maimon.sagi@gmail.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ .../net/ethernet/xilinx/xilinx_axienet_main.c | 74 +++++++++++++------
+ 1 file changed, 50 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+index 50ddc7c53b63..9bd458f15839 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
++++ b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+@@ -173,6 +173,46 @@ static dma_addr_t desc_get_phys_addr(struct axienet_local *lp,
+ 	return ret;
+ }
+ 
++/**
++ * axienet_free_tx_bufs - Release the buffers still held by the TX ring
++ * @lp:		Pointer to the axienet_local structure
++ *
++ * Unmap every descriptor whose mapping is still live, free any skb still
++ * attached, and clear the descriptor for reuse.  axienet_free_tx_chain()
++ * clears cntrl when it reclaims a descriptor, so a non-zero value means
++ * the mapping is live.  The DMA engine must be stopped.
++ */
++static void axienet_free_tx_bufs(struct axienet_local *lp)
++{
++	struct axidma_bd *cur_p;
++	u32 i;
++
++	for (i = 0; i < lp->tx_bd_num; i++) {
++		cur_p = &lp->tx_bd_v[i];
++		if (cur_p->cntrl) {
++			dma_addr_t addr = desc_get_phys_addr(lp, cur_p);
++
++			dma_unmap_single(lp->dev, addr,
++					 (cur_p->cntrl &
++					  XAXIDMA_BD_CTRL_LENGTH_MASK),
++					 DMA_TO_DEVICE);
++		}
++		/* not reclaimed by axienet_free_tx_chain(), so a drop */
++		if (cur_p->skb)
++			dev_kfree_skb_any(cur_p->skb);
++		cur_p->phys = 0;
++		cur_p->phys_msb = 0;
++		cur_p->cntrl = 0;
++		cur_p->status = 0;
++		cur_p->app0 = 0;
++		cur_p->app1 = 0;
++		cur_p->app2 = 0;
++		cur_p->app3 = 0;
++		cur_p->app4 = 0;
++		cur_p->skb = NULL;
++	}
++}
++
+ /**
+  * axienet_dma_bd_release - Release buffer descriptor rings
+  * @ndev:	Pointer to the net_device structure
+@@ -186,11 +226,18 @@ static void axienet_dma_bd_release(struct net_device *ndev)
+ 	int i;
+ 	struct axienet_local *lp = netdev_priv(ndev);
+ 
+-	/* If we end up here, tx_bd_v must have been DMA allocated. */
++	/* tx_bd_v is NULL if axienet_dma_bd_init() did not get as far as
++	 * allocating it, and is cleared below once the ring is freed;
++	 * dma_free_coherent() accepts NULL.
++	 */
++	if (lp->tx_bd_v)
++		axienet_free_tx_bufs(lp);
++
+ 	dma_free_coherent(lp->dev,
+ 			  sizeof(*lp->tx_bd_v) * lp->tx_bd_num,
+ 			  lp->tx_bd_v,
+ 			  lp->tx_bd_p);
++	lp->tx_bd_v = NULL;
+ 
+ 	if (!lp->rx_bd_v)
+ 		return;
+@@ -221,6 +268,7 @@ static void axienet_dma_bd_release(struct net_device *ndev)
+ 			  sizeof(*lp->rx_bd_v) * lp->rx_bd_num,
+ 			  lp->rx_bd_v,
+ 			  lp->rx_bd_p);
++	lp->rx_bd_v = NULL;
+ }
+ 
+ static u64 axienet_dma_rate(struct axienet_local *lp)
+@@ -2732,29 +2780,7 @@ static void axienet_dma_err_handler(struct work_struct *work)
+ 	axienet_dma_stop(lp);
+ 	netdev_reset_queue(ndev);
+ 
+-	for (i = 0; i < lp->tx_bd_num; i++) {
+-		cur_p = &lp->tx_bd_v[i];
+-		if (cur_p->cntrl) {
+-			dma_addr_t addr = desc_get_phys_addr(lp, cur_p);
+-
+-			dma_unmap_single(lp->dev, addr,
+-					 (cur_p->cntrl &
+-					  XAXIDMA_BD_CTRL_LENGTH_MASK),
+-					 DMA_TO_DEVICE);
+-		}
+-		if (cur_p->skb)
+-			dev_kfree_skb_irq(cur_p->skb);
+-		cur_p->phys = 0;
+-		cur_p->phys_msb = 0;
+-		cur_p->cntrl = 0;
+-		cur_p->status = 0;
+-		cur_p->app0 = 0;
+-		cur_p->app1 = 0;
+-		cur_p->app2 = 0;
+-		cur_p->app3 = 0;
+-		cur_p->app4 = 0;
+-		cur_p->skb = NULL;
+-	}
++	axienet_free_tx_bufs(lp);
+ 
+ 	for (i = 0; i < lp->rx_bd_num; i++) {
+ 		cur_p = &lp->rx_bd_v[i];
+-- 
+2.56.0
+

@@ -1,0 +1,169 @@
+From: Xingui Yang <yangxingui@huawei.com>
+Date: Fri, 9 Oct 2026 11:32:38 +0800
+Subject: [PATCH] scsi: hisi_sas: Fix spinup failure for SAS SSP devices in
+ Active_Wait state
+References: bsc#1258210
+Patch-mainline: 6.18.65
+Git-commit: 92821c2358c78345909889793918af8763808bd4
+
+[ Upstream commit 92821c2358c78345909889793918af8763808bd4 ]
+
+SAS HDDs powered up with RNOT=1 wait in Active_Wait state for a
+NOTIFY(ENABLE SPINUP) primitive and keep returning NOT_READY with
+ASC/ASCQ 0x04/0x11, causing endless mid-layer retries and spinup
+failure.
+
+Parse the sense data in the slot completion path and, when
+LU_NOT_READY_NOTIFY_REQUIRED is returned by a directly-attached SSP
+device, queue work that sends the primitive from process context
+(sl_notify_ssp() contains msleep()). The work takes a runtime PM
+reference with pm_runtime_get_if_active(), pairing with
+pm_runtime_put_sync() in the work, so the controller stays resumed until
+the primitive is sent.
+
+Fixes: 60b4a5ee9034 ("scsi: hisi_sas: add v3 cq interrupt handler")
+Signed-off-by: Xingui Yang <yangxingui@huawei.com>
+Link: https://patch.msgid.link/20261009033238.1076098-5-yangxingui@huawei.com
+Signed-off-by: Martin K. Petersen (Oracle) <mkp@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/scsi/hisi_sas/hisi_sas.h       |  3 ++
+ drivers/scsi/hisi_sas/hisi_sas_main.c  | 43 ++++++++++++++++++++++++++
+ drivers/scsi/hisi_sas/hisi_sas_v1_hw.c |  4 +++
+ drivers/scsi/hisi_sas/hisi_sas_v2_hw.c |  4 +++
+ drivers/scsi/hisi_sas/hisi_sas_v3_hw.c |  4 +++
+ 5 files changed, 58 insertions(+)
+
+diff --git a/drivers/scsi/hisi_sas/hisi_sas.h b/drivers/scsi/hisi_sas/hisi_sas.h
+index 1323ed8aa717..d48ba3747b81 100644
+--- a/drivers/scsi/hisi_sas/hisi_sas.h
++++ b/drivers/scsi/hisi_sas/hisi_sas.h
+@@ -163,6 +163,7 @@ enum hisi_sas_phy_event {
+ 	HISI_PHYE_PHY_UP   = 0U,
+ 	HISI_PHYE_LINK_RESET,
+ 	HISI_PHYE_PHY_UP_PM,
++	HISI_PHYE_SPINUP_NOTIFY,
+ 	HISI_PHYES_NUM,
+ };
+ 
+@@ -689,4 +690,6 @@ extern void hisi_sas_sync_cqs(struct hisi_hba *hisi_hba);
+ extern void hisi_sas_sync_poll_cqs(struct hisi_hba *hisi_hba);
+ extern void hisi_sas_controller_reset_prepare(struct hisi_hba *hisi_hba);
+ extern void hisi_sas_controller_reset_done(struct hisi_hba *hisi_hba);
++extern void hisi_sas_spinup_notify(struct hisi_hba *hisi_hba,
++				   struct sas_task *task);
+ #endif
+diff --git a/drivers/scsi/hisi_sas/hisi_sas_main.c b/drivers/scsi/hisi_sas/hisi_sas_main.c
+index c2b082f1252c..5a0470cc3dd2 100644
+--- a/drivers/scsi/hisi_sas/hisi_sas_main.c
++++ b/drivers/scsi/hisi_sas/hisi_sas_main.c
+@@ -996,10 +996,25 @@ static void hisi_sas_phyup_pm_work(struct work_struct *work)
+ 	pm_runtime_put_sync(dev);
+ }
+ 
++static void hisi_sas_spinup_notify_work(struct work_struct *work)
++{
++	struct hisi_sas_phy *phy =
++		container_of(work, typeof(*phy), works[HISI_PHYE_SPINUP_NOTIFY]);
++	struct hisi_hba *hisi_hba = phy->hisi_hba;
++	struct device *dev = hisi_hba->dev;
++	int phy_no = phy->sas_phy.id;
++
++	hisi_hba->hw->sl_notify_ssp(hisi_hba, phy_no);
++	dev_info(dev, "spinup notify primitive on phy%d\n", phy_no);
++
++	pm_runtime_put_sync(dev);
++}
++
+ static const work_func_t hisi_sas_phye_fns[HISI_PHYES_NUM] = {
+ 	[HISI_PHYE_PHY_UP] = hisi_sas_phyup_work,
+ 	[HISI_PHYE_LINK_RESET] = hisi_sas_linkreset_work,
+ 	[HISI_PHYE_PHY_UP_PM] = hisi_sas_phyup_pm_work,
++	[HISI_PHYE_SPINUP_NOTIFY] = hisi_sas_spinup_notify_work,
+ };
+ 
+ bool hisi_sas_notify_phy_event(struct hisi_sas_phy *phy,
+@@ -1639,6 +1654,34 @@ void hisi_sas_controller_reset_done(struct hisi_hba *hisi_hba)
+ }
+ EXPORT_SYMBOL_GPL(hisi_sas_controller_reset_done);
+ 
++void hisi_sas_spinup_notify(struct hisi_hba *hisi_hba,
++			    struct sas_task *task)
++{
++	struct task_status_struct *ts = &task->task_status;
++	struct domain_device *dev = task->dev;
++	struct scsi_sense_hdr sshdr;
++	struct sas_phy *local_phy;
++	struct hisi_sas_phy *phy;
++
++	if (!scsi_normalize_sense(ts->buf, ts->buf_valid_size, &sshdr))
++		return;
++
++	if (sshdr.sense_key != NOT_READY ||
++	    sshdr.sense_code != LU_NOT_READY_NOTIFY_REQUIRED)
++		return;
++
++	if (!pm_runtime_get_if_active(hisi_hba->dev))
++		return;
++
++	local_phy = sas_get_local_phy(dev);
++	phy = &hisi_hba->phy[local_phy->number];
++	if (!hisi_sas_notify_phy_event(phy, HISI_PHYE_SPINUP_NOTIFY))
++		pm_runtime_put(hisi_hba->dev);
++
++	sas_put_local_phy(local_phy);
++}
++EXPORT_SYMBOL_GPL(hisi_sas_spinup_notify);
++
+ static int hisi_sas_controller_prereset(struct hisi_hba *hisi_hba)
+ {
+ 	if (!hisi_hba->hw->soft_reset)
+diff --git a/drivers/scsi/hisi_sas/hisi_sas_v1_hw.c b/drivers/scsi/hisi_sas/hisi_sas_v1_hw.c
+index fa94d7110714..5fcb8d5002f5 100644
+--- a/drivers/scsi/hisi_sas/hisi_sas_v1_hw.c
++++ b/drivers/scsi/hisi_sas/hisi_sas_v1_hw.c
+@@ -1272,6 +1272,10 @@ static void slot_complete_v1_hw(struct hisi_hba *hisi_hba,
+ 				&status_buffer->iu[0];
+ 
+ 		sas_ssp_task_response(dev, task, iu);
++		if (unlikely(ts->stat == SAS_SAM_STAT_CHECK_CONDITION &&
++			     !dev_parent_is_expander(device)))
++			hisi_sas_spinup_notify(hisi_hba, task);
++
+ 		break;
+ 	}
+ 	case SAS_PROTOCOL_SMP:
+diff --git a/drivers/scsi/hisi_sas/hisi_sas_v2_hw.c b/drivers/scsi/hisi_sas/hisi_sas_v2_hw.c
+index f3516a0611dd..f16896e962fd 100644
+--- a/drivers/scsi/hisi_sas/hisi_sas_v2_hw.c
++++ b/drivers/scsi/hisi_sas/hisi_sas_v2_hw.c
+@@ -2427,6 +2427,10 @@ static void slot_complete_v2_hw(struct hisi_hba *hisi_hba,
+ 				&status_buffer->iu[0];
+ 
+ 		sas_ssp_task_response(dev, task, iu);
++		if (unlikely(ts->stat == SAS_SAM_STAT_CHECK_CONDITION &&
++			     !dev_parent_is_expander(device)))
++			hisi_sas_spinup_notify(hisi_hba, task);
++
+ 		break;
+ 	}
+ 	case SAS_PROTOCOL_SMP:
+diff --git a/drivers/scsi/hisi_sas/hisi_sas_v3_hw.c b/drivers/scsi/hisi_sas/hisi_sas_v3_hw.c
+index fbd476a3f131..80980e669202 100644
+--- a/drivers/scsi/hisi_sas/hisi_sas_v3_hw.c
++++ b/drivers/scsi/hisi_sas/hisi_sas_v3_hw.c
+@@ -2435,6 +2435,10 @@ static void slot_complete_v3_hw(struct hisi_hba *hisi_hba,
+ 			sizeof(struct hisi_sas_err_record);
+ 
+ 		sas_ssp_task_response(dev, task, iu);
++		if (unlikely(ts->stat == SAS_SAM_STAT_CHECK_CONDITION &&
++			     !dev_parent_is_expander(device)))
++			hisi_sas_spinup_notify(hisi_hba, task);
++
+ 		break;
+ 	}
+ 	case SAS_PROTOCOL_SMP: {
+-- 
+2.56.0
+
