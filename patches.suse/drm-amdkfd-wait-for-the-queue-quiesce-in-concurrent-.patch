@@ -1,0 +1,121 @@
+From 8c417209754a9d2cd8dc1e78c0dfadefd0ad0e82 Mon Sep 17 00:00:00 2001
+From: Qiang Han <qiangh@amd.com>
+Date: Sun, 8 Nov 2026 06:07:11 +0000
+Subject: drm/amdkfd: wait for the queue quiesce in concurrent SVM evictions
+Git-commit: 8c417209754a9d2cd8dc1e78c0dfadefd0ad0e82
+Patch-mainline: v7.4-rc4
+Alt-commit: d443bd2512c04a5d34c4473ce9ce2f2a6f7bf8f5
+References: git-fixes
+
+With XNACK off, svm_range_evict() leaves the GPU page tables in place
+and relies on the process's queues being stopped before the MMU
+notifier returns.
+
+Only the first eviction (evicted_ranges == 1) calls
+kgd2kfd_quiesce_mm(). The quiesce preempts every GPU the process has
+opened and takes milliseconds. Any other range invalidated in the
+meantime sees evicted_ranges > 1 and returns at once. The core mm then
+frees, migrates or reuses the page while the queues still run, and an
+in-flight SDMA or blit copy accesses it through the old GPU PTE. The
+result is silent corruption of the copy, or of whatever process now
+owns the page.
+
+Hold a new svms->evict_lock across the first evictor's quiesce, so that
+concurrent evictions return only after the queues have stopped. This is
+the scheme amdgpu_amdkfd_evict_userptr() uses with
+process_info->notifier_lock. evict_lock nests inside prange->lock and
+is taken nowhere else. Under it, the quiesce path takes the dqm lock,
+which is already used in MMU notifiers (memalloc_noreclaim).
+
+One way to reach this: a pageable hipMemcpy() larger than 1 MiB. ROCclr
+pins the buffer with hsa_amd_memory_lock(), libhsakmt registers it as
+a KFD SVM range, and host memory pressure (reclaim, compaction,
+allocator purge) invalidates the range.
+
+Fixes: 8a7c184a16d7 ("drm/amdkfd: svm range eviction and restore")
+Signed-off-by: Qiang Han <qiangh@amd.com>
+Signed-off-by: Philip Yang <Philip.Yang@amd.com>
+Reviewed-by: Felix Kuehling <felix.kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit d443bd2512c04a5d34c4473ce9ce2f2a6f7bf8f5)
+
+Cc: stable@vger.kernel.org
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h |    2 +
+ drivers/gpu/drm/amd/amdkfd/kfd_svm.c  |   35 ++++++++++++++++++++++------------
+ 2 files changed, 25 insertions(+), 12 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -882,6 +882,8 @@ struct svm_range_list {
+ 	struct list_head		deferred_range_list;
+ 	struct list_head                criu_svm_metadata_list;
+ 	spinlock_t			deferred_list_lock;
++	/* serializes XNACK-off evictions with the queue quiesce */
++	struct mutex			evict_lock;
+ 	atomic_t			evicted_ranges;
+ 	atomic_t			drain_pagefaults;
+ 	struct delayed_work		restore_work;
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+@@ -1995,21 +1995,30 @@ svm_range_evict(struct svm_range *prange
+ 		if (prange->start <= last && prange->last >= start)
+ 			atomic_inc(&prange->invalid);
+ 
++		/* The MMU notifier must not return before the GPU has stopped
++		 * accessing the invalidated pages. Only the first eviction stops
++		 * the queues, which takes milliseconds (HWS preemption on every
++		 * GPU of the process). Serialize all evictions of this process so
++		 * that a concurrent invalidation of another range waits until
++		 * that quiesce has completed instead of returning while queues
++		 * still run on stale PTEs.
++		 */
++		mutex_lock(&svms->evict_lock);
+ 		evicted_ranges = atomic_inc_return(&svms->evicted_ranges);
+-		if (evicted_ranges != 1)
+-			return r;
++		if (evicted_ranges == 1) {
++			pr_debug("evicting svms 0x%p range [0x%lx 0x%lx]\n",
++				 prange->svms, prange->start, prange->last);
+ 
+-		pr_debug("evicting svms 0x%p range [0x%lx 0x%lx]\n",
+-			 prange->svms, prange->start, prange->last);
+-
+-		/* First eviction, stop the queues */
+-		r = kgd2kfd_quiesce_mm(mm, KFD_QUEUE_EVICTION_TRIGGER_SVM);
+-		if (r)
+-			pr_debug("failed to quiesce KFD\n");
++			/* First eviction, stop the queues */
++			r = kgd2kfd_quiesce_mm(mm, KFD_QUEUE_EVICTION_TRIGGER_SVM);
++			if (r)
++				pr_debug("failed to quiesce KFD\n");
+ 
+-		pr_debug("schedule to restore svm %p ranges\n", svms);
+-		queue_delayed_work(system_freezable_wq, &svms->restore_work,
+-			msecs_to_jiffies(AMDGPU_SVM_RANGE_RESTORE_DELAY_MS));
++			pr_debug("schedule to restore svm %p ranges\n", svms);
++			queue_delayed_work(system_freezable_wq, &svms->restore_work,
++					   msecs_to_jiffies(AMDGPU_SVM_RANGE_RESTORE_DELAY_MS));
++		}
++		mutex_unlock(&svms->evict_lock);
+ 	} else {
+ 		unsigned long s, l;
+ 		uint32_t trigger;
+@@ -3305,6 +3314,7 @@ void svm_range_list_fini(struct kfd_proc
+ 		svm_range_free(prange, true);
+ 	}
+ 
++	mutex_destroy(&p->svms.evict_lock);
+ 	mutex_destroy(&p->svms.lock);
+ 
+ 	pr_debug("pasid 0x%x svms 0x%p done\n", p->pasid, &p->svms);
+@@ -3317,6 +3327,7 @@ int svm_range_list_init(struct kfd_proce
+ 
+ 	svms->objects = RB_ROOT_CACHED;
+ 	mutex_init(&svms->lock);
++	mutex_init(&svms->evict_lock);
+ 	INIT_LIST_HEAD(&svms->list);
+ 	atomic_set(&svms->evicted_ranges, 0);
+ 	atomic_set(&svms->drain_pagefaults, 0);
