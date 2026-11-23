@@ -1,0 +1,282 @@
+From: Joseph Qi <joseph.qi@linux.alibaba.com>
+Date: Tue, 22 Sep 2026 17:34:37 +0800
+Subject: [PATCH] ocfs2: fix possible deadlock between nfs_sync_rwlock and
+ fs_reclaim
+References: bsc#1258210
+Patch-mainline: 6.18.65
+Git-commit: 169bc4d16a8efa7852b101fdaa4c028505cd6750
+
+[ Upstream commit 169bc4d16a8efa7852b101fdaa4c028505cd6750 ]
+
+syzbot detected a circular locking dependency on &osb->nfs_sync_rwlock:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(fs_reclaim);
+                               lock(&ocfs2_sysfile_lock_key[INODE_ALLOC_SYSTEM_INODE]);
+                               lock(fs_reclaim);
+  rlock(&osb->nfs_sync_rwlock);
+
+ *** DEADLOCK ***
+
+Chain exists of:
+  &osb->nfs_sync_rwlock --> &ocfs2_sysfile_lock_key[INODE_ALLOC_SYSTEM_INODE] --> fs_reclaim
+
+CPU0 is kswapd.  The dentry shrinker runs under fs_reclaim and reaches
+ocfs2_delete_inode() through ->evict_inode():
+
+kswapd
+ balance_pgdat
+  shrink_node
+   shrink_slab
+    super_cache_scan
+     prune_dcache_sb
+      shrink_dentry_list
+       dentry_kill
+        ocfs2_dentry_iput
+         evict
+          ocfs2_evict_inode
+           ocfs2_delete_inode
+            ocfs2_nfs_sync_lock
+             down_read(&osb->nfs_sync_rwlock)      //C0: grabbing
+
+CPU1 is a task deleting an inode.  It takes nfs_sync_rwlock first, then
+the orphan dir and inode alloc system inode i_rwsems, and allocates the
+metadata reservation with GFP_KERNEL while holding them:
+
+evict
+ ocfs2_evict_inode
+  ocfs2_delete_inode
+  + ocfs2_nfs_sync_lock
+  |  down_read(&osb->nfs_sync_rwlock)              //C1: hold
+  + ocfs2_wipe_inode
+     + inode_lock(orphan_dir_inode)                //C1: hold
+     + ocfs2_truncate_for_delete
+     |  ocfs2_commit_truncate
+     |   ocfs2_remove_btree_range
+     |    ocfs2_reserve_blocks_for_rec_trunc
+     |     ocfs2_reserve_new_metadata_blocks
+     |      kzalloc_obj()                          //C1: grabbing
+     |      // GFP_KERNEL -> might_alloc -> fs_reclaim_acquire
+     + ocfs2_remove_inode
+        inode_lock(inode_alloc_inode)
+
+jbd2 pins allocations to GFP_NOFS for the lifetime of a transaction
+handle, but these reservations are made before ocfs2_start_trans(), so
+fs_reclaim is acquired with ocfs2 locks still held and the cycle closes.
+
+The same cycle is reachable from ocfs2_get_dentry() and
+ocfs2_get_parent(), which hold nfs_sync_rwlock for write across
+ocfs2_test_inode_bit() and ocfs2_iget().
+
+This is more than a lockdep artifact.  A GFP_KERNEL allocation under the
+orphan dir i_rwsem enters direct reclaim, which runs the shrinkers, which
+can evict another ocfs2 inode and re-enter ocfs2_wipe_inode() on the same
+task; the second inode_lock() on the singleton orphan dir inode then
+self-deadlocks, since i_rwsem is not recursive.
+
+Establish a GFP_NOFS allocation context for the whole nfs_sync_rwlock
+critical section so that nothing holding it can recurse into filesystem
+reclaim.  Do it in ocfs2_nfs_sync_lock()/ocfs2_nfs_sync_unlock() rather
+than at the call sites, so that future callers cannot forget it.
+
+Link: https://lore.kernel.org/20260922093437.954127-1-joseph.qi@linux.alibaba.com
+Fixes: 6ca497a83e59 ("ocfs2: fix rare stale inode errors when exporting via nfs")
+Signed-off-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reported-by: syzbot+a68ce48df87b8e36e915@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=a68ce48df87b8e36e915
+Cc: Heming Zhao <heming.zhao@suse.com>
+Cc: Mark Fasheh <mark@fasheh.com>
+Cc: Joel Becker <jlbec@evilplan.org>
+Cc: Junxiao Bi <junxiao.bi@oracle.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/ocfs2/dlmglue.c | 29 +++++++++++++++++++++++++----
+ fs/ocfs2/dlmglue.h |  5 +++--
+ fs/ocfs2/export.c  | 10 ++++++----
+ fs/ocfs2/inode.c   |  5 +++--
+ 4 files changed, 37 insertions(+), 12 deletions(-)
+
+diff --git a/fs/ocfs2/dlmglue.c b/fs/ocfs2/dlmglue.c
+index fdd0ed900e7e..7db1f1aff156 100644
+--- a/fs/ocfs2/dlmglue.c
++++ b/fs/ocfs2/dlmglue.c
+@@ -19,6 +19,7 @@
+ #include <linux/time.h>
+ #include <linux/delay.h>
+ #include <linux/quotaops.h>
++#include <linux/sched/mm.h>
+ #include <linux/sched/signal.h>
+ #include <linux/string_choices.h>
+ 
+@@ -2854,21 +2855,34 @@ void ocfs2_rename_unlock(struct ocfs2_super *osb)
+ 		ocfs2_cluster_unlock(osb, lockres, DLM_LOCK_EX);
+ }
+ 
+-int ocfs2_nfs_sync_lock(struct ocfs2_super *osb, int ex)
++int ocfs2_nfs_sync_lock(struct ocfs2_super *osb, int ex, unsigned int *nofs_flag)
+ {
+ 	int status;
++	unsigned int flags;
+ 	struct ocfs2_lock_res *lockres = &osb->osb_nfs_sync_lockres;
+ 
+ 	if (ocfs2_is_hard_readonly(osb))
+ 		return -EROFS;
+ 
++	/*
++	 * ocfs2_delete_inode() takes this lock from ->evict_inode(), which the
++	 * dentry shrinker reaches while holding fs_reclaim.  Anything allocated
++	 * under the lock must therefore stay out of filesystem reclaim, or
++	 * reclaim recurses back into the shrinker and tries to take this lock
++	 * again.  Cover the whole critical section, including the cluster lock
++	 * and the sysfile inode locks the callers take below it.
++	 */
++	flags = memalloc_nofs_save();
++
+ 	if (ex)
+ 		down_write(&osb->nfs_sync_rwlock);
+ 	else
+ 		down_read(&osb->nfs_sync_rwlock);
+ 
+-	if (ocfs2_mount_local(osb))
++	if (ocfs2_mount_local(osb)) {
++		*nofs_flag = flags;
+ 		return 0;
++	}
+ 
+ 	status = ocfs2_cluster_lock(osb, lockres, ex ? LKM_EXMODE : LKM_PRMODE,
+ 				    0, 0);
+@@ -2879,12 +2893,17 @@ int ocfs2_nfs_sync_lock(struct ocfs2_super *osb, int ex)
+ 			up_write(&osb->nfs_sync_rwlock);
+ 		else
+ 			up_read(&osb->nfs_sync_rwlock);
++		memalloc_nofs_restore(flags);
++		return status;
+ 	}
+ 
+-	return status;
++	*nofs_flag = flags;
++
++	return 0;
+ }
+ 
+-void ocfs2_nfs_sync_unlock(struct ocfs2_super *osb, int ex)
++void ocfs2_nfs_sync_unlock(struct ocfs2_super *osb, int ex,
++			   unsigned int nofs_flag)
+ {
+ 	struct ocfs2_lock_res *lockres = &osb->osb_nfs_sync_lockres;
+ 
+@@ -2895,6 +2914,8 @@ void ocfs2_nfs_sync_unlock(struct ocfs2_super *osb, int ex)
+ 		up_write(&osb->nfs_sync_rwlock);
+ 	else
+ 		up_read(&osb->nfs_sync_rwlock);
++
++	memalloc_nofs_restore(nofs_flag);
+ }
+ 
+ int ocfs2_trim_fs_lock(struct ocfs2_super *osb,
+diff --git a/fs/ocfs2/dlmglue.h b/fs/ocfs2/dlmglue.h
+index a3ebd7303ea2..faa58ed8699b 100644
+--- a/fs/ocfs2/dlmglue.h
++++ b/fs/ocfs2/dlmglue.h
+@@ -161,8 +161,9 @@ void ocfs2_orphan_scan_unlock(struct ocfs2_super *osb, u32 seqno);
+ 
+ int ocfs2_rename_lock(struct ocfs2_super *osb);
+ void ocfs2_rename_unlock(struct ocfs2_super *osb);
+-int ocfs2_nfs_sync_lock(struct ocfs2_super *osb, int ex);
+-void ocfs2_nfs_sync_unlock(struct ocfs2_super *osb, int ex);
++int ocfs2_nfs_sync_lock(struct ocfs2_super *osb, int ex, unsigned int *nofs_flag);
++void ocfs2_nfs_sync_unlock(struct ocfs2_super *osb, int ex,
++			   unsigned int nofs_flag);
+ void ocfs2_trim_fs_lock_res_init(struct ocfs2_super *osb);
+ void ocfs2_trim_fs_lock_res_uninit(struct ocfs2_super *osb);
+ int ocfs2_trim_fs_lock(struct ocfs2_super *osb,
+diff --git a/fs/ocfs2/export.c b/fs/ocfs2/export.c
+index b95724b767e1..04e40d8f9b8a 100644
+--- a/fs/ocfs2/export.c
++++ b/fs/ocfs2/export.c
+@@ -37,6 +37,7 @@ static struct dentry *ocfs2_get_dentry(struct super_block *sb,
+ 	struct inode *inode;
+ 	struct ocfs2_super *osb = OCFS2_SB(sb);
+ 	u64 blkno = handle->ih_blkno;
++	unsigned int nofs_flag = 0;
+ 	int status, set;
+ 	struct dentry *result;
+ 
+@@ -59,7 +60,7 @@ static struct dentry *ocfs2_get_dentry(struct super_block *sb,
+ 	 * This will synchronize us against ocfs2_delete_inode() on
+ 	 * all nodes
+ 	 */
+-	status = ocfs2_nfs_sync_lock(osb, 1);
++	status = ocfs2_nfs_sync_lock(osb, 1, &nofs_flag);
+ 	if (status < 0) {
+ 		mlog(ML_ERROR, "getting nfs sync lock(EX) failed %d\n", status);
+ 		goto check_err;
+@@ -89,7 +90,7 @@ static struct dentry *ocfs2_get_dentry(struct super_block *sb,
+ 	inode = ocfs2_iget(osb, blkno, 0, 0);
+ 
+ unlock_nfs_sync:
+-	ocfs2_nfs_sync_unlock(osb, 1);
++	ocfs2_nfs_sync_unlock(osb, 1, nofs_flag);
+ 
+ check_err:
+ 	if (status < 0) {
+@@ -132,12 +133,13 @@ static struct dentry *ocfs2_get_parent(struct dentry *child)
+ 	u64 blkno;
+ 	struct dentry *parent;
+ 	struct inode *dir = d_inode(child);
++	unsigned int nofs_flag = 0;
+ 	int set;
+ 
+ 	trace_ocfs2_get_parent(child, child->d_name.len, child->d_name.name,
+ 			       (unsigned long long)OCFS2_I(dir)->ip_blkno);
+ 
+-	status = ocfs2_nfs_sync_lock(OCFS2_SB(dir->i_sb), 1);
++	status = ocfs2_nfs_sync_lock(OCFS2_SB(dir->i_sb), 1, &nofs_flag);
+ 	if (status < 0) {
+ 		mlog(ML_ERROR, "getting nfs sync lock(EX) failed %d\n", status);
+ 		parent = ERR_PTR(status);
+@@ -181,7 +183,7 @@ static struct dentry *ocfs2_get_parent(struct dentry *child)
+ 	ocfs2_inode_unlock(dir, 0);
+ 
+ unlock_nfs_sync:
+-	ocfs2_nfs_sync_unlock(OCFS2_SB(dir->i_sb), 1);
++	ocfs2_nfs_sync_unlock(OCFS2_SB(dir->i_sb), 1, nofs_flag);
+ 
+ bail:
+ 	trace_ocfs2_get_parent_end(parent);
+diff --git a/fs/ocfs2/inode.c b/fs/ocfs2/inode.c
+index c1ac673ca456..27d45c3a36d1 100644
+--- a/fs/ocfs2/inode.c
++++ b/fs/ocfs2/inode.c
+@@ -1108,6 +1108,7 @@ static void ocfs2_delete_inode(struct inode *inode)
+ {
+ 	int wipe, status;
+ 	sigset_t oldset;
++	unsigned int nofs_flag = 0;
+ 	struct buffer_head *di_bh = NULL;
+ 	struct ocfs2_dinode *di = NULL;
+ 
+@@ -1142,7 +1143,7 @@ static void ocfs2_delete_inode(struct inode *inode)
+ 	 * shared mode so that all nodes can still concurrently
+ 	 * process deletes.
+ 	 */
+-	status = ocfs2_nfs_sync_lock(OCFS2_SB(inode->i_sb), 0);
++	status = ocfs2_nfs_sync_lock(OCFS2_SB(inode->i_sb), 0, &nofs_flag);
+ 	if (status < 0) {
+ 		mlog(ML_ERROR, "getting nfs sync lock(PR) failed %d\n", status);
+ 		ocfs2_cleanup_delete_inode(inode, 0);
+@@ -1214,7 +1215,7 @@ static void ocfs2_delete_inode(struct inode *inode)
+ 	brelse(di_bh);
+ 
+ bail_unlock_nfs_sync:
+-	ocfs2_nfs_sync_unlock(OCFS2_SB(inode->i_sb), 0);
++	ocfs2_nfs_sync_unlock(OCFS2_SB(inode->i_sb), 0, nofs_flag);
+ 
+ bail_unblock:
+ 	ocfs2_unblock_signals(&oldset);
+-- 
+2.56.0
+

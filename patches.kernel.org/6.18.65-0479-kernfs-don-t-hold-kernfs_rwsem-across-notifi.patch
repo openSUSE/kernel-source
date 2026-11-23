@@ -1,0 +1,131 @@
+From: Shakeel Butt <shakeel.butt@linux.dev>
+Date: Wed, 9 Sep 2026 21:54:06 -0700
+Subject: [PATCH] kernfs: don't hold kernfs_rwsem across notification delivery
+References: bsc#1258210
+Patch-mainline: 6.18.65
+Git-commit: 23985e2b1f31623468244a2149b2388cda4925eb
+
+[ Upstream commit 23985e2b1f31623468244a2149b2388cda4925eb ]
+
+Recently at Meta we noticed that on multi-tenant systems, a workload
+under extreme memory pressure negatively impacts unrelated workloads and
+system daemons like below [1] and fb-oomd [2]. Mainly we observed that
+system daemons were stuck on kernfs_rwsem in cgroup-related interfaces
+for long periods of time.
+
+On further inspection, we found that the workload under pressure had
+registered inotify watches on its memory.events and was continuously
+receiving limit-hitting notifications. The cgroup notification is done in
+kernfs_notify_workfn(), which holds kernfs_supers_rwsem and kernfs_rwsem
+and calls fsnotify(), which allocates the event with
+kmalloc(GFP_KERNEL_ACCOUNT|__GFP_RETRY_MAYFAIL) charged to the watching
+cgroup, which is already under memory pressure. So the notify worker
+ended up in memory reclaim of a cgroup already under pressure, and itself
+kept triggering the limit notifications.
+
+This notification path takes the locks in read mode, but a waiting writer
+blocks all future readers. That is exactly what is happening in the Meta
+fleet, and it leaves daemons that are critical to the reliability of the
+system stuck for long periods of time.
+
+Commit 400188ae361a ("kernfs: Acquire kernfs_rwsem in
+kernfs_notify_workfn().") added kernfs_rwsem just to safely read
+kernfs_node::name.  Let's sample the name once before the loop and drop
+the lock.  kernfs_supers_rwsem still covers the list, and the removal
+paths take that one for reading too, so a stalled worker can still hold
+a removal up once a mount or unmount is queued behind it.
+
+Two things change for a watcher.  A name longer than NAME_MAX now gives
+an event with no name, where before it gave one with the full name;
+fsnotify() takes the name as optional, so the event still arrives.  And
+the name and the parent are no longer sampled under one lock, so a rename
+between the two would name a file against the directory it moved to.
+That cannot happen today: kernfs_notify() rejects anything that is not a
+file, and no caller of kernfs_rename_ns() renames one.
+
+[1] https://github.com/facebookincubator/below
+[2] https://github.com/facebookincubator/oomd
+
+Fixes: 400188ae361a ("kernfs: Acquire kernfs_rwsem in kernfs_notify_workfn().")
+Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
+Link: https://patch.msgid.link/20260910045406.485295-1-shakeel.butt@linux.dev
+Acked-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/kernfs/file.c | 25 ++++++++++++++++---------
+ 1 file changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/fs/kernfs/file.c b/fs/kernfs/file.c
+index 9adf36e6364b..63c4beeed93f 100644
+--- a/fs/kernfs/file.c
++++ b/fs/kernfs/file.c
+@@ -911,9 +911,12 @@ static loff_t kernfs_fop_llseek(struct file *file, loff_t offset, int whence)
+ 
+ static void kernfs_notify_workfn(struct work_struct *work)
+ {
+-	struct kernfs_node *kn;
++	char name_buf[NAME_MAX + 1];
+ 	struct kernfs_super_info *info;
++	struct kernfs_node *kn;
+ 	struct kernfs_root *root;
++	struct qstr name;
++	bool have_name;
+ repeat:
+ 	/* pop one off the notify_list */
+ 	spin_lock_irq(&kernfs_notify_lock);
+@@ -929,14 +932,20 @@ static void kernfs_notify_workfn(struct work_struct *work)
+ 	root = kernfs_root(kn);
+ 	/* kick fsnotify */
+ 
++	/*
++	 * Sample the name once so kernfs_rwsem need not be held across the
++	 * loop.  A name that does not fit is reported without one; fsnotify()
++	 * takes the name as optional, so a watcher loses the name and not the
++	 * event.
++	 */
++	have_name = kernfs_name(kn, name_buf, sizeof(name_buf)) >= 0;
++	name = QSTR(name_buf);
++
+ 	down_read(&root->kernfs_supers_rwsem);
+-	down_read(&root->kernfs_rwsem);
+-	list_for_each_entry(info, &kernfs_root(kn)->supers, node) {
++	list_for_each_entry(info, &root->supers, node) {
+ 		struct kernfs_node *parent;
+ 		struct inode *p_inode = NULL;
+-		const char *kn_name;
+ 		struct inode *inode;
+-		struct qstr name;
+ 
+ 		/*
+ 		 * We want fsnotify_modify() on @kn but as the
+@@ -948,15 +957,14 @@ static void kernfs_notify_workfn(struct work_struct *work)
+ 		if (!inode)
+ 			continue;
+ 
+-		kn_name = kernfs_rcu_name(kn);
+-		name = QSTR(kn_name);
+ 		parent = kernfs_get_parent(kn);
+ 		if (parent) {
+ 			p_inode = ilookup(info->sb, kernfs_ino(parent));
+ 			if (p_inode) {
+ 				fsnotify(FS_MODIFY | FS_EVENT_ON_CHILD,
+ 					 inode, FSNOTIFY_EVENT_INODE,
+-					 p_inode, &name, inode, 0);
++					 p_inode, have_name ? &name : NULL,
++					 inode, 0);
+ 				iput(p_inode);
+ 			}
+ 
+@@ -969,7 +977,6 @@ static void kernfs_notify_workfn(struct work_struct *work)
+ 		iput(inode);
+ 	}
+ 
+-	up_read(&root->kernfs_rwsem);
+ 	up_read(&root->kernfs_supers_rwsem);
+ 	kernfs_put(kn);
+ 	goto repeat;
+-- 
+2.56.0
+

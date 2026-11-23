@@ -1,0 +1,138 @@
+From: Tapio Reijonen <tapio.reijonen@vaisala.com>
+Date: Thu, 8 Oct 2026 09:48:28 +0000
+Subject: [PATCH] serial: max310x: don't power down the port mid-transmission
+ on close
+References: bsc#1258210
+Patch-mainline: 6.18.65
+Git-commit: c3ad42ccd303113a08bd0b441fb5b3380f29c5bf
+
+[ Upstream commit c3ad42ccd303113a08bd0b441fb5b3380f29c5bf ]
+
+max310x_shutdown() powers the port down regardless of what the
+transmitter is doing. The power-off stops the UART clock mid-character,
+truncating the final frame, and on the auto-RTS path it freezes the
+RTS output at its current level: a close() with data still queued
+leaves the RS485 transceiver asserted until the next open, which also
+emits the interrupted character corrupted.
+
+Waiting for the data to drain is no better: the tty layer's
+wait-until-sent is bounded by closing_wait, configurable to none, and
+a hangup arrives with no wait at all, so draining a full FIFO blocks
+close() in uninterruptible sleep for seconds at low baud rates - and
+forever when CTS flow control blocks the FIFO.
+
+Instead, set MODE1 TxDisabl: the character in flight completes and the
+transmitter ceases with TX_ at idle. Give that character one character
+time (the chip has no transmitter-idle status), then reset the FIFOs
+so the auto-RTS engine sees the transmitter empty and releases RTS
+within the configured after-send hold; wait that hold plus one bit
+time before powering off. Abandoned data was explicitly not waited
+for, and startup() resets the FIFOs and TxDisabl on open anyway.
+
+Measured on a MAX14830: a truncating close() at 50 baud takes 0.23 s,
+RTS releases one character plus the hold after the last stop bit on
+both polarities, and the reopen corruption is gone.
+
+Fixes: f65444187a66 ("serial: New serial driver MAX310X")
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Tapio Reijonen <tapio.reijonen@vaisala.com>
+Link: https://patch.msgid.link/20261008-max310x-rs485-sw-delay-v8-5-6ba881f81e1f@vaisala.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/tty/serial/max310x.c | 44 ++++++++++++++++++++++++++++++++----
+ 1 file changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/tty/serial/max310x.c b/drivers/tty/serial/max310x.c
+index 8170638a1361..3243e2f4b9c6 100644
+--- a/drivers/tty/serial/max310x.c
++++ b/drivers/tty/serial/max310x.c
+@@ -289,6 +289,7 @@ struct max310x_one {
+ 	struct work_struct	md_work;
+ 	struct work_struct	rs_work;
+ 	struct regmap		*regmap;
++	unsigned int		char_time_us;
+ 	unsigned int		baud;
+ 	bool			tx_break;	/* break_ctl() owns the transceiver */
+ 
+@@ -984,6 +985,7 @@ static void max310x_set_termios(struct uart_port *port,
+ 				struct ktermios *termios,
+ 				const struct ktermios *old)
+ {
++	unsigned int frame_bits = tty_get_frame_size(termios->c_cflag);
+ 	unsigned int lcr = 0, flow = 0;
+ 	int baud;
+ 
+@@ -1096,10 +1098,13 @@ static void max310x_set_termios(struct uart_port *port,
+ 	uart_update_timeout(port, termios->c_cflag, baud);
+ 
+ 	/*
+-	 * Cache the new baud rate and reprogram the RS485 RTS delays, whose
+-	 * millisecond-to-bit-time conversion depends on it.
++	 * Cache the new baud rate and the time it takes to clock out one
++	 * character before reprogramming the RS485 RTS delays: the
++	 * millisecond-to-bit-time conversion divides by the baud rate.
+ 	 */
+ 	to_max310x_port(port)->baud = baud;
++	to_max310x_port(port)->char_time_us =
++		DIV_ROUND_UP(USEC_PER_SEC * frame_bits, baud);
+ 	max310x_set_rts_ctl_params(to_max310x_port(port));
+ }
+ 
+@@ -1156,9 +1161,10 @@ static int max310x_startup(struct uart_port *port)
+ 	one->tx_break = false;
+ 	max310x_port_update(port, MAX310X_LCR_REG, MAX310X_LCR_TXBREAK_BIT, 0);
+ 
+-	/* Configure MODE1 register */
++	/* Configure MODE1: re-enable the transmitter shutdown() stopped */
+ 	max310x_port_update(port, MAX310X_MODE1_REG,
+-			    MAX310X_MODE1_TRNSCVCTRL_BIT, 0);
++			    MAX310X_MODE1_TRNSCVCTRL_BIT |
++			    MAX310X_MODE1_TXDIS_BIT, 0);
+ 
+ 	/* Configure MODE2 register & Reset FIFOs*/
+ 	val = MAX310X_MODE2_RXEMPTINV_BIT | MAX310X_MODE2_FIFORST_BIT;
+@@ -1195,9 +1201,39 @@ static int max310x_startup(struct uart_port *port)
+ 
+ static void max310x_shutdown(struct uart_port *port)
+ {
++	struct max310x_one *one = to_max310x_port(port);
++
+ 	/* Disable all interrupts */
+ 	max310x_port_write(port, MAX310X_IRQEN_REG, 0);
+ 
++	/*
++	 * Stop the transmitter: the character in flight completes, data
++	 * still queued is abandoned (the next startup() resets the FIFOs).
++	 */
++	max310x_port_update(port, MAX310X_MODE1_REG,
++			    MAX310X_MODE1_TXDIS_BIT, MAX310X_MODE1_TXDIS_BIT);
++
++	/*
++	 * Let the character in flight finish (the chip has no
++	 * transmitter-idle status), then empty the FIFO: auto-RTS releases
++	 * only once the transmitter is empty, and the power-off below
++	 * would freeze an asserted pin until the next open.
++	 */
++	fsleep(one->char_time_us);
++	max310x_port_update(port, MAX310X_MODE2_REG,
++			    MAX310X_MODE2_FIFORST_BIT,
++			    MAX310X_MODE2_FIFORST_BIT);
++	max310x_port_update(port, MAX310X_MODE2_REG,
++			    MAX310X_MODE2_FIFORST_BIT, 0);
++	if (port->rs485.flags & SER_RS485_ENABLED && one->baud) {
++		unsigned int hold = DIV_ROUND_UP(one->baud *
++				port->rs485.delay_rts_after_send,
++				MSEC_PER_SEC);
++
++		fsleep(max(DIV_ROUND_UP((hold + 1) * USEC_PER_SEC,
++					one->baud), 100U));
++	}
++
+ 	max310x_power(port, 0);
+ }
+ 
+-- 
+2.56.0
+
