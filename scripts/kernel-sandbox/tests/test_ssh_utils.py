@@ -6,8 +6,8 @@ import time
 import unittest
 from pathlib import Path
 
-import libs.ssh_utils as ssh_utils
-from libs.ssh_utils import build_ssh_command, connect_ssh_and_wait, wait_for_ssh_ready
+import kernel_sandbox.ssh_utils as ssh_utils
+from kernel_sandbox.ssh_utils import build_ssh_command, connect_ssh_and_wait, wait_for_ssh_ready
 
 
 @contextlib.contextmanager

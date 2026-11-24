@@ -286,7 +286,7 @@ class TeaAPI(api.API):
         new_content = base64.standard_b64encode(new_content.encode()).decode()
         return self._update_file_content(org, repo, branch, fn, sha, content, new_content)
 
-    def update_content(self, org, repo, branch, src, message, ignored_files=None, upload_all=False):
+    def update_content(self, org, repo, branch, src, message, ignored_files=None):
         ign = ['.gitattributes', '.gitignore'] + (ignored_files if ignored_files else [])
         exc = ['.osc', '.git']
 
@@ -311,18 +311,6 @@ class TeaAPI(api.API):
                 files[f['name']] = f
         with tempfile.TemporaryDirectory() as tmpdirname:
             hasher = init_repo(tmpdirname, repo, 'whatever')
-            if upload_all:
-                self.log_progress('Forcedly uploading all files.\n')
-                rq = { 'branch' : branch, 'files' : [], 'message': message }
-                for filename in sorted(files.keys()):
-                    if file_ignored(filename):
-                        continue
-                    frq = { 'path' : filename, 'operation' : 'delete', 'sha' : files[filename]['sha'] }
-                    rq['files'].append(frq)
-                    self.log_progress('DELETE %s\n' % (filename))
-                    files.pop(filename, None)
-                if len(rq['files']) > 0:
-                    self.check_post(self.repo_path(org, repo) + '/contents', json=rq)
             rq = { 'branch' : branch, 'files' : [], 'message': message }
             for filename in list_files(src):
                 if file_ignored(filename):

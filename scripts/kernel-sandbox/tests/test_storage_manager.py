@@ -8,7 +8,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from libs.storage_manager import (
+from kernel_sandbox.storage_manager import (
     DownloadError,
     HTTPDownloader,
     ImageFinder,

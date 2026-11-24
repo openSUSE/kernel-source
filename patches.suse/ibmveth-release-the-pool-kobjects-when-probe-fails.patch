@@ -1,0 +1,162 @@
+From: Mingming Cao <mmc@linux.ibm.com>
+Date: Tue, 13 Oct 2026 11:29:22 -0700
+Subject: ibmveth: release the pool kobjects when probe fails
+Patch-mainline: v7.4-rc1
+Git-commit: fd052c6823b31eb45f824660567ab3f2da2d5195
+References: bsc#1285888
+
+If register_netdev() fails in ibmveth_probe(), for example with -EINTR
+when the binding task is killed, probe frees the netdev but leaves the
+pool%d kobjects embedded in it registered in sysfs. Reading
+/sys/devices/vio/<unit>/pool0/num is then a use-after-free, and the
+next probe cannot add pool0.
+
+Put the kobjects before freeing the netdev, as ibmveth_remove() does,
+on this path and on the netif_set_real_num_tx_queues() one.
+
+The kobjects also have no release(). With CONFIG_DEBUG_KOBJECT_RELEASE,
+kobject_put() defers their cleanup, including removing the sysfs files,
+to a work item, so free_netdev() can free them first, here and in
+remove(). Add a release() that signals a per-pool completion, and wait
+for it in both places before free_netdev(). Without that config,
+release() runs from kobject_put() and the wait returns at once.
+
+Found in review of the ibmveth multi-queue RX series and confirmed by
+code inspection; the release() part was raised by the Sashiko review of
+the first version. Tested on a POWER10 LPAR with register_netdev()
+forced to fail with -EINTR by a test-only module parameter (not part of
+this patch): no pool%d directories remain and the device binds again. No
+kernel selftests cover ibmveth.
+
+Fixes: 860f242eb534 ("[PATCH] ibmveth change buffer pools dynamically")
+Signed-off-by: Mingming Cao <mmc@linux.ibm.com>
+Link: https://patch.msgid.link/20261013182926.30417-6-mmc@linux.ibm.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/ibm/ibmveth.c |   52 +++++++++++++++++++++++++++++++------
+ drivers/net/ethernet/ibm/ibmveth.h |    3 ++
+ 2 files changed, 47 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/ethernet/ibm/ibmveth.c
++++ b/drivers/net/ethernet/ibm/ibmveth.c
+@@ -1890,6 +1890,40 @@ static const struct net_device_ops ibmve
+ 	.ndo_features_check	= ibmveth_features_check,
+ };
+ 
++/**
++ * ibmveth_pool_kobj_release - Mark a pool kobject finished
++ * @kobj: kobject embedded in the pool
++ *
++ * The pool kobjects live in netdev_priv(), so the last put must wait
++ * for this before free_netdev().
++ */
++static void ibmveth_pool_kobj_release(struct kobject *kobj)
++{
++	struct ibmveth_buff_pool *pool = container_of(kobj,
++						      struct ibmveth_buff_pool,
++						      kobj);
++
++	complete(&pool->released);
++}
++
++/**
++ * ibmveth_put_pool_kobjs - Drop the pool kobjects and wait for release
++ * @adapter: ibmveth adapter
++ *
++ * With CONFIG_DEBUG_KOBJECT_RELEASE the cleanup, including removing the
++ * sysfs files, runs later from a work item in the kobject; wait for it
++ * so free_netdev() cannot free the pools first.
++ */
++static void ibmveth_put_pool_kobjs(struct ibmveth_adapter *adapter)
++{
++	int i;
++
++	for (i = 0; i < IBMVETH_NUM_BUFF_POOLS; i++)
++		kobject_put(&adapter->rx_buff_pool[i].kobj);
++	for (i = 0; i < IBMVETH_NUM_BUFF_POOLS; i++)
++		wait_for_completion(&adapter->rx_buff_pool[i].released);
++}
++
+ static int ibmveth_probe(struct vio_dev *dev, const struct vio_device_id *id)
+ {
+ 	int rc, i, mac_len;
+@@ -2000,6 +2034,7 @@ static int ibmveth_probe(struct vio_dev
+ 		ibmveth_init_buffer_pool(&adapter->rx_buff_pool[i], i,
+ 					 pool_count[i], pool_size[i],
+ 					 pool_active[i]);
++		init_completion(&adapter->rx_buff_pool[i].released);
+ 		error = kobject_init_and_add(kobj, &ktype_veth_pool,
+ 					     &dev->dev.kobj, "pool%d", i);
+ 		if (!error)
+@@ -2011,8 +2046,7 @@ static int ibmveth_probe(struct vio_dev
+ 	if (rc) {
+ 		netdev_dbg(netdev, "failed to set number of tx queues rc=%d\n",
+ 			   rc);
+-		free_netdev(netdev);
+-		return rc;
++		goto err_put_pools;
+ 	}
+ 	adapter->tx_ltb_size = PAGE_ALIGN(IBMVETH_MAX_TX_BUF_SIZE);
+ 	for (i = 0; i < IBMVETH_MAX_QUEUES; i++)
+@@ -2027,25 +2061,27 @@ static int ibmveth_probe(struct vio_dev
+ 
+ 	if (rc) {
+ 		netdev_dbg(netdev, "failed to register netdev rc=%d\n", rc);
+-		free_netdev(netdev);
+-		return rc;
++		goto err_put_pools;
+ 	}
+ 
+ 	netdev_dbg(netdev, "registered\n");
+ 
+ 	return 0;
++
++err_put_pools:
++	ibmveth_put_pool_kobjs(adapter);
++	free_netdev(netdev);
++	return rc;
+ }
+ 
+ static void ibmveth_remove(struct vio_dev *dev)
+ {
+ 	struct net_device *netdev = dev_get_drvdata(&dev->dev);
+ 	struct ibmveth_adapter *adapter = netdev_priv(netdev);
+-	int i;
+ 
+ 	disable_work_sync(&adapter->work);
+ 
+-	for (i = 0; i < IBMVETH_NUM_BUFF_POOLS; i++)
+-		kobject_put(&adapter->rx_buff_pool[i].kobj);
++	ibmveth_put_pool_kobjs(adapter);
+ 
+ 	unregister_netdev(netdev);
+ 
+@@ -2221,7 +2257,7 @@ static const struct sysfs_ops veth_pool_
+ };
+ 
+ static struct kobj_type ktype_veth_pool = {
+-	.release        = NULL,
++	.release        = ibmveth_pool_kobj_release,
+ 	.sysfs_ops      = &veth_pool_ops,
+ 	.default_groups = veth_pool_groups,
+ };
+--- a/drivers/net/ethernet/ibm/ibmveth.h
++++ b/drivers/net/ethernet/ibm/ibmveth.h
+@@ -14,6 +14,8 @@
+ #ifndef _IBMVETH_H
+ #define _IBMVETH_H
+ 
++#include <linux/completion.h>
++
+ /* constants for H_MULTICAST_CTRL */
+ #define IbmVethMcastReceptionModifyBit     0x80000UL
+ #define IbmVethMcastReceptionEnableBit     0x20000UL
+@@ -143,6 +145,7 @@ struct ibmveth_buff_pool {
+     struct sk_buff **skbuff;
+     int active;
+     struct kobject kobj;
++	struct completion released;
+ };
+ 
+ struct ibmveth_rx_q {
