@@ -1,0 +1,920 @@
+#!/usr/bin/python3
+
+import argparse
+import multiprocessing
+from multiprocessing.pool import Pool
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from typing import Dict, List, Optional, Set, Tuple
+
+from alt_commits.alt_lib import (
+    ALGORITHM_VERSION,
+    DetectionType,
+    FileLock,
+    get_db_algorithm_version,
+    resolve_db_path,
+    resolve_repo_path,
+)
+
+CHERRY_PICK_RE = re.compile(r"\(cherry picked from commit ([a-fA-F0-9]{40})\)")
+CHUNK_SIZE = 2000  # Default commit chunk size
+BUCKET_CHUNK_SIZE = 20  # Granular worker load-balancing
+MAX_MAINLINE_CYCLE_GAP = 75 * 86400  # Hard 75-day max gap (~1 kernel release cycle)
+
+DETECTION_PRIORITY = (
+    DetectionType.CHERRY_PICK_TAG,
+    DetectionType.SUBJECT_AND_DIFF,
+    DetectionType.SUBJECT_AND_TIMESTAMP,
+)
+
+
+class CommitInfo:
+    """Strongly-typed metadata container for commit comparisons."""
+
+    __slots__ = (
+        "sha",
+        "author_name",
+        "author_date",
+        "committer_date",
+        "subject",
+        "body",
+        "files",
+    )
+
+    def __init__(
+        self,
+        sha: str,
+        author_name: str,
+        author_date: int,
+        committer_date: int,
+        subject: str,
+        body: str,
+        files: Set[str],
+    ) -> None:
+        self.sha = sha
+        self.author_name = author_name
+        self.author_date = author_date
+        self.committer_date = committer_date
+        self.subject = subject
+        self.body = body
+        self.files = files
+
+
+class DisjointSet:
+    """Fast, iterative Union-Find with path compression (stack-safe)."""
+
+    def __init__(self):
+        self.parent = {}
+
+    def find(self, item: str) -> str:
+        if item not in self.parent:
+            self.parent[item] = item
+            return item
+
+        root = item
+        while root != self.parent[root]:
+            root = self.parent[root]
+
+        curr = item
+        while curr != root:
+            nxt = self.parent[curr]
+            self.parent[curr] = root
+            curr = nxt
+
+        return root
+
+    def union(self, item1: str, item2: str):
+        root1 = self.find(item1)
+        root2 = self.find(item2)
+        if root1 != root2:
+            self.parent[root1] = root2
+
+
+def log_status(msg: str, verbose: bool = False, quiet: bool = False, force_newline: bool = False):
+    """Outputs log message either multi-line (if verbose) or dynamically on a single line."""
+    if quiet:
+        return
+    if verbose:
+        print(msg)
+    else:
+        sys.stdout.write(f"\r\033[K{msg}")
+        if force_newline:
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+def format_duration(seconds: float) -> str:
+    """Formats duration into human-readable string (e.g. 1h 02m 15.40s)."""
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {secs:.2f}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{int(hours)}h {int(minutes)}m {secs:.2f}s"
+
+
+def normalize_subject_for_comparison(subj: str) -> str:
+    """Strip git mailing-list/patch bracketed prefixes (e.g., '[PATCH v2]', '[stable]')."""
+    if not subj:
+        return ""
+    s = subj.strip().lower()
+    s = re.sub(r"^(\[.*?\]\s*)+", "", s)
+    return s.strip()
+
+
+def run_git(cmd: List[str], cwd: str = ".") -> str:
+    res = subprocess.run(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        errors="replace",
+        check=True,
+    )
+    return res.stdout.strip()
+
+
+def get_subject_for_sha(sha: str, sha_map: Dict[str, str], repo_path: str) -> str:
+    """Retrieve subject line for a SHA, falling back to git log if not pre-indexed."""
+    if sha in sha_map:
+        return sha_map[sha]
+    try:
+        subj = run_git(["git", "log", "-1", "--format=%s", sha], cwd=repo_path)
+        if subj:
+            sha_map[sha] = subj
+            return subj
+    except Exception:
+        pass
+    return ""
+
+
+def init_db(db_path: str, rebuild: bool = False):
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    with conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        if rebuild:
+            conn.execute("DROP TABLE IF EXISTS hashes;")
+            conn.execute("DROP TABLE IF EXISTS state;")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS hashes (
+                hash_value BLOB NOT NULL PRIMARY KEY CHECK(length(hash_value) = 20),
+                group_id INTEGER NOT NULL,
+                detection_type INTEGER NOT NULL
+            ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS idx_hashes_group ON hashes(group_id);
+
+            CREATE TABLE IF NOT EXISTS state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+        """)
+    conn.close()
+
+
+def get_last_processed_commit(db_path: str, repo_path: str, verbose: bool = False, quiet: bool = False) -> Optional[str]:
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM state WHERE key = 'last_commit'")
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    last_sha = row[0]
+    try:
+        subprocess.run(
+            ["git", "cat-file", "-e", f"{last_sha}^{{commit}}"],
+            cwd=repo_path,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        return last_sha
+    except subprocess.CalledProcessError:
+        log_status(f"Warning: Checkpointed commit {last_sha[:10]} no longer exists. Starting fresh scan.", verbose, quiet, force_newline=verbose)
+        return None
+
+
+def get_commit_list(repo_path: str, rev_spec: str) -> List[str]:
+    try:
+        out = run_git(
+            ["git", "rev-list", "--no-merges", "--reverse", "--no-abbrev-commit", rev_spec],
+            cwd=repo_path,
+        )
+        return [c for c in out.splitlines() if len(c) == 40] if out else []
+    except Exception:
+        return []
+
+
+# -----------------------------------------------------------------------------
+# Process Workers Namespace
+# -----------------------------------------------------------------------------
+
+class Workers:
+    """Isolated, picklable multiprocessing task handlers."""
+
+    @staticmethod
+    def fetch_commit_metadata(args: Tuple[str, List[str]]) -> Dict[str, CommitInfo]:
+        """Worker function: Stream author, dates, subject, body, and modified files for a chunk of SHAs."""
+        repo_path, shas = args
+        input_shas = "\n".join(shas) + "\n"
+
+        sha_to_info = {}
+        cmd = [
+            "git",
+            "--no-pager",
+            "log",
+            "-z",
+            "--ignore-missing",
+            "--no-walk",
+            "--no-merges",
+            "--stdin",
+            "--name-only",
+            "--format=%H%n%an%n%at%n%ct%n%s%n%b%x01",
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_path,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=1024 * 1024,
+        )
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        try:
+            proc.stdin.write(input_shas.encode("utf-8"))
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+
+        buffer = bytearray()
+        curr_info: Optional[CommitInfo] = None
+
+        while True:
+            chunk = proc.stdout.read(65536)
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            while b"\x00" in buffer:
+                pos = buffer.index(b"\x00")
+                record = buffer[:pos].decode("utf-8", errors="replace")
+                del buffer[: pos + 1]
+
+                if "\x01" in record:
+                    if curr_info:
+                        sha_to_info[curr_info.sha] = curr_info
+                        curr_info = None
+
+                    meta_part, first_file = record.split("\x01", 1)
+                    parts = meta_part.split("\n", 5)
+                    if len(parts) >= 5 and len(parts[0].strip()) == 40:
+                        sha = parts[0].strip().lower()
+                        author_name = parts[1].strip()
+                        try:
+                            author_date = int(parts[2].strip())
+                        except ValueError:
+                            author_date = 0
+                        try:
+                            committer_date = int(parts[3].strip())
+                        except ValueError:
+                            committer_date = 0
+                        subject = parts[4].strip()
+                        body = parts[5] if len(parts) > 5 else ""
+
+                        files = set()
+                        if first_file.strip():
+                            files.add(first_file.strip())
+
+                        curr_info = CommitInfo(
+                            sha=sha,
+                            author_name=author_name,
+                            author_date=author_date,
+                            committer_date=committer_date,
+                            subject=subject,
+                            body=body,
+                            files=files,
+                        )
+                elif curr_info:
+                    f = record.strip()
+                    if f:
+                        curr_info.files.add(f)
+
+        if curr_info:
+            sha_to_info[curr_info.sha] = curr_info
+
+        proc.stdout.close()
+        proc.wait()
+        return sha_to_info
+
+    @staticmethod
+    def process_subject_bucket(
+        chunk_buckets: List[List[CommitInfo]],
+    ) -> Tuple[int, List[Tuple[str, str]]]:
+        """Worker function: Compare commits within subject buckets for timestamp matches."""
+        author_date_matches = []
+
+        for commits in chunk_buckets:
+            n = len(commits)
+
+            for i in range(n):
+                c1 = commits[i]
+                for j in range(i + 1, n):
+                    c2 = commits[j]
+
+                    if c1.files and c2.files and not (c1.files & c2.files):
+                        continue
+
+                    time_diff = abs(c1.author_date - c2.author_date) if (c1.author_date and c2.author_date) else float("inf")
+                    if time_diff > MAX_MAINLINE_CYCLE_GAP:
+                        continue
+
+                    if c1.author_date > 0 and c1.author_date == c2.author_date:
+                        author_date_matches.append((c1.sha, c2.sha))
+
+        return len(chunk_buckets), author_date_matches
+
+    @staticmethod
+    def process_patch_id(args: Tuple[str, List[str]]) -> List[Tuple[str, str]]:
+        """Worker function: Compute patch IDs for candidate SHAs."""
+        repo_path, shas = args
+        input_shas = "\n".join(shas) + "\n"
+
+        log_cmd = [
+            "git",
+            "--no-pager",
+            "log",
+            "--ignore-missing",
+            "--no-walk",
+            "--no-merges",
+            "--stdin",
+            "-p",
+            "--no-renames",
+            "--no-abbrev-commit",
+        ]
+        log_proc = subprocess.Popen(
+            log_cmd,
+            cwd=repo_path,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+            errors="replace",
+            bufsize=1024 * 1024,
+        )
+
+        patch_cmd = ["git", "patch-id", "--stable"]
+        patch_proc = subprocess.Popen(
+            patch_cmd,
+            stdin=log_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+            errors="replace",
+            bufsize=1024 * 1024,
+        )
+        assert log_proc.stdout is not None
+        assert log_proc.stdin is not None
+        assert patch_proc.stdout is not None
+        log_proc.stdout.close()
+
+        try:
+            log_proc.stdin.write(input_shas)
+            log_proc.stdin.close()
+        except BrokenPipeError:
+            pass
+
+        results = []
+        for line in patch_proc.stdout:
+            parts = line.strip().split()
+            if len(parts) == 2:
+                patch_id, sha = parts[0], parts[1].lower()
+                if len(sha) == 40:
+                    results.append((patch_id, sha))
+
+        patch_proc.stdout.close()
+        patch_proc.wait()
+        log_proc.wait()
+        return results
+
+
+# -----------------------------------------------------------------------------
+# Modular Pipeline Stage Functions
+# -----------------------------------------------------------------------------
+
+def load_existing_db_state(
+    db_path: str, dsu: DisjointSet, verbose: bool = False, quiet: bool = False
+) -> Tuple[dict, defaultdict]:
+    """Load existing mapping state and build initial DisjointSet groups."""
+    existing_sha_to_gid = {}
+    gid_to_shas = defaultdict(list)
+    sha_detection = defaultdict(set)
+
+    log_status("Loading existing database state into memory...", verbose, quiet)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT hex(hash_value), group_id, detection_type FROM hashes")
+    for sha_hex, gid, dt_int in cur.fetchall():
+        sha_lower = sha_hex.lower()
+        if len(sha_lower) == 40:
+            existing_sha_to_gid[sha_lower] = gid
+            gid_to_shas[gid].append(sha_lower)
+            if dt_int is not None:
+                try:
+                    sha_detection[sha_lower].add(DetectionType(dt_int))
+                except ValueError:
+                    pass
+    conn.close()
+
+    for gid, shas in gid_to_shas.items():
+        first_sha = shas[0]
+        for other_sha in shas[1:]:
+            dsu.union(first_sha, other_sha)
+
+    return existing_sha_to_gid, sha_detection
+
+
+def run_metadata_pass(
+    repo_path: str,
+    shas_to_scan: List[str],
+    new_commits_set: Set[str],
+    dsu: DisjointSet,
+    sha_detection: defaultdict,
+    pool: Pool,
+    verbose: bool = False,
+    quiet: bool = False,
+) -> Tuple[Dict[str, str], Dict[str, CommitInfo], int]:
+    """Extract metadata for SHAs and identify explicit cherry-pick tag relationships with subject cross-validation."""
+    t0 = time.perf_counter()
+    log_status(f"Fetching metadata for {len(shas_to_scan):,} commits...", verbose, quiet)
+    chunks = [
+        (repo_path, shas_to_scan[i : i + CHUNK_SIZE])
+        for i in range(0, len(shas_to_scan), CHUNK_SIZE)
+    ]
+
+    sha_to_subject = {}
+    sha_to_meta: Dict[str, CommitInfo] = {}
+    candidate_tag_matches = []
+
+    for chunk_info in pool.imap_unordered(Workers.fetch_commit_metadata, chunks):
+        for sha, info in chunk_info.items():
+            sha_to_subject[sha] = info.subject
+            sha_to_meta[sha] = info
+            dsu.find(sha)
+
+            match = CHERRY_PICK_RE.search(info.body)
+            if match:
+                original_sha = match.group(1).lower()
+                if len(original_sha) == 40:
+                    candidate_tag_matches.append((sha, original_sha))
+
+    tag_match_count = 0
+    bogus_tag_count = 0
+
+    for sha, original_sha in candidate_tag_matches:
+        subj1 = get_subject_for_sha(sha, sha_to_subject, repo_path)
+        subj2 = get_subject_for_sha(original_sha, sha_to_subject, repo_path)
+
+        n1 = normalize_subject_for_comparison(subj1)
+        n2 = normalize_subject_for_comparison(subj2)
+
+        if n1 and n2 and (n1 == n2 or n1 in n2 or n2 in n1):
+            dsu.union(sha, original_sha)
+            if sha in new_commits_set:
+                tag_match_count += 1
+            sha_detection[sha].add(DetectionType.CHERRY_PICK_TAG)
+            sha_detection[original_sha].add(DetectionType.CHERRY_PICK_TAG)
+        else:
+            bogus_tag_count += 1
+
+    elapsed = time.perf_counter() - t0
+    bogus_msg = f" (filtered out {bogus_tag_count:,} bogus tags)" if bogus_tag_count > 0 else ""
+    if not quiet:
+        if verbose:
+            print(f"  -> Detected {tag_match_count:,} new commits via explicit cherry-pick tags{bogus_msg}. [{format_duration(elapsed)}]")
+        else:
+            log_status(f"Cherry-pick tag pass: {tag_match_count:,} matches [{format_duration(elapsed)}]", verbose, quiet)
+
+    return sha_to_subject, sha_to_meta, tag_match_count
+
+
+def run_patch_id_pass(
+    repo_path: str,
+    subject_to_shas: dict,
+    sha_to_subject: Dict[str, str],
+    new_commits_set: Set[str],
+    dsu: DisjointSet,
+    sha_detection: defaultdict,
+    pool: Pool,
+    verbose: bool = False,
+    quiet: bool = False,
+) -> Tuple[int, int]:
+    """Run high-reliability patch-ID pass on candidate commits sharing a subject line."""
+    t0 = time.perf_counter()
+    candidate_shas = set()
+    for subj, shas in subject_to_shas.items():
+        if len(shas) >= 2:
+            roots = {dsu.find(s) for s in shas}
+            if len(roots) > 1:
+                candidate_shas.update(shas)
+
+    patch_group_count = 0
+    patch_commit_count = 0
+
+    if candidate_shas:
+        candidate_list = list(candidate_shas)
+        log_status(f"Running patch-ID diff matching on {len(candidate_list):,} candidate commits...", verbose, quiet)
+        fb_chunks = [
+            (repo_path, candidate_list[i : i + CHUNK_SIZE])
+            for i in range(0, len(candidate_list), CHUNK_SIZE)
+        ]
+
+        patch_to_shas = defaultdict(list)
+        for chunk_results in pool.imap_unordered(Workers.process_patch_id, fb_chunks):
+            for patch_id, sha in chunk_results:
+                subj = sha_to_subject.get(sha, "")
+                norm_subj = normalize_subject_for_comparison(subj)
+                patch_to_shas[(patch_id, norm_subj)].append(sha)
+
+        for (_patch_id, _subject), shas in patch_to_shas.items():
+            if len(shas) > 1:
+                first_sha = shas[0]
+                for other_sha in shas[1:]:
+                    dsu.union(first_sha, other_sha)
+
+                for s in shas:
+                    sha_detection[s].add(DetectionType.SUBJECT_AND_DIFF)
+
+                new_in_group = [s for s in shas if s in new_commits_set]
+                if new_in_group:
+                    patch_group_count += 1
+                    patch_commit_count += len(new_in_group)
+
+        elapsed = time.perf_counter() - t0
+        if not quiet:
+            if verbose:
+                print(f"  -> Detected {patch_commit_count:,} new commits via patch-ID diff matching. [{format_duration(elapsed)}]")
+            else:
+                log_status(f"Patch-ID pass: {patch_commit_count:,} matches [{format_duration(elapsed)}]", verbose, quiet)
+
+    return patch_group_count, patch_commit_count
+
+
+def run_subject_bucket_pass(
+    sha_to_subject: Dict[str, str],
+    sha_to_meta: Dict[str, CommitInfo],
+    new_commits_set: Set[str],
+    dsu: DisjointSet,
+    sha_detection: defaultdict,
+    num_workers: int,
+    pool: Pool,
+    verbose: bool = False,
+    quiet: bool = False,
+) -> Tuple[defaultdict, dict]:
+    """Group commits by subject and match via timestamps."""
+    t0 = time.perf_counter()
+    subject_to_shas = defaultdict(list)
+    for sha, subj in sha_to_subject.items():
+        norm_subj = normalize_subject_for_comparison(subj)
+        if norm_subj:
+            subject_to_shas[norm_subj].append(sha)
+
+    candidate_buckets = [
+        [sha_to_meta[s] for s in shas if s in sha_to_meta]
+        for shas in subject_to_shas.values()
+        if len(shas) >= 2
+    ]
+    candidate_buckets.sort(key=len, reverse=True)
+
+    stats = {
+        "ad_groups": 0, "ad_commits": 0,
+    }
+
+    if candidate_buckets:
+        log_status(f"Evaluating {len(candidate_buckets):,} subject buckets across {num_workers} workers...", verbose, quiet)
+        bucket_chunks = [
+            candidate_buckets[i : i + BUCKET_CHUNK_SIZE]
+            for i in range(0, len(candidate_buckets), BUCKET_CHUNK_SIZE)
+        ]
+
+        processed_buckets = 0
+        total_buckets = len(candidate_buckets)
+
+        for count, ad_matches in pool.imap_unordered(
+            Workers.process_subject_bucket, bucket_chunks
+        ):
+            processed_buckets += count
+
+            for sha1, sha2 in ad_matches:
+                dsu.union(sha1, sha2)
+                sha_detection[sha1].add(DetectionType.SUBJECT_AND_TIMESTAMP)
+                sha_detection[sha2].add(DetectionType.SUBJECT_AND_TIMESTAMP)
+
+                if sha1 in new_commits_set or sha2 in new_commits_set:
+                    stats["ad_groups"] += 1
+                    if sha1 in new_commits_set:
+                        stats["ad_commits"] += 1
+                    if sha2 in new_commits_set:
+                        stats["ad_commits"] += 1
+
+            pct = min((processed_buckets / total_buckets) * 100, 100.0)
+            if not quiet:
+                if verbose:
+                    sys.stdout.write(
+                        f"\r\033[K  Subject Bucket Scan: {processed_buckets:,}/{total_buckets:,} buckets evaluated ({pct:.1f}%)"
+                    )
+                    sys.stdout.flush()
+                else:
+                    log_status(f"Subject Bucket Scan: {processed_buckets:,}/{total_buckets:,} ({pct:.1f}%)", verbose, quiet)
+
+        pct = min((processed_buckets / total_buckets) * 100, 100.0) if total_buckets else 100.0
+        elapsed = time.perf_counter() - t0
+        if not quiet:
+            if verbose:
+                sys.stdout.write(
+                    f"\r\033[K  Subject Bucket Scan: {processed_buckets:,}/{total_buckets:,} buckets evaluated ({pct:.1f}%) [{format_duration(elapsed)}]\n"
+                )
+                sys.stdout.flush()
+            else:
+                log_status(f"Subject Bucket Scan complete: {stats['ad_commits']:,} matches [{format_duration(elapsed)}]", verbose, quiet)
+
+    return subject_to_shas, stats
+
+
+def print_detection_summary(
+    tag_match_count: int,
+    bucket_stats: dict,
+    patch_group_count: int,
+    patch_commit_count: int,
+    total_elapsed: float,
+):
+    """Print the final run summary metrics."""
+    print("\n--- Detection Summary (Current Run Only) ---")
+    print(f"  Cherry-Pick Tags       : {tag_match_count:,} commits")
+    print(f"  Subject & Diff         : {patch_commit_count:,} commits ({patch_group_count:,} groups)")
+    print(f"  Subject & Timestamp    : {bucket_stats['ad_commits']:,} commits ({bucket_stats['ad_groups']:,} groups)")
+    print(f"  Total Execution Time   : {format_duration(total_elapsed)}")
+    print("--------------------------------------------\n")
+
+
+def save_results_to_db(
+    db_path: str,
+    dsu: DisjointSet,
+    existing_sha_to_gid: dict,
+    sha_detection: defaultdict,
+    latest_commit: Optional[str],
+    verbose: bool = False,
+    quiet: bool = False,
+):
+    """Persist final group assignments and commit checkpoints to SQLite."""
+    t0 = time.perf_counter()
+    log_status("Writing groups to SQLite...", verbose, quiet)
+    root_to_members = defaultdict(list)
+    for sha in list(dsu.parent.keys()):
+        root = dsu.find(sha)
+        root_to_members[root].append(sha)
+
+    max_gid = max(existing_sha_to_gid.values(), default=0)
+    next_gid = max_gid + 1
+
+    db_records = []
+
+    for root, members in root_to_members.items():
+        existing_gids = {
+            existing_sha_to_gid[m] for m in members if m in existing_sha_to_gid
+        }
+
+        if len(members) < 2 and not existing_gids:
+            continue
+
+        target_gid = min(existing_gids) if existing_gids else next_gid
+        if not existing_gids:
+            next_gid += 1
+
+        for sha in members:
+            if len(sha) == 40:
+                try:
+                    b_sha = bytes.fromhex(sha)
+                    if len(b_sha) == 20:
+                        types = sha_detection.get(sha, set())
+                        dt_val = next(
+                            (t for t in DETECTION_PRIORITY if t in types),
+                            DetectionType.CHERRY_PICK_TAG,
+                        )
+                        db_records.append((b_sha, target_gid, dt_val.value))
+                except ValueError:
+                    continue
+
+    conn = sqlite3.connect(db_path)
+    with conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO hashes (hash_value, group_id, detection_type) VALUES (?, ?, ?)",
+            db_records,
+        )
+        if latest_commit and len(latest_commit) == 40:
+            conn.execute(
+                "INSERT OR REPLACE INTO state (key, value) VALUES ('last_commit', ?)",
+                (latest_commit,),
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO state (key, value) VALUES ('algorithm_version', ?)",
+            (str(ALGORITHM_VERSION),),
+        )
+
+    conn.close()
+    elapsed = time.perf_counter() - t0
+    if not quiet:
+        if verbose:
+            print(f"Done! Saved {len(db_records):,} linked commit hashes to DB in {format_duration(elapsed)}.")
+        else:
+            log_status("Saved records to database.", verbose, quiet)
+
+
+def process_repository(
+    repo_path: str,
+    db_path: str,
+    num_workers: int,
+    verbose: bool = False,
+    quiet: bool = False,
+    rebuild: bool = False,
+):
+    """Main pipeline driver orchestrating repo processing."""
+    total_start = time.perf_counter()
+    log_status(f"Targeting repository: {repo_path}", verbose, quiet)
+
+    db_exists = os.path.exists(db_path)
+    current_algo_ver = get_db_algorithm_version(db_path) if db_exists else 0
+    if db_exists and not rebuild and current_algo_ver < ALGORITHM_VERSION:
+        log_status(
+            f"Detected outdated database algorithm version ({current_algo_ver} < {ALGORITHM_VERSION}). Starting full rebuild...",
+            verbose,
+            quiet,
+            force_newline=True,
+        )
+        rebuild = True
+
+    init_db(db_path, rebuild=rebuild)
+
+    if rebuild:
+        last_commit = None
+    else:
+        last_commit = get_last_processed_commit(db_path, repo_path, verbose, quiet)
+
+    if last_commit:
+        rev_spec = f"{last_commit}..HEAD"
+        log_status(f"Resuming scan from last commit checkpoint: {last_commit[:10]}...", verbose, quiet)
+    else:
+        rev_spec = "HEAD"
+        log_status("Starting full scan from beginning of repository...", verbose, quiet)
+
+    t0 = time.perf_counter()
+    log_status(f"Fetching commit list for range ({rev_spec})...", verbose, quiet)
+    new_commits = get_commit_list(repo_path, rev_spec)
+    total_new_commits = len(new_commits)
+    new_commits_set = set(new_commits)
+
+    if not quiet:
+        if verbose:
+            print(f"Found {total_new_commits:,} new commits in {format_duration(time.perf_counter() - t0)}.")
+        else:
+            log_status(f"Found {total_new_commits:,} new commits.", verbose, quiet)
+
+    if total_new_commits == 0:
+        if rebuild:
+            conn = sqlite3.connect(db_path)
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO state (key, value) VALUES ('algorithm_version', ?)",
+                    (str(ALGORITHM_VERSION),),
+                )
+            conn.close()
+        log_status("No new commits to process.", verbose, quiet, force_newline=True)
+        return
+
+    log_status(f"Using {num_workers} CPU cores for processing.", verbose, quiet)
+
+    dsu = DisjointSet()
+    t0 = time.perf_counter()
+    existing_sha_to_gid, sha_detection = load_existing_db_state(db_path, dsu, verbose, quiet)
+    if not quiet and verbose:
+        print(f"Loaded existing DB state in {format_duration(time.perf_counter() - t0)}.")
+
+    existing_db_shas = list(existing_sha_to_gid.keys())
+    shas_to_scan = list(dict.fromkeys(new_commits + existing_db_shas))
+
+    ctx = multiprocessing.get_context("forkserver" if "forkserver" in multiprocessing.get_all_start_methods() else "spawn")
+
+    with ctx.Pool(processes=num_workers) as pool:
+        # 1. Metadata and Explicit Cherry-Pick Tags Pass
+        sha_to_subject, sha_to_meta, tag_match_count = run_metadata_pass(
+            repo_path, shas_to_scan, new_commits_set, dsu, sha_detection, pool, verbose, quiet
+        )
+
+        # Build subject index for candidate matching passes
+        subject_to_shas = defaultdict(list)
+        for sha, subj in sha_to_subject.items():
+            norm_subj = normalize_subject_for_comparison(subj)
+            if norm_subj:
+                subject_to_shas[norm_subj].append(sha)
+
+        # 2. Patch-ID Matching Pass (Code Diff Matching - Rank 2 Priority)
+        patch_group_count, patch_commit_count = run_patch_id_pass(
+            repo_path, subject_to_shas, sha_to_subject, new_commits_set, dsu, sha_detection, pool, verbose, quiet
+        )
+
+        # 3. Subject Bucket Timestamp Matching Pass (Rank 3 Priority)
+        _, bucket_stats = run_subject_bucket_pass(
+            sha_to_subject, sha_to_meta, new_commits_set, dsu, sha_detection, num_workers, pool, verbose, quiet
+        )
+
+    # 4. Summary & DB Persistence (after worker pool is fully closed)
+    latest_commit: Optional[str] = None
+    try:
+        latest_commit = run_git(["git", "rev-parse", "HEAD"], cwd=repo_path)
+    except Exception:
+        latest_commit = new_commits[-1] if new_commits else None
+
+    save_results_to_db(
+        db_path, dsu, existing_sha_to_gid, sha_detection, latest_commit, verbose, quiet
+    )
+
+    total_elapsed = time.perf_counter() - total_start
+    if not quiet:
+        if verbose:
+            print_detection_summary(tag_match_count, bucket_stats, patch_group_count, patch_commit_count, total_elapsed)
+        else:
+            log_status(
+                f"Done! Processed {total_new_commits:,} commits in {format_duration(total_elapsed)} "
+                f"(Tags: {tag_match_count:,}, Diff: {patch_commit_count:,}, Timestamp: {bucket_stats['ad_commits']:,})",
+                verbose=False,
+                quiet=False,
+                force_newline=True,
+            )
+
+
+if __name__ == "__main__":
+    cpu_count = os.cpu_count() or 4
+
+    parser = argparse.ArgumentParser(
+        description="Scan a Git repository for cherry-picks and group matching commit hashes in SQLite.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "repo_path",
+        nargs="?",
+        default=None,
+        help="Path to the Git repository target directory (defaults to $LINUX_GIT if set).",
+    )
+    parser.add_argument(
+        "--db",
+        default=None,
+        help="Path to the SQLite database file (defaults to .git/alt-commits.db in kernel-source repo).",
+    )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=cpu_count,
+        help="Number of parallel worker processes to spawn.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable detailed verbose multi-line output.",
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress all progress and log output.",
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Force a full rescan from scratch, clearing existing database records.",
+    )
+
+    args = parser.parse_args()
+    repo_path = resolve_repo_path(args.repo_path)
+    db_path = resolve_db_path(args.db)
+    lock = FileLock(f"{db_path}.lock")
+
+    if not lock.acquire(blocking=False):
+        log_status("Another instance of alt-scan is already running. Exiting.", args.verbose, args.quiet, force_newline=True)
+        sys.exit(0)
+
+    try:
+        process_repository(repo_path, db_path, args.jobs, args.verbose, args.quiet, rebuild=args.rebuild)
+    finally:
+        lock.release()

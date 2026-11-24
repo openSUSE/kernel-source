@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from libs.command import get_printable_cmd
+from kernel_sandbox.command import get_printable_cmd
 
 
 class TestGetPrintableCmd(unittest.TestCase):
