@@ -1,4 +1,8 @@
 #!/usr/bin/python3
+import sys
+if sys.version_info < (3, 6):
+    raise RuntimeError('python 3.6 or later required')
+
 """
 Synopsis: determine the current kernel source version from a series of patches
           as being referenced from series.conf
@@ -39,6 +43,12 @@ License: {license}
 # pylint: disable=line-too-long, missing-function-docstring, unspecified-encoding
 # pylint: disable=consider-using-f-string, consider-using-sys-exit
 
+from typing import cast, Any, List, Iterable, TypeVar, Union, Mapping, Dict, Iterator, Tuple, Optional, Sequence, NoReturn
+try:
+    from _typeshed import SupportsKeysAndGetItem
+    DSI = Union[SupportsKeysAndGetItem[str, str], Iterable[Tuple[str, str]]]
+except:
+    DSI = Union[Mapping[str, str], Iterable[Tuple[str, str]]]  # type: ignore[misc]
 import configparser
 import subprocess
 import shlex
@@ -47,20 +57,23 @@ import os
 
 # some commonly used functions
 
-def uniq(lst):
+T = TypeVar('T')
+BytesStr = Union[bytes, str]
+
+def uniq(lst: Sequence[T]) -> Sequence[T]:
     # fairly slow but does not require any special property of elements nor ordered dictionaries
     return [x for i, x in enumerate(lst) if i == lst.index(x)]
 
-def init_repo(tmpdirname, repo, branch):
+def init_repo(tmpdirname: str, repo: str, branch: str) -> str:
     subprocess.check_call(['git', 'init', '-q', '--object-format=sha256', '-b', branch, repo], cwd=tmpdirname)
     return os.path.join(tmpdirname, repo)
 
-def get_source_timestamp(directory):
+def get_source_timestamp(directory: str) -> str:
     with open(os.path.join(directory, 'source-timestamp'), 'r') as fd:
         source_timestamp = fd.read().splitlines()
     return '\n'.join(source_timestamp[1:] + [source_timestamp[0]])
 
-def list_files(directory):
+def list_files(directory: str) -> Sequence[str]:
     if len(directory) > 1:
         directory = directory.rstrip('/')
     result = []
@@ -69,11 +82,11 @@ def list_files(directory):
             result.append(os.path.join(root, f)[len(directory)+1:])
     return sorted(result)
 
-def list_specs(directory):
+def list_specs(directory: str) -> Sequence[str]:
     ext = '.spec'
     return [f[0:-len(ext)] for f in list_files(directory) if f.endswith(ext)]
 
-def read_source_timestamp(directory):
+def read_source_timestamp(directory: str) -> Mapping[str, str]:
     file = os.path.join(directory, 'source-timestamp')
     cp = configparser.ConfigParser(delimiters=(':'), interpolation=None)
     with open(file, 'r') as fd:
@@ -84,7 +97,7 @@ def read_source_timestamp(directory):
 class SrcVersion:
     """Class, defining a source code version, allows parsing from string, updating single values
     and returns the resulting version as string repr"""
-    def __init__(self, version_str):
+    def __init__(self, version_str: str):
         self.version = '0'
         self.patchlevel = '0'
         self.sublevel = '0'
@@ -110,40 +123,41 @@ class SrcVersion:
             if value is not None:
                 self.update(part, value)
 
-    def update(self, part, value):
+    def update(self, part:str, value:str) -> None:
         """Update a specific version component to a new value"""
         if part in self._partlist:
             setattr(self, part, value)
 
-    def __str__(self):
+    def __str__(self) -> str:
         return '{version}.{patchlevel}.{sublevel}{extraversion}'.format(**self.__dict__)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Tuple[str, str]]:
         for index, item in self.__dict__.items():
             if index in self._partlist:
                 yield index, item
 
-class CaseInsensitiveDict(dict):
-    def __init__(self, *args, **kwargs):
+class CaseInsensitiveDict(Dict[str, str]):
+    def __init__(self, *args: DSI, **kwargs: str):
         self.update(*args, **kwargs)
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: str) -> str:
         return super().__getitem__(key.casefold())
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key: str, value: str) -> None:
         return super().__setitem__(key.casefold(), value)
 
-    def __contains__(self, key):
-        return super().__contains__(key.casefold())
+    def __contains__(self, key: Any) -> bool:
+        return isinstance(key, str) and super().__contains__(key.casefold())
 
-    def get(self, key, default=None):
+    # https://github.com/python/mypy/issues/3737
+    def get(self, key: str, default: T = None) -> Union[str, T]:  # type: ignore[assignment]
         return super().get(key.casefold(), default)
 
-    def update(self, *args, **kwargs):
+    def update(self, *args: DSI, **kwargs: str) -> None:
         for k, v in dict(*args, **kwargs).items():
             self[k] = v
 
-    def getboolean(self, key):
+    def getboolean(self, key: str) -> bool:
         if not key.casefold() in self:
             return False
         value = self.get(key)
@@ -157,11 +171,11 @@ class CaseInsensitiveDict(dict):
             return False
         raise ValueError('Do not know how to interpret "%s" as boolean' % (value,))
 
-    def getversion(self, key):
+    def getversion(self, key: str) -> SrcVersion:
         return SrcVersion(self.get(key))
 
 
-def read_config_sh(package_tar_up_dir):
+def read_config_sh(package_tar_up_dir: str) -> CaseInsensitiveDict:
     """Parse config.sh file and return a dict with key value pairs"""
     config_sh = os.path.join(package_tar_up_dir, 'config.sh')
     with open(config_sh, 'rb') as f:
@@ -169,7 +183,7 @@ def read_config_sh(package_tar_up_dir):
     return read_config_sh_data(data, config_sh)
 
 
-def read_config_sh_data(data, filename=None):
+def read_config_sh_data(data: BytesStr, filename: Optional[str] = None) -> CaseInsensitiveDict:
     config = CaseInsensitiveDict()
     lnnr = 0
     if isinstance(data, bytes):
@@ -192,7 +206,7 @@ def read_config_sh_data(data, filename=None):
 
     return config
 
-def get_kernel_project_package(package_tar_up_dir):
+def get_kernel_project_package(package_tar_up_dir: str) -> Tuple[str, str]:
     rpm_config = read_config_sh(package_tar_up_dir)
     if 'ibs_project' in rpm_config:
         project = rpm_config.get('ibs_project')
@@ -207,10 +221,10 @@ def get_kernel_project_package(package_tar_up_dir):
     assert '/' not in specname
     return (project, specname)
 
-def get_kernel_projects(package_tar_up_dir):
+def get_kernel_projects(package_tar_up_dir: str) -> Mapping[str, Mapping[str, str]]:
     rpm_config = read_config_sh(package_tar_up_dir)
-    ibs_projects = {}
-    obs_projects = {}
+    ibs_projects: Dict[str, str] = {}
+    obs_projects: Dict[str, str] = {}
     for var in sorted(list(rpm_config.keys())):
         suffix = var[len('ibs_project_'):].upper()
         if var.startswith('ibs_project'):
@@ -234,7 +248,7 @@ def get_kernel_projects(package_tar_up_dir):
 # Multiple ExclusiveArgs tags may exist because of repository conditionals.
 # Dummy architectures like do_not_build or noarch are not provided by
 # repositories and do not affect the repository selection.
-def get_package_archs(package_tar_up_dir, limit_packages=None):
+def get_package_archs(package_tar_up_dir: str, limit_packages: Optional[Iterable[str]] = None) -> Iterable[str]:
     ext = '.spec'
     tag = 'ExclusiveArch:'.lower()
     limit_packages = limit_packages if limit_packages else []
@@ -261,7 +275,7 @@ def get_package_archs(package_tar_up_dir, limit_packages=None):
 
 # here starts the new compute-PATCHVERSION.py implementation
 
-def parse_series_conf(patchdir, series_conf):
+def parse_series_conf(patchdir: BytesStr, series_conf: BytesStr) -> Iterable[str]:
     """Parse the series.conf file, taking guards into account, and return a list of patch files"""
     # Use grep to extract patch file names from series.conf.
     # In a plain quilt series file the non-whitespace thing at the start of a line that is not a comment is
@@ -272,7 +286,7 @@ def parse_series_conf(patchdir, series_conf):
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     patches, errors = pipe.communicate()
     if pipe.returncode == 2:
-        raise RuntimeError('%s\n%s' % (pipe.args, errors))
+        raise RuntimeError('%r\n%r' % (pipe.args, errors))
     # The resulting patch filenames can be prefixed with whitespace.
     # However, they are fed to xargs which splits on whitespace conveniently stripping the leading whitespace
     # from the patch filenames. This alleviates the need to ever touch the buffer from python
@@ -280,12 +294,12 @@ def parse_series_conf(patchdir, series_conf):
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=patchdir)
     output, errors = pipe.communicate(input=patches)
     if errors:  # The return value from xargs grep is fairly meaningless but stderr should be empty
-        raise RuntimeError('%s\n%s' % (pipe.args, errors))
-    patches = [p.decode() for p in output.splitlines()]
+        raise RuntimeError('%r\n%r' % (pipe.args, errors))
+    patchlist = [p.decode() for p in output.splitlines()]
 
-    return patches
+    return patchlist
 
-def parse_makefiles(diff_text):
+def parse_makefiles(diff_text: str) -> Iterable[Mapping[str, str]]:
     """Locate changes to the toplevel Makefile in a unified diff file
     return applied changesets to the linux kernel version variables"""
     # match top level Makefile
@@ -333,20 +347,20 @@ def parse_makefiles(diff_text):
 
     return changes
 
-def compute_patchversion(bindir, rpmdir, patchdir):
+def compute_patchversion(bindir: str, rpmdir: str, patchdir: str) -> SrcVersion:
     """Compute patchversion from config.sh, series.conf and patch files"""
     patchdir = str(patchdir)
     if not os.path.isdir(patchdir):
         raise FileNotFoundError('patch directory {} not found'.format(patchdir))
 
     # fetch key, value pairs from config.sh
-    config = read_config_sh(str(bindir))
+    config = read_config_sh(bindir)
 
     # determine kernel base source code version
     src_version = config.getversion('srcversion')
 
     # fetch patch files from series.conf
-    series_conf = os.path.join(str(rpmdir), 'series.conf')
+    series_conf = os.path.join(rpmdir, 'series.conf')
     patches = parse_series_conf(patchdir, series_conf)
 
     # collect top level Makefile changesets from patch files
@@ -389,13 +403,13 @@ if __name__ == "__main__":
         rpmdir = '.'
         patchdir = '.'
 
-    def stdout(*msg):
+    def stdout(*msg: str) -> None:
         print(*msg, file = sys.stdout, flush = True)
 
-    def stderr(*msg):
+    def stderr(*msg: str) -> None:
         print(*msg, file = sys.stderr, flush = True)
 
-    def exit(ret = 0, msg = None, usage = False):
+    def exit(ret: int = 0, msg: Optional[Any] = None, usage: bool = False) -> NoReturn:
         """Terminate process with optional message and usage"""
         if msg:
             stderr('{}: {}'.format(gpar.appname, msg))
@@ -403,7 +417,7 @@ if __name__ == "__main__":
             stderr(__doc__.format(**gpar.__dict__))
         sys.exit(ret)
 
-    def main(argv = None):
+    def main(argv: Optional[Sequence[str]] = None) -> int:
         """Command line interface and console script entry point."""
         if argv is None:
             argv = sys.argv[1:]

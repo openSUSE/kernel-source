@@ -1,10 +1,12 @@
-from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership, get_maintainership
-from kutil.config import get_package_archs, get_kernel_projects, uniq
-from obsapi.obsapi import OBSAPI, PkgRepo, process_scmsync
-from obsapi.uploader import UploaderBase
+import sys
+if sys.version_info >= (3, 6):
+    from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership, get_maintainership
+    from kutil.config import get_package_archs, get_kernel_projects, uniq
+    from obsapi.obsapi import OBSAPI, PkgRepo, process_scmsync
+    from obsapi.uploader import UploaderBase
+    from obsapi.api import APIError
 import xml.etree.ElementTree as ET
 from difflib import unified_diff
-from obsapi.api import APIError
 from threading import Thread
 import email.message
 import configparser
@@ -207,6 +209,7 @@ class ServerThread():
     data_consumed = property(lambda self: self.httpd.index == len(self.httpd.data))
 
 
+@unittest.skipIf(sys.version_info < (3, 6), 'This code uses type annotations, python 3.6+ required to parse')
 class TestMisc(unittest.TestCase):
     def test_json_dump(self):
         testdata = [
@@ -343,6 +346,7 @@ class APITest(unittest.TestCase):
         tmpdir.cleanup()
 
 
+@unittest.skipIf(sys.version_info < (3, 6), 'This code uses type annotations, python 3.6+ required to parse')
 class TestTea(APITest):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -548,6 +552,7 @@ foobar''')
         self.log_cycle(test_fn, 'tests/api/branch_roll_forward')
 
 
+@unittest.skipIf(sys.version_info < (3, 6), 'This code uses type annotations, python 3.6+ required to parse')
 class TestOBS(APITest):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -860,8 +865,9 @@ class FakeOBS:
     def __init__(self, prjmeta):
         self.prjmeta = prjmeta
 
-    get_kernel_projects = OBSAPI.get_kernel_projects
-    get_project_repo_archs = OBSAPI.get_project_repo_archs
+    if sys.version_info >= (3, 6):
+        get_kernel_projects = OBSAPI.get_kernel_projects
+        get_project_repo_archs = OBSAPI.get_project_repo_archs
 
     def project_exists(self, project):
         prj = self.prjmeta.get(project, None)
@@ -873,6 +879,7 @@ class FakeOBS:
     def user_exists(self, user):
         return user in self.users
 
+@unittest.skipIf(sys.version_info < (3, 6), 'This code uses type annotations, python 3.6+ required to parse')
 class TestUploader(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
