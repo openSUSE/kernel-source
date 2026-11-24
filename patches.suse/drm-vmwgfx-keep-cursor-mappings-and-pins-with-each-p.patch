@@ -1,0 +1,217 @@
+From 02e5f28413e4d81f3d2aa85ad7f7da0b810812dd Mon Sep 17 00:00:00 2001
+From: Zack Rusin <zack.rusin@broadcom.com>
+Date: Tue, 27 Oct 2026 02:07:05 -0400
+Subject: drm/vmwgfx: keep cursor mappings and pins with each plane state
+Git-commit: 556271f0ade9d3f1ed0a386f29d3363be294c1fc
+Patch-mainline: v7.4-rc4
+References: bsc#1288038
+
+Cursor plane states duplicate the user object reference without acquiring
+its mapping or pin. Preparing the duplicated state nevertheless unmaps
+that object, and only pins the new buffer if it is not already pinned.
+Cleanup of an older state can therefore remove a mapping or pin still
+needed by another cursor commit. Repeated cursor updates from KMS clients
+can then access an unmapped or movable buffer.
+
+Give each prepared state its own mapping, buffer reference and pin, and
+reset the mapping when duplicating a state. Release only the resources
+owned by that state in cleanup_fb(). Map the required image extent for
+every state so resizing a cursor on the same buffer cannot reuse a
+smaller cached mapping. Unwind the pin and reservation if preparation
+fails.
+
+Fixes: 965544150d1c ("drm/vmwgfx: Refactor cursor handling")
+Cc: stable@vger.kernel.org
+Assisted-by: LLM
+Signed-off-by: Zack Rusin <zack.rusin@broadcom.com>
+Reviewed-by: Maaz Mombasawala <maaz.mombasawala@broadcom.com>
+Tested-by: fausten <yunfeng.li.nb@gmail.com>
+Link: https://patch.msgid.link/20261027211729.646988-2-zack.rusin@broadcom.com
+(cherry picked from commit 556271f0ade9d3f1ed0a386f29d3363be294c1fc)
+Acked-by: Thomas Zimmermann <tzimmermann@suse.com>
+---
+ drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.c | 71 ++++++++++++--------
+ drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.h |  4 ++
+ drivers/gpu/drm/vmwgfx/vmwgfx_kms.c          |  1 +
+ 3 files changed, 49 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.c b/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.c
+index ff54ea9cc72be..4a7b07f0f3ae7 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.c
+@@ -112,8 +112,7 @@ static void vmw_cursor_update_mob(struct vmw_private *vmw,
+ {
+ 	SVGAGBCursorHeader *header;
+ 	SVGAGBAlphaCursorHeader *alpha_header;
+-	struct vmw_bo *bo = vmw_user_object_buffer(&vps->uo);
+-	u32 *image = vmw_bo_map_and_cache(bo);
++	u32 *image = vps->cursor.map.virtual;
+ 	const u32 image_size = vps->base.crtc_w * vps->base.crtc_h * sizeof(*image);
+ 
+ 	header = vmw_bo_map_and_cache(vps->cursor.mob);
+@@ -132,7 +131,6 @@ static void vmw_cursor_update_mob(struct vmw_private *vmw,
+ 	memcpy(header + 1, image, image_size);
+ 	vmw_write(vmw, SVGA_REG_CURSOR_MOBID, vmw_bo_mobid(vps->cursor.mob));
+ 
+-	vmw_bo_unmap(bo);
+ 	vmw_bo_unmap(vps->cursor.mob);
+ }
+ 
+@@ -490,9 +488,21 @@ vmw_cursor_plane_cleanup_fb(struct drm_plane *plane,
+ {
+ 	struct vmw_cursor_plane *vcp = vmw_plane_to_vcp(plane);
+ 	struct vmw_plane_state *vps = vmw_plane_state_to_vps(old_state);
++	struct vmw_bo *bo;
++	int ret;
+ 
+-	if (!vmw_user_object_is_null(&vps->uo))
+-		vmw_user_object_unmap(&vps->uo);
++	if (vps->cursor.map.bo) {
++		bo = to_vmw_bo(&vps->cursor.map.bo->base);
++		ret = ttm_bo_reserve(&bo->tbo, false, false, NULL);
++		if (WARN_ON_ONCE(ret))
++			return;
++
++		ttm_bo_kunmap(&vps->cursor.map);
++		vps->cursor.map.bo = NULL;
++		ttm_bo_unpin(&bo->tbo);
++		ttm_bo_unreserve(&bo->tbo);
++		vmw_bo_unreference(&bo);
++	}
+ 
+ 	vmw_cursor_mob_unmap(vps);
+ 	vmw_cursor_mob_put(vcp, vps);
+@@ -625,10 +635,12 @@ int vmw_cursor_plane_prepare_fb(struct drm_plane *plane,
+ 	struct vmw_surface *surface;
+ 	int ret = 0;
+ 
+-	if (!vmw_user_object_is_null(&vps->uo)) {
+-		vmw_user_object_unmap(&vps->uo);
++	/*
++	 * A duplicated state only owns the user object reference. Its mappings
++	 * and pins belong to the old state until cleanup_fb().
++	 */
++	if (!vmw_user_object_is_null(&vps->uo))
+ 		vmw_user_object_unref(&vps->uo);
+-	}
+ 
+ 	if (fb) {
+ 		if (vmw_framebuffer_to_vfb(fb)->bo) {
+@@ -652,31 +664,34 @@ int vmw_cursor_plane_prepare_fb(struct drm_plane *plane,
+ 		bo = vmw_user_object_buffer(&vps->uo);
+ 		if (bo) {
+ 			struct ttm_operation_ctx ctx = { false, false };
++			size_t size = (size_t)new_state->crtc_w *
++				      new_state->crtc_h * sizeof(u32);
+ 
+ 			ret = ttm_bo_reserve(&bo->tbo, true, false, NULL);
+ 			if (ret != 0)
+-				return -ENOMEM;
++				return ret;
+ 
+ 			ret = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
+ 			if (ret != 0)
+-				return -ENOMEM;
++				goto out_unreserve;
+ 
+ 			/*
+-			 * vmw_bo_pin_reserved also validates, so to skip
+-			 * the extra validation use ttm_bo_pin directly
++			 * vmw_bo_pin_reserved() also validates, so to skip
++			 * the extra validation use ttm_bo_pin directly.
++			 * Every state takes its own pin, the buffer can
++			 * still be in use by an older state whose commit
++			 * hasn't been cleaned up yet.
+ 			 */
+-			if (!bo->tbo.pin_count)
+-				ttm_bo_pin(&bo->tbo);
+-
+-			if (vmw_framebuffer_to_vfb(fb)->bo) {
+-				const u32 size = new_state->crtc_w *
+-						 new_state->crtc_h *
+-						 sizeof(u32);
+-
+-				(void)vmw_bo_map_and_cache_size(bo, size);
+-			} else {
+-				vmw_bo_map_and_cache(bo);
++			ttm_bo_pin(&bo->tbo);
++
++			ret = ttm_bo_kmap(&bo->tbo, 0, PFN_UP(size),
++					  &vps->cursor.map);
++			if (ret) {
++				vps->cursor.map.bo = NULL;
++				ttm_bo_unpin(&bo->tbo);
++				goto out_unreserve;
+ 			}
++			vmw_bo_reference(bo);
+ 			ttm_bo_unreserve(&bo->tbo);
+ 		}
+ 		if (!vmw_user_object_is_null(&vps->uo)) {
+@@ -703,6 +718,10 @@ int vmw_cursor_plane_prepare_fb(struct drm_plane *plane,
+ 	}
+ 
+ 	return 0;
++
++out_unreserve:
++	ttm_bo_unreserve(&bo->tbo);
++	return ret;
+ }
+ 
+ /**
+@@ -796,7 +815,6 @@ void
+ vmw_cursor_plane_atomic_update(struct drm_plane *plane,
+ 			       struct drm_atomic_state *state)
+ {
+-	struct vmw_bo *bo;
+ 	struct drm_plane_state *new_state =
+ 		drm_atomic_get_new_plane_state(state, plane);
+ 	struct drm_plane_state *old_state =
+@@ -823,9 +841,8 @@ vmw_cursor_plane_atomic_update(struct drm_plane *plane,
+ 		vmw_cursor_update_mob(dev_priv, vps);
+ 		break;
+ 	case VMW_CURSOR_UPDATE_GB_ONLY:
+-		bo = vmw_user_object_buffer(&vps->uo);
+-		if (bo)
+-			vmw_send_define_cursor_cmd(dev_priv, bo->map.virtual,
++		if (vps->cursor.map.virtual)
++			vmw_send_define_cursor_cmd(dev_priv, vps->cursor.map.virtual,
+ 						   vps->base.crtc_w,
+ 						   vps->base.crtc_h,
+ 						   vps->base.hotspot_x,
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.h b/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.h
+index 0c2cc0699b0d9..6ff71e6655247 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.h
+@@ -14,6 +14,8 @@
+ #include "drm/drm_fourcc.h"
+ #include "drm/drm_plane.h"
+ 
++#include <drm/ttm/ttm_bo.h>
++
+ #include <linux/types.h>
+ 
+ struct SVGA3dCmdHeader;
+@@ -41,6 +43,8 @@ struct vmw_cursor_plane_state {
+ 	enum vmw_cursor_update_type update_type;
+ 	bool changed;
+ 	bool surface_changed;
++	/* The mapped buffer is referenced and pinned by this state. */
++	struct ttm_bo_kmap_obj map;
+ 	struct vmw_bo *mob;
+ 	struct {
+ 		s32 hotspot_x;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+index 3f0dd8c1c2831..cd3841da63d52 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@ -274,6 +274,7 @@ vmw_du_plane_duplicate_state(struct drm_plane *plane)
+ 	vps->cpp = 0;
+ 
+ 	vps->cursor.mob = NULL;
++	memset(&vps->cursor.map, 0, sizeof(vps->cursor.map));
+ 
+ 	/* Each ref counted resource needs to be acquired again */
+ 	vmw_user_object_ref(&vps->uo);
+-- 
+2.56.1
+
