@@ -166,10 +166,10 @@ def read_config_sh(package_tar_up_dir):
     config_sh = os.path.join(package_tar_up_dir, 'config.sh')
     with open(config_sh, 'rb') as f:
         data = f.read()
-    return read_config_sh_data(data)
+    return read_config_sh_data(data, config_sh)
 
 
-def read_config_sh_data(data):
+def read_config_sh_data(data, filename=None):
     config = CaseInsensitiveDict()
     lnnr = 0
     if isinstance(data, bytes):
@@ -188,7 +188,7 @@ def read_config_sh_data(data):
             value = parsed_tokens[0] if parsed_tokens else ""
             config[key] = value
         else:
-            raise ValueError('line {} malformed in {}: "{}"'.format(lnnr, config_sh, line))
+            raise ValueError('line {} malformed in {}: "{}"'.format(lnnr, filename, line))
 
     return config
 
