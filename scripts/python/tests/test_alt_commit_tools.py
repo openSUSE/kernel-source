@@ -1,4 +1,3 @@
-#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 import io
@@ -453,7 +452,3 @@ class TestEndToEndCherryPickPipeline(unittest.TestCase):
         cur.execute("SELECT group_id FROM hashes WHERE hash_value = ?", (dummy_sha,))
         self.assertIsNone(cur.fetchone())
         conn.close()
-
-
-if __name__ == "__main__":
-    unittest.main()
