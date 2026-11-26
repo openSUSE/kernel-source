@@ -19,7 +19,7 @@ if not hasattr(ET, 'indent'):  # should be available since python 3.9
     import ETindent
     ET.indent = ETindent.indent
 
-if sys.version_info.major == 3 and sys.version_info.minor < 7:
+if sys.version_info < (3, 11):
     def PkgRepo(api, org, repo, branch=None, commit=None):
         return types.SimpleNamespace(api=api, org=org, repo=repo, branch=branch, commit=commit)
 else:

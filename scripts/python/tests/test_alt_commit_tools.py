@@ -8,13 +8,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
-
-if sys.version_info < (3, 6):
-    raise unittest.SkipTest("alt-commits suite requires Python 3.6+ (SLE 15+)")
-
-from contextlib import redirect_stderr
 from pathlib import Path
-from alt_commits import alt_lib
+if sys.version_info >= (3, 6):
+    from alt_commits import alt_lib
+    from contextlib import redirect_stderr
 
 # Locate repository root and scripts directory
 TESTS_DIR = Path(__file__).resolve().parent
@@ -22,6 +19,7 @@ REPO_ROOT = TESTS_DIR.parents[2]
 ALT_COMMITS_DIR = REPO_ROOT / "scripts" / "alt-commits"
 
 
+@unittest.skipIf(sys.version_info < (3, 6), 'This code uses type annotations, python 3.6+ required to parse')
 class TestRepoResolution(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="alt_test_repo_")
@@ -53,6 +51,7 @@ class TestRepoResolution(unittest.TestCase):
             self.assertTrue(os.path.isdir(discovered))
 
 
+@unittest.skipIf(sys.version_info < (3, 6), 'This code uses type annotations, python 3.6+ required to parse')
 class TestIgnoreFileHandling(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="alt_test_ignore_")
@@ -96,6 +95,7 @@ class TestIgnoreFileHandling(unittest.TestCase):
         self.assertEqual(resolved_path, ignore_file)
 
 
+@unittest.skipIf(sys.version_info < (3, 6), 'This code uses type annotations, python 3.6+ required to parse')
 class TestFileLock(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="alt_test_lock_")
@@ -122,6 +122,7 @@ class TestFileLock(unittest.TestCase):
         lock2.release()
 
 
+@unittest.skipIf(sys.version_info < (3, 6), 'This code uses type annotations, python 3.6+ required to parse')
 class TestDbAndCliExecution(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="alt_test_db_")
@@ -207,6 +208,7 @@ class TestDbAndCliExecution(unittest.TestCase):
             self.assertEqual(alt_lib.get_db_algorithm_version(tmp_db.name), 42)
 
 
+@unittest.skipIf(sys.version_info < (3, 6), 'This code uses type annotations, python 3.6+ required to parse')
 class TestEndToEndCherryPickPipeline(unittest.TestCase):
     """
     Tests full repository scanning, all 3 cherry-pick detection heuristics,
