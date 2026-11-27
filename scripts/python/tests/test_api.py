@@ -314,6 +314,12 @@ class TestMisc(unittest.TestCase):
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit=None)],
                 ['https://src.opensuse.org/kernel/kernel-default-base?trackingbranch=main',
                  PkgRepo(api='https://src.opensuse.org', org='kernel', repo='kernel-default-base', branch='main', commit=None)],
+                ['https://src.opensuse.org/kernelbugs/kernel-source-scripts?subdir=scripts#scripts',
+                 PkgRepo(api='https://src.opensuse.org', org='kernelbugs', repo='kernel-source-scripts', branch='scripts', commit=None, subdir='scripts')],
+                ['https://src.opensuse.org/kernelbugs/kernel-source-scripts?subdir=scripts/python&trackingbranch=scripts#' + 'cafedead' * 5,
+                 PkgRepo(api='https://src.opensuse.org', org='kernelbugs', repo='kernel-source-scripts', branch='scripts', commit='cafedead' * 5, subdir='scripts/python')],
+                ['https://src.opensuse.org/kernelbugs/kernel-source-scripts?subdir=scripts#main',
+                 PkgRepo(api='https://src.opensuse.org', org='kernelbugs', repo='kernel-source-scripts', branch='main', commit=None, subdir='scripts')],
                 ]
         testexcept = [
                 'https://src.suse.de/org/repo?trackingbranch=branch&foo=bar#' + 'cafedead' * 8,

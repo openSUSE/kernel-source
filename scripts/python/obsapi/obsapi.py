@@ -20,7 +20,7 @@ if not hasattr(ET, 'indent'):  # should be available since python 3.9
     ET.indent = ETindent.indent
 
 if sys.version_info < (3, 11):
-    def PkgRepo(api, org, repo, branch=None, commit=None):
+    def PkgRepo(api, org, repo, branch=None, commit=None, subdir=None):
         return types.SimpleNamespace(api=api, org=org, repo=repo, branch=branch, commit=commit)
 else:
     from dataclasses import dataclass
@@ -31,6 +31,7 @@ else:
         repo: str
         branch: str | None = None
         commit: str | None = None
+        subdir: str | None = None
 
 def expand_home(path):
     if path.startswith('~/'):
@@ -47,6 +48,9 @@ def process_scmsync(sync_text):
     assert sync.scheme == 'https'
     assert sync.netloc in ['src.suse.de', 'src.opensuse.org']
     query = urllib.parse.parse_qs(sync.query)
+    subdirs = query.pop('subdir', None)
+    assert not subdirs or len(subdirs) == 1
+    subdir = subdirs[0] if subdirs else None
     query_keys = list(query.keys())
     if 'enforce_bcntsynctag' in query_keys: query_keys.remove('enforce_bcntsynctag')  # Ignore irrelevant query option
     if query_keys != ['trackingbranch'] and query_keys != []:
@@ -69,7 +73,7 @@ def process_scmsync(sync_text):
     assert len(sync.path.split('/')) == 3
     _, org, repo = sync.path.split('/')
     assert _ == ''
-    return PkgRepo(sync.scheme + '://' + sync.netloc, org, repo, branch, commit)
+    return PkgRepo(sync.scheme + '://' + sync.netloc, org, repo, branch, commit, subdir)
 
 class OBSAPI(api.API):
     def __init__(self, URL, logfile=None, config=None, cookiejar=None, ca=None):
