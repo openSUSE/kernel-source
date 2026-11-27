@@ -310,6 +310,8 @@ class TestMisc(unittest.TestCase):
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch=None, commit='cafedead' * 5)],
                 ['https://src.suse.de/org/repo#' + 'cafedead' * 8,
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch=None, commit='cafedead' * 8)],
+                ['https://src.suse.de/org/repo?trackingbranch=' + 'branch',
+                 PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit=None)],
                 ['https://src.suse.de/org/repo#' + 'branch',
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit=None)],
                 ['https://src.opensuse.org/kernel/kernel-default-base?trackingbranch=main',
@@ -323,8 +325,8 @@ class TestMisc(unittest.TestCase):
                 ]
         testexcept = [
                 'https://src.suse.de/org/repo?trackingbranch=branch&foo=bar#' + 'cafedead' * 8,
+                'https://src.suse.de/org/repo?trackingbranch=foo&trackingbranch=bar#' + 'cafedead' * 8,
                 'https://src.suse.de/org/repo?foo=bar#' + 'cafedead' * 8,
-                'https://src.suse.de/org/repo?trackingbranch=' + 'branch',
                 'https://src.suse.de/org/repo?trackingbranch=foo#' + 'bar',
                 'https://src.suse.de/org/repo?trackingbranch=branch#' + 'cafedead' * 6,
                 'https://src.suse.de/org/repo',
@@ -332,7 +334,7 @@ class TestMisc(unittest.TestCase):
         for data, result in testdata:
             self.assertEqual(process_scmsync(data), result)
         for data in testexcept:
-            self.assertRaises(Exception)
+            self.assertRaises(RuntimeError, process_scmsync, data)
 
 class APITest(unittest.TestCase):
     def log_cycle(self, test_fn, orig_log):
