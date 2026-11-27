@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from libs.cache_metadata import discover_cached_builds, read_cache_metadata, write_cache_metadata
+from kernel_sandbox.cache_metadata import discover_cached_builds, read_cache_metadata, write_cache_metadata
 
 
 class TestWriteReadCacheMetadata(unittest.TestCase):
