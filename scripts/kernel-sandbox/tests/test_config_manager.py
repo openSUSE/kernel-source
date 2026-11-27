@@ -4,7 +4,7 @@ import tempfile
 import unittest
 import yaml
 from pathlib import Path
-from libs.config_manager import DEFAULT_IBS_API_URL, DEFAULT_OBS_API_URL, ConfigManager, ConfigurationError, get_host_arch
+from kernel_sandbox.config_manager import DEFAULT_IBS_API_URL, DEFAULT_OBS_API_URL, ConfigManager, ConfigurationError, get_host_arch
 
 
 def TestRepoSetup(workspace_path, config_content):
