@@ -1,8 +1,4 @@
 #!/usr/bin/python3
-import sys
-if sys.version_info < (3, 6):
-    raise RuntimeError('python 3.6 or later required')
-
 """
 Synopsis: determine the current kernel source version from a series of patches
           as being referenced from series.conf
@@ -36,6 +32,11 @@ Copyright: (c)2026 by {company}
 Author: {author}
 License: {license}
 """
+
+import sys
+if sys.version_info < (3, 6):
+    raise RuntimeError('python 3.6 or later required')
+
 #
 # vim:set et ts=8 sw=4:
 #
