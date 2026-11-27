@@ -23,7 +23,14 @@ if sys.version_info < (3, 11):
     def PkgRepo(api, org, repo, branch=None, commit=None):
         return types.SimpleNamespace(api=api, org=org, repo=repo, branch=branch, commit=commit)
 else:
-    from obsapi.pkgrepo import PkgRepo
+    from dataclasses import dataclass
+    @dataclass
+    class PkgRepo:
+        api: str
+        org: str
+        repo: str
+        branch: str | None = None
+        commit: str | None = None
 
 def expand_home(path):
     if path.startswith('~/'):
