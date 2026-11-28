@@ -1,4 +1,6 @@
-from kutil.config import read_config_sh, get_kernel_project_package, list_files, list_specs, get_kernel_projects, get_package_archs, SrcVersion, compute_patchversion
+import sys
+if sys.version_info >= (3, 6):
+    from kutil.config import read_config_sh, get_kernel_project_package, list_files, list_specs, get_kernel_projects, get_package_archs, SrcVersion, compute_patchversion
 from kutil import pathlib_compat
 from pathlib import Path
 import subprocess
@@ -6,6 +8,7 @@ import tempfile
 import unittest
 import shutil
 
+@unittest.skipIf(sys.version_info < (3, 6), 'This code uses type annotations, python 3.6+ required to parse')
 class MiscTests(unittest.TestCase):
     def test_config_sh(self):
         config = read_config_sh('tests/kutil/rpm/krnf')
@@ -125,6 +128,7 @@ another file
             self.assertEqual(str(sv), outs)
             self.assertEqual(dict(sv), outd)
 
+@unittest.skipIf(sys.version_info < (3, 6), 'This code uses type annotations, python 3.6+ required to parse')
 class TestComputePatchversion(unittest.TestCase):
 
     def setUp(self):
