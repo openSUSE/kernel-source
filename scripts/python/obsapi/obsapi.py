@@ -19,11 +19,19 @@ if not hasattr(ET, 'indent'):  # should be available since python 3.9
     import ETindent
     ET.indent = ETindent.indent
 
-if sys.version_info.major == 3 and sys.version_info.minor < 7:
-    def PkgRepo(api, org, repo, branch=None, commit=None):
+if sys.version_info < (3, 11):
+    def PkgRepo(api, org, repo, branch=None, commit=None, subdir=None):
         return types.SimpleNamespace(api=api, org=org, repo=repo, branch=branch, commit=commit)
 else:
-    from obsapi.pkgrepo import PkgRepo
+    from dataclasses import dataclass
+    @dataclass
+    class PkgRepo:
+        api: str
+        org: str
+        repo: str
+        branch: str | None = None
+        commit: str | None = None
+        subdir: str | None = None
 
 def expand_home(path):
     if path.startswith('~/'):
@@ -33,6 +41,11 @@ def expand_home(path):
 def is_git_sha(txt):
     return (len(txt) == 64 or len(txt) == 40) and re.fullmatch('(?ai)[a-f0-9]*', txt)
 
+def only_first_element(seq):
+    if not seq or len(seq) == 1:
+        return seq[0] if seq else None
+    raise RuntimeError('At most one element expected: %s' % (repr(seq), ))
+
 def process_scmsync(sync_text):
     if sync_text is None:
         return sync_text
@@ -40,29 +53,32 @@ def process_scmsync(sync_text):
     assert sync.scheme == 'https'
     assert sync.netloc in ['src.suse.de', 'src.opensuse.org']
     query = urllib.parse.parse_qs(sync.query)
-    query_keys = list(query.keys())
-    if 'enforce_bcntsynctag' in query_keys: query_keys.remove('enforce_bcntsynctag')  # Ignore irrelevant query option
-    if query_keys != ['trackingbranch'] and query_keys != []:
-        raise RuntimeError("In %s: expected [] or ['trackingbranch'], got %s" % (
-            repr(sync), str(query_keys)))
-    if 'trackingbranch' in query:
-        branch = query['trackingbranch'][0]
+    for k in query.keys():
+        if k not in ['enforce_bcntsynctag', 'subdir', 'trackingbranch']:
+            raise RuntimeError('In scmsync %s: unexpected query parameter %s' % (repr(sync), k))
+    query.pop('enforce_bcntsynctag', None)  # Ignore irrelevant query parameter
+    subdir = only_first_element(query.pop('subdir', None))
+    branch = only_first_element(query.pop('trackingbranch', None))
+    if branch:
         if sync.fragment:
-            assert is_git_sha(sync.fragment)
+            if not is_git_sha(sync.fragment):
+                raise RuntimeError('In scmsync %s: expected commit sha as URL fragment, got %s' % (repr(sync), sync.fragment))
             commit = sync.fragment
         else:
             commit = None
     else:
         if is_git_sha(sync.fragment):
-            branch = None
             commit = sync.fragment
         else:
             branch = sync.fragment
             commit = None
-    assert len(sync.path.split('/')) == 3
-    _, org, repo = sync.path.split('/')
-    assert _ == ''
-    return PkgRepo(sync.scheme + '://' + sync.netloc, org, repo, branch, commit)
+    if not branch and not commit:
+        raise RuntimeError('In scmsync %s: Neither branch nor commit specified' % (repr(sync), ))
+    path_components = sync.path.split('/')
+    if len(path_components) != 3 or path_components[0] != '':
+        raise RuntimeError('In scmsync %s: Invalid repository path %s' % (repr(sync), sync.path))
+    _, org, repo = path_components
+    return PkgRepo(sync.scheme + '://' + sync.netloc, org, repo, branch, commit, subdir)
 
 class OBSAPI(api.API):
     def __init__(self, URL, logfile=None, config=None, cookiejar=None, ca=None):

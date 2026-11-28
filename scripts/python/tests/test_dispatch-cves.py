@@ -8,7 +8,7 @@ import tempfile
 import unittest
 import sys
 
-if sys.version_info.major != 3 or sys.version_info.minor > 5:
+if sys.version_info >= (3, 6):
     from cve_tools import dispatch_cves
 
 class DictObj:
@@ -43,7 +43,7 @@ class BZMock:
             self.updates[id] = fields
 
 
-@unittest.skipIf(sys.version_info.major == 3 and sys.version_info.minor < 6, "python before 3.6 not supported")
+@unittest.skipIf(sys.version_info < (3, 6), "python before 3.6 not supported")
 class TestDispatchCves(unittest.TestCase):
     def setUp(self):
         self.bzapi = BZMock()
