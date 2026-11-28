@@ -338,6 +338,7 @@ class Uploader(UploaderBase):
         self.obs = OBSAPI(api, logfile)
         self.log_progress('Getting scmsync for %s/%s...' % (self.upstream_project, self.package))
         self.upstream = self.obs.package_repo(self.upstream_project, self.package)
+        assert self.upstream.subdir is None
         self.log_progress('%s\n' % (repr(self.upstream),))
         self.tea = TeaAPI(self.upstream.api, logfile, progress=self.progress)
         self.log_progress('Getting Gitea user...')
