@@ -1,10 +1,12 @@
-from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership, get_maintainership
-from kutil.config import get_package_archs, get_kernel_projects, uniq
-from obsapi.obsapi import OBSAPI, PkgRepo, process_scmsync
-from obsapi.uploader import UploaderBase
+import sys
+if sys.version_info >= (3, 6):
+    from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership, get_maintainership
+    from kutil.config import get_package_archs, get_kernel_projects, uniq
+    from obsapi.obsapi import OBSAPI, PkgRepo, process_scmsync
+    from obsapi.uploader import UploaderBase
+    from obsapi.api import APIError
 import xml.etree.ElementTree as ET
 from difflib import unified_diff
-from obsapi.api import APIError
 from threading import Thread
 import email.message
 import configparser
@@ -96,9 +98,6 @@ class TestRequest(http.server.BaseHTTPRequestHandler):
         body = None
         if 'Content-Length' in self.headers:
             body = self.rfile.read(int(self.headers['Content-Length']))
-        if sys.version_info.major == 3 and sys.version_info.minor < 6 and 'Content-Type' in self.headers and self.headers['Content-Type'] == 'application/json':
-            body = json.dumps(json.loads(body.decode()), sort_keys=True).encode()  # At least on SLE12 the order is random
-            data['request']['body'] = json.dumps(json.loads(data['request']['body'].decode()), sort_keys=True).encode()
         if data['request']['body'] != body:
             raise ValueError('Expected %s but got %s' %(data['request']['body'], body))
 
@@ -159,12 +158,8 @@ class ServerThread():
         self.httpd.socket = self.get_ssl_context().wrap_socket(self.httpd.socket, server_side=True)
 
     def get_ssl_context(self):
-        if sys.version_info.major == 3 and sys.version_info.minor < 6:  # SLE 12
-            self.servercert = 'tests/api/certificate12.pem'
-            self.serverkey = 'tests/api/certkey12.pem'
-        else:
-            self.servercert = 'tests/api/certificate.pem'
-            self.serverkey = 'tests/api/certkey.pem'
+        self.servercert = 'tests/api/certificate.pem'
+        self.serverkey = 'tests/api/certkey.pem'
 
         if hasattr(ssl, 'PROTOCOL_TLS_SERVER'):
             proto = ssl.PROTOCOL_TLS_SERVER
@@ -207,6 +202,7 @@ class ServerThread():
     data_consumed = property(lambda self: self.httpd.index == len(self.httpd.data))
 
 
+@unittest.skipIf(sys.version_info < (3, 6), 'This code uses type annotations, python 3.6+ required to parse')
 class TestMisc(unittest.TestCase):
     def test_json_dump(self):
         testdata = [
@@ -314,15 +310,23 @@ class TestMisc(unittest.TestCase):
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch=None, commit='cafedead' * 5)],
                 ['https://src.suse.de/org/repo#' + 'cafedead' * 8,
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch=None, commit='cafedead' * 8)],
+                ['https://src.suse.de/org/repo?trackingbranch=' + 'branch',
+                 PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit=None)],
                 ['https://src.suse.de/org/repo#' + 'branch',
                  PkgRepo(api='https://src.suse.de', org='org', repo='repo', branch='branch', commit=None)],
                 ['https://src.opensuse.org/kernel/kernel-default-base?trackingbranch=main',
                  PkgRepo(api='https://src.opensuse.org', org='kernel', repo='kernel-default-base', branch='main', commit=None)],
+                ['https://src.opensuse.org/kernelbugs/kernel-source-scripts?subdir=scripts#scripts',
+                 PkgRepo(api='https://src.opensuse.org', org='kernelbugs', repo='kernel-source-scripts', branch='scripts', commit=None, subdir='scripts')],
+                ['https://src.opensuse.org/kernelbugs/kernel-source-scripts?subdir=scripts/python&trackingbranch=scripts#' + 'cafedead' * 5,
+                 PkgRepo(api='https://src.opensuse.org', org='kernelbugs', repo='kernel-source-scripts', branch='scripts', commit='cafedead' * 5, subdir='scripts/python')],
+                ['https://src.opensuse.org/kernelbugs/kernel-source-scripts?subdir=scripts#main',
+                 PkgRepo(api='https://src.opensuse.org', org='kernelbugs', repo='kernel-source-scripts', branch='main', commit=None, subdir='scripts')],
                 ]
         testexcept = [
                 'https://src.suse.de/org/repo?trackingbranch=branch&foo=bar#' + 'cafedead' * 8,
+                'https://src.suse.de/org/repo?trackingbranch=foo&trackingbranch=bar#' + 'cafedead' * 8,
                 'https://src.suse.de/org/repo?foo=bar#' + 'cafedead' * 8,
-                'https://src.suse.de/org/repo?trackingbranch=' + 'branch',
                 'https://src.suse.de/org/repo?trackingbranch=foo#' + 'bar',
                 'https://src.suse.de/org/repo?trackingbranch=branch#' + 'cafedead' * 6,
                 'https://src.suse.de/org/repo',
@@ -330,7 +334,7 @@ class TestMisc(unittest.TestCase):
         for data, result in testdata:
             self.assertEqual(process_scmsync(data), result)
         for data in testexcept:
-            self.assertRaises(Exception)
+            self.assertRaises(RuntimeError, process_scmsync, data)
 
 class APITest(unittest.TestCase):
     def log_cycle(self, test_fn, orig_log):
@@ -343,6 +347,7 @@ class APITest(unittest.TestCase):
         tmpdir.cleanup()
 
 
+@unittest.skipIf(sys.version_info < (3, 6), 'This code uses type annotations, python 3.6+ required to parse')
 class TestTea(APITest):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -415,10 +420,7 @@ class TestTea(APITest):
             st.start_server(teaconfig=self.config)
             api = TeaAPI(st.url(), config=self.config, ca=st.servercert, logfile=outlog)
             reference = ['kernel-source', 'kernel-livepatch-MICRO-6-0-RT_Update_10', 'kernel-livepatch-MICRO-6-0-RT_Update_11', 'kernel-livepatch-MICRO-6-0-RT_Update_12', 'kernel-livepatch-MICRO-6-0-RT_Update_4', 'kernel-livepatch-MICRO-6-0-RT_Update_5', 'kernel-livepatch-MICRO-6-0-RT_Update_6', 'kernel-livepatch-MICRO-6-0-RT_Update_7', 'kernel-livepatch-MICRO-6-0-RT_Update_8', 'kernel-livepatch-MICRO-6-0-RT_Update_9', 'kernel-livepatch-MICRO-6-0_Update_10', 'kernel-livepatch-MICRO-6-0_Update_11', 'kernel-livepatch-MICRO-6-0_Update_12', 'kernel-livepatch-MICRO-6-0_Update_13', 'kernel-livepatch-MICRO-6-0_Update_4', 'kernel-livepatch-MICRO-6-0_Update_5', 'kernel-livepatch-MICRO-6-0_Update_6', 'kernel-livepatch-MICRO-6-0_Update_7', 'kernel-livepatch-MICRO-6-0_Update_8', 'kernel-livepatch-MICRO-6-0_Update_9', 'kgraft-patch-SLE12-SP5_Update_64', 'kgraft-patch-SLE12-SP5_Update_65', 'kgraft-patch-SLE12-SP5_Update_66', 'kgraft-patch-SLE12-SP5_Update_67', 'kgraft-patch-SLE12-SP5_Update_68', 'kgraft-patch-SLE12-SP5_Update_69', 'kgraft-patch-SLE12-SP5_Update_70', 'kgraft-patch-SLE12-SP5_Update_71', 'kgraft-patch-SLE12-SP5_Update_72', 'kgraft-patch-SLE12-SP5_Update_73', 'kgraft-patch-SLE12-SP5_Update_74', 'kgraft-patch-SLE12-SP5_Update_75', 'kernel-livepatch-SLE15-SP4_Update_35', 'kernel-livepatch-SLE15-SP4_Update_36', 'kernel-livepatch-SLE15-SP4_Update_37', 'kernel-livepatch-SLE15-SP4_Update_38', 'kernel-livepatch-SLE15-SP4_Update_39', 'kernel-livepatch-SLE15-SP4_Update_40', 'kernel-livepatch-SLE15-SP4_Update_41', 'kernel-livepatch-SLE15-SP4_Update_42', 'kernel-livepatch-SLE15-SP4_Update_43', 'kernel-livepatch-SLE15-SP4_Update_44', 'kernel-livepatch-SLE15-SP4_Update_45', 'kernel-livepatch-SLE15-SP4_Update_46', 'kernel-livepatch-SLE15-SP4_Update_47', 'kernel-livepatch-SLE15-SP5_Update_22', 'kernel-livepatch-SLE15-SP5_Update_23', 'kernel-livepatch-SLE15-SP5_Update_24', 'kernel-livepatch-SLE15-SP5_Update_25', 'kernel-livepatch-SLE15-SP5_Update_26', 'kernel-livepatch-SLE15-SP5_Update_27', 'kernel-livepatch-SLE15-SP5_Update_28', 'kernel-livepatch-SLE15-SP5_Update_29', 'kernel-livepatch-SLE15-SP5_Update_30', 'kernel-livepatch-SLE15-SP5_Update_31', 'kernel-livepatch-SLE15-SP5_Update_32', 'kernel-livepatch-SLE15-SP5_Update_33', 'kernel-livepatch-SLE15-SP6_Update_10', 'kernel-livepatch-SLE15-SP6_Update_11', 'kernel-livepatch-SLE15-SP6_Update_12', 'kernel-livepatch-SLE15-SP6_Update_13', 'kernel-livepatch-SLE15-SP6_Update_14', 'kernel-livepatch-SLE15-SP6_Update_15', 'kernel-livepatch-SLE15-SP6_Update_16', 'kernel-livepatch-SLE15-SP6_Update_17', 'kernel-livepatch-SLE15-SP6_Update_18', 'kernel-livepatch-SLE15-SP6_Update_7', 'kernel-livepatch-SLE15-SP6_Update_8', 'kernel-source-rt', 'kernel-livepatch-SLE16_Update_3', 'kernel-livepatch-SLE16_Update_2', 'kernel-livepatch-SLFO-Main_Update_0', 'kernel-livepatch-SLFO-Main-RT_Update_0', 'kernel-livepatch-SLE15-SP6_Update_9', 'kernel-livepatch-SLE15-SP7-RT_Update_0', 'kernel-livepatch-SLE15-SP7-RT_Update_1', 'kernel-livepatch-SLE15-SP7-RT_Update_2', 'kernel-livepatch-SLE15-SP7-RT_Update_3', 'kernel-livepatch-SLE15-SP7-RT_Update_4', 'kernel-livepatch-SLE15-SP7-RT_Update_5', 'kernel-livepatch-SLE15-SP7-RT_Update_6', 'kernel-livepatch-SLE15-SP7-RT_Update_7', 'kernel-livepatch-SLE15-SP7_Update_0', 'kernel-livepatch-SLE15-SP7_Update_1', 'kernel-livepatch-SLE15-SP7_Update_2', 'kernel-livepatch-SLE15-SP7_Update_3', 'kernel-livepatch-SLE15-SP7_Update_4', 'kernel-livepatch-SLE15-SP7_Update_5', 'kernel-livepatch-SLE15-SP7_Update_6', 'kernel-livepatch-SLE15-SP7_Update_7', 'kernel-livepatch-SLE16-RT_Update_0', 'kernel-livepatch-SLE16-RT_Update_1', 'kernel-livepatch-SLE16-RT_Update_2', 'kernel-livepatch-SLE16-RT_Update_3', 'kernel-livepatch-SLE16_Update_0', 'kernel-livepatch-SLE16_Update_1', 'kernel-source-longterm', 'kernel-source-vanilla', 'kernel-livepatch-MICRO-6-0-RT_Update_2', 'kernel-livepatch-MICRO-6-0-RT_Update_3', 'kernel-livepatch-MICRO-6-0_Update_2', 'kernel-livepatch-MICRO-6-0_Update_3', 'kgraft-patch-SLE12-SP5_Update_76', 'kernel-livepatch-SLE15-SP4_Update_48', 'kernel-livepatch-SLE15-SP5_Update_34', 'kernel-livepatch-SLE15-SP6_Update_19', 'kernel-livepatch-SLE15-SP7-RT_Update_8', 'kernel-livepatch-SLE15-SP7_Update_8', 'kernel-livepatch-SLE16-RT_Update_4', 'kernel-livepatch-SLE16_Update_4', 'SLFO', 'kernel-livepatch-MICRO-6-0-RT_Update_14', 'kernel-livepatch-MICRO-6-0-RT_Update_17', 'kgraft-patch-SLE12-SP5_Update_77', 'kernel-livepatch-SLE15-SP4_Update_49', 'kernel-livepatch-SLE15-SP5_Update_35', 'kernel-livepatch-SLE15-SP6_Update_20', 'kernel-livepatch-SLE15-SP7-RT_Update_9', 'kernel-livepatch-SLE15-SP7_Update_9', 'kernel-livepatch-SLE16-RT_Update_5', 'kernel-livepatch-SLE16_Update_5', 'kernel-livepatch-MICRO-6-0-RT_Update_13', 'kernel-livepatch-MICRO-6-0_Update_14', 'kgraft-patch-SLE12-SP5_Update_78', 'kernel-livepatch-SLE15-SP4_Update_50', 'kernel-livepatch-SLE15-SP5_Update_36', 'kernel-livepatch-SLE15-SP6_Update_21', 'kernel-livepatch-SLE15-SP7-RT_Update_10', 'kernel-livepatch-SLE15-SP7_Update_10', 'kernel-livepatch-SLE16-RT_Update_6', 'kernel-livepatch-SLE16_Update_6', 'SLFO_Kernel', 'kernel-livepatch-MICRO-6-0-RT_Update_15', 'kernel-livepatch-MICRO-6-0-RT_Update_19', 'kgraft-patch-SLE12-SP5_Update_79', 'kernel-livepatch-SLE15-SP5_Update_37', 'kernel-livepatch-SLE15-SP6_Update_22', 'kernel-livepatch-SLE15-SP7-RT_Update_11', 'kernel-livepatch-SLE15-SP7_Update_11', 'kernel-livepatch-SLE16-RT_Update_7', 'kernel-livepatch-SLE16_Update_7', 'kernel-livepatch-MICRO-6-0-RT_Update_18', 'kernel-livepatch-MICRO-6-0_Update_16', 'kernel-livepatch-MICRO-6-0_Update_17', 'kernel-livepatch-MICRO-6-0_Update_18']
-            if sys.version_info.major == 3 and sys.version_info.minor < 6:
-                self.assertEqual(sorted(list(api.list_repos('kernelbugs').keys())), sorted(reference))
-            else:
-                self.assertEqual(list(api.list_repos('kernelbugs').keys()), reference)
+            self.assertEqual(list(api.list_repos('kernelbugs').keys()), reference)
             self.assertTrue(st.data_consumed)
             st.stop_server()
         self.log_cycle(test_fn, 'tests/api/list_repos')
@@ -548,6 +550,7 @@ foobar''')
         self.log_cycle(test_fn, 'tests/api/branch_roll_forward')
 
 
+@unittest.skipIf(sys.version_info < (3, 6), 'This code uses type annotations, python 3.6+ required to parse')
 class TestOBS(APITest):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -742,11 +745,7 @@ class TestOBS(APITest):
         st = ServerThread('tests/api/obsapi_log_in_ssh')
         st.start_server(obsconfig=self.config)
         api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
-        if sys.version_info.major == 3 and sys.version_info.minor < 6:
-            re = '''^Authentication required but no usable credentials found
-Requested authorizarion:'''
-        else:
-            re = '''^Authentication required but no usable credentials found
+        re = '''^Authentication required but no usable credentials found
 Requested authorizarion: {'signature': {'realm': 'Use your developer account', 'headers': '[(]created[)]'}}
 Available credentials:  password: True  SSH key: False$'''
         with self.assertRaisesRegex(RuntimeError, re):
@@ -860,8 +859,9 @@ class FakeOBS:
     def __init__(self, prjmeta):
         self.prjmeta = prjmeta
 
-    get_kernel_projects = OBSAPI.get_kernel_projects
-    get_project_repo_archs = OBSAPI.get_project_repo_archs
+    if sys.version_info >= (3, 6):
+        get_kernel_projects = OBSAPI.get_kernel_projects
+        get_project_repo_archs = OBSAPI.get_project_repo_archs
 
     def project_exists(self, project):
         prj = self.prjmeta.get(project, None)
@@ -873,6 +873,7 @@ class FakeOBS:
     def user_exists(self, user):
         return user in self.users
 
+@unittest.skipIf(sys.version_info < (3, 6), 'This code uses type annotations, python 3.6+ required to parse')
 class TestUploader(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1132,12 +1133,7 @@ class TestUploader(unittest.TestCase):
     def printdiff(self, reference, result):
         self.maxDiff = None
         print('\n'.join(unified_diff(reference.splitlines(), result.splitlines(), fromfile='reference', tofile='result')))
-        # Output is not stable on python 3.4, probably a bug
-        # The difference is irrelevant for prjmeta but makes test output unreproducible
-        if sys.version_info.major == 3 and sys.version_info.minor < 6:
-            self.assertEqual(len(reference), len(result))
-        else:
-            self.assertEqual(reference.splitlines(), result.splitlines())
+        self.assertEqual(reference.splitlines(), result.splitlines())
 
     def test_prjconf_factory(self):
         ul = UploaderBase()
