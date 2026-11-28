@@ -26,7 +26,7 @@ import sys
 import os
 
 # fixups for python 3.6, works flawlessly in python 3.11
-if sys.version_info.minor < 11:  # SLE15
+if sys.version_info < (3, 11):  # SLE15
     _shelve_open = shelve.open
     def _fix_shelve(*args, **kwargs):
         args = [str(a) if isinstance(a, pathlib.PurePath) else a for a in args]
@@ -34,7 +34,7 @@ if sys.version_info.minor < 11:  # SLE15
 
     shelve.open = _fix_shelve
 
-    if sys.version_info.minor >= 6:
+    if sys.version_info >= (3, 6):
         class _FixPopen(subprocess.Popen):
             def __init__(self, *args, **kwargs):
                 args = [str(a) if isinstance(a, pathlib.PurePath) else a for a in args]
